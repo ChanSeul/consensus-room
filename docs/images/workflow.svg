@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="402" viewBox="0 0 1100 402" role="img" aria-labelledby="title desc">
+<title id="title">계획 검토부터 Git 전달까지</title><desc id="desc">Claude 계획, Codex 감사, Claude 개정, Codex 종결 뒤 같은 계획 해시와 사용자 승인을 확인합니다. 이후 구현, 코드 리뷰, 필요한 수정과 최종 리뷰를 거쳐 커밋과 push를 각각 승인합니다.</desc>
+<style>text{font-family:-apple-system, BlinkMacSystemFont, 'Noto Sans KR', 'Apple SD Gothic Neo', sans-serif;fill:#182432} .small{fill:#576879}</style>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" fill="#708395"/></marker></defs>
+<rect width="1100" height="402" rx="16" fill="#fff"/>
+<text x="30" y="38" font-size="23" font-weight="700" fill="#182432" text-anchor="start">계획을 함께 확인하고, 승인한 범위에서 구현합니다.</text>
+<rect x="30" y="70" width="235" height="92" rx="10" fill="#F2F6FA" stroke="#D8E1E9"/>
+<rect x="30" y="82" width="3" height="68" rx="1.5" fill="#2459A6"/>
+<text x="48" y="99" font-size="19" font-weight="700" fill="#182432" text-anchor="start">Claude 계획</text>
+<text x="48" y="125" font-size="16" font-weight="400" fill="#182432" text-anchor="start">범위·조건·검증 계획</text>
+<path d="M270 116 L295 116" fill="none" stroke="#708395" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="300" y="70" width="235" height="92" rx="10" fill="#F2F6FA" stroke="#D8E1E9"/>
+<rect x="300" y="82" width="3" height="68" rx="1.5" fill="#2459A6"/>
+<text x="318" y="99" font-size="19" font-weight="700" fill="#182432" text-anchor="start">Codex 감사</text>
+<text x="318" y="125" font-size="16" font-weight="400" fill="#182432" text-anchor="start">근거·누락·쟁점 검토</text>
+<path d="M540 116 L565 116" fill="none" stroke="#708395" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="570" y="70" width="235" height="92" rx="10" fill="#F2F6FA" stroke="#D8E1E9"/>
+<rect x="570" y="82" width="3" height="68" rx="1.5" fill="#2459A6"/>
+<text x="588" y="99" font-size="19" font-weight="700" fill="#182432" text-anchor="start">Claude 개정</text>
+<text x="588" y="125" font-size="16" font-weight="400" fill="#182432" text-anchor="start">지적에 답하고 계획 수정</text>
+<path d="M810 116 L835 116" fill="none" stroke="#708395" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="840" y="70" width="235" height="92" rx="10" fill="#F2F6FA" stroke="#D8E1E9"/>
+<rect x="840" y="82" width="3" height="68" rx="1.5" fill="#2459A6"/>
+<text x="858" y="99" font-size="19" font-weight="700" fill="#182432" text-anchor="start">Codex 종결</text>
+<text x="858" y="125" font-size="16" font-weight="400" fill="#182432" text-anchor="start">쟁점 처분과 근거 확인</text>
+<path d="M1040 168 V185 H50 V213" fill="none" stroke="#708395" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="30" y="223" width="235" height="92" rx="10" fill="#F2F6FA" stroke="#D8E1E9"/>
+<rect x="30" y="235" width="3" height="68" rx="1.5" fill="#087F78"/>
+<text x="48" y="252" font-size="19" font-weight="700" fill="#182432" text-anchor="start">해시 확인·승인</text>
+<text x="48" y="278" font-size="16" font-weight="400" fill="#182432" text-anchor="start">같은 계획 확인 후 승인</text>
+<path d="M270 269 L295 269" fill="none" stroke="#708395" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="300" y="223" width="235" height="92" rx="10" fill="#F2F6FA" stroke="#D8E1E9"/>
+<rect x="300" y="235" width="3" height="68" rx="1.5" fill="#087F78"/>
+<text x="318" y="252" font-size="19" font-weight="700" fill="#182432" text-anchor="start">Claude 구현</text>
+<text x="318" y="278" font-size="16" font-weight="400" fill="#182432" text-anchor="start">승인 범위에서 코드 작성</text>
+<path d="M540 269 L565 269" fill="none" stroke="#708395" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="570" y="223" width="235" height="92" rx="10" fill="#F2F6FA" stroke="#D8E1E9"/>
+<rect x="570" y="235" width="3" height="68" rx="1.5" fill="#087F78"/>
+<text x="588" y="252" font-size="19" font-weight="700" fill="#182432" text-anchor="start">Codex 코드 리뷰</text>
+<text x="588" y="278" font-size="16" font-weight="400" fill="#182432" text-anchor="start">필요한 수정·최종 재검토</text>
+<path d="M810 269 L835 269" fill="none" stroke="#708395" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="840" y="223" width="235" height="92" rx="10" fill="#F2F6FA" stroke="#D8E1E9"/>
+<rect x="840" y="235" width="3" height="68" rx="1.5" fill="#087F78"/>
+<text x="858" y="252" font-size="19" font-weight="700" fill="#182432" text-anchor="start">커밋·push</text>
+<text x="858" y="278" font-size="16" font-weight="400" fill="#182432" text-anchor="start">각각 승인 후 결과 대조</text>
+<rect x="30" y="345" width="1045" height="38" rx="8" fill="#F2F6FA"/>
+<text x="48" y="370" font-size="15" font-weight="400" fill="#182432" text-anchor="start">결정·증거·실패로 멈추면 현재 조건을 확인해 재개합니다. 개정·수정은 정해진 횟수와 조건 안에서 진행합니다.</text>
+</svg>

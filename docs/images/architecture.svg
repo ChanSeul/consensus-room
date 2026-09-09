@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="650" viewBox="0 0 1000 650" role="img" aria-labelledby="title desc">
+<title id="title">Consensus Room 시스템 구조</title><desc id="desc">React UI와 별도 Claude 중재 세션이 API를 호출합니다. 서버는 공통 실행, 계획, 전달 처리를 나누고 CLI 어댑터, SQLite 및 파일, Git worktree를 사용합니다.</desc>
+<style>text{font-family:-apple-system, BlinkMacSystemFont, 'Noto Sans KR', 'Apple SD Gothic Neo', sans-serif;fill:#182432} .small{fill:#576879}</style>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" fill="#708395"/></marker></defs>
+<rect width="1000" height="650" rx="16" fill="#fff"/>
+<text x="36" y="40" font-size="23" font-weight="700" fill="#182432" text-anchor="start">화면·중재 세션 → 서버 → 모델 실행·저장·Git</text>
+<rect x="36" y="72" width="440" height="98" rx="10" fill="#F2F6FA" stroke="#D8E1E9"/>
+<rect x="36" y="84" width="3" height="74" rx="1.5" fill="#2459A6"/>
+<text x="54" y="101" font-size="19" font-weight="700" fill="#182432" text-anchor="start">React UI</text>
+<text x="54" y="127" font-size="16" font-weight="400" fill="#182432" text-anchor="start">주제·계획·쟁점·결정 표시 / 위임 설정</text>
+<rect x="524" y="72" width="440" height="98" rx="10" fill="#F2F6FA" stroke="#D8E1E9"/>
+<rect x="524" y="84" width="3" height="74" rx="1.5" fill="#087F78"/>
+<text x="542" y="101" font-size="19" font-weight="700" fill="#182432" text-anchor="start">Claude 중재 세션</text>
+<text x="542" y="127" font-size="16" font-weight="400" fill="#182432" text-anchor="start">준비·검증·결정 전달·복구·유지보수</text>
+<path d="M256 176 L256 221" fill="none" stroke="#708395" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M744 176 L744 221" fill="none" stroke="#708395" stroke-width="1.6" marker-end="url(#arrow)"/>
+<text x="271" y="202" font-size="14" font-weight="400" fill="#182432" text-anchor="start">HTTP · SSE</text>
+<text x="759" y="202" font-size="14" font-weight="400" fill="#182432" text-anchor="start">HTTP API</text>
+<rect x="36" y="230" width="928" height="142" rx="10" fill="#F2F6FA" stroke="#D8E1E9"/>
+<rect x="36" y="242" width="3" height="118" rx="1.5" fill="#2459A6"/>
+<text x="54" y="259" font-size="19" font-weight="700" fill="#182432" text-anchor="start">Fastify API · WorkflowEngine</text>
+<text x="54" y="285" font-size="16" font-weight="400" fill="#182432" text-anchor="start">인증·요청 처리 · 상태와 승인 검사 · 다음 단계 실행</text>
+<rect x="57" y="307" width="270" height="43" rx="7" fill="#fff" stroke="#D8E1E9"/>
+<text x="192" y="334" font-size="17" font-weight="700" fill="#182432" text-anchor="middle">EngineCore</text>
+<rect x="366" y="307" width="270" height="43" rx="7" fill="#fff" stroke="#D8E1E9"/>
+<text x="501" y="334" font-size="17" font-weight="700" fill="#182432" text-anchor="middle">PlanningPipeline</text>
+<rect x="675" y="307" width="270" height="43" rx="7" fill="#fff" stroke="#D8E1E9"/>
+<text x="810" y="334" font-size="17" font-weight="700" fill="#182432" text-anchor="middle">DeliveryPipeline</text>
+<path d="M181 378 L181 424" fill="none" stroke="#708395" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M499 378 L499 424" fill="none" stroke="#708395" stroke-width="1.6" marker-end="url(#arrow)"/>
+<path d="M818 378 L818 424" fill="none" stroke="#708395" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="36" y="432" width="290" height="110" rx="10" fill="#F2F6FA" stroke="#D8E1E9"/>
+<rect x="36" y="444" width="3" height="86" rx="1.5" fill="#2459A6"/>
+<text x="54" y="461" font-size="19" font-weight="700" fill="#182432" text-anchor="start">CLI 어댑터</text>
+<text x="54" y="487" font-size="16" font-weight="400" fill="#182432" text-anchor="start">Claude: 계획·구현·수정</text>
+<text x="54" y="511" font-size="16" font-weight="400" fill="#182432" text-anchor="start">Codex: 감사·코드 리뷰</text>
+<rect x="354" y="432" width="290" height="110" rx="10" fill="#F2F6FA" stroke="#D8E1E9"/>
+<rect x="354" y="444" width="3" height="86" rx="1.5" fill="#2459A6"/>
+<text x="372" y="461" font-size="19" font-weight="700" fill="#182432" text-anchor="start">SQLite · 산출물 파일</text>
+<text x="372" y="487" font-size="16" font-weight="400" fill="#182432" text-anchor="start">상태·이벤트·실행 기록</text>
+<text x="372" y="511" font-size="16" font-weight="400" fill="#182432" text-anchor="start">계획·리뷰 본문과 SHA-256</text>
+<rect x="672" y="432" width="292" height="110" rx="10" fill="#F2F6FA" stroke="#D8E1E9"/>
+<rect x="672" y="444" width="3" height="86" rx="1.5" fill="#2459A6"/>
+<text x="690" y="461" font-size="19" font-weight="700" fill="#182432" text-anchor="start">Git worktree</text>
+<text x="690" y="487" font-size="16" font-weight="400" fill="#182432" text-anchor="start">주제별 작업 폴더</text>
+<text x="690" y="511" font-size="16" font-weight="400" fill="#182432" text-anchor="start">리뷰본·커밋·원격 OID</text>
+<rect x="36" y="579" width="928" height="44" rx="8" fill="#EAF5F1"/>
+<text x="54" y="607" font-size="16" font-weight="400" fill="#182432" text-anchor="start">서버는 처리 규칙을 검사하고, 기술적 판단은 검토 결과와 실행 근거로 확인합니다.</text>
+</svg>
