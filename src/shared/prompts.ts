@@ -159,6 +159,7 @@ export function buildCodexAuditPrompt(input: {
   planSHA256: string;
   scopeGeneration: number;
   timeline: readonly TimelineEvent[];
+  planningContextMode?: "full" | "delta";
   claudePlan?: AgentResult;
   deferredFindings?: readonly DeferredFinding[];
 }): string {
@@ -176,8 +177,8 @@ ${input.planMarkdown}
 Claude가 계획과 함께 기록한 쟁점:
 ${JSON.stringify(input.claudePlan?.findings ?? [], null, 2)}
 
-대화와 증거:
-${renderTimeline(input.timeline)}
+${input.planningContextMode === "delta" ? "직전 전달 이후 추가된 결정과 증거:" : "대화와 증거:"}
+${renderTimeline(input.timeline, false, input.planningContextMode === "delta" ? "(직전 전달 이후 새 결정·증거 없음)" : undefined)}
 ${renderDeferredFindings(input.deferredFindings, "audit")}
 ${outputLanguageContract({ planBody: false })}
 ${dispositionContract("AUDIT")}
@@ -235,6 +236,7 @@ export function buildCodexCloseoutPrompt(input: {
   claudeRevision: AgentResult;
   // 종결 재시도 때 새로 올라온 결정·증거가 이 프롬프트에 실리지 않으면 재시도의 의미가 없다(감사 ⑨).
   timeline: readonly TimelineEvent[];
+  planningContextMode?: "full" | "delta";
   // 개정 2회차 뒤의 종결 확인이면 true — 새 ID 를 또 내면 처음부터 다시 돌게 되므로 정말 새 결함일 때만.
   secondRound?: boolean;
 }): string {
@@ -249,8 +251,8 @@ ${input.revisedPlan}
 Claude의 처분:
 ${JSON.stringify(input.claudeRevision.findings, null, 2)}
 
-방에 추가된 결정과 증거:
-${renderTimeline(input.timeline)}
+${input.planningContextMode === "delta" ? "직전 전달 이후 추가된 결정과 증거:" : "방에 추가된 결정과 증거:"}
+${renderTimeline(input.timeline, false, input.planningContextMode === "delta" ? "(직전 전달 이후 새 결정·증거 없음)" : undefined)}
 
 이미 같은 증거로 끝난 논점을 다시 열지 마세요. 재개할 수 있는 조건은 변경된 리비전, 새 실행 증거, 새로 읽은 1차 자료,
 서로 다른 새 결함, 사용자의 명시적 재개뿐입니다. 각 finding의 최종 disposition을 확인하세요.

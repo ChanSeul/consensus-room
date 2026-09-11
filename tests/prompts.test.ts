@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { AgentResult, Finding, TimelineEvent } from "../src/shared/contracts";
-import { buildClaudeFixPrompt, buildCodexReviewPrompt, buildImplementationPrompt } from "../src/shared/prompts";
+import { buildCodexAuditPrompt, buildCodexCloseoutPrompt, buildClaudeFixPrompt, buildCodexReviewPrompt, buildImplementationPrompt } from "../src/shared/prompts";
 
 const implementation: AgentResult = { kind: "IMPLEMENTATION", summary: "구현을 마쳤습니다.", findings: [], evidenceRefs: [] };
 const finding: Finding = {
@@ -145,4 +145,22 @@ describe("최종 리뷰 변경분 확인", () => {
     });
     expect(prompt).toContain("현재 diff와 테스트 증거를 직접 확인");
   });
+});
+
+// 전달 범위는 계획 변경분 선택과 함께 바뀌어야 한다.
+it.each(["full", "delta"] as const)("계획 감사·종결의 %s 타임라인이 전달 범위를 설명한다", (planningContextMode) => {
+  const audit = buildCodexAuditPrompt({ title: "계획", planMarkdown, planSHA256, scopeGeneration: 1,
+    timeline: [], planningContextMode });
+  const closeout = buildCodexCloseoutPrompt({ revisedPlan: planMarkdown, revisedPlanSHA256: planSHA256,
+    claudeRevision: { ...implementation, kind: "REVISION" }, timeline: [], planningContextMode });
+  for (const prompt of [audit, closeout]) {
+    if (planningContextMode === "delta") {
+      expect(prompt).toContain("직전 전달 이후 추가된 결정과 증거:");
+      expect(prompt).toContain("직전 전달 이후 새 결정·증거 없음");
+      expect(prompt).not.toContain("아직 메시지가 없습니다");
+    } else {
+      expect(prompt).not.toContain("직전 전달 이후");
+      expect(prompt).toContain("아직 메시지가 없습니다");
+    }
+  }
 });

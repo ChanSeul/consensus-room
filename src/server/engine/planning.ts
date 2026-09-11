@@ -172,6 +172,7 @@ export class PlanningPipeline {
       title: topic.title, planMarkdown: context.text, planSHA256: storedFirstPlan.sha256,
       scopeGeneration: topic.scopeGeneration,
       timeline: context.timeline,
+      planningContextMode: context.mode,
       claudePlan,
       deferredFindings: await this.core.deferredFindingsFor(topicId),
     });
@@ -314,6 +315,7 @@ export class PlanningPipeline {
       revisedPlanSHA256: storedRevisedPlan.sha256,
       claudeRevision: revision,
       timeline: context.timeline,
+      planningContextMode: context.mode,
       secondRound,
     });
     const closeout = await this.core.turn("codex", topic, prompt, signal, false, {

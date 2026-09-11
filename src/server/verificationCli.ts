@@ -26,7 +26,7 @@ export async function runMediatorVerification(topicId: string, request: Request,
       const current = runs.find((run) => run.id === prepared.run.id);
       if (!current) throw new Error("대기 중인 검사 기록이 사라졌습니다.");
       if (current.status === "running") continue;
-      if (current.status !== "succeeded") return { reused: false, run: current };
+      if (current.status === "failed") return { reused: false, run: current };
       break;
     }
   }
@@ -41,6 +41,12 @@ export async function runMediatorVerification(topicId: string, request: Request,
   const run = await request<VerificationRun>(`${base}/${prepared.run.id}/complete`, completion, prepared.run.id);
   await unlink(path);
   return { reused: false, run };
+}
+
+function reportExpiredLease(run: VerificationRun): void {
+  if (run.status === "timed_out" && !run.completionSHA256) {
+    process.stderr.write("검사 실행의 90초 리스가 만료되어 완료 결과를 등록하지 않았습니다. --topic으로 새 검사를 시작하세요.\n");
+  }
 }
 
 async function wait(ms: number, signal?: AbortSignal): Promise<void> {
@@ -119,6 +125,7 @@ async function main() {
     // HTTP 실패 원장은 같은 키를 재실행하지 않는다. 실행 ID와 본문은 유지하고 등록 요청 키만 새로 만든다.
     const run = await request<VerificationRun>(`/api/topics/${encodeURIComponent(saved.topicId)}/verifications/${runId}/complete`, saved.completion, randomUUID());
     await unlink(path);
+    reportExpiredLease(run);
     process.stdout.write(`${JSON.stringify({ runId, status: run.status })}\n`);
     process.exitCode = run.status === "succeeded" ? 0 : 1;
     return;
@@ -130,6 +137,7 @@ async function main() {
   process.on("SIGTERM", cancel);
   try {
     const result = await runMediatorVerification(values.topic, request, pending, controller.signal);
+    reportExpiredLease(result.run);
     process.stdout.write(`${JSON.stringify({ runId: result.run.id, status: result.run.status, reused: result.reused, durationMs: result.run.durationMs })}\n`);
     process.exitCode = result.run.status === "succeeded" ? 0 : 1;
   } finally {

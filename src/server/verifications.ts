@@ -117,6 +117,8 @@ export class VerificationService {
       const run = this.list(topicId).find((entry) => entry.id === runId);
       if (!run) throw new Error("검사 실행 기록을 찾을 수 없습니다.");
       if (run.status !== "running") {
+        // 서버가 리스를 회수한 실행에는 등록된 완료 본문이 없다. 만료 상태만 돌려주고 결과는 쓰지 않는다.
+        if (run.status === "timed_out" && !run.completionSHA256) return run;
         if (run.completionSHA256 === completionSHA256) return run;
         throw new Error("이미 종료된 검사에 다른 결과를 등록할 수 없습니다.");
       }

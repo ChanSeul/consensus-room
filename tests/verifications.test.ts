@@ -3,7 +3,7 @@ import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeF
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ArtifactStore } from "../src/server/artifacts";
 import { buildApp } from "../src/server/app";
 import { loadConfig } from "../src/server/config";
@@ -11,7 +11,7 @@ import { ConsensusDatabase } from "../src/server/database";
 import { runMediatorVerification } from "../src/server/verificationCli";
 import { executeVerification } from "../src/server/verificationRunner";
 import { collectStaticInputs, inputSHA, STATIC_PROFILE_ID, STATIC_SCRIPT, STATIC_SCRIPT_SHA256, toolSHA } from "../src/server/verificationInputs";
-import { VerificationService, type VerificationCompletion } from "../src/server/verifications";
+import { VerificationService, type VerificationCompletion, type PreparedVerification, type VerificationRun } from "../src/server/verifications";
 
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
@@ -113,7 +113,33 @@ describe("정적 검사 실행 기록", () => {
     const third = await f.service.prepare("topic-1");
     expect(third.disposition).toBe("run");
     expect(third.run.id).not.toBe(second.run.id);
-    await expect(f.service.complete("topic-1", second.run.id, success)).rejects.toThrow("이미 종료");
+    const expired = f.service.list("topic-1").find((run) => run.id === second.run.id)!;
+    expect(await f.service.complete("topic-1", second.run.id, success)).toEqual(expired);
+    expect(f.database.latestArtifact("topic-1", `verification-log-${second.run.id}`)).toBeNull();
+  });
+
+  it.each(["cancelled", "timed_out", "stale", "failed"] as const)("busy 실행의 %s 종료 뒤 판정이 없으면 다시 prepare한다", async (status) => {
+    const f = await fixture();
+    const first = await f.service.prepare("topic-1");
+    const terminal = { ...first.run, status };
+    const next = { ...first.run, id: "replacement", status: "succeeded" as const };
+    let prepares = 0;
+    const request = async <T>(path: string): Promise<T> => {
+      if (path.endsWith("/prepare")) {
+        prepares += 1;
+        return (prepares === 1 ? { disposition: "busy", run: first.run }
+          : { disposition: "reused", run: next }) as PreparedVerification as T;
+      }
+      return [terminal] as VerificationRun[] as T;
+    };
+    vi.useFakeTimers();
+    try {
+      const pending = runMediatorVerification("topic-1", request, join(f.data, "pending"));
+      await vi.advanceTimersByTimeAsync(300);
+      const result = await pending;
+      expect(result.run.id).toBe(status === "failed" ? first.run.id : next.id);
+      expect(prepares).toBe(status === "failed" ? 1 : 2);
+    } finally { vi.useRealTimers(); }
   });
 
   it("입력 루트 누락·symlink·바뀐 검사기는 빈 검사 성공으로 처리하지 않는다", async () => {
@@ -203,6 +229,20 @@ describe("정적 검사 실행 기록", () => {
     const pendingRun = f.service.list("topic-1")[0];
     expect(pendingRun.status).toBe("running");
     expect(JSON.parse((await cli("--complete", pendingRun.id)).stdout)).toMatchObject({ runId: pendingRun.id, status: "succeeded" });
+    // 완료 등록 전에 서버가 리스를 회수한 경우: 실제 CLI는 만료를 알리고 pending을 지운다.
+    await writeFile(join(f.worktree, "Modules/Feature.swift"), "// expired input\n");
+    const expired = await f.service.prepare("topic-1");
+    await writeFile(join(pending, `${expired.run.id}.json`), JSON.stringify({
+      topicId: "topic-1", runId: expired.run.id, completion: success,
+    }));
+    f.advance(90_001);
+    await f.service.recoverExpired("topic-1");
+    await expect(cli("--complete", expired.run.id)).rejects.toMatchObject({
+      code: 1, stdout: expect.stringContaining('"status":"timed_out"'),
+      stderr: expect.stringContaining("리스가 만료"),
+    });
+    await expect(readFile(join(pending, `${expired.run.id}.json`))).rejects.toThrow();
+    expect(f.service.list("topic-1").find((entry) => entry.id === expired.run.id)?.status).toBe("timed_out");
     await rm(join(f.data, "verification-profiles", `${STATIC_PROFILE_ID}.json`));
     await cli("--install-profile", "--python", python);
     expect(JSON.parse((await cli("--topic", "topic-1")).stdout)).toMatchObject({ status: "succeeded", reused: false });
