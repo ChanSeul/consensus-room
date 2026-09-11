@@ -25,6 +25,7 @@ import { UsageLimitRetryScheduler, type RetryClock } from "./engine/usageLimitRe
 export interface WorkflowDependencies {
   database: ConsensusDatabase;
   artifacts: ArtifactStore;
+  verifications?: { receipts(topicId: string): Promise<{ text: string; readablePaths: string[] }> };
   git: GitService;
   claude: AgentAdapter;
   codex: AgentAdapter;

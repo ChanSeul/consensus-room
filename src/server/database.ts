@@ -53,8 +53,27 @@ export class ConsensusDatabase {
     this.db.close();
   }
 
+  verificationRecords(topicId: string): unknown[] {
+    return this.db.prepare("SELECT record_json FROM verification_runs WHERE topic_id = ? ORDER BY rowid DESC")
+      .all(topicId).map((row) => JSON.parse(String(row.record_json)));
+  }
+
+  saveVerification<T extends { id: string; topicId: string; cacheKey: string; status: string }>(record: T): void {
+    this.db.prepare(`INSERT INTO verification_runs(id, topic_id, cache_key, status, record_json) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET status = excluded.status, record_json = excluded.record_json`)
+      .run(record.id, record.topicId, record.cacheKey, record.status, JSON.stringify(record));
+  }
+
   private migrate(): void {
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS verification_runs (
+        id TEXT PRIMARY KEY,
+        topic_id TEXT NOT NULL REFERENCES topics(id),
+        cache_key TEXT NOT NULL,
+        status TEXT NOT NULL,
+        record_json TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS verification_single_flight ON verification_runs(cache_key) WHERE status = 'running';
       CREATE TABLE IF NOT EXISTS topics (
         id TEXT PRIMARY KEY,
         slug TEXT NOT NULL,
@@ -676,11 +695,11 @@ export class ConsensusDatabase {
   getPromptTimeline(topicId: string, scopeGeneration: number, afterSequence = 0): TimelineEvent[] {
     const rows = this.db.prepare(`
       SELECT * FROM timeline_events
-      WHERE topic_id = ? AND scope_generation = ? AND sequence > ? AND json_extract(payload_json, '$.usage') IS NULL AND (
+      WHERE topic_id = ? AND scope_generation = ? AND sequence > ? AND json_extract(payload_json, '$.usage') IS NULL AND json_extract(payload_json, '$.promptMetrics') IS NULL AND json_extract(payload_json, '$.verificationMetrics') IS NULL AND (
         kind IN ('scope_change', 'evidence', 'decision')
         OR sequence IN (
           SELECT sequence FROM timeline_events
-          WHERE topic_id = ? AND scope_generation = ? AND json_extract(payload_json, '$.usage') IS NULL
+          WHERE topic_id = ? AND scope_generation = ? AND json_extract(payload_json, '$.usage') IS NULL AND json_extract(payload_json, '$.promptMetrics') IS NULL AND json_extract(payload_json, '$.verificationMetrics') IS NULL
           ORDER BY sequence DESC LIMIT 80
         )
       )

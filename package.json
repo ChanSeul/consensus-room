@@ -14,7 +14,8 @@
     "build": "npm run typecheck && npm run build:web",
     "test": "vitest run",
     "test:watch": "vitest",
-    "check": "npm run test && npm run build"
+    "check": "npm run test && npm run build",
+    "verify:static": "tsx src/server/verificationCli.ts"
   },
   "dependencies": {
     "@fastify/cookie": "^11.0.2",

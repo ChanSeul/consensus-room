@@ -116,6 +116,15 @@ export class GitService {
     return (await this.run(worktreePath, ["rev-parse", "HEAD"])).stdout.trim();
   }
 
+  async diffPlanFiles(cwd: string, previous: string, current: string): Promise<string> {
+    const result = await this.runner.run({
+      command: "git", args: ["diff", "--no-index", "--no-ext-diff", "--no-textconv", "--no-color", "--", previous, current],
+      cwd, maxOutputBytes: 64 * 1024 * 1024,
+    });
+    if (result.exitCode !== 0 && result.exitCode !== 1) throw new Error("계획 변경분을 계산하지 못했습니다.");
+    return result.stdout;
+  }
+
   async snapshot(worktreePath: string, baseRef?: string): Promise<{ head: string; diffSHA256: string }> {
     const head = await this.head(worktreePath);
     const base = baseRef

@@ -368,6 +368,7 @@ export function buildCodexReviewPrompt(input: {
   resumedSession?: boolean;
   planningFindings?: readonly Finding[];
   planningEvidenceRefs?: readonly string[];
+  verificationReceipts?: string;
   // 최종 리뷰: 직전 리뷰 이후 실제로 바뀐 파일과 패치(2026-09-07 Codex 피드백 ①). 있으면 재검토 범위를 이것으로 좁힌다.
   deltaSinceLastReview?: { files: readonly string[]; patch: string } | null;
   // 서버의 허용 오차 대조 결과(규칙·원장·판정). 있으면 범위 밖 변경은 이것으로 판정한다.
@@ -375,11 +376,12 @@ export function buildCodexReviewPrompt(input: {
   // 계획 원문 파일(읽기 허용). 재개 세션이 압축됐을 때 본문 대신 읽을 수 있다.
   planPath?: string | null;
 }): string {
-  const delta = input.deltaSinceLastReview
-    ? `\n직전 리뷰 이후 실제 변경분(파일 ${input.deltaSinceLastReview.files.length}개):\n${input.deltaSinceLastReview.files.map((file) => `- ${file}`).join("\n")}\n---\n${
-      input.deltaSinceLastReview.patch.length > 200_000
-        ? `${input.deltaSinceLastReview.patch.slice(0, 200_000)}\n[이하 생략: 패치가 200,000자를 넘습니다 — 나머지는 파일 목록으로 직접 확인]`
-        : input.deltaSinceLastReview.patch}\n---\n**재검토 범위**: 위 변경분과 그 변경이 영향을 주는 호출부·상태 전이만 다시 봅니다. 바뀌지 않은 부분은 앞선 리뷰 결과를 이어받고 전체를 다시 탐색하지 마세요.\n`
+  const knownDelta = input.finalPass && input.resumedSession ? input.deltaSinceLastReview : null;
+  const delta = knownDelta
+    ? `\n직전 리뷰 이후 실제 변경분(파일 ${knownDelta.files.length}개):\n${knownDelta.files.map((file) => `- ${file}`).join("\n")}\n---\n${
+      knownDelta.patch.length > 200_000
+        ? `${knownDelta.patch.slice(0, 200_000)}\n[이하 생략: 패치가 200,000자를 넘습니다 — 나머지는 파일 목록으로 직접 확인]`
+        : knownDelta.patch}\n---\n**재검토 범위**: 위 변경분과 그 변경이 영향을 주는 호출부·상태 전이만 다시 봅니다. 바뀌지 않은 부분은 앞선 리뷰 결과를 이어받고 전체를 다시 탐색하지 마세요.\n`
     : "";
   const plan = input.resumedSession
     ? `승인된 계획 SHA-256: ${input.planSHA256}
@@ -406,11 +408,13 @@ ${input.planningFindings ? `계획 검토의 최종 처분과 근거(계획상 �
 Claude 구현 보고:
 ${JSON.stringify(input.implementation, null, 2)}
 
+${input.verificationReceipts ?? ""}
+
 ${originalFindings}${delta}${input.tolerance ? `\n허용 오차 대조(서버가 git diff 로 판정한 결과 — 승인 범위 밖 변경은 이 결과와 원장으로 판정하세요; 원장에 있고 술어를 만족하는 hunk 는 범위 이탈이 아닙니다):\n${input.tolerance}\n` : ""}
 ${input.resumedSession ? "이 리뷰 세션의 직전 턴 이후 방에 추가된 사용자 결정과 증거(그 전 것은 이 세션이 이미 받았습니다):" : "방에 추가된 사용자 결정과 증거:"}
 ${renderTimeline(input.timeline, true, input.resumedSession ? "(직전 리뷰 턴 이후 새 결정·증거 없음)" : undefined)}
 
-${input.deltaSinceLastReview
+${knownDelta
     ? "finding 별 수정 근거(원인 → 고친 위치 → 실행한 검증 → 미확인 부분)를 실제 코드와 대조해 판정하세요. 같은 코드·의존성·실행 조건에서 이미 통과한 검사는 결과를 재사용하고, 이번 수정이 영향을 준 검사만 다시 요구하세요."
     : "현재 diff와 테스트 증거를 직접 확인하고 정확성, 보안, 취소·복구, 범위 이탈, 테스트 공백을 검토하세요."}
 ${input.finalPass ? finalReviewContract() : "수정이 필요한 finding은 AGREED_ACTION으로 표시하세요."}

@@ -20,6 +20,7 @@ import {
   normalizePlan,
   redactSecrets, replanDirective } from "../../shared/workflow.js";
 import type { EngineCore } from "./core.js";
+import { preparePlanningContext } from "./planningContext.js";
 
 export class PlanningPipeline {
   constructor(private readonly core: EngineCore) {}
@@ -166,21 +167,26 @@ export class PlanningPipeline {
     signal: AbortSignal,
   ): Promise<void> {
     let topic = this.core.transition(topicId, "CODEX_AUDIT", "Codex가 계획을 읽기 전용으로 감사합니다.");
-    const audit = await this.core.turn("codex", topic, buildCodexAuditPrompt({
-      title: topic.title, planMarkdown: storedFirstPlan.markdown, planSHA256: storedFirstPlan.sha256,
+    const context = await preparePlanningContext(this.core, topic, storedFirstPlan.markdown, storedFirstPlan.sha256);
+    const prompt = buildCodexAuditPrompt({
+      title: topic.title, planMarkdown: context.text, planSHA256: storedFirstPlan.sha256,
       scopeGeneration: topic.scopeGeneration,
-      timeline: this.core.dependencies.database.getPromptTimeline(topicId, topic.scopeGeneration),
+      timeline: context.timeline,
       claudePlan,
       deferredFindings: await this.core.deferredFindingsFor(topicId),
-    }), signal, false, {
+    });
+    const audit = await this.core.turn("codex", topic, prompt, signal, false, {
+      readablePaths: context.readablePaths,
       check: (r) => {
         this.core.assertKind(r, "AUDIT");
         assertFindingCoverage(claudePlan.findings, r.findings, "Codex audit");
       },
     });
     await this.core.saveAgentOutput(topic, "codex", audit, "audit", signal);
+    if (this.core.interruptForNewUserInput(topic, context.inputSequence)) return;
+    await context.accept(signal, prompt);
+    if (this.core.interruptForNewUserInput(topic, context.inputSequence)) return;
     if (this.core.pauseForResult(topicId, audit, "CODEX_AUDIT", "계획 검토에 사용자 결정이나 외부 증거가 필요합니다.")) return;
-    if (this.core.interruptForLatestTurnInput(topic)) return;
 
     await this.runPlanningFromRevision(topicId, audit, storedFirstPlan, signal);
   }
@@ -302,20 +308,25 @@ export class PlanningPipeline {
     let topic = this.core.transition(topicId, "CODEX_CLOSEOUT", secondRound
       ? "Codex가 개정 2회차 결과로 의견 수렴을 종료할 수 있는지 확인합니다."
       : "Codex가 의견 수렴을 종료할 수 있는지 확인합니다.");
-    const closeout = await this.core.turn("codex", topic, buildCodexCloseoutPrompt({
-      revisedPlan: storedRevisedPlan.markdown,
+    const context = await preparePlanningContext(this.core, topic, storedRevisedPlan.markdown, storedRevisedPlan.sha256);
+    const prompt = buildCodexCloseoutPrompt({
+      revisedPlan: context.text,
       revisedPlanSHA256: storedRevisedPlan.sha256,
       claudeRevision: revision,
-      timeline: this.core.dependencies.database.getPromptTimeline(topicId, topic.scopeGeneration),
+      timeline: context.timeline,
       secondRound,
-    }), signal, false, {
+    });
+    const closeout = await this.core.turn("codex", topic, prompt, signal, false, {
+      readablePaths: context.readablePaths,
       check: (r) => {
         this.core.assertKind(r, "CLOSEOUT");
         assertFindingCoverage(revision.findings, r.findings, "Codex closeout");
       },
     });
     await this.core.saveAgentOutput(topic, "codex", closeout, "closeout", signal);
-    if (this.core.interruptForLatestTurnInput(topic)) return;
+    if (this.core.interruptForNewUserInput(topic, context.inputSequence)) return;
+    if (closeout.planSHA256 === storedRevisedPlan.sha256) await context.accept(signal, prompt);
+    if (this.core.interruptForNewUserInput(topic, context.inputSequence)) return;
     // 새 쟁점은 발견 시점이 아니라 Codex 의 처분으로 분류한다(2026-09-07 Codex 피드백): 범위 밖(DEFERRED_OUT_OF_SCOPE·
     // AGREED_NO_ACTION)은 후속 목록에 기록만 하고 진행, 필수 쟁점은 개정 2회차(바퀴당 1회) → 그 뒤에도 남으면 최신 계획을
     // 보존한 채 사용자 결정 뒤 그 쟁점만 추가 개정. 처음부터 다시 도는 것은 결정에 REPLAN 을 적은 경우뿐이다.

@@ -343,7 +343,7 @@ export class EngineCore {
 
   resetToDraft(topic: Topic, message: string): void {
     this.dependencies.database.updateTopic(topic.id, {
-      state: "DRAFT", planRevision: 0,
+      state: "DRAFT", planRevision: 0, planEpoch: topic.planEpoch + 1,
       planSHA256: null, approvedPlanSHA256: null, lastError: null,
       fixPassUsed: false, closeoutRevisionUsed: false, resumeState: null,
     });
@@ -475,6 +475,7 @@ export class EngineCore {
     revision: number,
     content: string,
     signal: AbortSignal,
+    accept?: () => boolean,
   ) {
     return this.dependencies.artifacts.write(topic.id, kind, revision, content, {
       scopeGeneration: topic.scopeGeneration,
@@ -483,7 +484,7 @@ export class EngineCore {
         const active = this.active.get(topic.id);
         const current = this.dependencies.database.getTopic(topic.id);
         return active?.controller.signal === signal &&
-          current.scopeGeneration === topic.scopeGeneration && current.state === topic.state;
+          current.scopeGeneration === topic.scopeGeneration && current.state === topic.state && (accept?.() ?? true);
       },
     });
   }

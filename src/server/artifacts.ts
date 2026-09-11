@@ -85,6 +85,11 @@ export class ArtifactStore {
     return artifact ? readVerified(artifact) : null;
   }
 
+  async verifiedRevision(topicId: string, kind: string, sha256: string): Promise<{ path: string; content: string } | null> {
+    const artifact = this.database.artifactsForScope(topicId, kind).find((entry) => entry.sha256 === sha256);
+    return artifact ? { path: artifact.path, content: await readVerified(artifact) } : null;
+  }
+
   async clearCurrentAliases(topicId: string): Promise<void> {
     const topicDirectory = join(this.topicsDirectory, topicId);
     await Promise.all(Object.values(PUBLIC_NAMES).map((name) =>

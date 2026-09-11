@@ -29,6 +29,7 @@ import { ProcessSupervisor } from "./processSupervisor.js";
 import { ProjectMemoryStore } from "./memoryStore.js";
 import { readMediationAutonomy, writeMediationAutonomy } from "./mediationAutonomy.js";
 import { scanWorktreeActivity } from "./activity.js";
+import { VerificationService, completeVerificationSchema } from "./verifications.js";
 
 export interface AppDependencies {
   config?: ServerConfig;
@@ -48,12 +49,14 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   const database = dependencies.database ?? new ConsensusDatabase(config.databasePath);
   const artifacts = new ArtifactStore(config.topicsDirectory, database);
   const git = new GitService(dependencies.runner);
+  const verifications = new VerificationService(database, artifacts, config.dataDirectory);
   const workflow = new WorkflowEngine({
     database,
     artifacts,
     git,
     claude: dependencies.claude,
     codex: dependencies.codex,
+    verifications,
     memory: new ProjectMemoryStore(config.memoryDirectory),
   });
   // 시작 URL의 일회성 token이나 인증 헤더가 request log에 남지 않도록 HTTP request logging을 끈다.
@@ -86,6 +89,21 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     defaultAgentSettings: config.defaultAgentSettings,
   }));
   app.get("/api/topics", async () => database.listTopics());
+
+  app.get<{ Params: { id: string } }>("/api/topics/:id/verifications", async (request) => {
+    await verifications.recoverExpired(request.params.id);
+    return verifications.list(request.params.id);
+  });
+  app.post<{ Params: { id: string } }>("/api/topics/:id/verifications/prepare", async (request, reply) => {
+    if (JSON.stringify(request.body ?? {}) !== "{}") return reply.code(400).send({ error: "정적 검사 프로필은 호스트에서 등록합니다." });
+    return runIdempotent(request, reply, actionLedger(database, request.params.id, "verification:prepare"), 200,
+      () => verifications.prepare(request.params.id));
+  });
+  app.post<{ Params: { id: string; runId: string } }>("/api/topics/:id/verifications/:runId/complete", { bodyLimit: 3 * 1024 * 1024 }, async (request, reply) => {
+    const input = completeVerificationSchema.parse(request.body);
+    return runIdempotent(request, reply, actionLedger(database, request.params.id, `verification:complete:${request.params.runId}`), 200,
+      () => verifications.complete(request.params.id, request.params.runId, input), createHash("sha256").update(JSON.stringify(input)).digest("hex"));
+  });
 
   // 자율 중재 위임 스위치 — 웹 토글과 셸 스크립트가 같은 파일(`mediation-autonomy.json`)을 공유한다.
   app.get("/api/mediation-autonomy", async () => readMediationAutonomy(config.dataDirectory));
@@ -283,6 +301,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   // 실수로 띄우면 포트 바인드에서 먼저 죽어야지, 첫 서버의 정상 작업을 회수(=강제 종료)하고
   // 죽으면 안 된다(2026-08-31 Codex 지적: 부팅 회수가 bind보다 먼저라 소유권 없이 남의 작업을 죽임).
   app.addHook("onListen", async () => {
+    await verifications.recoverExpired();
     await new ProcessSupervisor().recover(database.runningActions());
     database.recoverInterruptedActions();
     database.recoverInterruptedNonDeliveryRequests();
@@ -343,6 +362,7 @@ async function runIdempotent(
   ledger: RequestLedger,
   successCode: number,
   work: (idempotencyKey: string) => Promise<unknown> | unknown,
+  requestFingerprint?: string,
 ): Promise<unknown> {
   const idempotencyKey = request.headers["idempotency-key"];
   if (typeof idempotencyKey !== "string" || !idempotencyKey.trim() || idempotencyKey.length > 200) {
@@ -351,6 +371,7 @@ async function runIdempotent(
   const requestRecord = request.body && typeof request.body === "object" && !Array.isArray(request.body)
     ? redactRecord(request.body as Record<string, unknown>)
     : {};
+  if (requestFingerprint) requestRecord._requestFingerprint = requestFingerprint;
   if (!ledger.claim(idempotencyKey, requestRecord)) {
     const existing = ledger.read(idempotencyKey);
     // 같은 키가 다른 본문으로 재사용되면 예전 응답을 재생하지 않는다(감사 부차 지적) — 클라이언트 버그가

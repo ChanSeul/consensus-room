@@ -3111,3 +3111,89 @@ describe("코드 리뷰 전용 세션", () => {
     database.close();
   });
 });
+
+describe("계획 전송 기록", () => {
+  it.each([true, false])("공개 계획 흐름에서 같은 계획은 크기에 따라 축소한다 (긴 계획: %s)", async (longPlan) => {
+    const plan = normalizePlan(validPlan(longPlan ? "PLAN-CONTENT\n".repeat(1000) : "짧은 계획"));
+    const sha = hashPlan(plan);
+    const { database, artifacts, engine, codex, claude } = makePlanningEngine({
+      slug: "planning-cursor",
+      claudeResults: [
+        { kind: "PLAN", summary: "계획", planMarkdown: plan, findings: [], evidenceRefs: [] },
+        { kind: "REVISION", summary: "변경 없음", planMarkdown: plan, findings: [], evidenceRefs: [] },
+        { kind: "ACK", summary: "확인", planSHA256: sha, findings: [], evidenceRefs: [] },
+      ],
+      codexResults: [
+        { kind: "AUDIT", summary: "검토", findings: [], evidenceRefs: [] },
+        { kind: "CLOSEOUT", summary: "확정", planSHA256: sha, findings: [], evidenceRefs: [] },
+        { kind: "ACK", summary: "확인", planSHA256: sha, findings: [], evidenceRefs: [] },
+      ],
+    });
+    await engine.postMessage("topic-1", "evidence", "OLD-EVIDENCE-MARKER");
+    const done = waitForTopicState(database, "topic-1", "AWAITING_USER_APPROVAL");
+    engine.startPlan("topic-1");
+    await done;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(codex.calls[0]).toContain(plan.trim());
+    expect(codex.calls[0]).toContain("OLD-EVIDENCE-MARKER");
+    if (longPlan) {
+      expect(codex.calls[1]).toContain("(계획 변경 없음)");
+      expect(codex.calls[1]).not.toContain("PLAN-CONTENT");
+      expect(codex.calls[1]).not.toContain("OLD-EVIDENCE-MARKER");
+    } else {
+      expect(codex.calls[1]).toContain(plan.trim());
+      expect(codex.calls[1]).toContain("OLD-EVIDENCE-MARKER");
+    }
+    const cursor = JSON.parse((await artifacts.readLatest("topic-1", "codex-planning-cursor"))!);
+    expect(cursor).toMatchObject({ sessionId: "codex-session", scopeGeneration: 1, planSHA256: sha });
+    const metrics = database.getTimeline("topic-1").filter((event) => event.payload.promptMetrics);
+    expect(metrics).toHaveLength(2);
+    expect(database.getPromptTimeline("topic-1", 1).every((event) => !event.payload.promptMetrics)).toBe(true);
+    expect(claude.turns[1]).not.toHaveProperty("sessionId");
+    database.close();
+  });
+});
+
+describe("계획 전송 기록 저장 중 새 결정", () => {
+  it.each(["before-commit", "after-commit"])("%s에 도착한 결정을 처리하기 전에는 ACK로 넘어가지 않는다", async (timing) => {
+    const plan = normalizePlan(validPlan("상세 계획\n".repeat(500)));
+    const sha = hashPlan(plan);
+    const closeout: AgentResult = { kind: "CLOSEOUT", summary: "종결", planSHA256: sha, findings: [], evidenceRefs: [] };
+    const { database, artifacts, engine, codex, claude } = makePlanningEngine({ slug: "cursor-input-race",
+      claudeResults: [
+        { kind: "PLAN", summary: "계획", planMarkdown: plan, findings: [], evidenceRefs: [] },
+        { kind: "REVISION", summary: "개정", planMarkdown: plan, findings: [], evidenceRefs: [] },
+        { kind: "REVISION", summary: "새 결정 반영", planMarkdown: plan, findings: [], evidenceRefs: [] },
+        { kind: "ACK", summary: "확인", planSHA256: sha, findings: [], evidenceRefs: [] },
+      ],
+      codexResults: [{ kind: "AUDIT", summary: "감사", findings: [], evidenceRefs: [] }, closeout, closeout,
+        { kind: "ACK", summary: "확인", planSHA256: sha, findings: [], evidenceRefs: [] }],
+    });
+    const write = artifacts.write.bind(artifacts);
+    let injected = false;
+    artifacts.write = async (...args: Parameters<ArtifactStore["write"]>) => {
+      if (args[1] !== "codex-planning-cursor" || database.getTopic("topic-1").state !== "CODEX_CLOSEOUT" || injected) return write(...args);
+      injected = true;
+      if (timing === "before-commit") await engine.postMessage("topic-1", "decision", "NEW-CURSOR-DECISION");
+      const result = await write(...args);
+      if (timing === "after-commit") await engine.postMessage("topic-1", "decision", "NEW-CURSOR-DECISION");
+      return result;
+    };
+    const stopped = waitForTopicState(database, "topic-1", "USER_DECISION_REQUIRED");
+    engine.startPlan("topic-1");
+    await stopped;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(codex.calls).toHaveLength(2);
+    expect(claude.calls).toHaveLength(2);
+    expect(database.artifactsForScope("topic-1", "codex-planning-cursor")).toHaveLength(timing === "before-commit" ? 1 : 2);
+    expect(database.getFlags("topic-1").resumeState).toBe("CODEX_CLOSEOUT");
+    const done = waitForTopicState(database, "topic-1", "AWAITING_USER_APPROVAL");
+    engine.retry("topic-1");
+    await done;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(claude.calls[2]).toContain("NEW-CURSOR-DECISION");
+    expect(codex.calls[2]).toContain("NEW-CURSOR-DECISION");
+    expect(codex.calls).toHaveLength(4);
+    database.close();
+  });
+});

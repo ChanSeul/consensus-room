@@ -174,11 +174,14 @@ export class DeliveryPipeline {
     const previousFlags = this.core.dependencies.database.getFlags(topicId);
     const reviewedTree = await this.core.dependencies.git.writeWorkingTree(topic.worktreePath, `${topicId.slice(0, 8)}-${finalPass ? "final" : "first"}`)
       .catch(() => null);
-    const deltaSinceLastReview = finalPass && previousFlags.reviewedTreeOID && reviewedTree && previousFlags.reviewedTreeOID !== reviewedTree
-      ? await this.core.dependencies.git.diffTrees(topic.worktreePath, previousFlags.reviewedTreeOID, reviewedTree).catch(() => null)
-      : null;
     const reviewSessionId = this.core.dependencies.database.getCodexReviewSession(topicId);
     const resumedSession = reviewSessionId !== null;
+    // 동일한 tree도 확인된 결과다. 세션이나 snapshot이 없으면 전체 리뷰로 돌아간다.
+    const deltaSinceLastReview = finalPass && resumedSession && previousFlags.reviewedTreeOID && reviewedTree
+      ? previousFlags.reviewedTreeOID === reviewedTree
+        ? { files: [], patch: "" }
+        : await this.core.dependencies.git.diffTrees(topic.worktreePath, previousFlags.reviewedTreeOID, reviewedTree).catch(() => null)
+      : null;
     // 재개 세션에는 직전 리뷰 턴 이후의 결정·증거만 싣는다(2026-09-08 Codex 제안 ⑥). 값은 턴이 돌아온 뒤에 적는다.
     const reviewInputSequence = this.core.latestSequence(topicId);
     const reviewSince = resumedSession ? (this.core.dependencies.database.getCodexReviewPromptSequence(topicId) ?? 0) : 0;
@@ -201,15 +204,16 @@ export class DeliveryPipeline {
         tolerance = `허용 오차 대조를 리뷰 시점에 다시 계산하지 못했습니다(${error instanceof Error ? error.message : String(error)}) — 구현 단계의 대조 이벤트와 원장으로 판정하세요.\n원장: ${ledger}\n규칙: ${rules}`;
       }
     }
+    const receipts = await this.core.dependencies.verifications?.receipts(topicId);
     const review = await this.core.turn("codex", topic, buildCodexReviewPrompt({
       planMarkdown: plan, planSHA256: topic.planSHA256!, implementation, finalPass, resumedSession, tolerance, planPath,
       timeline: this.reviewTimeline(topicId, topic.scopeGeneration, reviewSince),
       planningFindings: closeout?.planSHA256 === topic.planSHA256 ? closeout.findings : undefined,
       planningEvidenceRefs: closeout?.planSHA256 === topic.planSHA256 ? closeout.evidenceRefs : undefined,
       originalReviewFindings: originalReview?.findings,
-      deltaSinceLastReview,
+      deltaSinceLastReview, verificationReceipts: receipts?.text,
     }), signal, false, {
-      readablePaths: [planPath],
+      readablePaths: [planPath, ...(receipts?.readablePaths ?? [])],
       session: {
         id: reviewSessionId,
         persist: (sessionId) => {

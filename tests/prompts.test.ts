@@ -115,3 +115,34 @@ describe("이어지는 턴의 프롬프트 축소(구현·수정·리뷰)", () =
     expect(first).toContain("(아직 메시지가 없습니다.)");
   });
 });
+
+
+describe("최종 리뷰 변경분 확인", () => {
+  it("확인된 빈 변경분도 finding 판정을 유지하며 재검토 범위를 좁힌다", () => {
+    const prompt = buildCodexReviewPrompt({
+      planMarkdown, planSHA256, implementation, finalPass: true, timeline: [],
+      resumedSession: true, deltaSinceLastReview: { files: [], patch: "" }, originalReviewFindings: [finding],
+    });
+    expect(prompt).toContain("파일 0개");
+    expect(prompt).toContain("finding 별 수정 근거");
+    expect(prompt).toContain("F-1");
+    expect(prompt).toContain("반환 kind는 FINAL_REVIEW입니다.");
+  });
+
+  it.each([undefined, false])("이전 리뷰 세션이 없으면 빈 변경분으로 리뷰를 축소하지 않는다 (%s)", (resumedSession) => {
+    const prompt = buildCodexReviewPrompt({
+      planMarkdown, planSHA256, implementation, finalPass: true, timeline: [],
+      resumedSession, deltaSinceLastReview: { files: [], patch: "" },
+    });
+    expect(prompt).toContain("현재 diff와 테스트 증거를 직접 확인");
+    expect(prompt).not.toContain("재검토 범위");
+  });
+
+  it("변경분 조회에 실패하면 유효한 세션에서도 전체 검토한다", () => {
+    const prompt = buildCodexReviewPrompt({
+      planMarkdown, planSHA256, implementation, finalPass: true, timeline: [], resumedSession: true,
+      deltaSinceLastReview: null,
+    });
+    expect(prompt).toContain("현재 diff와 테스트 증거를 직접 확인");
+  });
+});

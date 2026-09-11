@@ -22,7 +22,7 @@ afterEach(() => {
 });
 
 describe("승인 뒤 구현부터 전달까지", () => {
-  it("Claude 한 번 구현·한 번 보완과 Codex 최종 리뷰 뒤에만 커밋과 push를 실행한다", async () => {
+  it.each([true, false])("Claude 구현·보완과 최종 리뷰 뒤에만 전달한다 (파일 수정: %s)", async (changeOnFix) => {
     const root = mkdtempSync(join(tmpdir(), "consensus-room-delivery-"));
     temporaryDirectories.push(root);
     const repository = join(root, "repository");
@@ -75,7 +75,7 @@ describe("승인 뒤 구현부터 전달까지", () => {
     });
     await artifacts.write(topicId, "plan", 2, `${plan.trim()}\n`);
 
-    const claude = new EditingClaude(worktree);
+    const claude = new EditingClaude(worktree, changeOnFix);
     const codex = new ReviewingCodex();
     const engine = new WorkflowEngine({ database, artifacts, git: gitService, claude, codex });
 
@@ -92,6 +92,7 @@ describe("승인 뒤 구현부터 전달까지", () => {
     expect(codex.prompts[0]).toContain("승인된 계획:\n---");
     expect(codex.prompts[0]).toContain(plan);
     expect(codex.prompts[1]).toContain("본문은 다시 싣지 않습니다");
+    expect(codex.prompts[1]).toContain(changeOnFix ? "직전 리뷰 이후 실제 변경분(파일 1개)" : "직전 리뷰 이후 실제 변경분(파일 0개)");
     expect(codex.sessions).toEqual(["codex-code-review", "codex-code-review"]);
     expect(reviewedTopic.participants.find((participant) => participant.role === "codex")?.sessionId).toBe("codex-review-session");
     expect(codex.prompts[1]).toContain("- F-1 [MEDIUM] 보완할 동작 → AGREED_ACTION");
@@ -115,7 +116,7 @@ describe("승인 뒤 구현부터 전달까지", () => {
     expect(database.getTimeline(topicId).some((event) => "usage" in event.payload)).toBe(false);
     expect(reviewedTopic.branchName).toBe(`consensus/delivery-flow-${topicId.slice(0, 8)}-g1`);
     expect(flags.fixPassUsed).toBe(true);
-    expect(readFileSync(join(worktree, "feature.txt"), "utf8")).toBe("보완 완료\n");
+    expect(readFileSync(join(worktree, "feature.txt"), "utf8")).toBe(changeOnFix ? "보완 완료\n" : "첫 구현\n");
     expect(await gitService.head(worktree)).toBe(baseline);
     expect(git(worktree, ["rev-list", "--count", `${baseline}..HEAD`])).toBe("0");
     const reviewedSnapshot = await gitService.snapshot(worktree);
@@ -327,7 +328,7 @@ class EditingClaude implements AgentAdapter {
   implementationTurns = 0;
   fixTurns = 0;
 
-  constructor(private readonly worktree: string) {}
+  constructor(private readonly worktree: string, private readonly changeOnFix = true) {}
 
   // 구현은 계획 세션 fork가 아니라 **새 세션**으로 시작한다(2026-09-02 — fork가 물려주던 50만 토큰대
   // 계획 이력이 구현 비용의 대부분이었다). 계획 세션을 만드는 경로가 아님은 implementation 플래그로 판별한다.
@@ -352,7 +353,7 @@ class EditingClaude implements AgentAdapter {
     this.fixTurns += 1;
     this.fixPrompts.push(turn.prompt);
     this.readablePaths.push(turn.readablePaths);
-    writeFileSync(join(this.worktree, "feature.txt"), "보완 완료\n");
+    if (this.changeOnFix) writeFileSync(join(this.worktree, "feature.txt"), "보완 완료\n");
     return result("FIX", "검토 지적을 보완했습니다.", [reviewFinding("RESOLVED_BY_FIX")]);
   }
 
