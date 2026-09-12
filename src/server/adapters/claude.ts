@@ -174,10 +174,15 @@ export class ClaudeAdapter implements AgentAdapter {
           CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
         }),
       });
+      notifyUsage(
+        turn.onUsage,
+        withModel(claudeTurnUsage(output.jsonLines), executionSettings.model),
+        startedAt,
+        toolTime.summary(),
+      );
       if (output.exitCode !== 0) {
         throw new Error(describeCommandFailure("Claude", output.exitCode, output.stderr, output.stdout));
       }
-      notifyUsage(turn.onUsage, withModel(claudeTurnUsage(output.jsonLines), executionSettings.model), startedAt, toolTime.summary());
       return parseAgentResult(output.jsonLines, output.stdout);
     } finally {
       await rm(actionTemp, { recursive: true, force: true });

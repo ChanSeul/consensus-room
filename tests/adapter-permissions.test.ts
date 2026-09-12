@@ -1312,6 +1312,33 @@ describe("프로토콜 확인 턴의 지시문 생략과 턴 사용량 통지", 
     expect(seen[0].costUSD).toBeUndefined();
   });
 
+  it("Codex: 종료 코드가 0이 아니어도 마지막 turn.completed 사용량은 onUsage 로 알린다", async () => {
+    const runner = new RecordingRunner({
+      exitCode: 1,
+      stdout: [
+        JSON.stringify({ type: "thread.started", thread_id: "thread-usage" }),
+        JSON.stringify({ type: "turn.completed", usage: { input_tokens: 320, cached_input_tokens: 90, output_tokens: 42 } }),
+        JSON.stringify({ type: "error", message: "timeout" }),
+      ].join("\n"),
+      stderr: "",
+      jsonLines: [
+        { type: "thread.started", thread_id: "thread-usage" },
+        { type: "turn.completed", usage: { input_tokens: 320, cached_input_tokens: 90, output_tokens: 42 } },
+        { type: "error", message: "timeout" },
+      ],
+    });
+    const { adapter } = codexAdapter(runner);
+    const seen: TurnUsage[] = [];
+
+    await expect(adapter.createSession({
+      prompt: "계획을 감사하세요.", cwd: "/tmp", onUsage: (usage) => seen.push(usage),
+    })).rejects.toThrow("Codex 실행 실패(1)");
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ inputTokens: 320, cachedInputTokens: 90, outputTokens: 42 });
+    expect(seen[0].durationMs).toBeGreaterThanOrEqual(0);
+  });
+
   it("Claude: result 이벤트의 usage·비용·턴 수를 onUsage 로 알리고 캐시 읽기·생성을 총 입력에 더한다", async () => {
     const runner = new RecordingRunner(successfulResult([{
       type: "result", subtype: "success", num_turns: 3, total_cost_usd: 0.1234,
@@ -1325,6 +1352,35 @@ describe("프로토콜 확인 턴의 지시문 생략과 턴 사용량 통지", 
 
     expect(seen).toHaveLength(1);
     expect(seen[0]).toMatchObject({ inputTokens: 1000, cachedInputTokens: 900, outputTokens: 40, costUSD: 0.1234, modelTurns: 3 });
+  });
+
+  it("Claude: 종료 코드가 0이 아니어도 result 이벤트의 사용량은 onUsage 로 알린다", async () => {
+    const runner = new RecordingRunner({
+      exitCode: 1,
+      stdout: JSON.stringify({
+        type: "result",
+        subtype: "error",
+        usage: { input_tokens: 3, cache_read_input_tokens: 1, cache_creation_input_tokens: 2, output_tokens: 1 },
+        structured_output: planResult,
+      }),
+      stderr: "",
+      jsonLines: [{
+        type: "result",
+        subtype: "error",
+        usage: { input_tokens: 3, cache_read_input_tokens: 1, cache_creation_input_tokens: 2, output_tokens: 1 },
+        structured_output: planResult,
+      }],
+    });
+    const adapter = new ClaudeAdapter(runner);
+    const seen: TurnUsage[] = [];
+
+    await expect(adapter.createSession({
+      prompt: "계획을 작성하세요.", cwd: "/tmp", onUsage: (usage) => seen.push(usage),
+    })).rejects.toThrow("Claude 실행 실패(1)");
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ inputTokens: 6, cachedInputTokens: 1, outputTokens: 1 });
+    expect(seen[0].durationMs).toBeGreaterThanOrEqual(0);
   });
 
   it("사용량 이벤트가 없으면 알리지 않고, 관찰자가 던져도 턴 결과는 돌아온다", async () => {

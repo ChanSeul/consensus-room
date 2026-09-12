@@ -230,10 +230,15 @@ export class CodexAdapter implements AgentAdapter {
       // HOME은 git·keychain 경로 때문에 그대로 두고, codex 설정 출처만 CODEX_HOME으로 잘라낸다.
       environment: agentEnvironment({ CODEX_HOME: topicHome }),
     });
+    notifyUsage(
+      turn.onUsage,
+      withModel(codexTurnUsage(output.jsonLines), executionSettings.model),
+      startedAt,
+      toolTime.summary(),
+    );
     if (output.exitCode !== 0) {
       throw new Error(describeCommandFailure("Codex", output.exitCode, output.stderr, output.stdout));
     }
-    notifyUsage(turn.onUsage, withModel(codexTurnUsage(output.jsonLines), executionSettings.model), startedAt, toolTime.summary());
     return output;
   }
 
