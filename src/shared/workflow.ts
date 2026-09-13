@@ -44,6 +44,9 @@ const NEXT_STATES: Readonly<Record<WorkflowState, ReadonlySet<WorkflowState>>> =
     "DRAFT",
     "CLAUDE_PLAN",
     "CLAUDE_REVISION",
+    // 종결 확인이 "처분 되돌림" 가드로 멈춘 뒤 결정이 오면 저장된 종결로 곧장 ACK 한다(retry 사다리가 adjudicated 를
+    // 확인한 뒤에만 고른다). CODEX_CLOSEOUT 은 여전히 막는다 — 결정을 소비해 처분을 재기재하는 단계는 개정이다.
+    "CONSENSUS_ACK",
     "IMPLEMENTING",
     "CODEX_REVIEW",
     "CLAUDE_FIX",

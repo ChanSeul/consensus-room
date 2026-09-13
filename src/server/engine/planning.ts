@@ -205,8 +205,10 @@ export class PlanningPipeline {
       const closeout = await this.core.latestResult(topicId, "closeout");
       const known = await this.roundKnownFindings(topicId);
       const { essential } = classifyCloseoutAdditions(known, closeout);
-      if (essential.length === 0) return this.resumePlanningAtCloseout(topicId, signal);
-      await this.runPlanningFromRevision2(topicId, closeout, essential.map((finding) => finding.id), stored, known, signal);
+      // 처분을 되돌린 쟁점도 추가 개정의 대상이다 — 결정을 소비해 처분을 재기재하는 단계가 개정이기 때문이다.
+      const ids = [...new Set([...essential.map((finding) => finding.id), ...dispositionRegressions(known, closeout.findings)])];
+      if (ids.length === 0) return this.resumePlanningAtCloseout(topicId, signal);
+      await this.runPlanningFromRevision2(topicId, closeout, ids, stored, known, signal);
       return;
     }
     const audit = await this.core.latestResult(topicId, "audit");
@@ -260,7 +262,34 @@ export class PlanningPipeline {
   async resumePlanningAtCloseout(topicId: string, signal: AbortSignal): Promise<void> {
     const { markdown, sha256 } = await this.storedPlanForResume(topicId);
     const revision = await this.core.latestResult(topicId, "claude-revision");
-    await this.runPlanningFromCloseout(topicId, revision, { markdown, sha256 }, signal, await this.roundKnownFindings(topicId));
+    const known = await this.roundKnownFindings(topicId);
+    // 종결 확인이 "처분 되돌림" 가드로 멈췄고 그 뒤 사용자 결정이 올라왔으면(최종 리뷰의 adjudicated 와 같은 규칙),
+    // 저장된 종결로 곧장 ACK 한다 — Codex 종결 턴을 다시 사지 않는다(2026-09-13 S10H: 결정이 id 를 확정했는데도 재개가 죽었다).
+    if (this.closeoutRegressionAdjudicated(topicId)) {
+      const stored = this.core.dependencies.database.latestArtifact(topicId, "closeout");
+      const closeout = stored ? await this.core.latestResult(topicId, "closeout") : null;
+      if (closeout && closeout.planSHA256 === sha256 && classifyCloseout(closeout).state === "CONSENSUS_ACK"
+        && classifyCloseoutAdditions(known, closeout).essential.length === 0) {
+        this.core.event(topicId, "system", "system",
+          `결정이 처분 되돌림 쟁점(${dispositionRegressions(known, closeout.findings).join(", ")})을 확정했습니다 — 저장된 종결 확인(#${stored?.revision ?? "?"})으로 합의를 마칩니다(종결 턴 재구매 없음).`);
+        await this.runConsensusFinalization(topicId, closeout.findings, sha256, signal);
+        return;
+      }
+    }
+    await this.runPlanningFromCloseout(topicId, revision, { markdown, sha256 }, signal, known);
+  }
+
+  // 처분 되돌림 가드(payload closeoutRegressedFindingIDs) 뒤에 사용자 결정이 하나라도 올라왔는가 — delivery 의
+  // adjudicatedFinalReviewIDs 와 같은 규칙(결정이 그 쟁점을 다뤘다고 본다; 내용 판단은 사람 몫).
+  closeoutRegressionAdjudicated(topicId: string): boolean {
+    const topic = this.core.dependencies.database.getTopic(topicId);
+    const events = this.core.dependencies.database.getTimeline(topicId)
+      .filter((event) => event.scopeGeneration === topic.scopeGeneration);
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      if (!Array.isArray(events[index].payload?.closeoutRegressedFindingIDs)) continue;
+      return events.slice(index + 1).some((later) => later.actor === "user" && later.kind === "decision");
+    }
+    return false;
   }
 
   // 종결 확인의 새 쟁점만 반영하는 개정 2회차(2026-09-07, 사용자 결정 "개정 2회차로 바꿔"). 처음부터 다시 도는 대신
@@ -367,6 +396,7 @@ export class PlanningPipeline {
         "USER_DECISION_REQUIRED",
         `마지막 검토가 고치기로 합의한 쟁점의 처분을 되돌렸습니다(${downgradedAtCloseout.join(", ")}). 합의로 닫지 않고 계획 수렴을 다시 실행해야 합니다.`,
         "CODEX_CLOSEOUT",
+        { closeoutRegressedFindingIDs: downgradedAtCloseout },
       );
       return;
     }
@@ -388,10 +418,16 @@ export class PlanningPipeline {
   // ACK 턴이 인프라 오류로 죽었을 때의 재개 지점. 종결까지 끝난 상태이므로 계획·감사·개정·종결을
   // 하나도 다시 돌리지 않고 저장된 종결 결과로 확인 절차만 완료한다.
   async resumePlanningAtAck(topicId: string, signal: AbortSignal): Promise<void> {
-    this.core.requireParticipants(this.core.dependencies.database.getTopic(topicId));
+    const current = this.core.dependencies.database.getTopic(topicId);
+    this.core.requireParticipants(current);
     const stored = await this.storedPlanForResume(topicId);
     const closeout = await this.core.latestResult(topicId, "closeout");
     if (closeout.planSHA256 !== stored.sha256) throw new Error("저장된 closeout의 계획 해시가 현재 plan.md와 다릅니다.");
+    if (current.state === "USER_DECISION_REQUIRED") {
+      const regressed = dispositionRegressions(await this.roundKnownFindings(topicId), closeout.findings);
+      this.core.event(topicId, "system", "system",
+        `결정이 처분 되돌림 쟁점(${regressed.join(", ")})을 확정했습니다 — 저장된 종결 확인으로 합의를 마칩니다(종결 턴 재구매 없음).`);
+    }
     await this.runConsensusFinalization(topicId, closeout.findings, stored.sha256, signal);
   }
 

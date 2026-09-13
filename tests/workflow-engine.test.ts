@@ -3498,3 +3498,83 @@ it("묶음의 중간 단계는 푸시 전에 닫을 수 없고 전달 뒤에는 
  database.updateTopic("topic-1",{committedOID:"delivered",pushedOID:"delivered"});
  expect(engine.close("topic-1").state).toBe("CLOSED");database.close();
 });
+
+// 2026-09-13 S10H 실측: 개정 2회차 뒤 종결 확인이 처분을 되돌려 멈췄고, 결정을 올려도 retry 가
+// "허용되지 않은 상태 전이입니다: USER_DECISION_REQUIRED → CODEX_CLOSEOUT" 로 죽었다(2회차 재개가 종결 재실행으로 가는데 전이표가 막음).
+describe("개정 2회차 뒤 종결 확인의 처분 되돌림 — 결정 뒤 재개", () => {
+  function secondRoundRegression(slug: string, extraCodex: AgentResult[] = [], extraClaude: AgentResult[] = []) {
+    const revised = validPlan("개정 계획");
+    const revisedSHA = hashPlan(`${revised.trim()}\n`);
+    const agreed = finding("F-1", "합의된 결함", { severity: "HIGH", disposition: "AGREED_ACTION" });
+    const regressed = finding("F-1", "합의된 결함", { severity: "HIGH", disposition: "AGREED_NO_ACTION" });
+    const fresh = finding("F-NEW", "종결이 찾은 필수 쟁점", { severity: "HIGH", disposition: "AGREED_ACTION" });
+    return makePlanningEngine({
+      slug,
+      claudeResults: [
+        { kind: "PLAN", summary: "계획", planMarkdown: validPlan("첫 계획"), findings: [], evidenceRefs: [] },
+        { kind: "REVISION", summary: "개정", planMarkdown: revised, findings: [agreed], evidenceRefs: [] },
+        // 개정 2회차: 새 쟁점만 반영(계획 무변경)
+        { kind: "REVISION", summary: "개정 2회차", planEdits: [], findings: [fresh], evidenceRefs: [] },
+        ...extraClaude,
+        { kind: "ACK", summary: "확인", planSHA256: revisedSHA, findings: [], evidenceRefs: [] },
+      ],
+      codexResults: [
+        { kind: "AUDIT", summary: "감사", findings: [finding("F-1", "합의된 결함", { severity: "HIGH", disposition: undefined })], evidenceRefs: [] },
+        // 1차 종결: 새 필수 쟁점 → 개정 2회차
+        { kind: "CLOSEOUT", summary: "종결 1", planSHA256: revisedSHA, findings: [agreed, fresh], evidenceRefs: [] },
+        // 2차 종결: F-1 처분을 되돌린다 → 가드
+        { kind: "CLOSEOUT", summary: "종결 2", planSHA256: revisedSHA, findings: [regressed, fresh], evidenceRefs: [] },
+        ...extraCodex,
+        { kind: "ACK", summary: "확인", planSHA256: revisedSHA, findings: [], evidenceRefs: [] },
+      ],
+    });
+  }
+
+  it("결정이 올라오면 저장된 종결로 곧장 ACK 한다 — 종결 턴 재구매 없음", async () => {
+    const { database, engine } = secondRoundRegression("closeout-regression-round2-decision");
+    engine.startPlan("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+    let topic = database.getTopic("topic-1");
+    expect(topic.state).toBe("USER_DECISION_REQUIRED");
+    expect(topic.lastError ?? "").toContain("처분을 되돌렸습니다(F-1)");
+    expect(database.getFlags("topic-1").closeoutRevisionUsed).toBe(true);
+
+    await engine.postMessage("topic-1", "decision", "F-1 은 종결 확인의 처분(AGREED_NO_ACTION)이 맞다 — 합의로 닫는다.");
+    engine.retry("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+
+    topic = database.getTopic("topic-1");
+    expect(topic.lastError ?? "").toBe("");
+    expect(topic.state).toBe("AWAITING_USER_APPROVAL");
+    const bodies = database.getTimeline("topic-1").map((event) => event.body ?? "");
+    expect(bodies.some((body) => body.includes("저장된 종결 확인") && body.includes("F-1"))).toBe(true);
+    expect(bodies.some((body) => body.includes("허용되지 않은 상태 전이"))).toBe(false);
+    expect(bodies.some((body) => body.includes("처음부터 재시도"))).toBe(false);
+    database.close();
+  });
+
+  it("결정이 없으면 되돌린 쟁점만 추가 개정으로 재기재한 뒤 종결 확인을 다시 한다(재계획·전이 오류 없음)", async () => {
+    const revised = validPlan("개정 계획");
+    const revisedSHA = hashPlan(`${revised.trim()}\n`);
+    const agreed = finding("F-1", "합의된 결함", { severity: "HIGH", disposition: "AGREED_ACTION" });
+    const fresh = finding("F-NEW", "종결이 찾은 필수 쟁점", { severity: "HIGH", disposition: "AGREED_ACTION" });
+    const { database, engine } = secondRoundRegression("closeout-regression-round2-rerun",
+      [{ kind: "CLOSEOUT", summary: "종결 3", planSHA256: revisedSHA, findings: [agreed, fresh], evidenceRefs: [] }],
+      [{ kind: "REVISION", summary: "추가 개정(F-1 재기재)", planEdits: [], findings: [agreed], evidenceRefs: [] }]);
+    engine.startPlan("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+    expect(database.getTopic("topic-1").state).toBe("USER_DECISION_REQUIRED");
+
+    engine.retry("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+
+    const topic = database.getTopic("topic-1");
+    expect(topic.lastError ?? "").toBe("");
+    expect(topic.state).toBe("AWAITING_USER_APPROVAL");
+    const bodies = database.getTimeline("topic-1").map((event) => event.body ?? "");
+    expect(bodies.some((body) => body.includes("허용되지 않은 상태 전이"))).toBe(false);
+    expect(bodies.filter((body) => body.includes("의견 수렴을 종료할 수 있는지")).length).toBe(3);
+    expect(bodies.some((body) => body.includes("추가 개정") && body.includes("F-1"))).toBe(true);
+    database.close();
+  });
+});

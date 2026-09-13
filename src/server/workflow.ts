@@ -269,6 +269,9 @@ export class WorkflowEngine {
       for (const stage of candidates) {
         if (!canTransition(topic.state, stage)) continue;
         if (!this.core.dependencies.database.latestArtifact(topicId, prerequisites[stage])) continue;
+        // 결정으로 멈춘 종결(USER_DECISION_REQUIRED)에서 ACK 로 건너뛰는 것은 "처분 되돌림" 가드가 결정으로 확정된 경우뿐이다.
+        // 종결이 결정·증거를 요청해 멈춘 경우는 그대로 개정(CLAUDE_REVISION)이 결정을 소비한다(2026-09-13).
+        if (stage === "CONSENSUS_ACK" && topic.state === "USER_DECISION_REQUIRED" && !this.planning.closeoutRegressionAdjudicated(topicId)) continue;
         return this.core.startAction(topicId, "retry", resumers[stage], actionId);
       }
     }
