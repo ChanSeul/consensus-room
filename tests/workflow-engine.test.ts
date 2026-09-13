@@ -8,6 +8,7 @@ import { ArtifactStore } from "../src/server/artifacts";
 import { ConsensusDatabase } from "../src/server/database";
 import { GitService } from "../src/server/git";
 import type { AgentAdapter, CommandRunner, ProjectMemoryWriter } from "../src/server/types";
+import { EngineCore } from "../src/server/engine/core";
 import { WorkflowEngine } from "../src/server/workflow";
 import { REQUIRED_PLAN_HEADINGS, type AgentResult } from "../src/shared/contracts";
 import { hashPlan, normalizePlan, redactSecrets } from "../src/shared/workflow";
@@ -96,7 +97,7 @@ function makeEngine(
     claude: unavailableAdapter("claude"),
     codex: unavailableAdapter("codex"),
   });
-  return { database, engine };
+  return { database, engine, dependencies: { database, artifacts: new ArtifactStore(join(root, "topics"), database), git: new GitService(unavailableRunner), claude: unavailableAdapter("claude"), codex: unavailableAdapter("codex") } };
 }
 
 describe("범위 세대", () => {
@@ -3227,5 +3228,35 @@ describe("계획 전송 기록 저장 중 새 결정", () => {
     expect(codex.calls[2]).toContain("NEW-CURSOR-DECISION");
     expect(codex.calls).toHaveLength(4);
     database.close();
+  });
+});
+
+
+describe("사용량 이벤트 전달", () => {
+  it("진행은 최신 관측만 갱신하고 final·경고만 원장과 이벤트 구독에 전달한다", () => {
+    const { database, dependencies } = makeEngine("DRAFT", null);
+    const core = new EngineCore({ ...dependencies, executionLimits: { outputTokens: 10 } });
+    const received: unknown[] = [];
+    database.events.on("topic:topic-1", (event) => received.push(event));
+    const observe = core.usageObserver("topic-1", "claude", "턴");
+    observe({ executionId: "e1", recordKind: "progress", outputTokens: 1 });
+    observe({ executionId: "e1", recordKind: "progress", outputTokens: 2 });
+    expect(database.getTimeline("topic-1")).toHaveLength(0);
+    expect(received).toHaveLength(0);
+    observe({ executionId: "e1", recordKind: "progress", outputTokens: 10 });
+    observe({ executionId: "e1", recordKind: "progress", outputTokens: 11 });
+    expect(database.getTimeline("topic-1")).toHaveLength(1);
+    observe({ executionId: "e1", recordKind: "final", outputTokens: 12 });
+    observe({ executionId: "e1", recordKind: "final", outputTokens: 12 });
+    observe({ executionId: "e1", recordKind: "progress", outputTokens: 13 });
+    expect(database.getTimeline("topic-1")).toHaveLength(2);
+    expect(received).toHaveLength(2);
+    expect(database.getPromptTimeline("topic-1", 3)).toHaveLength(0);
+    expect(database.getExecutionUsage("topic-1")[0].usage.outputTokens).toBe(12);
+    const late = core.usageObserver("topic-1", "codex", "턴");
+    database.updateTopic("topic-1", { scopeGeneration: 4 });
+    late({ executionId: "old", recordKind: "final", outputTokens: 20 });
+    expect(database.getExecutionUsage("topic-1")).toHaveLength(0);
+    expect(database.getTimeline("topic-1")).toHaveLength(2);
   });
 });

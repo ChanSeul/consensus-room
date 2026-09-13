@@ -54,6 +54,44 @@ describe("실행별 사용량 계측", () => {
     });
   });
 
+  it("동일 Claude 메시지의 갱신·재전송·역순과 누락 필드를 병합한다", () => {
+    const meter = new ExecutionMetrics("claude", 1, "test", "low", false, Date.now());
+    const event = (usage: Record<string, number>) => ({ type: "assistant", message: { id: "m1", usage } });
+    const first = event({ input_tokens: 10, output_tokens: 2 });
+    meter.observe(first);
+    meter.observe(event({ cache_read_input_tokens: 20, output_tokens: 2637 }));
+    meter.observe(first);
+    meter.observe(event({ output_tokens: 2637 }));
+    meter.observe({ type: "assistant", message: { id: "m2", usage: { output_tokens: 3 } } });
+    expect(meter.snapshot({ toolDurationMs: 0, toolCalls: 0 }, "final")).toMatchObject({
+      inputTokens: 30, cachedInputTokens: 20, outputTokens: 2640, internalRequests: 2, completeness: "partial",
+    });
+  });
+
+  it("최종 result 후 버퍼의 미관측 assistant도 최종 합계를 바꾸지 않는다", () => {
+    const meter = new ExecutionMetrics("claude", 1, "test", "low", false, Date.now());
+    meter.observe({ type: "result", usage: { input_tokens: 5, output_tokens: 8 } });
+    meter.observe({ type: "assistant", message: { id: "late", usage: { output_tokens: 3 } } });
+    expect(meter.snapshot({ toolDurationMs: 0, toolCalls: 0 }, "final").outputTokens).toBe(8);
+  });
+
+  it("Claude 부분 스트림의 message_delta로 출력 갱신을 수집하고 result 불일치를 드러낸다", () => {
+    const meter = new ExecutionMetrics("claude", 1, "test", "low", false, Date.now());
+    const start = { type: "stream_event", event: { type: "message_start", message: { id: "m1", usage: { input_tokens: 10, output_tokens: 2 } } } };
+    const delta = { type: "stream_event", event: { type: "message_delta", usage: { output_tokens: 2637 } } };
+    meter.observe(start); meter.observe(delta);
+    meter.observe({ type: "stream_event", event: { type: "message_stop" } });
+    meter.observe({ type: "assistant", message: { id: "m1", usage: { input_tokens: 10, output_tokens: 2 } } });
+    expect(meter.snapshot({ toolDurationMs: 0, toolCalls: 0 }, "progress").outputTokens).toBe(2637);
+    meter.observe({ type: "result", usage: { input_tokens: 10, output_tokens: 52 } });
+    meter.observe(start); meter.observe(delta);
+    expect(meter.snapshot({ toolDurationMs: 0, toolCalls: 0 }, "final")).toMatchObject({
+      outputTokens: 52, completeness: "partial", sourceUsage: {
+        status: "mismatch", cli: { outputTokens: 52 }, claudeStream: { outputTokens: 2637 },
+      },
+    });
+  });
+
   it("final source 뒤에는 진행 이벤트를 다시 만들지 않는다", () => {
     const meter = new ExecutionMetrics("codex", 1, "gpt", "low", false, Date.now());
     meter.observe({ type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } });
@@ -113,4 +151,40 @@ describe("실행별 사용량 계측", () => {
       await rm(home, { recursive: true, force: true });
     }
   });
+});
+
+
+it("최종 input 일부만 주어져도 앞선 캐시 생성·읽기 관측을 지우지 않는다", () => {
+  const meter = new ExecutionMetrics("claude", 1, "test", "low", false, Date.now());
+  meter.observe({ type: "assistant", message: { id: "m1", usage: { input_tokens: 10, cache_read_input_tokens: 20, cache_creation_input_tokens: 30, output_tokens: 2 } } });
+  meter.observe({ type: "result", usage: { input_tokens: 11, output_tokens: 3 } });
+  expect(meter.snapshot({ toolDurationMs: 0, toolCalls: 0 }, "final")).toMatchObject({ inputTokens: 61, cachedInputTokens: 20, outputTokens: 3 });
+});
+
+it("익명화한 실제 실패 실행 transcript의 입력 범위와 출력 합계를 재현한다", () => {
+  // 2026-09-13 06:26:42–06:28:43 UTC. 원본 stdout이 아닌 transcript의 usage만 보존.
+  // DB 입력 1,315,697과 일치한다. DB 출력 52와 마지막 메시지 2,637은 서로 다른 집계 범위다.
+  const rows = [
+    [2, 37201, 98854, 2245], [2, 5236, 136055, 614], [2, 897, 141291, 275],
+    [2, 474, 142188, 449], [2, 2231, 142662, 862], [2, 2388, 144893, 997],
+    [2, 3376, 147281, 882], [2, 1666, 150657, 275], [2, 6006, 152323, 2637],
+  ];
+  const meter = new ExecutionMetrics("claude", 1, "test", "low", false, Date.now());
+  for (const [index, [input_tokens, cache_creation_input_tokens, cache_read_input_tokens, output_tokens]] of rows.entries()) {
+    const event = { type: "assistant", message: { id: `anonymous-${index}`, usage: { input_tokens, cache_creation_input_tokens, cache_read_input_tokens, output_tokens } } };
+    meter.observe(event); meter.observe(event);
+  }
+  expect(meter.snapshot({ toolDurationMs: 0, toolCalls: 0 }, "final")).toMatchObject({ inputTokens: 1315697, outputTokens: 9236, internalRequests: 9, completeness: "partial" });
+});
+
+
+it("불일치 진단의 CLI 원본에는 final이 실제로 준 필드만 보관한다", () => {
+  const meter = new ExecutionMetrics("claude", 1, "test", "low", false, Date.now());
+  meter.observe({ type: "stream_event", event: { type: "message_start", message: { id: "m1", usage: { input_tokens: 10, cache_read_input_tokens: 20, cache_creation_input_tokens: 30, output_tokens: 2 } } } });
+  meter.observe({ type: "stream_event", event: { type: "message_delta", usage: { output_tokens: 15 } } });
+  meter.observe({ type: "result", usage: { input_tokens: 11, output_tokens: 3 } });
+  const usage = meter.snapshot({ toolDurationMs: 0, toolCalls: 0 }, "final");
+  expect(usage).toMatchObject({ inputTokens: 61, cachedInputTokens: 20, outputTokens: 3, completeness: "partial" });
+  expect(usage.sourceUsage?.cli).toEqual({ inputTokens: 11, outputTokens: 3 });
+  expect(usage.sourceUsage?.claudeStream).toEqual({ inputTokens: 60, cachedInputTokens: 20, outputTokens: 15 });
 });

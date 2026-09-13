@@ -453,6 +453,15 @@ export type UpdateMediationAutonomyInput = z.infer<typeof UpdateMediationAutonom
 export const TopicActivitySchema = z.object({
   state: WorkflowStateSchema,
   runningAction: z.boolean(),
+  executionUsage: z.array(z.object({
+    executionId: z.string(), role: z.enum(["claude", "codex"]), phase: z.string(), observedAt: z.string(),
+    usage: z.object({
+      executionId: z.string(), recordKind: z.enum(["progress", "final"]),
+      completeness: z.enum(["complete", "partial"]).optional(),
+      inputTokens: z.number().optional(), cachedInputTokens: z.number().optional(), outputTokens: z.number().optional(),
+      durationMs: z.number().optional(),
+    }).passthrough(),
+  })).optional(),
   lastChangeAt: z.string().nullable(),
   lastChangedPath: z.string().nullable(),
   scanned: z.number().int(),

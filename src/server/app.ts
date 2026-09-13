@@ -191,6 +191,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     return {
       state: topic.state,
       runningAction: database.runningAction(topic.id) !== null,
+      executionUsage: database.getExecutionUsage(topic.id),
       ...activity,
       autoRetryAt: workflow.scheduledRetryAt(topic.id),
       checkedAt: new Date().toISOString(),

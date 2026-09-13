@@ -394,7 +394,11 @@ export class EngineCore {
   // 가리키므로 단계별 집계는 SQL 로 한다. payload.usage 가 있는 이벤트는 getPromptTimeline 이 걸러 프롬프트에
   // 들어가지 않는다 — 사용량 줄이 에이전트에게 되돌아가면 그 자체가 새 입력 비용이다.
   usageObserver(topicId: string, role: ParticipantRole, phase: "턴" | "계약 교정 재제출" | "프로토콜 확인") {
-    return (usage: TurnUsage) => {
+    const generation = this.dependencies.database.getTopic(topicId).scopeGeneration;
+    const fallbackExecutionId = randomUUID();
+    return (observation: TurnUsage) => {
+      const usage = { ...observation, executionId: observation.executionId ?? fallbackExecutionId,
+        recordKind: observation.recordKind ?? "final" as const, phase };
       const tokens = (count: number | undefined) => count === undefined ? "관측 안 됨" : count.toLocaleString("en-US");
       const seconds = (ms: number | undefined) => Math.round((ms ?? 0) / 1000);
       const cost = usage.costUSD === undefined ? "" : ` · $${usage.costUSD.toFixed(2)}`;
@@ -404,13 +408,15 @@ export class EngineCore {
         ? ""
         : ` · 도구 ${seconds(usage.toolDurationMs)}초(${usage.toolCalls ?? 0}회) · 모델+대기 ${seconds(Math.max(0, (usage.durationMs ?? 0) - usage.toolDurationMs))}초`;
       const api = usage.apiDurationMs === undefined ? "" : ` · API ${seconds(usage.apiDurationMs)}초`;
-      const kind = usage.recordKind === "progress" ? "진행" : "최종";
-      this.event(
-        topicId, role, "system",
-        `${role} ${phase} ${kind} 사용량 — 입력 ${tokens(usage.inputTokens)}(캐시 ${tokens(usage.cachedInputTokens)}) · ` +
-          `출력 ${tokens(usage.outputTokens)} 토큰 · ${seconds(usage.durationMs)}초${split}${api}${cost}${usage.model ? ` · 모델 ${usage.model}` : ""}${usage.completeness === "partial" ? " · 부분 관측" : ""}`,
-        { usage: { ...usage, phase } },
-      );
+      const body = `${role} ${phase} 최종 사용량 — 입력 ${tokens(usage.inputTokens)}(캐시 ${tokens(usage.cachedInputTokens)}) · ` +
+        `출력 ${tokens(usage.outputTokens)} 토큰 · ${seconds(usage.durationMs)}초${split}${api}${cost}${usage.model ? ` · 모델 ${usage.model}` : ""}${usage.completeness === "partial" ? " · 부분 관측" : ""}${usage.sourceUsage?.status === "mismatch" ? " · 원본 간 사용량 불일치" : ""}`;
+      if (!this.dependencies.database.saveExecutionUsage(topicId, generation, role, phase, usage,
+        usage.recordKind === "final" ? { body: redactSecrets(body), payload: redactRecord({ usage }) } : undefined)) return;
+      // 이전 세대에서 늦게 종료된 관측은 보존하되 새 세대의 원장에 알리지 않는다.
+      if (this.dependencies.database.getTopic(topicId).scopeGeneration !== generation) {
+        this.warnedLimits.delete(usage.executionId);
+        return;
+      }
       const executionId = usage.executionId ?? `${topicId}:${role}:${phase}`;
       const warned = this.warnedLimits.get(executionId) ?? new Set<string>();
       this.warnedLimits.set(executionId, warned);

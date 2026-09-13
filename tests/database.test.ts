@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 
 import { ConsensusDatabase } from "../src/server/database";
-import type { ActionRecord } from "../src/server/types";
+import type { ActionRecord, TurnUsage } from "../src/server/types";
 import type { Topic } from "../src/shared/contracts";
 
 const temporaryDirectories: string[] = [];
@@ -782,4 +782,42 @@ describe("전달한 타임라인 sequence 기록", () => {
     expect(database.getCodexReviewPromptSequence("topic-1")).toBeNull();
     database.close();
   });
+});
+
+
+describe("실행 사용량 최신 관측", () => {
+  it("progress 갱신은 원장을 늘리지 않고 재시작·final·세대를 보존한다", () => {
+    const { database, path } = openDatabase();
+    database.createTopic(topic());
+    const save = (usage: TurnUsage) => database.saveExecutionUsage("topic-1", 1, "claude", "턴", usage);
+    expect(save({ executionId: "e1", recordKind: "progress", outputTokens: 2 })).toBe(true);
+    expect(save({ executionId: "e1", recordKind: "progress", outputTokens: 3 })).toBe(true);
+    expect(database.getExecutionUsage("topic-1")).toHaveLength(1);
+    expect(database.getTimeline("topic-1")).toHaveLength(0);
+    database.close();
+    const reopened = new ConsensusDatabase(path);
+    expect(reopened.getExecutionUsage("topic-1")[0].usage.outputTokens).toBe(3);
+    expect(reopened.saveExecutionUsage("topic-1", 1, "claude", "턴", { executionId: "e1", recordKind: "final", outputTokens: 5 })).toBe(true);
+    expect(reopened.saveExecutionUsage("topic-1", 1, "claude", "턴", { executionId: "e1", recordKind: "progress", outputTokens: 9 })).toBe(false);
+    expect(reopened.saveExecutionUsage("topic-1", 1, "claude", "턴", { executionId: "e1", recordKind: "final", outputTokens: 9 })).toBe(false);
+    expect(reopened.getExecutionUsage("topic-1")[0].usage.outputTokens).toBe(5);
+    reopened.updateTopic("topic-1", { scopeGeneration: 2 });
+    expect(reopened.getExecutionUsage("topic-1")).toEqual([]);
+    reopened.close();
+  });
+});
+
+
+it("final 관측과 원장 기록 중 실패하면 함께 롤백되어 재시도할 수 있다", () => {
+  const { database, path } = openDatabase();
+  database.createTopic(topic());
+  const raw = new DatabaseSync(path);
+  raw.exec("CREATE TRIGGER fail_usage_event BEFORE INSERT ON timeline_events BEGIN SELECT RAISE(ABORT, 'forced failure'); END;");
+  const save = () => database.saveExecutionUsage("topic-1", 1, "claude", "턴", { executionId: "atomic", recordKind: "final" }, { body: "final", payload: {} });
+  expect(save).toThrow("forced failure");
+  expect(database.getExecutionUsage("topic-1")).toEqual([]);
+  raw.exec("DROP TRIGGER fail_usage_event");
+  expect(save()).toBe(true);
+  expect(database.getTimeline("topic-1")).toHaveLength(1);
+  raw.close(); database.close();
 });

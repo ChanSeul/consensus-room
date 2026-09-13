@@ -51,6 +51,10 @@ function homeRecordID(event: RecordValue, payload: RecordValue, usage: RecordVal
 export class ExecutionMetrics {
   readonly executionId = randomUUID();
   private readonly seen = new Set<string>();
+  private readonly claudeInputTotals: Record<string, number> = {};
+  private activeClaudeMessage?: string;
+  private sawClaudeDelta = false;
+  private readonly claudeMessages = new Map<string, Record<string, number>>();
   private totals: Partial<Pick<TurnUsage, "inputTokens" | "cachedInputTokens" | "outputTokens">> = {};
   private metadata: Partial<Pick<TurnUsage, "costUSD" | "modelTurns" | "apiDurationMs">> = {};
   private internalRequests = 0;
@@ -69,10 +73,51 @@ export class ExecutionMetrics {
   ) {}
 
   observe(value: unknown): void {
+    const envelope = record(value);
+    if (this.kind === "claude" && envelope?.type === "stream_event") {
+      if (this.finalSourceSeen || envelope.parent_tool_use_id) return;
+      const chunk = record(envelope.event);
+      if (chunk?.type === "message_start") {
+        const message = record(chunk.message);
+        this.activeClaudeMessage = typeof message?.id === "string" ? message.id : undefined;
+        if (this.activeClaudeMessage) this.observe({ type: "assistant", message });
+      } else if (chunk?.type === "message_delta" && this.activeClaudeMessage && record(chunk.usage)) {
+        this.sawClaudeDelta = true;
+        this.observe({ type: "assistant", message: { id: this.activeClaudeMessage, usage: chunk.usage } });
+      } else if (chunk?.type === "message_stop") this.activeClaudeMessage = undefined;
+      return;
+    }
     const event = usageEvent(this.kind, value);
-    if (!event || this.seen.has(eventID(event))) return;
+    if (!event) return;
     const isClaudeAssistant = this.kind === "claude" && event.type === "assistant";
     const isClaudeFinal = this.kind === "claude" && event.type === "result";
+    if (isClaudeAssistant) {
+      if (this.finalSourceSeen) return;
+      const id = eventID(event);
+      const previous = this.claudeMessages.get(id);
+      const next = { ...previous };
+      const usage = record(record(event.message)?.usage)!;
+      for (const key of ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens"]) {
+        const value = number(usage[key]);
+        if (value !== undefined && value >= 0) next[key] = Math.max(next[key] ?? 0, value);
+      }
+      for (const key of ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]) {
+        if (next[key] !== undefined) this.claudeInputTotals[key] = (this.claudeInputTotals[key] ?? 0) + next[key] - (previous?.[key] ?? 0);
+      }
+      if (!previous) this.claudeAssistantRequests += 1;
+      this.claudeMessages.set(id, next);
+      this.internalRequests = this.claudeAssistantRequests;
+      const addDelta = (target: "inputTokens" | "cachedInputTokens" | "outputTokens", keys: string[]) => {
+        if (!keys.some((key) => next[key] !== undefined)) return;
+        const delta = keys.reduce((sum, key) => sum + (next[key] ?? 0) - (previous?.[key] ?? 0), 0);
+        this.totals[target] = (this.totals[target] ?? 0) + delta;
+      };
+      addDelta("inputTokens", ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]);
+      addDelta("cachedInputTokens", ["cache_read_input_tokens"]);
+      addDelta("outputTokens", ["output_tokens"]);
+      return;
+    }
+    if (this.seen.has(eventID(event))) return;
     this.seen.add(eventID(event));
     if ((this.kind === "codex" && event.type === "turn.completed") || (this.kind === "claude" && event.type === "result")) this.finalSourceSeen = true;
     // Claude result usage is turn-cumulative. The streamed assistant records remain the partial observation
@@ -90,44 +135,47 @@ export class ExecutionMetrics {
       const created = number(usage.cache_creation_input_tokens);
       const output = number(usage.output_tokens);
       this.finalUsageComplete = (plain !== undefined || cached !== undefined || created !== undefined) && output !== undefined;
+      const inputParts = { ...this.claudeInputTotals };
+      for (const key of ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]) {
+        const value = number(usage[key]);
+        if (value !== undefined) inputParts[key] = value;
+        else if (inputParts[key] !== undefined && inputParts[key] > 0) this.finalUsageComplete = false;
+      }
+      const streamed = { ...this.totals };
       this.totals = {
         ...this.totals,
-        ...(plain === undefined && cached === undefined && created === undefined ? {} : { inputTokens: (plain ?? 0) + (cached ?? 0) + (created ?? 0) }),
+        ...(plain === undefined && cached === undefined && created === undefined ? {} : { inputTokens: Object.values(inputParts).reduce((sum, count) => sum + count, 0) }),
         ...(cached === undefined ? {} : { cachedInputTokens: cached }),
         ...(output === undefined ? {} : { outputTokens: output }),
       };
+      // Preserve both sources if the CLI aggregate contradicts completed streaming observations.
+      // This is not evidence that either source is the full billable total.
+      if (this.sawClaudeDelta) {
+        const mismatch = (["inputTokens", "cachedInputTokens", "outputTokens"] as const)
+          .some((key) => streamed[key] !== undefined && this.totals[key] !== undefined && streamed[key]! > this.totals[key]!);
+        if (mismatch) {
+          this.finalUsageComplete = false;
+          const cli = {
+            ...(plain === undefined && cached === undefined && created === undefined ? {} : { inputTokens: (plain ?? 0) + (cached ?? 0) + (created ?? 0) }),
+            ...(cached === undefined ? {} : { cachedInputTokens: cached }),
+            ...(output === undefined ? {} : { outputTokens: output }),
+          };
+          this.reconciliation = { cli, claudeStream: streamed, status: "mismatch" };
+        }
+      }
       // num_turns is the authoritative aggregate when present. The streamed count is retained only for
       // an aborted run that never emitted result.
       this.internalRequests = number(event.num_turns) ?? this.claudeAssistantRequests;
       return;
     }
-    if (isClaudeAssistant) this.claudeAssistantRequests += 1;
     this.internalRequests += 1;
-    const message = record(event.message);
-    const usage = record(event.usage) ?? record(message?.usage);
+    const usage = record(event.usage);
     if (!usage) return;
-    let counts: Partial<Pick<TurnUsage, "inputTokens" | "cachedInputTokens" | "outputTokens">>;
-    if (this.kind === "codex") {
-      counts = {
-        inputTokens: number(usage.input_tokens),
-        cachedInputTokens: number(usage.cached_input_tokens),
-        outputTokens: number(usage.output_tokens),
-      };
-    } else {
-      const plain = number(usage.input_tokens);
-      const cached = number(usage.cache_read_input_tokens);
-      const created = number(usage.cache_creation_input_tokens);
-      counts = {
-        ...(plain === undefined && cached === undefined && created === undefined ? {} : { inputTokens: (plain ?? 0) + (cached ?? 0) + (created ?? 0) }),
-        ...(cached === undefined ? {} : { cachedInputTokens: cached }),
-        ...(number(usage.output_tokens) === undefined ? {} : { outputTokens: number(usage.output_tokens) }),
-      };
-      this.metadata = {
-        ...(number(event.total_cost_usd) === undefined ? {} : { costUSD: Number(event.total_cost_usd) }),
-        ...(number(event.num_turns) === undefined ? {} : { modelTurns: number(event.num_turns) }),
-        ...(number(event.duration_api_ms) === undefined ? {} : { apiDurationMs: number(event.duration_api_ms) }),
-      };
-    }
+    const counts = {
+      inputTokens: number(usage.input_tokens),
+      cachedInputTokens: number(usage.cached_input_tokens),
+      outputTokens: number(usage.output_tokens),
+    };
     if (this.kind === "codex" && event.type === "turn.completed") {
       this.finalUsageComplete = counts.inputTokens !== undefined && counts.outputTokens !== undefined;
     }

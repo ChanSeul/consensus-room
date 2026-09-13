@@ -16,7 +16,7 @@ import {
   type Topic,
   type WorkflowState,
 } from "../shared/contracts.js";
-import type { ActionRecord, AutoRetryState, InternalTopicFlags, ParticipantRole, StoredArtifact } from "./types.js";
+import type { ActionRecord, TurnUsage, AutoRetryState, InternalTopicFlags, ParticipantRole, StoredArtifact } from "./types.js";
 
 type SqlValue = string | number | bigint | null | Uint8Array;
 
@@ -64,8 +64,58 @@ export class ConsensusDatabase {
       .run(record.id, record.topicId, record.cacheKey, record.status, JSON.stringify(record));
   }
 
+  saveExecutionUsage(topicId: string, generation: number, role: ParticipantRole, phase: string, usage: TurnUsage, finalEvent?: { body: string; payload: Record<string, unknown> }): boolean {
+    if (!usage.executionId) throw new Error("executionId is required");
+    let event: TimelineEvent | undefined;
+    this.db.exec("BEGIN IMMEDIATE");
+    let changed = false;
+    try {
+      const result = this.db.prepare(`
+        INSERT INTO execution_usage(execution_id, topic_id, scope_generation, role, phase, usage_json, observed_at, final)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(execution_id) DO UPDATE SET usage_json = excluded.usage_json,
+          observed_at = excluded.observed_at, final = excluded.final
+        WHERE execution_usage.final = 0 AND execution_usage.topic_id = excluded.topic_id
+          AND execution_usage.scope_generation = excluded.scope_generation AND execution_usage.role = excluded.role
+      `).run(usage.executionId, topicId, generation, role, phase, JSON.stringify(usage), now(), usage.recordKind === "final" ? 1 : 0);
+      changed = Number(result.changes) > 0;
+      const topic = this.getTopic(topicId);
+      if (changed && usage.recordKind === "final" && finalEvent && topic.scopeGeneration === generation) {
+        event = this.insertEventInTransaction({ topicId, actor: role, kind: "system", state: topic.state, ...finalEvent });
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    if (event) this.emitEvent(event);
+    return changed;
+  }
+
+  getExecutionUsage(topicId: string): Array<{ executionId: string; role: ParticipantRole; phase: string; observedAt: string; usage: TurnUsage }> {
+    return this.db.prepare(`
+      SELECT e.* FROM execution_usage e JOIN topics t ON t.id = e.topic_id
+      WHERE e.topic_id = ? AND e.scope_generation = t.scope_generation
+        AND e.rowid = (SELECT MAX(n.rowid) FROM execution_usage n
+          WHERE n.topic_id = e.topic_id AND n.scope_generation = e.scope_generation AND n.role = e.role)
+      ORDER BY e.rowid
+    `).all(topicId).map((row) => ({ executionId: String(row.execution_id), role: row.role as ParticipantRole,
+      phase: String(row.phase), observedAt: String(row.observed_at), usage: JSON.parse(String(row.usage_json)) as TurnUsage }));
+  }
+
   private migrate(): void {
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS execution_usage (
+        execution_id TEXT PRIMARY KEY,
+        topic_id TEXT NOT NULL REFERENCES topics(id),
+        scope_generation INTEGER NOT NULL,
+        role TEXT NOT NULL,
+        phase TEXT NOT NULL,
+        usage_json TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        final INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS execution_usage_topic ON execution_usage(topic_id, scope_generation, role);
       CREATE TABLE IF NOT EXISTS verification_runs (
         id TEXT PRIMARY KEY,
         topic_id TEXT NOT NULL REFERENCES topics(id),

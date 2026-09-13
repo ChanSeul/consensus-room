@@ -454,3 +454,25 @@ describe("멱등 키 본문 재사용", () => {
     expect(replay.json().id).toBe(first.json().id);
   });
 });
+
+
+it("activity API는 현재 세대의 역할별 최신 관측과 시각을 반환한다", async () => {
+  const { app, database, root } = await makeApp();
+  draftTopic(database, "metrics", { worktreePath: root });
+  database.saveExecutionUsage("metrics", 1, "claude", "턴", { executionId: "older", recordKind: "progress", outputTokens: 1 });
+  database.saveExecutionUsage("metrics", 1, "claude", "턴", { executionId: "newer", recordKind: "final", outputTokens: 2 });
+  database.saveExecutionUsage("metrics", 1, "claude", "턴", { executionId: "older", recordKind: "progress", outputTokens: 3 });
+  database.saveExecutionUsage("metrics", 1, "codex", "턴", { executionId: "codex", recordKind: "progress" });
+  const response = await app.inject({ method: "GET", url: "/api/topics/metrics/activity",
+    headers: { "x-consensus-token": "launch-token-for-test" } });
+  expect(response.statusCode).toBe(200);
+  expect(response.json()).toMatchObject({ runningAction: false, executionUsage: [
+    { executionId: "newer", role: "claude", observedAt: expect.any(String), usage: { recordKind: "final", outputTokens: 2 } },
+    { executionId: "codex", role: "codex", usage: { recordKind: "progress" } },
+  ] });
+  database.updateTopic("metrics", { scopeGeneration: 2 });
+  const next = await app.inject({ method: "GET", url: "/api/topics/metrics/activity",
+    headers: { "x-consensus-token": "launch-token-for-test" } });
+  expect(next.json().executionUsage).toEqual([]);
+  await app.close();
+});

@@ -138,6 +138,7 @@ export class ClaudeAdapter implements AgentAdapter {
         ...(pluginDirectory ? ["--plugin-dir", pluginDirectory] : []),
         "--permission-mode", permissionMode,
         "--output-format", "stream-json",
+        "--include-partial-messages",
         "--verbose",
         "--json-schema", JSON.stringify(AgentResultJsonSchema),
         ...sessionArgs,

@@ -1399,3 +1399,26 @@ describe("프로토콜 확인 턴의 지시문 생략과 턴 사용량 통지", 
     expect(created.result.kind).toBe("PLAN");
   });
 });
+
+
+it("Claude 실제 수신 콜백과 반환 버퍼 중복·취소에서 관측값을 보존한다", async () => {
+  const events = [
+    { type: "stream_event", event: { type: "message_start", message: { id: "m1", usage: { input_tokens: 10, output_tokens: 2 } } } },
+    { type: "stream_event", event: { type: "message_delta", usage: { output_tokens: 2637 } } },
+    { type: "stream_event", event: { type: "message_stop" } },
+    { type: "assistant", message: { id: "m1", usage: { input_tokens: 10, output_tokens: 2 } } },
+  ];
+  for (const abort of [false, true]) {
+    const seen: TurnUsage[] = [];
+    const runner: CommandRunner = { run: async (spec) => {
+      expect(spec.args).toContain("--include-partial-messages");
+      for (const event of events) spec.onJSONLine?.(event, Date.now());
+      if (abort) throw new Error("cancelled");
+      return successfulResult(events);
+    } };
+    const adapter = new ClaudeAdapter(runner);
+    await expect(adapter.createSession({ prompt: "test", cwd: "/tmp", onUsage: (usage) => seen.push(usage) })).rejects.toThrow();
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ recordKind: "final", completeness: "partial", outputTokens: 2637, internalRequests: 1 });
+  }
+});
