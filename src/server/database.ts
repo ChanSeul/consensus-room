@@ -1,3 +1,4 @@
+import { BudgetLedger } from "./budgetLedger.js";
 import { EventEmitter } from "node:events";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
@@ -41,12 +42,14 @@ export const COMPLETED_TOPIC_STATES: ReadonlySet<WorkflowState> = new Set([
 export class ConsensusDatabase {
   readonly events = new EventEmitter();
   private readonly db: DatabaseSync;
+  readonly budgets: BudgetLedger;
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
     this.migrate();
+    this.budgets = new BudgetLedger(this.db);
   }
 
   close(): void {
