@@ -38,7 +38,9 @@ export function parseAgentResult(candidates: unknown[], stdout: string): AgentRe
   }
   const direct = parseJsonText(stdout);
   if (direct) return direct;
-  throw new Error("에이전트가 계약된 구조의 결과를 반환하지 않았습니다.");
+  // 왜 구조가 없는지 남긴다 — CLI 의 result 이벤트(subtype·is_error·num_turns·본문 앞부분)가 진단의 전부인데 버려지고
+  // 있었다(2026-09-13 S10 실측: 수정 턴이 tool_use 직후 result 로 끝났는데 원인을 알 길이 없었다).
+  throw new Error(`에이전트가 계약된 구조의 결과를 반환하지 않았습니다.${describeTerminalResult(candidates, stdout)}`);
 }
 
 function parseCandidate(candidate: unknown): AgentResult | null {
@@ -75,6 +77,30 @@ export function describeCommandFailure(
 
 // 두 CLI 다 마지막 이벤트에 사람이 읽을 사유를 담는다(claude는 result.result, codex는 error.message).
 // 그걸 뽑아내면 4KB짜리 JSON 꼬리 대신 "월 지출 한도" 같은 한 줄이 원장에 남는다.
+// 마지막 result 이벤트의 요약. stream-json: {"type":"result","subtype":"success|error_max_turns|error_during_execution|…",
+// "is_error":bool,"num_turns":n,"result":"본문"}. codex: {"type":"turn.completed"} 다음 줄에 error 가 올 수 있다.
+function describeTerminalResult(candidates: readonly unknown[], stdout: string): string {
+  const events = [...candidates].reverse().filter((value): value is Record<string, unknown> =>
+    Boolean(value) && typeof value === "object" && !Array.isArray(value));
+  const result = events.find((event) => event.type === "result") ?? events.find((event) => event.type === "turn.completed" || event.type === "error");
+  const parts: string[] = [];
+  if (result) {
+    if (typeof result.subtype === "string") parts.push(`subtype=${result.subtype}`);
+    if (typeof result.is_error === "boolean") parts.push(`is_error=${result.is_error}`);
+    if (typeof result.num_turns === "number") parts.push(`num_turns=${result.num_turns}`);
+    if (typeof result.stop_reason === "string") parts.push(`stop_reason=${result.stop_reason}`);
+    const text = typeof result.result === "string" ? result.result : typeof result.message === "string" ? result.message : null;
+    if (text) parts.push(`text=${JSON.stringify(redactSecrets(text.slice(0, 300)))}`);
+    const errors = Array.isArray(result.errors) ? result.errors : null;
+    if (errors && errors.length > 0) parts.push(`errors=${JSON.stringify(redactSecrets(JSON.stringify(errors).slice(0, 300)))}`);
+  } else {
+    parts.push("result 이벤트 없음");
+  }
+  const terminal = terminalMessage(stdout);
+  if (terminal) parts.push(`terminal=${JSON.stringify(terminal.slice(0, 200))}`);
+  return parts.length ? ` (${parts.join(" · ")})` : "";
+}
+
 function terminalMessage(stdout: string): string | null {
   const lines = stdout.trim().split(/\r?\n/);
   for (const line of [...lines].reverse().slice(0, 12)) {
