@@ -3,6 +3,7 @@
 // 흐름(계획 수렴·구현 전달)은 PlanningPipeline·DeliveryPipeline이, 공개 API는 WorkflowEngine 파사드가 갖는다.
 import { randomUUID } from "node:crypto";
 import { ZodError } from "zod";
+import { ToleranceFormatError } from "../../shared/tolerance.js";
 import {
   AgentResultSchema,
   DeferredFindingsSchema,
@@ -47,6 +48,11 @@ export class FormatViolation extends Error {
     super(message);
     this.name = "FormatViolation";
   }
+}
+
+// 표기만 고치면 되는 위반(추론 low 로 교정): 스키마 오류·응답 종류·허용 오차 블록 형식. 처분 판단이 필요한 위반(쟁점 누락 등)은 제외.
+export function isFormatOnlyViolation(error: unknown): boolean {
+  return error instanceof ZodError || error instanceof FormatViolation || error instanceof ToleranceFormatError;
 }
 
 export class HandledWorkflowInterruption extends Error {
@@ -262,7 +268,7 @@ export class EngineCore {
       return parsed;
     } catch (error) {
       if (error instanceof HandledWorkflowInterruption) throw error;
-      formatOnly = error instanceof ZodError || error instanceof FormatViolation;
+      formatOnly = isFormatOnlyViolation(error);
       violation = error instanceof Error ? error.message : String(error);
     }
     this.event(topic.id, "system", "system",

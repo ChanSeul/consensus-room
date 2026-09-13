@@ -101,7 +101,7 @@ function planContract(): string {
   return [
     "최종 plan.md에는 아래 제목이 모두 있어야 합니다.",
     ...REQUIRED_PLAN_HEADINGS.map((heading) => `- ## ${heading}`),
-    "`## 허용 오차` 절에는 fenced 블록 ```tolerance {JSON} ``` 을 둡니다 — scopePaths(이 계획의 승인 경로 glob 목록)와 rules(각각 id `T-n`·title·paths(적용 영역 glob)·hunk(`insert-token`|`annotation-only`|`any`)·tokens·maxFiles·maxHunks·invariants). 규칙이 없으면 `\"rules\": []`. 서버가 이 블록을 파싱해 구현 결과의 승인 범위 밖 변경을 git diff 로 기계 대조하므로, 술어는 diff 만으로 판정 가능해야 하고 상한은 숫자여야 합니다. 부류 예: 다른 단계 소유 파일의 격리 표기 한 줄(insert-token: nonisolated), 모듈 선언의 표기 변경(annotation-only: @Sendable). 동작 변경·우회 표기(`@unchecked Sendable`·`nonisolated(unsafe)`·`assumeIsolated`)는 규칙으로 허용하지 마세요.",
+    "`## 허용 오차` 절에는 fenced 블록 ```tolerance {JSON} ``` 을 둡니다 — scopePaths(이 계획의 승인 경로 glob 목록)와 rules(각각 id `T-n`·title·paths(적용 영역 glob)·hunk(`insert-token`|`annotation-only`|`any`)·tokens·maxFiles·maxHunks·invariants). 규칙이 없으면 `\"rules\": []`. 길이 상한: title ≤200자, tokens 각 ≤80자, invariants 각 ≤300자(넘으면 서버가 형식 오류로 거부합니다 — 긴 근거는 본문 절에 쓰고 invariant 는 한 문장으로). 서버가 이 블록을 파싱해 구현 결과의 승인 범위 밖 변경을 git diff 로 기계 대조하므로, 술어는 diff 만으로 판정 가능해야 하고 상한은 숫자여야 합니다. 부류 예: 다른 단계 소유 파일의 격리 표기 한 줄(insert-token: nonisolated), 모듈 선언의 표기 변경(annotation-only: @Sendable). 동작 변경·우회 표기(`@unchecked Sendable`·`nonisolated(unsafe)`·`assumeIsolated`)는 규칙으로 허용하지 마세요.",
     "확정되지 않은 분석 이벤트, API 계약, SDK 동작을 추정해서 만들지 마세요.",
     "외부 증거가 없으면 EXTERNAL_EVIDENCE로 남기고 억지로 합의하지 마세요.",
   ].join("\n");

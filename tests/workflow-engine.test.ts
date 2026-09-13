@@ -8,8 +8,9 @@ import { ArtifactStore } from "../src/server/artifacts";
 import { ConsensusDatabase } from "../src/server/database";
 import { GitService } from "../src/server/git";
 import type { AgentAdapter, CommandRunner, ProjectMemoryWriter } from "../src/server/types";
-import { EngineCore } from "../src/server/engine/core";
+import { EngineCore, FormatViolation, isFormatOnlyViolation } from "../src/server/engine/core";
 import { WorkflowEngine } from "../src/server/workflow";
+import { parseTolerancePolicy, ToleranceFormatError } from "../src/shared/tolerance";
 import { REQUIRED_PLAN_HEADINGS, type AgentResult } from "../src/shared/contracts";
 import { hashPlan, normalizePlan, redactSecrets } from "../src/shared/workflow";
 
@@ -3363,5 +3364,15 @@ describe("settled 쟁점 서버 승계 — 수정·리뷰 경로", () => {
     expect(carries[0].body).toContain("계약 교정 재제출 1회 뒤 확정");
     expect(carries[0].payload).toMatchObject({ carriedFindings: ["F-2"], corrected: true, label: "Claude fix" });
     database.close();
+  });
+});
+
+// 2026-09-13 S10H 실측: 허용 오차 블록 형식 오류가 xhigh 교정으로 갔다 — 표기 위반은 전부 low 로 분류한다.
+describe("계약 교정의 표기 위반 분류", () => {
+  it("스키마·응답 종류·허용 오차 블록 형식 오류는 표기 위반이고, 쟁점 누락(plain Error)은 아니다", () => {
+    expect(isFormatOnlyViolation(new FormatViolation("kind"))).toBe(true);
+    expect(isFormatOnlyViolation(new ToleranceFormatError("허용 오차 블록 형식 오류: rules.0.invariants.0 Too big"))).toBe(true);
+    expect(() => parseTolerancePolicy("## 허용 오차\n```tolerance\n{\"scopePaths\":[],\"rules\":[]}\n```\n")).toThrow(ToleranceFormatError);
+    expect(isFormatOnlyViolation(new Error("Claude fix 가 검토 쟁점을 누락했습니다: F-1"))).toBe(false);
   });
 });

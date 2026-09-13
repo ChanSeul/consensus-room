@@ -63,6 +63,15 @@ const TOLERANCE_FENCE = /```tolerance[^\n]*\n([\s\S]*?)\n```/;
 
 // 계획 본문에서 tolerance 블록을 꺼낸다. 블록이 없으면 null(정책 없음 — 엔진 대조 생략, 승계 계획 호환).
 // 블록이 있는데 형식이 틀리면 던진다 — 계획 계약 검사에서 잡혀 그 계획은 저장되지 않는다.
+// 허용 오차 블록의 JSON·스키마 오류는 **표기 오류**다 — 계약 교정을 low 추론으로 내리기 위해 따로 구분한다
+// (2026-09-13 S10H 실측: invariants 300자 초과가 plain Error 라 xhigh 교정 재제출로 갔다).
+export class ToleranceFormatError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ToleranceFormatError";
+  }
+}
+
 export function parseTolerancePolicy(planMarkdown: string): TolerancePolicy | null {
   const match = TOLERANCE_FENCE.exec(planMarkdown);
   if (!match) return null;
@@ -70,12 +79,12 @@ export function parseTolerancePolicy(planMarkdown: string): TolerancePolicy | nu
   try {
     raw = JSON.parse(match[1]);
   } catch (error) {
-    throw new Error(`허용 오차 블록이 JSON 이 아닙니다: ${error instanceof Error ? error.message : String(error)}`);
+    throw new ToleranceFormatError(`허용 오차 블록이 JSON 이 아닙니다: ${error instanceof Error ? error.message : String(error)}`);
   }
   const parsed = TolerancePolicySchema.safeParse(raw);
   if (!parsed.success) {
     const issue = parsed.error.issues[0];
-    throw new Error(`허용 오차 블록 형식 오류: ${issue ? `${issue.path.join(".")} ${issue.message}` : "unknown"}`);
+    throw new ToleranceFormatError(`허용 오차 블록 형식 오류: ${issue ? `${issue.path.join(".")} ${issue.message}` : "unknown"}`);
   }
   return parsed.data;
 }
