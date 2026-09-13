@@ -3466,3 +3466,35 @@ for(const resumeState of ["CODEX_AUDIT","CODEX_CLOSEOUT","CONSENSUS_ACK"] as con
   database.close();
  });
 }
+
+it("단계 토픽의 실제 호출은 공통 계약을 받고 작업 묶음 예산에도 누적된다",async()=>{
+ const {database,dependencies}=makeEngine("DRAFT",null);
+ const budget={execution:{inputTokens:100,outputTokens:100,durationMs:100000},total:{inputTokens:1000,outputTokens:1000,durationMs:1000000}};
+ database.workGroups.create("group",{title:"작업",goal:"전체 목표",contracts:"공통 계약 표식",stages:[
+  {id:"one",kind:"work",title:"첫 단계",goal:"지금 구현",acceptance:"검증",dependsOn:[],budget},
+  {id:"two",kind:"integration",title:"통합",goal:"미래 단계 표식",acceptance:"통합 검증",dependsOn:["one"],budget}]},"/tmp/repository","head");
+ database.workGroups.link("group","one","topic-1","head");
+ database.budgets.configure("topic-1",budget,"test");
+ database.budgets.configure("group",{...budget,execution:{...budget.execution,inputTokens:5}},"test");
+ let prompt="",codexCalls=0;
+ dependencies.claude.createSession=async turn=>{prompt=turn.prompt;turn.onUsage?.({inputTokens:10});return {sessionId:"stage-session",result:{kind:"PLAN",summary:"plan",planMarkdown:validPlan("단계"),findings:[],evidenceRefs:[]}};};
+ dependencies.claude.resumeTurn=async turn=>(await dependencies.claude.createSession(turn)).result;
+ dependencies.codex.createSession=async()=>{codexCalls++;throw new Error("blocked");};dependencies.codex.resumeTurn=async()=>{codexCalls++;throw new Error("blocked");};
+ const engine=new WorkflowEngine({...dependencies,enforceBudgets:true});engine.startPlan("topic-1");await waitForActionCompletion(database,"topic-1");
+ expect(prompt).toContain("공통 계약 표식");expect(prompt).not.toContain("미래 단계 표식");
+ expect(database.budgets.account("topic-1")?.used.inputTokens).toBe(10);expect(database.budgets.account("topic-1")?.pause).toBeNull();
+ expect(database.budgets.account("group")?.used.inputTokens).toBe(10);expect(database.budgets.account("group")?.pause).not.toBeNull();
+ expect(codexCalls).toBe(0);database.close();
+});
+
+it("묶음의 중간 단계는 푸시 전에 닫을 수 없고 전달 뒤에는 닫을 수 있다",()=>{
+ const {database,engine}=makeEngine("READY_TO_DELIVER","a".repeat(64),true);
+ const budget={execution:{inputTokens:10,outputTokens:10,durationMs:100},total:{inputTokens:100,outputTokens:100,durationMs:1000}};
+ database.workGroups.create("group",{title:"작업",goal:"목표",contracts:"계약",stages:[
+ {id:"a",kind:"work",title:"a",goal:"a",acceptance:"a",dependsOn:[],budget},
+ {id:"b",kind:"integration",title:"b",goal:"b",acceptance:"b",dependsOn:["a"],budget}]},"/repo","head");
+ database.workGroups.link("group","a","topic-1","head");
+ expect(()=>engine.close("topic-1")).toThrow("푸시");expect(database.getTopic("topic-1").state).toBe("READY_TO_DELIVER");
+ database.updateTopic("topic-1",{committedOID:"delivered",pushedOID:"delivered"});
+ expect(engine.close("topic-1").state).toBe("CLOSED");database.close();
+});

@@ -1,3 +1,5 @@
+import { WorkGroupInputSchema } from "../shared/workGroups.js";
+import { WorkGroupService } from "./workGroupService.js";
 import { BudgetPolicySchema } from "../shared/budgets.js";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -62,6 +64,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     executionLimits: config.executionLimits,
     enforceBudgets: config.enforceBudgets ?? true,
   });
+  const workGroups = new WorkGroupService(database,git,config.repositoryPath,config.worktreesDirectory,config.defaultAgentSettings);
   // 시작 URL의 일회성 token이나 인증 헤더가 request log에 남지 않도록 HTTP request logging을 끈다.
   const app = Fastify({ logger: false });
 
@@ -91,6 +94,59 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     memoryDirectory: config.memoryDirectory,
     defaultAgentSettings: config.defaultAgentSettings,
   }));
+  app.get("/api/work-groups",async()=>database.workGroups.list().map(group=>({...group,budget:database.budgets.account(group.id),stageStates:Object.fromEntries(group.stages.map(stage=>[stage.id,group.links[stage.id]?database.getTopic(group.links[stage.id].topicId).state:null]))})));
+  app.post("/api/work-groups",async(request,reply)=>{
+    const input=WorkGroupInputSchema.parse(request.body);
+    return runIdempotent(request,reply,globalLedger(database,"work-group:create"),201,key=>workGroups.create(input,id=>database.annotateGlobalRequest("work-group:create",key,{plannedGroupId:id})));
+  });
+  app.post<{Params:{id:string}}>("/api/work-groups/:id/next",async(request,reply)=>
+    runIdempotent(request,reply,globalLedger(database,`work-group:next:${request.params.id}`),201,key=>workGroups.next(request.params.id,(plannedTopicId,worktreePath)=>database.annotateGlobalRequest(`work-group:next:${request.params.id}`,key,{plannedTopicId,worktreePath}))));
+  app.post<{Params:{id:string}}>("/api/work-groups/:id/budget",async(request,reply)=>{
+    const body=request.body as {policy:unknown;version:number};
+    const policy=BudgetPolicySchema.parse(body?.policy);
+    return runIdempotent(request,reply,globalLedger(database,`work-group:budget:${request.params.id}`),200,key=>{
+      const group=database.workGroups.get(request.params.id);
+      for(const link of Object.values(group.links))workflow.assertBudgetEditable(link.topicId);
+      const granted=database.budgets.grant(group.id,key,policy,body.version);
+      for(const link of Object.values(group.links)) {
+        const topic=database.getTopic(link.topicId);
+        const interruption=database.getTimeline(topic.id).filter(event=>event.scopeGeneration===topic.scopeGeneration && event.actor==="system" && event.payload?.resumeState).at(-1);
+        if(topic.state!=="FAILED" && !(topic.state==="USER_DECISION_REQUIRED" && interruption?.payload?.budgetPause===true))continue;
+        try {database.budgets.assertAvailable([topic.id,group.id]);}
+        catch {return {...granted,resumeBlocked:"묶음 예산을 늘렸습니다. 해당 토픽의 예산도 추가한 뒤 재개하세요."};}
+        workflow.retry(topic.id,requestActionId(topic.id,"group-budget-resume",key));
+        return {...granted,resumedTopicId:topic.id};
+      }
+      return granted;
+    });
+  });
+  app.post<{Params:{id:string}}>("/api/work-groups/:id/revise",async(request,reply)=>{
+    const body=request.body as {input:unknown;version:number};
+    const input=WorkGroupInputSchema.parse(body?.input);
+    return runIdempotent(request,reply,globalLedger(database,`work-group:revise:${request.params.id}`),200,async()=>{
+      const group=database.workGroups.get(request.params.id);
+      for(const link of Object.values(group.links))workflow.assertBudgetEditable(link.topicId);
+      if(group.stages.every(stage=>group.links[stage.id] && database.getTopic(group.links[stage.id].topicId).state==="CLOSED"))throw new Error("완료한 작업 묶음은 변경할 수 없습니다.");
+      if(Object.keys(group.pending??{}).length)throw new Error("준비 중인 단계를 먼저 연결하세요.");
+      for(const stage of group.stages) {
+        const link=group.links[stage.id];
+        if(link && database.getTopic(link.topicId).state==="CLOSED" && JSON.stringify(stage)!==JSON.stringify(input.stages.find(next=>next.id===stage.id)))throw new Error("완료한 단계의 목표와 조건은 바꿀 수 없습니다.");
+      }
+      const next=database.workGroups.previewRevision(group.id,input,body.version);
+      for(const [stageId,link] of Object.entries(next.links)) {
+        const topic=database.getTopic(link.topicId);
+        if(topic.state!=="CLOSED") {
+          await workflow.handleScopeChange(topic.id,"공통 계약 변경: "+next.contracts);
+
+        }
+      }
+      database.workGroups.atomic(()=>{
+        database.workGroups.revise(group.id,input,body.version);
+        for(const [stageId,link] of Object.entries(next.links))if(database.getTopic(link.topicId).state!=="CLOSED")database.workGroups.acknowledgeRevision(group.id,stageId);
+      });
+      return database.workGroups.get(group.id);
+    });
+  });
   app.get("/api/topics", async () => database.listTopics());
 
   app.get<{ Params: { id: string } }>("/api/topics/:id/verifications", async (request) => {

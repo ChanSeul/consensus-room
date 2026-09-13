@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { buildApp } from "../src/server/app";
 import { ConsensusDatabase } from "../src/server/database";
@@ -21,10 +21,11 @@ async function makeApp(runner?: CommandRunner) {
   const unavailableRunner: CommandRunner = {
     run: async () => { throw new Error("이 테스트에서는 명령을 실행하지 않습니다."); },
   };
+  const adapterCalls:string[]=[];
   const adapter = (role: "claude" | "codex"): AgentAdapter => ({
     role,
-    createSession: async () => { throw new Error("이 테스트에서는 CLI를 실행하지 않습니다."); },
-    resumeTurn: async () => { throw new Error("이 테스트에서는 CLI를 실행하지 않습니다."); },
+    createSession: async () => { adapterCalls.push(role);throw new Error("이 테스트에서는 CLI를 실행하지 않습니다."); },
+    resumeTurn: async () => { adapterCalls.push(role);throw new Error("이 테스트에서는 CLI를 실행하지 않습니다."); },
     validateExistingSession: async () => false,
   });
   const database = new ConsensusDatabase(join(root, "room.sqlite"));
@@ -55,7 +56,7 @@ async function makeApp(runner?: CommandRunner) {
     claude: adapter("claude"),
     codex: adapter("codex"),
   });
-  return { app, database, root };
+  return { app, database, root, adapterCalls };
 }
 
 // worktree 생성 명령만 세는 가짜 git. 실제 저장소 없이 "몇 번 만들었는지"를 관측한다.
@@ -65,6 +66,7 @@ function countingGitRunner(): { runner: CommandRunner; worktreeAdds: string[] } 
   const runner: CommandRunner = {
     run: async ({ args, cwd }) => {
       const joined = args.join(" ");
+      if (joined === "rev-parse HEAD") return ok("a".repeat(40));
       if (joined === "rev-parse --show-toplevel") return ok(cwd);
       if (joined === "config --path --get core.hooksPath") return { exitCode: 1, stdout: "", stderr: "", jsonLines: [] };
       if (joined === "rev-parse --path-format=absolute --git-common-dir") return ok(join(cwd, ".git"));
@@ -475,4 +477,41 @@ it("activity API는 현재 세대의 역할별 최신 관측과 시각을 반환
     headers: { "x-consensus-token": "launch-token-for-test" } });
   expect(next.json().executionUsage).toEqual([]);
   await app.close();
+});
+
+it("작업 묶음 API는 단계 생성 중복을 막고 계약 변경 때 승인을 무효화한다",async()=>{
+ const {runner,worktreeAdds}=countingGitRunner();let failWorktree=false;
+ const {app,database,adapterCalls}=await makeApp({run:spec=>{if(failWorktree&&spec.args[0]==="worktree")throw new Error("worktree failure");return runner.run(spec);}});
+ const budget={execution:{inputTokens:100,outputTokens:100,durationMs:100000},total:{inputTokens:1000,outputTokens:1000,durationMs:1000000}};
+ const input={title:"단계 작업",goal:"목표",contracts:"기존 계약",stages:[
+  {id:"one",kind:"work",title:"구현",goal:"구현",acceptance:"테스트",dependsOn:[],budget},
+  {id:"two",kind:"integration",title:"통합",goal:"통합",acceptance:"전체 검증",dependsOn:["one"],budget}]};
+ const post=(url:string,payload:unknown,key:string)=>app.inject({method:"POST",url,payload:payload as any,headers:{"x-consensus-token":"launch-token-for-test","idempotency-key":key}});
+ try {
+  const created=await post("/api/work-groups",input,"create");expect(created.statusCode).toBe(201);const group=created.json();
+  const next=await post(`/api/work-groups/${group.id}/next`,{},"next");expect(next.statusCode).toBe(201);const topic=next.json();
+  const repeated=await post(`/api/work-groups/${group.id}/next`,{},"next");expect(repeated.json().id).toBe(topic.id);expect(worktreeAdds).toHaveLength(1);
+  const blocked=await post(`/api/work-groups/${group.id}/next`,{},"next-new");expect(blocked.statusCode).toBeGreaterThanOrEqual(400);expect(worktreeAdds).toHaveLength(1);
+  database.updateTopic(topic.id,{state:"AWAITING_USER_APPROVAL",planSHA256:"a".repeat(64),approvedPlanSHA256:"a".repeat(64)});
+  const revised=await post(`/api/work-groups/${group.id}/revise`,{input:{...input,contracts:"새 계약"},version:1},"revise");expect(revised.statusCode).toBe(200);
+  expect(database.getTopic(topic.id)).toMatchObject({state:"DRAFT",planSHA256:null,approvedPlanSHA256:null,planEpoch:2});
+  expect(database.budgets.account(topic.id)?.policy).toEqual(budget);
+  expect(database.workGroups.forTopic(topic.id)?.version).toBe(2);
+  database.updateTopic(topic.id,{state:"READY_TO_DELIVER",approvedPlanSHA256:"a".repeat(64)});failWorktree=true;
+  const failure=await post(`/api/work-groups/${group.id}/revise`,{input:{...input,contracts:"저장되면 안 되는 계약"},version:2},"revision-failure");
+  expect(failure.statusCode).toBeGreaterThanOrEqual(400);
+  expect(database.workGroups.get(group.id)).toMatchObject({version:2,contracts:"새 계약"});
+  expect(database.getTopic(topic.id).approvedPlanSHA256).toBe("a".repeat(64));failWorktree=false;
+  database.updateTopic(topic.id,{state:"USER_DECISION_REQUIRED",resumeState:"CLAUDE_PLAN"});
+  database.appendEvent({topicId:topic.id,actor:"system",kind:"system",state:"USER_DECISION_REQUIRED",body:"예산 중단",payload:{budgetPause:true,resumeState:"CLAUDE_PLAN"}});
+  database.budgets.start({id:"group-cap",accounts:[group.id],startedAt:Date.now(),stage:"PLAN",role:"claude",model:"test",effort:"test"});
+  database.budgets.observe("group-cap",{inputTokens:100},Date.now(),true);
+  const groupPolicy=database.budgets.account(group.id)!.policy;
+  const granted=await post(`/api/work-groups/${group.id}/budget`,{version:1,policy:{...groupPolicy,execution:{...groupPolicy.execution,inputTokens:200}}},"grant");
+  expect(granted.statusCode).toBe(200);
+  await vi.waitFor(()=>expect(adapterCalls).toEqual(["claude"]));
+  await vi.waitFor(()=>expect(database.runningAction(topic.id)).toBeNull());
+  expect(database.budgets.account(group.id)?.used.inputTokens).toBe(100);
+
+ } finally {await app.close();}
 });

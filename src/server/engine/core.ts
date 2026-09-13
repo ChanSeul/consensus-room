@@ -1,3 +1,4 @@
+import { wrapWorkGroupAdapter } from "../workGroupAdapter.js";
 import { BudgetController } from "../budgetController.js";
 import { BudgetBlocked } from "../budgetLedger.js";
 import { applyPlanLineEdits, applyPlanRepair, planRepairPrompt, repairablePlan } from "../../shared/planPatches.js";
@@ -95,6 +96,10 @@ export class EngineCore {
   private readonly warnedLimits = new Map<string, Set<string>>();
 
   constructor(readonly dependencies: WorkflowDependencies) {
+    dependencies = {...dependencies,
+      claude:wrapWorkGroupAdapter(dependencies.claude,dependencies.database,dependencies.git),
+      codex:wrapWorkGroupAdapter(dependencies.codex,dependencies.database,dependencies.git)};
+    this.dependencies=dependencies;
     if (dependencies.enforceBudgets) {
       const controller = new BudgetController(dependencies.database.budgets, cwd => {
         const topic = dependencies.database.listTopics().find(t => t.worktreePath === cwd && this.active.has(t.id));
@@ -107,7 +112,10 @@ export class EngineCore {
     }
   }
 
-  budgetAccounts(topicId: string): string[] { return [topicId]; }
+  budgetAccounts(topicId: string): string[] {
+    const group=this.dependencies.database.workGroups.forTopic(topicId);
+    return group?[topicId,group.id]:[topicId];
+  }
   assertBudgetAvailable(topicId: string): void {
     if (this.dependencies.enforceBudgets) this.dependencies.database.budgets.assertAvailable(this.budgetAccounts(topicId));
   }

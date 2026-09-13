@@ -1,3 +1,5 @@
+import type { WorkGroup, WorkGroupInput } from "../shared/workGroups";
+import type { BudgetAccount } from "../shared/budgets";
 import type {
   ActionResponse,
   AttachParticipantInput,
@@ -92,6 +94,12 @@ function unwrapTopics(payload: Topic[] | { topics: Topic[] }): Topic[] {
 }
 
 export const api = {
+  listWorkGroups:()=>request<Array<WorkGroup & {budget:BudgetAccount|null;stageStates:Record<string,string|null>}>>("/work-groups"),
+  createWorkGroup:(input:WorkGroupInput)=>request<WorkGroup>("/work-groups",{method:"POST",body:JSON.stringify(input)}),
+  nextWorkStage:(id:string)=>request<Topic>(`/work-groups/${id}/next`,{method:"POST",body:"{}"}),
+  reviseWorkGroup:(id:string,input:WorkGroupInput,version:number)=>request<WorkGroup>(`/work-groups/${id}/revise`,{method:"POST",body:JSON.stringify({input,version})}),
+  grantWorkGroup:(id:string,body:unknown)=>request<BudgetAccount & {resumedTopicId?:string;resumeBlocked?:string}>(`/work-groups/${id}/budget`,{method:"POST",body:JSON.stringify(body)}),
+
   getConfig(): Promise<ClientConfig> {
     return request<ClientConfig>("/config");
   },

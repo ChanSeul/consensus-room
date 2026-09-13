@@ -312,6 +312,11 @@ export class WorkflowEngine {
     }
     const topic = this.core.dependencies.database.getTopic(topicId);
     if (topic.state !== "READY_TO_DELIVER") throw new Error("전달 준비가 끝난 주제만 닫을 수 있습니다.");
+    const group=this.core.dependencies.database.workGroups.forTopic(topicId);
+    if(group && group.links[group.stages.at(-1)!.id]?.topicId!==topicId) {
+      const flags=this.core.dependencies.database.getFlags(topicId);
+      if(!flags.pushedOID || flags.pushedOID!==flags.committedOID)throw new Error("다음 단계로 넘어가려면 먼저 커밋과 푸시를 완료하세요.");
+    }
     return this.core.transition(topicId, "CLOSED", "주제를 닫았습니다.");
   }
 

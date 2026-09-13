@@ -240,3 +240,9 @@ h3 { font-size: 17px; }
 .budget-panel fieldset { display: flex; gap: 12px; flex-wrap: wrap; margin: 10px 0; }
 .budget-panel label { display: grid; gap: 4px; }
 .budget-panel input { width: 150px; padding: 6px; }
+
+.work-groups { padding: 12px; border-bottom: 1px solid var(--border); }
+.work-groups form, .work-groups label { display: grid; gap: 8px; margin-block: 8px; }
+.work-groups input, .work-groups textarea { width: 100%; min-width: 0; }
+.work-groups fieldset { min-width: 0; }
+.work-groups button { margin-block: 4px; }

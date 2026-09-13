@@ -1,3 +1,4 @@
+import { WorkGroupsPanel } from "./WorkGroupsPanel";
 import { BudgetPanel } from "./BudgetPanel";
 import {
   FormEvent,
@@ -459,6 +460,7 @@ export function App() {
             </div>
             <button className="icon-button" onClick={() => setDialog("create")} aria-label="새 주제 만들기">+</button>
           </div>
+          <WorkGroupsPanel onTopic={id=>{void refreshTopics();setSelectedTopicId(id);setMobilePanel("chat");}}/>
           <div className="topic-list">
             {loading ? (
               <div className="skeleton-list" aria-label="주제를 불러오는 중"><i /><i /><i /></div>

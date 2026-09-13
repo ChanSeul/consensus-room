@@ -1,3 +1,4 @@
+import { WorkGroups } from "./workGroups.js";
 import { BudgetLedger } from "./budgetLedger.js";
 import { EventEmitter } from "node:events";
 import { mkdirSync } from "node:fs";
@@ -43,6 +44,7 @@ export class ConsensusDatabase {
   readonly events = new EventEmitter();
   private readonly db: DatabaseSync;
   readonly budgets: BudgetLedger;
+  readonly workGroups: WorkGroups;
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true });
@@ -50,6 +52,7 @@ export class ConsensusDatabase {
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
     this.migrate();
     this.budgets = new BudgetLedger(this.db);
+    this.workGroups = new WorkGroups(this.db);
   }
 
   close(): void {
@@ -1111,6 +1114,10 @@ export class ConsensusDatabase {
         ...parseRequestRecord(row.request_json),
         ...parseRequestRecord(row.planned_json),
       };
+      if(typeof planned.plannedGroupId==="string" && this.workGroups.list().some(group=>group.id===planned.plannedGroupId)) {
+        this.finishGlobalRequest(scope,key,this.workGroups.get(planned.plannedGroupId));
+        continue;
+      }
       const plannedTopicId = typeof planned.plannedTopicId === "string" ? planned.plannedTopicId : null;
       const topicExists = plannedTopicId
         ? Boolean(this.db.prepare("SELECT 1 FROM topics WHERE id = ?").get(plannedTopicId))
