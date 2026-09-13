@@ -113,6 +113,32 @@ export const PlanEditSchema = z.object({
 });
 export type PlanEdit = z.infer<typeof PlanEditSchema>;
 
+export const PlanLineEditsSchema = z.object({
+  baseSHA256: z.string().regex(/^[a-f0-9]{64}$/),
+  edits: z.array(z.object({
+    startLine: z.number().int().min(1),
+    endLineExclusive: z.number().int().min(1),
+    replacement: z.string(),
+  }).strict()).max(200),
+}).strict();
+export type PlanLineEdits = z.infer<typeof PlanLineEditsSchema>;
+
+export const PlanRepairSchema = z.object({
+  baseSHA256: z.string().regex(/^[a-f0-9]{64}$/),
+  edits: z.array(PlanEditSchema.strict()).min(1).max(200),
+}).strict();
+export type PlanRepair = z.infer<typeof PlanRepairSchema>;
+export const PlanRepairJsonSchema = {
+  type: "object", additionalProperties: false, required: ["baseSHA256", "edits"],
+  properties: {
+    baseSHA256: { type: "string", pattern: "^[a-f0-9]{64}$" },
+    edits: { type: "array", items: {
+      type: "object", additionalProperties: false, required: ["find", "replace"],
+      properties: { find: { type: "string" }, replace: { type: "string" } },
+    } },
+  },
+} as const;
+
 export const AgentResultSchema = z.object({
   kind: z.enum([
     "PLAN",
@@ -128,6 +154,7 @@ export const AgentResultSchema = z.object({
   summary: z.string().min(1),
   planMarkdown: z.string().min(1).optional(),
   planEdits: z.array(PlanEditSchema).max(200).optional(),
+  planLineEdits: PlanLineEditsSchema.optional(),
   planSHA256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   findings: z.array(FindingSchema).default([]),
   evidenceRefs: z.array(z.string()).default([]),
@@ -135,6 +162,10 @@ export const AgentResultSchema = z.object({
   memoryUpdates: z.array(MemoryUpdateSchema).max(10).optional(),
   // 허용 오차 원장 — 승인 범위 밖 변경마다 {ruleId, file, note}. 서버가 git diff 와 대조한다(shared/tolerance.ts).
   toleranceLedger: z.array(ToleranceLedgerEntrySchema).max(500).optional(),
+ }).superRefine((result, context) => {
+  if (result.planLineEdits && (result.kind !== "REVISION" || result.planEdits !== undefined || result.planMarkdown !== undefined)) {
+    context.addIssue({ code: "custom", message: "planLineEdits는 REVISION에서 단독으로 사용해야 합니다." });
+  }
 });
 export type AgentResult = z.infer<typeof AgentResultSchema>;
 
@@ -313,7 +344,7 @@ export const AgentResultJsonSchema = {
   type: "object",
   additionalProperties: false,
   required: [
-    "kind", "summary", "planMarkdown", "planEdits", "planSHA256",
+    "kind", "summary", "planMarkdown", "planEdits", "planLineEdits", "planSHA256",
     "findings", "evidenceRefs", "requestedUserDecision", "memoryUpdates", "toleranceLedger",
   ],
   properties: {
@@ -337,6 +368,16 @@ export const AgentResultJsonSchema = {
         { type: "null" },
       ],
     },
+    planLineEdits: { anyOf: [{
+      type: "object", additionalProperties: false, required: ["baseSHA256", "edits"],
+      properties: {
+        baseSHA256: { type: "string" },
+        edits: { type: "array", items: {
+          type: "object", additionalProperties: false, required: ["startLine", "endLineExclusive", "replacement"],
+          properties: { startLine: { type: "integer" }, endLineExclusive: { type: "integer" }, replacement: { type: "string" } },
+        } },
+      },
+    }, { type: "null" }] },
     planSHA256: { anyOf: [{ type: "string" }, { type: "null" }] },
     findings: {
       type: "array",

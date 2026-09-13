@@ -1,3 +1,4 @@
+import { applyPlanLineEdits, applyPlanRepair, planRepairPrompt, repairablePlan } from "../../shared/planPatches.js";
 // WorkflowEngine 분해(2026-08-31): 상태 전환·세션·산출물·메모리·전달이 한 클래스(1,504줄)에 있어
 // 순서 결함이 반복된다는 Codex 진단에 따른 분리. EngineCore는 공유 상태와 횡단 프리미티브만 갖는다 —
 // 흐름(계획 수렴·구현 전달)은 PlanningPipeline·DeliveryPipeline이, 공개 API는 WorkflowEngine 파사드가 갖는다.
@@ -190,6 +191,7 @@ export class EngineCore {
       // 이 턴에 추가로 읽기를 허용할 경로(주제 plan.md 등).
       readablePaths?: readonly string[];
       normalize?: ResultNormalizer;
+      planBase?: string;
     } = {},
   ): Promise<AgentResult> {
     const { freshSession = false, planMode = false, check } = options;
@@ -198,6 +200,9 @@ export class EngineCore {
     const participant = this.participant(topic, role);
     const resumeSessionId = options.session ? options.session.id : participant.sessionId;
     const adapter = this.adapter(role);
+    let executionId: string | undefined;
+    const observeUsage = this.usageObserver(topic.id, role, "턴");
+    const onUsage = (usage: TurnUsage) => { executionId = usage.executionId; observeUsage(usage); };
     let result: AgentResult;
     let sessionId: string;
     if (freshSession || !resumeSessionId || resumeSessionId.startsWith("pending:")) {
@@ -205,7 +210,7 @@ export class EngineCore {
         prompt, cwd: topic.worktreePath, signal, implementation, planMode,
         settings: this.executionSettings(topic.id, role, implementation),
         onProcessSpawn: this.processObserver(topic.id),
-        onUsage: this.usageObserver(topic.id, role, "턴"),
+        onUsage,
         readablePaths: options.readablePaths,
       });
       this.assertCurrent(topic.id, signal, topic.scopeGeneration, topic.state);
@@ -227,16 +232,28 @@ export class EngineCore {
         sessionId: resumeSessionId, prompt, cwd: topic.worktreePath, signal, implementation, planMode,
         settings: this.executionSettings(topic.id, role, implementation),
         onProcessSpawn: this.processObserver(topic.id),
-        onUsage: this.usageObserver(topic.id, role, "턴"),
+        onUsage,
         readablePaths: options.readablePaths,
       });
       sessionId = resumeSessionId;
     }
     this.assertCurrent(topic.id, signal, topic.scopeGeneration, topic.state);
     if (await this.interruptPreservingResult(topic, role, result, startedAfter, signal)) throw new HandledWorkflowInterruption();
-    return this.enforceResultContract(role, topic, result, sessionId, {
-      signal, implementation, planMode, startedAfter, check, readablePaths: options.readablePaths, normalize: options.normalize,
-    });
+    let accepted = false;
+    try {
+      const checked = await this.enforceResultContract(role, topic, result, sessionId, {
+        signal, implementation, planMode, startedAfter, check, readablePaths: options.readablePaths, normalize: options.normalize, planBase: options.planBase,
+      });
+      accepted = true;
+      return checked;
+    } finally {
+      if (result.kind === "PLAN" || result.kind === "REVISION") this.dependencies.database.saveOptimizationMetric(topic.id, topic.scopeGeneration, executionId, {
+        kind: "plan-output", success: accepted, format: result.planLineEdits ? "lines" : result.planEdits ? "find-replace" : "full",
+        responseBytes: Buffer.byteLength(JSON.stringify(result), "utf8"),
+        patchBytes: Buffer.byteLength(JSON.stringify(result.planLineEdits ?? result.planEdits ?? result.planMarkdown ?? ""), "utf8"),
+        patchCount: result.planLineEdits?.edits.length ?? result.planEdits?.length ?? 0,
+      });
+    }
   }
 
   // 기계 계약 위반은 작업 실패가 아니라 표기 실패다. 턴을 버리면 그때까지의 작업 비용 전체가 소각되므로
@@ -257,10 +274,12 @@ export class EngineCore {
       readablePaths?: readonly string[];
       // 파싱 직후·검사 직전에 결과를 손질한다(예: 판단이 끝난 앞 단계 쟁점을 서버가 승계). 교정 재제출의 재파싱에도 같이 적용된다.
       normalize?: ResultNormalizer;
+      planBase?: string;
     },
   ): Promise<AgentResult> {
     let violation: string;
     let formatOnly = false;
+    let repairPlan: string | null = null;
     try {
       const parsed = normalized(context.normalize, redactAgentResult(AgentResultSchema.parse(raw)));
       context.check?.(parsed);
@@ -270,6 +289,41 @@ export class EngineCore {
       if (error instanceof HandledWorkflowInterruption) throw error;
       formatOnly = isFormatOnlyViolation(error);
       violation = error instanceof Error ? error.message : String(error);
+      if (error instanceof ToleranceFormatError) repairPlan = repairablePlan(redactAgentResult(raw), context.planBase);
+    }
+    if (repairPlan && this.adapter(role).resumePlanRepair) {
+      const usageObserver = this.usageObserver(topic.id, role, "계약 교정 재제출");
+      let executionId: string | undefined;
+      let repaired: AgentResult | undefined;
+      let responseBytes: number | undefined;
+      let accepted = false;
+      try {
+        const sourceRevision = (this.dependencies.database.latestArtifact(topic.id, "plan-repair-source")?.revision ?? 0) + 1;
+        await this.writeArtifact(topic, "plan-repair-source", sourceRevision, JSON.stringify(redactAgentResult(raw)), context.signal);
+        const patch = await this.adapter(role).resumePlanRepair!({
+          sessionId, prompt: planRepairPrompt(repairPlan, violation), cwd: topic.worktreePath,
+          signal: context.signal, protocolOnly: true, implementation: false, planMode: false,
+          settings: { ...this.executionSettings(topic.id, role, false), effort: "low" },
+          onProcessSpawn: this.processObserver(topic.id),
+          onUsage: (usage) => { executionId = usage.executionId; usageObserver(usage); },
+        });
+        responseBytes = Buffer.byteLength(JSON.stringify(patch), "utf8");
+        this.assertCurrent(topic.id, context.signal, topic.scopeGeneration, topic.state);
+        if (this.interruptForNewUserInput(topic, context.startedAfter)) throw new HandledWorkflowInterruption();
+        if (this.dependencies.database.getTopic(topic.id).planSHA256 !== topic.planSHA256) throw new Error("교정 중 계획 기준이 바뀌었습니다.");
+        const planMarkdown = applyPlanRepair(repairPlan, patch);
+        const { planEdits: _oldEdits, planLineEdits: _oldLines, ...preserved } = raw;
+        repaired = normalized(context.normalize, redactAgentResult(AgentResultSchema.parse({ ...preserved, planMarkdown })));
+        context.check?.(repaired);
+        this.reportCarriedFindings(topic.id, context.normalize, true);
+        accepted = true;
+        return repaired;
+      } finally {
+        this.dependencies.database.saveOptimizationMetric(topic.id, topic.scopeGeneration, executionId, {
+          kind: "plan-repair", success: accepted, originalBytes: Buffer.byteLength(JSON.stringify(raw), "utf8"),
+          responseBytes,
+        });
+      }
     }
     this.event(topic.id, "system", "system",
       `기계 계약 위반을 같은 세션에 돌려보내 1회 교정합니다${formatOnly ? "(표기 교정 — 추론 low)" : ""}: ${violation}`);
@@ -706,6 +760,11 @@ export class EngineCore {
   requireRevisedPlan(result: AgentResult, baseMarkdown: string): string {
     // 빈 배열도 패치 모드다 — "계획 변경 없음"(개정 6·12 실측 패턴). planMarkdown 누락으로
     // 오판해 거부하면 무수정 개정이 성립할 수 없다(2026-08-31 Codex 지적 재현 확인).
+    if (result.planLineEdits) {
+      const patched = applyPlanLineEdits(baseMarkdown, result.planLineEdits);
+      assertPlanContract(patched);
+      return patched;
+    }
     if (result.planEdits) {
       const patched = applyPlanEdits(baseMarkdown, result.planEdits);
       assertPlanContract(patched);

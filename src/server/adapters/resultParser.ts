@@ -1,4 +1,4 @@
-import { AgentResultSchema, type AgentResult } from "../../shared/contracts.js";
+import { PlanRepairSchema, type PlanRepair, AgentResultSchema, type AgentResult } from "../../shared/contracts.js";
 import { redactSecrets } from "../../shared/workflow.js";
 
 // AgentResultJsonSchema는 선택 필드를 "required + null 허용"으로 표현한다 — OpenAI 구조화 출력이
@@ -6,7 +6,7 @@ import { redactSecrets } from "../../shared/workflow.js";
 // zod에서 그 필드들은 optional이라 null을 받지 못한다. 그래서 파싱 전에 값이 null인 키만 지운다.
 // memoryUpdates[].expectedSHA256처럼 null 자체가 유효한 값인 필드는 건드리지 않으므로 재귀로 훑지 않는다.
 const OPTIONAL_KEYS = [
-  "planMarkdown", "planEdits", "planSHA256", "requestedUserDecision", "memoryUpdates", "findings", "evidenceRefs",
+  "planMarkdown", "planEdits", "planLineEdits", "planSHA256", "requestedUserDecision", "memoryUpdates", "findings", "evidenceRefs",
   "toleranceLedger",
 ] as const;
 
@@ -143,4 +143,31 @@ function parseJsonText(text: string): AgentResult | null {
     } catch { /* next representation */ }
   }
   return null;
+}
+
+
+// Repair responses cannot be interpreted as a full AgentResult (or accidentally reuse one from stdout).
+export function parsePlanRepair(candidates: unknown[], stdout: string): PlanRepair {
+  const inspect = (value: unknown, depth = 0): PlanRepair | null => {
+    if (depth > 4) return null;
+    if (typeof value === "string") {
+      try { return inspect(JSON.parse(value), depth + 1); } catch { return null; }
+    }
+    const parsed = PlanRepairSchema.safeParse(value);
+    if (parsed.success) return parsed.data;
+    if (!value || typeof value !== "object") return null;
+    const row = value as Record<string, unknown>;
+    for (const key of ["structured_output", "structuredOutput", "result", "output", "text", "item"]) {
+      const nested = inspect(row[key], depth + 1);
+      if (nested) return nested;
+    }
+    return null;
+  };
+  for (const candidate of [...candidates].reverse()) {
+    const repair = inspect(candidate);
+    if (repair) return repair;
+  }
+  const direct = inspect(stdout);
+  if (direct) return direct;
+  throw new Error("부분 교정 결과가 PlanRepair 계약을 만족하지 않습니다.");
 }

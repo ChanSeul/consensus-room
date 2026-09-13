@@ -1588,7 +1588,7 @@ describe("개정 턴은 이전 개정본을 다시 실어 나르지 않는다", 
   it("개정 프롬프트가 계획 전문을 직접 담아 세션 기억에 기대지 않는다", async () => {
     const { database, first, revisionPrompt } = await runToRevision();
 
-    expect(revisionPrompt).toContain(first.trim().slice(0, 60));
+    for (const [index, line] of first.trim().split("\n").entries()) expect(revisionPrompt).toContain(`${index + 1} | ${line}`);
     expect(revisionPrompt).toContain("Codex 감사:");
     database.close();
   });
@@ -3375,4 +3375,84 @@ describe("계약 교정의 표기 위반 분류", () => {
     expect(() => parseTolerancePolicy("## 허용 오차\n```tolerance\n{\"scopePaths\":[],\"rules\":[]}\n```\n")).toThrow(ToleranceFormatError);
     expect(isFormatOnlyViolation(new Error("Claude fix 가 검토 쟁점을 누락했습니다: F-1"))).toBe(false);
   });
+});
+
+
+describe("부분 계획 교정의 엔진 경계", () => {
+  const broken = () => validPlan("부분 교정").replace('"rules":[]', '"rules":[],');
+  it("PLAN의 블록만 고쳐 기존 쟁점·근거와 다음 계약 검사를 보존한다", async () => {
+    const { database, dependencies } = makeEngine("DRAFT", null);
+    database.updateTopic("topic-1", { state: "CLAUDE_PLAN" });
+    let calls = 0;
+    dependencies.claude.resumePlanRepair = async (turn) => {
+      calls++; expect(turn.protocolOnly).toBe(true); expect(turn.settings?.effort).toBe("low");
+      expect(turn.prompt).not.toContain("불변인 요약");
+      turn.onUsage?.({ executionId: "repair-1", recordKind: "final", outputTokens: 20 });
+      return { baseSHA256: hashPlan(broken()), edits: [{ find: '"rules":[],', replace: '"rules":[]' }] };
+    };
+    const core = new EngineCore(dependencies);
+    const raw: AgentResult = { kind: "PLAN", summary: "불변인 요약", planMarkdown: broken(), findings: [finding("S", "기존 쟁점")], evidenceRefs: ["기존 근거"] };
+    let result: AgentResult | undefined;
+    core.startAction("topic-1", "plan", async signal => {
+      result = await core.enforceResultContract("claude", database.getTopic("topic-1"), raw, "session", {
+        signal, implementation: false, planMode: true, startedAfter: 0,
+        check: r => { core.assertKind(r, "PLAN"); core.requirePlan(r); },
+      });
+    });
+    await waitForActionCompletion(database, "topic-1");
+    expect(calls).toBe(1); expect(result).toMatchObject({ summary: raw.summary, findings: raw.findings, evidenceRefs: raw.evidenceRefs });
+    expect(result?.planMarkdown, database.getTopic("topic-1").lastError ?? "").toBe(normalizePlan(validPlan("부분 교정")));
+    expect(database.optimizationMetrics("topic-1")[0]).toMatchObject({ executionId: "repair-1", metrics: { kind: "plan-repair", success: true } });
+    expect(database.getPromptTimeline("topic-1", 3).some(e => e.body.includes("plan-repair"))).toBe(false);
+  });
+  it.each(["invalid", "cancel", "input"])("%s이면 부분 교정에서 멈추고 전체 재제출을 추가하지 않는다", async (mode) => {
+    const { database, dependencies } = makeEngine("DRAFT", null);
+    database.updateTopic("topic-1", { state: "CLAUDE_PLAN" });
+    let calls = 0;
+    dependencies.claude.resumePlanRepair = async () => {
+      calls++;
+      if (mode === "cancel") void core.stopIfRunning("topic-1");
+      if (mode === "input") database.appendEvent({ topicId: "topic-1", actor: "user", kind: "decision", state: "CLAUDE_PLAN", body: "새 결정" });
+      return { baseSHA256: mode === "invalid" ? "0".repeat(64) : hashPlan(broken()), edits: [{ find: '"rules":[],', replace: '"rules":[]' }] };
+    };
+    dependencies.claude.resumeTurn = async () => { throw new Error("전체 재제출 호출 금지"); };
+    const core = new EngineCore(dependencies);
+    const raw: AgentResult = { kind: "PLAN", summary: "x", planMarkdown: broken(), findings: [], evidenceRefs: [] };
+    let caught: unknown;
+    core.startAction("topic-1", "plan", async signal => {
+      try { await core.enforceResultContract("claude", database.getTopic("topic-1"), raw, "session", {
+        signal, implementation: false, planMode: true, startedAfter: 0, check: r => { core.requirePlan(r); },
+      }); } catch (error) { caught = error; throw error; }
+    });
+    await waitForActionCompletion(database, "topic-1");
+    expect(caught).toBeInstanceOf(Error);
+    expect(String(caught)).not.toContain("전체 재제출 호출 금지");
+    expect(calls).toBe(1);
+    expect(database.optimizationMetrics("topic-1")[0].metrics.success).toBe(false);
+  });
+});
+
+it("줄 패치 개정도 감사·종결·ACK를 거쳐 같은 계획으로 승인 대기한다", async () => {
+  const first = normalizePlan(validPlan("기준"));
+  const lines = first.trimEnd().split("\n");
+  const lineIndex = lines.findIndex(line => line.startsWith("기준:"));
+  const replacement = lines[lineIndex].replace("기준:", "수정:") + "\n";
+  const changed = [...lines]; changed[lineIndex] = replacement.trimEnd();
+  const expected = changed.join("\n") + "\n";
+  const sha = hashPlan(expected);
+  const { database, engine, artifacts } = makePlanningEngine({
+    slug: "line-plan", claudeResults: [
+      { kind: "PLAN", summary: "기준", planMarkdown: first, findings: [], evidenceRefs: [] },
+      { kind: "REVISION", summary: "한 줄 수정", planLineEdits: { baseSHA256: hashPlan(first), edits: [{ startLine: lineIndex + 1, endLineExclusive: lineIndex + 2, replacement }] }, findings: [], evidenceRefs: [] },
+      { kind: "ACK", summary: "확인", planSHA256: sha, findings: [], evidenceRefs: [] },
+    ], codexResults: [
+      { kind: "AUDIT", summary: "감사", findings: [], evidenceRefs: [] },
+      { kind: "CLOSEOUT", summary: "종결", planSHA256: sha, findings: [], evidenceRefs: [] },
+      { kind: "ACK", summary: "확인", planSHA256: sha, findings: [], evidenceRefs: [] },
+    ],
+  });
+  engine.startPlan("topic-1"); await waitForActionCompletion(database, "topic-1");
+  expect(database.getTopic("topic-1")).toMatchObject({ state: "AWAITING_USER_APPROVAL", planSHA256: sha });
+  expect(await artifacts.readLatest("topic-1", "plan")).toBe(expected);
+  expect(database.optimizationMetrics("topic-1").some(row => row.metrics.format === "lines" && row.metrics.success)).toBe(true);
 });

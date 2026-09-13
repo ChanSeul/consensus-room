@@ -236,7 +236,7 @@ export class PlanningPipeline {
       planMarkdown: storedFirstPlan.markdown, audit, scopeGeneration: topic.scopeGeneration,
       timeline: this.core.dependencies.database.getPromptTimeline(topicId, topic.scopeGeneration),
     }), signal, false, {
-      freshSession: true, planMode: audit.findings.length === 0,
+      freshSession: true, planMode: audit.findings.length === 0, planBase: storedFirstPlan.markdown,
       normalize: this.core.carryForwardNormalizer(audit.findings, "Claude revision", { forReview: false }),
       check: (r) => {
         this.core.assertKind(r, "REVISION");
@@ -282,7 +282,7 @@ export class PlanningPipeline {
       timeline: this.core.dependencies.database.getPromptTimeline(topicId, topic.scopeGeneration),
       source: "closeout",
     }), signal, false, {
-      freshSession: true, planMode: false,
+      freshSession: true, planMode: false, planBase: storedRevisedPlan.markdown,
       normalize: this.core.carryForwardNormalizer(source.findings, "Claude revision(2회차)", { forReview: false }),
       check: (r) => {
         this.core.assertKind(r, "REVISION");

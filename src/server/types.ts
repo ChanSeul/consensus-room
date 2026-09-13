@@ -1,6 +1,7 @@
 import type {
   AgentExecutionSettings,
   AgentResult,
+  PlanRepair,
   AgentRole,
   MemoryUpdate,
   WorkflowState,
@@ -136,6 +137,7 @@ export interface AgentAdapter {
   readonly role: ParticipantRole;
   createSession(turn: Omit<SessionTurn, "sessionId">): Promise<CreatedSession>;
   resumeTurn(turn: SessionTurn): Promise<AgentResult>;
+  resumePlanRepair?(turn: SessionTurn): Promise<PlanRepair>;
   validateExistingSession(sessionId: string): Promise<boolean>;
 }
 

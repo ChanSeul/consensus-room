@@ -6,15 +6,16 @@ import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import {
   AgentResultJsonSchema,
+  PlanRepairJsonSchema, type PlanRepair,
   DEFAULT_AGENT_SETTINGS,
   type AgentResult,
 } from "../../shared/contracts.js";
 import { EXECUTION_POLICY_NOTE } from "../../shared/prompts.js";
-import type { AgentAdapter, CommandRunner, CreatedSession, SessionTurn } from "../types.js";
+import type { AgentAdapter, CommandRunner, CommandResult, CreatedSession, SessionTurn } from "../types.js";
 import { agentEnvironment } from "../security.js";
 import { ProjectMemoryReader } from "../projectMemory.js";
 import { readAppliedInstructions } from "../projectInstructions.js";
-import { describeCommandFailure, parseAgentResult } from "./resultParser.js";
+import { describeCommandFailure, parsePlanRepair, parseAgentResult } from "./resultParser.js";
 import { ExecutionMetrics } from "./executionMetrics.js";
 import { createToolTimeMeter } from "./toolTime.js";
 
@@ -80,16 +81,28 @@ export class ClaudeAdapter implements AgentAdapter {
     return this.invoke(turn, ["--resume", turn.sessionId], false);
   }
 
+  async resumePlanRepair(turn: SessionTurn): Promise<PlanRepair> {
+    const output = await this.invokeOutput({ ...turn, protocolOnly: true, implementation: false, planMode: false, readablePaths: [] },
+      ["--resume", turn.sessionId], false, PlanRepairJsonSchema);
+    return parsePlanRepair(output.jsonLines, output.stdout);
+  }
+
+  private async invoke(turn: Omit<SessionTurn, "sessionId"> | SessionTurn, args: string[], fresh: boolean): Promise<AgentResult> {
+    const output = await this.invokeOutput(turn, args, fresh);
+    return parseAgentResult(output.jsonLines, output.stdout);
+  }
+
   async validateExistingSession(sessionId: string): Promise<boolean> {
     if (!isUUID(sessionId)) return false;
     return findFile(join(homedir(), ".claude", "projects"), `${sessionId}.jsonl`, 3);
   }
 
-  private async invoke(
+  private async invokeOutput(
     turn: Omit<SessionTurn, "sessionId"> | SessionTurn,
     sessionArgs: string[],
     newSession: boolean,
-  ): Promise<AgentResult> {
+    outputSchema: unknown = AgentResultJsonSchema,
+  ): Promise<CommandResult> {
     const workspace = resolve(turn.cwd);
     const actionTemp = await mkdtemp(join(tmpdir(), "consensus-room-claude-"));
     try {
@@ -140,7 +153,7 @@ export class ClaudeAdapter implements AgentAdapter {
         "--output-format", "stream-json",
         "--include-partial-messages",
         "--verbose",
-        "--json-schema", JSON.stringify(AgentResultJsonSchema),
+        "--json-schema", JSON.stringify(outputSchema),
         ...sessionArgs,
       ];
       // 프로토콜 확인 턴은 판단에 필요한 값을 프롬프트가 다 담고 있어 지시문(CLAUDE.md)도 싣지 않는다
@@ -196,7 +209,7 @@ export class ClaudeAdapter implements AgentAdapter {
       if (output.exitCode !== 0) {
         throw new Error(describeCommandFailure("Claude", output.exitCode, output.stderr, output.stdout));
       }
-      return parseAgentResult(output.jsonLines, output.stdout);
+      return output;
       } finally {
         clearInterval(progressTimer);
         recordFinal();

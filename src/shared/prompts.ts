@@ -1,3 +1,4 @@
+import { numberedPlan } from "./planPatches";
 import type { AgentResult, DeferredFinding, Finding, TimelineEvent } from "./contracts";
 import type { TolerancePolicy } from "./tolerance";
 import { DISPOSITIONS, FIX_AWARE_KINDS, REQUIRED_PLAN_HEADINGS } from "./contracts";
@@ -213,7 +214,7 @@ export function buildClaudeRevisionPrompt(input: {
 범위 세대: ${input.scopeGeneration}
 기존 계획:
 ---
-${input.planMarkdown}
+${numberedPlan(input.planMarkdown)}
 ---
 
 ${closeoutRound ? "Codex 종결 확인의 새 쟁점:" : "Codex 감사:"}
@@ -226,7 +227,13 @@ ${dispositionContract("REVISION")}
 ${outputLanguageContract({ planBody: true })}
 반박할 때는 근거를 적고, 합의된 변경은 계획에 실제로 반영하세요. 새 범위를 몰래 추가하지 마세요.
 ${planContract()}
-반환 kind는 REVISION입니다. 계획 전문을 다시 쓰지 말고 **planEdits 패치**로 반환하세요:
+반환 kind는 REVISION입니다. 기본적으로 **planLineEdits**로 바뀐 줄만 반환하세요:
+- {baseSHA256, edits:[{startLine,endLineExclusive,replacement}]} 형식입니다. 기준 SHA는 위 값 그대로 복사하세요.
+- 모든 범위는 위 원문의 줄 번호(1부터 시작)를 기준으로 하며 끝 줄은 포함하지 않습니다. 번호와 구분자 | 는 원문에 포함되지 않습니다.
+- 삽입은 startLine=endLineExclusive, 삭제는 replacement=""입니다. 대체할 완전한 줄에는 끝 줄바꿈을 포함하세요. 마지막 줄 뒤 삽입 위치는 줄 수+1입니다.
+- 범위 겹침·같은 위치 복수 삽입은 금지합니다. planLineEdits 사용 시 planEdits와 planMarkdown은 null입니다.
+- 변경 문장과 필요한 문맥만 출력하고, 변하지 않은 원문은 복사하지 마세요. 필요한 근거와 조건을 생략하지 마세요.
+호환용 planEdits 패치도 허용합니다:
 - planEdits는 {find, replace} 목록이고 순서대로 적용됩니다.
 - 각 find는 위 "기존 계획" 본문에서 **정확히 한 번** 일치하는 원문이어야 합니다. 0회나 복수 일치면
   서버가 어느 편집이 실패했는지 명시하며 응답을 거부합니다. 필요하면 앞뒤 문맥을 늘려 유일하게 만드세요.

@@ -103,8 +103,25 @@ export class ConsensusDatabase {
       phase: String(row.phase), observedAt: String(row.observed_at), usage: JSON.parse(String(row.usage_json)) as TurnUsage }));
   }
 
+  saveOptimizationMetric(topicId: string, generation: number, executionId: string | undefined, metrics: Record<string, unknown>): void {
+    try {
+      this.db.prepare("INSERT INTO optimization_metrics(topic_id, scope_generation, execution_id, record_json, created_at) VALUES (?, ?, ?, ?, ?)")
+        .run(topicId, generation, executionId ?? null, JSON.stringify(metrics), now());
+    } catch { /* Optional measurements must not change the execution outcome. */ }
+  }
+
+  optimizationMetrics(topicId: string): Array<{ executionId: string | null; metrics: Record<string, unknown> }> {
+    return this.db.prepare("SELECT execution_id, record_json FROM optimization_metrics WHERE topic_id = ? ORDER BY id").all(topicId)
+      .map((row) => ({ executionId: row.execution_id as string | null, metrics: JSON.parse(String(row.record_json)) }));
+  }
+
   private migrate(): void {
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS optimization_metrics (
+        id INTEGER PRIMARY KEY, topic_id TEXT NOT NULL REFERENCES topics(id), scope_generation INTEGER NOT NULL,
+        execution_id TEXT, record_json TEXT NOT NULL, created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS optimization_metrics_topic ON optimization_metrics(topic_id);
       CREATE TABLE IF NOT EXISTS execution_usage (
         execution_id TEXT PRIMARY KEY,
         topic_id TEXT NOT NULL REFERENCES topics(id),

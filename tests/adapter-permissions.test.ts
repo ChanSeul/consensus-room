@@ -1422,3 +1422,21 @@ it("Claude 실제 수신 콜백과 반환 버퍼 중복·취소에서 관측값�
     expect(seen[0]).toMatchObject({ recordKind: "final", completeness: "partial", outputTokens: 2637, internalRequests: 1 });
   }
 });
+
+it("Claude 부분 교정은 별도 스키마·도구 없는 권한을 쓰고 사용량을 남긴다", async () => {
+  const repair = { baseSHA256: "a".repeat(64), edits: [{ find: "bad", replace: "good" }] };
+  const runner: CommandRunner = { run: async spec => {
+    expect(spec.args).toContain("--resume");
+    expect(spec.args[spec.args.indexOf("--resume") + 1]).toBe("existing");
+    expect(spec.args[spec.args.indexOf("--tools") + 1]).toBe("");
+    const schema = JSON.parse(spec.args[spec.args.indexOf("--json-schema") + 1]);
+    expect(schema.required).toEqual(["baseSHA256", "edits"]);
+    return successfulResult([{ type: "result", structured_output: repair, usage: { input_tokens: 10, output_tokens: 5 } }]);
+  } };
+  const seen: TurnUsage[] = [];
+  expect(await new ClaudeAdapter(runner).resumePlanRepair({ sessionId: "existing", prompt: "repair", cwd: "/tmp", implementation: true,
+    onUsage: u => seen.push(u) })).toEqual(repair);
+  expect(seen).toHaveLength(1);
+  // CLI resume retains V2 tools; unsupported adapters must take the existing full-correction path.
+  expect("resumePlanRepair" in codexAdapter(runner).adapter).toBe(false);
+});
