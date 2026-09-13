@@ -102,6 +102,7 @@ export class SpawnCommandRunner implements CommandRunner {
             return;
           }
           if (aborted) {
+            try { spec.onInterruptedOutput?.({ stdout: stdoutTail.join(), stderr: stderrTail.join(), jsonLines: jsonLineValues(jsonLines), truncated: stdoutBytes > MAX_CAPTURE_BYTES || lineTooLarge }); } catch { /* cancellation still completes */ }
             finishReject(abortError(abortReason));
             return;
           }

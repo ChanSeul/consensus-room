@@ -29,6 +29,10 @@ export class BudgetLedger {
     this.save(account); return account;
   }
   assertAvailable(ids: string[]): void {
+    const unfinished = this.db.prepare("SELECT record_json FROM budget_executions").all()
+      .map(row=>JSON.parse(String(row.record_json)) as Execution)
+      .find(execution=>!execution.finished && execution.accounts.some(id=>ids.includes(id)));
+    if(unfinished) throw new BudgetBlocked(unfinished.accounts.find(id=>ids.includes(id))!,"집계가 끝나지 않은 실행이 있습니다. 진행 상태를 확인하고 예산을 추가하세요.");
     for (const id of ids) {
       const a = this.account(id);
       if (!a) throw new BudgetBlocked(id, "검증된 기본 예산이 없습니다. 예산을 설정한 뒤 진행하세요.");
@@ -93,6 +97,13 @@ export class BudgetLedger {
           || policy.total[key] <= a.used[key]) throw new Error("사용량보다 큰 예산을 지정하고 기존 상한을 낮추지 마세요.");
       }
       if (JSON.stringify(policy) === JSON.stringify(a.policy)) throw new Error("추가 예산이 필요합니다.");
+      for(const row of this.db.prepare("SELECT record_json FROM budget_executions").all()) {
+        const execution=JSON.parse(String(row.record_json)) as Execution;
+        if(!execution.finished && execution.accounts.includes(id)) {
+          execution.finished=true;
+          this.db.prepare("UPDATE budget_executions SET record_json=? WHERE id=?").run(JSON.stringify(execution),execution.id);
+        }
+      }
       a.policy = policy; a.pause = null; a.version++;
       this.save(a);
       this.db.prepare("INSERT INTO budget_grants VALUES (?,?,?)").run(requestId,id,JSON.stringify({ policy, version:a.version, at:Date.now() }));

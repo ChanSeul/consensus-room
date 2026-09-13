@@ -1,3 +1,4 @@
+import { BudgetPanel } from "./BudgetPanel";
 import {
   FormEvent,
   ReactNode,
@@ -284,7 +285,8 @@ export function App() {
   useEffect(() => {
     const state = detail?.topic.id === selectedTopicId ? detail.topic.state : null;
     // FAILED 도 읽는다 — 사용 한도(429) 자동 재시도 예약 시각(autoRetryAt)을 보여 주기 위해서다.
-    if (!selectedTopicId || !state || !(WORKING_STATES.has(state) || state === "FAILED")) { setActivity(null); return; }
+    if (!selectedTopicId || !state) { setActivity(null); return; }
+    setActivity(null);
     let cancelled = false;
     const load = () => api.getActivity(selectedTopicId).then((next) => {
       if (!cancelled) setActivity(next);
@@ -490,12 +492,15 @@ export function App() {
           {selected && detail ? (
             <>
               <RoomHeader
+                budgetPaused={Boolean(activity?.budget?.pause)}
                 autoRetryAt={activity?.autoRetryAt ?? null}
                 topic={selected}
                 busyAction={busyAction}
                 onSession={(role) => setDialog(role)}
                 onAction={(action, body) => void run(action, () => api.runAction(selected.id, action, body))}
               />
+              {activity && <BudgetPanel account={activity.budget ?? null} busy={Boolean(busyAction) || activity.runningAction}
+                onSubmit={(action,body)=>void run(action,async()=>{ const result=await api.runAction(selected.id,action,body as Record<string,unknown>);const next=await api.getActivity(selected.id);if(selectedTopicRef.current===selected.id)setActivity(next);return result; })}/>}
               <Timeline events={detail.timeline} />
               <MessageComposer
                 disabled={Boolean(busyAction) || selected.state === "CLOSED"}
@@ -515,6 +520,7 @@ export function App() {
         <aside className={`inspector-pane mobile-${mobilePanel}`}>
           {selected && detail ? (
             <Inspector
+              budgetPaused={Boolean(activity?.budget?.pause)}
               detail={detail}
               findings={findings}
               evidence={evidence}
@@ -580,6 +586,7 @@ function RoomHeader({
   topic,
   busyAction,
   autoRetryAt,
+  budgetPaused,
   onSession,
   onAction,
 }: {
@@ -587,6 +594,7 @@ function RoomHeader({
   busyAction: string | null;
   // FAILED 상태에 예약된 사용 한도 자동 재시도 시각 — 있으면 '예약 취소'(stop) 를 제공한다.
   autoRetryAt: string | null;
+  budgetPaused: boolean;
   onSession: (role: "claude" | "codex") => void;
   onAction: (action: string, body?: Record<string, unknown>) => void;
 }) {
@@ -596,7 +604,7 @@ function RoomHeader({
   const pendingRetry = topic.state === "FAILED" && Boolean(autoRetryAt);
   const canStop = ACTIVE_STATES.has(topic.state) || pendingRetry;
   const deliveryRecovery = topic.state === "USER_DECISION_REQUIRED" && topic.lastError?.includes("커밋 또는 push 도중");
-  const canRetry = ["FAILED", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED"].includes(topic.state) && !deliveryRecovery;
+  const canRetry = ["FAILED", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED"].includes(topic.state) && !deliveryRecovery && !budgetPaused;
 
   return (
     <div className="room-header">
@@ -619,7 +627,7 @@ function RoomHeader({
         ) : canRetry ? (
           <button className="secondary-button" disabled={Boolean(busyAction)} onClick={() => onAction("retry")}>다시 시도</button>
         ) : (
-          <button className="primary-button" disabled={!canStart || Boolean(busyAction)} onClick={() => onAction("plan")}>합의 시작</button>
+          <button className="primary-button" disabled={!canStart || budgetPaused || Boolean(busyAction)} onClick={() => onAction("plan")}>합의 시작</button>
         )}
       </div>
     </div>
@@ -714,6 +722,7 @@ function MessageComposer({
 }
 
 function Inspector({
+  budgetPaused,
   detail,
   findings,
   evidence,
@@ -721,6 +730,7 @@ function Inspector({
   onAction,
   onDelivery,
 }: {
+  budgetPaused: boolean;
   detail: TopicDetail;
   findings: Finding[];
   evidence: string[];
@@ -842,7 +852,7 @@ function Inspector({
         <section className="gate-card gate-danger">
           <strong>{STATE_COPY[topic.state].label}</strong>
           <p>{topic.lastError ?? STATE_COPY[topic.state].hint}</p>
-          {!(topic.state === "USER_DECISION_REQUIRED" && topic.lastError?.includes("커밋 또는 push 도중")) && (
+          {!budgetPaused && !(topic.state === "USER_DECISION_REQUIRED" && topic.lastError?.includes("커밋 또는 push 도중")) && (
             <button className="secondary-button" disabled={Boolean(busyAction)} onClick={() => onAction("retry")}>다시 시도</button>
           )}
           {topic.state === "USER_DECISION_REQUIRED" && topic.lastError?.includes("커밋 또는 push 도중") && (

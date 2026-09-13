@@ -1,3 +1,4 @@
+import { BudgetPolicySchema } from "../shared/budgets.js";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { access, mkdir, readFile } from "node:fs/promises";
@@ -59,6 +60,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     verifications,
     memory: new ProjectMemoryStore(config.memoryDirectory),
     executionLimits: config.executionLimits,
+    enforceBudgets: config.enforceBudgets ?? true,
   });
   // 시작 URL의 일회성 token이나 인증 헤더가 request log에 남지 않도록 HTTP request logging을 끈다.
   const app = Fastify({ logger: false });
@@ -182,7 +184,9 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     const topic = database.getTopic(request.params.id);
     const cached = activityCache.get(topic.id);
     let activity: Awaited<ReturnType<typeof scanWorktreeActivity>>;
-    if (cached && Date.now() - cached.at < 10_000) {
+    if (!database.runningAction(topic.id)) {
+      activity = {lastChangeAt:null,lastChangedPath:null,scanned:0,truncated:false};
+    } else if (cached && Date.now() - cached.at < 10_000) {
       activity = cached.value; // 캐시 적중은 만료 시각을 연장하지 않는다(창 두 개가 번갈아 조회하면 영원히 과거에 머문다).
     } else {
       activity = await scanWorktreeActivity(topic.worktreePath);
@@ -193,6 +197,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       runningAction: database.runningAction(topic.id) !== null,
       executionUsage: database.getExecutionUsage(topic.id),
       ...activity,
+      budget: database.budgets.account(topic.id),
       autoRetryAt: workflow.scheduledRetryAt(topic.id),
       checkedAt: new Date().toISOString(),
     };
@@ -230,7 +235,17 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     return runIdempotent(request, reply, actionLedger(database, topicId, action), 200, async (idempotencyKey) => {
       const actionId = requestActionId(topicId, action, idempotencyKey);
       let response: unknown;
-      if (action === "plan") response = accepted(workflow.startPlan(topicId, actionId), database.getTopic(topicId));
+      if (action === "budget-configure" || action === "budget-resume") {
+        workflow.assertBudgetEditable(topicId);
+        const body = request.body as { policy?: unknown; version?: number };
+        const policy = BudgetPolicySchema.parse(body?.policy);
+        if (action === "budget-configure") database.budgets.configure(topicId,policy,"user-explicit");
+        else database.budgets.grant(topicId,idempotencyKey,policy,body?.version ?? -1);
+        if (action === "budget-resume" && ["FAILED","USER_DECISION_REQUIRED"].includes(database.getTopic(topicId).state)) {
+          response = accepted(workflow.retry(topicId,actionId),database.getTopic(topicId));
+        } else response = accepted(randomUUID(),database.getTopic(topicId));
+      }
+      else if (action === "plan") response = accepted(workflow.startPlan(topicId, actionId), database.getTopic(topicId));
       else if (action === "stop") {
         workflow.stop(topicId);
         response = accepted(randomUUID(), database.getTopic(topicId));

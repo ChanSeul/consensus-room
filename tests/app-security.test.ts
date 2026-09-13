@@ -466,7 +466,7 @@ it("activity API는 현재 세대의 역할별 최신 관측과 시각을 반환
   const response = await app.inject({ method: "GET", url: "/api/topics/metrics/activity",
     headers: { "x-consensus-token": "launch-token-for-test" } });
   expect(response.statusCode).toBe(200);
-  expect(response.json()).toMatchObject({ runningAction: false, executionUsage: [
+  expect(response.json()).toMatchObject({ runningAction: false, scanned:0, executionUsage: [
     { executionId: "newer", role: "claude", observedAt: expect.any(String), usage: { recordKind: "final", outputTokens: 2 } },
     { executionId: "codex", role: "codex", usage: { recordKind: "progress" } },
   ] });

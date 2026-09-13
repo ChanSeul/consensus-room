@@ -25,6 +25,7 @@ export interface ProjectMemoryWriter {
 }
 
 export interface CommandSpec {
+  onInterruptedOutput?: (output: { stdout: string; stderr: string; jsonLines: unknown[]; truncated: boolean }) => void;
   command: string;
   args: string[];
   cwd: string;
@@ -81,6 +82,7 @@ export interface SessionTurn {
   // 턴이 쓴 토큰·시간을 알린다(codex `turn.completed` / claude `result` 이벤트에서 읽음). 기록 전용 —
   // 관찰자가 던져도 턴 결과는 유지된다(adapters/usage.ts notifyUsage).
   onUsage?: (usage: TurnUsage) => void;
+  onInterruptedOutput?: CommandSpec["onInterruptedOutput"];
   // 모든 값이 기본 미설정인 실행별 관찰 한도. 한도는 중단이 아닌 경고에만 쓴다.
   limits?: ExecutionLimits;
   // 세션 id 가 만들어진 즉시(프로세스 실행 전) 알린다 — 턴이 429·stop 으로 끊겨도 resume 할 수 있게 저장하기 위함(2026-09-03 실측).

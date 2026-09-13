@@ -191,6 +191,7 @@ export class ClaudeAdapter implements AgentAdapter {
       }, 10_000);
       try {
       const output = await this.runner.run({
+        onInterruptedOutput: turn.onInterruptedOutput,
         command: "claude", args, cwd: workspace, stdin,
         signal: turn.signal, onSpawn: turn.onProcessSpawn,
         onJSONLine: (value, at) => { toolTime.observe(value, at); metrics.observe(value); },

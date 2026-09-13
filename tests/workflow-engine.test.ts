@@ -3425,3 +3425,44 @@ it("줄 패치 개정도 감사·종결·ACK를 거쳐 같은 계획으로 승�
   expect(await artifacts.readLatest("topic-1", "plan")).toBe(expected);
   expect(database.optimizationMetrics("topic-1").some(row => row.metrics.format === "lines" && row.metrics.success)).toBe(true);
 });
+
+it("완료한 계획을 보존하고 예산 도달 뒤 감사와 일반 재시도를 막는다", async () => {
+  const {database,dependencies}=makeEngine("DRAFT",null);
+  const artifacts=dependencies.artifacts;
+  let claudeCalls=0,codexCalls=0;
+  dependencies.claude.createSession=async turn=>{claudeCalls++;turn.onUsage?.({inputTokens:10,recordKind:"final"});return {sessionId:"new",result:{kind:"PLAN",summary:"완료",planMarkdown:validPlan("예산"),findings:[],evidenceRefs:[]}};};
+  dependencies.claude.resumeTurn=async turn=>(await dependencies.claude.createSession(turn)).result;
+  dependencies.codex.createSession=async()=>{codexCalls++;throw new Error("호출 금지");};
+  dependencies.codex.resumeTurn=async()=>{codexCalls++;throw new Error("호출 금지");};
+  const policy={execution:{inputTokens:10,outputTokens:100,durationMs:100000},total:{inputTokens:100,outputTokens:1000,durationMs:1000000}};
+  database.budgets.configure("topic-1",policy,"test");
+  const engine=new WorkflowEngine({...dependencies,enforceBudgets:true});
+  engine.startPlan("topic-1");await waitForActionCompletion(database,"topic-1");
+  expect(claudeCalls).toBe(1);expect(codexCalls).toBe(0);
+  expect(await artifacts.readLatest("topic-1","plan")).not.toBeNull();
+  expect(database.getTopic("topic-1").state).toBe("USER_DECISION_REQUIRED");
+  expect(database.getFlags("topic-1").resumeState).toBe("CODEX_AUDIT");
+  expect(()=>engine.retry("topic-1")).toThrow("예산");
+  expect(database.budgets.account("topic-1")?.used.inputTokens).toBe(10);
+  const before=database.getTopic("topic-1");
+  database.budgets.grant("topic-1","grant",{...policy,execution:{...policy.execution,inputTokens:20}},1);
+  engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");
+  expect(claudeCalls).toBe(1);expect(codexCalls).toBe(1);
+  expect(database.getTopic("topic-1").planEpoch).toBe(before.planEpoch);
+  expect(database.getTopic("topic-1").planSHA256).toBe(before.planSHA256);
+  database.close();
+});
+
+for(const resumeState of ["CODEX_AUDIT","CODEX_CLOSEOUT","CONSENSUS_ACK"] as const) {
+ it(`예산 중단의 ${resumeState} 재개는 계획 해시와 epoch를 보존한다`,async()=>{
+  const {database,engine,planSHA256}=await makePlanningRecovery(resumeState,{state:"USER_DECISION_REQUIRED"});
+  const epoch=database.getTopic("topic-1").planEpoch;
+  database.appendEvent({topicId:"topic-1",actor:"system",kind:"system",state:"USER_DECISION_REQUIRED",body:"예산 중단",payload:{budgetPause:true,resumeState}});
+  engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");
+  expect(database.getTopic("topic-1").planEpoch).toBe(epoch);
+  expect(database.getTopic("topic-1").planSHA256).toBe(planSHA256);
+  expect(database.getTimeline("topic-1").some(event=>event.state==="CLAUDE_PLAN")).toBe(false);
+  expect(database.getFlags("topic-1").resumeState).toBe(resumeState);
+  database.close();
+ });
+}

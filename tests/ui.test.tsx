@@ -449,3 +449,19 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   const promise = new Promise<T>((next) => { resolve = next; });
   return { promise, resolve };
 }
+
+it("예산 증액의 늦은 응답은 다른 토픽의 예산을 덮지 않는다",async()=>{
+ const a={...makeTopic(),state:"USER_DECISION_REQUIRED" as const},b={...makeTopic(),id:"topic-b",title:"다른 토픽",state:"USER_DECISION_REQUIRED" as const};
+ vi.spyOn(api,"listTopics").mockResolvedValue([a,b]);vi.spyOn(api,"getTopic").mockImplementation(async id=>makeDetail(id===a.id?a:b));
+ const account=(id:string,input:number)=>({id,policy:{execution:{inputTokens:100,outputTokens:100,durationMs:60000},total:{inputTokens:1000,outputTokens:1000,durationMs:600000}},used:{inputTokens:input,outputTokens:0,durationMs:0},startedAt:0,pause:{reason:"중단",detectedAt:0,deadline:60000},version:1,source:"test"});
+ vi.mocked(api.getActivity).mockImplementation(async id=>({state:"USER_DECISION_REQUIRED",runningAction:false,lastChangeAt:null,lastChangedPath:null,scanned:0,truncated:false,autoRetryAt:null,checkedAt:"now",budget:account(id,id===a.id?111:222)}));
+ const pending=deferred<any>();vi.spyOn(api,"runAction").mockReturnValue(pending.promise);
+ render(<App/>);fireEvent.click(await screen.findByRole("button",{name:"예산 추가 후 재개"}));
+ expect(screen.queryByRole("button",{name:"다시 시도"})).not.toBeInTheDocument();
+ fireEvent.click(screen.getByRole("button",{name:"증액하고 재개"}));
+ fireEvent.click(screen.getByRole("button",{name:/다른 토픽/}));
+ await screen.findByText(/입력 222/);
+ pending.resolve({accepted:true,actionId:"grant",topic:a});
+ await waitFor(()=>expect(api.getActivity).toHaveBeenCalledWith(a.id));
+ expect(screen.getByText(/입력 222/)).toBeInTheDocument();expect(screen.queryByText(/입력 111/)).not.toBeInTheDocument();
+});

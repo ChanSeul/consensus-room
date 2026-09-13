@@ -33,6 +33,7 @@ export interface WorkflowDependencies {
   // 사용 한도 자동 재시도의 시계(테스트 주입용). 기본은 실제 setTimeout(unref).
   clock?: RetryClock;
   executionLimits?: ExecutionLimits;
+  enforceBudgets?: boolean;
 }
 
 // 범위 변경을 허용하는 상태. WorkflowState가 늘어나면 이 표가 컴파일을 막아 새 상태를 의식적으로 판단하게 만든다.
@@ -154,6 +155,8 @@ export class WorkflowEngine {
     });
   }
 
+  assertBudgetEditable(topicId: string): void { this.core.assertNoActiveWork(topicId); }
+
   startPlan(topicId: string, actionId?: string): string {
     // 원장에 running 행을 만들기 전에 상태를 확인한다. 비동기 work에서 거부하면 이미 끝난 주제까지 FAILED로 덮인다.
     this.core.assertNotShuttingDown();
@@ -207,12 +210,20 @@ export class WorkflowEngine {
 
   retry(topicId: string, actionId?: string): string {
     this.core.assertNotShuttingDown();
+    this.core.assertBudgetAvailable(topicId);
     // 상태를 바꾸기 전에 다른 작업(실행·범위 변경·인도)이 없는지 본다 — 아래 사다리 일부는 startAction 전에 전이하므로,
     // 잠금을 startAction 에서 뒤늦게 만나면 상태만 바뀐 채 고착된다(Codex 후속 지적 2).
     this.core.assertNoActiveWork(topicId);
-    const topic = this.core.dependencies.database.getTopic(topicId);
+    let topic = this.core.dependencies.database.getTopic(topicId);
     const flags = this.core.dependencies.database.getFlags(topicId);
     const resume = flags.resumeState;
+    const interruption = this.core.dependencies.database.getTimeline(topicId).filter(event =>
+      event.scopeGeneration === topic.scopeGeneration && event.actor === "system" && event.payload?.resumeState).at(-1);
+    if (topic.state === "USER_DECISION_REQUIRED" && interruption?.payload?.budgetPause === true
+      && interruption.payload.resumeState === resume) {
+      // Budget pauses resume the exact infrastructure stage, without consuming a product decision or resetting the plan.
+      topic = this.core.dependencies.database.updateTopic(topicId, {state:"FAILED"});
+    }
     if (!resume) throw new Error("재시도할 단계가 기록되어 있지 않습니다.");
     // 개정 턴이 결정을 물어 멈췄고 결정이 올라왔다 — 그 개정본을 저장해 종결 확인으로 넘긴다(개정 턴 재구매 방지).
     // 아래 사다리(resumers)가 CLAUDE_REVISION 을 "개정 재실행" 으로 잡기 전에 먼저 본다.

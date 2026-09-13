@@ -1071,6 +1071,38 @@ describe("Codex 토픽별 관리형 홈과 동시 실행", () => {
     await new Promise((resolve) => setTimeout(resolve, 150));
   }
 
+  it("슬롯과 같은 토픽 대기는 실행 중인 다른 턴을 기다리지 않고 취소된다", async () => {
+    const directory=mkdtempSync(join(tmpdir(),"consensus-cancel-"));temporaryDirectories.push(directory);
+    const a=join(directory,"a"),b=join(directory,"b");mkdirSync(a);mkdirSync(b);
+    const home=join(directory,"home"),gate=gatedRunner(home);
+    const adapter=new CodexAdapter(gate.runner,join(directory,"schema.json"),home,undefined,{maxConcurrentTurns:1});
+    const first=adapter.createSession({prompt:"first",cwd:a});await waitFor(()=>gate.pending()===1);
+    for(const cwd of [a,b]) {
+      const controller=new AbortController();
+      const queued=adapter.createSession({prompt:"cancel",cwd,signal:controller.signal});
+      await Promise.resolve();await Promise.resolve();
+      controller.abort(new Error("cancel queued"));
+      await expect(queued).rejects.toThrow("cancel queued");
+    }
+    const same=adapter.createSession({prompt:"same after cancellation",cwd:a});
+    await Promise.resolve();await Promise.resolve();
+    expect(gate.order).toEqual([`start:${a}`]);gate.releaseNext();await first;
+    await waitFor(()=>gate.pending()===1);gate.releaseNext();await same;
+    const next=adapter.createSession({prompt:"after",cwd:b});await waitFor(()=>gate.pending()===1);gate.releaseNext();await next;
+  });
+
+  it("같은 토픽의 대기 취소가 뒤 호출에 실행 중인 선행 턴을 추월시키지 않는다",async()=>{
+    const directory=mkdtempSync(join(tmpdir(),"consensus-queue-tail-"));temporaryDirectories.push(directory);
+    const home=join(directory,"home"),gate=gatedRunner(home);
+    const adapter=new CodexAdapter(gate.runner,join(directory,"schema.json"),home,undefined,{maxConcurrentTurns:2});
+    const first=adapter.createSession({prompt:"first",cwd:directory});await waitFor(()=>gate.pending()===1);
+    const controller=new AbortController(),cancelled=adapter.createSession({prompt:"cancel",cwd:directory,signal:controller.signal});
+    controller.abort(new Error("cancel"));await expect(cancelled).rejects.toThrow("cancel");
+    const next=adapter.createSession({prompt:"next",cwd:directory});
+    await settle();expect(gate.order).toHaveLength(1);
+    gate.releaseNext();await first;await waitFor(()=>gate.pending()===1);gate.releaseNext();await next;
+  });
+
   it("다른 worktree 두 턴은 각자의 홈 config 로 동시에 돌고, 홈은 공유 홈 아래 topics/ 에 있다", async () => {
     const directory = mkdtempSync(join(tmpdir(), "consensus-room-codex-concurrency-"));
     temporaryDirectories.push(directory);

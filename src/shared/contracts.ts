@@ -1,3 +1,4 @@
+import { type BudgetAccount } from "./budgets.js";
 import { z } from "zod";
 import { ToleranceLedgerEntrySchema } from "./tolerance";
 
@@ -494,6 +495,7 @@ export type UpdateMediationAutonomyInput = z.infer<typeof UpdateMediationAutonom
 export const TopicActivitySchema = z.object({
   state: WorkflowStateSchema,
   runningAction: z.boolean(),
+  budget: z.custom<BudgetAccount>().nullable().optional(),
   executionUsage: z.array(z.object({
     executionId: z.string(), role: z.enum(["claude", "codex"]), phase: z.string(), observedAt: z.string(),
     usage: z.object({

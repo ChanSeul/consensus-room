@@ -34,6 +34,7 @@ export const CODEX_SKILL_DIRECTORIES = [
 ] as const;
 
 export interface ServerConfig {
+  enforceBudgets?: boolean;
   host: "127.0.0.1";
   port: number;
   launchToken: string;
@@ -86,6 +87,7 @@ export function loadConfig(overrides: Partial<ServerConfig> = {}): ServerConfig 
     },
   });
   return {
+    enforceBudgets: overrides.enforceBudgets ?? true,
     host: "127.0.0.1",
     port: overrides.port ?? Number(process.env.CONSENSUS_ROOM_PORT ?? 4317),
     codexConcurrency: overrides.codexConcurrency ?? Math.max(1, Number(process.env.CONSENSUS_ROOM_CODEX_CONCURRENCY ?? 2) || 2),

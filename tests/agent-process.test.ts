@@ -458,3 +458,13 @@ describe("최종 결과 뒤 유휴 종료 (2026-09-03 hang 처방)", () => {
     expect(command.terminatedAfterResult).toBeUndefined();
   });
 });
+
+it("중단된 실제 프로세스의 출력을 종료 완료 경계에서 보존한다", async () => {
+  const controller = new AbortController();
+  let saved: { stdout:string; truncated:boolean } | undefined;
+  const runner = new SpawnCommandRunner();
+  const task = runner.run({command:process.execPath,args:["-e",'console.log(JSON.stringify({ready:true}));setInterval(()=>{},1000)'],cwd:tmpdir(),
+    signal:controller.signal,onJSONLine:()=>controller.abort(new Error("budget stop")),onInterruptedOutput:output=>{saved=output;}});
+  await expect(task).rejects.toThrow("budget stop");
+  expect(saved?.stdout).toContain('"ready":true');expect(saved?.truncated).toBe(false);
+});

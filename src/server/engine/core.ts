@@ -1,3 +1,5 @@
+import { BudgetController } from "../budgetController.js";
+import { BudgetBlocked } from "../budgetLedger.js";
 import { applyPlanLineEdits, applyPlanRepair, planRepairPrompt, repairablePlan } from "../../shared/planPatches.js";
 // WorkflowEngine 분해(2026-08-31): 상태 전환·세션·산출물·메모리·전달이 한 클래스(1,504줄)에 있어
 // 순서 결함이 반복된다는 Codex 진단에 따른 분리. EngineCore는 공유 상태와 횡단 프리미티브만 갖는다 —
@@ -92,7 +94,23 @@ export class EngineCore {
   actionObserver?: (topicId: string) => void;
   private readonly warnedLimits = new Map<string, Set<string>>();
 
-  constructor(readonly dependencies: WorkflowDependencies) {}
+  constructor(readonly dependencies: WorkflowDependencies) {
+    if (dependencies.enforceBudgets) {
+      const controller = new BudgetController(dependencies.database.budgets, cwd => {
+        const topic = dependencies.database.listTopics().find(t => t.worktreePath === cwd && this.active.has(t.id));
+        if (!topic) throw new Error("예산을 연결할 실행 중 토픽이 없습니다.");
+        return { topicId:topic.id, accounts:this.budgetAccounts(topic.id), stage:topic.state };
+      }, async (topicId, output) => {
+        await dependencies.artifacts.write(topicId,"interrupted-output",1,JSON.stringify(redactRecord(output as Record<string, unknown>)));
+      });
+      this.dependencies = { ...dependencies, claude:controller.wrap(dependencies.claude), codex:controller.wrap(dependencies.codex) };
+    }
+  }
+
+  budgetAccounts(topicId: string): string[] { return [topicId]; }
+  assertBudgetAvailable(topicId: string): void {
+    if (this.dependencies.enforceBudgets) this.dependencies.database.budgets.assertAvailable(this.budgetAccounts(topicId));
+  }
 
   // 서버 종료: 새 실행을 막고, 실행 중인 action 을 전부 중단(프로세스 그룹 SIGTERM→SIGKILL 은 runner 몫)한 뒤
   // 각 action 의 원장 마감(cancelled + 주제 FAILED/resume_state)이 끝나기를 기다린다. 그래서 재시작 뒤 startup
@@ -134,6 +152,12 @@ export class EngineCore {
       if (!this.isCurrentAction(topicId, actionId, scopeGeneration)) return;
       this.dependencies.database.finishAction(actionId, "succeeded");
     }).catch((error: unknown) => {
+      if (error instanceof BudgetBlocked && this.isCurrentAction(topicId, actionId, scopeGeneration)) {
+        const topic = this.dependencies.database.getTopic(topicId);
+        this.dependencies.database.finishAction(actionId, "cancelled", error.message);
+        this.interrupt(topicId, "USER_DECISION_REQUIRED", error.message, topic.state, { budgetPause:true });
+        return;
+      }
       const cancelled = controller.signal.aborted;
       const message = redactSecrets(error instanceof Error ? error.message : String(error));
       if (error instanceof HandledWorkflowInterruption) {
@@ -208,6 +232,14 @@ export class EngineCore {
     if (freshSession || !resumeSessionId || resumeSessionId.startsWith("pending:")) {
       const created = await adapter.createSession({
         prompt, cwd: topic.worktreePath, signal, implementation, planMode,
+        onSessionCreated: id => {
+          this.assertCurrent(topic.id,signal,topic.scopeGeneration,topic.state);
+          if (options.session) options.session.persist(id);
+          else if (!freshSession) {
+            if (this.dependencies.database.participantSessionInUse(topic.id,role,id)) throw new Error("세션 충돌");
+            this.dependencies.database.upsertParticipant(topic.id,{...participant,sessionId:id,acknowledgedPlanSHA256:null});
+          }
+        },
         settings: this.executionSettings(topic.id, role, implementation),
         onProcessSpawn: this.processObserver(topic.id),
         onUsage,

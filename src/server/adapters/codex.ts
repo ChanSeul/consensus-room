@@ -169,15 +169,15 @@ export class CodexAdapter implements AgentAdapter {
   ): ReturnType<CodexAdapter["invokeExclusively"]> {
     const key = resolve(turn.cwd);
     const previous = this.topicQueues.get(key) ?? Promise.resolve();
-    const run = previous.then(async () => {
-      const release = await this.slots.acquire();
+    const run = waitWithSignal(previous, turn.signal).then(async () => {
+      const release = await this.slots.acquire(turn.signal);
       try {
         return await this.invokeExclusively(turn, commandArgs, newSession);
       } finally {
         release();
       }
     });
-    this.topicQueues.set(key, run.catch(() => undefined));
+    this.topicQueues.set(key, Promise.allSettled([previous, run]));
     return run;
   }
 
@@ -222,7 +222,12 @@ export class CodexAdapter implements AgentAdapter {
     }, 10_000);
     try {
     const output = await this.runner.run({
-      onJSONLine: (value, at) => { toolTime.observe(value, at); metrics.observe(value); },
+        onInterruptedOutput: turn.onInterruptedOutput,
+      onJSONLine: (value, at) => {
+        toolTime.observe(value, at); metrics.observe(value);
+        if (newSession && typeof value === "object" && value !== null && "type" in value && value.type === "thread.started"
+          && "thread_id" in value && typeof value.thread_id === "string") turn.onSessionCreated?.(value.thread_id);
+      },
       // PATH가 준 심볼릭 링크가 아니라 실제 경로로 실행한다(resolveCodexExecutable 주석 참조).
       command: resolveCodexExecutable(),
       args: [
@@ -478,8 +483,14 @@ class Semaphore {
 
   constructor(private readonly limit: number) {}
 
-  async acquire(): Promise<() => void> {
-    if (this.active >= this.limit) await new Promise<void>((resolve) => this.waiters.push(resolve));
+  async acquire(signal?: AbortSignal): Promise<() => void> {
+    signal?.throwIfAborted();
+    if (this.active >= this.limit) await new Promise<void>((resolve,reject) => {
+      const ready=()=>{signal?.removeEventListener("abort",abort);resolve();};
+      const abort=()=>{const index=this.waiters.indexOf(ready);if(index>=0)this.waiters.splice(index,1);reject(signal?.reason);};
+      signal?.addEventListener("abort",abort,{once:true});
+      this.waiters.push(ready);
+    });
     this.active += 1;
     let released = false;
     return () => {
@@ -489,6 +500,15 @@ class Semaphore {
       this.waiters.shift()?.();
     };
   }
+}
+
+function waitWithSignal<T>(promise:Promise<T>,signal?:AbortSignal):Promise<T> {
+  signal?.throwIfAborted();
+  return new Promise((resolve,reject)=>{
+    const abort=()=>reject(signal?.reason);
+    signal?.addEventListener("abort",abort,{once:true});
+    promise.then(value=>{signal?.removeEventListener("abort",abort);resolve(value);},error=>{signal?.removeEventListener("abort",abort);reject(error);});
+  });
 }
 
 function findGitCommonDirectory(workspace: string): string | null {
