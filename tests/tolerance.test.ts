@@ -11,6 +11,7 @@ import {
   parseUnifiedDiff,
   stateAtLine,
   ToleranceFormatError,
+  sanitizeJSONControlCharacters,
 } from "../src/shared/tolerance";
 
 const policyBlock = `## 허용 오차
@@ -262,5 +263,19 @@ describe("허용 오차 블록 형식 오류는 ToleranceFormatError 다", () =>
     expect(() => parseTolerancePolicy(schemaBad)).toThrow(ToleranceFormatError);
     expect(() => parseTolerancePolicy(schemaBad)).toThrow("<=300");
     expect(() => parseTolerancePolicy("## 허용 오차\n```tolerance\n{not json\n```\n")).toThrow(ToleranceFormatError);
+  });
+});
+
+// 2026-09-13 S11: 문자열 리터럴 안의 탭·줄바꿈으로 개정 턴 2개가 소각됐다 — 문자열 안 제어 문자만 공백으로 흡수한다.
+describe("허용 오차 블록의 문자열 안 제어 문자", () => {
+  it("문자열 안의 탭·줄바꿈은 공백이 되고, 구조 공백·이스케이프·값은 그대로다", () => {
+    const raw = '{\n  "scopePaths": ["a/**"],\n  "rules": [{"id": "T-1", "title": "탭\t있음\n줄바꿈", "paths": ["a/**"], "hunk": "any", "maxFiles": 1, "maxHunks": 1, "invariants": ["이스케이프 \\n 유지"]}]\n}';
+    const cleaned = sanitizeJSONControlCharacters(raw);
+    expect(cleaned).toContain('"title": "탭 있음 줄바꿈"');
+    expect(cleaned).toContain("\\n 유지");
+    expect(cleaned.startsWith("{\n  ")).toBe(true);
+    const policy = parseTolerancePolicy("## 허용 오차\n```tolerance\n" + raw + "\n```\n");
+    expect(policy?.rules[0]?.title).toBe("탭 있음 줄바꿈");
+    expect(policy?.rules[0]?.invariants[0]).toBe("이스케이프 \n 유지"); // JSON 이스케이프 \n 은 실제 줄바꿈으로 남는다
   });
 });

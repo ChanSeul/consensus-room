@@ -65,6 +65,27 @@ const TOLERANCE_FENCE = /```tolerance[^\n]*\n([\s\S]*?)\n```/;
 // 블록이 있는데 형식이 틀리면 던진다 — 계획 계약 검사에서 잡혀 그 계획은 저장되지 않는다.
 // 허용 오차 블록의 JSON·스키마 오류는 **표기 오류**다 — 계약 교정을 low 추론으로 내리기 위해 따로 구분한다
 // (2026-09-13 S10H 실측: invariants 300자 초과가 plain Error 라 xhigh 교정 재제출로 갔다).
+// 모델이 문자열 리터럴 안에 탭·줄바꿈 같은 제어 문자를 그대로 넣는 일이 잦다(2026-09-13 S11 개정 2회 연속 "Bad control
+// character in string literal" → FAILED, 턴 2개 소각). 문자열 **안**의 제어 문자만 공백으로 바꾼다 — 문자열 밖(구조 공백)은 그대로,
+// 이스케이프(`\n`)는 건드리지 않는다. 의미가 바뀌는 치환이 아니므로(공백↔공백류) 계약 완화가 아니다.
+export function sanitizeJSONControlCharacters(text: string): string {
+  let out = "";
+  let inString = false;
+  let escaped = false;
+  for (const ch of text) {
+    if (inString) {
+      if (escaped) { escaped = false; out += ch; continue; }
+      if (ch === "\\") { escaped = true; out += ch; continue; }
+      if (ch === '"') { inString = false; out += ch; continue; }
+      out += ch.charCodeAt(0) < 0x20 ? " " : ch;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    out += ch;
+  }
+  return out;
+}
+
 export class ToleranceFormatError extends Error {
   constructor(message: string) {
     super(message);
@@ -77,7 +98,7 @@ export function parseTolerancePolicy(planMarkdown: string): TolerancePolicy | nu
   if (!match) return null;
   let raw: unknown;
   try {
-    raw = JSON.parse(match[1]);
+    raw = JSON.parse(sanitizeJSONControlCharacters(match[1]));
   } catch (error) {
     throw new ToleranceFormatError(`허용 오차 블록이 JSON 이 아닙니다: ${error instanceof Error ? error.message : String(error)}`);
   }
