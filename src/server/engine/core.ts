@@ -34,7 +34,11 @@ import type { WorkflowDependencies } from "../workflow.js";
 
 // 결과 JSON 의 표기만 틀린 위반(스키마·kind). 재제출에 판단이 필요 없어 교정 턴의 추론 강도를 low 로 내린다
 // (2026-09-07 Codex 자기 최적화 제안 ③). 쟁점 누락·처분 규칙 위반은 판단이 섞이므로 여기 속하지 않는다.
-function normalized(normalize: ((result: AgentResult) => AgentResult) | undefined, result: AgentResult): AgentResult {
+// 파싱 직후·검사 직전에 결과를 손질하는 함수. carried 가 있으면 enforceResultContract 가 **최종 검사 뒤** 마지막 적용의 승계 id 를
+// 턴당 1회 이벤트로 남긴다(2026-09-13 Codex 지적 3: 검사 전에 "재제출 없음" 을 적으면 바로 뒤 교정이 그 기록을 거짓으로 만든다).
+export type ResultNormalizer = ((result: AgentResult) => AgentResult) & { carried?: () => readonly string[]; label?: string };
+
+function normalized(normalize: ResultNormalizer | undefined, result: AgentResult): AgentResult {
   return normalize ? normalize(result) : result;
 }
 
@@ -179,7 +183,7 @@ export class EngineCore {
       session?: { id: string | null; persist: (sessionId: string) => void };
       // 이 턴에 추가로 읽기를 허용할 경로(주제 plan.md 등).
       readablePaths?: readonly string[];
-      normalize?: (result: AgentResult) => AgentResult;
+      normalize?: ResultNormalizer;
     } = {},
   ): Promise<AgentResult> {
     const { freshSession = false, planMode = false, check } = options;
@@ -246,7 +250,7 @@ export class EngineCore {
       // 본 턴과 같은 읽기 허용(계획 정본 등) — 교정 턴에서만 권한이 빠지면 "필요하면 읽으라" 고 안내한 파일을 못 읽는다(Codex 후속 지적 7).
       readablePaths?: readonly string[];
       // 파싱 직후·검사 직전에 결과를 손질한다(예: 판단이 끝난 앞 단계 쟁점을 서버가 승계). 교정 재제출의 재파싱에도 같이 적용된다.
-      normalize?: (result: AgentResult) => AgentResult;
+      normalize?: ResultNormalizer;
     },
   ): Promise<AgentResult> {
     let violation: string;
@@ -254,6 +258,7 @@ export class EngineCore {
     try {
       const parsed = normalized(context.normalize, redactAgentResult(AgentResultSchema.parse(raw)));
       context.check?.(parsed);
+      this.reportCarriedFindings(topic.id, context.normalize, false);
       return parsed;
     } catch (error) {
       if (error instanceof HandledWorkflowInterruption) throw error;
@@ -275,24 +280,34 @@ export class EngineCore {
     if (this.interruptForNewUserInput(topic, context.startedAfter)) throw new HandledWorkflowInterruption();
     const reparsed = normalized(context.normalize, redactAgentResult(AgentResultSchema.parse(corrected)));
     context.check?.(reparsed);
+    this.reportCarriedFindings(topic.id, context.normalize, true);
     return reparsed;
   }
 
-  // 앞 단계 쟁점 승계용 normalize — 승계가 있으면 턴당 한 번만 이벤트로 남긴다(절감 측정 근거, 2026-09-13).
+  // 최종 검사를 통과한 결과 기준으로 승계 id 와 실제 교정 여부를 한 번 남긴다 — 절감 측정의 근거(payload.carriedFindings·corrected).
+  private reportCarriedFindings(topicId: string, normalize: ResultNormalizer | undefined, corrected: boolean): void {
+    const carried = normalize?.carried?.() ?? [];
+    if (carried.length === 0) return;
+    const label = normalize?.label ?? "결과 계약";
+    this.event(topicId, "system", "system",
+      `${label}: 판단이 끝난 앞 단계 쟁점 ${carried.length}건을 서버가 같은 처분으로 승계했습니다(계약 교정 재제출 ${corrected ? "1회 뒤 확정" : "없음"}): ${carried.join(", ")}`,
+      { carriedFindings: [...carried], label, corrected });
+  }
+
+  // 앞 단계 쟁점 승계용 normalize. 이벤트는 여기서 내지 않는다 — enforceResultContract 가 최종 검사 뒤 마지막 적용분을 1회 기록한다.
+  // 원본이 여럿이면 호출자가 mergeFindingSources 로 최신 우선 합친 **하나**를 준다(원본마다 normalizer 를 두면 옛 처분이 최신을 덮는다).
   carryForwardNormalizer(
-    topicId: string, source: readonly Finding[], label: string, options: { forReview?: boolean } = {},
-  ): (result: AgentResult) => AgentResult {
-    let announced = false;
-    return (result) => {
+    source: readonly Finding[], label: string, options: { forReview?: boolean } = {},
+  ): ResultNormalizer {
+    let lastCarried: readonly string[] = [];
+    const normalizer: ResultNormalizer = (result) => {
       const { findings, carried } = carryForwardFindings(source, result.findings, options);
-      if (carried.length > 0 && !announced) {
-        announced = true;
-        this.event(topicId, "system", "system",
-          `${label}: 판단이 끝난 앞 단계 쟁점 ${carried.length}건을 서버가 같은 처분으로 승계했습니다(모델 재제출 없음): ${carried.join(", ")}`,
-          { carriedFindings: carried, label });
-      }
+      lastCarried = carried;
       return carried.length > 0 ? { ...result, findings } : result;
     };
+    normalizer.carried = () => lastCarried;
+    normalizer.label = label;
+    return normalizer;
   }
 
   // 합의 세션과 무관한 일회용 세션에서 실행한다. 만들어진 세션 ID는 participant에 저장하지 않는다 —

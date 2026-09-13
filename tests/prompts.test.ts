@@ -164,3 +164,14 @@ it.each(["full", "delta"] as const)("계획 감사·종결의 %s 타임라인이
     }
   }
 });
+
+// 2026-09-13 Codex 지적 2: RESOLVED_BY_FIX 판정 문구가 fixAware 로 묶여 FINAL_REVIEW(fixAware) 에서 빠졌다. 리뷰 단계 여부는 별도 축이다.
+describe("Codex 리뷰 프롬프트 — RESOLVED_BY_FIX 주장은 승계되지 않는다는 문구", () => {
+  it("첫 리뷰와 최종 리뷰 모두 앞 단계의 RESOLVED_BY_FIX 주장을 직접 판정하라고 말한다", () => {
+    for (const finalPass of [false, true]) {
+      const prompt = buildCodexReviewPrompt({ planMarkdown, planSHA256, implementation, finalPass, timeline: [], originalReviewFindings: finalPass ? [finding] : undefined });
+      expect(prompt, String(finalPass)).toContain("RESOLVED_BY_FIX 로 주장한 쟁점은 승계되지 않습니다");
+      expect(prompt, String(finalPass)).toContain("서버가 같은 처분으로 승계합니다");
+    }
+  });
+});

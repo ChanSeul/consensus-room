@@ -33,6 +33,7 @@ import {
   CARRIED_RATIONALE_PREFIX,
   carryForwardFindings,
   isSettledFinding,
+  mergeFindingSources,
 } from "../src/shared/workflow";
 
 function completePlan(extra = ""): string {
@@ -527,6 +528,8 @@ describe("처분 프롬프트와 단계 제약의 정합", () => {
       expect(prompt).toContain("서버가 같은 처분으로 승계합니다");
       expect(prompt).toContain("새로 발견한 쟁점은 처분을 비워 둬도 됩니다");
     }
+    // 리뷰가 아닌 단계에는 RESOLVED_BY_FIX 판정 문구가 없다(리뷰 단계 문구는 prompts.test 에서 확인).
+    for (const prompt of [revisionPrompt, closeoutPrompt, fixPrompt]) expect(prompt).not.toContain("주장한 쟁점은 승계되지 않습니다");
   });
 });
 
@@ -685,5 +688,19 @@ describe("settled 쟁점 승계(carryForwardFindings)", () => {
     // 승계는 멱등 — 이미 접두가 붙은 쟁점을 다시 승계해도 접두가 겹치지 않는다.
     const again = carryForwardFindings(missingActionable.findings, []);
     expect(again.findings.find((x) => x.id === "TODO-1")!.rationale.split(CARRIED_RATIONALE_PREFIX).length).toBe(2);
+  });
+
+  // 2026-09-13 Codex 지적 1: 원본마다 따로 승계하면 첫 리뷰의 AGREED_NO_ACTION 이 수정 결과의 최신 판단을 덮는다.
+  it("원본이 여럿이면 최신 우선으로 합친 뒤 승계한다 — 옛 no-action 이 최신 AGREED_ACTION·RESOLVED_BY_FIX 를 덮지 않는다", () => {
+    const firstReview = [f("F-1", "AGREED_NO_ACTION"), f("F-2", "AGREED_NO_ACTION")];
+    for (const latest of ["AGREED_ACTION", "RESOLVED_BY_FIX"]) {
+      const fix = [f("F-1", latest), f("F-2", "AGREED_NO_ACTION")];
+      const merged = mergeFindingSources(fix, firstReview);
+      expect(merged.map((x) => [x.id, x.disposition])).toEqual([["F-1", latest], ["F-2", "AGREED_NO_ACTION"]]);
+      const { carried, findings } = carryForwardFindings(merged, [], { forReview: true });
+      expect(carried).toEqual(["F-2"]);
+      expect(() => assertFindingCoverage(firstReview, findings, "Codex final review")).toThrow("F-1");
+    }
+    expect(mergeFindingSources(undefined, firstReview, undefined)).toHaveLength(2);
   });
 });

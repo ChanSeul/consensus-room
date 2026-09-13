@@ -18,13 +18,14 @@ import {
   refixDirective,
   shouldRunFixPass,
   carryForwardFindings,
+  mergeFindingSources,
 } from "../../shared/workflow.js";
 import { normalizeCommitPaths } from "../git.js";
 import { redactAgentResult } from "../security.js";
 import {
   evaluateTolerance, parseTolerancePolicy, parseUnifiedDiff, renderToleranceSummary, type ChangedFile,
 } from "../../shared/tolerance.js";
-import type { EngineCore } from "./core.js";
+import type { ResultNormalizer, EngineCore } from "./core.js";
 
 function renderReport(result: AgentResult): string {
   return `# ${result.kind}\n\n${result.summary}\n\n## Findings\n\n\`\`\`json\n${JSON.stringify(result.findings, null, 2)}\n\`\`\`\n\n## Evidence\n\n${result.evidenceRefs.map((item) => `- ${item}`).join("\n") || "- 없음"}\n`;
@@ -208,12 +209,11 @@ export class DeliveryPipeline {
     }
     const receipts = await this.core.dependencies.verifications?.receipts(topicId);
     // 구현/수정 결과의 settled 쟁점(주로 TODO-n 이연)과 첫 리뷰의 no-action 쟁점은 서버가 승계한다. RESOLVED_BY_FIX 주장은 승계하지 않는다(리뷰가 판정).
+    // 두 원본은 **최신(수정 결과) 우선으로 합친 뒤** 승계를 판단한다 — 따로 승계하면 첫 리뷰의 AGREED_NO_ACTION 이 수정 결과의
+    // AGREED_ACTION·RESOLVED_BY_FIX 를 덮어 누락된 쟁점이 검사를 통과한다(2026-09-13 Codex 지적 1).
     const reviewLabel = finalPass ? "Codex final review" : "Codex review";
-    const carryImplementation = this.core.carryForwardNormalizer(topicId, implementation.findings, reviewLabel, { forReview: true });
-    const carryOriginal = originalReview
-      ? this.core.carryForwardNormalizer(topicId, originalReview.findings, `${reviewLabel}(첫 리뷰 승계)`, { forReview: true })
-      : null;
-    const reviewNormalizer = (result: AgentResult) => carryOriginal ? carryOriginal(carryImplementation(result)) : carryImplementation(result);
+    const reviewNormalizer = this.core.carryForwardNormalizer(
+      mergeFindingSources(implementation.findings, originalReview?.findings), reviewLabel, { forReview: true });
     const review = await this.core.turn("codex", topic, buildCodexReviewPrompt({
       planMarkdown: plan, planSHA256: topic.planSHA256!, implementation, finalPass, resumedSession, tolerance, planPath,
       timeline: this.reviewTimeline(topicId, topic.scopeGeneration, reviewSince),
@@ -470,7 +470,7 @@ export class DeliveryPipeline {
       }),
     };
     // 판단이 끝난 리뷰 쟁점은 서버가 승계한다 — 러너가 되돌려 담지 않아도 재제출을 사지 않는다(2026-09-13).
-    const fixNormalizer = this.core.carryForwardNormalizer(topicId, review.findings, "Claude fix");
+    const fixNormalizer = this.core.carryForwardNormalizer(review.findings, "Claude fix");
     const fixFork = await this.resumeImplementationSession(
       topicId, flags.implementationSessionId, fixPrompts, topic.worktreePath, signal, [planPath],
     );
@@ -613,7 +613,7 @@ export class DeliveryPipeline {
     inputSequence: number; resumeState: "IMPLEMENTING" | "CLAUDE_FIX"; check: (result: AgentResult) => void;
     baselineHead: string;
     readablePaths?: readonly string[];
-    normalize?: (result: AgentResult) => AgentResult;
+    normalize?: ResultNormalizer;
   }): Promise<AgentResult | null> {
     const policy = parseTolerancePolicy(input.plan);
     if (!policy) return input.result;

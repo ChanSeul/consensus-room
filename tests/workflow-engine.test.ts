@@ -3286,7 +3286,8 @@ describe("settled 쟁점 서버 승계 — 수정·리뷰 경로", () => {
     const bodies = database.getTimeline("topic-1").map((event) => event.body);
     expect(bodies.some((body) => body.includes("기계 계약 위반"))).toBe(false);
     expect(bodies.filter((body) => body.startsWith("Claude fix: 판단이 끝난 앞 단계 쟁점 2건을 서버가") && body.includes("F-2, TODO-1"))).toHaveLength(1);
-    expect(bodies.some((body) => body.startsWith("Codex final review") && body.includes("승계했습니다"))).toBe(true);
+    // 최종 리뷰는 원본이 둘(수정 결과·첫 리뷰)이어도 합쳐서 한 번만 기록한다(2026-09-13 Codex 지적 3).
+    expect(bodies.filter((body) => body.startsWith("Codex final review") && body.includes("승계했습니다"))).toHaveLength(1);
     const storedFix = JSON.parse((await artifacts.readLatest("topic-1", "claude-fix"))!);
     const carried = storedFix.findings.find((item: { id: string }) => item.id === "F-2");
     expect(carried).toMatchObject({ disposition: "AGREED_NO_ACTION" });
@@ -3309,6 +3310,58 @@ describe("settled 쟁점 서버 승계 — 수정·리뷰 경로", () => {
     expect(database.getTopic("topic-1").state).toBe("FAILED");
     const bodies = database.getTimeline("topic-1").map((event) => event.body);
     expect(bodies.some((body) => body.includes("기계 계약 위반") && body.includes("검토 쟁점을 누락했습니다: F-1"))).toBe(true);
+    database.close();
+  });
+
+  // 2026-09-13 Codex 지적 1: 첫 리뷰의 AGREED_NO_ACTION 이 수정 결과의 최신 판단(AGREED_ACTION·RESOLVED_BY_FIX)을 덮어
+  // 최종 리뷰가 그 쟁점을 누락해도 READY_TO_DELIVER 까지 가던 구멍.
+  it("최종 리뷰가 최신 판단이 바뀐 쟁점을 누락하면 옛 no-action 으로 승계되지 않고 교정으로 간다", async () => {
+    for (const latest of ["AGREED_ACTION", "RESOLVED_BY_FIX"] as const) {
+      const { database, engine } = await makeReviewRecovery({
+        resumeState: "CODEX_FINAL_REVIEW",
+        implementationFindings: [finding("F-1", "결함", { disposition: latest })],
+        originalReviewFindings: [finding("F-1", "결함", { disposition: "AGREED_NO_ACTION" })],
+        codexResult: { kind: "FINAL_REVIEW", summary: "F-1 을 빠뜨린 최종 리뷰", findings: [], evidenceRefs: [] },
+      });
+      engine.retry("topic-1");
+      await waitForActionCompletion(database, "topic-1");
+      const topic = database.getTopic("topic-1");
+      expect(topic.state, latest).toBe("FAILED");
+      expect(topic.lastError, latest).toContain("F-1");
+      const bodies = database.getTimeline("topic-1").map((event) => event.body);
+      expect(bodies.some((body) => body.includes("승계했습니다") && body.includes("F-1")), latest).toBe(false);
+      database.close();
+    }
+  });
+
+  // 2026-09-13 Codex 지적 3: 승계 기록은 최종 검사 뒤에, 실제 교정 여부와 함께 남는다.
+  it("승계와 교정이 같은 턴에 있으면 기록은 교정 뒤 1회이고 corrected 를 담는다", async () => {
+    const action = finding("F-1", "결함", { disposition: "AGREED_ACTION" });
+    const noAction = finding("F-2", "오탐", { disposition: "AGREED_NO_ACTION", severity: "LOW" });
+    const resolved = finding("F-1", "결함", { disposition: "RESOLVED_BY_FIX" });
+    const { database, engine } = await makeReviewRecovery({
+      resumeState: "CLAUDE_FIX", implementationFindings: [action], originalReviewFindings: [action, noAction],
+      codexResult: { kind: "FINAL_REVIEW", summary: "수정 확인", findings: [resolved], evidenceRefs: [] },
+      codexResults: [{ kind: "FINAL_REVIEW", summary: "수정 확인", findings: [resolved], evidenceRefs: [] }],
+      claudeResults: [
+        // 1차: 행동 필요 F-1 누락(교정 대상) + settled F-2 생략(승계 대상)
+        { kind: "FIX", summary: "F-1 을 빠뜨렸다", findings: [], evidenceRefs: [] },
+        // 교정 재제출: F-1 만 적음 — F-2 는 여전히 승계
+        { kind: "FIX", summary: "F-1 고침", findings: [resolved], evidenceRefs: ["feature.txt"] },
+      ],
+    });
+    engine.retry("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+    const topic = database.getTopic("topic-1");
+    expect(topic.state, topic.lastError ?? "").toBe("READY_TO_DELIVER");
+    const events = database.getTimeline("topic-1");
+    const correction = events.findIndex((event) => event.body.includes("기계 계약 위반") && event.body.includes("F-1"));
+    const carries = events.filter((event) => event.body.startsWith("Claude fix: 판단이 끝난 앞 단계 쟁점"));
+    expect(correction).toBeGreaterThan(-1);
+    expect(carries).toHaveLength(1);
+    expect(events.indexOf(carries[0])).toBeGreaterThan(correction);
+    expect(carries[0].body).toContain("계약 교정 재제출 1회 뒤 확정");
+    expect(carries[0].payload).toMatchObject({ carriedFindings: ["F-2"], corrected: true, label: "Claude fix" });
     database.close();
   });
 });

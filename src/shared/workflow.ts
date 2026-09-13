@@ -184,6 +184,21 @@ export function isSettledFinding(finding: Finding, options: { forReview?: boolea
   return true;
 }
 
+// 여러 앞 단계 결과를 id 별로 합친다 — 앞에 준 것이 최신이라 우선한다. 승계 판단은 반드시 합친 뒤에 한다: 원본마다 따로 승계하면
+// 첫 리뷰의 AGREED_NO_ACTION 이 수정 결과의 AGREED_ACTION·RESOLVED_BY_FIX 를 덮어 최신 판단이 사라진다(2026-09-13 Codex 지적 1).
+export function mergeFindingSources(...sources: ReadonlyArray<readonly Finding[] | undefined>): Finding[] {
+  const seen = new Set<string>();
+  const merged: Finding[] = [];
+  for (const source of sources) {
+    for (const finding of source ?? []) {
+      if (seen.has(finding.id)) continue;
+      seen.add(finding.id);
+      merged.push(finding);
+    }
+  }
+  return merged;
+}
+
 export const CARRIED_RATIONALE_PREFIX = "리뷰 처분 승계(엔진 자동): ";
 
 // source 의 settled 쟁점 중 response 에 없는 id 를 같은 처분으로 덧붙인다. response 가 이미 적은 쟁점은 response 가 우선

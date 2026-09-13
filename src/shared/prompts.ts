@@ -8,6 +8,9 @@ import { DISPOSITIONS, FIX_AWARE_KINDS, REQUIRED_PLAN_HEADINGS } from "./contrac
 // fixAware를 손으로 고르지 않는다 — 단계 kind에서 검사기와 같은 정본(FIX_AWARE_KINDS)을 읽어 파생한다.
 function dispositionContract(kind: AgentResult["kind"]): string {
   const fixAware = FIX_AWARE_KINDS.has(kind);
+  // 리뷰 단계 여부는 처분 사용 가능 여부(fixAware)와 다른 축이다 — FINAL_REVIEW 는 fixAware 지만 앞 단계의 RESOLVED_BY_FIX 주장을
+  // 승계받지 못하고 판정해야 한다(2026-09-13 Codex 지적 2: fixAware 로 묶어 최종 리뷰에서 문구가 빠졌다).
+  const reviewStage = kind === "REVIEW" || kind === "FINAL_REVIEW";
   const usable = fixAware ? DISPOSITIONS : DISPOSITIONS.filter((value) => value !== "RESOLVED_BY_FIX");
   const forbidden = fixAware
     ? "이 단계는 실제 수정을 확인하는 단계이므로 RESOLVED_BY_FIX를 쓸 수 있습니다."
@@ -16,7 +19,7 @@ function dispositionContract(kind: AgentResult["kind"]): string {
 ${forbidden}
 앞 단계 쟁점 중 **행동이 필요한 것**(AGREED_ACTION·EXTERNAL_EVIDENCE·requiresUserDecision·처분 없음)은 하나도 빠짐없이 처분을 붙이세요.
 이미 판단이 끝난 쟁점(AGREED_NO_ACTION·REFUTED·DEFERRED_OUT_OF_SCOPE)은 되돌려 적지 않아도 됩니다 — 서버가 같은 처분으로 승계합니다. 처분을 **바꾸려는** 쟁점만 적으세요.${
-  fixAware ? "" : " 앞 단계가 RESOLVED_BY_FIX 로 주장한 쟁점은 승계되지 않습니다 — 반드시 판정해 적으세요."} 이 단계에서 새로 발견한 쟁점은 처분을 비워 둬도 됩니다.
+  reviewStage ? " 앞 단계가 RESOLVED_BY_FIX 로 주장한 쟁점은 승계되지 않습니다 — 수정이 실제로 확인되는지 반드시 판정해 적으세요." : ""} 이 단계에서 새로 발견한 쟁점은 처분을 비워 둬도 됩니다.
 EXTERNAL_EVIDENCE는 증거를 **아직 기다리는 중**일 때만 씁니다 — 이미 방에 기록된 증거로 해소된 쟁점에 이 값을 쓰면 서버가 증거 대기로 읽어 진행을 막습니다. 해소됐다면 AGREED_NO_ACTION(또는 실제 조치 합의면 AGREED_ACTION)으로 처분하세요.`;
 }
 
