@@ -178,6 +178,7 @@ export class PlanningPipeline {
     });
     const audit = await this.core.turn("codex", topic, prompt, signal, false, {
       readablePaths: context.readablePaths,
+      normalize: this.core.carryForwardNormalizer(topic.id, claudePlan.findings, "Codex audit", { forReview: true }),
       check: (r) => {
         this.core.assertKind(r, "AUDIT");
         assertFindingCoverage(claudePlan.findings, r.findings, "Codex audit");
@@ -236,6 +237,7 @@ export class PlanningPipeline {
       timeline: this.core.dependencies.database.getPromptTimeline(topicId, topic.scopeGeneration),
     }), signal, false, {
       freshSession: true, planMode: audit.findings.length === 0,
+      normalize: this.core.carryForwardNormalizer(topic.id, audit.findings, "Claude revision", { forReview: false }),
       check: (r) => {
         this.core.assertKind(r, "REVISION");
         assertFindingCoverage(audit.findings, r.findings, "Claude revision");
@@ -281,6 +283,7 @@ export class PlanningPipeline {
       source: "closeout",
     }), signal, false, {
       freshSession: true, planMode: false,
+      normalize: this.core.carryForwardNormalizer(topic.id, source.findings, "Claude revision(2회차)", { forReview: false }),
       check: (r) => {
         this.core.assertKind(r, "REVISION");
         assertFindingCoverage(source.findings, r.findings, "Claude revision(2회차)");
@@ -320,6 +323,7 @@ export class PlanningPipeline {
     });
     const closeout = await this.core.turn("codex", topic, prompt, signal, false, {
       readablePaths: context.readablePaths,
+      normalize: this.core.carryForwardNormalizer(topic.id, revision.findings, "Codex closeout", { forReview: true }),
       check: (r) => {
         this.core.assertKind(r, "CLOSEOUT");
         assertFindingCoverage(revision.findings, r.findings, "Codex closeout");

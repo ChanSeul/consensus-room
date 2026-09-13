@@ -14,7 +14,9 @@ function dispositionContract(kind: AgentResult["kind"]): string {
     : "이 단계에서 RESOLVED_BY_FIX를 쓰면 서버가 응답 전체를 거부합니다 — 아직 수정이 일어나지 않았기 때문입니다.";
   return `처분(disposition)은 다음 값만 씁니다: ${usable.join(", ")}.
 ${forbidden}
-앞 단계에서 넘어온 쟁점은 하나도 빠짐없이 처분을 붙이세요. 이 단계에서 새로 발견한 쟁점은 처분을 비워 둬도 됩니다.
+앞 단계 쟁점 중 **행동이 필요한 것**(AGREED_ACTION·EXTERNAL_EVIDENCE·requiresUserDecision·처분 없음)은 하나도 빠짐없이 처분을 붙이세요.
+이미 판단이 끝난 쟁점(AGREED_NO_ACTION·REFUTED·DEFERRED_OUT_OF_SCOPE)은 되돌려 적지 않아도 됩니다 — 서버가 같은 처분으로 승계합니다. 처분을 **바꾸려는** 쟁점만 적으세요.${
+  fixAware ? "" : " 앞 단계가 RESOLVED_BY_FIX 로 주장한 쟁점은 승계되지 않습니다 — 반드시 판정해 적으세요."} 이 단계에서 새로 발견한 쟁점은 처분을 비워 둬도 됩니다.
 EXTERNAL_EVIDENCE는 증거를 **아직 기다리는 중**일 때만 씁니다 — 이미 방에 기록된 증거로 해소된 쟁점에 이 값을 쓰면 서버가 증거 대기로 읽어 진행을 막습니다. 해소됐다면 AGREED_NO_ACTION(또는 실제 조치 합의면 AGREED_ACTION)으로 처분하세요.`;
 }
 

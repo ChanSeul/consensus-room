@@ -22,6 +22,7 @@ import {
   assertFixDispositionAllowed,
   assertPlanContract,
   assertTransition,
+  carryForwardFindings,
   normalizePlan,
   redactSecrets,
 } from "../../shared/workflow.js";
@@ -33,6 +34,10 @@ import type { WorkflowDependencies } from "../workflow.js";
 
 // 결과 JSON 의 표기만 틀린 위반(스키마·kind). 재제출에 판단이 필요 없어 교정 턴의 추론 강도를 low 로 내린다
 // (2026-09-07 Codex 자기 최적화 제안 ③). 쟁점 누락·처분 규칙 위반은 판단이 섞이므로 여기 속하지 않는다.
+function normalized(normalize: ((result: AgentResult) => AgentResult) | undefined, result: AgentResult): AgentResult {
+  return normalize ? normalize(result) : result;
+}
+
 export class FormatViolation extends Error {
   constructor(message: string) {
     super(message);
@@ -174,6 +179,7 @@ export class EngineCore {
       session?: { id: string | null; persist: (sessionId: string) => void };
       // 이 턴에 추가로 읽기를 허용할 경로(주제 plan.md 등).
       readablePaths?: readonly string[];
+      normalize?: (result: AgentResult) => AgentResult;
     } = {},
   ): Promise<AgentResult> {
     const { freshSession = false, planMode = false, check } = options;
@@ -219,7 +225,7 @@ export class EngineCore {
     this.assertCurrent(topic.id, signal, topic.scopeGeneration, topic.state);
     if (await this.interruptPreservingResult(topic, role, result, startedAfter, signal)) throw new HandledWorkflowInterruption();
     return this.enforceResultContract(role, topic, result, sessionId, {
-      signal, implementation, planMode, startedAfter, check, readablePaths: options.readablePaths,
+      signal, implementation, planMode, startedAfter, check, readablePaths: options.readablePaths, normalize: options.normalize,
     });
   }
 
@@ -239,12 +245,14 @@ export class EngineCore {
       check?: (result: AgentResult) => void;
       // 본 턴과 같은 읽기 허용(계획 정본 등) — 교정 턴에서만 권한이 빠지면 "필요하면 읽으라" 고 안내한 파일을 못 읽는다(Codex 후속 지적 7).
       readablePaths?: readonly string[];
+      // 파싱 직후·검사 직전에 결과를 손질한다(예: 판단이 끝난 앞 단계 쟁점을 서버가 승계). 교정 재제출의 재파싱에도 같이 적용된다.
+      normalize?: (result: AgentResult) => AgentResult;
     },
   ): Promise<AgentResult> {
     let violation: string;
     let formatOnly = false;
     try {
-      const parsed = redactAgentResult(AgentResultSchema.parse(raw));
+      const parsed = normalized(context.normalize, redactAgentResult(AgentResultSchema.parse(raw)));
       context.check?.(parsed);
       return parsed;
     } catch (error) {
@@ -265,9 +273,26 @@ export class EngineCore {
     });
     this.assertCurrent(topic.id, context.signal, topic.scopeGeneration, this.dependencies.database.getTopic(topic.id).state);
     if (this.interruptForNewUserInput(topic, context.startedAfter)) throw new HandledWorkflowInterruption();
-    const reparsed = redactAgentResult(AgentResultSchema.parse(corrected));
+    const reparsed = normalized(context.normalize, redactAgentResult(AgentResultSchema.parse(corrected)));
     context.check?.(reparsed);
     return reparsed;
+  }
+
+  // 앞 단계 쟁점 승계용 normalize — 승계가 있으면 턴당 한 번만 이벤트로 남긴다(절감 측정 근거, 2026-09-13).
+  carryForwardNormalizer(
+    topicId: string, source: readonly Finding[], label: string, options: { forReview?: boolean } = {},
+  ): (result: AgentResult) => AgentResult {
+    let announced = false;
+    return (result) => {
+      const { findings, carried } = carryForwardFindings(source, result.findings, options);
+      if (carried.length > 0 && !announced) {
+        announced = true;
+        this.event(topicId, "system", "system",
+          `${label}: 판단이 끝난 앞 단계 쟁점 ${carried.length}건을 서버가 같은 처분으로 승계했습니다(모델 재제출 없음): ${carried.join(", ")}`,
+          { carriedFindings: carried, label });
+      }
+      return carried.length > 0 ? { ...result, findings } : result;
+    };
   }
 
   // 합의 세션과 무관한 일회용 세션에서 실행한다. 만들어진 세션 ID는 participant에 저장하지 않는다 —

@@ -17,6 +17,7 @@ import {
   resolveBranchName,
   refixDirective,
   shouldRunFixPass,
+  carryForwardFindings,
 } from "../../shared/workflow.js";
 import { normalizeCommitPaths } from "../git.js";
 import { redactAgentResult } from "../security.js";
@@ -206,6 +207,13 @@ export class DeliveryPipeline {
       }
     }
     const receipts = await this.core.dependencies.verifications?.receipts(topicId);
+    // 구현/수정 결과의 settled 쟁점(주로 TODO-n 이연)과 첫 리뷰의 no-action 쟁점은 서버가 승계한다. RESOLVED_BY_FIX 주장은 승계하지 않는다(리뷰가 판정).
+    const reviewLabel = finalPass ? "Codex final review" : "Codex review";
+    const carryImplementation = this.core.carryForwardNormalizer(topicId, implementation.findings, reviewLabel, { forReview: true });
+    const carryOriginal = originalReview
+      ? this.core.carryForwardNormalizer(topicId, originalReview.findings, `${reviewLabel}(첫 리뷰 승계)`, { forReview: true })
+      : null;
+    const reviewNormalizer = (result: AgentResult) => carryOriginal ? carryOriginal(carryImplementation(result)) : carryImplementation(result);
     const review = await this.core.turn("codex", topic, buildCodexReviewPrompt({
       planMarkdown: plan, planSHA256: topic.planSHA256!, implementation, finalPass, resumedSession, tolerance, planPath,
       timeline: this.reviewTimeline(topicId, topic.scopeGeneration, reviewSince),
@@ -215,6 +223,7 @@ export class DeliveryPipeline {
       deltaSinceLastReview, verificationReceipts: receipts?.text,
     }), signal, false, {
       readablePaths: [planPath, ...(receipts?.readablePaths ?? [])],
+      normalize: reviewNormalizer,
       session: {
         id: reviewSessionId,
         persist: (sessionId) => {
@@ -460,6 +469,8 @@ export class DeliveryPipeline {
         timeline: this.core.dependencies.database.getPromptTimeline(topicId, topic.scopeGeneration, flags.implementationPromptSequence ?? 0),
       }),
     };
+    // 판단이 끝난 리뷰 쟁점은 서버가 승계한다 — 러너가 되돌려 담지 않아도 재제출을 사지 않는다(2026-09-13).
+    const fixNormalizer = this.core.carryForwardNormalizer(topicId, review.findings, "Claude fix");
     const fixFork = await this.resumeImplementationSession(
       topicId, flags.implementationSessionId, fixPrompts, topic.worktreePath, signal, [planPath],
     );
@@ -475,7 +486,7 @@ export class DeliveryPipeline {
     }
     if (await this.core.interruptPreservingResult(topic, "claude", result, inputSequence, signal)) return;
     const fixResult = await this.core.enforceResultContract("claude", topic, result, fixFork.sessionId, {
-      signal, implementation: true, planMode: false, startedAfter: inputSequence, readablePaths: [planPath],
+      signal, implementation: true, planMode: false, startedAfter: inputSequence, readablePaths: [planPath], normalize: fixNormalizer,
       check: (r) => {
         this.core.assertKind(r, "FIX");
         assertFindingCoverage(review.findings, r.findings, "Claude fix");
@@ -486,7 +497,7 @@ export class DeliveryPipeline {
     await this.assertBaselineIntact(topic, baselineHead, "자동 수정 교정 중");
     const fixChecked = await this.enforceTolerance({
       topicId, topic: this.core.dependencies.database.getTopic(topicId), plan, result: fixResult, sessionId: fixFork.sessionId,
-      signal, inputSequence, resumeState: "CLAUDE_FIX", baselineHead, readablePaths: [planPath],
+      signal, inputSequence, resumeState: "CLAUDE_FIX", baselineHead, readablePaths: [planPath], normalize: fixNormalizer,
       check: (r) => {
         this.core.assertKind(r, "FIX");
         assertFindingCoverage(review.findings, r.findings, "Claude fix");
@@ -548,7 +559,9 @@ export class DeliveryPipeline {
         `결정의 REFIX 지시로 저장된 수정 결과(#${storedFix.revision})를 재사용하지 않고 수정 턴을 다시 엽니다.`);
       return false;
     }
-    const fixResult = await this.core.latestResult(topicId, "claude-fix");
+    const storedResult = await this.core.latestResult(topicId, "claude-fix");
+    // 저장된 결과도 같은 승계 규칙으로 본다 — 되돌려 담지 않은 settled 쟁점 때문에 재사용을 포기하지 않는다.
+    const fixResult = { ...storedResult, findings: carryForwardFindings(review.findings, storedResult.findings).findings };
     try {
       this.core.assertKind(fixResult, "FIX");
       assertFindingCoverage(review.findings, fixResult.findings, "Claude fix");
@@ -600,6 +613,7 @@ export class DeliveryPipeline {
     inputSequence: number; resumeState: "IMPLEMENTING" | "CLAUDE_FIX"; check: (result: AgentResult) => void;
     baselineHead: string;
     readablePaths?: readonly string[];
+    normalize?: (result: AgentResult) => AgentResult;
   }): Promise<AgentResult | null> {
     const policy = parseTolerancePolicy(input.plan);
     if (!policy) return input.result;
@@ -621,7 +635,7 @@ export class DeliveryPipeline {
       await this.assertBaselineIntact(input.topic, input.baselineHead, "허용 오차 교정 중");
       result = await this.core.enforceResultContract("claude", input.topic, corrected, input.sessionId, {
         signal: input.signal, implementation: true, planMode: false, startedAfter: input.inputSequence, check: input.check,
-        readablePaths: input.readablePaths,
+        readablePaths: input.readablePaths, normalize: input.normalize,
       });
       // 계약 교정이 한 번 더 돌았을 수 있다 — 그 호출도 커밋을 만들 수 있으므로 다시 본다(Codex 후속 지적 1).
       await this.assertBaselineIntact(input.topic, input.baselineHead, "허용 오차 교정 뒤 계약 교정 중");

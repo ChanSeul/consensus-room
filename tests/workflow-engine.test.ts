@@ -974,7 +974,8 @@ describe("가짜 에이전트 전체 계획 왕복", () => {
 
 describe("리뷰 finding 보존", () => {
   it("첫 Codex 리뷰가 구현 보고의 finding을 누락하면 전달 준비로 넘어가지 않는다", async () => {
-    const implementationFinding = finding("F-IMPLEMENTATION", "구현 중 발견한 제약");
+    // 행동이 필요한 쟁점이어야 한다 — 판단이 끝난 쟁점(AGREED_NO_ACTION 등)은 2026-09-13 부터 서버가 승계한다.
+    const implementationFinding = finding("F-IMPLEMENTATION", "구현 중 발견한 제약", { disposition: "AGREED_ACTION" });
     const { database, engine } = await makeReviewRecovery({
       resumeState: "CODEX_REVIEW",
       implementationFindings: [implementationFinding],
@@ -1207,7 +1208,8 @@ describe("리뷰 finding 보존", () => {
 
   it("최종 Codex 리뷰가 Claude fix에서 새로 보고한 finding을 누락하면 전달 준비로 넘어가지 않는다", async () => {
     const originalFinding = finding("F-ORIGINAL", "첫 리뷰 지적");
-    const fixFinding = finding("F-FIX", "수정 중 새로 발견한 제약");
+    // 행동이 필요한 쟁점이어야 한다 — 판단이 끝난 쟁점은 서버가 승계하므로 누락으로 잡히지 않는다(2026-09-13).
+    const fixFinding = finding("F-FIX", "수정 중 새로 발견한 제약", { disposition: "AGREED_ACTION" });
     const { database, engine } = await makeReviewRecovery({
       resumeState: "CODEX_FINAL_REVIEW",
       implementationFindings: [fixFinding],
@@ -3258,5 +3260,55 @@ describe("사용량 이벤트 전달", () => {
     late({ executionId: "old", recordKind: "final", outputTokens: 20 });
     expect(database.getExecutionUsage("topic-1")).toHaveLength(0);
     expect(database.getTimeline("topic-1")).toHaveLength(2);
+  });
+});
+
+// 2026-09-13 S10 #120~#121: 판단이 끝난 리뷰 쟁점을 러너가 되돌려 담지 않아 재제출을 샀다. 서버가 승계하면 교정 없이 진행한다.
+describe("settled 쟁점 서버 승계 — 수정·리뷰 경로", () => {
+  it("수정 응답이 no-action·이연 쟁점을 생략해도 교정 없이 READY 까지 가고, 산출물에는 승계 표시가 남는다", async () => {
+    const action = finding("F-1", "결함", { disposition: "AGREED_ACTION" });
+    const noAction = finding("F-2", "오탐", { disposition: "AGREED_NO_ACTION", severity: "LOW" });
+    const deferred = finding("TODO-1", "이연", { disposition: "DEFERRED_OUT_OF_SCOPE", severity: "LOW" });
+    const resolved = finding("F-1", "결함", { disposition: "RESOLVED_BY_FIX" });
+    const { database, engine, artifacts } = await makeReviewRecovery({
+      resumeState: "CLAUDE_FIX", implementationFindings: [action], originalReviewFindings: [action, noAction, deferred],
+      // 최종 리뷰도 F-1 판정만 적는다 — F-2·TODO-1 은 서버가 승계한다.
+      codexResult: { kind: "FINAL_REVIEW", summary: "수정 확인", findings: [resolved], evidenceRefs: [] },
+      codexResults: [{ kind: "FINAL_REVIEW", summary: "수정 확인", findings: [resolved], evidenceRefs: [] }],
+      // 수정 응답 하나뿐 — 교정 재제출이 일어나면 가짜 응답 부족으로 FAILED 가 되어 드러난다.
+      claudeResults: [{ kind: "FIX", summary: "F-1 만 고쳤다", findings: [resolved], evidenceRefs: ["feature.txt"] }],
+    });
+    engine.retry("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+
+    const topic = database.getTopic("topic-1");
+    expect(topic.state, topic.lastError ?? "").toBe("READY_TO_DELIVER");
+    const bodies = database.getTimeline("topic-1").map((event) => event.body);
+    expect(bodies.some((body) => body.includes("기계 계약 위반"))).toBe(false);
+    expect(bodies.filter((body) => body.startsWith("Claude fix: 판단이 끝난 앞 단계 쟁점 2건을 서버가") && body.includes("F-2, TODO-1"))).toHaveLength(1);
+    expect(bodies.some((body) => body.startsWith("Codex final review") && body.includes("승계했습니다"))).toBe(true);
+    const storedFix = JSON.parse((await artifacts.readLatest("topic-1", "claude-fix"))!);
+    const carried = storedFix.findings.find((item: { id: string }) => item.id === "F-2");
+    expect(carried).toMatchObject({ disposition: "AGREED_NO_ACTION" });
+    expect(carried.rationale.startsWith("리뷰 처분 승계(엔진 자동): ")).toBe(true);
+    database.close();
+  });
+
+  it("행동이 필요한 쟁점을 빠뜨리면 여전히 교정 재제출로 간다(승계 대상이 아니다)", async () => {
+    const action = finding("F-1", "결함", { disposition: "AGREED_ACTION" });
+    const noAction = finding("F-2", "오탐", { disposition: "AGREED_NO_ACTION", severity: "LOW" });
+    const { database, engine } = await makeReviewRecovery({
+      resumeState: "CLAUDE_FIX", implementationFindings: [action], originalReviewFindings: [action, noAction],
+      codexResult: { kind: "FINAL_REVIEW", summary: "수정 확인", findings: [], evidenceRefs: [] },
+      // F-1(행동 필요)을 빠뜨린 응답 하나뿐 → 교정을 시도하다 가짜 응답 부족으로 실패해야 한다.
+      claudeResults: [{ kind: "FIX", summary: "F-2 만 적었다", findings: [noAction], evidenceRefs: [] }],
+    });
+    engine.retry("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+
+    expect(database.getTopic("topic-1").state).toBe("FAILED");
+    const bodies = database.getTimeline("topic-1").map((event) => event.body);
+    expect(bodies.some((body) => body.includes("기계 계약 위반") && body.includes("검토 쟁점을 누락했습니다: F-1"))).toBe(true);
+    database.close();
   });
 });

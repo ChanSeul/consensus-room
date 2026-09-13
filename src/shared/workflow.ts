@@ -174,6 +174,39 @@ export function classifyCloseout(result: AgentResult):
   return { state: "CONSENSUS_ACK", findings: result.findings };
 }
 
+// 판단이 끝난 쟁점 — 처분이 있고 행동(AGREED_ACTION·EXTERNAL_EVIDENCE·사용자 결정)이 필요 없는 것. 뒤 단계가 다시 적어도
+// 정보가 늘지 않으므로 서버가 승계한다(2026-09-13 S10 #120: 러너가 이런 쟁점 13건을 빠뜨려 재제출 1회 $0.41·121초).
+// forReview: 리뷰 단계는 RESOLVED_BY_FIX **주장**을 검증해야 하므로 그것은 승계하지 않는다.
+export function isSettledFinding(finding: Finding, options: { forReview?: boolean } = {}): boolean {
+  if (!finding.disposition || finding.requiresUserDecision) return false;
+  if (finding.disposition === "AGREED_ACTION" || finding.disposition === "EXTERNAL_EVIDENCE") return false;
+  if (options.forReview && finding.disposition === "RESOLVED_BY_FIX") return false;
+  return true;
+}
+
+export const CARRIED_RATIONALE_PREFIX = "리뷰 처분 승계(엔진 자동): ";
+
+// source 의 settled 쟁점 중 response 에 없는 id 를 같은 처분으로 덧붙인다. response 가 이미 적은 쟁점은 response 가 우선
+// (처분을 바꾸려는 뜻). 반환 carried 는 승계한 id 목록 — 호출자가 이벤트로 남겨 절감을 잰다.
+export function carryForwardFindings(
+  source: readonly Finding[],
+  response: readonly Finding[],
+  options: { forReview?: boolean } = {},
+): { findings: Finding[]; carried: string[] } {
+  const present = new Set(response.map((finding) => finding.id));
+  const carried: Finding[] = [];
+  for (const finding of source) {
+    if (present.has(finding.id) || !isSettledFinding(finding, options)) continue;
+    present.add(finding.id);
+    carried.push({
+      ...finding,
+      requiresUserDecision: false,
+      rationale: finding.rationale.startsWith(CARRIED_RATIONALE_PREFIX) ? finding.rationale : `${CARRIED_RATIONALE_PREFIX}${finding.rationale}`,
+    });
+  }
+  return { findings: carried.length ? [...response, ...carried] : [...response], carried: carried.map((finding) => finding.id) };
+}
+
 export function assertFindingCoverage(
   source: readonly Finding[],
   response: readonly Finding[],

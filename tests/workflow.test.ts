@@ -30,6 +30,9 @@ import {
   resetParticipantsForScopeChange,
   resolveBranchName,
   shouldRunFixPass,
+  CARRIED_RATIONALE_PREFIX,
+  carryForwardFindings,
+  isSettledFinding,
 } from "../src/shared/workflow";
 
 function completePlan(extra = ""): string {
@@ -520,6 +523,8 @@ describe("처분 프롬프트와 단계 제약의 정합", () => {
   it("앞 단계 쟁점에 처분이 필요하다는 것과 새 쟁점은 예외라는 것을 둘 다 말한다", () => {
     for (const prompt of [revisionPrompt, closeoutPrompt, fixPrompt]) {
       expect(prompt).toContain("빠짐없이 처분을 붙이세요");
+      // 2026-09-13: 판단이 끝난 쟁점은 서버가 승계한다고 알려 되돌려 담는 출력 토큰을 줄인다.
+      expect(prompt).toContain("서버가 같은 처분으로 승계합니다");
       expect(prompt).toContain("새로 발견한 쟁점은 처분을 비워 둬도 됩니다");
     }
   });
@@ -643,5 +648,42 @@ describe("dispositionRegressions 의 overruled 집합", () => {
     expect(dispositionRegressions([agreed], [closed])).toEqual(["F-1"]);
     expect(dispositionRegressions([agreed], [closed], new Set(["F-1"]))).toEqual([]);
     expect(dispositionRegressions([agreed], [closed], new Set(["F-2"]))).toEqual(["F-1"]);
+  });
+});
+
+// 2026-09-13 S10 #120: 러너가 판단이 끝난 리뷰 쟁점 13건을 되돌려 담지 않아 재제출 1회를 샀다. 서버가 승계하면 재제출이 없다.
+describe("settled 쟁점 승계(carryForwardFindings)", () => {
+  const f = (id: string, disposition: string | undefined, extra: Record<string, unknown> = {}) => ({
+    id, title: id, severity: "MEDIUM", disposition, rationale: `근거 ${id}`, evidenceRefs: [], requiresUserDecision: false, ...extra,
+  }) as unknown as import("../src/shared/contracts").Finding;
+
+  it("처분이 있고 행동이 필요 없는 쟁점만 settled 다", () => {
+    expect(isSettledFinding(f("A", "AGREED_NO_ACTION"))).toBe(true);
+    expect(isSettledFinding(f("B", "REFUTED"))).toBe(true);
+    expect(isSettledFinding(f("C", "DEFERRED_OUT_OF_SCOPE"))).toBe(true);
+    expect(isSettledFinding(f("D", "RESOLVED_BY_FIX"))).toBe(true);
+    expect(isSettledFinding(f("D", "RESOLVED_BY_FIX"), { forReview: true })).toBe(false); // 리뷰는 주장을 판정해야 한다
+    expect(isSettledFinding(f("E", "AGREED_ACTION"))).toBe(false);
+    expect(isSettledFinding(f("F", "EXTERNAL_EVIDENCE"))).toBe(false);
+    expect(isSettledFinding(f("G", undefined))).toBe(false);
+    expect(isSettledFinding(f("H", "AGREED_NO_ACTION", { requiresUserDecision: true }))).toBe(false);
+  });
+
+  it("응답에 없는 settled 쟁점만 같은 처분으로 덧붙이고, 응답이 적은 쟁점은 응답이 우선한다", () => {
+    const source = [f("F-1", "AGREED_ACTION"), f("F-2", "AGREED_NO_ACTION"), f("TODO-1", "DEFERRED_OUT_OF_SCOPE"), f("F-3", "REFUTED")];
+    const response = [f("F-1", "RESOLVED_BY_FIX"), f("F-3", "AGREED_ACTION", { rationale: "다시 열기" })];
+    const { findings, carried } = carryForwardFindings(source, response);
+    expect(carried).toEqual(["F-2", "TODO-1"]);
+    expect(findings.map((x) => [x.id, x.disposition])).toEqual([
+      ["F-1", "RESOLVED_BY_FIX"], ["F-3", "AGREED_ACTION"], ["F-2", "AGREED_NO_ACTION"], ["TODO-1", "DEFERRED_OUT_OF_SCOPE"],
+    ]);
+    expect(findings.find((x) => x.id === "F-2")!.rationale.startsWith(CARRIED_RATIONALE_PREFIX)).toBe(true);
+    // 행동 필요 쟁점(F-1 이 빠진 응답)은 승계되지 않아 커버리지 검사에 그대로 걸린다.
+    const missingActionable = carryForwardFindings(source, [f("F-2", "AGREED_NO_ACTION")]);
+    expect(missingActionable.carried).toEqual(["TODO-1", "F-3"]);
+    expect(() => assertFindingCoverage(source, missingActionable.findings, "Claude fix")).toThrow("F-1");
+    // 승계는 멱등 — 이미 접두가 붙은 쟁점을 다시 승계해도 접두가 겹치지 않는다.
+    const again = carryForwardFindings(missingActionable.findings, []);
+    expect(again.findings.find((x) => x.id === "TODO-1")!.rationale.split(CARRIED_RATIONALE_PREFIX).length).toBe(2);
   });
 });
