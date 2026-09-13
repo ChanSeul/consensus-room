@@ -60,8 +60,15 @@ export class DeliveryPipeline {
     const existingImplementationSession = sessionFlags.implementationSessionId;
     // 계획 원문은 별칭(plan.md)이 아니라 sha 로 검증한 정본 blob 경로를 넘긴다(Codex 후속 지적 6).
     const planPath = await this.core.dependencies.artifacts.verifiedPath(topicId, "plan");
+    // 개정 없이 넘어온 경미 지적(구현 노트)은 첫 프롬프트에 실리고, 러너 결과가 id 별 처분을 빠뜨리면 커버리지 계약이 재제출을 요구한다.
+    const implementationNotes = await this.core.implementationNotesOf(topicId);
+    const noteFindings: Finding[] = implementationNotes.map((note) => ({
+      id: note.id, title: note.title, severity: note.severity, disposition: "AGREED_ACTION", rationale: note.rationale,
+      evidenceRefs: [], requiresUserDecision: false,
+    }));
     const promptBase = {
       planMarkdown: plan, planSHA256: topic.planSHA256!, worktreePath: topic.worktreePath, branchName: topic.branchName!, planPath,
+      implementationNotes,
     };
     // 이어지는 턴은 계획 본문과 이미 받은 이벤트를 다시 싣지 않는다(2026-09-08 Codex 제안 ⑥). 세션 유실로 새 세션이 되면
     // resumeImplementationSession 이 전문 프롬프트로 바꿔 쓴다. '전달한 sequence' 는 턴이 실제로 돌아온 뒤에만 적는다 —
@@ -85,13 +92,15 @@ export class DeliveryPipeline {
     this.core.dependencies.database.updateTopic(topicId, { implementationPromptSequence: inputSequence });
     let implementationResult = await this.core.enforceResultContract("claude", topic, fork.result, fork.sessionId, {
       signal, implementation: true, planMode: false, startedAfter: inputSequence,
-      check: (r) => this.core.assertKind(r, "IMPLEMENTATION"), readablePaths: [planPath],
+      check: (r) => { this.core.assertKind(r, "IMPLEMENTATION"); assertFindingCoverage(noteFindings, r.findings, "Claude implementation(구현 노트)"); },
+      readablePaths: [planPath], normalize: this.core.carryForwardNormalizer(noteFindings, "Claude implementation"),
     });
     await this.assertBaselineIntact(topic, baselineHead, "구현 중");
     const toleranceChecked = await this.enforceTolerance({
       topicId, topic: this.core.dependencies.database.getTopic(topicId), plan, result: implementationResult, sessionId: fork.sessionId,
-      signal, inputSequence, resumeState: "IMPLEMENTING", check: (r) => this.core.assertKind(r, "IMPLEMENTATION"), baselineHead,
-      readablePaths: [planPath],
+      signal, inputSequence, resumeState: "IMPLEMENTING",
+      check: (r) => { this.core.assertKind(r, "IMPLEMENTATION"); assertFindingCoverage(noteFindings, r.findings, "Claude implementation(구현 노트)"); },
+      baselineHead, readablePaths: [planPath], normalize: this.core.carryForwardNormalizer(noteFindings, "Claude implementation"),
     });
     if (!toleranceChecked) return;
     implementationResult = toleranceChecked;

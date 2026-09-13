@@ -24,7 +24,8 @@ export const INTERRUPTED_WORKFLOW_STATES: ReadonlySet<WorkflowState> = new Set([
 const NEXT_STATES: Readonly<Record<WorkflowState, ReadonlySet<WorkflowState>>> = {
   DRAFT: new Set(["CLAUDE_PLAN", "FAILED"]),
   CLAUDE_PLAN: new Set(["CODEX_AUDIT", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED", "FAILED"]),
-  CODEX_AUDIT: new Set(["CLAUDE_REVISION", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED", "FAILED"]),
+  // CODEX_CLOSEOUT 직행: 감사 지적이 전부 경미(MEDIUM 이하)면 개정 턴을 생략하고 구현 노트로 넘긴다(2026-09-13 사용자 규칙).
+  CODEX_AUDIT: new Set(["CLAUDE_REVISION", "CODEX_CLOSEOUT", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED", "FAILED"]),
   CLAUDE_REVISION: new Set(["CODEX_CLOSEOUT", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED", "FAILED"]),
   // CLAUDE_REVISION 포함: 종결 확인의 새 쟁점은 처음부터 다시 도는 대신 개정 2회차(바퀴당 1회)로 반영한다(2026-09-07).
   CODEX_CLOSEOUT: new Set(["CONSENSUS_ACK", "CLAUDE_REVISION", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED", "FAILED"]),
@@ -200,6 +201,13 @@ export function mergeFindingSources(...sources: ReadonlyArray<readonly Finding[]
     }
   }
   return merged;
+}
+
+// 계획 개정을 여는 심각도. 그 아래(MEDIUM·LOW·INFO)는 "경미" — 개정 턴 대신 구현 노트로 러너에게 전달한다
+// (2026-09-13 사용자 규칙: S10H·S11 계획 단계가 경미 지적의 개정 반복으로 토픽당 $50~60 을 썼다).
+export const REVISION_SEVERITIES: ReadonlySet<Finding["severity"]> = new Set(["BLOCKER", "HIGH"]);
+export function isMinorFinding(finding: Finding): boolean {
+  return !REVISION_SEVERITIES.has(finding.severity);
 }
 
 export const CARRIED_RATIONALE_PREFIX = "리뷰 처분 승계(엔진 자동): ";

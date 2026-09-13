@@ -1,5 +1,5 @@
 import { numberedPlan } from "./planPatches";
-import type { AgentResult, DeferredFinding, Finding, TimelineEvent } from "./contracts";
+import type { AgentResult, DeferredFinding, Finding, ImplementationNote, TimelineEvent } from "./contracts";
 import type { TolerancePolicy } from "./tolerance";
 import { DISPOSITIONS, FIX_AWARE_KINDS, REQUIRED_PLAN_HEADINGS } from "./contracts";
 
@@ -22,6 +22,19 @@ ${forbidden}
 이미 판단이 끝난 쟁점(AGREED_NO_ACTION·REFUTED·DEFERRED_OUT_OF_SCOPE)은 되돌려 적지 않아도 됩니다 — 서버가 같은 처분으로 승계합니다. 처분을 **바꾸려는** 쟁점만 적으세요.${
   reviewStage ? " 앞 단계가 RESOLVED_BY_FIX 로 주장한 쟁점은 승계되지 않습니다 — 수정이 실제로 확인되는지 반드시 판정해 적으세요." : ""} 이 단계에서 새로 발견한 쟁점은 처분을 비워 둬도 됩니다.
 EXTERNAL_EVIDENCE는 증거를 **아직 기다리는 중**일 때만 씁니다 — 이미 방에 기록된 증거로 해소된 쟁점에 이 값을 쓰면 서버가 증거 대기로 읽어 진행을 막습니다. 해소됐다면 AGREED_NO_ACTION(또는 실제 조치 합의면 AGREED_ACTION)으로 처분하세요.`;
+}
+
+// 심각도 정책(2026-09-13 사용자 규칙): 계획 개정은 BLOCKER/HIGH 만 연다. MEDIUM 이하는 개정 없이 구현 노트로 러너에게 간다.
+export function severityPolicyContract(): string {
+  return `심각도 규칙: 계획 **개정**을 여는 지적은 BLOCKER·HIGH 뿐입니다(계획 전제·게이트·안전·되돌릴 수 없는 절차를 깨는 것). MEDIUM·LOW·INFO 지적은 개정 없이 **구현 노트**로 러너에게 전달되어 구현 중 처리·보고되고 코드 리뷰가 검증합니다 — 그러니 경미한 항목을 HIGH 로 올리지 말고, 반대로 전제를 깨는 항목을 MEDIUM 으로 내리지 마세요. 심각도가 곧 처리 경로입니다.`;
+}
+
+export function renderImplementationNotes(notes: readonly ImplementationNote[] | undefined, audience: "closeout" | "implementation"): string {
+  if (!notes || notes.length === 0) return "";
+  const lines = notes.map((note) => `- ${note.id} [${note.severity}] ${note.title} (${note.source === "audit" ? "감사" : "종결"}): ${note.rationale.slice(0, 400)}`).join("\n");
+  return audience === "closeout"
+    ? `\n개정 없이 구현 노트로 넘어간 경미 지적(계획 본문에 반영되지 않은 것이 정상입니다 — 같은 항목을 새 쟁점으로 다시 내지 마세요):\n${lines}\n`
+    : `\n**개정 없이 넘어온 경미 지적(구현 노트)** — 구현 중 전부 처리하고 반환 findings 에 id 별 처분을 적으세요(고쳤으면 RESOLVED_BY_FIX + evidenceRefs, 근거 있는 미조치는 AGREED_NO_ACTION/DEFERRED_OUT_OF_SCOPE + 근거; 빠뜨리면 서버가 재제출을 요구합니다):\n${lines}\n`;
 }
 
 function renderDeferredFindings(findings: readonly DeferredFinding[] | undefined, stage: "plan" | "audit"): string {
@@ -186,6 +199,7 @@ ${JSON.stringify(input.claudePlan?.findings ?? [], null, 2)}
 ${input.planningContextMode === "delta" ? "직전 전달 이후 추가된 결정과 증거:" : "대화와 증거:"}
 ${renderTimeline(input.timeline, false, input.planningContextMode === "delta" ? "(직전 전달 이후 새 결정·증거 없음)" : undefined)}
 ${renderDeferredFindings(input.deferredFindings, "audit")}
+${severityPolicyContract()}
 ${outputLanguageContract({ planBody: false })}
 ${dispositionContract("AUDIT")}
 
@@ -251,6 +265,7 @@ export function buildCodexCloseoutPrompt(input: {
   planningContextMode?: "full" | "delta";
   // 개정 2회차 뒤의 종결 확인이면 true — 새 ID 를 또 내면 처음부터 다시 돌게 되므로 정말 새 결함일 때만.
   secondRound?: boolean;
+  implementationNotes?: readonly ImplementationNote[];
 }): string {
   return `읽기 전용 최종 의견 수렴입니다. 코드를 수정하지 마세요.
 
@@ -268,7 +283,8 @@ ${renderTimeline(input.timeline, false, input.planningContextMode === "delta" ? 
 
 이미 같은 증거로 끝난 논점을 다시 열지 마세요. 재개할 수 있는 조건은 변경된 리비전, 새 실행 증거, 새로 읽은 1차 자료,
 서로 다른 새 결함, 사용자의 명시적 재개뿐입니다. 각 finding의 최종 disposition을 확인하세요.
-
+${renderImplementationNotes(input.implementationNotes, "closeout")}
+${severityPolicyContract()}
 ${dispositionContract("CLOSEOUT")}
 ${outputLanguageContract({ planBody: false })}
 
@@ -343,6 +359,7 @@ export function buildImplementationPrompt(input: {
   timeline: readonly TimelineEvent[];
   resumedSession?: boolean;
   planPath?: string | null;
+  implementationNotes?: readonly ImplementationNote[];
 }): string {
   return `${input.resumedSession
     ? "이 구현 세션의 이어지는 턴입니다. 같은 승인 범위를 계속 구현하세요."
@@ -357,6 +374,7 @@ ${planSection(input)}
 ${continuedTimelineHeading(input.resumedSession, "현재 방의 사용자 결정과 증거:")}
 ${renderTimeline(input.timeline, false, continuedTimelineEmpty(input.resumedSession))}
 
+${input.resumedSession ? "" : renderImplementationNotes(input.implementationNotes, "implementation")}
 구현 중 발견해 이 턴에서 실제로 고친 쟁점은 RESOLVED_BY_FIX로 처분하고 확인 방법을 evidenceRefs에 남기세요.
 
 ${dispositionContract("IMPLEMENTATION")}

@@ -17,11 +17,15 @@ import {
   classifyCloseout,
   dispositionRegressions,
   hashPlan,
+  isMinorFinding,
+  isSettledFinding,
   newFindingIDs,
   normalizePlan,
   redactSecrets, replanDirective } from "../../shared/workflow.js";
 import type { EngineCore } from "./core.js";
 import { preparePlanningContext } from "./planningContext.js";
+
+const IMPLEMENTATION_NOTE_PREFIX = "구현 노트로 승계(엔진 자동, 개정 생략): ";
 
 export class PlanningPipeline {
   constructor(private readonly core: EngineCore) {}
@@ -191,6 +195,29 @@ export class PlanningPipeline {
     if (this.core.interruptForNewUserInput(topic, context.inputSequence)) return;
     if (this.core.pauseForResult(topicId, audit, "CODEX_AUDIT", "계획 검토에 사용자 결정이나 외부 증거가 필요합니다.")) return;
 
+    // 2026-09-13 사용자 규칙: 감사 지적이 전부 경미(MEDIUM 이하)이거나 이미 판단이 끝난 것이면 개정 턴을 사지 않는다 —
+    // 경미 지적은 구현 노트로 러너에게 넘기고(AGREED_ACTION 으로 승계), 계획은 그대로 종결 확인으로 간다.
+    const actionable = audit.findings.filter((finding) => !isSettledFinding(finding));
+    if (actionable.length > 0 && actionable.every(isMinorFinding)) {
+      const carried = actionable.map((finding) => ({
+        ...finding, disposition: "AGREED_ACTION" as const, requiresUserDecision: false,
+        rationale: `${IMPLEMENTATION_NOTE_PREFIX}${finding.rationale}`,
+      }));
+      await this.core.recordImplementationNotes(topic, actionable, "audit", signal);
+      const synthetic: AgentResult = {
+        kind: "REVISION", summary: "감사 지적이 전부 경미해 개정을 생략했습니다(엔진 자동) — 경미 지적은 구현 노트로 러너에게 넘어갑니다.",
+        findings: uniqueFindings([...audit.findings.filter((finding) => isSettledFinding(finding)), ...carried]),
+        evidenceRefs: [], planEdits: [],
+      };
+      const revision = this.core.dependencies.database.timelineCount(topicId) + 1;
+      await this.core.writeArtifact(topic, "claude-revision", revision, JSON.stringify(synthetic, null, 2), signal);
+      this.core.event(topicId, "system", "system",
+        `감사 지적 ${actionable.length}건이 전부 경미(MEDIUM 이하)라 개정 턴을 생략합니다 — 구현 노트로 러너에게 넘기고 종결 확인으로 갑니다: ${actionable.map((finding) => finding.id).join(", ")}`,
+        { skippedRevision: true, implementationNoteIDs: actionable.map((finding) => finding.id) });
+      await this.runPlanningFromCloseout(topicId, synthetic, storedFirstPlan, signal);
+      return;
+    }
+
     await this.runPlanningFromRevision(topicId, audit, storedFirstPlan, signal);
   }
 
@@ -204,10 +231,17 @@ export class PlanningPipeline {
       // 개정 2회차 도중 죽었다 — 감사가 아니라 종결 확인의 새 쟁점을 다시 반영한다(기존 계획 = 2판).
       const closeout = await this.core.latestResult(topicId, "closeout");
       const known = await this.roundKnownFindings(topicId);
-      const { essential } = classifyCloseoutAdditions(known, closeout);
+      const { essential, minor } = classifyCloseoutAdditions(known, closeout);
+      if (minor.length > 0) await this.core.recordImplementationNotes(this.core.dependencies.database.getTopic(topicId), minor, "closeout", signal);
       // 처분을 되돌린 쟁점도 추가 개정의 대상이다 — 결정을 소비해 처분을 재기재하는 단계가 개정이기 때문이다.
       const ids = [...new Set([...essential.map((finding) => finding.id), ...dispositionRegressions(known, closeout.findings)])];
-      if (ids.length === 0) return this.resumePlanningAtCloseout(topicId, signal);
+      if (ids.length === 0) {
+        // 남은 것이 경미 지적뿐이면(배포 전 엔진이 필수로 분류했던 것) 저장된 종결로 합의를 마친다 — 종결 재실행은 전이표가 막는다.
+        if (closeout.planSHA256 === stored.sha256 && classifyCloseout(closeout).state === "CONSENSUS_ACK") {
+          return this.runConsensusFinalization(topicId, closeout.findings, stored.sha256, signal);
+        }
+        return this.resumePlanningAtCloseout(topicId, signal);
+      }
       await this.runPlanningFromRevision2(topicId, closeout, ids, stored, known, signal);
       return;
     }
@@ -350,6 +384,7 @@ export class PlanningPipeline {
       timeline: context.timeline,
       planningContextMode: context.mode,
       secondRound,
+      implementationNotes: await this.core.implementationNotesOf(topicId),
     });
     const closeout = await this.core.turn("codex", topic, prompt, signal, false, {
       readablePaths: context.readablePaths,
@@ -366,8 +401,9 @@ export class PlanningPipeline {
     // 새 쟁점은 발견 시점이 아니라 Codex 의 처분으로 분류한다(2026-09-07 Codex 피드백): 범위 밖(DEFERRED_OUT_OF_SCOPE·
     // AGREED_NO_ACTION)은 후속 목록에 기록만 하고 진행, 필수 쟁점은 개정 2회차(바퀴당 1회) → 그 뒤에도 남으면 최신 계획을
     // 보존한 채 사용자 결정 뒤 그 쟁점만 추가 개정. 처음부터 다시 도는 것은 결정에 REPLAN 을 적은 경우뿐이다.
-    const { deferred, essential } = classifyCloseoutAdditions(knownFindings, closeout);
+    const { deferred, essential, minor } = classifyCloseoutAdditions(knownFindings, closeout);
     if (deferred.length > 0) await this.core.recordDeferredFindings(topic, deferred, "closeout", signal);
+    if (minor.length > 0) await this.core.recordImplementationNotes(topic, minor, "closeout", signal);
     if (essential.length > 0) {
       const ids = essential.map((finding) => finding.id);
       if (!secondRound) {
@@ -494,13 +530,16 @@ export class PlanningPipeline {
 }
 
 // 종결 확인이 낸 새 쟁점을 Codex 의 처분으로 나눈다: 범위 밖(기록만) vs 필수(개정으로 반영).
-function classifyCloseoutAdditions(known: readonly Finding[], closeout: AgentResult): { deferred: Finding[]; essential: Finding[] } {
+// 2026-09-13 사용자 규칙: 경미(MEDIUM 이하) 새 쟁점은 개정을 열지 않고 구현 노트로 러너에게 넘긴다. 필수(essential)는 BLOCKER/HIGH 뿐.
+function classifyCloseoutAdditions(known: readonly Finding[], closeout: AgentResult): { deferred: Finding[]; essential: Finding[]; minor: Finding[] } {
   const added = new Set(newFindingIDs(known, closeout.findings, "Codex closeout"));
   const additions = closeout.findings.filter((finding) => added.has(finding.id));
   const deferred = additions.filter((finding) =>
     finding.disposition === "DEFERRED_OUT_OF_SCOPE" || finding.disposition === "AGREED_NO_ACTION");
-  const essential = additions.filter((finding) => !deferred.includes(finding));
-  return { deferred, essential };
+  const actionable = additions.filter((finding) => !deferred.includes(finding));
+  const minor = actionable.filter((finding) => isMinorFinding(finding) && !finding.requiresUserDecision && finding.disposition !== "EXTERNAL_EVIDENCE");
+  const essential = actionable.filter((finding) => !minor.includes(finding));
+  return { deferred, essential, minor };
 }
 
 function uniqueFindings(findings: readonly Finding[]): Finding[] {

@@ -281,6 +281,20 @@ export const DeferredFindingSchema = z.object({
 export type DeferredFinding = z.infer<typeof DeferredFindingSchema>;
 export const DeferredFindingsSchema = z.object({ findings: z.array(DeferredFindingSchema) });
 
+// 개정 없이 구현 단계로 넘긴 경미 지적(2026-09-13 사용자 규칙 "사소한 finding 은 개정하지 말고 러너에게 따로 알려라").
+// 감사·종결의 MEDIUM 이하 AGREED_ACTION 은 계획 개정 턴을 사지 않고 여기 기록돼 구현 프롬프트에 실리며, 러너는 id 별 처분을 보고한다.
+export const ImplementationNoteSchema = z.object({
+  id: z.string().min(1),
+  title: z.string().min(1),
+  severity: FindingSchema.shape.severity,
+  rationale: z.string(),
+  source: z.enum(["audit", "closeout"]),
+  topicId: z.string().min(1),
+  recordedAt: z.string(),
+});
+export type ImplementationNote = z.infer<typeof ImplementationNoteSchema>;
+export const ImplementationNotesSchema = z.object({ notes: z.array(ImplementationNoteSchema) });
+
 export const UpdateAgentSettingsInputSchema = AgentExecutionSettingsSchema;
 export type UpdateAgentSettingsInput = z.infer<typeof UpdateAgentSettingsInputSchema>;
 

@@ -20,6 +20,8 @@ import {
   type Topic,
   type WorkflowState,
   type MemoryUpdate,
+  type ImplementationNote,
+  ImplementationNotesSchema,
 } from "../../shared/contracts.js";
 import { appliedExecutionSettings } from "../../shared/execution.js";
 import {
@@ -610,6 +612,31 @@ export class EngineCore {
     this.event(topic.id, "system", "system",
       `후속 목록에서 제외(뒤 단계에서 처분됨): ${removed.map((item) => `${item.id} ${item.title}`).join(", ")}`,
       { deferredFindingIDsRemoved: removed.map((item) => item.id) });
+  }
+
+  // 경미 지적을 개정 없이 구현 단계로 넘긴다 — 산출물 implementation-notes + 이벤트(payload.implementationNoteIDs).
+  async recordImplementationNotes(
+    topic: Topic, findings: readonly Finding[], source: ImplementationNote["source"], signal: AbortSignal,
+  ): Promise<void> {
+    if (findings.length === 0) return;
+    const existing = await this.implementationNotesOf(topic.id);
+    const recordedAt = new Date().toISOString();
+    const additions = findings
+      .filter((finding) => !existing.some((item) => item.id === finding.id))
+      .map((finding) => ({ id: finding.id, title: finding.title, severity: finding.severity, rationale: finding.rationale, source, topicId: topic.id, recordedAt }));
+    if (additions.length === 0) return;
+    const revision = this.dependencies.database.timelineCount(topic.id) + 1;
+    await this.writeArtifact(topic, "implementation-notes", revision, JSON.stringify({ notes: [...existing, ...additions] }, null, 2), signal);
+    this.event(topic.id, "system", "system",
+      `경미 지적 ${additions.length}건을 개정 없이 구현 노트로 넘깁니다(${source === "audit" ? "감사" : "종결 확인"}, 구현 프롬프트에 실리고 러너가 id 별 처분을 보고합니다): ${additions.map((item) => `${item.id} [${item.severity}] ${item.title}`).join(", ")}`,
+      { implementationNoteIDs: additions.map((item) => item.id), source });
+  }
+
+  async implementationNotesOf(topicId: string): Promise<ImplementationNote[]> {
+    const raw = await this.dependencies.artifacts.readLatest(topicId, "implementation-notes");
+    if (!raw) return [];
+    const parsed = ImplementationNotesSchema.safeParse(JSON.parse(raw));
+    return parsed.success ? parsed.data.notes : [];
   }
 
   async deferredFindingsOf(topicId: string): Promise<DeferredFinding[]> {

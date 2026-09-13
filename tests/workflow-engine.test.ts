@@ -260,7 +260,7 @@ describe("범위 세대", () => {
         {
           kind: "AUDIT",
           summary: "첫 세대 감사",
-          findings: [finding("F-GEN1", "첫 세대에서만 나온 쟁점", { disposition: undefined })],
+          findings: [finding("F-GEN1", "첫 세대에서만 나온 쟁점", { severity: "HIGH", disposition: undefined })],
           evidenceRefs: [],
         },
         {
@@ -851,7 +851,7 @@ describe("가짜 에이전트 전체 계획 왕복", () => {
           kind: "PLAN",
           summary: "첫 계획",
           planMarkdown: firstPlan,
-          findings: [finding("F-PLAN", "계획과 함께 기록한 쟁점", { disposition: undefined })],
+          findings: [finding("F-PLAN", "계획과 함께 기록한 쟁점", { severity: "HIGH", disposition: undefined })],
           evidenceRefs: [],
         },
         {
@@ -867,7 +867,7 @@ describe("가짜 에이전트 전체 계획 왕복", () => {
         {
           kind: "AUDIT",
           summary: "감사",
-          findings: [finding("F-PLAN", "계획과 함께 기록한 쟁점", { disposition: undefined })],
+          findings: [finding("F-PLAN", "계획과 함께 기록한 쟁점", { severity: "HIGH", disposition: undefined })],
           evidenceRefs: [],
         },
         {
@@ -930,7 +930,7 @@ describe("가짜 에이전트 전체 계획 왕복", () => {
     const firstPlan = validPlan("첫 계획");
     const revisedPlan = validPlan("수정 계획");
     const revisedSHA = hashPlan(`${revisedPlan.trim()}\n`);
-    const newCloseoutFinding = finding("F-NEW", "마지막 검토에서 나온 새 쟁점", { disposition: "AGREED_ACTION" });
+    const newCloseoutFinding = finding("F-NEW", "마지막 검토에서 나온 새 쟁점", { severity: "HIGH", disposition: "AGREED_ACTION" });
     const claude = new QueuedAdapter("claude", [
       { kind: "PLAN", summary: "첫 계획", planMarkdown: firstPlan, findings: [], evidenceRefs: [] },
       { kind: "REVISION", summary: "계획 수정", planMarkdown: revisedPlan, findings: [], evidenceRefs: [] },
@@ -2755,8 +2755,8 @@ describe("종결 확인의 새 쟁점 → 개정 2회차", () => {
   const revisedSHA = hashPlan(`${revised.trim()}\n`);
   const third = validPlan("개정 2회차 계획");
   const thirdSHA = hashPlan(`${third.trim()}\n`);
-  const auditFinding = finding("A-1", "감사 지적", { disposition: "AGREED_ACTION" });
-  const closeoutNew = finding("C-NEW", "종결에서 처음 나온 쟁점", { disposition: "AGREED_ACTION" });
+  const auditFinding = finding("A-1", "감사 지적", { severity: "HIGH", disposition: "AGREED_ACTION" });
+  const closeoutNew = finding("C-NEW", "종결에서 처음 나온 쟁점", { severity: "HIGH", disposition: "AGREED_ACTION" });
 
   it("새 쟁점만 개정 2회차로 반영하고 종결 확인을 다시 해 승인 대기까지 간다", async () => {
     const { database, artifacts, engine, claude, codex } = makePlanningEngine({
@@ -2796,7 +2796,7 @@ describe("종결 확인의 새 쟁점 → 개정 2회차", () => {
     database.close();
   });
 
-  const closeoutNew2 = finding("C-NEW-2", "2회차 종결에서 또 나온 필수 쟁점", { disposition: "AGREED_ACTION" });
+  const closeoutNew2 = finding("C-NEW-2", "2회차 종결에서 또 나온 필수 쟁점", { severity: "HIGH", disposition: "AGREED_ACTION" });
 
   function exhaustedRound(extraClaude: AgentResult[], extraCodex: AgentResult[]) {
     return {
@@ -3575,6 +3575,73 @@ describe("개정 2회차 뒤 종결 확인의 처분 되돌림 — 결정 뒤 �
     expect(bodies.some((body) => body.includes("허용되지 않은 상태 전이"))).toBe(false);
     expect(bodies.filter((body) => body.includes("의견 수렴을 종료할 수 있는지")).length).toBe(3);
     expect(bodies.some((body) => body.includes("추가 개정") && body.includes("F-1"))).toBe(true);
+    database.close();
+  });
+});
+
+// 2026-09-13 사용자 규칙 "코덱스 리뷰에서 사소한 finding 이 나오면 개정하지 말고 중재자가 runner 에게 따로 알려라":
+// MEDIUM 이하는 개정 턴 대신 구현 노트로 러너에게 간다(엔진이 기록·프롬프트에 실어 자동으로 알린다).
+describe("경미 지적은 개정 대신 구현 노트", () => {
+  it("감사 지적이 전부 경미면 개정 턴을 생략하고 종결 확인 → 승인 대기까지 간다", async () => {
+    const first = validPlan("첫 계획");
+    const firstSHA = hashPlan(`${first.trim()}\n`);
+    const minor = finding("A-M", "문서 표기 보완", { severity: "MEDIUM", disposition: undefined });
+    const { database, artifacts, engine, claude } = makePlanningEngine({
+      slug: "minor-audit-skips-revision",
+      claudeResults: [
+        { kind: "PLAN", summary: "계획", planMarkdown: first, findings: [], evidenceRefs: [] },
+        { kind: "ACK", summary: "확인", planSHA256: firstSHA, findings: [], evidenceRefs: [] },
+      ],
+      codexResults: [
+        { kind: "AUDIT", summary: "감사(경미 1건)", findings: [minor], evidenceRefs: [] },
+        { kind: "CLOSEOUT", summary: "종결", planSHA256: firstSHA, findings: [{ ...minor, disposition: "AGREED_ACTION" }], evidenceRefs: [] },
+        { kind: "ACK", summary: "확인", planSHA256: firstSHA, findings: [], evidenceRefs: [] },
+      ],
+    });
+    engine.startPlan("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+    const topic = database.getTopic("topic-1");
+    expect(topic.lastError ?? "").toBe("");
+    expect(topic.state).toBe("AWAITING_USER_APPROVAL");
+    expect(topic.planRevision).toBe(1);
+    expect(claude.calls).toHaveLength(2); // PLAN + ACK — 개정 턴 없음
+    const bodies = database.getTimeline("topic-1").map((event) => event.body ?? "");
+    expect(bodies.some((body) => body.includes("개정 턴을 생략합니다") && body.includes("A-M"))).toBe(true);
+    expect(bodies.some((body) => body.includes("감사 결과를 한 번 반영합니다"))).toBe(false);
+    const notes = JSON.parse((await artifacts.readLatest("topic-1", "implementation-notes"))!).notes;
+    expect(notes.map((note: { id: string; source: string }) => [note.id, note.source])).toEqual([["A-M", "audit"]]);
+    database.close();
+  });
+
+  it("종결 확인의 경미 새 쟁점은 개정 2회차 대신 구현 노트로 기록하고 합의로 닫는다", async () => {
+    const revised = validPlan("개정 계획");
+    const revisedSHA = hashPlan(`${revised.trim()}\n`);
+    const high = finding("F-1", "전제 결함", { severity: "HIGH", disposition: "AGREED_ACTION" });
+    const minorNew = finding("C-M", "종결이 찾은 경미 항목", { severity: "LOW", disposition: "AGREED_ACTION" });
+    const { database, artifacts, engine } = makePlanningEngine({
+      slug: "minor-closeout-addition",
+      claudeResults: [
+        { kind: "PLAN", summary: "계획", planMarkdown: validPlan("첫 계획"), findings: [], evidenceRefs: [] },
+        { kind: "REVISION", summary: "개정", planMarkdown: revised, findings: [high], evidenceRefs: [] },
+        { kind: "ACK", summary: "확인", planSHA256: revisedSHA, findings: [], evidenceRefs: [] },
+      ],
+      codexResults: [
+        { kind: "AUDIT", summary: "감사", findings: [finding("F-1", "전제 결함", { severity: "HIGH", disposition: undefined })], evidenceRefs: [] },
+        { kind: "CLOSEOUT", summary: "종결", planSHA256: revisedSHA, findings: [high, minorNew], evidenceRefs: [] },
+        { kind: "ACK", summary: "확인", planSHA256: revisedSHA, findings: [], evidenceRefs: [] },
+      ],
+    });
+    engine.startPlan("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+    const topic = database.getTopic("topic-1");
+    expect(topic.lastError ?? "").toBe("");
+    expect(topic.state).toBe("AWAITING_USER_APPROVAL");
+    expect(database.getFlags("topic-1").closeoutRevisionUsed).toBe(false);
+    const bodies = database.getTimeline("topic-1").map((event) => event.body ?? "");
+    expect(bodies.some((body) => body.includes("개정 2회차"))).toBe(false);
+    expect(bodies.some((body) => body.includes("구현 노트로 넘깁니다") && body.includes("C-M"))).toBe(true);
+    const notes = JSON.parse((await artifacts.readLatest("topic-1", "implementation-notes"))!).notes;
+    expect(notes.map((note: { id: string; source: string }) => [note.id, note.source])).toEqual([["C-M", "closeout"]]);
     database.close();
   });
 });

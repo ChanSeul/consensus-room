@@ -175,3 +175,24 @@ describe("Codex 리뷰 프롬프트 — RESOLVED_BY_FIX 주장은 승계되지 �
     }
   });
 });
+
+// 2026-09-13 사용자 규칙: 경미 지적은 개정 없이 구현 노트로 러너에게 간다 — 프롬프트가 그 목록과 심각도 정책을 말해야 한다.
+describe("구현 노트와 심각도 정책", () => {
+  const note = { id: "A-M", title: "문서 표기 보완", severity: "MEDIUM" as const, rationale: "NOTE-RATIONALE", source: "audit" as const, topicId: "topic-1", recordedAt: "2026-09-13T00:00:00Z" };
+  it("구현 프롬프트는 첫 턴에만 구현 노트를 싣고 id 별 처분을 요구한다", () => {
+    const base = { planMarkdown, planSHA256, worktreePath: "/tmp/wt", branchName: "topic/x", timeline: [], implementationNotes: [note] };
+    const fresh = buildImplementationPrompt(base);
+    expect(fresh).toContain("개정 없이 넘어온 경미 지적(구현 노트)");
+    expect(fresh).toContain("A-M [MEDIUM] 문서 표기 보완");
+    expect(fresh).toContain("NOTE-RATIONALE");
+    expect(buildImplementationPrompt({ ...base, resumedSession: true })).not.toContain("A-M [MEDIUM]");
+  });
+  it("감사·종결 프롬프트는 심각도 정책을 말하고 종결은 구현 노트 목록을 받는다", () => {
+    const audit = buildCodexAuditPrompt({ title: "t", planMarkdown, planSHA256, scopeGeneration: 1, timeline: [] });
+    expect(audit).toContain("개정**을 여는 지적은 BLOCKER·HIGH 뿐");
+    const closeout = buildCodexCloseoutPrompt({ revisedPlan: planMarkdown, revisedPlanSHA256: planSHA256, claudeRevision: { kind: "REVISION", summary: "s", findings: [], evidenceRefs: [] }, timeline: [], implementationNotes: [note] });
+    expect(closeout).toContain("같은 항목을 새 쟁점으로 다시 내지 마세요");
+    expect(closeout).toContain("A-M [MEDIUM]");
+    expect(closeout).toContain("BLOCKER·HIGH 뿐");
+  });
+});
