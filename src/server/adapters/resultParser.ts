@@ -79,6 +79,16 @@ export function describeCommandFailure(
 // 그걸 뽑아내면 4KB짜리 JSON 꼬리 대신 "월 지출 한도" 같은 한 줄이 원장에 남는다.
 // 마지막 result 이벤트의 요약. stream-json: {"type":"result","subtype":"success|error_max_turns|error_during_execution|…",
 // "is_error":bool,"num_turns":n,"result":"본문"}. codex: {"type":"turn.completed"} 다음 줄에 error 가 올 수 있다.
+// CLI 가 모델을 한 번도 부르지 않고 끝낸 결과(num_turns=0, is_error=false) — 2026-09-14 S10H 실측: 이전 프로세스가 남긴
+// 백그라운드 작업 알림이 resume 직후 큐에서 먼저 빠지며 합성 턴("No response requested")이 result 로 나갔고 실제 프롬프트는
+// 응답 없이 남았다. 모델 비용 0 이므로 같은 호출을 한 번 다시 돌리는 것이 정확한 처방이다(FAILED 로 사람을 부르는 것이 아니라).
+export function isZeroTurnResult(candidates: readonly unknown[]): boolean {
+  const events = [...candidates].reverse().filter((value): value is Record<string, unknown> =>
+    Boolean(value) && typeof value === "object" && !Array.isArray(value));
+  const result = events.find((event) => event.type === "result");
+  return Boolean(result) && result!.num_turns === 0 && result!.is_error !== true;
+}
+
 function describeTerminalResult(candidates: readonly unknown[], stdout: string): string {
   const events = [...candidates].reverse().filter((value): value is Record<string, unknown> =>
     Boolean(value) && typeof value === "object" && !Array.isArray(value));

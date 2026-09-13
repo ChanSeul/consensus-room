@@ -15,7 +15,7 @@ import type { AgentAdapter, CommandRunner, CommandResult, CreatedSession, Sessio
 import { agentEnvironment } from "../security.js";
 import { ProjectMemoryReader } from "../projectMemory.js";
 import { readAppliedInstructions } from "../projectInstructions.js";
-import { describeCommandFailure, parsePlanRepair, parseAgentResult } from "./resultParser.js";
+import { describeCommandFailure, parsePlanRepair, parseAgentResult, isZeroTurnResult } from "./resultParser.js";
 import { ExecutionMetrics } from "./executionMetrics.js";
 import { createToolTimeMeter } from "./toolTime.js";
 
@@ -30,6 +30,8 @@ export interface ClaudeAdapterOptions {
   managedPluginDirectory?: string;
   // 원본 저장소. worktree 에 CLAUDE.md 가 없으면(gitignored) 여기 것을 주입한다(projectInstructions.ts).
   repositoryPath?: string | null;
+  // 0턴 합성 결과를 받아 같은 호출을 한 번 더 돌릴 때 알린다(테스트·계측용).
+  onZeroTurnRetry?: () => void;
 }
 
 // --plugin-dir로 로드되는 유일한 스킬 원천. 다른 원천은 --safe-mode와 빈 --setting-sources가 계속 차단한다.
@@ -92,7 +94,13 @@ export class ClaudeAdapter implements AgentAdapter {
   }
 
   private async invoke(turn: Omit<SessionTurn, "sessionId"> | SessionTurn, args: string[], fresh: boolean): Promise<AgentResult> {
-    const output = await this.invokeOutput(turn, args, fresh);
+    let output = await this.invokeOutput(turn, args, fresh);
+    // 모델 호출 0회로 끝난 합성 턴(resume 직후 큐에 남은 알림이 먼저 소비된 경우)은 비용 0 이므로 같은 호출을 한 번 더 돌린다.
+    // 새 세션(fresh)은 큐가 비어 있어 해당 없고, 두 번째도 0턴이면 그대로 계약 오류로 올린다.
+    if (!fresh && isZeroTurnResult(output.jsonLines)) {
+      this.options.onZeroTurnRetry?.();
+      output = await this.invokeOutput(turn, args, fresh);
+    }
     return parseAgentResult(output.jsonLines, output.stdout);
   }
 

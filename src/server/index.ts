@@ -17,6 +17,7 @@ const app = await buildApp({
     skillsDirectories: config.claudeSkillDirectories,
     managedPluginDirectory: join(config.dataDirectory, "claude-plugin"),
     repositoryPath: config.repositoryPath,
+    onZeroTurnRetry: () => console.warn("[claude] 0턴 합성 결과(num_turns=0) — 같은 호출을 한 번 더 돌립니다"),
   }),
   codex: new CodexAdapter(
     runner,
