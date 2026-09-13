@@ -462,7 +462,26 @@ it("예산 증액의 늦은 응답은 다른 토픽의 예산을 덮지 않는�
  fireEvent.click(screen.getByRole("button",{name:"증액하고 재개"}));
  fireEvent.click(screen.getByRole("button",{name:/다른 토픽/}));
  await screen.findByText(/입력 222/);
- pending.resolve({accepted:true,actionId:"grant",topic:a});
+ pending.resolve({accepted:true,actionId:"grant",topic:a,resumeBlocked:"이전 토픽의 추가 예산 안내"});
  await waitFor(()=>expect(api.getActivity).toHaveBeenCalledWith(a.id));
- expect(screen.getByText(/입력 222/)).toBeInTheDocument();expect(screen.queryByText(/입력 111/)).not.toBeInTheDocument();
+ expect(screen.getByText(/입력 222/)).toBeInTheDocument();expect(screen.queryByText(/입력 111/)).not.toBeInTheDocument();expect(screen.queryByText("이전 토픽의 추가 예산 안내")).not.toBeInTheDocument();
+});
+
+it("추가 승인 뒤 예산이 부족하면 안내를 표시하고 토픽 전환 시 지운다",async()=>{
+ const a={...makeTopic(),state:"USER_DECISION_REQUIRED" as const},b={...makeTopic(),id:"notice-b",title:"다른 승인 토픽",state:"USER_DECISION_REQUIRED" as const};
+ vi.spyOn(api,"listTopics").mockResolvedValue([a,b]);vi.spyOn(api,"getTopic").mockImplementation(async id=>makeDetail(id===a.id?a:b));
+ vi.mocked(api.getActivity).mockResolvedValue({state:"USER_DECISION_REQUIRED",runningAction:false,lastChangeAt:null,lastChangedPath:null,scanned:0,truncated:false,autoRetryAt:null,checkedAt:"now",revisionPaused:true,revisionAllowance:{topicId:a.id,used:3,limit:3,version:1,firstPlanUsed:true,historyIncomplete:false,startedAt:"now"}});
+ vi.spyOn(api,"runAction").mockResolvedValue({accepted:true,actionId:"grant",topic:a,resumeBlocked:"승인은 저장했습니다. 재개하려면 예산을 추가하세요."} as any);
+ render(<App/>);fireEvent.click(await screen.findByRole("button",{name:"재작성 1회 추가 승인 후 재개"}));
+ expect(await screen.findByRole("status")).toHaveTextContent("승인은 저장했습니다. 재개하려면 예산을 추가하세요.");
+ fireEvent.click(screen.getByRole("button",{name:/다른 승인 토픽/}));
+ await waitFor(()=>expect(screen.queryByText("승인은 저장했습니다. 재개하려면 예산을 추가하세요.")).not.toBeInTheDocument());
+});
+
+it("scrollIntoView 반환값을 effect 정리 함수로 사용하지 않는다",async()=>{
+ Object.defineProperty(HTMLElement.prototype,"scrollIntoView",{configurable:true,value:vi.fn(()=>Promise.resolve())});
+ vi.spyOn(api,"listTopics").mockResolvedValue([makeTopic()]);vi.spyOn(api,"getTopic").mockResolvedValue(makeDetail(makeTopic(),[timelineEvent(1,"스크롤 확인")]));
+ const view=render(<App/>);await screen.findByRole("heading",{name:makeTopic().title});
+ await waitFor(()=>expect(HTMLElement.prototype.scrollIntoView).toHaveBeenCalled());
+ expect(()=>view.unmount()).not.toThrow();
 });

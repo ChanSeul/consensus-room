@@ -1,3 +1,5 @@
+import {reviewScope,type ReviewScope} from "../shared/reviews.js";
+import { RevisionBlocked } from "./revisionLedger.js";
 import { randomUUID } from "node:crypto";
 import { describePrune, pruneBuildTrees } from "./buildTrees.js";
 import { basename, dirname, join } from "node:path";
@@ -219,8 +221,12 @@ export class WorkflowEngine {
     const resume = flags.resumeState;
     const interruption = this.core.dependencies.database.getTimeline(topicId).filter(event =>
       event.scopeGeneration === topic.scopeGeneration && event.actor === "system" && event.payload?.resumeState).at(-1);
-    if (topic.state === "USER_DECISION_REQUIRED" && interruption?.payload?.budgetPause === true
-      && interruption.payload.resumeState === resume) {
+    if(interruption?.payload?.reviewPause && topic.state==="USER_DECISION_REQUIRED")
+      this.core.dependencies.database.reviews.assertAvailable(topicId,interruption.payload.reviewPause as ReviewScope);
+    if(interruption?.payload?.revisionPause===true && topic.state==="USER_DECISION_REQUIRED")
+      this.core.dependencies.database.revisions.assertAvailable(topicId,resume==="CLAUDE_PLAN"?"plan":"revision");
+    if (topic.state === "USER_DECISION_REQUIRED" && (interruption?.payload?.budgetPause === true || interruption?.payload?.revisionPause === true || Boolean(interruption?.payload?.reviewPause))
+      && interruption?.payload?.resumeState === resume) {
       // Budget pauses resume the exact infrastructure stage, without consuming a product decision or resetting the plan.
       topic = this.core.dependencies.database.updateTopic(topicId, {state:"FAILED"});
     }
@@ -229,8 +235,7 @@ export class WorkflowEngine {
     // 아래 사다리(resumers)가 CLAUDE_REVISION 을 "개정 재실행" 으로 잡기 전에 먼저 본다.
     if (resume === "CLAUDE_REVISION" && this.planning.replanRequested(topicId)) {
       // 사용자가 결정에 REPLAN 을 적었다 — 핵심 전제가 바뀐 경우라 처음부터 다시 돈다(직전 계획 전문은 프롬프트에 실린다).
-      this.core.resetToDraft(topic, "결정의 REPLAN 지시로 계획 수렴을 처음부터 다시 실행합니다.");
-      return this.startPlan(topicId, actionId);
+      return this.restartPlanning(topic, "결정의 REPLAN 지시로 계획 수렴을 처음부터 다시 실행합니다.", actionId);
     }
     if (resume === "CLAUDE_REVISION" && this.planning.pausedRevisionReusable(topicId)) {
       return this.core.startAction(topicId, "retry", (signal) => this.planning.resumePlanningFromPausedRevision(topicId, signal), actionId);
@@ -280,16 +285,56 @@ export class WorkflowEngine {
       return this.core.startAction(topicId, "retry", (signal) => this.planning.resumePlanningFromPausedPlan(topicId, signal), actionId);
     }
     if (["CLAUDE_PLAN", "CODEX_AUDIT", "CLAUDE_REVISION", "CODEX_CLOSEOUT", "CONSENSUS_ACK"].includes(resume)) {
-      // 계획 왕복은 4회 경계를 보존하기 위해 중간 단계를 반복하지 않고 첫 계획부터 다시 실행한다.
+      // 재개할 산출물이 없으면 계획부터 다시 실행하되, 초기화 전에 재작성 한도를 검사한다.
       // 범위 세대는 올리지 않는다. 재시도의 근거가 된 사용자 evidence·decision이 같은 세대에 있어야 새 프롬프트에 실린다.
-      this.core.resetToDraft(topic, "계획 실행을 처음부터 재시도합니다.");
-      return this.startPlan(topicId, actionId);
+      return this.restartPlanning(topic, "계획 실행을 처음부터 재시도합니다.", actionId);
     }
     if (["IMPLEMENTING", "CODEX_REVIEW", "CLAUDE_FIX", "CODEX_FINAL_REVIEW"].includes(resume)) {
       this.core.transition(topicId, resume, "중단된 구현 단계를 재시도합니다.");
       return this.core.startAction(topicId, "retry", (signal) => this.delivery.resumeDelivery(topicId, resume, signal), actionId);
     }
     throw new Error(`재시도를 지원하지 않는 단계입니다: ${resume}`);
+  }
+
+  private restartPlanning(topic: Topic, message: string, actionId?: string): string {
+    return this.core.startAction(topic.id, "retry", async signal => {
+      try { this.core.dependencies.database.revisions.assertAvailable(topic.id, "plan"); }
+      catch (error) {
+        if (!(error instanceof RevisionBlocked)) throw error;
+        if(topic.state!=="USER_DECISION_REQUIRED")this.core.transition(topic.id,"CLAUDE_PLAN","재계획 호출 전 한도를 확인했습니다.");
+        this.core.interrupt(topic.id, "USER_DECISION_REQUIRED", error.message, "CLAUDE_PLAN", {revisionPause:true});
+        return;
+      }
+      const pending=await this.core.pendingRepair(topic.id,"CLAUDE_PLAN");
+      this.core.assertCurrent(topic.id,signal,topic.scopeGeneration,topic.state);
+      if(pending)this.core.dependencies.database.updateTopic(topic.id,{state:"DRAFT"});
+      else this.core.resetToDraft(topic, message);
+      await this.planning.runPlanningLoop(topic.id, signal);
+    }, actionId);
+  }
+
+  reviewPaused(topicId:string):ReviewScope|null {
+    const db=this.core.dependencies.database,topic=db.getTopic(topicId);
+    if(!["FAILED","USER_DECISION_REQUIRED"].includes(topic.state))return null;
+    const interruption=db.getTimeline(topicId).filter(e=>e.scopeGeneration===topic.scopeGeneration && e.actor==="system" && e.payload?.resumeState).at(-1);
+    if(topic.state==="USER_DECISION_REQUIRED" && !interruption?.payload?.reviewPause && !interruption?.payload?.budgetPause)return null;
+    const scope=reviewScope(db.getFlags(topicId).resumeState??"");
+    if(!scope)return null;
+    const account=db.reviews.account(topicId,scope);
+    return account.used>=account.limit?scope:null;
+  }
+
+  revisionPaused(topicId: string): boolean {
+    const db=this.core.dependencies.database, topic=db.getTopic(topicId);
+    const account=db.revisions.account(topicId);
+    if(account.used<account.limit)return false;
+    const interruption=db.getTimeline(topicId).filter(e=>e.scopeGeneration===topic.scopeGeneration && e.actor==="system" && e.payload?.resumeState).at(-1);
+    if(topic.state==="USER_DECISION_REQUIRED" && interruption?.payload?.revisionPause===true)return true;
+    if(topic.state==="USER_DECISION_REQUIRED" && !interruption?.payload?.budgetPause)return false;
+    const stage=topic.state==="DRAFT" ? "CLAUDE_PLAN" : db.getFlags(topicId).resumeState;
+    if(!["DRAFT","FAILED","USER_DECISION_REQUIRED"].includes(topic.state))return false;
+    if(stage==="CLAUDE_PLAN")return account.firstPlanUsed || account.historyIncomplete;
+    return stage==="CLAUDE_REVISION";
   }
 
   approve(topicId: string, planSHA256: string): Topic {

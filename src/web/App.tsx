@@ -1,3 +1,5 @@
+import {ReviewPanel} from "./ReviewPanel";
+import { RevisionPanel } from "./RevisionPanel";
 import { WorkGroupsPanel } from "./WorkGroupsPanel";
 import { BudgetPanel } from "./BudgetPanel";
 import {
@@ -215,6 +217,7 @@ export function App() {
   const [loading, setLoading] = useState(true);
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [actionNotice,setActionNotice]=useState<string|null>(null);
   const [dialog, setDialog] = useState<Dialog>(null);
   const [mobilePanel, setMobilePanel] = useState<"topics" | "chat" | "plan">("chat");
   const [autonomy, setAutonomy] = useState<MediationAutonomy | null>(null);
@@ -226,6 +229,7 @@ export function App() {
 
   useEffect(() => {
     selectedTopicRef.current = selectedTopicId;
+    setActionNotice(null);
     detailRequestRef.current += 1;
   }, [selectedTopicId]);
 
@@ -394,10 +398,13 @@ export function App() {
       setBusyAction(name);
       setError(null);
       try {
-        await operation();
+        const response=await operation();
         setDialog(null);
         await refreshTopics();
-        if (targetTopicId && selectedTopicRef.current === targetTopicId) await refreshDetail(targetTopicId);
+        if (targetTopicId && selectedTopicRef.current === targetTopicId) {
+          await refreshDetail(targetTopicId);
+          if(selectedTopicRef.current===targetTopicId)setActionNotice(response && typeof response==="object" && "resumeBlocked" in response && typeof response.resumeBlocked==="string"?response.resumeBlocked:null);
+        }
         return true;
       } catch (cause) {
         setError(errorMessage(cause));
@@ -444,6 +451,7 @@ export function App() {
         <button className={mobilePanel === "plan" ? "active" : ""} onClick={() => setMobilePanel("plan")}>계획·근거</button>
       </nav>
 
+      {actionNotice && <div role="status" className="error-banner">{actionNotice}</div>}
       {error && (
         <div className="error-banner" role="alert">
           <span>{error}</span>
@@ -494,7 +502,7 @@ export function App() {
           {selected && detail ? (
             <>
               <RoomHeader
-                budgetPaused={Boolean(activity?.budget?.pause)}
+                budgetPaused={Boolean(activity?.budget?.pause || activity?.revisionPaused || activity?.reviewPaused)}
                 autoRetryAt={activity?.autoRetryAt ?? null}
                 topic={selected}
                 busyAction={busyAction}
@@ -503,6 +511,11 @@ export function App() {
               />
               {activity && <BudgetPanel account={activity.budget ?? null} busy={Boolean(busyAction) || activity.runningAction}
                 onSubmit={(action,body)=>void run(action,async()=>{ const result=await api.runAction(selected.id,action,body as Record<string,unknown>);const next=await api.getActivity(selected.id);if(selectedTopicRef.current===selected.id)setActivity(next);return result; })}/>}
+              {activity?.revisionAllowance && <RevisionPanel account={activity.revisionAllowance} paused={activity.revisionPaused ?? false}
+                busy={Boolean(busyAction) || activity.runningAction}
+                onGrant={()=>void run("revision-resume",async()=>{const result=await api.runAction(selected.id,"revision-resume",{version:activity.revisionAllowance!.version});const next=await api.getActivity(selected.id);if(selectedTopicRef.current===selected.id)setActivity(next);return result;})}/>}
+              {activity?.reviewAllowances && <ReviewPanel accounts={activity.reviewAllowances} paused={activity.reviewPaused??null}
+                busy={Boolean(busyAction) || activity.runningAction} onGrant={(scope,version)=>void run("review-resume",async()=>{const result=await api.runAction(selected.id,"review-resume",{scope,version});const next=await api.getActivity(selected.id);if(selectedTopicRef.current===selected.id)setActivity(next);return result;})}/>}
               <Timeline events={detail.timeline} />
               <MessageComposer
                 disabled={Boolean(busyAction) || selected.state === "CLOSED"}
@@ -522,7 +535,7 @@ export function App() {
         <aside className={`inspector-pane mobile-${mobilePanel}`}>
           {selected && detail ? (
             <Inspector
-              budgetPaused={Boolean(activity?.budget?.pause)}
+              budgetPaused={Boolean(activity?.budget?.pause || activity?.revisionPaused || activity?.reviewPaused)}
               detail={detail}
               findings={findings}
               evidence={evidence}
@@ -638,7 +651,7 @@ function RoomHeader({
 
 function Timeline({ events }: { events: TimelineEvent[] }) {
   const bottomRef = useRef<HTMLDivElement>(null);
-  useEffect(() => bottomRef.current?.scrollIntoView({ block: "nearest" }), [events.length]);
+  useEffect(() => { bottomRef.current?.scrollIntoView({ block: "nearest" }); }, [events.length]);
 
   if (events.length === 0) {
     return (

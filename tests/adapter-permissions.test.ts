@@ -1475,12 +1475,12 @@ it("Claude 부분 교정은 별도 스키마·도구 없는 권한을 쓰고 사
 
 // 2026-09-14 사용자 결정: 러너는 사용자 settings 를 안 읽으므로 압축 임계값을 격리 설정에 명시한다(600K).
 describe("러너 auto-compact 임계값", () => {
-  it("계획·구현 세션 모두 autoCompactWindow 600000 을 --settings 로 받는다", async () => {
+  it("구현 세션은 600K, 계획 세션(fable 1M)은 800K 에서 압축한다", async () => {
     const { buildIsolationSettings, RUNNER_AUTO_COMPACT_WINDOW } = await import("../src/server/adapters/claude");
-    expect(RUNNER_AUTO_COMPACT_WINDOW).toBe(600_000);
-    for (const implementation of [true, false]) {
-      const settings = buildIsolationSettings("/tmp/ws", "/tmp/act", implementation) as { autoCompactWindow?: number };
-      expect(settings.autoCompactWindow).toBe(600_000);
-    }
+    expect(RUNNER_AUTO_COMPACT_WINDOW).toEqual({ implementation: 600_000, planning: 800_000 });
+    const impl = buildIsolationSettings("/tmp/ws", "/tmp/act", true) as { autoCompactWindow?: number };
+    const plan = buildIsolationSettings("/tmp/ws", "/tmp/act", false) as { autoCompactWindow?: number };
+    expect(impl.autoCompactWindow).toBe(600_000);
+    expect(plan.autoCompactWindow).toBe(800_000);
   });
 });

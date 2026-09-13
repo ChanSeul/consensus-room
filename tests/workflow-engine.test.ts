@@ -290,10 +290,13 @@ describe("범위 세대", () => {
     engine.approve("topic-1", firstSHA);
     await engine.handleScopeChange("topic-1", "두 번째 세대 범위로 다시 계획합니다.");
 
-    const secondApproval = waitForTopicState(database, "topic-1", "AWAITING_USER_APPROVAL");
     engine.startPlan("topic-1");
-    await secondApproval;
     await waitForActionCompletion(database, "topic-1");
+    expect(engine.reviewPaused("topic-1")).toBe("planning");
+    database.reviews.grant("topic-1","planning","scope-review-grant",1);
+    engine.retry("topic-1");
+    await waitForActionCompletion(database,"topic-1");
+    expect(database.getTopic("topic-1").state).toBe("AWAITING_USER_APPROVAL");
 
     expect(claude.calls).toHaveLength(6);
     const secondGenerationPlanPrompt = claude.calls[3];
@@ -2013,7 +2016,7 @@ async function makePlanningRecovery(
     });
   }
   const artifacts = new ArtifactStore(join(root, "topics"), database);
-  await artifacts.write("topic-1", "plan", 1, plan);
+  await artifacts.write("topic-1", "plan", 1, `${plan.trim()}\n`);
   const artifactKinds = queues.artifactKinds ?? ["claude-plan", "audit", "claude-revision", "closeout"];
   for (const [kind, resultKind] of ([
     ["claude-plan", "PLAN"], ["audit", "AUDIT"], ["claude-revision", "REVISION"], ["closeout", "CLOSEOUT"],
@@ -2023,15 +2026,17 @@ async function makePlanningRecovery(
       planMarkdown: plan, planSHA256,
     }));
   }
+  const claude=new QueuedAdapter("claude",queues.claudeResults??[]);
+  const codex=new QueuedAdapter("codex",queues.codexResults??[]);
   const engine = new WorkflowEngine({
     database,
     artifacts,
     git: new GitService(new RecordingGitRunner()),
     // 기본 큐는 비워 둔다. 재개가 계획 턴을 다시 돌리려 하면 그 시도 자체가 타임라인에 남는다.
-    claude: new QueuedAdapter("claude", queues.claudeResults ?? []),
-    codex: new QueuedAdapter("codex", queues.codexResults ?? []),
+    claude,
+    codex,
   });
-  return { database, engine, artifacts, planSHA256 };
+  return { database, engine, artifacts, planSHA256,claude,codex };
 }
 
 // 2026-08-29 회귀: 재개 조건이 CODEX_AUDIT만 봐서 CLAUDE_REVISION에서 죽으면 resetToDraft로 떨어졌고,
@@ -2836,6 +2841,10 @@ describe("종결 확인의 새 쟁점 → 개정 2회차", () => {
     engine.retry("topic-1");
     await waitForActionCompletion(database, "topic-1");
 
+    expect(engine.reviewPaused("topic-1")).toBe("planning");
+    database.reviews.grant("topic-1","planning","extra-closeout",1);
+    engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");
+
     // 첫 계획 턴이 아니라 C-NEW-2 만 담은 추가 개정 턴이 돌았고(4번째), 종결 3회차 통과 뒤 ACK 턴(5번째)까지 갔다.
     expect(claude.calls).toHaveLength(5);
     expect(claude.calls[3]).toContain("Codex 종결 확인의 새 쟁점:");
@@ -3568,12 +3577,17 @@ describe("개정 2회차 뒤 종결 확인의 처분 되돌림 — 결정 뒤 �
     engine.retry("topic-1");
     await waitForActionCompletion(database, "topic-1");
 
+    expect(engine.reviewPaused("topic-1")).toBe("planning");
+    database.reviews.grant("topic-1","planning","regression-closeout",1);
+    engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");
+
     const topic = database.getTopic("topic-1");
     expect(topic.lastError ?? "").toBe("");
     expect(topic.state).toBe("AWAITING_USER_APPROVAL");
     const bodies = database.getTimeline("topic-1").map((event) => event.body ?? "");
     expect(bodies.some((body) => body.includes("허용되지 않은 상태 전이"))).toBe(false);
-    expect(bodies.filter((body) => body.includes("의견 수렴을 종료할 수 있는지")).length).toBe(3);
+    expect(bodies.filter((body) => body.includes("의견 수렴을 종료할 수 있는지")).length).toBe(4); // 거절된 호출의 단계 진입 포함
+    expect(database.reviews.account("topic-1","planning").used).toBe(4);
     expect(bodies.some((body) => body.includes("추가 개정") && body.includes("F-1"))).toBe(true);
     database.close();
   });
@@ -3644,4 +3658,133 @@ describe("경미 지적은 개정 대신 구현 노트", () => {
     expect(notes.map((note: { id: string; source: string }) => [note.id, note.source])).toEqual([["C-M", "closeout"]]);
     database.close();
   });
+});
+
+it("3회 재작성 뒤 네 번째 개정은 호출하지 않고 단계와 계획을 보존한다",async()=>{
+ const {database,engine,planSHA256}=await makePlanningRecovery("CLAUDE_REVISION");
+ for(const id of ["one","two","three"])database.revisions.admit("topic-1",id,"revision");
+ const epoch=database.getTopic("topic-1").planEpoch;
+ engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");
+ expect(database.getTopic("topic-1")).toMatchObject({state:"USER_DECISION_REQUIRED",planSHA256,planEpoch:epoch});
+ expect(database.getFlags("topic-1").resumeState).toBe("CLAUDE_REVISION");
+ expect(database.getTimeline("topic-1").some(event=>event.payload?.revisionPause===true)).toBe(true);
+ database.close();
+});
+
+it("재계획 한도 거절은 기존 계획과 승인·epoch를 초기화하지 않는다",async()=>{
+ const {database,engine,planSHA256}=await makePlanningRecovery("CLAUDE_REVISION",{artifactKinds:[]});
+ database.revisions.admit("topic-1","initial","plan");
+ for(const id of ["one","two","three"])database.revisions.admit("topic-1",id,"revision");
+ database.updateTopic("topic-1",{approvedPlanSHA256:planSHA256});
+ const epoch=database.getTopic("topic-1").planEpoch;
+ engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");
+ expect(database.getTopic("topic-1")).toMatchObject({state:"USER_DECISION_REQUIRED",planSHA256,approvedPlanSHA256:planSHA256,planEpoch:epoch});
+ expect(database.getFlags("topic-1").resumeState).toBe("CLAUDE_PLAN");
+ database.close();
+});
+
+it("세 번째 개정 결과를 저장하고 종결·ACK까지 추가 횟수 없이 진행한다",async()=>{
+ const plan=validPlan("계획 단계 재개"),sha=hashPlan(plan);
+ const ack:AgentResult={kind:"ACK",summary:"확인",planSHA256:sha,findings:[],evidenceRefs:[]};
+ const revision:AgentResult={kind:"REVISION",summary:"세 번째 개정",planMarkdown:plan,planSHA256:sha,findings:[],evidenceRefs:[]};
+ const closeout:AgentResult={kind:"CLOSEOUT",summary:"종결",planSHA256:sha,findings:[],evidenceRefs:[]};
+ const {database,engine,artifacts}=await makePlanningRecovery("CLAUDE_REVISION",{claudeResults:[revision,ack],codexResults:[closeout,ack]});
+ for(const id of ["one","two"])database.revisions.admit("topic-1",id,"revision");
+ engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");
+ expect(database.getTopic("topic-1").state).toBe("AWAITING_USER_APPROVAL");
+ expect(database.revisions.account("topic-1").used).toBe(3);
+ expect(await artifacts.readLatest("topic-1","claude-revision")).toContain("세 번째 개정");
+ database.close();
+});
+
+it("네 번째 계획 검토를 차단하고 1회 승인 뒤 저장된 계획으로 같은 검토를 재개한다",async()=>{
+ const {database,engine,planSHA256}=await makePlanningRecovery("CODEX_AUDIT");
+ for(const id of ["one","two","three"])database.reviews.admit("topic-1",id,"planning");
+ const epoch=database.getTopic("topic-1").planEpoch;
+ engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");
+ expect(database.getTopic("topic-1"),database.getTopic("topic-1").lastError??"").toMatchObject({state:"USER_DECISION_REQUIRED",planSHA256,planEpoch:epoch});
+ expect(database.getFlags("topic-1").resumeState).toBe("CODEX_AUDIT");
+ expect(()=>engine.retry("topic-1")).toThrow("한도");
+ database.reviews.grant("topic-1","planning","allow",1);
+ engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");
+ expect(database.reviews.account("topic-1","planning").used).toBe(4);
+ expect(database.getTopic("topic-1")).toMatchObject({state:"FAILED",planSHA256,planEpoch:epoch});
+ expect(database.getFlags("topic-1").resumeState).toBe("CODEX_AUDIT");
+ database.close();
+});
+
+it("세 번째 구현 리뷰는 전달 준비까지 완료하고 네 번째 호출은 중단한다",async()=>{
+ const result:AgentResult={kind:"FINAL_REVIEW",summary:"검토 완료",findings:[],evidenceRefs:[]};
+ const {database,engine}=await makeReviewRecovery({resumeState:"CODEX_FINAL_REVIEW",implementationFindings:[],originalReviewFindings:[],codexResult:result});
+ database.reviews.admit("topic-1","one","implementation");database.reviews.admit("topic-1","two","implementation");
+ engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");
+ expect(database.getTopic("topic-1").state).toBe("READY_TO_DELIVER");
+ expect(database.reviews.account("topic-1","implementation").used).toBe(3);
+ database.updateTopic("topic-1",{state:"FAILED",resumeState:"CODEX_FINAL_REVIEW"});
+ engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");
+ expect(database.getTopic("topic-1").state).toBe("USER_DECISION_REQUIRED");
+ expect(engine.reviewPaused("topic-1")).toBe("implementation");
+ expect(database.reviews.account("topic-1","implementation").used).toBe(3);database.close();
+});
+
+it("한도로 멈춘 개정 교정은 재시작 뒤 원본 세션에서 교정만 재개한다",async()=>{
+ const plan=validPlan("계획 단계 재개");
+ const {database,engine,artifacts,claude,codex}=await makePlanningRecovery("CLAUDE_REVISION",{claudeResults:[
+  {kind:"PLAN",summary:"종류만 잘못 적은 개정",planMarkdown:plan,findings:[],evidenceRefs:[]},
+  {kind:"REVISION",summary:"종류 교정",planMarkdown:plan,findings:[],evidenceRefs:[]},
+ ]});
+ for(const id of ["one","two"])database.revisions.admit("topic-1",id,"revision");
+ engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");
+ expect(database.getTopic("topic-1").state).toBe("USER_DECISION_REQUIRED");expect(claude.calls).toHaveLength(1);
+ expect(await artifacts.readLatest("topic-1","pending-contract-repair")).toContain("claude-created-session");
+ const restarted=new WorkflowEngine({database,artifacts,claude,codex,git:new GitService(new RecordingGitRunner())});
+ database.revisions.grant("topic-1","one-more",1);restarted.retry("topic-1");await waitForActionCompletion(database,"topic-1");
+ expect(claude.calls).toHaveLength(2);expect(claude.turns[1]).toMatchObject({sessionId:"claude-created-session",planningWrite:"repair"});
+ expect(claude.calls[1]).toContain("서버 기계 검사");expect(database.revisions.account("topic-1").used).toBe(4);
+ expect(await artifacts.readLatest("topic-1","claude-revision")).toContain("종류 교정");database.close();
+});
+
+it("최초 계획 교정 재개는 epoch를 바꾸거나 계획 호출을 다시 사지 않는다",async()=>{
+ const {database,engine,claude}=makePlanningEngine({slug:"initial-correction",claudeResults:[
+  {kind:"REVISION",summary:"종류 오류",planMarkdown:validPlan("계획"),findings:[],evidenceRefs:[]},
+  {kind:"PLAN",summary:"교정 완료",planMarkdown:validPlan("계획"),findings:[],evidenceRefs:[]},
+ ],codexResults:[]});
+ for(const id of ["a","b","c"])database.revisions.admit("topic-1",id,"revision");
+ const epoch=database.getTopic("topic-1").planEpoch;
+ engine.startPlan("topic-1");await waitForActionCompletion(database,"topic-1");
+ expect(database.getTopic("topic-1").state).toBe("USER_DECISION_REQUIRED");
+ database.revisions.grant("topic-1","more",1);engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");
+ expect(claude.calls).toHaveLength(2);expect(claude.turns[1]).toMatchObject({sessionId:"claude-session",planningWrite:"repair"});
+ expect(database.getTopic("topic-1").planEpoch).toBe(epoch);database.close();
+});
+
+it("리뷰 교정 재개는 새 전체 리뷰 대신 같은 리뷰 세션에서 결과만 교정한다",async()=>{
+ const codex=new ReviewSessionAdapter([{kind:"REVIEW",summary:"종류 오류",findings:[],evidenceRefs:[]},{kind:"FINAL_REVIEW",summary:"교정 완료",findings:[],evidenceRefs:[]}]);
+ const {database,engine}=await makeReviewRecovery({resumeState:"CODEX_FINAL_REVIEW",implementationFindings:[],originalReviewFindings:[],codexResult:{kind:"FINAL_REVIEW",summary:"unused",findings:[],evidenceRefs:[]},codex});
+ database.reviews.admit("topic-1","a","implementation");database.reviews.admit("topic-1","b","implementation");
+ engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");expect(database.getTopic("topic-1").state).toBe("USER_DECISION_REQUIRED");
+ database.reviews.grant("topic-1","implementation","more",1);engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");
+ expect(codex.calls).toHaveLength(2);expect(codex.calls[1]).toMatchObject({sessionId:codex.calls[0].sessionId,created:false});
+ expect(codex.calls[1].turn.prompt).toContain("서버 기계 검사");expect(database.getTopic("topic-1").state).toBe("READY_TO_DELIVER");database.close();
+});
+
+it("부분 교정 한도 중단도 원본과 같은 세션을 복구해 부분 패치만 호출한다",async()=>{
+ const {database,dependencies}=makeEngine("DRAFT",null);
+ database.updateTopic("topic-1",{state:"CLAUDE_PLAN"});
+ const original=normalizePlan(validPlan("부분 교정")).replace('"rules":[]','"rules":[],');
+ const calls:string[]=[];
+ dependencies.claude.createSession=async()=>{calls.push("create");return {sessionId:"partial-session",result:{kind:"PLAN",summary:"원본",planMarkdown:original,findings:[],evidenceRefs:[]}};};
+ dependencies.claude.resumePlanRepair=async turn=>{calls.push(`repair:${turn.sessionId}`);return {baseSHA256:hashPlan(original),edits:[{find:'"rules":[],',replace:'"rules":[]'}]};};
+ dependencies.claude.resumeTurn=async()=>{throw new Error("전체 재호출 금지");};
+ for(const id of ["a","b","c"])database.revisions.admit("topic-1",id,"revision");
+ let checked:AgentResult|undefined;
+ const run=(core:EngineCore)=>core.startAction("topic-1","test",async signal=>{
+  checked=await core.turn("claude",database.getTopic("topic-1"),"처음 계획",signal,false,{freshSession:true,check:r=>{if(r.planMarkdown?.includes('"rules":[],'))throw new ToleranceFormatError("부분 교정이 필요한 형식 오류");}});
+ });
+ run(new EngineCore(dependencies));await waitForActionCompletion(database,"topic-1");
+ expect(database.getTopic("topic-1").state).toBe("USER_DECISION_REQUIRED");expect(calls).toEqual(["create"]);
+ database.revisions.grant("topic-1","allow",1);database.updateTopic("topic-1",{state:"CLAUDE_PLAN"});
+ run(new EngineCore(dependencies));await waitForActionCompletion(database,"topic-1");
+ expect(calls).toEqual(["create","repair:partial-session"]);expect(checked?.planMarkdown,database.getTopic("topic-1").lastError??"").toBe(original.replace('"rules":[],','"rules":[]'));
+ expect(database.revisions.account("topic-1").used).toBe(4);database.close();
 });

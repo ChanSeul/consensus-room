@@ -39,10 +39,11 @@ export class BudgetLedger {
       if (a.pause || BUDGET_KEYS.some(key => a.used[key] >= a.policy.total[key])) throw new BudgetBlocked(id);
     }
   }
-  start(input: Omit<Execution, "used" | "finished" | "limit" | "accountLimits">): Execution {
+  start(input: Omit<Execution, "used" | "finished" | "limit" | "accountLimits">, reserve?: () => void): Execution {
     return this.transaction(() => {
       if (!input.accounts.length || new Set(input.accounts).size !== input.accounts.length) throw new Error("예산 계정은 비어 있거나 중복될 수 없습니다.");
       this.assertAvailable(input.accounts);
+      reserve?.();
       const limit = Object.fromEntries(BUDGET_KEYS.map(key => [key, Math.min(...input.accounts.map(id => this.account(id)!.policy.execution[key]))])) as BudgetVector;
       const execution = { ...input, limit, accountLimits:Object.fromEntries(input.accounts.map(id=>[id,this.account(id)!.policy.execution])), used: zeroBudget(), finished: false };
       this.db.prepare("INSERT INTO budget_executions VALUES (?,?)").run(input.id, JSON.stringify(execution));

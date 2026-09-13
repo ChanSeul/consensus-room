@@ -69,6 +69,8 @@ export interface SessionTurn {
   cwd: string;
   signal?: AbortSignal;
   implementation?: boolean;
+  // 서버가 지정하는 계획 작성 호출의 종류. 재작성 횟수 집계에 사용한다.
+  planningWrite?: import("../shared/revisions.js").RewriteKind;
   // 프로토콜 확인 전용 턴. 저장소를 읽거나 명령을 실행할 필요가 없는데 도구를 열어 두면 에이전트가
   // 스스로 파일 해시를 계산하는 등 탐색을 시작해 출력 토큰만 쓴다(2026-08-29 ACK 턴 실측: output 19,975).
   protocolOnly?: boolean;

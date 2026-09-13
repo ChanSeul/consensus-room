@@ -232,6 +232,7 @@ export class DeliveryPipeline {
       deltaSinceLastReview, verificationReceipts: receipts?.text,
     }), signal, false, {
       readablePaths: [planPath, ...(receipts?.readablePaths ?? [])],
+      repairContextKey: reviewedTree ?? JSON.stringify(reviewedSnapshot),
       normalize: reviewNormalizer,
       session: {
         id: reviewSessionId,

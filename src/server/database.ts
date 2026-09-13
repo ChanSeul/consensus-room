@@ -1,3 +1,5 @@
+import { ReviewLedger } from "./reviewLedger.js";
+import { RevisionLedger } from "./revisionLedger.js";
 import { WorkGroups } from "./workGroups.js";
 import { BudgetLedger } from "./budgetLedger.js";
 import { EventEmitter } from "node:events";
@@ -43,6 +45,8 @@ export const COMPLETED_TOPIC_STATES: ReadonlySet<WorkflowState> = new Set([
 export class ConsensusDatabase {
   readonly events = new EventEmitter();
   private readonly db: DatabaseSync;
+  readonly revisions: RevisionLedger;
+  readonly reviews: ReviewLedger;
   readonly budgets: BudgetLedger;
   readonly workGroups: WorkGroups;
 
@@ -53,6 +57,8 @@ export class ConsensusDatabase {
     this.migrate();
     this.budgets = new BudgetLedger(this.db);
     this.workGroups = new WorkGroups(this.db);
+    this.revisions = new RevisionLedger(this.db);
+    this.reviews = new ReviewLedger(this.db);
   }
 
   close(): void {
@@ -449,6 +455,8 @@ export class ConsensusDatabase {
       settings.codex.implementation?.model ?? null, settings.codex.implementation?.effort ?? null,
       input.createdAt, input.updatedAt, input.lastError,
     );
+    this.revisions.initialize(input.id);
+    this.reviews.initialize(input.id);
     return this.getTopic(input.id);
   }
 

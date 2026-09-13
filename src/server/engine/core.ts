@@ -1,3 +1,6 @@
+import {ReviewBlocked} from "../reviewLedger.js";
+import {reviewScope} from "../../shared/reviews.js";
+import { RevisionBlocked } from "../revisionLedger.js";
 import { wrapWorkGroupAdapter } from "../workGroupAdapter.js";
 import { BudgetController } from "../budgetController.js";
 import { BudgetBlocked } from "../budgetLedger.js";
@@ -98,20 +101,16 @@ export class EngineCore {
   private readonly warnedLimits = new Map<string, Set<string>>();
 
   constructor(readonly dependencies: WorkflowDependencies) {
-    dependencies = {...dependencies,
-      claude:wrapWorkGroupAdapter(dependencies.claude,dependencies.database,dependencies.git),
-      codex:wrapWorkGroupAdapter(dependencies.codex,dependencies.database,dependencies.git)};
-    this.dependencies=dependencies;
-    if (dependencies.enforceBudgets) {
-      const controller = new BudgetController(dependencies.database.budgets, cwd => {
-        const topic = dependencies.database.listTopics().find(t => t.worktreePath === cwd && this.active.has(t.id));
-        if (!topic) throw new Error("예산을 연결할 실행 중 토픽이 없습니다.");
-        return { topicId:topic.id, accounts:this.budgetAccounts(topic.id), stage:topic.state };
-      }, async (topicId, output) => {
-        await dependencies.artifacts.write(topicId,"interrupted-output",1,JSON.stringify(redactRecord(output as Record<string, unknown>)));
-      });
-      this.dependencies = { ...dependencies, claude:controller.wrap(dependencies.claude), codex:controller.wrap(dependencies.codex) };
-    }
+    const controller = new BudgetController(dependencies.database.budgets, cwd => {
+      const topic = dependencies.database.listTopics().find(t => t.worktreePath === cwd && this.active.has(t.id));
+      if (!topic) throw new Error("집계를 연결할 실행 중 토픽이 없습니다.");
+      return {topicId:topic.id,accounts:this.budgetAccounts(topic.id),stage:topic.state};
+    }, async(topicId,output)=>{
+      await dependencies.artifacts.write(topicId,"interrupted-output",1,JSON.stringify(redactRecord(output as Record<string,unknown>)));
+    },dependencies.database.revisions,Boolean(dependencies.enforceBudgets),dependencies.database.reviews);
+    this.dependencies={...dependencies,
+      claude:wrapWorkGroupAdapter(controller.wrap(dependencies.claude),dependencies.database,dependencies.git),
+      codex:wrapWorkGroupAdapter(controller.wrap(dependencies.codex),dependencies.database,dependencies.git)};
   }
 
   budgetAccounts(topicId: string): string[] {
@@ -120,6 +119,14 @@ export class EngineCore {
   }
   assertBudgetAvailable(topicId: string): void {
     if (this.dependencies.enforceBudgets) this.dependencies.database.budgets.assertAvailable(this.budgetAccounts(topicId));
+  }
+
+  assertRetryRewriteAvailable(topicId: string): void {
+    const stage=this.dependencies.database.getFlags(topicId).resumeState;
+    const review=reviewScope(stage??"");
+    if(review)this.dependencies.database.reviews.assertAvailable(topicId,review);
+    if(stage==="CLAUDE_PLAN" || stage==="CLAUDE_REVISION")
+      this.dependencies.database.revisions.assertAvailable(topicId,stage==="CLAUDE_PLAN"?"plan":"revision");
   }
 
   // 서버 종료: 새 실행을 막고, 실행 중인 action 을 전부 중단(프로세스 그룹 SIGTERM→SIGKILL 은 runner 몫)한 뒤
@@ -162,10 +169,10 @@ export class EngineCore {
       if (!this.isCurrentAction(topicId, actionId, scopeGeneration)) return;
       this.dependencies.database.finishAction(actionId, "succeeded");
     }).catch((error: unknown) => {
-      if (error instanceof BudgetBlocked && this.isCurrentAction(topicId, actionId, scopeGeneration)) {
+      if ((error instanceof BudgetBlocked || error instanceof RevisionBlocked || error instanceof ReviewBlocked) && this.isCurrentAction(topicId, actionId, scopeGeneration)) {
         const topic = this.dependencies.database.getTopic(topicId);
         this.dependencies.database.finishAction(actionId, "cancelled", error.message);
-        this.interrupt(topicId, "USER_DECISION_REQUIRED", error.message, topic.state, { budgetPause:true });
+        this.interrupt(topicId, "USER_DECISION_REQUIRED", error.message, topic.state, error instanceof RevisionBlocked ? {revisionPause:true} : error instanceof ReviewBlocked ? {reviewPause:error.scope} : {budgetPause:true});
         return;
       }
       const cancelled = controller.signal.aborted;
@@ -226,6 +233,7 @@ export class EngineCore {
       readablePaths?: readonly string[];
       normalize?: ResultNormalizer;
       planBase?: string;
+      repairContextKey?: string;
     } = {},
   ): Promise<AgentResult> {
     const { freshSession = false, planMode = false, check } = options;
@@ -239,9 +247,16 @@ export class EngineCore {
     const onUsage = (usage: TurnUsage) => { executionId = usage.executionId; observeUsage(usage); };
     let result: AgentResult;
     let sessionId: string;
-    if (freshSession || !resumeSessionId || resumeSessionId.startsWith("pending:")) {
+    const pending=await this.pendingRepair(topic.id,topic.state);
+    const reuse=pending && pending.role===role && pending.contextKey===(options.repairContextKey??null)
+      && (!options.session || options.session.id===pending.sessionId);
+    if(reuse) {
+      result=pending.raw;sessionId=pending.sessionId;
+      this.event(topic.id,"system","system","저장된 응답의 교정을 같은 세션에서 재개합니다.");
+    } else if (freshSession || !resumeSessionId || resumeSessionId.startsWith("pending:")) {
       const created = await adapter.createSession({
         prompt, cwd: topic.worktreePath, signal, implementation, planMode,
+        planningWrite: role==="claude" && topic.state==="CLAUDE_PLAN"?"plan":role==="claude"&&topic.state==="CLAUDE_REVISION"?"revision":undefined,
         onSessionCreated: id => {
           this.assertCurrent(topic.id,signal,topic.scopeGeneration,topic.state);
           if (options.session) options.session.persist(id);
@@ -272,6 +287,7 @@ export class EngineCore {
     } else {
       result = await adapter.resumeTurn({
         sessionId: resumeSessionId, prompt, cwd: topic.worktreePath, signal, implementation, planMode,
+        planningWrite: role==="claude" && topic.state==="CLAUDE_PLAN"?"plan":role==="claude"&&topic.state==="CLAUDE_REVISION"?"revision":undefined,
         settings: this.executionSettings(topic.id, role, implementation),
         onProcessSpawn: this.processObserver(topic.id),
         onUsage,
@@ -287,7 +303,17 @@ export class EngineCore {
         signal, implementation, planMode, startedAfter, check, readablePaths: options.readablePaths, normalize: options.normalize, planBase: options.planBase,
       });
       accepted = true;
+      if(pending)await this.writeArtifact(topic,"pending-contract-repair",this.latestSequence(topic.id)+1,"null",signal);
       return checked;
+    } catch(error) {
+      if(error instanceof RevisionBlocked || error instanceof ReviewBlocked || error instanceof BudgetBlocked) {
+        await this.writeArtifact(topic,"pending-contract-repair",this.latestSequence(topic.id)+1,JSON.stringify({
+          role,stage:topic.state,scopeGeneration:topic.scopeGeneration,planEpoch:topic.planEpoch,planSHA256:topic.planSHA256,
+          participantSessionId:this.participant(this.dependencies.database.getTopic(topic.id),role).sessionId,
+          sessionId,raw:redactAgentResult(result),contextKey:options.repairContextKey??null,startedAfter,
+        }),signal);
+      }
+      throw error;
     } finally {
       if (result.kind === "PLAN" || result.kind === "REVISION") this.dependencies.database.saveOptimizationMetric(topic.id, topic.scopeGeneration, executionId, {
         kind: "plan-output", success: accepted, format: result.planLineEdits ? "lines" : result.planEdits ? "find-replace" : "full",
@@ -296,6 +322,23 @@ export class EngineCore {
         patchCount: result.planLineEdits?.edits.length ?? result.planEdits?.length ?? 0,
       });
     }
+  }
+
+  async pendingRepair(topicId:string,stage:string):Promise<{
+    role:ParticipantRole;stage:string;scopeGeneration:number;planEpoch:number;planSHA256:string|null;
+    participantSessionId:string|null;sessionId:string;raw:AgentResult;contextKey:string|null;startedAfter:number;
+  }|null> {
+    const stored=await this.dependencies.artifacts.readLatest(topicId,"pending-contract-repair");
+    if(!stored)return null;
+    const pending=JSON.parse(stored);
+    if(!pending)return null;
+    const topic=this.dependencies.database.getTopic(topicId);
+    if(pending.stage!==stage || pending.scopeGeneration!==topic.scopeGeneration || pending.planEpoch!==topic.planEpoch
+      || pending.planSHA256!==topic.planSHA256 || this.newUserInputSince(topic,pending.startedAfter))return null;
+    if(pending.role!=="claude" && pending.role!=="codex")throw new Error("교정 재개 기록의 역할이 올바르지 않습니다.");
+    if(this.participant(topic,pending.role).sessionId!==pending.participantSessionId)return null;
+    if(typeof pending.sessionId!=="string" || !pending.raw || !Number.isInteger(pending.startedAfter))throw new Error("교정 재개 기록이 올바르지 않습니다.");
+    return pending;
   }
 
   // 기계 계약 위반은 작업 실패가 아니라 표기 실패다. 턴을 버리면 그때까지의 작업 비용 전체가 소각되므로
@@ -367,10 +410,13 @@ export class EngineCore {
         });
       }
     }
+    const correctionRevision=(this.dependencies.database.latestArtifact(topic.id,"contract-repair-source")?.revision ?? 0)+1;
+    await this.writeArtifact(topic,"contract-repair-source",correctionRevision,JSON.stringify(redactAgentResult(raw)),context.signal);
     this.event(topic.id, "system", "system",
       `기계 계약 위반을 같은 세션에 돌려보내 1회 교정합니다${formatOnly ? "(표기 교정 — 추론 low)" : ""}: ${violation}`);
     const settings = this.executionSettings(topic.id, role, context.implementation);
     const corrected = await this.adapter(role).resumeTurn({
+      planningWrite:"repair",
       sessionId, prompt: buildContractCorrectionPrompt(violation), cwd: topic.worktreePath,
       signal: context.signal, implementation: context.implementation, planMode: context.planMode,
       readablePaths: context.readablePaths,

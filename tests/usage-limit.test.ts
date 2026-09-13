@@ -203,9 +203,10 @@ describe("사용 한도 자동 재시도", () => {
       await settle(database);
     }
     expect(clock.timers).toHaveLength(0);
-    expect(database.getTimeline("topic-1").some((event) => event.body.includes(`연속 ${USAGE_LIMIT_RETRY.maxConsecutive}회 썼는데도`))).toBe(true);
+    expect(database.revisions.account("topic-1")).toMatchObject({used:3,limit:3});
+    expect(database.getAutoRetry("topic-1")?.attempts).toBe(3);
 
-    // 재시작 시뮬레이션: 상한(3회)에 닿은 상태는 DB 에 남아 재시작해도 다시 예약하지 않는다(Codex 후속 지적 5). 사람이 retry 로 연다.
+    // 재시작 시뮬레이션: 상한(3회)에 닿은 상태는 DB 에 남아 재시작해도 다시 예약하지 않는다(Codex 후속 지적 5). 사람이 재작성 1회를 추가 승인해야 연다.
     const restartClock = new FakeClock("2026-09-20T00:00:00.000Z");
     const restarted = new WorkflowEngine({
       database, artifacts: new ArtifactStore(join(tmpdir(), "unused-topics"), database),

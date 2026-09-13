@@ -515,3 +515,55 @@ it("작업 묶음 API는 단계 생성 중복을 막고 계약 변경 때 승인
 
  } finally {await app.close();}
 });
+
+it("재작성 승인은 1회만 늘리고 실제 호출을 재개하며 중복·낡은 승인을 거절한다",async()=>{
+ const {app,database,root,adapterCalls}=await makeApp(countingGitRunner().runner);
+ const post=(action:string,payload:unknown,key:string)=>app.inject({method:"POST",url:`/api/topics/revisions/actions/${action}`,payload:payload as any,headers:{"x-consensus-token":"launch-token-for-test","idempotency-key":key}});
+ try {
+  draftTopic(database,"revisions",{worktreePath:root});
+  for(const role of ["claude","codex"] as const)database.upsertParticipant("revisions",{role,sessionId:`${role}-revision`,mode:"attached",acknowledgedPlanSHA256:null});
+  database.revisions.admit("revisions","initial","plan");
+  for(const id of ["a","b","c"])database.revisions.admit("revisions",id,"revision");
+  const policy={execution:{inputTokens:1000,outputTokens:1000,durationMs:100000},total:{inputTokens:10000,outputTokens:10000,durationMs:1000000}};
+  database.budgets.configure("revisions",policy,"test");
+  const unauthorized=await app.inject({method:"POST",url:"/api/topics/revisions/actions/revision-resume",payload:{version:1}});
+  expect(unauthorized.statusCode).toBe(401);
+  expect((await post("revision-resume",{version:1,limit:100},"invalid")).statusCode).toBeGreaterThanOrEqual(400);
+  const grant=await post("revision-resume",{version:1},"grant");expect(grant.statusCode).toBe(200);
+  await vi.waitFor(()=>expect(database.runningAction("revisions")).toBeNull());
+  expect(adapterCalls,database.getTopic("revisions").lastError ?? JSON.stringify(grant.json())).toEqual(["claude"]);
+  expect(database.revisions.account("revisions")).toMatchObject({used:4,limit:4,version:2});
+  expect((await post("revision-resume",{version:1},"grant")).statusCode).toBe(200);
+  expect((await post("revision-resume",{version:1},"stale")).statusCode).toBeGreaterThanOrEqual(400);
+  expect(adapterCalls).toHaveLength(1);
+  const budgetGrant=await post("budget-resume",{version:1,policy:{...policy,execution:{...policy.execution,inputTokens:2000}}},"budget");
+  expect(budgetGrant.statusCode).toBe(200);expect(budgetGrant.json().resumeBlocked).toContain("재작성");
+  expect(database.revisions.account("revisions").limit).toBe(4);expect(adapterCalls).toHaveLength(1);
+ } finally {await app.close();}
+});
+
+it("재작성 승인 후 토큰 예산이 없으면 승인만 보존하고 호출하지 않는다",async()=>{
+ const {app,database,root,adapterCalls}=await makeApp(countingGitRunner().runner);
+ try {
+  draftTopic(database,"both",{worktreePath:root});
+  database.revisions.admit("both","initial","plan");
+  for(const id of ["a","b","c"])database.revisions.admit("both",id,"revision");
+  const grant=await app.inject({method:"POST",url:"/api/topics/both/actions/revision-resume",payload:{version:1},headers:{"x-consensus-token":"launch-token-for-test","idempotency-key":"grant"}});
+  expect(grant.statusCode).toBe(200);expect(grant.json().resumeBlocked).toContain("예산");
+  expect(database.revisions.account("both")).toMatchObject({used:3,limit:4});expect(adapterCalls).toHaveLength(0);
+ } finally {await app.close();}
+});
+
+it("리뷰 1회 승인은 지정된 검토만 늘리고 예산 부족 시 재개를 보류한다",async()=>{
+ const {app,database,adapterCalls}=await makeApp();
+ try {
+  draftTopic(database,"review");database.updateTopic("review",{state:"FAILED",resumeState:"CODEX_REVIEW"});
+  for(const id of ["a","b","c"])database.reviews.admit("review",id,"implementation");
+  const post=(scope:string,key:string)=>app.inject({method:"POST",url:"/api/topics/review/actions/review-resume",payload:{scope,version:1},headers:{"x-consensus-token":"launch-token-for-test","idempotency-key":key}});
+  expect((await post("planning","wrong")).statusCode).toBeGreaterThanOrEqual(400);
+  const result=await post("implementation","grant");expect(result.statusCode).toBe(200);expect(result.json().resumeBlocked).toContain("예산");
+  expect((await post("implementation","grant")).statusCode).toBe(200);
+  expect(database.reviews.account("review","implementation")).toMatchObject({used:3,limit:4,version:2});
+  expect(database.reviews.account("review","planning")).toMatchObject({used:0,limit:3});expect(adapterCalls).toHaveLength(0);
+ } finally {await app.close();}
+});

@@ -1,4 +1,6 @@
+import {ReviewAllowanceSchema,ReviewScopeSchema} from "./reviews.js";
 import { type BudgetAccount } from "./budgets.js";
+import { RevisionAllowanceSchema } from "./revisions.js";
 import { z } from "zod";
 import { ToleranceLedgerEntrySchema } from "./tolerance";
 
@@ -510,6 +512,10 @@ export const TopicActivitySchema = z.object({
   state: WorkflowStateSchema,
   runningAction: z.boolean(),
   budget: z.custom<BudgetAccount>().nullable().optional(),
+  revisionAllowance: RevisionAllowanceSchema.optional(),
+  revisionPaused: z.boolean().optional(),
+  reviewAllowances: z.array(ReviewAllowanceSchema).optional(),
+  reviewPaused: ReviewScopeSchema.nullable().optional(),
   executionUsage: z.array(z.object({
     executionId: z.string(), role: z.enum(["claude", "codex"]), phase: z.string(), observedAt: z.string(),
     usage: z.object({

@@ -33,7 +33,9 @@ export interface ClaudeAdapterOptions {
 }
 
 // --plugin-dir로 로드되는 유일한 스킬 원천. 다른 원천은 --safe-mode와 빈 --setting-sources가 계속 차단한다.
-export const RUNNER_AUTO_COMPACT_WINDOW = 600_000;
+// 구현 세션(sonnet, 여러 턴을 resume)은 600K — 850K 이상 resume 이 빈 턴으로 죽은 실측 때문. 계획·개정·ACK 세션(fable 1M,
+// 턴마다 새 세션)은 사용자 설정과 같은 800K — 계획 턴은 문서를 넓게 읽는 단일 턴이라 일찍 압축하면 근거를 잃는다(2026-09-14 사용자 지적).
+export const RUNNER_AUTO_COMPACT_WINDOW = { implementation: 600_000, planning: 800_000 } as const;
 
 const MANAGED_PLUGIN_MANIFEST = JSON.stringify({
   name: "consensus-room",
@@ -357,7 +359,7 @@ export function buildIsolationSettings(
     // 러너는 --setting-sources "" 라 사용자 settings 의 autoCompactWindow 를 못 받는다 → CLI 기본 임계값까지 컨텍스트가 자라
     // 850K 이상 세션을 resume 하면 빈 턴("No response requested")으로 죽었다(2026-09-06 실측, 중재자가 600K 넘으면 손으로 세션 교체).
     // 600K 에서 압축하도록 명시한다(2026-09-14 사용자 결정 "그 값으로 해").
-    autoCompactWindow: RUNNER_AUTO_COMPACT_WINDOW,
+    autoCompactWindow: implementation ? RUNNER_AUTO_COMPACT_WINDOW.implementation : RUNNER_AUTO_COMPACT_WINDOW.planning,
     // ultracode는 effort 값이 아니라 session-start 설정 키다. `--effort ultracode`는 CLI가 경고만 찍고
     // 조용히 기본 effort로 떨어뜨린다(실측: "Valid values: low, medium, high, xhigh, max").
     // 구현 턴에서만 켠다 — 계획 턴은 Workflow를 열지 않아 켜 봐야 동작할 도구가 없다.

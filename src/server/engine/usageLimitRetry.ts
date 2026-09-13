@@ -50,7 +50,7 @@ export class UsageLimitRetryScheduler {
   // failedAt: 메시지의 리셋 시각은 실패 시점 기준으로 읽어야 한다 — 재시작 복원처럼 한참 뒤에 읽으면 "8:50am" 이 이미 지난
   // 시각이라 다음 날로 밀린다. 대기 시간 자체는 지금 기준이다.
   consider(topicId: string, message: string, failedAt?: number): void {
-    try { this.core.assertBudgetAvailable(topicId); } catch { this.cancel(topicId); return; }
+    try { this.core.assertBudgetAvailable(topicId); this.core.assertRetryRewriteAvailable(topicId); } catch { this.cancel(topicId); return; }
     const now = this.clock.now();
     const limit = parseUsageLimit(message, new Date(failedAt ?? now));
     if (!limit) {
@@ -140,7 +140,7 @@ export class UsageLimitRetryScheduler {
     const now = this.clock.now();
     for (const topic of this.database.listTopics()) {
       if (topic.state !== "FAILED" || !topic.lastError) continue;
-      try { this.core.assertBudgetAvailable(topic.id); } catch { continue; }
+      try { this.core.assertBudgetAvailable(topic.id); this.core.assertRetryRewriteAvailable(topic.id); } catch { continue; }
       if (!this.database.getFlags(topic.id).resumeState) continue;
       const stored = this.database.getAutoRetry(topic.id);
       if (stored?.cancelled) continue;
@@ -183,6 +183,8 @@ export class UsageLimitRetryScheduler {
     if (!blocked) {
       try {
         this.core.assertNoActiveWork(topicId);
+        this.core.assertBudgetAvailable(topicId);
+        this.core.assertRetryRewriteAvailable(topicId);
       } catch (error) {
         blocked = error instanceof Error ? error.message : String(error);
       }

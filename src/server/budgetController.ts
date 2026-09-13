@@ -1,3 +1,7 @@
+import {reviewScope} from "../shared/reviews.js";
+import type {ReviewLedger} from "./reviewLedger.js";
+import type { RevisionLedger } from "./revisionLedger.js";
+import type { RewriteKind } from "../shared/revisions.js";
 import { BUDGET_KEYS, zeroBudget } from "../shared/budgets.js";
 import { randomUUID } from "node:crypto";
 import type { AgentAdapter, SessionTurn } from "./types.js";
@@ -7,7 +11,8 @@ interface Context { topicId: string; accounts: string[]; stage: string; }
 // All model methods pass through this boundary, including direct delivery/correction calls.
 export class BudgetController {
   constructor(private readonly ledger: BudgetLedger, private readonly context: (cwd:string) => Context,
-    private readonly checkpoint: (topicId:string, output:unknown) => Promise<void>) {}
+    private readonly checkpoint: (topicId:string, output:unknown) => Promise<void>,
+    private readonly revisions?: RevisionLedger, private readonly budgetsEnabled = true, private readonly reviews?:ReviewLedger) {}
   wrap(adapter: AgentAdapter): AgentAdapter {
     const wrapper: AgentAdapter = {
       role:adapter.role,
@@ -15,14 +20,23 @@ export class BudgetController {
       createSession: turn => this.run(adapter.role,turn,t => adapter.createSession(t)),
       resumeTurn: turn => this.run(adapter.role,turn,t => adapter.resumeTurn(t as SessionTurn)),
     };
-    if (adapter.resumePlanRepair) wrapper.resumePlanRepair = turn => this.run(adapter.role,turn,t => adapter.resumePlanRepair!(t as SessionTurn));
+    if (adapter.resumePlanRepair) wrapper.resumePlanRepair = turn => this.run(adapter.role,{...turn,planningWrite:"repair"},t => adapter.resumePlanRepair!(t as SessionTurn));
     return wrapper;
   }
   private async run<T>(role:string, turn:Omit<SessionTurn,"sessionId">, invoke:(turn:Omit<SessionTurn,"sessionId">)=>Promise<T>):Promise<T> {
     turn.signal?.throwIfAborted();
     const ctx=this.context(turn.cwd), id=randomUUID(), startedAt=Date.now();
+    const kind:RewriteKind|undefined=role==="claude" && ["CLAUDE_PLAN","CLAUDE_REVISION"].includes(ctx.stage)
+      ? turn.planningWrite ?? (ctx.stage==="CLAUDE_PLAN"?"plan":"revision") : undefined;
+    const review=role==="codex"?reviewScope(ctx.stage):undefined;
+    if(!this.budgetsEnabled) {
+      if(review)this.reviews?.admit(ctx.topicId,id,review);
+      if(kind)this.revisions?.admit(ctx.topicId,id,kind);
+      return invoke(turn);
+    }
+    const reserve=()=>{if(kind)this.revisions?.reserve(ctx.topicId,id,kind);if(review)this.reviews?.reserve(ctx.topicId,id,review);};
     this.ledger.start({id,accounts:ctx.accounts,stage:ctx.stage,role,model:turn.settings?.model??"unknown",
-      effort:turn.settings?.effort??"unknown",startedAt});
+      effort:turn.settings?.effort??"unknown",startedAt},reserve);
     const controller=new AbortController();
     const observed=zeroBudget();
     let failure:unknown; let partial:unknown; let sessionId = (turn as SessionTurn).sessionId;

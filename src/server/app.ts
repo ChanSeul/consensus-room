@@ -1,3 +1,5 @@
+import {ReviewGrantInputSchema} from "../shared/reviews.js";
+import { RevisionGrantInputSchema } from "../shared/revisions.js";
 import { WorkGroupInputSchema } from "../shared/workGroups.js";
 import { WorkGroupService } from "./workGroupService.js";
 import { BudgetPolicySchema } from "../shared/budgets.js";
@@ -114,6 +116,8 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
         if(topic.state!=="FAILED" && !(topic.state==="USER_DECISION_REQUIRED" && interruption?.payload?.budgetPause===true))continue;
         try {database.budgets.assertAvailable([topic.id,group.id]);}
         catch {return {...granted,resumeBlocked:"묶음 예산을 늘렸습니다. 해당 토픽의 예산도 추가한 뒤 재개하세요."};}
+        if(workflow.reviewPaused(topic.id))return {...granted,resumeBlocked:"묶음 예산을 늘렸습니다. 리뷰 1회 추가 승인도 필요합니다."};
+        if(workflow.revisionPaused(topic.id))return {...granted,resumeBlocked:"묶음 예산을 늘렸습니다. 계획 재작성 1회 추가 승인도 필요합니다."};
         workflow.retry(topic.id,requestActionId(topic.id,"group-budget-resume",key));
         return {...granted,resumedTopicId:topic.id};
       }
@@ -254,6 +258,10 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       executionUsage: database.getExecutionUsage(topic.id),
       ...activity,
       budget: database.budgets.account(topic.id),
+      revisionAllowance: database.revisions.account(topic.id),
+      revisionPaused: workflow.revisionPaused(topic.id),
+      reviewAllowances: [database.reviews.account(topic.id,"planning"),database.reviews.account(topic.id,"implementation")],
+      reviewPaused: workflow.reviewPaused(topic.id),
       autoRetryAt: workflow.scheduledRetryAt(topic.id),
       checkedAt: new Date().toISOString(),
     };
@@ -291,14 +299,38 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     return runIdempotent(request, reply, actionLedger(database, topicId, action), 200, async (idempotencyKey) => {
       const actionId = requestActionId(topicId, action, idempotencyKey);
       let response: unknown;
-      if (action === "budget-configure" || action === "budget-resume") {
+      if(action === "review-resume") {
+        workflow.assertBudgetEditable(topicId);
+        const input=ReviewGrantInputSchema.parse(request.body);
+        if(workflow.reviewPaused(topicId)!==input.scope)throw new Error("추가 승인이 필요한 리뷰 중단 상태가 아닙니다.");
+        database.reviews.grant(topicId,input.scope,idempotencyKey,input.version);
+        let budgetBlocked=false;
+        const group=database.workGroups.forTopic(topicId);
+        try {database.budgets.assertAvailable(group?[topicId,group.id]:[topicId]);} catch {budgetBlocked=true;}
+        response=budgetBlocked?{...accepted(actionId,database.getTopic(topicId)),resumeBlocked:"리뷰 1회를 추가했습니다. 토큰·시간 예산도 추가한 뒤 재개하세요."}
+          :accepted(workflow.retry(topicId,actionId),database.getTopic(topicId));
+      }
+      else if(action === "revision-resume") {
+        workflow.assertBudgetEditable(topicId);
+        const input=RevisionGrantInputSchema.parse(request.body);
+        if(!workflow.revisionPaused(topicId))throw new Error("추가 승인이 필요한 계획 재작성 중단 상태가 아닙니다.");
+        database.revisions.grant(topicId,idempotencyKey,input.version);
+        let budgetBlocked=false;
+        const group=database.workGroups.forTopic(topicId);
+        try {database.budgets.assertAvailable(group?[topicId,group.id]:[topicId]);} catch {budgetBlocked=true;}
+        if(budgetBlocked)response={...accepted(actionId,database.getTopic(topicId)),resumeBlocked:"재작성 1회를 추가했습니다. 토큰·시간 예산도 추가한 뒤 재개하세요."};
+        else response=accepted(database.getTopic(topicId).state==="DRAFT"?workflow.startPlan(topicId,actionId):workflow.retry(topicId,actionId),database.getTopic(topicId));
+      }
+      else if (action === "budget-configure" || action === "budget-resume") {
         workflow.assertBudgetEditable(topicId);
         const body = request.body as { policy?: unknown; version?: number };
         const policy = BudgetPolicySchema.parse(body?.policy);
         if (action === "budget-configure") database.budgets.configure(topicId,policy,"user-explicit");
         else database.budgets.grant(topicId,idempotencyKey,policy,body?.version ?? -1);
         if (action === "budget-resume" && ["FAILED","USER_DECISION_REQUIRED"].includes(database.getTopic(topicId).state)) {
-          response = accepted(workflow.retry(topicId,actionId),database.getTopic(topicId));
+          response = workflow.revisionPaused(topicId) || workflow.reviewPaused(topicId)
+            ? {...accepted(actionId,database.getTopic(topicId)),resumeBlocked:"예산을 추가했습니다. 중단된 계획 재작성 또는 리뷰의 1회 추가 승인도 필요합니다."}
+            : accepted(workflow.retry(topicId,actionId),database.getTopic(topicId));
         } else response = accepted(randomUUID(),database.getTopic(topicId));
       }
       else if (action === "plan") response = accepted(workflow.startPlan(topicId, actionId), database.getTopic(topicId));
