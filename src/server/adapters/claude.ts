@@ -33,6 +33,8 @@ export interface ClaudeAdapterOptions {
 }
 
 // --plugin-dir로 로드되는 유일한 스킬 원천. 다른 원천은 --safe-mode와 빈 --setting-sources가 계속 차단한다.
+export const RUNNER_AUTO_COMPACT_WINDOW = 600_000;
+
 const MANAGED_PLUGIN_MANIFEST = JSON.stringify({
   name: "consensus-room",
   description: "Consensus Room이 검토해 연결한 스킬만 담는 관리형 플러그인",
@@ -352,6 +354,10 @@ export function buildIsolationSettings(
   const credentialPath = join(home, ".claude", ".credentials.json");
   return {
     autoMemoryEnabled: false,
+    // 러너는 --setting-sources "" 라 사용자 settings 의 autoCompactWindow 를 못 받는다 → CLI 기본 임계값까지 컨텍스트가 자라
+    // 850K 이상 세션을 resume 하면 빈 턴("No response requested")으로 죽었다(2026-09-06 실측, 중재자가 600K 넘으면 손으로 세션 교체).
+    // 600K 에서 압축하도록 명시한다(2026-09-14 사용자 결정 "그 값으로 해").
+    autoCompactWindow: RUNNER_AUTO_COMPACT_WINDOW,
     // ultracode는 effort 값이 아니라 session-start 설정 키다. `--effort ultracode`는 CLI가 경고만 찍고
     // 조용히 기본 effort로 떨어뜨린다(실측: "Valid values: low, medium, high, xhigh, max").
     // 구현 턴에서만 켠다 — 계획 턴은 Workflow를 열지 않아 켜 봐야 동작할 도구가 없다.

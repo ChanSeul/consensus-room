@@ -1472,3 +1472,15 @@ it("Claude 부분 교정은 별도 스키마·도구 없는 권한을 쓰고 사
   // CLI resume retains V2 tools; unsupported adapters must take the existing full-correction path.
   expect("resumePlanRepair" in codexAdapter(runner).adapter).toBe(false);
 });
+
+// 2026-09-14 사용자 결정: 러너는 사용자 settings 를 안 읽으므로 압축 임계값을 격리 설정에 명시한다(600K).
+describe("러너 auto-compact 임계값", () => {
+  it("계획·구현 세션 모두 autoCompactWindow 600000 을 --settings 로 받는다", async () => {
+    const { buildIsolationSettings, RUNNER_AUTO_COMPACT_WINDOW } = await import("../src/server/adapters/claude");
+    expect(RUNNER_AUTO_COMPACT_WINDOW).toBe(600_000);
+    for (const implementation of [true, false]) {
+      const settings = buildIsolationSettings("/tmp/ws", "/tmp/act", implementation) as { autoCompactWindow?: number };
+      expect(settings.autoCompactWindow).toBe(600_000);
+    }
+  });
+});
