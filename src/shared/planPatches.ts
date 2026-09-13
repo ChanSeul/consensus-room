@@ -49,7 +49,7 @@ export function repairablePlan(result: AgentResult, base?: string): string | nul
   text = normalizePlan(text);
   const block = toleranceBlock(text);
   if (!block) return null;
-  try { parseRepairBaseline(block.text); return text; } catch { return null; }
+  try { return TolerancePolicySchema.safeParse(parseRepairBaseline(block.text)).success ? text : null; } catch { return null; }
 }
 
 export function planRepairPrompt(plan: string, violation: string): string {
@@ -90,16 +90,7 @@ function parseRepairBaseline(original: string): unknown {
 function assertPolicyValuesPreserved(original: string, fixed: string): void {
   const before = parseRepairBaseline(original);
   const after: unknown = JSON.parse(sanitizeJSONControlCharacters(fixed));
-  const parsed = TolerancePolicySchema.safeParse(before);
-  const editable = new Set<string>();
-  if (!parsed.success) for (const issue of parsed.error.issues) {
-    if (issue.code === "too_big" && issue.path[0] === "rules"
-      && (issue.path.length === 3 && issue.path[2] === "title" || issue.path.length === 4 && issue.path[2] === "invariants")) {
-      editable.add(JSON.stringify(issue.path));
-    }
-  }
   const equal = (a: unknown, b: unknown, path: Array<string | number>): boolean => {
-    if (editable.has(JSON.stringify(path))) return typeof b === "string";
     if (a === null || b === null || typeof a !== "object" || typeof b !== "object") return a === b;
     if (Array.isArray(a) !== Array.isArray(b)) return false;
     const aa = a as Record<string, unknown>, bb = b as Record<string, unknown>;

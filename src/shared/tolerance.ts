@@ -21,7 +21,7 @@ export type ToleranceHunkKind = z.infer<typeof ToleranceHunkKindSchema>;
 
 export const ToleranceRuleSchema = z.object({
   id: z.string().regex(/^T-\d{1,3}$/, "규칙 id 는 T-1, T-2 … 형식"),
-  title: z.string().trim().min(1).max(200),
+  title: z.string().trim().min(1),
   // 이 규칙이 적용되는 파일 glob(승인 범위 밖 영역). `**`·`*`·`?` 를 지원한다.
   paths: z.array(z.string().trim().min(1)).min(1).max(50),
   // insert-token: 삭제줄→추가줄이 tokens 중 하나의 삽입만으로 다르다(표기 추가만).
@@ -32,7 +32,7 @@ export const ToleranceRuleSchema = z.object({
   maxFiles: z.number().int().min(0).max(1000),
   maxHunks: z.number().int().min(0).max(10000),
   // 사람이 읽는 불변식(도구가 따로 검사하는 조건의 이름). 엔진은 기록만 한다.
-  invariants: z.array(z.string().trim().min(1).max(300)).max(20).default([]),
+  invariants: z.array(z.string().trim().min(1)).max(20).default([]),
 }).superRefine((rule, context) => {
   if (rule.hunk !== "any" && rule.tokens.length === 0) {
     context.addIssue({ code: z.ZodIssueCode.custom, message: `${rule.id}: ${rule.hunk} 규칙은 tokens 가 필요합니다.` });
@@ -86,6 +86,16 @@ export function sanitizeJSONControlCharacters(text: string): string {
   return out;
 }
 
+// Only remove trailing commas outside strings. Missing keys/brackets are never inferred.
+export function normalizeToleranceJSON(text: string): string {
+  return sanitizeJSONControlCharacters(text).replace(/"(?:\\.|[^"\\])*"|,(?=\s*[}\]])/g, token => token === "," ? "" : token);
+}
+
+export function normalizeToleranceBlocks(plan: string): string {
+  return plan.replace(/(```tolerance[^\n]*\n)([\s\S]*?)(\n```)/g,
+    (_match, opening, body, closing) => opening + normalizeToleranceJSON(body) + closing);
+}
+
 export class ToleranceFormatError extends Error {
   constructor(message: string) {
     super(message);
@@ -98,7 +108,7 @@ export function parseTolerancePolicy(planMarkdown: string): TolerancePolicy | nu
   if (!match) return null;
   let raw: unknown;
   try {
-    raw = JSON.parse(sanitizeJSONControlCharacters(match[1]));
+    raw = JSON.parse(normalizeToleranceJSON(match[1]));
   } catch (error) {
     throw new ToleranceFormatError(`허용 오차 블록이 JSON 이 아닙니다: ${error instanceof Error ? error.message : String(error)}`);
   }

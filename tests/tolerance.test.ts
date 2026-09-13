@@ -12,6 +12,7 @@ import {
   stateAtLine,
   ToleranceFormatError,
   sanitizeJSONControlCharacters,
+  normalizeToleranceBlocks,
 } from "../src/shared/tolerance";
 
 const policyBlock = `## 허용 오차
@@ -257,11 +258,11 @@ describe("Swift 문자열 보간 — 보간식 안은 값이다", () => {
 
 // 2026-09-13 S10H: invariants 300자 초과가 plain Error 라 xhigh 교정으로 갔다 — 형식 오류는 전용 타입으로 구분한다.
 describe("허용 오차 블록 형식 오류는 ToleranceFormatError 다", () => {
-  it("스키마 위반(invariants 300자 초과)과 JSON 오류 모두 ToleranceFormatError 를 던진다", () => {
+  it("설명은 길어도 보존하고 기계 규칙과 JSON 오류는 거부한다", () => {
     const long = "가".repeat(301);
     const schemaBad = "## 허용 오차\n```tolerance\n" + JSON.stringify({ scopePaths: ["a/**"], rules: [{ id: "T-1", title: "t", paths: ["a/**"], hunk: "any", maxFiles: 1, maxHunks: 1, invariants: [long] }] }) + "\n```\n";
-    expect(() => parseTolerancePolicy(schemaBad)).toThrow(ToleranceFormatError);
-    expect(() => parseTolerancePolicy(schemaBad)).toThrow("<=300");
+    expect(parseTolerancePolicy(schemaBad)?.rules[0].invariants).toEqual([long]);
+    expect(() => parseTolerancePolicy(schemaBad.replace('"maxFiles":1', '"maxFiles":-1'))).toThrow(ToleranceFormatError);
     expect(() => parseTolerancePolicy("## 허용 오차\n```tolerance\n{not json\n```\n")).toThrow(ToleranceFormatError);
   });
 });
@@ -278,4 +279,18 @@ describe("허용 오차 블록의 문자열 안 제어 문자", () => {
     expect(policy?.rules[0]?.title).toBe("탭 있음 줄바꿈");
     expect(policy?.rules[0]?.invariants[0]).toBe("이스케이프 \n 유지"); // JSON 이스케이프 \n 은 실제 줄바꿈으로 남는다
   });
+});
+
+ it("긴 제목과 마지막 쉼표를 허용하고 문자열 안 쉼표는 보존한다", () => {
+   const title = "설명,}".repeat(100);
+   const raw = JSON.stringify({scopePaths:["a/**"],rules:[{id:"T-1",title,paths:["b/**"],hunk:"any",maxFiles:1,maxHunks:1}]}).replace(/}$/, ",}");
+   expect(parseTolerancePolicy("```tolerance\n" + raw + "\n```")?.rules[0].title).toBe(title);
+ });
+
+it("기존 계획 해시 규칙은 보존하고 새 본문만 정규화한다", async () => {
+  const { hashPlan } = await import("../src/shared/workflow");
+  const { createHash } = await import("node:crypto");
+  const old = '```tolerance\n{"scopePaths":["a/**"],"rules":[],}\n```\n';
+  expect(hashPlan(old)).toBe(createHash("sha256").update(old).digest("hex"));
+  expect(normalizeToleranceBlocks(old)).toBe(old.replace("[],}","[]}"));
 });

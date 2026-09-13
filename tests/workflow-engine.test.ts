@@ -3378,58 +3378,27 @@ describe("계약 교정의 표기 위반 분류", () => {
 });
 
 
-describe("부분 계획 교정의 엔진 경계", () => {
-  const broken = () => validPlan("부분 교정").replace('"rules":[]', '"rules":[],');
-  it("PLAN의 블록만 고쳐 기존 쟁점·근거와 다음 계약 검사를 보존한다", async () => {
-    const { database, dependencies } = makeEngine("DRAFT", null);
-    database.updateTopic("topic-1", { state: "CLAUDE_PLAN" });
-    let calls = 0;
-    dependencies.claude.resumePlanRepair = async (turn) => {
-      calls++; expect(turn.protocolOnly).toBe(true); expect(turn.settings?.effort).toBe("low");
-      expect(turn.prompt).not.toContain("불변인 요약");
-      turn.onUsage?.({ executionId: "repair-1", recordKind: "final", outputTokens: 20 });
-      return { baseSHA256: hashPlan(broken()), edits: [{ find: '"rules":[],', replace: '"rules":[]' }] };
-    };
-    const core = new EngineCore(dependencies);
-    const raw: AgentResult = { kind: "PLAN", summary: "불변인 요약", planMarkdown: broken(), findings: [finding("S", "기존 쟁점")], evidenceRefs: ["기존 근거"] };
-    let result: AgentResult | undefined;
-    core.startAction("topic-1", "plan", async signal => {
-      result = await core.enforceResultContract("claude", database.getTopic("topic-1"), raw, "session", {
-        signal, implementation: false, planMode: true, startedAfter: 0,
-        check: r => { core.assertKind(r, "PLAN"); core.requirePlan(r); },
+it("설명 길이와 마지막 쉼표 때문에 모델 교정을 요청하지 않는다", async () => {
+  const { database, dependencies } = makeEngine("DRAFT", null);
+  database.updateTopic("topic-1", { state: "CLAUDE_PLAN" });
+  const core = new EngineCore(dependencies);
+  let calls = 0;
+  dependencies.claude.resumeTurn = async () => { calls++; throw new Error("불필요한 교정"); };
+  dependencies.claude.resumePlanRepair = async () => { calls++; throw new Error("불필요한 교정"); };
+  const policy = { scopePaths:["a/**"], rules:[{id:"T-1",title:"긴 제목".repeat(100),paths:["b/**"],hunk:"any",maxFiles:1,maxHunks:1,invariants:["설명".repeat(300)]}] };
+  const plan = validPlan("설명 보존").replace(/```tolerance[\s\S]*?```/, "```tolerance\n" + JSON.stringify(policy).replace(/}$/, ",}") + "\n```");
+  let result: AgentResult | undefined;
+  core.startAction("topic-1", "plan", async signal => {
+    result = await core.enforceResultContract("claude", database.getTopic("topic-1"),
+      {kind:"PLAN",summary:"계획",planMarkdown:plan,findings:[],evidenceRefs:[]}, "session", {
+        signal, implementation:false, planMode:true, startedAfter:0, check:r => {core.requirePlan(r);},
       });
-    });
-    await waitForActionCompletion(database, "topic-1");
-    expect(calls).toBe(1); expect(result).toMatchObject({ summary: raw.summary, findings: raw.findings, evidenceRefs: raw.evidenceRefs });
-    expect(result?.planMarkdown, database.getTopic("topic-1").lastError ?? "").toBe(normalizePlan(validPlan("부분 교정")));
-    expect(database.optimizationMetrics("topic-1")[0]).toMatchObject({ executionId: "repair-1", metrics: { kind: "plan-repair", success: true } });
-    expect(database.getPromptTimeline("topic-1", 3).some(e => e.body.includes("plan-repair"))).toBe(false);
   });
-  it.each(["invalid", "cancel", "input"])("%s이면 부분 교정에서 멈추고 전체 재제출을 추가하지 않는다", async (mode) => {
-    const { database, dependencies } = makeEngine("DRAFT", null);
-    database.updateTopic("topic-1", { state: "CLAUDE_PLAN" });
-    let calls = 0;
-    dependencies.claude.resumePlanRepair = async () => {
-      calls++;
-      if (mode === "cancel") void core.stopIfRunning("topic-1");
-      if (mode === "input") database.appendEvent({ topicId: "topic-1", actor: "user", kind: "decision", state: "CLAUDE_PLAN", body: "새 결정" });
-      return { baseSHA256: mode === "invalid" ? "0".repeat(64) : hashPlan(broken()), edits: [{ find: '"rules":[],', replace: '"rules":[]' }] };
-    };
-    dependencies.claude.resumeTurn = async () => { throw new Error("전체 재제출 호출 금지"); };
-    const core = new EngineCore(dependencies);
-    const raw: AgentResult = { kind: "PLAN", summary: "x", planMarkdown: broken(), findings: [], evidenceRefs: [] };
-    let caught: unknown;
-    core.startAction("topic-1", "plan", async signal => {
-      try { await core.enforceResultContract("claude", database.getTopic("topic-1"), raw, "session", {
-        signal, implementation: false, planMode: true, startedAfter: 0, check: r => { core.requirePlan(r); },
-      }); } catch (error) { caught = error; throw error; }
-    });
-    await waitForActionCompletion(database, "topic-1");
-    expect(caught).toBeInstanceOf(Error);
-    expect(String(caught)).not.toContain("전체 재제출 호출 금지");
-    expect(calls).toBe(1);
-    expect(database.optimizationMetrics("topic-1")[0].metrics.success).toBe(false);
-  });
+  await waitForActionCompletion(database,"topic-1");
+  expect(calls).toBe(0);
+  expect(parseTolerancePolicy(result!.planMarkdown!)?.rules[0].invariants).toEqual(policy.rules[0].invariants);
+  expect(database.optimizationMetrics("topic-1")).toEqual([]);
+  database.close();
 });
 
 it("줄 패치 개정도 감사·종결·ACK를 거쳐 같은 계획으로 승인 대기한다", async () => {

@@ -1,3 +1,4 @@
+import { normalizeToleranceBlocks } from "../../shared/tolerance.js";
 // 계획 수렴 파이프라인: CLAUDE_PLAN → CODEX_AUDIT → CLAUDE_REVISION → CODEX_CLOSEOUT → CONSENSUS_ACK.
 // 각 단계의 검증 순서(검증 → 메모리 반영 → pause → 저장)가 이 파일의 계약이다.
 import { type AgentResult, type Topic, AgentResultSchema, type Finding } from "../../shared/contracts.js";
@@ -442,7 +443,7 @@ export class PlanningPipeline {
     signal: AbortSignal,
   ): Promise<{ markdown: string; sha256: string }> {
     assertPlanContract(markdown);
-    const normalized = normalizePlan(redactSecrets(markdown));
+    const normalized = normalizePlan(normalizeToleranceBlocks(redactSecrets(markdown)));
     const artifact = await this.core.writeArtifact(topic, "plan", revision, normalized, signal);
     this.core.assertCurrent(topic.id, signal, topic.scopeGeneration, topic.state);
     this.core.dependencies.database.updateTopic(topic.id, {
