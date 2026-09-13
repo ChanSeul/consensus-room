@@ -15,6 +15,7 @@ import {
   dispositionRegressions,
   newFindingIDs,
   resolveBranchName,
+  refixDirective,
   shouldRunFixPass,
 } from "../../shared/workflow.js";
 import { normalizeCommitPaths } from "../git.js";
@@ -538,9 +539,15 @@ export class DeliveryPipeline {
     const storedReview = database.latestArtifact(topicId, reviewKind);
     if (!storedFix || !storedReview || storedFix.revision <= storedReview.revision) return false;
     if (storedFix.scopeGeneration !== topic.scopeGeneration) return false;
-    const decided = database.getTimeline(topicId, storedFix.revision)
-      .some((event) => event.scopeGeneration === topic.scopeGeneration && event.actor === "user" && event.kind === "decision");
-    if (!decided) return false;
+    const decisions = database.getTimeline(topicId, storedFix.revision)
+      .filter((event) => event.scopeGeneration === topic.scopeGeneration && event.actor === "user" && event.kind === "decision");
+    if (decisions.length === 0) return false;
+    // 결정이 수정을 더 요구하면(REFIX) 저장 결과는 낡은 것이다 — 재사용하지 않고 수정 턴을 다시 연다.
+    if (decisions.some((event) => refixDirective(event.body))) {
+      this.core.event(topicId, "system", "system",
+        `결정의 REFIX 지시로 저장된 수정 결과(#${storedFix.revision})를 재사용하지 않고 수정 턴을 다시 엽니다.`);
+      return false;
+    }
     const fixResult = await this.core.latestResult(topicId, "claude-fix");
     try {
       this.core.assertKind(fixResult, "FIX");

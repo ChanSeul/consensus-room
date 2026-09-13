@@ -695,11 +695,11 @@ export class ConsensusDatabase {
   getPromptTimeline(topicId: string, scopeGeneration: number, afterSequence = 0): TimelineEvent[] {
     const rows = this.db.prepare(`
       SELECT * FROM timeline_events
-      WHERE topic_id = ? AND scope_generation = ? AND sequence > ? AND json_extract(payload_json, '$.usage') IS NULL AND json_extract(payload_json, '$.promptMetrics') IS NULL AND json_extract(payload_json, '$.verificationMetrics') IS NULL AND (
+      WHERE topic_id = ? AND scope_generation = ? AND sequence > ? AND json_extract(payload_json, '$.usage') IS NULL AND json_extract(payload_json, '$.promptMetrics') IS NULL AND json_extract(payload_json, '$.verificationMetrics') IS NULL AND json_extract(payload_json, '$.executionWarning') IS NULL AND (
         kind IN ('scope_change', 'evidence', 'decision')
         OR sequence IN (
           SELECT sequence FROM timeline_events
-          WHERE topic_id = ? AND scope_generation = ? AND json_extract(payload_json, '$.usage') IS NULL AND json_extract(payload_json, '$.promptMetrics') IS NULL AND json_extract(payload_json, '$.verificationMetrics') IS NULL
+          WHERE topic_id = ? AND scope_generation = ? AND json_extract(payload_json, '$.usage') IS NULL AND json_extract(payload_json, '$.promptMetrics') IS NULL AND json_extract(payload_json, '$.verificationMetrics') IS NULL AND json_extract(payload_json, '$.executionWarning') IS NULL
           ORDER BY sequence DESC LIMIT 80
         )
       )

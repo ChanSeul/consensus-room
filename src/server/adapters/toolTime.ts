@@ -16,6 +16,8 @@ export function createToolTimeMeter(kind: "claude" | "codex"): ToolTimeMeter {
   let windowStart: number | undefined;
   let toolDurationMs = 0;
   let toolCalls = 0;
+  const started = new Set<string>();
+  const completed = new Set<string>();
   const open = (at: number, count: number) => {
     if (count <= 0) return;
     if (outstanding === 0) windowStart = at;
@@ -35,14 +37,15 @@ export function createToolTimeMeter(kind: "claude" | "codex"): ToolTimeMeter {
       const event = record(value);
       if (!event) return;
       if (kind === "claude") {
-        if (event.type === "assistant") open(at, countBlocks(event, "tool_use"));
-        else if (event.type === "user") close(at, countBlocks(event, "tool_result"));
+        if (event.type === "assistant") open(at, uniqueBlocks(event, "tool_use", "id", started));
+        else if (event.type === "user") close(at, uniqueBlocks(event, "tool_result", "tool_use_id", completed));
         return;
       }
       const item = record(event.item);
       if (!item || typeof item.type !== "string" || !CODEX_TOOL_ITEMS.has(item.type)) return;
-      if (event.type === "item.started") open(at, 1);
-      else if (event.type === "item.completed") close(at, 1);
+      const id = typeof item.id === "string" ? item.id : "";
+      if (event.type === "item.started" && id && !started.has(id)) { started.add(id); open(at, 1); }
+      else if (event.type === "item.completed" && id && !completed.has(id)) { completed.add(id); close(at, 1); }
     },
     summary() {
       return { toolDurationMs, toolCalls };
@@ -54,9 +57,16 @@ function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
 }
 
-function countBlocks(event: Record<string, unknown>, blockType: string): number {
+function uniqueBlocks(event: Record<string, unknown>, blockType: string, key: string, seen: Set<string>): number {
   const message = record(event.message);
   const content = message?.content;
   if (!Array.isArray(content)) return 0;
-  return content.filter((block) => record(block)?.type === blockType).length;
+  let count = 0;
+  for (const block of content) {
+    const item = record(block);
+    const rawID = item?.[key];
+    const id = typeof rawID === "string" ? rawID : JSON.stringify(item);
+    if (item?.type === blockType && !seen.has(id)) { seen.add(id); count += 1; }
+  }
+  return count;
 }

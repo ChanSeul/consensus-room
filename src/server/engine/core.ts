@@ -28,6 +28,7 @@ import {
 import { buildContractCorrectionPrompt } from "../../shared/prompts.js";
 import { redactAgentResult, redactRecord } from "../security.js";
 import type { AgentAdapter, AppliedMemoryChange, ParticipantRole, TurnUsage } from "../types.js";
+import { exceededLimits } from "../adapters/executionMetrics.js";
 import type { WorkflowDependencies } from "../workflow.js";
 
 // 결과 JSON 의 표기만 틀린 위반(스키마·kind). 재제출에 판단이 필요 없어 교정 턴의 추론 강도를 low 로 내린다
@@ -73,6 +74,7 @@ export class EngineCore {
   failureObserver?: (topicId: string, message: string) => void;
   // 새 action 이 시작될 때 알린다 — 그 주제의 예약된 자동 재시도를 취소한다.
   actionObserver?: (topicId: string) => void;
+  private readonly warnedLimits = new Map<string, Set<string>>();
 
   constructor(readonly dependencies: WorkflowDependencies) {}
 
@@ -393,21 +395,33 @@ export class EngineCore {
   // 들어가지 않는다 — 사용량 줄이 에이전트에게 되돌아가면 그 자체가 새 입력 비용이다.
   usageObserver(topicId: string, role: ParticipantRole, phase: "턴" | "계약 교정 재제출" | "프로토콜 확인") {
     return (usage: TurnUsage) => {
-      const tokens = (count: number) => count.toLocaleString("en-US");
-      const seconds = (ms: number) => Math.round(ms / 1000);
+      const tokens = (count: number | undefined) => count === undefined ? "관측 안 됨" : count.toLocaleString("en-US");
+      const seconds = (ms: number | undefined) => Math.round((ms ?? 0) / 1000);
       const cost = usage.costUSD === undefined ? "" : ` · $${usage.costUSD.toFixed(2)}`;
       // 총 시간은 CLI 실행 전체다. 도구 창(러너 측정)과 API 시간(claude CLI 측정)을 따로 적어야 모델 속도를 도구·빌드 시간과
       // 구분해 비교할 수 있다(2026-09-08 Codex 지적 — 이전의 '출력 tok/s' 비교는 총 시간 기준이라 도구 시간이 섞였다).
       const split = usage.toolDurationMs === undefined
         ? ""
-        : ` · 도구 ${seconds(usage.toolDurationMs)}초(${usage.toolCalls ?? 0}회) · 모델+대기 ${seconds(Math.max(0, usage.durationMs - usage.toolDurationMs))}초`;
+        : ` · 도구 ${seconds(usage.toolDurationMs)}초(${usage.toolCalls ?? 0}회) · 모델+대기 ${seconds(Math.max(0, (usage.durationMs ?? 0) - usage.toolDurationMs))}초`;
       const api = usage.apiDurationMs === undefined ? "" : ` · API ${seconds(usage.apiDurationMs)}초`;
+      const kind = usage.recordKind === "progress" ? "진행" : "최종";
       this.event(
         topicId, role, "system",
-        `${role} ${phase} 사용량 — 입력 ${tokens(usage.inputTokens)}(캐시 ${tokens(usage.cachedInputTokens)}) · ` +
-          `출력 ${tokens(usage.outputTokens)} 토큰 · ${seconds(usage.durationMs)}초${split}${api}${cost}${usage.model ? ` · 모델 ${usage.model}` : ""}`,
+        `${role} ${phase} ${kind} 사용량 — 입력 ${tokens(usage.inputTokens)}(캐시 ${tokens(usage.cachedInputTokens)}) · ` +
+          `출력 ${tokens(usage.outputTokens)} 토큰 · ${seconds(usage.durationMs)}초${split}${api}${cost}${usage.model ? ` · 모델 ${usage.model}` : ""}${usage.completeness === "partial" ? " · 부분 관측" : ""}`,
         { usage: { ...usage, phase } },
       );
+      const executionId = usage.executionId ?? `${topicId}:${role}:${phase}`;
+      const warned = this.warnedLimits.get(executionId) ?? new Set<string>();
+      this.warnedLimits.set(executionId, warned);
+      for (const warning of exceededLimits(usage, this.dependencies.executionLimits ?? {})) {
+        if (warned.has(warning.key)) continue;
+        warned.add(warning.key);
+        this.event(topicId, "system", "system", `${role} ${phase} 실행 한도 경고 — ${warning.key} ${warning.value} / ${warning.limit}${warning.timing === "completion" ? " (완료 시 평가)" : ""}`, {
+          executionWarning: { executionId, ...warning },
+        });
+      }
+      if (usage.recordKind === "final") this.warnedLimits.delete(executionId);
     };
   }
 

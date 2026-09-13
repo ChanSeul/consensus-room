@@ -80,6 +80,8 @@ export interface SessionTurn {
   // 턴이 쓴 토큰·시간을 알린다(codex `turn.completed` / claude `result` 이벤트에서 읽음). 기록 전용 —
   // 관찰자가 던져도 턴 결과는 유지된다(adapters/usage.ts notifyUsage).
   onUsage?: (usage: TurnUsage) => void;
+  // 모든 값이 기본 미설정인 실행별 관찰 한도. 한도는 중단이 아닌 경고에만 쓴다.
+  limits?: ExecutionLimits;
   // 세션 id 가 만들어진 즉시(프로세스 실행 전) 알린다 — 턴이 429·stop 으로 끊겨도 resume 할 수 있게 저장하기 위함(2026-09-03 실측).
   onSessionCreated?: (sessionId: string) => void;
   // 이 턴에서 추가로 읽기를 허용할 경로(예: 주제 디렉터리의 plan.md). 이어지는 턴이 계획 본문을 다시 받지 않는 대신
@@ -89,12 +91,21 @@ export interface SessionTurn {
 
 // 한 CLI 턴의 사용량. inputTokens 는 캐시 읽기를 포함한 총 입력이고 cachedInputTokens 는 그중 캐시에서 읽은 양이다.
 export interface TurnUsage {
+  // 한 CLI 프로세스를 식별한다. 기존 TurnUsage 소비처는 아래 숫자 필드만 사용해도 된다.
+  executionId?: string;
+  phase?: string;
+  resumed?: boolean;
+  inputBytes?: number;
+  recordKind?: "progress" | "final";
+  completeness?: "complete" | "partial";
+  source?: "cli-stream" | "codex-home";
   // 이 턴을 돌린 모델(속도·비용 비교 때 모델 변경과 다른 변경을 분리하기 위해 기록, 2026-09-08).
   model?: string;
-  inputTokens: number;
-  cachedInputTokens: number;
-  outputTokens: number;
-  durationMs: number;
+  effort?: string;
+  inputTokens?: number;
+  cachedInputTokens?: number;
+  outputTokens?: number;
+  durationMs?: number;
   // 모델(API) 응답 시간 — claude result 의 duration_api_ms. codex 는 이 값을 주지 않는다.
   apiDurationMs?: number;
   // 도구 실행 창의 합과 호출 수(adapters/toolTime.ts). durationMs − toolDurationMs ≈ 모델 응답 + CLI 오버헤드.
@@ -102,6 +113,18 @@ export interface TurnUsage {
   toolCalls?: number;
   costUSD?: number;
   modelTurns?: number;
+  internalRequests?: number;
+  // Codex CLI 최종값과 관리형 홈 원본을 합산하지 않고 나란히 보관한다.
+  sourceUsage?: { cli?: Partial<TurnUsage>; codexHome?: Partial<TurnUsage>; status: "matched" | "mismatch" | "unavailable" };
+}
+
+export interface ExecutionLimits {
+  inputBytes?: number;
+  durationMs?: number;
+  internalRequests?: number;
+  toolCalls?: number;
+  inputTokens?: number;
+  outputTokens?: number;
 }
 
 export interface CreatedSession {

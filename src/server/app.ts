@@ -58,6 +58,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     codex: dependencies.codex,
     verifications,
     memory: new ProjectMemoryStore(config.memoryDirectory),
+    executionLimits: config.executionLimits,
   });
   // 시작 URL의 일회성 token이나 인증 헤더가 request log에 남지 않도록 HTTP request logging을 끈다.
   const app = Fastify({ logger: false });

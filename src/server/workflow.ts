@@ -16,7 +16,7 @@ import { ArtifactStore } from "./artifacts.js";
 import { ConsensusDatabase } from "./database.js";
 import { GitService } from "./git.js";
 import { redactRecord } from "./security.js";
-import type { AgentAdapter, ParticipantRole, ProjectMemoryWriter } from "./types.js";
+import type { AgentAdapter, ExecutionLimits, ParticipantRole, ProjectMemoryWriter } from "./types.js";
 import { EngineCore } from "./engine/core.js";
 import { PlanningPipeline } from "./engine/planning.js";
 import { DeliveryPipeline } from "./engine/delivery.js";
@@ -32,6 +32,7 @@ export interface WorkflowDependencies {
   memory?: ProjectMemoryWriter;
   // 사용 한도 자동 재시도의 시계(테스트 주입용). 기본은 실제 setTimeout(unref).
   clock?: RetryClock;
+  executionLimits?: ExecutionLimits;
 }
 
 // 범위 변경을 허용하는 상태. WorkflowState가 늘어나면 이 표가 컴파일을 막아 새 상태를 의식적으로 판단하게 만든다.

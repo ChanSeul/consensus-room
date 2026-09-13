@@ -15,7 +15,7 @@ import type { AgentAdapter, CommandRunner, CreatedSession, SessionTurn } from ".
 import { agentEnvironment } from "../security.js";
 import { ProjectMemoryReader } from "../projectMemory.js";
 import { describeCommandFailure, parseAgentResult } from "./resultParser.js";
-import { codexTurnUsage, notifyUsage, withModel } from "./usage.js";
+import { codexHomeUsage, ExecutionMetrics } from "./executionMetrics.js";
 import { createToolTimeMeter } from "./toolTime.js";
 
 export interface CodexAdapterOptions {
@@ -208,8 +208,21 @@ export class CodexAdapter implements AgentAdapter {
     const stdin = [EXECUTION_POLICY_NOTE, ...instructions, enriched].join("\n\n");
     const startedAt = Date.now();
     const toolTime = createToolTimeMeter("codex");
+    const metrics = new ExecutionMetrics("codex", Buffer.byteLength(stdin, "utf8"), executionSettings.model, executionSettings.effort, !newSession, startedAt);
+    let finalRecorded = false;
+    const recordFinal = () => {
+      if (finalRecorded) return;
+      finalRecorded = true;
+      try { turn.onUsage?.(metrics.snapshot(toolTime.summary(), "final")); } catch { /* observer is non-fatal */ }
+    };
+    const progressTimer = setInterval(() => {
+      if (!metrics.hasFinalSource()) {
+        try { turn.onUsage?.(metrics.snapshot(toolTime.summary(), "progress")); } catch { /* observer is non-fatal */ }
+      }
+    }, 10_000);
+    try {
     const output = await this.runner.run({
-      onJSONLine: toolTime.observe,
+      onJSONLine: (value, at) => { toolTime.observe(value, at); metrics.observe(value); },
       // PATH가 준 심볼릭 링크가 아니라 실제 경로로 실행한다(resolveCodexExecutable 주석 참조).
       command: resolveCodexExecutable(),
       args: [
@@ -230,16 +243,23 @@ export class CodexAdapter implements AgentAdapter {
       // HOME은 git·keychain 경로 때문에 그대로 두고, codex 설정 출처만 CODEX_HOME으로 잘라낸다.
       environment: agentEnvironment({ CODEX_HOME: topicHome }),
     });
-    notifyUsage(
-      turn.onUsage,
-      withModel(codexTurnUsage(output.jsonLines), executionSettings.model),
-      startedAt,
-      toolTime.summary(),
-    );
+    for (const value of output.jsonLines) metrics.observe(value);
+    // CLI 스트림 값과 관리형 홈 원본을 합산하지 않는다. 새 세션의 id는 stream에서만 알 수 있어
+    // 이 실행 구간의 thread.started를 사용하고, 대조 불가 상태도 명시한다.
+    const sessionId = newSession
+      ? output.jsonLines.find((value) => typeof value === "object" && value !== null && (value as { type?: unknown }).type === "thread.started" && typeof (value as { thread_id?: unknown }).thread_id === "string") as { thread_id?: string } | undefined
+      : undefined;
+    const resumedSessionId = "sessionId" in turn ? turn.sessionId : undefined;
+    metrics.setCodexHomeUsage(await codexHomeUsage(this.codexHome, resumedSessionId ?? sessionId?.thread_id, startedAt));
+    recordFinal();
     if (output.exitCode !== 0) {
       throw new Error(describeCommandFailure("Codex", output.exitCode, output.stderr, output.stdout));
     }
     return output;
+    } finally {
+      clearInterval(progressTimer);
+      recordFinal();
+    }
   }
 
 

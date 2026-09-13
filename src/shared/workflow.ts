@@ -319,3 +319,10 @@ function uniqueFindingIDs(findings: readonly Finding[], label: string): Set<stri
 export function replanDirective(body: string): boolean {
   return /^\s*REPLAN\b/m.test(body) || /\bREPLAN\s*$/.test(body.trimEnd());
 }
+
+// 수정 턴이 결정을 물어 멈춘 뒤의 결정에 REFIX 가 있으면 저장된 수정 결과를 재사용하지 않고 수정 턴을 다시 연다
+// (2026-09-13 S10 실측: 결정이 "원자 하나 더 넣고 재측정" 인데 엔진이 저장 결과로 최종 리뷰에 들어가 Codex 리뷰 1회를 낭비).
+// REPLAN 과 같은 위치 규칙 — 줄 머리 또는 본문 끝.
+export function refixDirective(body: string): boolean {
+  return /^\s*REFIX\b/m.test(body) || /\bREFIX\s*$/.test(body.trimEnd());
+}

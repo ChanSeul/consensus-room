@@ -1383,11 +1383,12 @@ describe("프로토콜 확인 턴의 지시문 생략과 턴 사용량 통지", 
     expect(seen[0].durationMs).toBeGreaterThanOrEqual(0);
   });
 
-  it("사용량 이벤트가 없으면 알리지 않고, 관찰자가 던져도 턴 결과는 돌아온다", async () => {
+  it("사용량 이벤트가 없어도 실행 메타데이터를 부분 기록하고, 관찰자가 던져도 턴 결과는 돌아온다", async () => {
     const silent = new RecordingRunner(successfulResult([planResult]));
     const seen: TurnUsage[] = [];
     await new ClaudeAdapter(silent).createSession({ prompt: "계획", cwd: "/tmp", onUsage: (usage) => seen.push(usage) });
-    expect(seen).toHaveLength(0);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ completeness: "partial", inputBytes: expect.any(Number) });
 
     const noisy = new RecordingRunner(successfulResult([
       { type: "result", subtype: "success", usage: { input_tokens: 1, output_tokens: 1 }, structured_output: planResult },

@@ -15,7 +15,7 @@ import { agentEnvironment } from "../security.js";
 import { ProjectMemoryReader } from "../projectMemory.js";
 import { readAppliedInstructions } from "../projectInstructions.js";
 import { describeCommandFailure, parseAgentResult } from "./resultParser.js";
-import { claudeTurnUsage, notifyUsage, withModel } from "./usage.js";
+import { ExecutionMetrics } from "./executionMetrics.js";
 import { createToolTimeMeter } from "./toolTime.js";
 
 export interface ClaudeAdapterOptions {
@@ -161,10 +161,25 @@ export class ClaudeAdapter implements AgentAdapter {
       const stdin = [EXECUTION_POLICY_NOTE, ...instructions, enriched].join("\n\n");
       const startedAt = Date.now();
       const toolTime = createToolTimeMeter("claude");
+      const metrics = new ExecutionMetrics("claude", Buffer.byteLength(stdin, "utf8"), executionSettings.model, executionSettings.effort, !newSession, startedAt);
+      let finalRecorded = false;
+      const recordFinal = () => {
+        if (finalRecorded) return;
+        finalRecorded = true;
+        // abort/error라도 이미 스트림에서 받은 관측값과 실행 메타데이터는 남긴다. 이벤트가 전혀 없으면
+        // 토큰을 0으로 만들지 않고 completeness=partial로만 기록한다.
+        try { turn.onUsage?.(metrics.snapshot(toolTime.summary(), "final")); } catch { /* observer is non-fatal */ }
+      };
+      const progressTimer = setInterval(() => {
+        if (!metrics.hasFinalSource()) {
+          try { turn.onUsage?.(metrics.snapshot(toolTime.summary(), "progress")); } catch { /* observer is non-fatal */ }
+        }
+      }, 10_000);
+      try {
       const output = await this.runner.run({
         command: "claude", args, cwd: workspace, stdin,
         signal: turn.signal, onSpawn: turn.onProcessSpawn,
-        onJSONLine: toolTime.observe,
+        onJSONLine: (value, at) => { toolTime.observe(value, at); metrics.observe(value); },
         // stream-json 의 마지막 줄은 {"type":"result"} 다. 그 뒤 2분 안에 프로세스가 안 끝나면 hang 으로 보고 정리한다.
         finalResultTimeoutMs: FINAL_RESULT_TIMEOUT_MS,
         isFinalResult: (value) => typeof value === "object" && value !== null && (value as { type?: unknown }).type === "result",
@@ -174,16 +189,17 @@ export class ClaudeAdapter implements AgentAdapter {
           CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
         }),
       });
-      notifyUsage(
-        turn.onUsage,
-        withModel(claudeTurnUsage(output.jsonLines), executionSettings.model),
-        startedAt,
-        toolTime.summary(),
-      );
+      // 테스트용 runner가 onJSONLine을 생략해도 최종 버퍼를 한 번 관찰한다.
+      for (const value of output.jsonLines) metrics.observe(value);
+      recordFinal();
       if (output.exitCode !== 0) {
         throw new Error(describeCommandFailure("Claude", output.exitCode, output.stderr, output.stdout));
       }
       return parseAgentResult(output.jsonLines, output.stdout);
+      } finally {
+        clearInterval(progressTimer);
+        recordFinal();
+      }
     } finally {
       await rm(actionTemp, { recursive: true, force: true });
     }

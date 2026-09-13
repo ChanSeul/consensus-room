@@ -2665,6 +2665,38 @@ describe("구현·수정 경로의 결과 보존과 멈춘 수정 결과 재사�
   });
 });
 
+// 2026-09-13 S10 d16: 결정이 "원자 하나 더 넣어라" 였는데 엔진이 저장 결과를 재사용해 최종 리뷰로 갔다. REFIX 지시어가 그 재사용을 끈다.
+describe("멈춘 수정의 REFIX", () => {
+  it("결정에 REFIX 가 있으면 저장된 수정 결과를 재사용하지 않고 수정 턴을 다시 연다", async () => {
+    const agreed = finding("F-1", "결함", { disposition: "AGREED_ACTION" });
+    const resolved = finding("F-1", "결함", { disposition: "RESOLVED_BY_FIX" });
+    const { database, engine } = await makeReviewRecovery({
+      resumeState: "CLAUDE_FIX", implementationFindings: [agreed], originalReviewFindings: [agreed],
+      codexResult: { kind: "FINAL_REVIEW", summary: "수정 확인", findings: [resolved], evidenceRefs: [] },
+      codexResults: [{ kind: "FINAL_REVIEW", summary: "수정 확인", findings: [resolved], evidenceRefs: [] }],
+      claudeResults: [
+        { kind: "FIX", summary: "고쳤지만 범위 확인 요청", findings: [resolved], evidenceRefs: ["feature.txt"], requestedUserDecision: "원자를 더 넣어야 하는지 확인해 주세요." },
+        { kind: "FIX", summary: "원자 하나 더 넣고 재측정했다.", findings: [resolved], evidenceRefs: ["feature.txt"] },
+      ],
+    });
+    engine.retry("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+    expect(database.getTopic("topic-1").state).toBe("USER_DECISION_REQUIRED");
+
+    await engine.postMessage("topic-1", "decision", "REFIX\n`nonisolated struct ChatServiceAccountRequest` 원자를 넣고 커버 C 로 재측정하라.");
+    engine.retry("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+
+    expect(database.getTopic("topic-1").state).toBe("READY_TO_DELIVER");
+    const bodies = database.getTimeline("topic-1").map((event) => event.body);
+    // 두 번째 수정 응답이 실제로 소비됐다(수정 턴이 다시 돌았다는 증거).
+    expect(bodies.some((body) => body.includes("원자 하나 더 넣고 재측정했다."))).toBe(true);
+    expect(bodies.some((body) => body.includes("REFIX 지시로 저장된 수정 결과") && body.includes("수정 턴을 다시 엽니다"))).toBe(true);
+    expect(bodies.some((body) => body.includes("수정 턴을 다시 사지 않습니다"))).toBe(false);
+    database.close();
+  });
+});
+
 // 2026-09-07 S10 #31: 개정 턴이 배치 순서 확인 하나를 requestedUserDecision 에 담아 멈췄다. 결정 뒤 retry 는 개정 턴을
 // 다시 사지 않고 저장된 개정본으로 종결 확인에 들어가야 한다.
 describe("멈춘 개정의 재사용", () => {

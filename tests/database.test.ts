@@ -676,6 +676,15 @@ describe("사용량 이벤트는 프롬프트 타임라인에서 뺀다", () => 
     expect(database.getPromptTimeline("topic-1", 1).map((event) => event.body)).toEqual(["메시지"]);
     database.close();
   });
+
+  it("실행 한도 경고도 다음 모델 프롬프트에 넣지 않는다", () => {
+    const { database } = openDatabase();
+    database.createTopic(topic());
+    database.appendEvent({ topicId: "topic-1", actor: "system", kind: "system", state: "DRAFT", body: "한도 경고", payload: { executionWarning: { key: "toolCalls" } } });
+    database.appendEvent({ topicId: "topic-1", actor: "user", kind: "note", state: "DRAFT", body: "메시지", payload: {} });
+    expect(database.getPromptTimeline("topic-1", 1).map((event) => event.body)).toEqual(["메시지"]);
+    database.close();
+  });
 });
 
 describe("코드 리뷰 세션의 저장과 범위 격리", () => {

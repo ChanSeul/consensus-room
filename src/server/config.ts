@@ -7,6 +7,7 @@ import {
   DEFAULT_AGENT_SETTINGS,
   type AgentSettings,
 } from "../shared/contracts.js";
+import type { ExecutionLimits } from "./types.js";
 
 export const SAMPLE_IOS_REPOSITORY = "/Users/example/sample-ios";
 export const SAMPLE_IOS_MEMORY_DIRECTORY = join(
@@ -50,6 +51,13 @@ export interface ServerConfig {
   figmaMcpUrl: string | null;
   // 전체 동시 Codex 턴 상한(토픽 간). 토픽 안은 항상 직렬.
   codexConcurrency: number;
+  executionLimits?: ExecutionLimits;
+}
+
+function optionalLimit(value: string | undefined): number | undefined {
+  if (value === undefined || value.trim() === "") return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.round(parsed) : undefined;
 }
 
 export function loadConfig(overrides: Partial<ServerConfig> = {}): ServerConfig {
@@ -81,6 +89,14 @@ export function loadConfig(overrides: Partial<ServerConfig> = {}): ServerConfig 
     host: "127.0.0.1",
     port: overrides.port ?? Number(process.env.CONSENSUS_ROOM_PORT ?? 4317),
     codexConcurrency: overrides.codexConcurrency ?? Math.max(1, Number(process.env.CONSENSUS_ROOM_CODEX_CONCURRENCY ?? 2) || 2),
+    executionLimits: overrides.executionLimits ?? {
+      inputBytes: optionalLimit(process.env.CONSENSUS_ROOM_LIMIT_INPUT_BYTES),
+      durationMs: optionalLimit(process.env.CONSENSUS_ROOM_LIMIT_DURATION_MS),
+      internalRequests: optionalLimit(process.env.CONSENSUS_ROOM_LIMIT_INTERNAL_REQUESTS),
+      toolCalls: optionalLimit(process.env.CONSENSUS_ROOM_LIMIT_TOOL_CALLS),
+      inputTokens: optionalLimit(process.env.CONSENSUS_ROOM_LIMIT_INPUT_TOKENS),
+      outputTokens: optionalLimit(process.env.CONSENSUS_ROOM_LIMIT_OUTPUT_TOKENS),
+    },
     launchToken:
       overrides.launchToken ?? process.env.CONSENSUS_ROOM_TOKEN ?? randomBytes(32).toString("hex"),
     dataDirectory,
