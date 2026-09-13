@@ -17,6 +17,7 @@ import {
   resolveBranchName,
   refixDirective,
   shouldRunFixPass,
+  routeMediatorOwnedFindings,
   carryForwardFindings,
   mergeFindingSources,
 } from "../../shared/workflow.js";
@@ -223,7 +224,7 @@ export class DeliveryPipeline {
     const reviewLabel = finalPass ? "Codex final review" : "Codex review";
     const reviewNormalizer = this.core.carryForwardNormalizer(
       mergeFindingSources(implementation.findings, originalReview?.findings), reviewLabel, { forReview: true });
-    const review = await this.core.turn("codex", topic, buildCodexReviewPrompt({
+    let review = await this.core.turn("codex", topic, buildCodexReviewPrompt({
       planMarkdown: plan, planSHA256: topic.planSHA256!, implementation, finalPass, resumedSession, tolerance, planPath,
       timeline: this.reviewTimeline(topicId, topic.scopeGeneration, reviewSince),
       planningFindings: closeout?.planSHA256 === topic.planSHA256 ? closeout.findings : undefined,
@@ -250,6 +251,16 @@ export class DeliveryPipeline {
       },
     });
     this.core.dependencies.database.setCodexReviewPromptSequence(topicId, reviewInputSequence);
+    // 중재자 소유 경로(gitignore 된 도구 트리)의 확정 결함은 러너 수정 회차를 열지 않는다 — EXTERNAL_EVIDENCE 로 바꿔 아래
+    // BLOCKED_ON_EVIDENCE 분기로 보낸다. 중재자가 고치고 evidence + retry 하면 같은 리뷰 단계가 다시 돌아 재검증한다
+    // (2026-09-14 사용자 지시 "러너는 앱 코드만"; S10H 도구 결함 수정 4회 루프의 처방).
+    const routed = routeMediatorOwnedFindings(review.findings);
+    if (routed.routed.length > 0) {
+      review = { ...review, findings: routed.findings };
+      this.core.event(topicId, "system", "system",
+        `중재자 소유 경로(앱 밖 도구 코드)의 확정 결함 ${routed.routed.length}건은 러너 수정 대신 중재자에게 보냅니다: ${routed.routed.join(", ")}`,
+        { mediatorOwnedFindingIDs: routed.routed });
+    }
     const afterReviewSnapshot = await this.core.dependencies.git.snapshot(topic.worktreePath);
     if (reviewedSnapshot.head !== afterReviewSnapshot.head || reviewedSnapshot.diffSHA256 !== afterReviewSnapshot.diffSHA256) {
       this.core.interrupt(topicId, "USER_DECISION_REQUIRED", "코드 검토 중 worktree가 바뀌었습니다. 변경 원인을 확인한 뒤 다시 검토하세요.", expected);

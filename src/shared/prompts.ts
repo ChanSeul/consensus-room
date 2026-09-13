@@ -323,6 +323,11 @@ ${planMarkdown}
 // 정지 정책 — requestedUserDecision 은 드물게. 2026-09-08 사용자 지시("retry 가 일상이 되지 않게"):
 // 범위 밖은 구현도 대기도 하지 말고 to-do 로 남기고 계속한다. S9/S10 실측: 정지 1회 = 결정문 작성 10~15분 +
 // 재기동·상태 재확인 5~10분이고, 범위 밖을 미리 구현하면 Codex 가 되돌리게 해 그 왕복이 더 크다.
+// 러너 경계(2026-09-14 사용자 지시): 러너는 저장소가 추적하는 앱 코드·문서만 고친다. gitignore 된 단계 도구 트리와 방 엔진은 중재자 몫.
+export function runnerScopeContract(): string {
+  return `수정 경계 — 러너가 고치는 것은 **저장소가 git 으로 추적하는 앱 코드와 문서**뿐입니다. gitignore 된 도구 트리(\`DerivedData/*-logs/scripts\` 의 .py/.sh, 자기검사 픽스처)와 consensus-room 자체는 중재자가 직접 고칩니다. 도구 스크립트는 **실행하고 산출물·로그를 기록**할 수 있지만 그 코드를 수정하지 마세요. 도구 결함을 만나면 findings 에 id·evidenceRefs(\`경로:줄\`)·원인·필요한 변경을 적고 disposition 은 EXTERNAL_EVIDENCE 로 두세요 — 방이 중재자에게 보냅니다. 리뷰에서 도구 경로만 가리키는 지적은 방이 자동으로 중재자에게 돌리므로 러너가 고치려 들지 마세요.`;
+}
+
 export function stopPolicyContract(): string {
   return `정지 정책 — requestedUserDecision 은 드물게 씁니다:
 - 승인 범위 밖 변경이 필요한 자리는 먼저 계획의 \`## 허용 오차\` 규칙과 대조하세요. **규칙 술어를 만족하면 구현하고 반환 JSON 의 toleranceLedger 에 {ruleId, file, note} 로 적으세요**(서버가 git diff 로 대조하며, 원장에 없는 범위 밖 변경은 되돌리게 합니다). 규칙 밖(다른 단계가 소유한 파일의 다른 변경, 모듈 선언, 우회 표기가 필요한 자리)은 **코드를 건드리지 말고 to-do 로 남기고 계속**하세요. 원장·보고서에 진단 정체성·원인 선언·필요한 변경·권장 형태를 한 줄로 적고 다음 일로 갑니다. 그 항목 때문에 턴을 끝내지 마세요. 범위 밖을 미리 구현하는 것도 금지입니다(리뷰가 되돌리게 합니다).
@@ -383,6 +388,8 @@ ${dispositionContract("IMPLEMENTATION")}
 분석 이벤트와 외부 계약을 추정하지 마세요.
 
 ${stopPolicyContract()}
+
+${runnerScopeContract()}
 
 관련 테스트를 실행하되 commit과 push는 하지 마세요. 반환 kind는 IMPLEMENTATION이며 변경 파일과 검증 근거를 evidenceRefs에 적으세요.`;
 }
@@ -485,6 +492,8 @@ ${dispositionContract("FIX")}
 ${outputLanguageContract({ planBody: false })}
 
 ${stopPolicyContract()}
+
+${runnerScopeContract()}
 
 관련 테스트를 실행하되 commit과 push는 하지 마세요. 반환 kind는 FIX입니다.`;
 }

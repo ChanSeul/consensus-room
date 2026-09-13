@@ -313,6 +313,46 @@ export function dispositionRegressions(
     .map((finding) => finding.id);
 }
 
+// 중재자 소유 경로 — 러너(구현·수정 턴)가 고치지 않는다(2026-09-14 사용자 지시: "러너는 앱 코드만 고치게 경계를 둬").
+// 근거: S10H 인도 리뷰가 수정 4회를 돌았는데 전부 gitignore 된 단계 도구 트리(DerivedData/*-logs/scripts)의 결함이었고,
+// Swift 변경은 1회차에 검증이 끝났다. 도구는 중재자가 실물 트리에서 직접 고치고 자기검사를 돌리는 편이 싸고 정확하다.
+// 판정: 증거 경로(`경로[:줄]` 모양, .md 문서 인용은 제외) 가 1개 이상 있고 **전부** 중재자 소유 패턴이면 그 지적은 중재자 몫이다.
+// 경로가 하나도 없거나 앱 소스가 섞여 있으면 종전대로 러너가 고친다.
+export const MEDIATOR_OWNED_PATH_PATTERNS: readonly RegExp[] = [/(^|\/)DerivedData\//, /(^|\/)\.build\//];
+const PATH_REF = /^[A-Za-z0-9_./@+~-]+(?::\d+(?::\d+)?)?$/;
+
+export function isMediatorOwnedFinding(finding: Finding, patterns: readonly RegExp[] = MEDIATOR_OWNED_PATH_PATTERNS): boolean {
+  const paths = finding.evidenceRefs
+    .map((ref) => ref.trim())
+    .filter((ref) => ref.includes("/") && PATH_REF.test(ref))
+    .map((ref) => ref.replace(/:\d+(?::\d+)?$/, ""))
+    .filter((path) => !/\.md$/i.test(path));
+  if (paths.length === 0) return false;
+  return paths.every((path) => patterns.some((pattern) => pattern.test(path)));
+}
+
+export const MEDIATOR_OWNED_PREFIX = "중재자 소유 경로(앱 밖 도구 코드) — 러너 수정 대신 중재자가 고친다: ";
+
+// AGREED_ACTION 인 중재자 소유 지적을 EXTERNAL_EVIDENCE 로 바꾼다 → 방은 BLOCKED_ON_EVIDENCE 로 멈추고, 중재자가 고친 뒤
+// evidence 메시지 + retry 로 같은 리뷰 단계가 다시 돌아 재검증한다. 반환 routed 는 바뀐 id 목록(이벤트·계측용).
+export function routeMediatorOwnedFindings(
+  findings: readonly Finding[],
+  patterns: readonly RegExp[] = MEDIATOR_OWNED_PATH_PATTERNS,
+): { findings: Finding[]; routed: string[] } {
+  const routed: string[] = [];
+  const next = findings.map((finding) => {
+    if (finding.disposition !== "AGREED_ACTION" || !isMediatorOwnedFinding(finding, patterns)) return finding;
+    routed.push(finding.id);
+    return {
+      ...finding,
+      disposition: "EXTERNAL_EVIDENCE" as const,
+      requiresUserDecision: false,
+      rationale: finding.rationale.startsWith(MEDIATOR_OWNED_PREFIX) ? finding.rationale : `${MEDIATOR_OWNED_PREFIX}${finding.rationale}`,
+    };
+  });
+  return { findings: next, routed };
+}
+
 export function shouldRunFixPass(findings: readonly Finding[]): boolean {
   return findings.some(
     (finding) =>
