@@ -6,6 +6,8 @@ import { EventEmitter } from "node:events";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { redactSecrets } from "../shared/workflow.js";
+import { redactRecord } from "./security.js";
 import {
   DEFAULT_AGENT_SETTINGS,
   ParticipantSchema,
@@ -729,7 +731,12 @@ export class ConsensusDatabase {
     return this.getTopic(input.topicId);
   }
 
-  private insertEventInTransaction(input: TimelineEventInput): TimelineEvent {
+  // 비밀값 가림은 저장 경계에서 한 번 더 한다 — core.event 를 거치지 않는 transaction 경로(applyTopicTransition)가
+  // 원문을 그대로 저장한 회귀(2026-09-14 Codex 후속 Medium 2). 이미 가려진 문자열에 다시 적용해도 같다.
+  private insertEventInTransaction(raw: TimelineEventInput): TimelineEvent {
+    const input: TimelineEventInput = {
+      ...raw, body: redactSecrets(raw.body), ...(raw.payload ? { payload: redactRecord(raw.payload) } : {}),
+    };
     const topicRow = this.db.prepare("SELECT scope_generation FROM topics WHERE id = ?")
       .get(input.topicId) as { scope_generation: number } | undefined;
     if (!topicRow) throw new Error(`주제를 찾을 수 없습니다: ${input.topicId}`);

@@ -233,6 +233,37 @@ export function carryForwardFindings(
   return { findings: carried.length ? [...response, ...carried] : [...response], carried: carried.map((finding) => finding.id) };
 }
 
+export const CORRECTION_SUMMARY_SEPARATOR = "\n\n---\n교정 전 턴 보고(서버 보존):\n";
+
+// 허용 오차 교정 재제출은 그 턴의 최종 결과가 된다 — 러너가 교정만 적고 본 턴 보고(summary·findings·evidence·요청 결정)를
+// 비우면 턴의 성과가 기록에서 사라진다(2026-09-14 S11: $6.35 짜리 턴이 "코드 변경 없음 — 원장 공란" 한 줄로 남았고,
+// 남은 단계를 적은 결정 요청도 사라져 엔진이 구현 완료로 보고 리뷰로 넘겼다). 교정 결과를 본 턴 결과 위에 병합한다:
+// 같은 id 의 쟁점은 교정이 우선, 나머지는 보존; evidence 는 합집합; 요청 결정은 교정이 비우면 본 턴 것; summary 는 교정이
+// 본 턴 요약을 담지 않았으면 뒤에 붙인다. toleranceLedger 는 교정 것만 쓴다(원장이 교정의 목적이다).
+export function mergeCorrectionResult(original: AgentResult, corrected: AgentResult): { result: AgentResult; preserved: string[] } {
+  const preserved: string[] = [];
+  const ids = new Set(corrected.findings.map((finding) => finding.id));
+  const keptFindings = original.findings.filter((finding) => !ids.has(finding.id));
+  if (keptFindings.length) preserved.push(`findings ${keptFindings.length}건`);
+  const evidence = [...corrected.evidenceRefs];
+  const keptEvidence = original.evidenceRefs.filter((ref) => !evidence.includes(ref));
+  if (keptEvidence.length) preserved.push(`evidence ${keptEvidence.length}건`);
+  const originalDecision = original.requestedUserDecision?.trim() ? original.requestedUserDecision : undefined;
+  const decision = corrected.requestedUserDecision?.trim() ? corrected.requestedUserDecision : originalDecision;
+  if (!corrected.requestedUserDecision?.trim() && originalDecision) preserved.push("요청 결정");
+  const originalSummary = original.summary.trim();
+  let summary = corrected.summary;
+  if (originalSummary && !corrected.summary.includes(originalSummary)) {
+    summary = `${corrected.summary.trimEnd()}${CORRECTION_SUMMARY_SEPARATOR}${originalSummary}`;
+    preserved.push("summary");
+  }
+  const result: AgentResult = {
+    ...corrected, summary, findings: [...corrected.findings, ...keptFindings], evidenceRefs: [...evidence, ...keptEvidence],
+    ...(decision !== undefined ? { requestedUserDecision: decision } : {}),
+  };
+  return { result, preserved };
+}
+
 export function assertFindingCoverage(
   source: readonly Finding[],
   response: readonly Finding[],
@@ -324,11 +355,16 @@ export const MEDIATOR_OWNED_PATH_PATTERNS: readonly RegExp[] = [
 ];
 // 경로 인용: 디렉터리 이름에는 공백을 허용한다(실제 워크트리가 `Library/Application Support/...` 아래에 있다 — 공백을 막으면
 // 절대경로 증거가 전부 버려져 기본값(러너 수정)으로 흘렀다). 마지막 항목(파일명)엔 공백이 없어야 문장과 구분된다.
-const PATH_REF = /^\/?(?:[A-Za-z0-9_.@+~ -]+\/)*[A-Za-z0-9_.@+~-]+(?::\d+(?::\d+)?)?$/;
+// 위치 접미는 한 파서다: `:줄`, `:줄:열`, `:줄-줄`, `:줄:열-열`, `:줄:열-줄:열`. 경로 인식(PATH_REF)과 정규화(normalizeEvidencePath)가 같은
+// 정의를 쓰므로 한쪽만 아는 모양이 없다(2026-09-14 Codex 후속 Medium 1: `gate4.py:1-3` 같은 줄 범위를 PATH_REF 가 버려
+// 도구 결함이 러너 수정 호출로 흘렀다 — 운영 DB 의 Codex 증거에도 `p0c_all.sh:165-170` 같은 범위가 흔하다).
+const LOCATION_SUFFIX_SOURCE = String.raw`:\d+(?::\d+)?(?:-\d+(?::\d+)?)?`;
+const LOCATION_SUFFIX = new RegExp(`${LOCATION_SUFFIX_SOURCE}$`);
+const PATH_REF = new RegExp(`^\\/?(?:[A-Za-z0-9_.@+~ -]+\\/)*[A-Za-z0-9_.@+~-]+(?:${LOCATION_SUFFIX_SOURCE})?$`);
 
 // 절대경로는 worktree 기준 상대경로로 정규화한다(worktreePath 가 주어졌을 때). 밖의 절대경로는 그대로 패턴에 댄다.
 export function normalizeEvidencePath(ref: string, worktreePath?: string | null): string {
-  const bare = ref.replace(/:\d+(?::\d+)?$/, "");
+  const bare = ref.replace(LOCATION_SUFFIX, "");
   if (worktreePath) {
     const root = worktreePath.replace(/\/+$/, "");
     if (bare === root) return ".";

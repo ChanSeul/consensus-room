@@ -3858,3 +3858,37 @@ it("부분 교정 한도 중단도 원본과 같은 세션을 복구해 부분 �
  expect(calls).toEqual(["create","repair:partial-session"]);expect(checked?.planMarkdown,database.getTopic("topic-1").lastError??"").toBe(original.replace('"rules":[],','"rules":[]'));
  expect(database.revisions.account("topic-1").used).toBe(4);database.close();
 });
+
+
+// 2026-09-14 Codex 후속 리뷰 재현(Medium 1·2) — 공개 경계(engine.retry / engine.amendTolerance)에서 고정한다.
+describe("Codex 후속 리뷰 2026-09-14 — 줄 범위 도구 증거·개정 사유 가림", () => {
+  it.each(["1", "1-3", "49-77"])("도구 트리 증거 `gate4.py:%s` 는 러너 수정 호출 없이 중재자 대기로 간다", async (suffix) => {
+    const tool = finding("TOOL", "도구 결함", {
+      severity: "HIGH", disposition: "AGREED_ACTION",
+      evidenceRefs: [`/Users/example/Library/Application Support/ConsensusRoom/worktrees/topic/DerivedData/s11-logs/scripts/gate4.py:${suffix}`],
+    });
+    const claude = new QueuedAdapter("claude", []);
+    const { database, engine } = await makeReviewRecovery({
+      resumeState: "CODEX_REVIEW", implementationFindings: [], originalReviewFindings: [],
+      codexResult: { kind: "REVIEW", summary: "도구 실패", findings: [tool], evidenceRefs: [] }, claude,
+    });
+    database.setImplementationSession("topic-1", "claude-implementation-session");
+    engine.retry("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+    expect({ state: database.getTopic("topic-1").state, claudeCalls: claude.calls.length }).toEqual({ state: "BLOCKED_ON_EVIDENCE", claudeCalls: 0 });
+    database.close();
+  });
+  it("허용 오차 개정 사유의 비밀값은 transaction 경로에서도 가려져 저장된다", async () => {
+    const { database, engine } = await makeReviewRecovery({
+      resumeState: "CLAUDE_FIX", implementationFindings: [], originalReviewFindings: [],
+      codexResult: { kind: "REVIEW", summary: "unused", findings: [], evidenceRefs: [] },
+    });
+    const fake = "sk-" + "reviewonly".repeat(5);
+    await engine.amendTolerance("topic-1", { tolerance: { scopePaths: ["**"], rules: [] }, reason: `개정 사유 ${fake}` });
+    const event = database.getTimeline("topic-1").find((entry) => entry.payload.toleranceAmendment);
+    expect(event).toBeDefined();
+    expect(event!.body).not.toContain(fake);
+    expect(JSON.stringify(event!.payload)).not.toContain(fake);
+    database.close();
+  });
+});

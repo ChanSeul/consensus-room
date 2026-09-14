@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  CARRIED_LEDGER_NOTE_PREFIX,
   LEX_START,
+  carryForwardLedger,
   evaluateTolerance,
   globToRegExp,
   hunkSatisfies,
@@ -308,4 +310,41 @@ it("기존 계획 해시 규칙은 보존하고 새 본문만 정규화한다", 
   const old = '```tolerance\n{"scopePaths":["a/**"],"rules":[],}\n```\n';
   expect(hashPlan(old)).toBe(createHash("sha256").update(old).digest("hex"));
   expect(normalizeToleranceBlocks(old)).toBe(old.replace("[],}","[]}"));
+});
+
+// 2026-09-14 S11: 앞 턴에 T-5 로 받아들인 6개 파일을 러너가 다음 턴 원장에서 빼먹어 교정 턴 1회($0.38)를 샀다 —
+// 승인된 원장은 엔진이 승계한다. 술어·상한 판정은 승계된 원장으로 evaluateTolerance 가 다시 한다.
+describe("carryForwardLedger — 앞 턴에서 받아들인 원장 행 승계", () => {
+  const previous = [
+    { ruleId: "T-5", file: "Tests/A.swift", note: "클래스 @MainActor" },
+    { ruleId: "T-5", file: "Tests/B.swift", note: "클래스 @MainActor" },
+    { ruleId: "T-1", file: "service/S.swift", note: "nonisolated" },
+  ];
+  it("여전히 범위 밖으로 바뀐 채이고 이번 원장에 없는 파일만 승계하고, 승계 표식을 note 에 붙인다", () => {
+    const { ledger, carried } = carryForwardLedger(previous, [{ ruleId: "T-5", file: "Tests/A.swift", note: "다시 적음" }], ["Tests/A.swift", "Tests/B.swift"]);
+    expect(carried).toEqual(["Tests/B.swift"]);
+    expect(ledger).toEqual([
+      { ruleId: "T-5", file: "Tests/A.swift", note: "다시 적음" },
+      { ruleId: "T-5", file: "Tests/B.swift", note: `${CARRIED_LEDGER_NOTE_PREFIX}클래스 @MainActor` },
+    ]);
+  });
+  it("되돌려져 더는 바뀌지 않은 파일은 승계하지 않는다(원장은 실제 변경만 적는다)", () => {
+    const { ledger, carried } = carryForwardLedger(previous, [], ["Tests/A.swift"]);
+    expect(carried).toEqual(["Tests/A.swift"]);
+    expect(ledger.map((entry) => entry.file)).toEqual(["Tests/A.swift"]);
+  });
+  it("승계된 행도 술어 판정을 받는다 — 같은 파일이 규칙 밖 모양으로 바뀌었으면 위반이다", () => {
+    const policy = parseTolerancePolicy(`## 허용 오차\n\`\`\`tolerance\n${JSON.stringify({ scopePaths: ["app/**"], rules: [{ id: "T-1", title: "표기", paths: ["service/**"], hunk: "insert-token", tokens: ["nonisolated"], maxFiles: 2, maxHunks: 4, invariants: ["x"] }] })}\n\`\`\`\n`)!;
+    const parsed = parseUnifiedDiff("diff --git a/service/S.swift b/service/S.swift\n--- a/service/S.swift\n+++ b/service/S.swift\n@@ -1,1 +1,1 @@\n-func a() {}\n+func renamed() {}\n");
+    const changed = [{ file: "service/S.swift", untracked: false, binary: parsed.binary, modeChanged: parsed.modeChanged, hunks: parsed.hunks, baseLines: ["func a() {}"] }];
+    const carried = carryForwardLedger(previous, [], changed.map((item) => item.file));
+    expect(carried.carried).toEqual(["service/S.swift"]);
+    const evaluation = evaluateTolerance(policy, changed, carried.ledger);
+    expect(evaluation.violations.join("\n")).toContain("술어를 만족하지 않습니다");
+  });
+  it("승계 표식은 중첩되지 않고 같은 규칙·파일 중복은 한 번만 승계한다", () => {
+    const twice = [{ ruleId: "T-1", file: "s/X.swift", note: `${CARRIED_LEDGER_NOTE_PREFIX}원래` }, { ruleId: "T-1", file: "s/X.swift", note: "원래" }];
+    const { ledger } = carryForwardLedger(twice, [], ["s/X.swift"]);
+    expect(ledger).toEqual([{ ruleId: "T-1", file: "s/X.swift", note: `${CARRIED_LEDGER_NOTE_PREFIX}원래` }]);
+  });
 });

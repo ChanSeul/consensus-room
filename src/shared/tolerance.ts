@@ -59,6 +59,31 @@ export const ToleranceLedgerEntrySchema = z.object({
 });
 export type ToleranceLedgerEntry = z.infer<typeof ToleranceLedgerEntrySchema>;
 
+export const CARRIED_LEDGER_NOTE_PREFIX = "앞 턴 원장 승계(엔진 자동): ";
+
+// 앞 턴(서버가 이미 받아들인 결과)의 원장 행을 이번 결과에 승계한다 — 같은 파일이 여전히 범위 밖으로 바뀐 채이고
+// 이번 원장에 그 파일이 없을 때만. 술어·상한은 호출자가 승계된 원장으로 evaluateTolerance 를 다시 돌려 판정하므로
+// 승계는 "누가 적었나" 만 바꾸고 "무엇이 허용되나" 는 바꾸지 않는다(2026-09-14 S11: 앞 턴에 T-5 로 승인된 6개 파일을
+// 러너가 다음 턴 원장에서 빼먹어 교정 턴 1회를 샀다).
+export function carryForwardLedger(
+  previous: readonly ToleranceLedgerEntry[],
+  current: readonly ToleranceLedgerEntry[],
+  outOfScopeFiles: readonly string[],
+): { ledger: ToleranceLedgerEntry[]; carried: string[] } {
+  const currentFiles = new Set(current.map((entry) => entry.file));
+  const outOfScope = new Set(outOfScopeFiles);
+  const seen = new Set<string>();
+  const carried: ToleranceLedgerEntry[] = [];
+  for (const entry of previous) {
+    const key = `${entry.ruleId}\u0000${entry.file}`;
+    if (currentFiles.has(entry.file) || !outOfScope.has(entry.file) || seen.has(key)) continue;
+    seen.add(key);
+    const note = entry.note.startsWith(CARRIED_LEDGER_NOTE_PREFIX) ? entry.note : `${CARRIED_LEDGER_NOTE_PREFIX}${entry.note}`.slice(0, 2000);
+    carried.push({ ruleId: entry.ruleId, file: entry.file, note });
+  }
+  return { ledger: carried.length ? [...current, ...carried] : [...current], carried: [...new Set(carried.map((entry) => entry.file))] };
+}
+
 const TOLERANCE_FENCE = /```tolerance[^\n]*\n([\s\S]*?)\n```/;
 
 // 계획 본문에서 tolerance 블록을 꺼낸다. 블록이 없으면 null(정책 없음 — 엔진 대조 생략, 승계 계획 호환).

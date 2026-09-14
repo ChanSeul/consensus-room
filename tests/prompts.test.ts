@@ -52,6 +52,16 @@ describe("정지 정책 — requestedUserDecision 은 드물게", () => {
     expect(prompt).toContain("to-do 로 남기고 계속");
     expect(prompt).toContain("한 턴에 한 번, 턴 끝에 모아서");
     expect(prompt).not.toContain("승인 범위 밖 변경은 멈추고 사용자 결정을 요청하세요");
+    // 2026-09-14 S11: 완료 형식 중간 보고가 두 번 리뷰로 흘렀다 — 완료 선언 계약과 (4) 계속 진행 요청을 명시한다.
+    expect(prompt).toContain("완료 선언 계약");
+    expect(prompt).toContain("(4) 계획 단계가 남았는데 턴을 끊어야 할 때");
+  });
+  it("허용 오차 교정 프롬프트는 재제출이 최종 보고임을 알리고 본 턴 보고 유지를 요구한다", async () => {
+    const { buildToleranceCorrectionPrompt } = await import("../src/shared/prompts");
+    const prompt = buildToleranceCorrectionPrompt(["x: 위반"], { scopePaths: ["a/**"], rules: [] }, "IMPLEMENTATION");
+    expect(prompt).toContain("최종 보고");
+    expect(prompt).toContain("직전 제출의 summary·findings·evidenceRefs·requestedUserDecision 을 그대로 유지");
+    expect(prompt).toContain("서버가 승계합니다");
   });
 
   it("수정 프롬프트도 같은 정지 정책을 싣는다", async () => {

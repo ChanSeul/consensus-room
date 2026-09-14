@@ -339,3 +339,90 @@ describe("허용 오차 교정 뒤 계약 교정이 커밋을 만들면", () => 
     database.close();
   });
 });
+
+// 2026-09-14 S11 실측 두 건 — (1) 앞 턴에 T-5 로 받아들인 원장을 러너가 다음 턴에서 빼먹어 교정 턴을 샀다,
+// (2) 교정 재제출이 본 턴 보고·남은 단계 결정 요청을 덮어써 엔진이 구현 완료로 보고 리뷰로 넘겼다.
+describe("허용 오차 — 턴을 넘어 살아야 할 상태는 엔진이 든다", () => {
+  function scriptedClaude(turns: Array<() => AgentResult>) {
+    const prompts: string[] = [];
+    let index = 0;
+    const next = () => { const turn = turns[index]; if (!turn) throw new Error(`턴 ${index + 1} 을 기대하지 않았습니다.`); index += 1; return turn(); };
+    const adapter: AgentAdapter = {
+      role: "claude",
+      async createSession(turn) { prompts.push(turn.prompt); return { sessionId: "claude-implementation-session", result: next() }; },
+      async resumeTurn(turn) { prompts.push(turn.prompt); return next(); },
+      async validateExistingSession() { return true; },
+    };
+    return { adapter, prompts };
+  }
+  const settled = (topicId: string, database: ConsensusDatabase) => waitUntil(() =>
+    database.runningAction(topicId) === null && ["READY_TO_DELIVER", "FAILED", "USER_DECISION_REQUIRED"].includes(database.getTopic(topicId).state));
+
+  it("앞 턴에서 받아들인 원장 행은 다음 턴이 비워 내도 승계돼 교정 턴 없이 통과한다", async () => {
+    const { worktree, database, artifacts, gitService, topicId } = await setup("carry");
+    const claude = scriptedClaude([
+      () => {
+        writeFileSync(join(worktree, "feature.txt"), "구현 1\n");
+        writeFileSync(join(worktree, "service", "S.swift"), "nonisolated func a() {}\nfunc b() {}\n");
+        return result("IMPLEMENTATION", "P3 완료", {
+          toleranceLedger: [{ ruleId: "T-1", file: "service/S.swift", note: "S9 소유 파일 표기 1줄" }],
+          requestedUserDecision: "남은 단계 P3.5 — 계속 진행 요청",
+        });
+      },
+      () => {
+        writeFileSync(join(worktree, "feature.txt"), "구현 2\n");
+        return result("IMPLEMENTATION", "P3.5 완료(원장을 비워 냈다)"); // 원장 없음 — 서버가 승계해야 한다
+      },
+    ]);
+    const engine = new WorkflowEngine({ database, artifacts, git: gitService, claude: claude.adapter, codex: new PassingCodex() });
+    engine.startImplementation(topicId);
+    await settled(topicId, database);
+    expect(database.getTopic(topicId).state).toBe("USER_DECISION_REQUIRED");
+    await engine.postMessage(topicId, "decision", "계속 진행");
+    engine.retry(topicId);
+    await settled(topicId, database);
+    const topic = database.getTopic(topicId);
+    expect(topic.state, topic.lastError ?? "").toBe("READY_TO_DELIVER");
+    expect(claude.prompts).toHaveLength(2); // 교정 턴 없음
+    expect(claude.prompts.some((prompt) => prompt.includes("허용 오차 규칙과 git diff 로 대조했더니"))).toBe(false);
+    const bodies = database.getTimeline(topicId).map((event) => event.body);
+    expect(bodies.filter((body) => body.startsWith("허용 오차 원장 승계 1건")).length).toBe(1);
+    expect(bodies.some((body) => body.startsWith("허용 오차 대조 통과 — 범위 밖 파일 1개 (T-1: 파일 1·hunk 1)"))).toBe(true);
+    const stored = JSON.parse((await artifacts.readLatest(topicId, "implementation-result"))!);
+    expect(stored.toleranceLedger).toEqual([{ ruleId: "T-1", file: "service/S.swift", note: "앞 턴 원장 승계(엔진 자동): S9 소유 파일 표기 1줄" }]);
+    database.close();
+  });
+
+  it("교정 재제출이 본 턴 보고를 비워도 쟁점·증거·요청 결정이 병합돼 남고, 남은 단계 결정으로 멈춘다", async () => {
+    const { worktree, database, artifacts, gitService, topicId } = await setup("merge");
+    const claude = scriptedClaude([
+      () => {
+        writeFileSync(join(worktree, "feature.txt"), "구현\n");
+        writeFileSync(join(worktree, "service", "S.swift"), "func aa() {}\nfunc b() {}\n"); // 이름 변경 — 위반
+        return result("IMPLEMENTATION", "P3 완료 — 커버 A–D errors=0", {
+          evidenceRefs: ["cover-A-post.log errors=0"],
+          findings: [{ id: "TODO-1", title: "이연", severity: "LOW", disposition: "DEFERRED_OUT_OF_SCOPE", rationale: "범위 밖", evidenceRefs: [], requiresUserDecision: false }],
+          requestedUserDecision: "남은 단계 P3.5·P3.6 — 계속 진행 요청",
+        });
+      },
+      () => {
+        writeFileSync(join(worktree, "service", "S.swift"), "func a() {}\nfunc b() {}\n"); // 되돌림
+        return result("IMPLEMENTATION", "범위 밖 변경을 되돌렸다(코드 변경 없음)", { evidenceRefs: ["git diff -- service/S.swift"] });
+      },
+    ]);
+    const engine = new WorkflowEngine({ database, artifacts, git: gitService, claude: claude.adapter, codex: new PassingCodex() });
+    engine.startImplementation(topicId);
+    await settled(topicId, database);
+    const topic = database.getTopic(topicId);
+    expect(topic.state, topic.lastError ?? "").toBe("USER_DECISION_REQUIRED"); // 리뷰로 새지 않는다
+    expect(claude.prompts).toHaveLength(2);
+    const bodies = database.getTimeline(topicId).map((event) => event.body);
+    expect(bodies.some((body) => body.startsWith("허용 오차 교정 재제출에 본 턴 보고를 병합했습니다(서버 보존): findings 1건 · evidence 1건 · 요청 결정 · summary"))).toBe(true);
+    expect(bodies.some((body) => body.includes("남은 단계 P3.5·P3.6 — 계속 진행 요청"))).toBe(true);
+    const stored = JSON.parse((await artifacts.readLatest(topicId, "implementation-result"))!);
+    expect(stored.findings.map((finding: { id: string }) => finding.id)).toEqual(["TODO-1"]);
+    expect(stored.evidenceRefs).toEqual(["git diff -- service/S.swift", "cover-A-post.log errors=0"]);
+    expect(stored.summary).toContain("교정 전 턴 보고(서버 보존):\nP3 완료 — 커버 A–D errors=0");
+    database.close();
+  });
+});

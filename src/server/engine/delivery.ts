@@ -1,7 +1,7 @@
 // 구현·리뷰·전달 파이프라인: IMPLEMENTING → CODEX_REVIEW → (CLAUDE_FIX → CODEX_FINAL_REVIEW) →
 // READY_TO_DELIVER → commit/push. git 사후 검증(고아 커밋 처분 포함)이 이 파일의 계약이다.
 import {
-  DeliveryInputSchema, type AgentResult, type Finding, type TimelineEvent, type Topic, type WorkflowState,
+  AgentResultSchema, DeliveryInputSchema, type AgentResult, type Finding, type TimelineEvent, type Topic, type WorkflowState,
 } from "../../shared/contracts.js";
 import {
   buildClaudeFixPrompt,
@@ -19,12 +19,14 @@ import {
   shouldRunFixPass,
   routeMediatorOwnedFindings,
   carryForwardFindings,
+  mergeCorrectionResult,
   mergeFindingSources,
 } from "../../shared/workflow.js";
 import { normalizeCommitPaths } from "../git.js";
 import { redactAgentResult } from "../security.js";
 import {
-  evaluateTolerance, parseTolerancePolicy, parseUnifiedDiff, renderToleranceSummary, type ChangedFile,
+  carryForwardLedger, evaluateTolerance, parseTolerancePolicy, parseUnifiedDiff, renderToleranceSummary, type ChangedFile,
+  type ToleranceLedgerEntry,
 } from "../../shared/tolerance.js";
 import type { ResultNormalizer, EngineCore } from "./core.js";
 
@@ -638,9 +640,24 @@ export class DeliveryPipeline {
   }): Promise<AgentResult | null> {
     const policy = parseTolerancePolicy(input.plan);
     if (!policy) return input.result;
-    let result = input.result;
-    let evaluation = evaluateTolerance(policy, await this.collectChangedFiles(input.topic), result.toleranceLedger ?? []);
+    // 앞 턴에서 받아들인 원장(구현·수정 결과 산출물)은 승계한다 — 같은 파일이 그대로 범위 밖으로 바뀐 채면 러너가 다시
+    // 적지 않아도 교정 턴을 사지 않는다. 술어·상한은 승계된 원장으로 다시 판정한다.
+    const previousLedger = await this.acceptedLedger(input.topicId);
+    const evaluateWithCarry = async (candidate: AgentResult): Promise<{ result: AgentResult; evaluation: ReturnType<typeof evaluateTolerance> }> => {
+      const changed = await this.collectChangedFiles(input.topic);
+      const own = candidate.toleranceLedger ?? [];
+      let evaluation = evaluateTolerance(policy, changed, own);
+      const carry = carryForwardLedger(previousLedger, own, evaluation.outOfScopeFiles);
+      if (carry.carried.length === 0) return { result: candidate, evaluation };
+      evaluation = evaluateTolerance(policy, changed, carry.ledger);
+      this.core.event(input.topicId, "system", "system",
+        `허용 오차 원장 승계 ${carry.carried.length}건(앞 턴에서 받아들인 행, 엔진 자동): ${carry.carried.join(", ")}`,
+        { carriedLedgerFiles: carry.carried });
+      return { result: { ...candidate, toleranceLedger: carry.ledger }, evaluation };
+    };
+    let { result, evaluation } = await evaluateWithCarry(input.result);
     if (evaluation.violations.length > 0) {
+      const original = result;
       this.core.event(input.topicId, "system", "system",
         `${renderToleranceSummary(evaluation)}\n같은 세션에 돌려보내 1회 교정합니다(되돌리기 또는 원장 보완).`,
         { toleranceViolations: evaluation.violations });
@@ -654,13 +671,25 @@ export class DeliveryPipeline {
       this.core.assertCurrent(input.topicId, input.signal, input.topic.scopeGeneration, input.resumeState);
       // 교정 턴도 커밋을 만들 수 있다 — 범위 밖 변경을 커밋해 버리면 작업 트리 대조에서 사라진다(2026-09-08 Codex 지적 2).
       await this.assertBaselineIntact(input.topic, input.baselineHead, "허용 오차 교정 중");
-      result = await this.core.enforceResultContract("claude", input.topic, corrected, input.sessionId, {
+      // 교정 재제출은 본 턴 결과 위에 병합한다(쟁점·증거·요청 결정·요약 보존). 파싱 직후·계약 검사 전에 병합해야
+      // 본 턴이 이미 채운 쟁점 처분을 교정이 빠뜨렸다고 계약 교정을 한 번 더 사지 않는다.
+      let preservedParts: string[] = [];
+      const mergeNormalizer = (parsed: AgentResult): AgentResult => {
+        const merged = mergeCorrectionResult(original, parsed);
+        preservedParts = merged.preserved;
+        return input.normalize ? input.normalize(merged.result) : merged.result;
+      };
+      const contracted = await this.core.enforceResultContract("claude", input.topic, corrected, input.sessionId, {
         signal: input.signal, implementation: true, planMode: false, startedAfter: input.inputSequence, check: input.check,
-        readablePaths: input.readablePaths, normalize: input.normalize,
+        readablePaths: input.readablePaths, normalize: mergeNormalizer,
       });
+      if (preservedParts.length > 0) {
+        this.core.event(input.topicId, "system", "system",
+          `허용 오차 교정 재제출에 본 턴 보고를 병합했습니다(서버 보존): ${preservedParts.join(" · ")}`, { correctionPreserved: preservedParts });
+      }
       // 계약 교정이 한 번 더 돌았을 수 있다 — 그 호출도 커밋을 만들 수 있으므로 다시 본다(Codex 후속 지적 1).
       await this.assertBaselineIntact(input.topic, input.baselineHead, "허용 오차 교정 뒤 계약 교정 중");
-      evaluation = evaluateTolerance(policy, await this.collectChangedFiles(input.topic), result.toleranceLedger ?? []);
+      ({ result, evaluation } = await evaluateWithCarry(contracted));
       if (evaluation.violations.length > 0) {
         this.core.interrupt(input.topicId, "USER_DECISION_REQUIRED",
           `교정 뒤에도 허용 오차 위반이 남았습니다 — 되돌릴지, 규칙을 넓힐지(계획 개정) 결정이 필요합니다.\n${renderToleranceSummary(evaluation)}`,
@@ -670,6 +699,22 @@ export class DeliveryPipeline {
     }
     this.core.event(input.topicId, "system", "system", renderToleranceSummary(evaluation), { toleranceUsage: evaluation.usage });
     return result;
+  }
+
+  // 서버가 받아들인 마지막 구현·수정 결과의 원장 합집합. 산출물이 없거나 깨졌으면 빈 원장(승계 없음).
+  private async acceptedLedger(topicId: string): Promise<ToleranceLedgerEntry[]> {
+    const entries: ToleranceLedgerEntry[] = [];
+    for (const kind of ["implementation-result", "claude-fix"]) {
+      try {
+        const raw = await this.core.dependencies.artifacts.readLatest(topicId, kind);
+        if (!raw) continue;
+        const parsed = AgentResultSchema.safeParse(JSON.parse(raw));
+        if (parsed.success) entries.push(...(parsed.data.toleranceLedger ?? []));
+      } catch {
+        // 손상된 산출물은 승계 근거가 아니다 — 러너 원장만으로 판정한다.
+      }
+    }
+    return entries;
   }
 
   // 브랜치가 그대로이고 HEAD 가 구현 기준과 같은지 — 에이전트 호출(교정 포함) 뒤마다 부른다. 커밋으로 범위 밖 변경을 숨기면 여기서 멈춘다.

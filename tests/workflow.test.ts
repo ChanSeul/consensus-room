@@ -31,7 +31,9 @@ import {
   resolveBranchName,
   shouldRunFixPass,
   CARRIED_RATIONALE_PREFIX,
+  CORRECTION_SUMMARY_SEPARATOR,
   carryForwardFindings,
+  mergeCorrectionResult,
   isSettledFinding,
   mergeFindingSources,
 } from "../src/shared/workflow";
@@ -702,5 +704,48 @@ describe("settled 쟁점 승계(carryForwardFindings)", () => {
       expect(() => assertFindingCoverage(firstReview, findings, "Codex final review")).toThrow("F-1");
     }
     expect(mergeFindingSources(undefined, firstReview, undefined)).toHaveLength(2);
+  });
+});
+
+// 2026-09-14 S11: 허용 오차 교정 재제출("코드 변경 없음 — 원장 공란")이 $6.35 짜리 본 턴 보고와 남은 단계를 적은 결정 요청을
+// 통째로 덮어써 엔진이 구현 완료로 보고 리뷰로 넘겼다. 교정은 본 턴 결과 위에 병합한다.
+describe("mergeCorrectionResult — 교정 재제출을 본 턴 결과 위에 병합", () => {
+  const original: AgentResult = {
+    kind: "IMPLEMENTATION", summary: "P3 완료. 남은 단계 P3.5·P3.6.",
+    findings: [
+      { id: "TODO-1", title: "이연", severity: "LOW", disposition: "DEFERRED_OUT_OF_SCOPE", rationale: "범위 밖", evidenceRefs: [], requiresUserDecision: false },
+      { id: "F-1", title: "고침", severity: "MEDIUM", disposition: "RESOLVED_BY_FIX", rationale: "본 턴", evidenceRefs: [], requiresUserDecision: false },
+    ],
+    evidenceRefs: ["cover-A-post.log errors=0", "gate4 OK"], requestedUserDecision: "남은 단계 P3.5·P3.6 — 계속 진행 요청",
+    toleranceLedger: [],
+  };
+  it("교정이 비운 쟁점·증거·요청 결정을 보존하고 요약은 뒤에 붙이며 원장은 교정 것을 쓴다", () => {
+    const corrected: AgentResult = {
+      kind: "IMPLEMENTATION", summary: "원장 6행 재기재(코드 변경 없음)", findings: [], evidenceRefs: ["git diff -- Tests/A.swift"],
+      toleranceLedger: [{ ruleId: "T-5", file: "Tests/A.swift", note: "재기재" }],
+    };
+    const { result, preserved } = mergeCorrectionResult(original, corrected);
+    expect(preserved).toEqual(["findings 2건", "evidence 2건", "요청 결정", "summary"]);
+    expect(result.findings.map((finding) => finding.id)).toEqual(["TODO-1", "F-1"]);
+    expect(result.evidenceRefs).toEqual(["git diff -- Tests/A.swift", "cover-A-post.log errors=0", "gate4 OK"]);
+    expect(result.requestedUserDecision).toBe(original.requestedUserDecision);
+    expect(result.summary).toBe(`원장 6행 재기재(코드 변경 없음)${CORRECTION_SUMMARY_SEPARATOR}P3 완료. 남은 단계 P3.5·P3.6.`);
+    expect(result.toleranceLedger).toEqual(corrected.toleranceLedger);
+  });
+  it("교정이 같은 id 를 다시 적으면 교정이 우선하고, 본 턴 요약을 담고 있으면 덧붙이지 않는다", () => {
+    const corrected: AgentResult = {
+      kind: "IMPLEMENTATION", summary: "P3 완료. 남은 단계 P3.5·P3.6. (원장 보완)",
+      findings: [{ id: "F-1", title: "고침", severity: "MEDIUM", disposition: "AGREED_ACTION", rationale: "되돌림", evidenceRefs: [], requiresUserDecision: false }],
+      evidenceRefs: ["cover-A-post.log errors=0", "gate4 OK"], requestedUserDecision: "다른 결정",
+    };
+    const { result, preserved } = mergeCorrectionResult(original, corrected);
+    expect(preserved).toEqual(["findings 1건"]);
+    expect(result.findings.map((finding) => [finding.id, finding.disposition])).toEqual([["F-1", "AGREED_ACTION"], ["TODO-1", "DEFERRED_OUT_OF_SCOPE"]]);
+    expect(result.requestedUserDecision).toBe("다른 결정");
+    expect(result.summary).toBe(corrected.summary);
+  });
+  it("본 턴에 요청 결정이 없었고 교정도 없으면 요청 결정 필드를 만들지 않는다", () => {
+    const { result } = mergeCorrectionResult({ ...original, requestedUserDecision: undefined }, { kind: "IMPLEMENTATION", summary: "x", findings: [], evidenceRefs: [] });
+    expect("requestedUserDecision" in result).toBe(false);
   });
 });
