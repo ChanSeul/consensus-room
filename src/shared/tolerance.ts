@@ -371,6 +371,10 @@ export interface ChangedFile {
 
 export interface ToleranceEvaluation {
   violations: string[];
+  // 원장 정리 메모(위반 아님): 범위 안 파일·바뀌지 않은 파일의 원장 행은 판정에 영향이 없으므로 버리고 적어 둔다.
+  // 2026-09-14 S11 실측: 러너가 범위 안 파일 2건을 원장에 적었다는 이유로 52분짜리 세션을 교정 재제출로 돌렸다 —
+  // 그 행은 아무 변경도 허용하지 않으므로 교정 턴(입력 5,700만 토큰)이 살 것이 없다.
+  ledgerNotes: string[];
   outOfScopeFiles: string[];
   usage: Record<string, { files: string[]; hunks: number }>;
 }
@@ -423,11 +427,12 @@ export function evaluateTolerance(
       usage[rule.id] = used;
     }
   }
+  const ledgerNotes: string[] = [];
   for (const entry of ledger) {
     if (!changed.some((item) => item.file === entry.file)) {
-      violations.push(`원장의 ${entry.file} 은 실제로 바뀌지 않았습니다(원장은 실제 변경만 적습니다).`);
+      ledgerNotes.push(`원장의 ${entry.file} 은 실제로 바뀌지 않았습니다(원장은 실제 변경만 적습니다) — 행을 무시합니다.`);
     } else if (matchesAny(entry.file, policy.scopePaths)) {
-      violations.push(`원장의 ${entry.file} 은 승인 범위 안 파일이라 원장에 적지 않습니다.`);
+      ledgerNotes.push(`원장의 ${entry.file} 은 승인 범위 안 파일이라 원장에 적지 않습니다 — 행을 무시합니다.`);
     }
   }
   for (const [ruleId, used] of Object.entries(usage)) {
@@ -435,14 +440,17 @@ export function evaluateTolerance(
     if (used.files.length > rule.maxFiles) violations.push(`규칙 ${ruleId}: 파일 ${used.files.length}개 > 상한 ${rule.maxFiles}`);
     if (used.hunks > rule.maxHunks) violations.push(`규칙 ${ruleId}: hunk ${used.hunks}개 > 상한 ${rule.maxHunks}`);
   }
-  return { violations, outOfScopeFiles: outOfScope.map((item) => item.file), usage };
+  return { violations, ledgerNotes, outOfScopeFiles: outOfScope.map((item) => item.file), usage };
 }
 
 export function renderToleranceSummary(evaluation: ToleranceEvaluation): string {
   const usage = Object.entries(evaluation.usage)
     .map(([ruleId, used]) => `${ruleId}: 파일 ${used.files.length}·hunk ${used.hunks}`)
     .join(", ");
+  const notes = evaluation.ledgerNotes.length > 0
+    ? `\n원장 정리 ${evaluation.ledgerNotes.length}건(위반 아님):\n${evaluation.ledgerNotes.map((line) => `- ${line}`).join("\n")}`
+    : "";
   return evaluation.violations.length === 0
-    ? `허용 오차 대조 통과 — 범위 밖 파일 ${evaluation.outOfScopeFiles.length}개${usage ? ` (${usage})` : ""}`
-    : `허용 오차 위반 ${evaluation.violations.length}건:\n${evaluation.violations.map((line) => `- ${line}`).join("\n")}`;
+    ? `허용 오차 대조 통과 — 범위 밖 파일 ${evaluation.outOfScopeFiles.length}개${usage ? ` (${usage})` : ""}${notes}`
+    : `허용 오차 위반 ${evaluation.violations.length}건:\n${evaluation.violations.map((line) => `- ${line}`).join("\n")}${notes}`;
 }

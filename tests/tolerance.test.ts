@@ -9,6 +9,7 @@ import {
   matchesAny,
   parseTolerancePolicy,
   parseUnifiedDiff,
+  renderToleranceSummary,
   stateAtLine,
   ToleranceFormatError,
   sanitizeJSONControlCharacters,
@@ -153,7 +154,21 @@ describe("평가기", () => {
     expect(text).toContain("F.swift: 1개 hunk 가 규칙 T-1");
     expect(text).toContain("New.swift: 새 파일은 T-1");
     expect(text).toContain("규칙 T-2: 파일 2개 > 상한 1");
-    expect(text).toContain("Z.swift 은 실제로 바뀌지 않았습니다");
+    expect(text).not.toContain("Z.swift");
+    expect(evaluation.ledgerNotes.join("\n")).toContain("Z.swift 은 실제로 바뀌지 않았습니다");
+  });
+
+  // 2026-09-14 S11: 범위 안 파일·바뀌지 않은 파일의 원장 행은 판정에 영향이 없다 — 교정 재제출을 만들지 않고 메모로만 남긴다.
+  it("범위 안 파일의 원장 행은 위반이 아니라 정리 메모다", () => {
+    const policy = parseTolerancePolicy(policyBlock)!;
+    const evaluation = evaluateTolerance(policy, [
+      { file: "SampleApp/Features/Home/A.swift", untracked: false, binary: false, modeChanged: false, baseLines: [], hunks: [{ oldStart: 1, removed: [], added: ["let a = 1"] }] },
+    ], [{ ruleId: "T-1", file: "SampleApp/Features/Home/A.swift", note: "범위 안인데 적었다" }]);
+    expect(evaluation.violations).toEqual([]);
+    expect(evaluation.ledgerNotes).toHaveLength(1);
+    expect(evaluation.ledgerNotes[0]).toContain("승인 범위 안 파일");
+    expect(renderToleranceSummary(evaluation)).toContain("허용 오차 대조 통과");
+    expect(renderToleranceSummary(evaluation)).toContain("원장 정리 1건(위반 아님)");
   });
 });
 
