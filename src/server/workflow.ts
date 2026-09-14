@@ -221,7 +221,9 @@ export class WorkflowEngine {
     const resume = flags.resumeState;
     const interruption = this.core.dependencies.database.getTimeline(topicId).filter(event =>
       event.scopeGeneration === topic.scopeGeneration && event.actor === "system" && event.payload?.resumeState).at(-1);
-    if(interruption?.payload?.reviewPause && topic.state==="USER_DECISION_REQUIRED")
+    // 리뷰 한도 정지는 **그 리뷰 단계를 재개할 때만** 막는다. 중재자가 resume_state 를 다른 단계(예: 러너가 중간 보고를
+    // 완료 형식으로 닫아 리뷰로 넘어간 것을 IMPLEMENTING 으로 되돌림, 2026-09-14 S11)로 바꿨으면 리뷰 승인은 필요 없다.
+    if(interruption?.payload?.reviewPause && topic.state==="USER_DECISION_REQUIRED" && interruption.payload.resumeState===resume)
       this.core.dependencies.database.reviews.assertAvailable(topicId,interruption.payload.reviewPause as ReviewScope);
     if(interruption?.payload?.revisionPause===true && topic.state==="USER_DECISION_REQUIRED")
       this.core.dependencies.database.revisions.assertAvailable(topicId,resume==="CLAUDE_PLAN"?"plan":"revision");

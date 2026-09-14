@@ -3727,6 +3727,24 @@ it("세 번째 구현 리뷰는 전달 준비까지 완료하고 네 번째 호�
  expect(database.reviews.account("topic-1","implementation").used).toBe(3);database.close();
 });
 
+// 2026-09-14 S11: 러너가 중간 보고를 완료 형식으로 닫아 리뷰로 넘어가 한도에서 멈춘 뒤, 중재자가 resume_state 를
+// IMPLEMENTING 으로 되돌리면 리뷰 승인 없이 retry 가 구현을 재개해야 한다(한도 정지는 그 리뷰 단계 재개에만 걸린다).
+it("리뷰 한도 정지 뒤 resume_state 를 다른 단계로 되돌리면 retry 가 리뷰 승인 없이 그 단계를 재개한다",async()=>{
+ const result:AgentResult={kind:"FINAL_REVIEW",summary:"검토 완료",findings:[],evidenceRefs:[]};
+ const {database,engine}=await makeReviewRecovery({resumeState:"CODEX_FINAL_REVIEW",implementationFindings:[],originalReviewFindings:[],codexResult:result});
+ for(const id of ["one","two","three"])database.reviews.admit("topic-1",id,"implementation");
+ database.updateTopic("topic-1",{state:"FAILED",resumeState:"CODEX_FINAL_REVIEW"});
+ engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");
+ expect(database.getTopic("topic-1").state).toBe("USER_DECISION_REQUIRED");
+ expect(engine.reviewPaused("topic-1")).toBe("implementation");
+ expect(()=>engine.retry("topic-1")).toThrow("한도");
+ database.updateTopic("topic-1",{resumeState:"IMPLEMENTING"});
+ expect(engine.reviewPaused("topic-1")).toBeNull();
+ expect(()=>engine.retry("topic-1")).not.toThrow();
+ await waitForActionCompletion(database,"topic-1");
+ expect(database.reviews.account("topic-1","implementation").used).toBe(3);database.close();
+});
+
 it("한도로 멈춘 개정 교정은 재시작 뒤 원본 세션에서 교정만 재개한다",async()=>{
  const plan=validPlan("계획 단계 재개");
  const {database,engine,artifacts,claude,codex}=await makePlanningRecovery("CLAUDE_REVISION",{claudeResults:[
