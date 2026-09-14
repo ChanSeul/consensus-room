@@ -67,6 +67,9 @@ export function isFormatOnlyViolation(error: unknown): boolean {
   return error instanceof ZodError || error instanceof FormatViolation || error instanceof ToleranceFormatError;
 }
 
+// 유지보수 잠금 소유 증명 — 잠금 파일의 pid·at 을 그대로 제시한 호출만 잠금 아래에서 통과한다(R3-06).
+export type MaintenanceLockOwner = { pid: number; at: string };
+
 export class HandledWorkflowInterruption extends Error {
   constructor() {
     super("새 메시지를 반영하기 위해 현재 단계를 멈췄습니다.");
@@ -210,23 +213,26 @@ export class EngineCore {
     return actionId;
   }
 
-  assertNoActiveWork(topicId: string): void {
+  assertNoActiveWork(topicId: string, options: { maintenanceOwner?: MaintenanceLockOwner } = {}): void {
     if (this.active.has(topicId) || this.dependencies.database.runningAction(topicId) ||
         this.deliveryActive.has(topicId) || this.scopeChangeActive.has(topicId) || this.amendmentActive.has(topicId)) {
       throw new Error("이 주제에서 이미 실행 중인 작업이 있습니다.");
     }
-    this.assertNoMaintenanceLock();
+    this.assertNoMaintenanceLock(options.maintenanceOwner);
   }
 
   // 중재자가 도구 트리·서버를 교체하는 동안(next-stop.sh) 새 실행을 시작하지 않는다 — 유휴 확인과 교체 사이의 경쟁을 막는 공유 잠금.
   // 60분이 지난 잠금은 버려진 것으로 보고 무시한다(스크립트가 죽어 지우지 못한 경우).
-  assertNoMaintenanceLock(): void {
+  // 잠금 **소유자**(잠금 파일의 pid·at 을 그대로 제시한 호출)는 통과한다 — 유지보수 스크립트가 잠금을 쥔 채 마지막에 기준 갱신(rebaseline)을
+  // 부르는 종료 절차가 자기 잠금에 막히지 않게(R3-06). 잠금을 조기에 풀어 유휴 확인↔교체 경쟁을 되살리지 않는다.
+  assertNoMaintenanceLock(owner?: MaintenanceLockOwner): void {
     const path = this.dependencies.maintenanceLockPath;
     if (!path || !existsSync(path)) return;
-    let info: { at?: string; reason?: string } = {};
-    try { info = JSON.parse(readFileSync(path, "utf8")) as { at?: string; reason?: string }; } catch { /* 형식 무관 — 파일 존재가 잠금이다 */ }
+    let info: { at?: string; reason?: string; pid?: number } = {};
+    try { info = JSON.parse(readFileSync(path, "utf8")) as { at?: string; reason?: string; pid?: number }; } catch { /* 형식 무관 — 파일 존재가 잠금이다 */ }
     const age = info.at ? Date.now() - Date.parse(info.at) : 0;
     if (Number.isFinite(age) && age > 60 * 60 * 1000) return;
+    if (owner && typeof info.pid === "number" && info.pid === owner.pid && info.at === owner.at) return;
     throw new Error(`중재자 유지보수 잠금 중입니다(${info.reason ?? "사유 없음"}, ${info.at ?? "시각 없음"}) — 끝난 뒤 다시 시도하세요.`);
   }
 
@@ -403,6 +409,7 @@ export class EngineCore {
       try {
         const sourceRevision = (this.dependencies.database.latestArtifact(topic.id, "plan-repair-source")?.revision ?? 0) + 1;
         await this.writeArtifact(topic, "plan-repair-source", sourceRevision, JSON.stringify(redactAgentResult(raw)), context.signal);
+        if (this.interruptForNewUserInput(topic, context.startedAfter)) throw new HandledWorkflowInterruption();   // 저장 사이 새 입력(R3-03)
         const patch = await this.adapter(role).resumePlanRepair!({
           sessionId, prompt: planRepairPrompt(repairPlan, violation), cwd: topic.worktreePath,
           signal: context.signal, protocolOnly: true, implementation: false, planMode: false,
@@ -435,6 +442,8 @@ export class EngineCore {
       kind: "contract-repair-source", scopeGeneration: topic.scopeGeneration, planSHA256: topic.planSHA256, state: topic.state,
       original: redactUnverifiedResult(raw),
     }),context.signal);
+    // 원본을 저장하는 사이 새 결정·증거가 도착했으면 교정 호출(쓰기 턴)을 열지 않는다 — 원본은 방금 보존됐으므로 재개가 소비한다(R3-03).
+    if (this.interruptForNewUserInput(topic, context.startedAfter)) throw new HandledWorkflowInterruption();
     this.event(topic.id, "system", "system",
       `기계 계약 위반을 같은 세션에 돌려보내 1회 교정합니다${formatOnly ? "(표기 교정 — 추론 low)" : ""}: ${violation}`);
     const settings = this.executionSettings(topic.id, role, context.implementation);

@@ -333,6 +333,11 @@ export type ResumeImplementationInput = z.infer<typeof ResumeImplementationInput
 
 // 도구 트리 기준 재설정(중재자, 재동기화 뒤) — 감지된 변경을 "복구했다" 고 선언하는 유일한 경로(F04).
 export const ReasonInputSchema = z.object({ reason: z.string().trim().min(1).max(4000) });
+// 도구 트리 기준 갱신 — 유지보수 잠금을 쥔 스크립트가 종료 절차로 부를 때 잠금 파일의 pid·at 을 그대로 제시한다(소유 증명, R3-06).
+export const ToolTreeRebaselineInputSchema = ReasonInputSchema.extend({
+  maintenanceLock: z.object({ pid: z.number().int().positive(), at: z.string().min(1) }).optional(),
+});
+export type ToolTreeRebaselineInput = z.infer<typeof ToolTreeRebaselineInputSchema>;
 export const RESPONSE_LEDGER_LIMIT = 500;
 
 export const AmendToleranceInputSchema = z.object({
@@ -451,6 +456,8 @@ export const AgentResultJsonSchema = {
       anyOf: [
         {
           type: "array",
+          // 한 번 응답의 원장 상한(파서 RESPONSE_LEDGER_LIMIT 과 같은 값) — 앞 턴에서 받아들인 행은 서버가 승계하므로 이번 턴 변경분만 적는다(R3-11).
+          maxItems: RESPONSE_LEDGER_LIMIT,
           items: {
             type: "object",
             additionalProperties: false,

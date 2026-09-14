@@ -669,3 +669,128 @@ describe("Codex 감사 2026-09-14 — 결과 수명·진행 상태·도구 트�
     database.close();
   });
 });
+
+// 2026-09-14 Codex 3차 감사(R3-02·R3-03·R3-10) — 진단(결함 관찰)을 정상 기대값으로 뒤집은 회귀 테스트.
+describe("Codex 3차 감사 2026-09-14 — 중첩 교정 실패 복구·계속 진행 입장 재검사·수정 진행 원장 승계", { timeout: 30_000 }, () => {
+  function scripted(turns: Array<(prompt: string) => AgentResult>) {
+    const prompts: string[] = [];
+    let index = 0;
+    const next = (prompt: string) => { const turn = turns[index]; if (!turn) throw new Error(`턴 ${index + 1} 을 기대하지 않았습니다.`); index += 1; return turn(prompt); };
+    const adapter: AgentAdapter = {
+      role: "claude",
+      async createSession(turn) { prompts.push(turn.prompt); return { sessionId: "claude-implementation-session", result: next(turn.prompt) }; },
+      async resumeTurn(turn) { prompts.push(turn.prompt); return next(turn.prompt); },
+      async validateExistingSession() { return true; },
+    };
+    return { adapter, prompts };
+  }
+  const settled = (db: ConsensusDatabase, id: string) => waitUntil(() =>
+    db.runningAction(id) === null && ["READY_TO_DELIVER", "FAILED", "USER_DECISION_REQUIRED"].includes(db.getTopic(id).state));
+
+  it("R3-02: 허용 오차 교정 원본의 요청 결정은 그 뒤 일반 계약 교정이 실패해도 retry 결과에 순서대로 병합돼 리뷰로 새지 않는다", async () => {
+    const { worktree, database, artifacts, gitService, topicId } = await setup("r3-02");
+    const claude = scripted([
+      () => { writeFileSync(join(worktree, "service/S.swift"), "func renamed() {}\nfunc b() {}\n"); return result("IMPLEMENTATION", "original", { requestedUserDecision: "ORIGINAL-DECISION", evidenceRefs: ["ORIGINAL-PROOF"] }); },
+      () => { writeFileSync(join(worktree, "service/S.swift"), "func a() {}\nfunc b() {}\n"); return result("FIX", "short corrected raw"); },   // 되돌렸지만 kind 가 틀림 → 계약 교정
+      () => { throw new Error("generic repair failed"); },
+      () => result("IMPLEMENTATION", "retry complete", { status: "completed" }),
+    ]);
+    const engine = new WorkflowEngine({ database, artifacts, git: gitService, claude: claude.adapter, codex: new PassingCodex() });
+    engine.startImplementation(topicId); await settled(database, topicId);
+    expect(database.getTopic(topicId).state).toBe("FAILED");
+    expect(await artifacts.readLatest(topicId, "tolerance-correction-source")).toContain("ORIGINAL-DECISION");
+    expect(await artifacts.readLatest(topicId, "contract-repair-source")).not.toContain("ORIGINAL-DECISION");
+    engine.retry(topicId); await settled(database, topicId);
+    const topic = database.getTopic(topicId);
+    expect(topic.state, topic.lastError ?? "").toBe("USER_DECISION_REQUIRED");
+    const saved = JSON.parse((await artifacts.readLatest(topicId, "implementation-result"))!);
+    expect(saved.requestedUserDecision).toBe("ORIGINAL-DECISION");
+    expect(saved.evidenceRefs).toContain("ORIGINAL-PROOF");
+    expect(claude.prompts).toHaveLength(4);
+    database.close();
+  });
+
+  it("R3-02(진행 중): 계속 진행 응답의 계약 교정이 실패해도 progress 원본의 증거가 retry 최종 결과에 남는다", async () => {
+    const { database, artifacts, gitService, topicId } = await setup("r3-02p");
+    const claude = scripted([
+      () => result("IMPLEMENTATION", "P3", { status: "in_progress", remainingSteps: ["P4"], evidenceRefs: ["P3-PROOF"] }),
+      () => result("FIX", "P4 short report"),
+      () => { throw new Error("contract failure"); },
+      () => result("IMPLEMENTATION", "P4 done", { status: "completed" }),
+    ]);
+    const engine = new WorkflowEngine({ database, artifacts, git: gitService, claude: claude.adapter, codex: new PassingCodex() });
+    engine.startImplementation(topicId); await settled(database, topicId);
+    expect(database.getTopic(topicId).state).toBe("FAILED");
+    expect(await artifacts.readLatest(topicId, "implementation-progress")).toContain("P3-PROOF");
+    engine.retry(topicId); await settled(database, topicId);
+    const topic = database.getTopic(topicId);
+    expect(topic.state, topic.lastError ?? "").toBe("READY_TO_DELIVER");
+    const saved = JSON.parse((await artifacts.readLatest(topicId, "implementation-result"))!);
+    expect(saved.evidenceRefs).toContain("P3-PROOF");
+    expect(saved.status).toBe("completed");
+    expect(saved.remainingSteps ?? []).toEqual([]);
+    database.close();
+  });
+
+  it("R3-03: 진행 결과를 저장하는 사이 새 결정이 도착하면 다음 계속 진행 턴(쓰기 호출)을 열지 않는다", async () => {
+    const { database, artifacts, gitService, topicId } = await setup("r3-03");
+    let resumed = 0; let posted = false;
+    let engine: WorkflowEngine;
+    const originalWrite = artifacts.write.bind(artifacts);
+    artifacts.write = async (...args: Parameters<ArtifactStore["write"]>) => {
+      const saved = await originalWrite(...args);
+      if (args[1] === "implementation-progress" && !posted) { posted = true; await engine.postMessage(topicId, "decision", "Stop and apply the new user decision"); }
+      return saved;
+    };
+    const adapter: AgentAdapter = {
+      role: "claude",
+      createSession: async () => ({ sessionId: "s", result: result("IMPLEMENTATION", "P3", { status: "in_progress", remainingSteps: ["P4"] }) }),
+      resumeTurn: async () => { resumed += 1; throw new Error("R3_WRITE_AFTER_NEW_DECISION"); },
+      validateExistingSession: async () => true,
+    };
+    engine = new WorkflowEngine({ database, artifacts, git: gitService, claude: adapter, codex: new PassingCodex() });
+    engine.startImplementation(topicId); await settled(database, topicId);
+    expect(posted).toBe(true);
+    expect(resumed).toBe(0);
+    const topic = database.getTopic(topicId);
+    expect(topic.state).toBe("USER_DECISION_REQUIRED");
+    expect(topic.lastError ?? "").not.toContain("R3_WRITE_AFTER_NEW_DECISION");
+    expect(database.getTimeline(topicId).some((event) => event.body.includes("다음 계속 진행 턴을 열지 않습니다"))).toBe(true);
+    expect(await artifacts.readLatest(topicId, "implementation-progress")).toContain("P3");
+    database.close();
+  });
+
+  it("R3-10: 수정 계속 진행(fix-progress)에서 받아들인 원장은 다음 수정 턴이 생략해도 승계돼 교정 턴을 사지 않는다", async () => {
+    const { worktree, database, artifacts, gitService, topicId } = await setup("r3-10");
+    const agreed: AgentResult["findings"][number] = { id: "F-1", title: "fix", severity: "MEDIUM", disposition: "AGREED_ACTION", rationale: "fix", evidenceRefs: ["feature.txt"], requiresUserDecision: false };
+    const resolved = { ...agreed, disposition: "RESOLVED_BY_FIX" as const };
+    let resumes = 0; let reviews = 0; const resumePrompts: string[] = [];
+    const claude: AgentAdapter = {
+      role: "claude", validateExistingSession: async () => true,
+      createSession: async () => ({ sessionId: "implementation", result: result("IMPLEMENTATION", "done", { status: "completed" }) }),
+      resumeTurn: async (turn) => {
+        resumes += 1; resumePrompts.push(turn.prompt);
+        if (resumes === 1) { writeFileSync(join(worktree, "service/S.swift"), "nonisolated func a() {}\nfunc b() {}\n"); return result("FIX", "P3 fixed", { status: "in_progress", remainingSteps: ["P4"], findings: [resolved], toleranceLedger: [{ ruleId: "T-1", file: "service/S.swift", note: "accepted outside change" }] }); }
+        if (resumes === 2) return result("FIX", "P4 done", { status: "completed", findings: [resolved] });
+        throw new Error("R3_UNNECESSARY_TOLERANCE_REPAIR");
+      },
+    };
+    const codex: AgentAdapter = {
+      role: "codex", validateExistingSession: async () => true,
+      createSession: async () => { reviews += 1; return { sessionId: "review", result: result("REVIEW", "fix requested", { findings: [agreed] }) }; },
+      resumeTurn: async () => { reviews += 1; return result("FINAL_REVIEW", "done", { findings: [resolved] }); },
+    };
+    const engine = new WorkflowEngine({ database, artifacts, git: gitService, claude, codex });
+    engine.startImplementation(topicId); await settled(database, topicId);
+    const topic = database.getTopic(topicId);
+    expect(topic.state, topic.lastError ?? "").toBe("READY_TO_DELIVER");
+    expect(await artifacts.readLatest(topicId, "fix-progress")).toContain("accepted outside change");
+    expect(resumes).toBe(2);
+    expect(reviews).toBe(2);
+    expect(database.getTimeline(topicId).some((event) => event.body.includes("허용 오차 원장 승계 1건"))).toBe(true);
+    // 계속 진행 프롬프트는 원장 전체 재제출이 아니라 변경분만 요구한다(R3-11 — 파서 500행 한도와 일치).
+    expect(resumePrompts[1]).toContain("이번 턴에 새로 생기거나 바뀐 범위 밖 변경만");
+    expect(resumePrompts[1]).not.toContain("전부를 다시 적으세요");
+    database.close();
+  });
+});

@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -599,6 +599,45 @@ describe("Codex 후속 F07 — 중재자 권한 경계", () => {
       expect(decisionOn.statusCode).toBe(200);
       const saved = database.getTimeline("f07-topic").find((event) => event.body === "위임 결정");
       expect(saved?.payload?.origin).toMatchObject({ actor: "mediator" });
+    } finally { await app.close(); }
+  });
+  // 2026-09-14 Codex 3차 R3-04 — 범위 변경도 사용자 권한 대행이다: OFF 에서 중재자 scope_change 는 403 이고 세대가 오르지 않는다.
+  it("OFF 에서 중재자 scope_change 는 403 이며 세대·타임라인이 그대로다; ON 이면 origin 을 남기고 세대가 오른다", async () => {
+    const { app, database } = await makeApp();
+    try {
+      draftTopic(database, "r3-scope");
+      const headers = { ...token, "x-consensus-actor": "mediator" };
+      await app.inject({ method: "POST", url: "/api/mediation-autonomy", headers: { ...token, "idempotency-key": "r3-off" }, payload: { autonomy: "off", note: "audit" } });
+      const refused = await app.inject({ method: "POST", url: "/api/topics/r3-scope/messages", headers: { ...headers, "idempotency-key": "r3-scope-off" }, payload: { kind: "scope_change", body: "Unapproved expanded scope" } });
+      expect(refused.statusCode).toBe(403);
+      expect(database.getTopic("r3-scope").scopeGeneration).toBe(1);
+      expect(database.getTimeline("r3-scope").some((event) => event.body === "Unapproved expanded scope")).toBe(false);
+      await app.inject({ method: "POST", url: "/api/mediation-autonomy", headers: { ...token, "idempotency-key": "r3-on" }, payload: { autonomy: "on", note: "user" } });
+      const allowed = await app.inject({ method: "POST", url: "/api/topics/r3-scope/messages", headers: { ...headers, "idempotency-key": "r3-scope-on" }, payload: { kind: "scope_change", body: "Delegated scope change" } });
+      expect(allowed.statusCode).toBe(200);
+      expect(database.getTopic("r3-scope").scopeGeneration).toBe(2);
+      const saved = database.getTimeline("r3-scope").find((event) => event.body === "Delegated scope change");
+      expect(saved?.payload?.origin).toMatchObject({ actor: "mediator" });
+    } finally { await app.close(); }
+  });
+  // R3-06 — 유지보수 잠금 아래의 기준 갱신은 잠금 소유자(pid·at 증명)만 통과한다. 잠금을 풀지 않아 유휴 확인↔교체 경쟁이 되살아나지 않는다.
+  it("maintenance.lock 이 있으면 tool-tree-rebaseline 은 거부되고, 잠금 소유 증명을 실은 호출만 기준 산출물을 만든다", async () => {
+    const { app, database, root } = await makeApp();
+    try {
+      draftTopic(database, "r3-lock", { worktreePath: root });
+      const lock = { at: new Date().toISOString(), pid: 123, reason: "next-stop audit" };
+      writeFileSync(join(root, "maintenance.lock"), JSON.stringify(lock));
+      const refused = await app.inject({ method: "POST", url: "/api/topics/r3-lock/actions/tool-tree-rebaseline", headers: { ...token, "idempotency-key": "r3-lock-1" }, payload: { reason: "tools_sync finished" } });
+      expect(refused.statusCode).toBeGreaterThanOrEqual(400);
+      expect(refused.json().error).toContain("유지보수 잠금");
+      expect(database.latestArtifact("r3-lock", "tool-tree-baseline")).toBeNull();
+      const wrongOwner = await app.inject({ method: "POST", url: "/api/topics/r3-lock/actions/tool-tree-rebaseline", headers: { ...token, "idempotency-key": "r3-lock-2" }, payload: { reason: "tools_sync finished", maintenanceLock: { pid: 999, at: lock.at } } });
+      expect(wrongOwner.statusCode).toBeGreaterThanOrEqual(400);
+      const owner = await app.inject({ method: "POST", url: "/api/topics/r3-lock/actions/tool-tree-rebaseline", headers: { ...token, "idempotency-key": "r3-lock-3" }, payload: { reason: "tools_sync finished", maintenanceLock: { pid: lock.pid, at: lock.at } } });
+      expect(owner.statusCode, owner.body).toBe(200);
+      expect(database.latestArtifact("r3-lock", "tool-tree-baseline")).not.toBeNull();
+      expect(database.getTimeline("r3-lock").some((event) => event.body.includes("유지보수 잠금 소유자 pid 123"))).toBe(true);
+      expect(existsSync(join(root, "maintenance.lock"))).toBe(true);   // 잠금은 스크립트가 끝날 때 스스로 지운다 — 서버가 풀지 않는다
     } finally { await app.close(); }
   });
 });

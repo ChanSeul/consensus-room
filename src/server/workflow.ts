@@ -22,7 +22,7 @@ import { ConsensusDatabase } from "./database.js";
 import { GitService } from "./git.js";
 import { redactRecord } from "./security.js";
 import type { AgentAdapter, ExecutionLimits, ParticipantRole, ProjectMemoryWriter } from "./types.js";
-import { EngineCore } from "./engine/core.js";
+import { EngineCore, type MaintenanceLockOwner } from "./engine/core.js";
 import { PlanningPipeline } from "./engine/planning.js";
 import { DeliveryPipeline } from "./engine/delivery.js";
 import { UsageLimitRetryScheduler, type RetryClock } from "./engine/usageLimitRetry.js";
@@ -485,12 +485,14 @@ export class WorkflowEngine {
     });
   }
 
-  // 도구 트리 기준 재설정(F04) — 중재자가 tools_sync 로 되돌리거나 새 핀을 배치한 뒤 부른다. 실행 중이면 거부.
-  async rebaselineToolTree(topicId: string, reason: string, origin?: CallOrigin): Promise<Topic> {
-    this.core.assertNoActiveWork(topicId);
+  // 도구 트리 기준 재설정(F04) — 중재자가 tools_sync 로 되돌리거나 새 핀을 배치한 뒤 부른다. 실행 중이면 거부. 유지보수 잠금을 쥔 스크립트의
+  // 종료 절차로 부를 때는 잠금 소유 증명(maintenanceLock = 잠금 파일의 pid·at)을 실어 자기 잠금에 막히지 않는다(R3-06).
+  async rebaselineToolTree(topicId: string, reason: string, origin?: CallOrigin, maintenanceLock?: MaintenanceLockOwner): Promise<Topic> {
+    this.core.assertNoActiveWork(topicId, { maintenanceOwner: maintenanceLock });
     const topic = this.core.dependencies.database.getTopic(topicId);
     const controller = new AbortController();
-    await this.delivery.writeToolTreeBaseline(topic, controller.signal, `${reason}${origin ? " (중재자 위임 호출)" : ""}`);
+    const suffix = `${origin ? " (중재자 위임 호출)" : ""}${maintenanceLock ? ` (유지보수 잠금 소유자 pid ${maintenanceLock.pid})` : ""}`;
+    await this.delivery.writeToolTreeBaseline(topic, controller.signal, `${reason}${suffix}`);
     return this.core.dependencies.database.getTopic(topicId);
   }
 
@@ -556,7 +558,7 @@ export class WorkflowEngine {
     return this.core.dependencies.database.getTopic(topicId);
   }
 
-  async handleScopeChange(topicId: string, body: string, requestKey?: string): Promise<Topic> {
+  async handleScopeChange(topicId: string, body: string, requestKey?: string, origin?: CallOrigin): Promise<Topic> {
     if (this.core.deliveryActive.has(topicId)) throw new Error("커밋 또는 push가 끝난 뒤 범위를 바꿔 주세요.");
     if (this.core.dependencies.database.unknownDeliveryAction(topicId)) {
       // 미확정 commit/push 확인은 git await 사이에 낀다. 그 사이 세대가 올라가면 이전 세대의 OID가
@@ -649,6 +651,7 @@ export class WorkflowEngine {
               previousPushedOID: previous.pushedOID,
               previousOrphanCommitOID: previous.orphanCommitOID,
               previousSessions,
+              ...(origin ? { origin } : {}),
               ...(requestKey ? { requestKey, requestAction: "message:scope_change" } : {}),
             }),
           },

@@ -482,7 +482,7 @@ export function buildContinuationPrompt(remainingSteps: readonly string[], round
 남은 단계(직전 제출):
 ${remainingSteps.length ? remainingSteps.map((step) => `- ${step}`).join("\n") : "- (명시 없음 — 계획의 다음 단계)"}
 
-규칙: 결과 JSON 은 이번 턴까지 누적된 보고입니다(직전 findings·evidenceRefs 는 서버가 병합해 보존합니다). 모든 단계가 끝났으면 status=completed, 아직이면 status=in_progress + remainingSteps, 중재자·사용자 입력이 필요하면 status=blocked + requestedUserDecision. 허용 오차 원장(toleranceLedger)은 워킹트리에 남아 있는 범위 밖 변경 전부를 다시 적으세요.
+규칙: 결과 JSON 은 이번 턴까지 누적된 보고입니다(직전 findings·evidenceRefs 는 서버가 병합해 보존합니다). 모든 단계가 끝났으면 status=completed, 아직이면 status=in_progress + remainingSteps, 중재자·사용자 입력이 필요하면 status=blocked + requestedUserDecision. 허용 오차 원장(toleranceLedger)은 **이번 턴에 새로 생기거나 바뀐 범위 밖 변경만** {ruleId, file, note} 로 적으세요 — 앞 턴에서 서버가 받아들인 행은 같은 파일이 그대로 바뀐 채면 서버가 승계하므로 다시 적지 않습니다(한 번 응답의 원장은 500행까지).
 
 ${dispositionContract(kind)}`;
 }

@@ -601,6 +601,13 @@ export class DeliveryPipeline {
   private async finishFix(
     topicId: string, topic: Topic, review: AgentResult, fixResult: AgentResult, secondPass: boolean, signal: AbortSignal,
   ): Promise<void> {
+    // 공통 진입점에서도 완료를 강제한다 — 어느 경로로 왔든 미완료 수정은 최종 리뷰를 사지 않는다(R3-01).
+    if (implementationInProgress(fixResult)) {
+      this.core.interrupt(topicId, "USER_DECISION_REQUIRED",
+        `수정 결과가 아직 in_progress 입니다 — 남은 단계: ${(fixResult.remainingSteps ?? []).join(" · ") || "(명시 없음)"}. 최종 리뷰로 넘기지 않았습니다. 재시도(retry)로 같은 세션에서 이어갑니다.`,
+        "CLAUDE_FIX", { fixInProgress: true, remainingSteps: fixResult.remainingSteps ?? [] });
+      return;
+    }
     const overruled = this.userOverruledFindings(topic, secondPass ? "codex-final-review" : "codex-review", review.findings);
     this.noteOverruled(topicId, overruled, review.findings, fixResult.findings);
     const downgraded = dispositionRegressions(review.findings, fixResult.findings, overruled);
@@ -640,6 +647,14 @@ export class DeliveryPipeline {
       return false;
     }
     const storedResult = await this.core.latestResult(topicId, "claude-fix");
+    // 미완료(status=in_progress·남은 단계) 저장 결과는 "완료된 수정" 이 아니다 — 일반 결정이 올라왔다고 최종 리뷰로 넘기면 남은 단계가
+    // 실행되지 않은 채 인도 준비가 된다(R3-01). 수정 턴을 다시 열어 남은 단계를 이어 간다(재개 턴이 이 결과 위에 병합한다).
+    if (implementationInProgress(storedResult)) {
+      this.core.event(topicId, "system", "system",
+        `저장된 수정 결과(#${storedFix.revision})가 아직 in_progress 입니다(남은 단계: ${(storedResult.remainingSteps ?? []).join(" · ") || "(명시 없음)"}) — 재사용하지 않고 같은 세션에서 수정 턴을 이어 갑니다.`,
+        { storedFixInProgress: true, remainingSteps: storedResult.remainingSteps ?? [] });
+      return false;
+    }
     // 저장된 결과도 같은 승계 규칙으로 본다 — 되돌려 담지 않은 settled 쟁점 때문에 재사용을 포기하지 않는다.
     const fixResult = { ...storedResult, findings: carryForwardFindings(review.findings, storedResult.findings).findings };
     try {
@@ -723,6 +738,8 @@ export class DeliveryPipeline {
         resumeState: input.resumeState, sessionId: input.sessionId, violations: evaluation.violations,
         original: redactUnverifiedResult(original),
       }, null, 2), input.signal);
+      // 원본을 저장하는 사이 새 결정·증거가 도착했으면 교정 호출을 열지 않는다(R3-03) — 원본은 방금 보존됐으므로 재개가 소비한다.
+      if (this.core.interruptForNewUserInput(input.topic, input.inputSequence)) return null;
       this.core.event(input.topicId, "system", "system",
         `${renderToleranceSummary(evaluation)}\n같은 세션에 돌려보내 1회 교정합니다(되돌리기 또는 원장 보완).`,
         { toleranceViolations: evaluation.violations });
@@ -771,7 +788,8 @@ export class DeliveryPipeline {
   // (Codex 감사 R05). 산출물이 없거나 깨졌으면 빈 원장(승계 없음).
   private async acceptedLedger(topicId: string): Promise<ToleranceLedgerEntry[]> {
     const db = this.core.dependencies.database;
-    const candidates = ["implementation-result", "implementation-progress", "claude-fix"]
+    // fix-progress(수정 계속 진행의 중간 결과)도 받아들인 원장이다 — 빠뜨리면 이미 통과한 변경을 다음 턴이 원장 누락으로 보고 교정 턴을 산다(R3-10).
+    const candidates = ["implementation-result", "implementation-progress", "claude-fix", "fix-progress"]
       .map((kind) => db.latestArtifact(topicId, kind))
       .filter((artifact): artifact is NonNullable<typeof artifact> => artifact !== null)
       .sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
@@ -788,16 +806,38 @@ export class DeliveryPipeline {
   }
 
   // 직전 턴이 교정(허용 오차·계약)이나 계속 진행 도중 끊겼을 때 보존해 둔 미완료 결과 — 같은 세대(계획 sha는 원본이 적혀 있으면 대조)이고
-  // 그 뒤 받아들인 결과가 없을 때만 유효하다. 종류마다 복구를 따로 두지 않고 한 곳에서 가장 최근 것을 고른다(R01·F03).
+  // 그 뒤 받아들인 결과가 없을 때만 유효하다(R01·F03). 원본이 여럿이면(허용 오차 교정 원본 → 짧은 교정 응답의 계약 교정 원본, 또는
+  // 진행 결과 → 다음 응답의 교정 원본) **가장 최근 하나만 고르지 않고 오래된 것부터 순서대로 병합**한다 — 최신 원본만 쓰면 앞선
+  // 원본에만 있던 미해결 요청 결정·증거가 후속 판단에서 빠진다(R3-02). 받아들였지만 status=in_progress 로 멈춘 최신 결과도 병합
+  // 바탕이다 — 사용자 결정 뒤 재개 턴은 그 위에 남은 단계를 쌓는다(R3-01).
   private async pendingResultOriginal(topicId: string, topic: Topic, resumeState: "IMPLEMENTING" | "CLAUDE_FIX"): Promise<AgentResult | null> {
     const db = this.core.dependencies.database;
-    const accepted = ["implementation-result", "claude-fix"].map((kind) => db.latestArtifact(topicId, kind))
+    const acceptedArtifacts = ["implementation-result", "claude-fix"].map((kind) => db.latestArtifact(topicId, kind))
       .filter((artifact): artifact is NonNullable<typeof artifact> => artifact !== null)
-      .map((artifact) => artifact.createdAt).sort().at(-1) ?? "";
+      .sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
+    const latestAccepted = acceptedArtifacts[0];
+    const accepted = latestAccepted?.createdAt ?? "";
+    const parts: AgentResult[] = [];
+    const acceptedKind = resumeState === "IMPLEMENTING" ? "implementation-result" : "claude-fix";
+    if (latestAccepted && latestAccepted.kind === acceptedKind && latestAccepted.scopeGeneration === topic.scopeGeneration) {
+      try {
+        const raw = await this.core.dependencies.artifacts.readLatest(topicId, acceptedKind);
+        const parsed = raw ? AgentResultSchema.safeParse(JSON.parse(raw)) : null;
+        if (parsed?.success && implementationInProgress(parsed.data)) {
+          // 이 결과의 요청 결정은 이미 사용자에게 제시됐다(정지) — 그 뒤 결정이 올라왔으면 소비된 것이므로 재개 결과에 되살리지 않는다.
+          const answered = db.getTimeline(topicId).some((event) =>
+            event.actor === "user" && event.kind === "decision" && event.scopeGeneration === topic.scopeGeneration && event.createdAt > latestAccepted.createdAt);
+          const { requestedUserDecision: asked, ...rest } = parsed.data;
+          parts.push(answered || !asked ? rest : parsed.data);
+        }
+      } catch {
+        // 손상된 산출물은 복구 근거가 아니다.
+      }
+    }
     const kinds = ["tolerance-correction-source", "contract-repair-source", resumeState === "IMPLEMENTING" ? "implementation-progress" : "fix-progress"];
     const candidates = kinds.map((kind) => db.latestArtifact(topicId, kind))
       .filter((artifact): artifact is NonNullable<typeof artifact> => artifact !== null && artifact.createdAt > accepted && artifact.scopeGeneration === topic.scopeGeneration)
-      .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+      .sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0));   // 오래된 것부터
     for (const artifact of candidates) {
       try {
         const raw = await this.core.dependencies.artifacts.readLatest(topicId, artifact.kind);
@@ -806,20 +846,23 @@ export class DeliveryPipeline {
         if (artifact.kind === "tolerance-correction-source") {
           if (record.planSHA256 !== topic.planSHA256 || record.resumeState !== resumeState) continue;
           const parsed = AgentResultSchema.safeParse(record.original);
-          if (parsed.success) return parsed.data;
+          if (parsed.success) parts.push(parsed.data);
           continue;
         }
         if (artifact.kind === "contract-repair-source") {
           if (record.kind !== "contract-repair-source" || record.state !== resumeState || record.planSHA256 !== topic.planSHA256) continue;
-          return salvageResultFields(record.original, resumeState === "IMPLEMENTING" ? "IMPLEMENTATION" : "FIX");
+          parts.push(salvageResultFields(record.original, resumeState === "IMPLEMENTING" ? "IMPLEMENTATION" : "FIX"));
+          continue;
         }
         const parsed = AgentResultSchema.safeParse(record);
-        if (parsed.success) return parsed.data;
+        if (parsed.success) parts.push(parsed.data);
       } catch {
         // 손상된 산출물은 복구 근거가 아니다.
       }
     }
-    return null;
+    if (parts.length === 0) return null;
+    // 오래된 원본 위에 새 원본을 병합한다(같은 id 쟁점은 새것 우선, 증거 합집합, 요청 결정은 새것이 비우면 옛것 — 해소 표식이면 제외).
+    return parts.reduce((base, next) => mergeCorrectionResult(base, next).result);
   }
 
   // 구현·수정·계속 진행 턴 공통: status=in_progress 이고 정지 사유가 없으면 같은 세션에서 계속 진행 턴을 연다(상한 CONTINUATION_LIMIT).
@@ -841,6 +884,15 @@ export class DeliveryPipeline {
       continuations += 1;
       const remaining = result.remainingSteps ?? [];
       await this.core.saveAgentOutput(input.topic, "claude", result, input.progressKind, input.signal);
+      // 저장을 기다리는 사이 새 결정·증거가 도착했으면 다음 쓰기 턴을 열지 않는다 — 마지막 await 뒤·모델 호출 직전의 재검사(R3-03).
+      // 진행 결과는 방금 progress 산출물로 보존됐으므로 재개 턴이 그 위에 병합한다.
+      if (this.core.newUserInputSince(input.topic, input.inputSequence)) {
+        this.core.event(input.topicId, "system", "system",
+          "진행 결과를 저장하는 사이 새 결정·증거가 도착해 다음 계속 진행 턴을 열지 않습니다(진행 결과는 보존됨).", { continuationRefused: "new-user-input" });
+        this.core.interruptForNewUserInput(input.topic, input.inputSequence);
+        return null;
+      }
+      this.core.assertCurrent(input.topicId, input.signal, input.topic.scopeGeneration, input.resumeState);
       this.core.event(input.topicId, "system", "system",
         `러너가 진행 중(status=in_progress)으로 멈췄습니다 — 남은 단계 ${remaining.length}개. 같은 세션에서 계속 진행합니다(${continuations}/${CONTINUATION_LIMIT}).`,
         { continuation: continuations, remainingSteps: remaining });

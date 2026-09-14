@@ -266,7 +266,9 @@ export function mergeCorrectionResult(original: AgentResult, corrected: AgentRes
     // 해소 표식은 최종 병합·소비까지 유지한다 — 실패 원본 복구와 교정 병합이 겹치면 바깥 병합이 원래 질문을 되살렸다(F08).
     ...(resolved ? { resolvesRequestedDecision: true } : {}),
     ...(corrected.status ?? original.status ? { status: corrected.status ?? original.status } : {}),
-    ...(corrected.remainingSteps ?? original.remainingSteps ? { remainingSteps: corrected.remainingSteps ?? original.remainingSteps } : {}),
+    // 교정이 completed 를 선언하면 옛 remainingSteps 를 끌고 오지 않는다(완료 결과에 남은 단계가 붙어 모순이 되지 않게, R3-01).
+    ...((corrected.remainingSteps ?? (corrected.status === "completed" ? undefined : original.remainingSteps))
+      ? { remainingSteps: corrected.remainingSteps ?? original.remainingSteps } : {}),
   };
   return { result, preserved };
 }

@@ -1,7 +1,7 @@
 import {ReviewGrantInputSchema} from "../shared/reviews.js";
 import { readFileSync } from "node:fs";
 import {
-  ReasonInputSchema,
+  ToolTreeRebaselineInputSchema,
   ResumeImplementationInputSchema, AmendToleranceInputSchema } from "../shared/contracts.js";
 import { RevisionGrantInputSchema } from "../shared/revisions.js";
 import { WorkGroupInputSchema } from "../shared/workGroups.js";
@@ -310,10 +310,14 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   app.post<{ Params: { id: string } }>("/api/topics/:id/messages", async (request, reply) => {
     const input = PostMessageInputSchema.parse(request.body);
     const ledger = actionLedger(database, request.params.id, `message:${input.kind}`);
-    // 위임 검사는 결정 대행(decision)에만 — 증거 게시·메모는 계약상 OFF 에서도 중재자가 한다(README 위임 표, F07).
-    const origin = input.kind === "decision" ? callOrigin(request, `message:${input.kind}`) : (request.headers["x-consensus-actor"] === "mediator" ? { actor: "mediator" as const, delegationSetAt: null } : undefined);
+    // 위임 검사는 사용자 권한을 대행하는 종류 전부(decision·scope_change)에 — 증거 게시·메모만 계약상 OFF 에서도 중재자가 한다
+    // (README 위임 표, F07). scope_change 를 예외로 두면 OFF 에서 중재자가 범위 세대를 올릴 수 있다(R3-04).
+    const mediatorHeader = request.headers["x-consensus-actor"] === "mediator";
+    const origin = input.kind === "note" || input.kind === "evidence"
+      ? (mediatorHeader ? { actor: "mediator" as const, delegationSetAt: null } : undefined)
+      : callOrigin(request, `message:${input.kind}`);
     return runIdempotent(request, reply, ledger, 200, (idempotencyKey) => input.kind === "scope_change"
-      ? workflow.handleScopeChange(request.params.id, input.body, idempotencyKey)
+      ? workflow.handleScopeChange(request.params.id, input.body, idempotencyKey, origin)
       : workflow.postMessage(request.params.id, input.kind, input.body, idempotencyKey, origin));
   });
 
@@ -335,8 +339,8 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
         response = accepted(randomUUID(), workflow.resumeImplementation(topicId, input, origin));
       }
       else if(action === "tool-tree-rebaseline") {
-        const input = ReasonInputSchema.parse(request.body);
-        response = accepted(randomUUID(), await workflow.rebaselineToolTree(topicId, input.reason, origin));
+        const input = ToolTreeRebaselineInputSchema.parse(request.body);
+        response = accepted(randomUUID(), await workflow.rebaselineToolTree(topicId, input.reason, origin, input.maintenanceLock));
       }
       else if(action === "review-resume") {
         workflow.assertBudgetEditable(topicId);

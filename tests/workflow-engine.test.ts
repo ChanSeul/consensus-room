@@ -3944,3 +3944,31 @@ describe("Codex 후속 F01 — 수정 턴의 완료 판정", () => {
     database.close();
   });
 });
+
+// 2026-09-14 Codex 3차 감사 R3-01 — 저장된 미완료(in_progress) FIX 는 일반 결정+retry 로 최종 리뷰에 가지 않고 수정 턴을 이어 간다.
+describe("Codex 3차 감사 R3-01 — 저장된 미완료 FIX 재사용 금지", () => {
+  it("일반 결정 뒤 retry 는 남은 단계를 실행하는 수정 턴을 열고, completed 가 된 뒤에만 최종 리뷰를 산다", async () => {
+    const f = finding("F-1", "fix", { severity: "HIGH", disposition: "RESOLVED_BY_FIX" });
+    const claude = new QueuedAdapter("claude", [
+      { kind: "FIX", summary: "code done but P4 remains", status: "in_progress", remainingSteps: ["P4"], requestedUserDecision: "environment ready before remaining P4", findings: [f], evidenceRefs: ["P3-PROOF"] },
+      { kind: "FIX", summary: "P4 done", status: "completed", findings: [f], evidenceRefs: ["P4-PROOF"] },
+    ]);
+    const codex = new QueuedAdapter("codex", [{ kind: "FINAL_REVIEW", summary: "review", findings: [f], evidenceRefs: [] }]);
+    const review = { kind: "REVIEW" as const, summary: "fix", findings: [f], evidenceRefs: [] };
+    const { database, engine, artifacts } = await makeReviewRecovery({ resumeState: "CLAUDE_FIX", implementationFindings: [], originalReviewFindings: [f], codexResult: review, claude, codex });
+    engine.retry("topic-1"); await waitForActionCompletion(database, "topic-1");
+    expect(database.getTopic("topic-1").state).toBe("USER_DECISION_REQUIRED");
+    expect(claude.calls).toHaveLength(1); expect(codex.calls).toHaveLength(0);
+    await engine.postMessage("topic-1", "decision", "환경 준비했으니 남은 P4를 계속해");
+    engine.retry("topic-1"); await waitForActionCompletion(database, "topic-1");
+    expect(database.getTopic("topic-1").state, database.getTopic("topic-1").lastError ?? "").toBe("READY_TO_DELIVER");
+    expect(claude.calls).toHaveLength(2);           // 남은 P4 를 실행하는 수정 턴 1회
+    expect(claude.calls[1]).toContain("환경 준비했으니 남은 P4를 계속해");
+    expect(codex.calls).toHaveLength(1);            // 최종 리뷰는 completed 뒤 한 번만
+    expect(database.getTimeline("topic-1").some((event) => event.body.includes("아직 in_progress 입니다") && event.body.includes("재사용하지 않고"))).toBe(true);
+    const saved = JSON.parse((await artifacts.readLatest("topic-1", "claude-fix"))!);
+    expect(saved.status).toBe("completed");
+    expect(saved.evidenceRefs).toEqual(expect.arrayContaining(["P3-PROOF", "P4-PROOF"]));   // 미완료 결과 위에 병합
+    database.close();
+  });
+});
