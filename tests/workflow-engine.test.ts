@@ -3916,3 +3916,31 @@ describe("Codex 감사 2026-09-14 — resume-implementation / 계약 교정 원�
     database.close();
   });
 });
+
+// 2026-09-14 Codex 후속 F01 — 미완료(status=in_progress) FIX 는 최종 리뷰를 사지 않고 같은 세션에서 계속 진행한다.
+describe("Codex 후속 F01 — 수정 턴의 완료 판정", () => {
+  it("in_progress FIX 는 계속 진행 턴을 열고 completed 뒤에만 최종 리뷰로 간다", async () => {
+    const review: AgentResult = { kind: "REVIEW", summary: "고칠 것 1", evidenceRefs: [], findings: [
+      finding("F-1", "고칠 것", { severity: "HIGH", disposition: "AGREED_ACTION" }),
+    ] };
+    const claude = new QueuedAdapter("claude", [
+      { kind: "FIX", summary: "절반 고침", findings: [finding("F-1", "고칠 것", { severity: "HIGH", disposition: "AGREED_ACTION" })], evidenceRefs: ["half"], status: "in_progress", remainingSteps: ["나머지 절반"] },
+      { kind: "FIX", summary: "전부 고침", findings: [finding("F-1", "고칠 것", { severity: "HIGH", disposition: "RESOLVED_BY_FIX" })], evidenceRefs: ["full"], status: "completed" },
+    ]);
+    const codex = new QueuedAdapter("codex", [{ kind: "FINAL_REVIEW", summary: "확인", findings: [finding("F-1", "고칠 것", { severity: "HIGH", disposition: "RESOLVED_BY_FIX" })], evidenceRefs: [] }]);
+    const { database, engine } = await makeReviewRecovery({
+      resumeState: "CLAUDE_FIX", implementationFindings: [], originalReviewFindings: review.findings, codexResult: review, claude, codex,
+    });
+    database.setImplementationSession("topic-1", "claude-implementation-session");
+    engine.retry("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+    const topic = database.getTopic("topic-1");
+    expect(topic.state, topic.lastError ?? "").toBe("READY_TO_DELIVER");
+    expect(claude.calls).toHaveLength(2);
+    expect(claude.calls[1]).toContain("계속 진행 1/4");
+    expect(claude.calls[1]).toContain("반환 kind 는 FIX");
+    expect(codex.calls).toHaveLength(1); // 최종 리뷰는 completed 뒤 한 번만
+    expect(database.getTimeline("topic-1").map((event) => event.body).some((body) => body.includes("같은 세션에서 계속 진행합니다"))).toBe(true);
+    database.close();
+  });
+});

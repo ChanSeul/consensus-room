@@ -1,4 +1,4 @@
-import { PlanRepairSchema, type PlanRepair, AgentResultSchema, type AgentResult } from "../../shared/contracts.js";
+import { PlanRepairSchema, type PlanRepair, AgentResultSchema, RESPONSE_LEDGER_LIMIT, type AgentResult } from "../../shared/contracts.js";
 import { redactSecrets } from "../../shared/workflow.js";
 
 // AgentResultJsonSchema는 선택 필드를 "required + null 허용"으로 표현한다 — OpenAI 구조화 출력이
@@ -27,8 +27,13 @@ function withoutNullOptionals(value: unknown): unknown {
   return record;
 }
 
+// 모델 한 번 응답의 원장 한도 — 누적 저장 계약(무제한)과 분리한다(F10). 서버 승계로 500행을 넘는 것은 저장 쪽 몫이다.
 function parseResult(value: unknown) {
-  return AgentResultSchema.safeParse(withoutNullOptionals(value));
+  const parsed = AgentResultSchema.safeParse(withoutNullOptionals(value));
+  if (parsed.success && (parsed.data.toleranceLedger?.length ?? 0) > RESPONSE_LEDGER_LIMIT) {
+    return { success: false as const, error: new Error(`toleranceLedger 가 한 번 응답 한도 ${RESPONSE_LEDGER_LIMIT}행을 넘습니다(서버가 앞 턴 원장을 승계하므로 이번 턴 변경분만 적으세요)`) };
+  }
+  return parsed;
 }
 
 export function parseAgentResult(candidates: unknown[], stdout: string): AgentResult {

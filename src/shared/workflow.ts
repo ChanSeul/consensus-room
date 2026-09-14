@@ -263,6 +263,8 @@ export function mergeCorrectionResult(original: AgentResult, corrected: AgentRes
   const result: AgentResult = {
     ...rest, summary, findings: [...corrected.findings, ...keptFindings], evidenceRefs: [...evidence, ...keptEvidence],
     ...(decision !== undefined ? { requestedUserDecision: decision } : {}),
+    // 해소 표식은 최종 병합·소비까지 유지한다 — 실패 원본 복구와 교정 병합이 겹치면 바깥 병합이 원래 질문을 되살렸다(F08).
+    ...(resolved ? { resolvesRequestedDecision: true } : {}),
     ...(corrected.status ?? original.status ? { status: corrected.status ?? original.status } : {}),
     ...(corrected.remainingSteps ?? original.remainingSteps ? { remainingSteps: corrected.remainingSteps ?? original.remainingSteps } : {}),
   };

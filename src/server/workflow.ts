@@ -485,6 +485,15 @@ export class WorkflowEngine {
     });
   }
 
+  // 도구 트리 기준 재설정(F04) — 중재자가 tools_sync 로 되돌리거나 새 핀을 배치한 뒤 부른다. 실행 중이면 거부.
+  async rebaselineToolTree(topicId: string, reason: string, origin?: CallOrigin): Promise<Topic> {
+    this.core.assertNoActiveWork(topicId);
+    const topic = this.core.dependencies.database.getTopic(topicId);
+    const controller = new AbortController();
+    await this.delivery.writeToolTreeBaseline(topic, controller.signal, `${reason}${origin ? " (중재자 위임 호출)" : ""}`);
+    return this.core.dependencies.database.getTopic(topicId);
+  }
+
   async postMessage(
     topicId: string,
     kind: "note" | "evidence" | "decision",
@@ -538,7 +547,7 @@ export class WorkflowEngine {
       kind,
       state: topic.state,
       body: redactSecrets(body),
-      payload: requestKey ? { requestKey, requestAction: `message:${kind}` } : {},
+      payload: { ...(origin ? { origin } : {}), ...(requestKey ? { requestKey, requestAction: `message:${kind}` } : {}) },
     });
     if ((kind === "evidence" && topic.state === "BLOCKED_ON_EVIDENCE") ||
         (kind === "decision" && topic.state === "USER_DECISION_REQUIRED")) {

@@ -105,7 +105,8 @@ export function loadConfig(overrides: Partial<ServerConfig> = {}): ServerConfig 
     topicsDirectory: resolve(overrides.topicsDirectory ?? join(dataDirectory, "topics")),
     worktreesDirectory: resolve(overrides.worktreesDirectory ?? join(dataDirectory, "worktrees")),
     databasePath: resolve(overrides.databasePath ?? join(dataDirectory, "consensus-room.sqlite")),
-    webDirectory: resolve(overrides.webDirectory ?? join(process.cwd(), "dist")),
+    // 후보 웹 출력 디렉터리(restart_room.sh 가 커밋별로 만든다, F12). 없으면 종전대로 dist.
+    webDirectory: resolve(overrides.webDirectory ?? process.env.CONSENSUS_ROOM_WEB_DIR ?? join(process.cwd(), "dist")),
     repositoryPath: resolve(overrides.repositoryPath ?? SAMPLE_IOS_REPOSITORY),
     memoryDirectory: resolve(overrides.memoryDirectory ?? SAMPLE_IOS_MEMORY_DIRECTORY),
     claudeSkillDirectories: (overrides.claudeSkillDirectories ?? CLAUDE_SKILL_DIRECTORIES).map((path) => resolve(path)),

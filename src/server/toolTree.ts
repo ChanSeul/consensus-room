@@ -2,7 +2,7 @@
 // (2026-09-14 사용자 지시 "러너는 앱 코드만"). 프롬프트 문구만으로는 권한이 아니다(Codex 감사 R02) — 어댑터는 이 경로들을
 // 쓰기 거부에 넣고, 엔진은 턴 전후의 다이제스트를 대조해 바뀌었으면 턴을 실패시킨다(git 은 ignored 파일을 보지 않으므로 별도 검사).
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, statSync, lstatSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, readlinkSync, statSync, lstatSync } from "node:fs";
 import { join, relative } from "node:path";
 
 export const TOOL_TREE_SUBDIRECTORIES = ["scripts", "bootstrap", "stages", "selftest"] as const;
@@ -34,7 +34,7 @@ export function digestToolTrees(workspace: string): ToolTreeDigest {
       const path = join(dir, entry.name);
       const st = lstatSync(path);
       const rel = relative(workspace, path);
-      if (st.isSymbolicLink()) { lines.push(`${rel}\0link\0${readlinkSafe(path)}`); continue; }
+      if (st.isSymbolicLink()) { lines.push(`${rel}\0link\0${readlinkSync(path)}\0${linkTargetKind(path)}`); continue; }
       if (st.isDirectory()) { walk(root, path); continue; }
       if (!st.isFile()) { lines.push(`${rel}\0other`); continue; }
       const hash = createHash("sha256").update(readFileSync(path)).digest("hex");
@@ -45,6 +45,7 @@ export function digestToolTrees(workspace: string): ToolTreeDigest {
   return { directories, files: lines.length, sha256: createHash("sha256").update(lines.join("\n")).digest("hex") };
 }
 
-function readlinkSafe(path: string): string {
-  try { return statSync(path).isDirectory() ? `dir:${path}` : `file:${path}`; } catch { return "dangling"; }
+// 심링크는 **대상 문자열**과 대상 종류를 해시한다 — 링크 자신의 경로를 해시하면 대상을 바꿔도 지문이 같았다(F04).
+function linkTargetKind(path: string): string {
+  try { return statSync(path).isDirectory() ? "dir" : "file"; } catch { return "dangling"; }
 }

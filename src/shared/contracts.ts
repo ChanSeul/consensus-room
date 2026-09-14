@@ -170,8 +170,9 @@ export const AgentResultSchema = z.object({
   resolvesRequestedDecision: z.boolean().optional(),
   memoryUpdates: z.array(MemoryUpdateSchema).max(10).optional(),
   // 허용 오차 원장 — 승인 범위 밖 변경마다 {ruleId, file, note}. 서버가 git diff 와 대조한다(shared/tolerance.ts).
-  // 상한은 모델 한 번 응답이 아니라 서버 누적 원장(승계 포함)의 저장 계약이다 — 규칙이 파일 1,000개까지 허용하므로 그보다 크게(R06).
-  toleranceLedger: z.array(ToleranceLedgerEntrySchema).max(5000).optional(),
+  // 서버 누적 원장(승계 포함)의 저장 계약엔 상한이 없다 — 상한은 정책(규칙 수×파일 수)이 정하고, 모델 한 번 응답의 상한(500행)은
+  // 어댑터 결과 파서가 따로 검사한다(F10: 응답 한도와 누적 저장 계약의 분리).
+  toleranceLedger: z.array(ToleranceLedgerEntrySchema).optional(),
  }).superRefine((result, context) => {
   if (result.planLineEdits && (result.kind !== "REVISION" || result.planEdits !== undefined || result.planMarkdown !== undefined)) {
     context.addIssue({ code: "custom", message: "planLineEdits는 REVISION에서 단독으로 사용해야 합니다." });
@@ -329,6 +330,10 @@ export const ResumeImplementationInputSchema = z.object({
   reason: z.string().trim().min(1).max(4000),
 });
 export type ResumeImplementationInput = z.infer<typeof ResumeImplementationInputSchema>;
+
+// 도구 트리 기준 재설정(중재자, 재동기화 뒤) — 감지된 변경을 "복구했다" 고 선언하는 유일한 경로(F04).
+export const ReasonInputSchema = z.object({ reason: z.string().trim().min(1).max(4000) });
+export const RESPONSE_LEDGER_LIMIT = 500;
 
 export const AmendToleranceInputSchema = z.object({
   tolerance: z.unknown(),

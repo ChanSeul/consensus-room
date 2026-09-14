@@ -567,3 +567,38 @@ it("리뷰 1회 승인은 지정된 검토만 늘리고 예산 부족 시 재개
   expect(database.reviews.account("review","planning")).toMatchObject({used:0,limit:3});expect(adapterCalls).toHaveLength(0);
  } finally {await app.close();}
 });
+
+
+// 2026-09-14 Codex 후속 F07 — 위임 스위치는 사용자만, 증거 게시는 OFF 에서도, 중재자 결정의 origin 보존.
+describe("Codex 후속 F07 — 중재자 권한 경계", () => {
+  const token = { "x-consensus-token": "launch-token-for-test" };
+  it("OFF 상태에서 중재자 헤더로 위임을 ON 으로 바꿀 수 없다(403)", async () => {
+    const { app } = await makeApp();
+    try {
+      const off = await app.inject({ method: "POST", url: "/api/mediation-autonomy", headers: { ...token, "idempotency-key": "f07-off" }, payload: { autonomy: "off", note: "audit" } });
+      expect(off.statusCode).toBe(200);
+      const enabled = await app.inject({ method: "POST", url: "/api/mediation-autonomy", headers: { ...token, "x-consensus-actor": "mediator", "idempotency-key": "f07-self" }, payload: { autonomy: "on", note: "self" } });
+      expect(enabled.statusCode).toBe(403);
+      const view = await app.inject({ method: "GET", url: "/api/mediation-autonomy", headers: token });
+      expect(view.json().autonomy).toBe("off");
+    } finally { await app.close(); }
+  });
+  it("OFF 에서도 증거 게시는 되고 결정 대행은 403 이며, ON 중재자 결정은 origin 을 남긴다", async () => {
+    const { app, database } = await makeApp();
+    try {
+      draftTopic(database, "f07-topic");
+      const headers = { ...token, "x-consensus-actor": "mediator" };
+      await app.inject({ method: "POST", url: "/api/mediation-autonomy", headers: { ...token, "idempotency-key": "f07-off2" }, payload: { autonomy: "off", note: "audit" } });
+      const evidence = await app.inject({ method: "POST", url: "/api/topics/f07-topic/messages", headers: { ...headers, "idempotency-key": "f07-ev" }, payload: { kind: "evidence", body: "측정 결과 게시" } });
+      expect(evidence.statusCode).toBe(200);
+      const decisionOff = await app.inject({ method: "POST", url: "/api/topics/f07-topic/messages", headers: { ...headers, "idempotency-key": "f07-dec-off" }, payload: { kind: "decision", body: "대행 결정" } });
+      expect(decisionOff.statusCode).toBe(403);
+      await app.inject({ method: "POST", url: "/api/mediation-autonomy", headers: { ...token, "idempotency-key": "f07-on" }, payload: { autonomy: "on", note: "user" } });
+      database.updateTopic("f07-topic", { state: "USER_DECISION_REQUIRED" });
+      const decisionOn = await app.inject({ method: "POST", url: "/api/topics/f07-topic/messages", headers: { ...headers, "idempotency-key": "f07-dec-on" }, payload: { kind: "decision", body: "위임 결정" } });
+      expect(decisionOn.statusCode).toBe(200);
+      const saved = database.getTimeline("f07-topic").find((event) => event.body === "위임 결정");
+      expect(saved?.payload?.origin).toMatchObject({ actor: "mediator" });
+    } finally { await app.close(); }
+  });
+});

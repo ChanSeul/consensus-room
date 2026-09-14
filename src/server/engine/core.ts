@@ -430,7 +430,11 @@ export class EngineCore {
     }
     const correctionRevision=(this.dependencies.database.latestArtifact(topic.id,"contract-repair-source")?.revision ?? 0)+1;
     // 보관은 계약 검증 없이 가린다 — 계약을 어긴 응답을 스키마로 다시 파싱하면 보관에서 죽어 교정에 못 간다(Codex 감사 R08).
-    await this.writeArtifact(topic,"contract-repair-source",correctionRevision,JSON.stringify(redactUnverifiedResult(raw)),context.signal);
+    // 세대·계획 sha·상태에 결속해 보관한다 — 교정이 실패하면 재개(delivery.pendingResultOriginal)가 이 원본을 소비한다(F03).
+    await this.writeArtifact(topic,"contract-repair-source",correctionRevision,JSON.stringify({
+      kind: "contract-repair-source", scopeGeneration: topic.scopeGeneration, planSHA256: topic.planSHA256, state: topic.state,
+      original: redactUnverifiedResult(raw),
+    }),context.signal);
     this.event(topic.id, "system", "system",
       `기계 계약 위반을 같은 세션에 돌려보내 1회 교정합니다${formatOnly ? "(표기 교정 — 추론 low)" : ""}: ${violation}`);
     const settings = this.executionSettings(topic.id, role, context.implementation);

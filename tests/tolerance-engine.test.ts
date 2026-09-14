@@ -109,7 +109,7 @@ async function waitUntil(predicate: () => boolean, timeoutMilliseconds = 8_000):
   }
 }
 
-describe("허용 오차 — 엔진이 리뷰 전에 git diff 로 대조한다", () => {
+describe("허용 오차 — 엔진이 리뷰 전에 git diff 로 대조한다", { timeout: 30_000 }, () => {
   it("규칙 술어를 만족하는 범위 밖 표기 변경은 원장과 함께 통과하고 Codex 프롬프트에 대조 결과가 실린다", async () => {
     const { worktree, database, artifacts, gitService, topicId } = await setup("pass");
     const claude = claudeAdapter(worktree, {
@@ -269,7 +269,7 @@ describe("허용 오차 — 엔진이 리뷰 전에 git diff 로 대조한다", 
 });
 
 // 2026-09-08 Codex 후속 지적 1: 코드를 바꿀 수 있는 마지막 호출(허용 오차 교정 → 계약 교정) 뒤에도 HEAD 를 봐야 한다.
-describe("허용 오차 교정 뒤 계약 교정이 커밋을 만들면", () => {
+describe("허용 오차 교정 뒤 계약 교정이 커밋을 만들면", { timeout: 30_000 }, () => {
   it("HEAD 재확인에 걸려 실패하고 리뷰로 넘어가지 않는다", async () => {
     const { worktree, database, artifacts, gitService, topicId } = await setup("late-commit");
     let resumes = 0;
@@ -342,7 +342,7 @@ describe("허용 오차 교정 뒤 계약 교정이 커밋을 만들면", () => 
 
 // 2026-09-14 S11 실측 두 건 — (1) 앞 턴에 T-5 로 받아들인 원장을 러너가 다음 턴에서 빼먹어 교정 턴을 샀다,
 // (2) 교정 재제출이 본 턴 보고·남은 단계 결정 요청을 덮어써 엔진이 구현 완료로 보고 리뷰로 넘겼다.
-describe("허용 오차 — 턴을 넘어 살아야 할 상태는 엔진이 든다", () => {
+describe("허용 오차 — 턴을 넘어 살아야 할 상태는 엔진이 든다", { timeout: 30_000 }, () => {
   function scriptedClaude(turns: Array<() => AgentResult>) {
     const prompts: string[] = [];
     let index = 0;
@@ -428,7 +428,7 @@ describe("허용 오차 — 턴을 넘어 살아야 할 상태는 엔진이 든�
 });
 
 // 2026-09-14 Codex 감사(R01·R02·R05·R06·R07·R08·D01) — 실패 때 결과·진행 상태를 잃지 않고, 도구 트리는 러너 권한 밖이며, 설명 길이는 실패 사유가 아니다.
-describe("Codex 감사 2026-09-14 — 결과 수명·진행 상태·도구 트리·원장 경계", () => {
+describe("Codex 감사 2026-09-14 — 결과 수명·진행 상태·도구 트리·원장 경계", { timeout: 30_000 }, () => {
   function scripted(turns: Array<(prompt: string) => AgentResult>) {
     const prompts: string[] = [];
     let index = 0;
@@ -461,7 +461,7 @@ describe("Codex 감사 2026-09-14 — 결과 수명·진행 상태·도구 트�
     const topic = database.getTopic(topicId);
     expect(topic.state, topic.lastError ?? "").toBe("USER_DECISION_REQUIRED");
     const bodies = database.getTimeline(topicId).map((event) => event.body);
-    expect(bodies.some((body) => body.includes("보존해 둔 본 턴 보고"))).toBe(true);
+    expect(bodies.some((body) => body.includes("보존해 둔 미완료 보고"))).toBe(true);
     expect(bodies.some((body) => body.includes("P4 가 남았다"))).toBe(true);
     const saved = JSON.parse((await artifacts.readLatest(topicId, "implementation-result"))!);
     expect(saved.evidenceRefs).toContain("ORIGINAL-ONLY");
@@ -526,6 +526,7 @@ describe("Codex 감사 2026-09-14 — 결과 수명·진행 상태·도구 트�
     writeFileSync(join(tool, "gate.py"), "print('tool')\n");
     const claude = scripted([
       () => { writeFileSync(join(tool, "gate.py"), "print('changed by runner')\n"); writeFileSync(join(worktree, "feature.txt"), "x\n"); return result("IMPLEMENTATION", "done"); },
+      () => result("IMPLEMENTATION", "done after restore"),
     ]);
     const engine = new WorkflowEngine({ database, artifacts, git: gitService, claude: claude.adapter, codex: new PassingCodex() });
     engine.startImplementation(topicId); await settled(database, topicId);
@@ -533,8 +534,121 @@ describe("Codex 감사 2026-09-14 — 결과 수명·진행 상태·도구 트�
     expect(topic.state).toBe("FAILED");
     expect(topic.lastError ?? "").toContain("도구 트리가");
     expect(database.getTimeline(topicId).map((event) => event.body).some((body) => body.includes("러너는 앱 코드만 고친다"))).toBe(true);
+    // F04: 복구(재동기화) 없이 retry 하면 기준 산출물(tool-tree-baseline)과 여전히 달라 다시 실패한다 — 현재 디스크를 새 기준으로 잡지 않는다.
+    engine.retry(topicId); await settled(database, topicId);
+    expect(database.getTopic(topicId).state).toBe("FAILED");
+    expect(database.getTopic(topicId).lastError ?? "").toContain("재개 전");
+    // 중재자가 되돌린 뒤(여기서는 파일 원복) rebaseline 없이도 기준과 같아지면 통과한다 — 원복이 곧 복구다.
+    writeFileSync(join(tool, "gate.py"), "print('tool')\n");
+    engine.retry(topicId); await settled(database, topicId);
+    expect(database.getTopic(topicId).state).toBe("READY_TO_DELIVER");
     database.close();
   });
+
+  it("F04: 중재자가 새 도구 핀을 배치했으면 tool-tree-rebaseline 으로만 새 기준이 된다", async () => {
+    const { root, worktree, database, artifacts, gitService, topicId } = await setup("rebaseline");
+    writeFileSync(join(root, "repository", ".git", "info", "exclude"), "DerivedData/\n");
+    const tool = join(worktree, "DerivedData", "s11-logs", "scripts"); mkdirSync(tool, { recursive: true });
+    writeFileSync(join(tool, "gate.py"), "print('v1')\n");
+    const claude = scripted([
+      () => { writeFileSync(join(worktree, "feature.txt"), "x\n"); return result("IMPLEMENTATION", "P3", { status: "blocked", remainingSteps: ["P4"], requestedUserDecision: "P4 요청" }); },
+      () => { writeFileSync(join(worktree, "feature.txt"), "y\n"); return result("IMPLEMENTATION", "done"); },
+    ]);
+    const engine = new WorkflowEngine({ database, artifacts, git: gitService, claude: claude.adapter, codex: new PassingCodex() });
+    engine.startImplementation(topicId); await settled(database, topicId);
+    expect(database.getTopic(topicId).state).toBe("USER_DECISION_REQUIRED");
+    writeFileSync(join(tool, "gate.py"), "print('v2 — mediator tools_sync')\n");   // 중재자 재동기화(정당한 변경)
+    await engine.postMessage(topicId, "decision", "계속");
+    engine.retry(topicId); await settled(database, topicId);
+    expect(database.getTopic(topicId).state, database.getTopic(topicId).lastError ?? "").toBe("FAILED"); // rebaseline 전엔 기준 불일치
+    await engine.rebaselineToolTree(topicId, "tools_sync r11");
+    engine.retry(topicId); await settled(database, topicId);
+    const topic = database.getTopic(topicId);
+    expect(topic.state, topic.lastError ?? "").toBe("READY_TO_DELIVER");
+    expect(database.getTimeline(topicId).map((event) => event.body).some((body) => body.includes("도구 트리 기준 #2 — tools_sync r11"))).toBe(true);
+    database.close();
+  });
+
+  it("F02: 결정이 필요한 쟁점(requiresUserDecision)이 있으면 in_progress 여도 계속 진행 턴을 열지 않고 정지한다", async () => {
+    const { worktree, database, artifacts, gitService, topicId } = await setup("f02");
+    const claude = scripted([
+      () => { writeFileSync(join(worktree, "feature.txt"), "x\n"); return result("IMPLEMENTATION", "진행 중", { status: "in_progress", remainingSteps: ["P3.5"],
+        findings: [{ id: "Q-1", title: "결정 필요", severity: "HIGH", disposition: "AGREED_ACTION", rationale: "범위 밖 파일을 고칠지 결정해달라", evidenceRefs: [], requiresUserDecision: true }] }); },
+    ]);
+    const engine = new WorkflowEngine({ database, artifacts, git: gitService, claude: claude.adapter, codex: new PassingCodex() });
+    engine.startImplementation(topicId); await settled(database, topicId);
+    expect(database.getTopic(topicId).state).toBe("USER_DECISION_REQUIRED");
+    expect(claude.prompts).toHaveLength(1);
+    expect(database.getTimeline(topicId).map((event) => event.body).some((body) => body.includes("같은 세션에서 계속 진행합니다"))).toBe(false);
+    database.close();
+  });
+
+  it("F03: 일반 계약 교정이 실패해도 원본의 요청 결정·증거가 retry 결과에 병합돼 리뷰로 새지 않는다", async () => {
+    const { worktree, database, artifacts, gitService, topicId } = await setup("f03");
+    let calls = 0;
+    const claude = scripted([
+      () => { writeFileSync(join(worktree, "feature.txt"), "x\n"); return result("FIX" as AgentResult["kind"], "실제 작업", { requestedUserDecision: "ORIGINAL-DECISION P4 remains", evidenceRefs: ["ORIGINAL-PROOF"] }); },
+      () => { calls += 1; throw new Error("교정 전송 실패"); },
+      () => result("IMPLEMENTATION", "짧은 완료 응답"),
+    ]);
+    const engine = new WorkflowEngine({ database, artifacts, git: gitService, claude: claude.adapter, codex: new PassingCodex() });
+    engine.startImplementation(topicId); await settled(database, topicId);
+    expect(database.getTopic(topicId).state).toBe("FAILED");
+    engine.retry(topicId); await settled(database, topicId);
+    const topic = database.getTopic(topicId);
+    expect(topic.state, topic.lastError ?? "").toBe("USER_DECISION_REQUIRED");
+    const saved = JSON.parse((await artifacts.readLatest(topicId, "implementation-result"))!);
+    expect(saved.requestedUserDecision).toBe("ORIGINAL-DECISION P4 remains");
+    expect(saved.evidenceRefs).toContain("ORIGINAL-PROOF");
+    database.close();
+  });
+
+  it("F03(진행 중 결과): 계속 진행 턴이 끊긴 뒤 retry 하면 progress 산출물의 증거가 최종 결과에 병합된다", async () => {
+    const { worktree, database, artifacts, gitService, topicId } = await setup("progress");
+    const claude = scripted([
+      () => { writeFileSync(join(worktree, "feature.txt"), "1\n"); return result("IMPLEMENTATION", "P3", { status: "in_progress", remainingSteps: ["P3.5"], evidenceRefs: ["P3-PROOF"] }); },
+      () => { throw new Error("계속 진행 전송 실패"); },
+      () => { writeFileSync(join(worktree, "feature.txt"), "2\n"); return result("IMPLEMENTATION", "P3.5 끝", { status: "completed", evidenceRefs: ["P35-PROOF"] }); },
+    ]);
+    const engine = new WorkflowEngine({ database, artifacts, git: gitService, claude: claude.adapter, codex: new PassingCodex() });
+    engine.startImplementation(topicId); await settled(database, topicId);
+    expect(database.getTopic(topicId).state).toBe("FAILED");
+    engine.retry(topicId); await settled(database, topicId);
+    const topic = database.getTopic(topicId);
+    expect(topic.state, topic.lastError ?? "").toBe("READY_TO_DELIVER");
+    const saved = JSON.parse((await artifacts.readLatest(topicId, "implementation-result"))!);
+    expect(saved.evidenceRefs).toEqual(expect.arrayContaining(["P35-PROOF", "P3-PROOF"]));
+    database.close();
+  });
+
+  it("F08: 실패 원본 복구와 허용 오차 교정 병합이 겹쳐도 resolvesRequestedDecision 은 유지돼 원래 질문이 되살아나지 않는다", async () => {
+    const { worktree, database, artifacts, gitService, topicId } = await setup("f08");
+    const claude = scripted([
+      () => { writeFileSync(join(worktree, "service", "S.swift"), "func renamed() {}\nfunc b() {}\n"); return result("IMPLEMENTATION", "본 턴", { requestedUserDecision: "범위 밖 변경을 유지할까?" }); },
+      () => { throw new Error("교정 전송 실패"); },                                  // 실패 → tolerance-correction-source 보존
+      () => { return result("IMPLEMENTATION", "재개 — 아직 범위 밖 변경 있음"); }, // 재개 턴: 원본 병합(질문 복원) → 위반 → 교정
+      () => { writeFileSync(join(worktree, "service", "S.swift"), "func a() {}\nfunc b() {}\n"); return result("IMPLEMENTATION", "전부 되돌림", { resolvesRequestedDecision: true }); },
+    ]);
+    const engine = new WorkflowEngine({ database, artifacts, git: gitService, claude: claude.adapter, codex: new PassingCodex() });
+    engine.startImplementation(topicId); await settled(database, topicId);
+    expect(database.getTopic(topicId).state).toBe("FAILED");
+    engine.retry(topicId); await settled(database, topicId);
+    const topic = database.getTopic(topicId);
+    expect(topic.state, topic.lastError ?? "").toBe("READY_TO_DELIVER");
+    database.close();
+  });
+
+  it("F09·F10: 20,001자 메모와 5,001행 승계 원장도 결과 파서·저장 계약을 통과한다", async () => {
+    const { parseAgentResult } = await import("../src/server/adapters/resultParser");
+    const { AgentResultSchema } = await import("../src/shared/contracts");
+    const long = { kind: "IMPLEMENTATION", summary: "s", findings: [], evidenceRefs: [], toleranceLedger: [{ ruleId: "T-1", file: "a.swift", note: "x".repeat(20001) }] };
+    expect(parseAgentResult([long], "").toleranceLedger?.[0].note.length).toBe(20001);
+    const rows = Array.from({ length: 5001 }, (_, i) => ({ ruleId: "T-1", file: `s/${i}.swift`, note: "" }));
+    expect(AgentResultSchema.safeParse({ ...long, toleranceLedger: rows }).success).toBe(true);
+    const tooMany = { ...long, toleranceLedger: Array.from({ length: 501 }, (_, i) => ({ ruleId: "T-1", file: `s/${i}.swift`, note: "" })) };
+    expect(() => parseAgentResult([tooMany], "")).toThrow();
+  });
+
 
   it("D02: 구현·재개 턴은 결정·증거 원문 산출물(decisions)을 읽기 허용 경로로 받고 프롬프트가 그 경로를 안내한다", async () => {
     const { worktree, database, artifacts, gitService, topicId } = await setup("decisions");

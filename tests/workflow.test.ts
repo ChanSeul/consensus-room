@@ -760,8 +760,10 @@ describe("mergeCorrectionResult — resolvesRequestedDecision / salvageResultFie
     const corrected: AgentResult = { ...base, summary: "전부 되돌렸다", resolvesRequestedDecision: true };
     const merged = mergeCorrectionResult(original, corrected);
     expect(merged.result.requestedUserDecision).toBeUndefined();
-    expect("resolvesRequestedDecision" in merged.result).toBe(false);
+    expect(merged.result.resolvesRequestedDecision).toBe(true); // 중첩 병합까지 해소 표식 유지(F08)
     expect(merged.preserved).not.toContain("요청 결정");
+    const outer = mergeCorrectionResult({ ...base, requestedUserDecision: "원래 질문(실패 원본)" }, merged.result);
+    expect(outer.result.requestedUserDecision).toBeUndefined();
   });
   it("salvageResultFields 는 개별로 유효한 필드만 건진다(깨진 쟁점은 버리고 유효한 결정·증거·상태는 남긴다)", () => {
     const raw = { kind: "FIX", summary: "실제 작업", requestedUserDecision: "ORIGINAL-DECISION", evidenceRefs: ["PROOF", 3],

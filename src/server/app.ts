@@ -1,6 +1,7 @@
 import {ReviewGrantInputSchema} from "../shared/reviews.js";
 import { readFileSync } from "node:fs";
 import {
+  ReasonInputSchema,
   ResumeImplementationInputSchema, AmendToleranceInputSchema } from "../shared/contracts.js";
 import { RevisionGrantInputSchema } from "../shared/revisions.js";
 import { WorkGroupInputSchema } from "../shared/workGroups.js";
@@ -74,7 +75,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   // 중재 세션의 호출은 헤더 x-consensus-actor: mediator 로 구분한다. 결정·승인·실행·인도 류는 위임 스위치(mediation-autonomy.json)가
   // on 일 때만 받는다(off 면 403) — "중재자가 사용자와 같은 인증으로 무엇이든 부른다" 를 닫는다(2026-09-14 Codex 감사 D03).
   const delegationPath = join(config.dataDirectory, "mediation-autonomy.json");
-  const DELEGATED_ACTIONS = new Set(["approve", "implement", "commit", "push", "close", "review-resume", "revision-resume", "budget-configure", "budget-resume", "amend-tolerance", "resume-implementation", "reconcile-delivery", "discard-orphan-commit"]);
+  const DELEGATED_ACTIONS = new Set(["approve", "implement", "tool-tree-rebaseline", "commit", "push", "close", "review-resume", "revision-resume", "budget-configure", "budget-resume", "amend-tolerance", "resume-implementation", "reconcile-delivery", "discard-orphan-commit"]);
   const callOrigin = (request: { headers: Record<string, unknown> }, subject: string): CallOrigin | undefined => {
     if (request.headers["x-consensus-actor"] !== "mediator") return undefined;
     let doc: { autonomy?: string; set_at?: string } = {};
@@ -120,8 +121,9 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     return runIdempotent(request,reply,globalLedger(database,"work-group:create"),201,key=>workGroups.create(input,id=>database.annotateGlobalRequest("work-group:create",key,{plannedGroupId:id})));
   });
   app.post<{Params:{id:string}}>("/api/work-groups/:id/next",async(request,reply)=>
-    runIdempotent(request,reply,globalLedger(database,`work-group:next:${request.params.id}`),201,key=>workGroups.next(request.params.id,(plannedTopicId,worktreePath)=>database.annotateGlobalRequest(`work-group:next:${request.params.id}`,key,{plannedTopicId,worktreePath}))));
+    (callOrigin(request, "work-group:next"), runIdempotent(request,reply,globalLedger(database,`work-group:next:${request.params.id}`),201,key=>workGroups.next(request.params.id,(plannedTopicId,worktreePath)=>database.annotateGlobalRequest(`work-group:next:${request.params.id}`,key,{plannedTopicId,worktreePath})))));
   app.post<{Params:{id:string}}>("/api/work-groups/:id/budget",async(request,reply)=>{
+    callOrigin(request, "work-group:budget");
     const body=request.body as {policy:unknown;version:number};
     const policy=BudgetPolicySchema.parse(body?.policy);
     return runIdempotent(request,reply,globalLedger(database,`work-group:budget:${request.params.id}`),200,key=>{
@@ -189,6 +191,10 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   // 자율 중재 위임 스위치 — 웹 토글과 셸 스크립트가 같은 파일(`mediation-autonomy.json`)을 공유한다.
   app.get("/api/mediation-autonomy", async () => readMediationAutonomy(config.dataDirectory));
   app.post("/api/mediation-autonomy", async (request, reply) => {
+    // 위임 변경은 사용자 권한이다 — 중재자 호출(헤더)은 OFF 를 스스로 ON 으로 바꿀 수 없다(F07).
+    if (request.headers["x-consensus-actor"] === "mediator") {
+      throw Object.assign(new Error("위임 스위치는 사용자만 바꿀 수 있습니다(중재자 호출 거부)."), { statusCode: 403 });
+    }
     const input = UpdateMediationAutonomyInputSchema.parse(request.body);
     return runIdempotent(request, reply, globalLedger(database, "mediation-autonomy:set"), 200, () =>
       writeMediationAutonomy(config.dataDirectory, { autonomy: input.autonomy, note: input.note, setBy: "web" }));
@@ -304,7 +310,8 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   app.post<{ Params: { id: string } }>("/api/topics/:id/messages", async (request, reply) => {
     const input = PostMessageInputSchema.parse(request.body);
     const ledger = actionLedger(database, request.params.id, `message:${input.kind}`);
-    const origin = input.kind === "note" ? undefined : callOrigin(request, `message:${input.kind}`);
+    // 위임 검사는 결정 대행(decision)에만 — 증거 게시·메모는 계약상 OFF 에서도 중재자가 한다(README 위임 표, F07).
+    const origin = input.kind === "decision" ? callOrigin(request, `message:${input.kind}`) : (request.headers["x-consensus-actor"] === "mediator" ? { actor: "mediator" as const, delegationSetAt: null } : undefined);
     return runIdempotent(request, reply, ledger, 200, (idempotencyKey) => input.kind === "scope_change"
       ? workflow.handleScopeChange(request.params.id, input.body, idempotencyKey)
       : workflow.postMessage(request.params.id, input.kind, input.body, idempotencyKey, origin));
@@ -326,6 +333,10 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       if(action === "resume-implementation") {
         const input = ResumeImplementationInputSchema.parse(request.body);
         response = accepted(randomUUID(), workflow.resumeImplementation(topicId, input, origin));
+      }
+      else if(action === "tool-tree-rebaseline") {
+        const input = ReasonInputSchema.parse(request.body);
+        response = accepted(randomUUID(), await workflow.rebaselineToolTree(topicId, input.reason, origin));
       }
       else if(action === "review-resume") {
         workflow.assertBudgetEditable(topicId);

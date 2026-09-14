@@ -477,14 +477,14 @@ function decisionsSection(path?: string | null): string {
 }
 
 // 러너가 status=in_progress 로 멈춘 뒤 같은 세션에서 여는 "계속 진행" 턴 — 새 결정이 아니라 남은 단계의 이행 요청이다(D01).
-export function buildContinuationPrompt(remainingSteps: readonly string[], round: number, limit: number): string {
-  return `직전 결과가 status=in_progress 였습니다(계속 진행 ${round}/${limit}). 같은 승인 범위에서 남은 단계를 이어서 수행하세요.
+export function buildContinuationPrompt(remainingSteps: readonly string[], round: number, limit: number, kind: "IMPLEMENTATION" | "FIX" = "IMPLEMENTATION"): string {
+  return `직전 결과가 status=in_progress 였습니다(계속 진행 ${round}/${limit}). 같은 승인 범위에서 남은 단계를 이어서 수행하세요. 반환 kind 는 ${kind} 입니다.
 남은 단계(직전 제출):
 ${remainingSteps.length ? remainingSteps.map((step) => `- ${step}`).join("\n") : "- (명시 없음 — 계획의 다음 단계)"}
 
 규칙: 결과 JSON 은 이번 턴까지 누적된 보고입니다(직전 findings·evidenceRefs 는 서버가 병합해 보존합니다). 모든 단계가 끝났으면 status=completed, 아직이면 status=in_progress + remainingSteps, 중재자·사용자 입력이 필요하면 status=blocked + requestedUserDecision. 허용 오차 원장(toleranceLedger)은 워킹트리에 남아 있는 범위 밖 변경 전부를 다시 적으세요.
 
-${dispositionContract("IMPLEMENTATION")}`;
+${dispositionContract(kind)}`;
 }
 
 export function buildClaudeFixPrompt(input: {

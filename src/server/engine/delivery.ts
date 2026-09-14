@@ -3,7 +3,7 @@
 import {
   AgentResultSchema, DeliveryInputSchema, type AgentResult, type Finding, type TimelineEvent, type Topic, type WorkflowState,
 } from "../../shared/contracts.js";
-import { digestToolTrees } from "../toolTree.js";
+import { digestToolTrees, type ToolTreeDigest } from "../toolTree.js";
 import { redactUnverifiedResult } from "../security.js";
 import {
   buildContinuationPrompt,
@@ -24,6 +24,7 @@ import {
   carryForwardFindings,
   implementationInProgress,
   mergeCorrectionResult,
+  salvageResultFields,
   mergeFindingSources,
 } from "../../shared/workflow.js";
 import { normalizeCommitPaths } from "../git.js";
@@ -79,17 +80,19 @@ export class DeliveryPipeline {
     // 결정·증거 원문 산출물(읽기 허용) — 세션 압축 뒤에도 원문을 다시 찾을 수 있다(Codex 감사 D02).
     const decisionsPath = await this.writeDecisionsDigest(topic, signal);
     const readablePaths = [planPath, decisionsPath];
-    // 직전 허용 오차 교정이 실패로 끝났으면 그 원본(요약·쟁점·증거·요청 결정)을 이번 결과에 병합한다(Codex 감사 R01 ①).
-    const pendingOriginal = await this.pendingCorrectionOriginal(topicId, topic, "IMPLEMENTING");
+    // 직전 교정(허용 오차·계약)이 실패했거나 계속 진행 턴이 끊겼으면 보존해 둔 미완료 결과를 이번 결과에 병합한다(R01·F03).
+    const pendingOriginal = await this.pendingResultOriginal(topicId, topic, "IMPLEMENTING");
     const baseNormalizer = this.core.carryForwardNormalizer(noteFindings, "Claude implementation");
     const normalize = pendingOriginal
       ? (result: AgentResult) => baseNormalizer(mergeCorrectionResult(pendingOriginal, result).result)
       : baseNormalizer;
     if (pendingOriginal) {
       this.core.event(topicId, "system", "system",
-        "직전 허용 오차 교정이 실패로 끝나 보존해 둔 본 턴 보고(요약·쟁점·증거·요청 결정)를 이번 재개 결과에 병합합니다.", { pendingCorrectionMerged: true });
+        "직전 턴이 교정·계속 진행 도중 끊겨 보존해 둔 미완료 보고(요약·쟁점·증거·요청 결정)를 이번 재개 결과에 병합합니다.", { pendingCorrectionMerged: true });
     }
-    const toolTreesBefore = digestToolTrees(topic.worktreePath);
+    // 도구 트리 기준은 산출물(tool-tree-baseline)이다 — 감지된 변경은 중재자가 재동기화 뒤 rebaseline 하기 전까지 재시도로 통과하지 않는다(F04).
+    const toolTreesBefore = await this.toolTreeBaseline(topic, signal);
+    this.assertToolTreesIntact(topic, toolTreesBefore, "재개 전");
     const promptBase = {
       planMarkdown: plan, planSHA256: topic.planSHA256!, worktreePath: topic.worktreePath, branchName: topic.branchName!, planPath,
       decisionsPath, implementationNotes,
@@ -130,46 +133,13 @@ export class DeliveryPipeline {
     // 코드를 바꿀 수 있는 마지막 호출(허용 오차 교정 → 계약 교정) 뒤에 다시 본다 — 검사가 마지막 호출보다 먼저 끝나면 뚫린다(Codex 후속 지적 1).
     await this.assertBaselineIntact(topic, baselineHead, "구현 교정 중");
     this.assertToolTreesIntact(topic, toolTreesBefore, "구현 교정 중");
-    // status=in_progress: 같은 세션에서 "계속 진행" 턴을 연다(상한 안에서). 중간 결과는 산출물로 보존하고 다음 결과 위에 병합한다(D01).
-    let continuations = 0;
-    while (implementationInProgress(implementationResult) && !implementationResult.requestedUserDecision && continuations < CONTINUATION_LIMIT) {
-      continuations += 1;
-      const remaining = implementationResult.remainingSteps ?? [];
-      await this.core.saveAgentOutput(topic, "claude", implementationResult, "implementation-progress", signal);
-      this.core.event(topicId, "system", "system",
-        `러너가 진행 중(status=in_progress)으로 멈췄습니다 — 남은 단계 ${remaining.length}개. 같은 세션에서 계속 진행합니다(${continuations}/${CONTINUATION_LIMIT}).`,
-        { continuation: continuations, remainingSteps: remaining });
-      const previous = implementationResult;
-      const continued = await this.core.dependencies.claude.resumeTurn({
-        sessionId: fork.sessionId, prompt: buildContinuationPrompt(remaining, continuations, CONTINUATION_LIMIT), cwd: topic.worktreePath,
-        signal, implementation: true, readablePaths, settings: this.core.executionSettings(topicId, "claude", true),
-        onProcessSpawn: this.core.processObserver(topicId), onUsage: this.core.usageObserver(topicId, "claude", "계속 진행 턴"),
-      });
-      this.core.assertCurrent(topicId, signal, topic.scopeGeneration, "IMPLEMENTING");
-      await this.assertBaselineIntact(topic, baselineHead, "계속 진행 중");
-      this.assertToolTreesIntact(topic, toolTreesBefore, "계속 진행 중");
-      if (await this.core.interruptPreservingResult(topic, "claude", continued, inputSequence, signal)) return;
-      const progressNormalizer = (result: AgentResult) => baseNormalizer(mergeCorrectionResult(previous, result).result);
-      const contracted = await this.core.enforceResultContract("claude", topic, continued, fork.sessionId, {
-        signal, implementation: true, planMode: false, startedAfter: inputSequence, check, readablePaths, normalize: progressNormalizer,
-      });
-      await this.assertBaselineIntact(topic, baselineHead, "계속 진행 계약 교정 중");
-      const checked = await this.enforceTolerance({
-        topicId, topic: this.core.dependencies.database.getTopic(topicId), plan, result: contracted, sessionId: fork.sessionId,
-        signal, inputSequence, resumeState: "IMPLEMENTING", check, baselineHead, readablePaths, normalize: progressNormalizer,
-      });
-      if (!checked) return;
-      implementationResult = checked;
-      await this.assertBaselineIntact(topic, baselineHead, "계속 진행 교정 중");
-      this.assertToolTreesIntact(topic, toolTreesBefore, "계속 진행 교정 중");
-    }
-    if (implementationInProgress(implementationResult) && !implementationResult.requestedUserDecision) {
-      await this.core.saveAgentOutput(topic, "claude", implementationResult, "implementation-progress", signal);
-      this.core.interrupt(topicId, "USER_DECISION_REQUIRED",
-        `러너가 계속 진행 상한(${CONTINUATION_LIMIT}회)에 닿았는데 아직 in_progress 입니다 — 남은 단계: ${(implementationResult.remainingSteps ?? []).join(" · ") || "(명시 없음)"}. 재시도(retry)로 같은 세션에서 이어갑니다.`,
-        "IMPLEMENTING", { continuationExhausted: true, remainingSteps: implementationResult.remainingSteps ?? [] });
-      return;
-    }
+    // status=in_progress: 정지 사유(요청 결정·blocked·결정 필요 쟁점·외부 증거·새 사용자 입력)가 없을 때만 같은 세션에서 "계속 진행" 턴을 연다(D01·F02).
+    const continued = await this.continueUntilComplete({
+      topicId, topic, plan, kind: "IMPLEMENTATION", result: implementationResult, sessionId: fork.sessionId, signal, inputSequence,
+      resumeState: "IMPLEMENTING", check, baselineHead, readablePaths, baseNormalizer, toolTreesBefore, progressKind: "implementation-progress",
+    });
+    if (!continued) return;
+    implementationResult = continued;
     // 러너가 범위 밖으로 판정해 to-do 로 남긴 쟁점(DEFERRED_OUT_OF_SCOPE)은 후속 목록에 올린다 — 인도 전 사용자가 처분한다.
     await this.core.recordDeferredFindings(topic,
       implementationResult.findings.filter((finding) => finding.disposition === "DEFERRED_OUT_OF_SCOPE"), "implementation", signal);
@@ -545,8 +515,9 @@ export class DeliveryPipeline {
     const planPath = await this.core.dependencies.artifacts.verifiedPath(topicId, "plan");
     const decisionsPath = await this.writeDecisionsDigest(topic, signal);
     const fixReadable = [planPath, decisionsPath];
-    const pendingFixOriginal = await this.pendingCorrectionOriginal(topicId, topic, "CLAUDE_FIX");
-    const toolTreesBefore = digestToolTrees(topic.worktreePath);
+    const pendingFixOriginal = await this.pendingResultOriginal(topicId, topic, "CLAUDE_FIX");
+    const toolTreesBefore = await this.toolTreeBaseline(topic, signal);
+    this.assertToolTreesIntact(topic, toolTreesBefore, "수정 재개 전");
     const fixBase = { planMarkdown: plan, planSHA256: topic.planSHA256, reviewFindings: review.findings, planPath, decisionsPath };
     const fixPrompts = {
       fresh: buildClaudeFixPrompt({
@@ -564,7 +535,7 @@ export class DeliveryPipeline {
       : fixCarry;
     if (pendingFixOriginal) {
       this.core.event(topicId, "system", "system",
-        "직전 허용 오차 교정이 실패로 끝나 보존해 둔 수정 턴 보고를 이번 재개 결과에 병합합니다.", { pendingCorrectionMerged: true });
+        "직전 수정 턴이 교정·계속 진행 도중 끊겨 보존해 둔 미완료 보고를 이번 재개 결과에 병합합니다.", { pendingCorrectionMerged: true });
     }
     const fixFork = await this.resumeImplementationSession(
       topicId, flags.implementationSessionId, fixPrompts, topic.worktreePath, signal, fixReadable,
@@ -603,15 +574,27 @@ export class DeliveryPipeline {
     if (!fixChecked) return;
     await this.assertBaselineIntact(topic, baselineHead, "자동 수정 교정 중");
     this.assertToolTreesIntact(topic, toolTreesBefore, "자동 수정 교정 중");
+    // 수정 턴도 같은 완료 판정을 쓴다 — 미완료(status=in_progress) FIX 가 최종 리뷰를 사서 인도 준비로 가지 않게(F01).
+    const fixCheck = (r: AgentResult) => {
+      this.core.assertKind(r, "FIX");
+      assertFindingCoverage(review.findings, r.findings, "Claude fix");
+      assertDispositionsResolved(review.findings, r, "Claude fix");
+    };
+    const fixContinued = await this.continueUntilComplete({
+      topicId, topic, plan, kind: "FIX", result: fixChecked, sessionId: fixFork.sessionId, signal, inputSequence, resumeState: "CLAUDE_FIX",
+      check: fixCheck, baselineHead, readablePaths: fixReadable, baseNormalizer: fixCarry, toolTreesBefore, progressKind: "fix-progress",
+    });
+    if (!fixContinued) return;
+    const fixFinal = fixContinued;
     await this.core.recordDeferredFindings(topic,
-      fixChecked.findings.filter((finding) => finding.disposition === "DEFERRED_OUT_OF_SCOPE"), "fix", signal);
-    await this.core.pruneDeferredFindings(topic, resolvedIDs(fixChecked), signal);
-    await this.core.saveAgentOutput(topic, "claude", fixChecked, "claude-fix", signal);
+      fixFinal.findings.filter((finding) => finding.disposition === "DEFERRED_OUT_OF_SCOPE"), "fix", signal);
+    await this.core.pruneDeferredFindings(topic, resolvedIDs(fixFinal), signal);
+    await this.core.saveAgentOutput(topic, "claude", fixFinal, "claude-fix", signal);
     if (this.core.interruptForNewUserInput(topic, inputSequence)) return;
-    if (this.core.pauseForResult(topicId, fixChecked, "CLAUDE_FIX", "수정 범위를 넓히려면 사용자 결정이 필요합니다.")) {
+    if (this.core.pauseForResult(topicId, fixFinal, "CLAUDE_FIX", "수정 범위를 넓히려면 사용자 결정이 필요합니다.")) {
       return;
     }
-    await this.finishFix(topicId, topic, review, fixChecked, secondPass, signal);
+    await this.finishFix(topicId, topic, review, fixFinal, secondPass, signal);
   }
 
   // 수정 결과가 확정된 뒤의 공통 꼬리: 되돌림 가드(결정으로 뒤집힌 쟁점 제외) → 회차 소비 → 최종 리뷰.
@@ -804,25 +787,135 @@ export class DeliveryPipeline {
     }
   }
 
-  // 직전 허용 오차 교정이 실패로 끝났을 때 보존해 둔 원본 — 같은 세대·계획 sha·단계이고, 그 뒤에 받아들인 결과가 없을 때만 유효하다.
-  private async pendingCorrectionOriginal(topicId: string, topic: Topic, resumeState: "IMPLEMENTING" | "CLAUDE_FIX"): Promise<AgentResult | null> {
+  // 직전 턴이 교정(허용 오차·계약)이나 계속 진행 도중 끊겼을 때 보존해 둔 미완료 결과 — 같은 세대(계획 sha는 원본이 적혀 있으면 대조)이고
+  // 그 뒤 받아들인 결과가 없을 때만 유효하다. 종류마다 복구를 따로 두지 않고 한 곳에서 가장 최근 것을 고른다(R01·F03).
+  private async pendingResultOriginal(topicId: string, topic: Topic, resumeState: "IMPLEMENTING" | "CLAUDE_FIX"): Promise<AgentResult | null> {
     const db = this.core.dependencies.database;
-    const source = db.latestArtifact(topicId, "tolerance-correction-source");
-    if (!source) return null;
-    const acceptedAfter = ["implementation-result", "implementation-progress", "claude-fix"]
-      .map((kind) => db.latestArtifact(topicId, kind))
-      .some((artifact) => artifact !== null && artifact.createdAt >= source.createdAt);
-    if (acceptedAfter) return null;
-    try {
-      const raw = await this.core.dependencies.artifacts.readLatest(topicId, "tolerance-correction-source");
-      if (!raw) return null;
-      const record = JSON.parse(raw) as { scopeGeneration?: number; planSHA256?: string | null; resumeState?: string; original?: unknown };
-      if (record.scopeGeneration !== topic.scopeGeneration || record.planSHA256 !== topic.planSHA256 || record.resumeState !== resumeState) return null;
-      const parsed = AgentResultSchema.safeParse(record.original);
-      return parsed.success ? parsed.data : null;
-    } catch {
+    const accepted = ["implementation-result", "claude-fix"].map((kind) => db.latestArtifact(topicId, kind))
+      .filter((artifact): artifact is NonNullable<typeof artifact> => artifact !== null)
+      .map((artifact) => artifact.createdAt).sort().at(-1) ?? "";
+    const kinds = ["tolerance-correction-source", "contract-repair-source", resumeState === "IMPLEMENTING" ? "implementation-progress" : "fix-progress"];
+    const candidates = kinds.map((kind) => db.latestArtifact(topicId, kind))
+      .filter((artifact): artifact is NonNullable<typeof artifact> => artifact !== null && artifact.createdAt > accepted && artifact.scopeGeneration === topic.scopeGeneration)
+      .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+    for (const artifact of candidates) {
+      try {
+        const raw = await this.core.dependencies.artifacts.readLatest(topicId, artifact.kind);
+        if (!raw) continue;
+        const record = JSON.parse(raw) as Record<string, unknown>;
+        if (artifact.kind === "tolerance-correction-source") {
+          if (record.planSHA256 !== topic.planSHA256 || record.resumeState !== resumeState) continue;
+          const parsed = AgentResultSchema.safeParse(record.original);
+          if (parsed.success) return parsed.data;
+          continue;
+        }
+        if (artifact.kind === "contract-repair-source") {
+          if (record.kind !== "contract-repair-source" || record.state !== resumeState || record.planSHA256 !== topic.planSHA256) continue;
+          return salvageResultFields(record.original, resumeState === "IMPLEMENTING" ? "IMPLEMENTATION" : "FIX");
+        }
+        const parsed = AgentResultSchema.safeParse(record);
+        if (parsed.success) return parsed.data;
+      } catch {
+        // 손상된 산출물은 복구 근거가 아니다.
+      }
+    }
+    return null;
+  }
+
+  // 구현·수정·계속 진행 턴 공통: status=in_progress 이고 정지 사유가 없으면 같은 세션에서 계속 진행 턴을 연다(상한 CONTINUATION_LIMIT).
+  // 정지 사유(요청 결정·blocked·결정 필요 쟁점·외부 증거 대기·새 사용자 입력)가 있으면 다음 쓰기 호출을 열지 않는다(F02).
+  // 중간 결과는 progress 산출물로 보존하고 다음 결과 위에 병합한다. 반환 null = 호출자가 그대로 return(인터럽트·정지 처리 끝).
+  private async continueUntilComplete(input: {
+    topicId: string; topic: Topic; plan: string; kind: "IMPLEMENTATION" | "FIX"; result: AgentResult; sessionId: string; signal: AbortSignal;
+    inputSequence: number; resumeState: "IMPLEMENTING" | "CLAUDE_FIX"; check: (result: AgentResult) => void; baselineHead: string;
+    readablePaths: readonly string[]; baseNormalizer: ResultNormalizer; toolTreesBefore: ToolTreeDigest; progressKind: string;
+  }): Promise<AgentResult | null> {
+    let result = input.result;
+    let continuations = 0;
+    const stopReason = (candidate: AgentResult): string | null => {
+      if (this.core.resultRequestsPause(candidate)) return "정지 사유(요청 결정·blocked·결정 필요 쟁점·외부 증거)";
+      if (this.core.newUserInputSince(input.topic, input.inputSequence)) return "새 사용자 입력";
+      return null;
+    };
+    while (implementationInProgress(result) && !stopReason(result) && continuations < CONTINUATION_LIMIT) {
+      continuations += 1;
+      const remaining = result.remainingSteps ?? [];
+      await this.core.saveAgentOutput(input.topic, "claude", result, input.progressKind, input.signal);
+      this.core.event(input.topicId, "system", "system",
+        `러너가 진행 중(status=in_progress)으로 멈췄습니다 — 남은 단계 ${remaining.length}개. 같은 세션에서 계속 진행합니다(${continuations}/${CONTINUATION_LIMIT}).`,
+        { continuation: continuations, remainingSteps: remaining });
+      const previous = result;
+      const continued = await this.core.dependencies.claude.resumeTurn({
+        sessionId: input.sessionId, prompt: buildContinuationPrompt(remaining, continuations, CONTINUATION_LIMIT, input.kind), cwd: input.topic.worktreePath,
+        signal: input.signal, implementation: true, readablePaths: input.readablePaths, settings: this.core.executionSettings(input.topicId, "claude", true),
+        onProcessSpawn: this.core.processObserver(input.topicId), onUsage: this.core.usageObserver(input.topicId, "claude", "계속 진행 턴"),
+      });
+      this.core.assertCurrent(input.topicId, input.signal, input.topic.scopeGeneration, input.resumeState);
+      await this.assertBaselineIntact(input.topic, input.baselineHead, "계속 진행 중");
+      this.assertToolTreesIntact(input.topic, input.toolTreesBefore, "계속 진행 중");
+      if (await this.core.interruptPreservingResult(input.topic, "claude", continued, input.inputSequence, input.signal)) return null;
+      const progressNormalizer = (candidate: AgentResult) => input.baseNormalizer(mergeCorrectionResult(previous, candidate).result);
+      const contracted = await this.core.enforceResultContract("claude", input.topic, continued, input.sessionId, {
+        signal: input.signal, implementation: true, planMode: false, startedAfter: input.inputSequence, check: input.check,
+        readablePaths: input.readablePaths, normalize: progressNormalizer,
+      });
+      await this.assertBaselineIntact(input.topic, input.baselineHead, "계속 진행 계약 교정 중");
+      const checked = await this.enforceTolerance({
+        topicId: input.topicId, topic: this.core.dependencies.database.getTopic(input.topicId), plan: input.plan, result: contracted, sessionId: input.sessionId,
+        signal: input.signal, inputSequence: input.inputSequence, resumeState: input.resumeState, check: input.check, baselineHead: input.baselineHead,
+        readablePaths: input.readablePaths, normalize: progressNormalizer,
+      });
+      if (!checked) return null;
+      result = checked;
+      await this.assertBaselineIntact(input.topic, input.baselineHead, "계속 진행 교정 중");
+      this.assertToolTreesIntact(input.topic, input.toolTreesBefore, "계속 진행 교정 중");
+    }
+    if (implementationInProgress(result) && !stopReason(result)) {
+      await this.core.saveAgentOutput(input.topic, "claude", result, input.progressKind, input.signal);
+      this.core.interrupt(input.topicId, "USER_DECISION_REQUIRED",
+        `러너가 계속 진행 상한(${CONTINUATION_LIMIT}회)에 닿았는데 아직 in_progress 입니다 — 남은 단계: ${(result.remainingSteps ?? []).join(" · ") || "(명시 없음)"}. 재시도(retry)로 같은 세션에서 이어갑니다.`,
+        input.resumeState, { continuationExhausted: true, remainingSteps: result.remainingSteps ?? [] });
       return null;
     }
+    return result;
+  }
+
+  // 도구 트리 기준 산출물(tool-tree-baseline, 세대별). 없으면 지금 지문을 첫 기준으로 쓴다. 감지된 변경은 중재자가 재동기화 뒤
+  // rebaseline 액션으로만 새 기준이 된다 — 재시도가 현재 디스크를 기준으로 다시 잡지 않는다(F04).
+  private async toolTreeBaseline(topic: Topic, signal: AbortSignal): Promise<ToolTreeDigest> {
+    const db = this.core.dependencies.database;
+    const latest = db.latestArtifact(topic.id, "tool-tree-baseline");
+    if (latest && latest.scopeGeneration === topic.scopeGeneration) {
+      const raw = await this.core.dependencies.artifacts.readLatest(topic.id, "tool-tree-baseline");
+      if (raw) {
+        const record = JSON.parse(raw) as { digest?: ToolTreeDigest };
+        if (record.digest?.sha256) return record.digest;
+      }
+    }
+    return this.writeToolTreeBaseline(topic, signal, "첫 구현 턴의 도구 트리 지문");
+  }
+
+  async writeToolTreeBaseline(topic: Topic, _signal: AbortSignal, reason: string): Promise<ToolTreeDigest> {
+    const digest = digestToolTrees(topic.worktreePath);
+    const revision = (this.core.dependencies.database.latestArtifact(topic.id, "tool-tree-baseline")?.revision ?? 0) + 1;
+    // 실행(action) 밖에서도 쓴다(rebaseline 액션) — action 현재성 가드가 있는 core.writeArtifact 대신 저장소에 직접 쓴다.
+    await this.core.dependencies.artifacts.write(topic.id, "tool-tree-baseline", revision, JSON.stringify({
+      kind: "tool-tree-baseline", scopeGeneration: topic.scopeGeneration, reason, digest, at: new Date().toISOString(),
+    }, null, 2), { scopeGeneration: topic.scopeGeneration });
+    this.core.event(topic.id, "system", "system", `도구 트리 기준 #${revision} — ${reason} (파일 ${digest.files}, ${digest.sha256.slice(0, 12)})`,
+      { toolTreeBaseline: { revision, sha256: digest.sha256, files: digest.files } });
+    return digest;
+  }
+
+  // 단계 도구 트리(gitignore 된 DerivedData/*-logs/{scripts,…})가 기준과 다르면 턴을 실패시킨다 — git 변경 목록은 ignored 파일을 보지
+  // 않으므로 별도 대조(R02). 중재자가 tools_sync 로 되돌린 뒤 tool-tree-rebaseline 액션으로 기준을 갱신하고 retry 한다.
+  private assertToolTreesIntact(topic: Topic, baseline: ToolTreeDigest, phase: string): void {
+    const after = digestToolTrees(topic.worktreePath);
+    if (after.sha256 === baseline.sha256) return;
+    this.core.event(topic.id, "system", "system",
+      `도구 트리가 기준과 다릅니다(${phase}: 파일 ${baseline.files} → ${after.files}, ${baseline.sha256.slice(0, 12)} → ${after.sha256.slice(0, 12)}) — 러너는 앱 코드만 고친다. 중재자가 tools_sync 로 되돌린 뒤 tool-tree-rebaseline 으로 기준을 갱신하고 재시도한다.`,
+      { toolTreeDrift: { baseline: baseline.sha256, after: after.sha256, directories: after.directories } });
+    throw new Error(`도구 트리가 기준과 다릅니다(${phase}) — 러너 권한 밖. 재동기화 + tool-tree-rebaseline 뒤 재시도.`);
   }
 
   // 사용자 결정·증거·범위 변경 원문 전체를 읽기 전용 산출물로 쓴다(내용이 같으면 새 판 없음). 반환: sha 검증한 정본 경로.
@@ -842,16 +935,7 @@ export class DeliveryPipeline {
     return this.core.dependencies.artifacts.verifiedPath(topic.id, "decisions");
   }
 
-  // 단계 도구 트리(gitignore 된 DerivedData/*-logs/{scripts,…})가 에이전트 호출 중 바뀌었으면 턴을 실패시킨다 — git 변경 목록은
-  // ignored 파일을 보지 않으므로 별도 대조(Codex 감사 R02). 중재자가 tools_sync 로 되돌린 뒤 retry 한다.
-  private assertToolTreesIntact(topic: Topic, before: ReturnType<typeof digestToolTrees>, phase: string): void {
-    const after = digestToolTrees(topic.worktreePath);
-    if (after.sha256 === before.sha256) return;
-    this.core.event(topic.id, "system", "system",
-      `도구 트리가 ${phase} 바뀌었습니다(파일 ${before.files} → ${after.files}, ${before.sha256.slice(0, 12)} → ${after.sha256.slice(0, 12)}) — 러너는 앱 코드만 고친다. 중재자가 tools_sync 로 되돌린 뒤 재시도한다.`,
-      { toolTreeDrift: { before: before.sha256, after: after.sha256, directories: after.directories } });
-    throw new Error(`도구 트리가 ${phase} 바뀌었습니다 — 러너 권한 밖(중재자 재동기화 필요).`);
-  }
+
 
   // 브랜치가 그대로이고 HEAD 가 구현 기준과 같은지 — 에이전트 호출(교정 포함) 뒤마다 부른다. 커밋으로 범위 밖 변경을 숨기면 여기서 멈춘다.
   private async assertBaselineIntact(topic: Topic, baselineHead: string, phase: string): Promise<void> {
@@ -1108,6 +1192,7 @@ export class DeliveryPipeline {
   }
 
   private async withDeliveryLock<T>(topicId: string, work: (topic: Topic) => Promise<T>): Promise<T> {
+    this.core.assertNoMaintenanceLock();
     if (this.core.active.has(topicId) || this.core.scopeChangeActive.has(topicId) || this.core.deliveryActive.has(topicId)) {
       throw new Error("이 주제에서 다른 작업이 진행 중입니다.");
     }
