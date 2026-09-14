@@ -51,11 +51,12 @@ describe("accumulate — 요청별 보존", () => {
 
 describe("workId — 논리 작업 id", () => {
   const base: WorkBinding = { kind: "FIX", resumeState: "CLAUDE_FIX", scopeGeneration: 1, planEpoch: 2, planSHA256: "a".repeat(64), sessionId: "s" };
-  it("같은 계획의 1차·2차 FIX 는 다른 작업이고, 세션 id 는 작업 id 에 들어가지 않는다", () => {
-    expect(workId({ ...base, fixPass: 1 })).not.toBe(workId({ ...base, fixPass: 2 }));
-    expect(workId({ ...base, fixPass: 1, sessionId: "other" })).toBe(workId({ ...base, fixPass: 1 }));
+  it("수정 작업은 원본 리뷰 산출물(종류#revision)로 구분된다 — 사용자 승인으로 연 3차 수정도 2차와 다른 작업; 세션 id 는 작업 id 에 들어가지 않는다", () => {
+    expect(workId({ ...base, fixSource: "codex-final-review#1" })).not.toBe(workId({ ...base, fixSource: "codex-final-review#2" }));
+    expect(workId({ ...base, fixSource: "codex-review#1" })).not.toBe(workId({ ...base, fixSource: "codex-final-review#1" }));
+    expect(workId({ ...base, fixSource: "codex-review#1", sessionId: "other" })).toBe(workId({ ...base, fixSource: "codex-review#1" }));
     expect(workId({ ...base, planEpoch: 3 })).not.toBe(workId(base));
-    expect(workId({ ...base, kind: "IMPLEMENTATION", resumeState: "IMPLEMENTING" })).not.toContain("fix");
+    expect(workId({ ...base, kind: "IMPLEMENTATION", resumeState: "IMPLEMENTING" })).not.toContain("codex-");
   });
 });
 

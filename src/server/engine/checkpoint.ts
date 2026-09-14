@@ -28,8 +28,8 @@ export interface WorkBinding {
   planEpoch: number;
   planSHA256: string | null;
   sessionId: string | null;
-  // 수정 회차(1·2) — 같은 세대 안에서 리뷰마다 새 논리 작업이다.
-  fixPass?: number;
+  // 수정 작업의 원본 리뷰(종류#산출물 revision) — 리뷰마다 새 논리 작업이다. 회차 번호(1·2)로는 사용자 승인으로 연 3차 수정이 2차와 같은 작업이 됐다(CF-03).
+  fixSource?: string;
 }
 
 export type CheckpointPhase =
@@ -67,6 +67,8 @@ export interface WorkCheckpoint {
   acceptedSHA256?: string;
   // 수락 절차 id(= accepting checkpoint 의 revision). 강제 종료 뒤 재개는 이 id 로 어디까지 했는지 판단한다(내용 해시가 아니다).
   acceptId?: number;
+  // 수락 시점의 워킹트리(HEAD·diff sha) — 재개 때 현재 변경분과 대조한다(다르면 수락을 이어가지 않고 다시 대조·판정, CF-01).
+  worktree?: { head: string; diffSHA256: string };
   at: string;
 }
 
@@ -78,7 +80,7 @@ export function requestId(text: string, askedAfterSequence: number): string {
 // 논리 작업 id — 구현 세대(계획 epoch·sha 포함) 또는 수정 회차. 복구·확인 횟수·중복 재소비의 공통 기준.
 export function workId(binding: WorkBinding): string {
   const base = `${binding.kind}:g${binding.scopeGeneration}:e${binding.planEpoch}:${(binding.planSHA256 ?? "-").slice(0, 12)}:${binding.resumeState}`;
-  return binding.kind === "FIX" ? `${base}:fix${binding.fixPass ?? 1}` : base;
+  return binding.kind === "FIX" ? `${base}:${binding.fixSource ?? "fix?"}` : base;
 }
 
 export interface Accumulation {
@@ -137,10 +139,10 @@ export interface RecoveredWork {
 export class WorkCheckpoints {
   constructor(private readonly core: EngineCore) {}
 
-  binding(topic: Topic, kind: WorkKind, sessionId: string | null, fixPass?: number): WorkBinding {
+  binding(topic: Topic, kind: WorkKind, sessionId: string | null, fixSource?: string): WorkBinding {
     return {
       kind, resumeState: kind === "IMPLEMENTATION" ? "IMPLEMENTING" : "CLAUDE_FIX", scopeGeneration: topic.scopeGeneration,
-      planEpoch: topic.planEpoch, planSHA256: topic.planSHA256, sessionId, ...(fixPass !== undefined ? { fixPass } : {}),
+      planEpoch: topic.planEpoch, planSHA256: topic.planSHA256, sessionId, ...(fixSource !== undefined ? { fixSource } : {}),
     };
   }
 
@@ -148,7 +150,7 @@ export class WorkCheckpoints {
   async record(topic: Topic, input: {
     work: WorkBinding; phase: CheckpointPhase; raw?: unknown; accumulated: AgentResult; verifiedLedger: readonly ToleranceLedgerEntry[];
     inputSequence: number; pendingCorrection?: "tolerance" | "contract" | null; openRequests: readonly OpenRequest[]; confirmations: number;
-    acceptId?: number;
+    acceptId?: number; worktree?: { head: string; diffSHA256: string };
   }, signal: AbortSignal): Promise<WorkCheckpoint> {
     const db = this.core.dependencies.database;
     const latest = db.latestArtifact(topic.id, WORK_CHECKPOINT_KIND);
@@ -163,6 +165,7 @@ export class WorkCheckpoints {
       inputSequence: input.inputSequence,
       ...(input.phase === "accepted" ? { acceptedSHA256: resultSHA256(accumulated) } : {}),
       ...(input.acceptId !== undefined ? { acceptId: input.acceptId } : {}),
+      ...(input.worktree ? { worktree: input.worktree } : {}),
       at: new Date().toISOString(),
     };
     await this.core.writeArtifact(topic, WORK_CHECKPOINT_KIND, revision, JSON.stringify(checkpoint, null, 2), signal);

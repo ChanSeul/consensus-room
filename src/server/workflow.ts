@@ -235,7 +235,10 @@ export class WorkflowEngine {
       this.core.dependencies.database.reviews.assertAvailable(topicId,interruption.payload.reviewPause as ReviewScope);
     if(interruption?.payload?.revisionPause===true && topic.state==="USER_DECISION_REQUIRED")
       this.core.dependencies.database.revisions.assertAvailable(topicId,resume==="CLAUDE_PLAN"?"plan":"revision");
-    if (topic.state === "USER_DECISION_REQUIRED" && (interruption?.payload?.budgetPause === true || interruption?.payload?.revisionPause === true || Boolean(interruption?.payload?.reviewPause))
+    // 실행 환경 때문에 멈춘 정지(예산·한도·spawn 직전 허용 거부: 유지보수 잠금·계획 변경·기준 불일치)는 사람의 제품 결정이 아니다 — 저장된 같은 단계로
+    // 재개하고 계획을 다시 만들지 않는다(CF-07: 유지보수 거부 뒤 retry 가 계획부터 다시 만들었다).
+    if (topic.state === "USER_DECISION_REQUIRED" && (interruption?.payload?.budgetPause === true || interruption?.payload?.revisionPause === true || Boolean(interruption?.payload?.reviewPause)
+      || typeof interruption?.payload?.admissionRefused === "string")
       && interruption?.payload?.resumeState === resume) {
       // Budget pauses resume the exact infrastructure stage, without consuming a product decision or resetting the plan.
       topic = this.core.dependencies.database.updateTopic(topicId, {state:"FAILED"});

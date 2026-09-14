@@ -118,7 +118,15 @@ export class RevisionLedger {
       const previous = this.db.prepare("SELECT * FROM revision_attempts WHERE execution_id=?").get(executionId);
       if (!previous || previous.topic_id !== topicId) return false;
       this.db.prepare("DELETE FROM revision_attempts WHERE execution_id=?").run(executionId);
-      if (Number(previous.counted) === 1) { const a = this.account(topicId); a.used = Math.max(0, a.used - 1); this.save(a); }
+      const a = this.account(topicId);
+      if (Number(previous.counted) === 1) a.used = Math.max(0, a.used - 1);
+      // 무료 최초 계획 예약(counted=0, plan)을 되돌리면 그 자격도 되돌린다 — 아니면 첫 실제 계획이 재작성 1회를 차감한다(CF-08).
+      // 그 사이 실제로 돈 다른 plan 시도가 있으면 자격은 이미 소비된 것이다.
+      else if (previous.kind === "plan") {
+        const otherPlan = this.db.prepare("SELECT 1 FROM revision_attempts WHERE topic_id=? AND kind='plan' LIMIT 1").get(topicId);
+        if (!otherPlan) a.firstPlanUsed = false;
+      }
+      this.save(a);
       return true;
     });
   }

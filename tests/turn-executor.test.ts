@@ -138,3 +138,53 @@ describe("예약 해제 — spawn 직전 거부로 실제 호출이 없었던 �
     database.close();
   });
 });
+
+// Astra CF-07·CF-08 — 실행 환경 정지(유지보수 거부)는 같은 단계로 재개하고, 무료 최초 계획 예약의 해제는 자격도 되돌린다.
+describe("실행 허용 거부의 재개와 예약 복원", () => {
+  it("CF-07: 감사 spawn 직전 유지보수 잠금으로 거부되면 retry 는 계획을 다시 만들지 않고 CODEX_AUDIT 를 재개한다", async () => {
+    const root = mkdtempSync(join(tmpdir(), "consensus-room-maint-")); temporaryDirectories.push(root);
+    const database = new ConsensusDatabase(join(root, "room.sqlite"));
+    const at = new Date().toISOString();
+    database.createTopic({ id: "t", slug: "t", title: "t", repositoryPath: root, baseRef: "develop", worktreePath: root, branchName: null, state: "DRAFT", scopeGeneration: 1, planRevision: 0, planSHA256: null, approvedPlanSHA256: null, createdAt: at, updatedAt: at, lastError: null });
+    for (const role of ["claude", "codex"] as const) database.upsertParticipant("t", { role, sessionId: `${role}-session`, mode: "attached", acknowledgedPlanSHA256: null });
+    database.budgets.configure("t", { execution: { inputTokens: 1000, outputTokens: 1000, durationMs: 60000 }, total: { inputTokens: 100000, outputTokens: 100000, durationMs: 600000 } }, "probe");
+    const lock = join(root, "maintenance.json");
+    const { REQUIRED_PLAN_HEADINGS } = await import("../src/shared/contracts");
+    const plan = REQUIRED_PLAN_HEADINGS.map((h) => `## ${h}\n\n${h}${h === "허용 오차" ? '\n\n```tolerance\n{"scopePaths":["owned.txt"],"rules":[]}\n```' : ""}`).join("\n\n");
+    let claudeCalls = 0, codexCalls = 0;
+    const runClaude = async (turn: { beforeSpawn?: () => void | Promise<void>; admitSync?: () => void }) => { await turn.beforeSpawn?.(); turn.admitSync?.(); claudeCalls++; return { kind: "PLAN" as const, summary: "plan", planMarkdown: plan, findings: [], evidenceRefs: [] }; };
+    const claude = { role: "claude" as const, validateExistingSession: async () => true, resumeTurn: runClaude, createSession: async (turn: Parameters<typeof runClaude>[0]) => ({ sessionId: "c", result: await runClaude(turn) }) };
+    const runCodex = async (turn: { beforeSpawn?: () => void | Promise<void>; admitSync?: () => void }) => { codexCalls++; writeFileSync(lock, JSON.stringify({ at: new Date().toISOString(), reason: "probe" })); await turn.beforeSpawn?.(); turn.admitSync?.(); throw new Error("unexpected spawn"); };
+    const codex = { role: "codex" as const, validateExistingSession: async () => true, resumeTurn: runCodex, createSession: async (turn: Parameters<typeof runCodex>[0]) => ({ sessionId: "x", result: await runCodex(turn) }) };
+    const { WorkflowEngine } = await import("../src/server/workflow");
+    const { ArtifactStore } = await import("../src/server/artifacts");
+    const engine = new WorkflowEngine({ database, artifacts: new ArtifactStore(join(root, "topics"), database), git: {} as never, claude, codex, enforceBudgets: true, maintenanceLockPath: lock });
+    const settled = async () => { while (database.runningAction("t")) await new Promise((resolve) => setTimeout(resolve, 10)); };
+    engine.startPlan("t"); await settled();
+    expect(database.getTopic("t").state).toBe("USER_DECISION_REQUIRED");
+    expect(database.getFlags("t").resumeState).toBe("CODEX_AUDIT");
+    const epoch = database.getTopic("t").planEpoch;
+    expect(database.reviews.account("t", "planning").used).toBe(0);   // spawn 없이 거부된 리뷰 예약은 해제됐다
+    rmSync(lock, { force: true });
+    engine.retry("t"); await settled();
+    expect(database.getTopic("t").planEpoch).toBe(epoch);
+    expect(claudeCalls).toBe(1);          // 계획을 다시 만들지 않았다
+    expect(codexCalls).toBe(2);           // 감사를 같은 단계에서 재개했다(가짜는 spawn 전에 실패한다)
+    expect(database.getFlags("t").resumeState).toBe("CODEX_AUDIT");
+    database.close();
+  });
+  it("CF-08: 무료 최초 계획 예약을 해제하면 자격도 돌아와 첫 실제 계획이 재작성 회차를 차감하지 않는다", () => {
+    const root = mkdtempSync(join(tmpdir(), "consensus-room-first-plan-")); temporaryDirectories.push(root);
+    const database = new ConsensusDatabase(join(root, "room.sqlite"));
+    const at = new Date().toISOString();
+    database.createTopic({ id: "u", slug: "u", title: "u", repositoryPath: root, baseRef: "develop", worktreePath: root, branchName: null, state: "DRAFT", scopeGeneration: 1, planRevision: 0, planSHA256: null, approvedPlanSHA256: null, createdAt: at, updatedAt: at, lastError: null });
+    const ledger = database.revisions;
+    ledger.admit("u", "unspawned", "plan"); ledger.release("u", "unspawned");
+    expect(ledger.account("u")).toMatchObject({ used: 0, firstPlanUsed: false });
+    ledger.admit("u", "actual", "plan");
+    expect(ledger.account("u")).toMatchObject({ used: 0, firstPlanUsed: true });
+    ledger.admit("u", "second", "plan"); ledger.release("u", "second");   // 실제 계획이 이미 돈 뒤의 해제는 자격을 되살리지 않는다
+    expect(ledger.account("u")).toMatchObject({ used: 0, firstPlanUsed: true });
+    database.close();
+  });
+});
