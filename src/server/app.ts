@@ -1,4 +1,5 @@
 import {ReviewGrantInputSchema} from "../shared/reviews.js";
+import { DIAGNOSIS_ID_PATTERN, DiagnosisInputSchema } from "../shared/diagnoses.js";
 import { readFileSync } from "node:fs";
 import {
   ToolTreeRebaselineInputSchema,
@@ -289,6 +290,30 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       autoRetryAt: workflow.scheduledRetryAt(topic.id),
       checkedAt: new Date().toISOString(),
     };
+  });
+
+  // ---- 중재자 진단(2026-09-14) — 일반 메시지와 구분되는 기록. 등록·적용은 분리하고, 기존 멱등 요청 처리와 중재자 위임 검사를 그대로 쓴다.
+  app.get<{ Params: { id: string } }>("/api/topics/:id/diagnoses", async (request) => ({ diagnoses: workflow.listDiagnoses(request.params.id) }));
+
+  app.post<{ Params: { id: string } }>("/api/topics/:id/diagnoses", async (request, reply) => {
+    const origin = callOrigin(request, "diagnosis:register");
+    const input = DiagnosisInputSchema.parse(request.body);
+    return runIdempotent(request, reply, actionLedger(database, request.params.id, "diagnosis:register"), 201,
+      (idempotencyKey) => workflow.registerDiagnosis(request.params.id, input, idempotencyKey, origin));
+  });
+
+  app.post<{ Params: { id: string; diagnosisId: string } }>("/api/topics/:id/diagnoses/:diagnosisId/apply", async (request, reply) => {
+    const topicId = request.params.id;
+    const diagnosisId = request.params.diagnosisId;
+    if (!DIAGNOSIS_ID_PATTERN.test(diagnosisId)) throw Object.assign(new Error("진단 id 형식(DG-n)이 아닙니다."), { statusCode: 400 });
+    const origin = callOrigin(request, "diagnosis:apply");
+    const action = `diagnosis:apply:${diagnosisId}`;
+    changedPathsCache.delete(topicId);
+    return runIdempotent(request, reply, actionLedger(database, topicId, action), 200, async (idempotencyKey) => {
+      const actionId = requestActionId(topicId, action, idempotencyKey);
+      const started = await workflow.applyDiagnosis(topicId, diagnosisId, { requestKey: idempotencyKey, origin, actionId });
+      return accepted(started, database.getTopic(topicId));
+    });
   });
 
   app.post<{ Params: { id: string; role: string } }>("/api/topics/:id/participants/:role", async (request, reply) => {

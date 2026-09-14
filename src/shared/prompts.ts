@@ -1,4 +1,5 @@
 import { numberedPlan } from "./planPatches";
+import type { DiagnosisPrompt } from "./diagnoses";
 import type { AgentResult, DeferredFinding, Finding, ImplementationNote, TimelineEvent } from "./contracts";
 import type { TolerancePolicy } from "./tolerance";
 import { DISPOSITIONS, FIX_AWARE_KINDS, REQUIRED_PLAN_HEADINGS } from "./contracts";
@@ -7,6 +8,37 @@ import { DISPOSITIONS, FIX_AWARE_KINDS, REQUIRED_PLAN_HEADINGS } from "./contrac
 // assertFixDispositionAllowed(RESOLVED_BY_FIX는 실제 수정이 일어난 단계에서만). 그 규칙이 프롬프트에 없으면
 // 에이전트가 값을 추측하고 턴이 통째로 거부된다(2026-08-29: 감사 ID 누락, 종결 RESOLVED_BY_FIX 오용).
 // fixAware를 손으로 고르지 않는다 — 단계 kind에서 검사기와 같은 정본(FIX_AWARE_KINDS)을 읽어 파생한다.
+// 중재자 진단 — 적용된 수정 지시(요약 + 원문 경로). 진단 id 는 findings 계약의 쟁점 id 다(누락하면 서버가 재제출을 요구한다).
+// 긴 본문은 잘라 싣고 원문 경로(읽기 허용)로 넘긴다 — 전달은 해결이 아니다(러너 처분 → 리뷰 → 인도 준비).
+function clip(value: string, limit: number): string {
+  return value.length > limit ? `${value.slice(0, limit)}…(이하 원문 참조)` : value;
+}
+
+function renderDiagnosis(item: DiagnosisPrompt): string {
+  return [
+    `- [${item.id}] ${item.title} (${item.severity}${item.supersedes ? `, ${item.supersedes} 정정` : ""})`,
+    `  관찰한 실패: ${clip(item.observedFailure, 2_000)}`,
+    `  원인 판단: ${clip(item.cause, 2_000)}${item.uncertainty ? ` (남은 불확실성: ${clip(item.uncertainty, 1_000)})` : ""}`,
+    `  수정 지시: ${clip(item.instructions, 4_000)}`,
+    `  검증 기준: ${item.verificationCriteria.map((criterion, index) => `${index + 1}) ${clip(criterion, 500)}`).join(" ")}`,
+    ...(item.evidenceRefs.length ? [`  근거: ${item.evidenceRefs.map((ref) => clip(ref, 300)).join(" · ")}`] : []),
+    ...(item.relatedRequestIds.length ? [`  관련 요청: ${item.relatedRequestIds.join(", ")}`] : []),
+    ...(item.path ? [`  원문: \`${item.path}\` (이 턴에 읽기가 허용돼 있습니다)`] : []),
+  ].join("\n");
+}
+
+export function diagnosesSection(items: readonly DiagnosisPrompt[] | undefined): string {
+  if (!items || items.length === 0) return "";
+  return `중재자 진단(서버 기록 — 이 턴에서 반영할 수정 지시입니다. 진단 전달은 해결이 아닙니다: 수정·검증한 뒤 id 별로 처분을 보고하세요):
+${items.map(renderDiagnosis).join("\n")}
+진단 보고 규칙(진단 id 는 findings 의 쟁점 id 입니다 — 빠뜨리면 서버가 재제출을 요구합니다):
+- 반영했으면 RESOLVED_BY_FIX 로 처분하고 evidenceRefs 에 \`<진단 id> → 원인 → 고친 파일:위치 → 실행한 검증과 결과 → 미확인 부분\` 한 줄을 남기세요. 검증 기준을 하나씩 확인했는지 적으세요.
+- 진단이 틀렸다고 판단하면 REFUTED, 판단에 증거가 더 필요하면 EXTERNAL_EVIDENCE 로 처분하고 근거·필요한 증거를 rationale 에 적으세요 — 중재자에게 돌아갑니다(서버가 같은 지시를 자동으로 반복하지 않습니다).
+- 아직 끝내지 못했으면 AGREED_ACTION 을 유지하고 status=in_progress 로 남은 단계를 적으세요.
+- 진단이 도착했다고 관련 요청이 닫히지 않습니다 — 요청 해소는 따로 resolvedRequestId 로 보고합니다.
+`;
+}
+
 function dispositionContract(kind: AgentResult["kind"]): string {
   const fixAware = FIX_AWARE_KINDS.has(kind);
   // 리뷰 단계 여부는 처분 사용 가능 여부(fixAware)와 다른 축이다 — FINAL_REVIEW 는 fixAware 지만 앞 단계의 RESOLVED_BY_FIX 주장을
@@ -370,6 +402,8 @@ export function buildImplementationPrompt(input: {
   decisionsPath?: string | null;
   implementationNotes?: readonly ImplementationNote[];
   openRequests?: readonly OpenRequestPrompt[];
+  // 적용된 중재자 진단(수정 지시).
+  diagnoses?: readonly DiagnosisPrompt[];
 }): string {
   return `${input.resumedSession
     ? "이 구현 세션의 이어지는 턴입니다. 같은 승인 범위를 계속 구현하세요."
@@ -384,7 +418,7 @@ ${planSection(input)}
 ${continuedTimelineHeading(input.resumedSession, "현재 방의 사용자 결정과 증거:")}
 ${renderTimeline(input.timeline, false, continuedTimelineEmpty(input.resumedSession))}
 ${decisionsSection(input.decisionsPath)}
-${openRequestsSection(input.openRequests)}${input.resumedSession ? "" : renderImplementationNotes(input.implementationNotes, "implementation")}
+${openRequestsSection(input.openRequests)}${diagnosesSection(input.diagnoses)}${input.resumedSession ? "" : renderImplementationNotes(input.implementationNotes, "implementation")}
 구현 중 발견해 이 턴에서 실제로 고친 쟁점은 RESOLVED_BY_FIX로 처분하고 확인 방법을 evidenceRefs에 남기세요.
 
 ${completionStatusContract()}
@@ -541,8 +575,11 @@ export function buildClaudeFixPrompt(input: {
   planPath?: string | null;
   decisionsPath?: string | null;
   openRequests?: readonly OpenRequestPrompt[];
+  // 적용된 중재자 진단(수정 지시). 진단 전용 수정 작업이면 heading 이 그 사실을 알린다.
+  diagnoses?: readonly DiagnosisPrompt[];
+  heading?: string;
 }): string {
-  return `승인된 계획 범위 안에서 Codex가 확정한 finding을 한 번만 수정하세요.
+  return `${input.heading ?? "승인된 계획 범위 안에서 Codex가 확정한 finding을 한 번만 수정하세요."}
 
 ${input.resumedSession ? `승인된 계획 SHA-256: ${input.planSHA256 ?? "(미기록)"}\n` : ""}${planSection(input)}
 
@@ -552,7 +589,7 @@ ${JSON.stringify(input.reviewFindings, null, 2)}
 ${continuedTimelineHeading(input.resumedSession, "방에 추가된 사용자 결정과 증거:")}
 ${renderTimeline(input.timeline, false, continuedTimelineEmpty(input.resumedSession))}
 ${decisionsSection(input.decisionsPath)}
-${openRequestsSection(input.openRequests)}
+${openRequestsSection(input.openRequests)}${diagnosesSection(input.diagnoses)}
 실제로 고친 finding은 RESOLVED_BY_FIX로 처분하고, **finding 별로** evidenceRefs 에 다음 형식의 한 줄을 남기세요
 (Codex 가 원인과 확인 방법을 다시 찾지 않게): \`F-12 → 발생 원인 → 고친 파일:위치 → 실행한 검증과 로그 경로 → 아직 확인하지 못한 부분\`.
 고치지 못한 finding은 AGREED_ACTION을 그대로 유지하세요. 고치지 않은 것을 RESOLVED_BY_FIX로 적지 마세요.

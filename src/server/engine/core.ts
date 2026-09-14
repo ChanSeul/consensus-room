@@ -46,6 +46,7 @@ import { exceededLimits } from "../adapters/executionMetrics.js";
 import type { WorkflowDependencies } from "../workflow.js";
 import { AdmissionRefused, TurnExecutor, type TurnPurpose, type WriteGuards } from "./turnExecutor.js";
 import { WorkCheckpoints } from "./checkpoint.js";
+import { DiagnosisService } from "./diagnoses.js";
 
 // 결과 JSON 의 표기만 틀린 위반(스키마·kind). 재제출에 판단이 필요 없어 교정 턴의 추론 강도를 low 로 내린다
 // (2026-09-07 Codex 자기 최적화 제안 ③). 쟁점 누락·처분 규칙 위반은 판단이 섞이므로 여기 속하지 않는다.
@@ -102,6 +103,8 @@ export class EngineCore {
   readonly scopeChangeActive = new Set<string>();
   // 허용 오차 개정(amendTolerance)이 계획을 읽고 쓰는 동안 — 범위 변경·재개와 직렬화한다(2026-09-14 Codex High 2).
   readonly amendmentActive = new Set<string>();
+  // 진단 등록·적용(결속을 잡는 await 포함) 진행 중 — 다른 변경·실행과 겹치지 않는다.
+  readonly diagnosisActive = new Set<string>();
   readonly turnInputSequence = new Map<string, number>();
   shuttingDown = false;
   // 주제가 FAILED 로 떨어진 직후(원장 마감 뒤) 알린다 — 사용 한도 자동 재시도 예약(engine/usageLimitRetry.ts).
@@ -113,6 +116,8 @@ export class EngineCore {
   readonly executor: TurnExecutor;
   // 논리 작업별 누적 checkpoint(결과 복구의 정본).
   readonly checkpoints: WorkCheckpoints;
+  // 중재자 진단 서비스(저장·조회·적용·재개 검사·전달 기록) — 2026-09-14 진단 계획.
+  readonly diagnoses: DiagnosisService;
 
   constructor(readonly dependencies: WorkflowDependencies) {
     const controller = new BudgetController(dependencies.database.budgets, cwd => {
@@ -127,6 +132,7 @@ export class EngineCore {
       codex:wrapWorkGroupAdapter(controller.wrap(dependencies.codex),dependencies.database,dependencies.git)};
     this.executor = new TurnExecutor(this);
     this.checkpoints = new WorkCheckpoints(this);
+    this.diagnoses = new DiagnosisService(this);
   }
 
   // 지금 토픽 상태를 실행 기대값으로 고정한다 — 실행기가 spawn 직전에 이 값과 현재를 대조한다.
@@ -240,7 +246,7 @@ export class EngineCore {
 
   assertNoActiveWork(topicId: string, options: { maintenanceOwner?: MaintenanceLockOwner } = {}): void {
     if (this.active.has(topicId) || this.dependencies.database.runningAction(topicId) ||
-        this.deliveryActive.has(topicId) || this.scopeChangeActive.has(topicId) || this.amendmentActive.has(topicId)) {
+        this.deliveryActive.has(topicId) || this.scopeChangeActive.has(topicId) || this.amendmentActive.has(topicId) || this.diagnosisActive.has(topicId)) {
       throw new Error("이 주제에서 이미 실행 중인 작업이 있습니다.");
     }
     this.assertNoMaintenanceLock(options.maintenanceOwner);

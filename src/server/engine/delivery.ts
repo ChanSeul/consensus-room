@@ -41,6 +41,7 @@ import {
   accumulate, requestId, workId, CheckpointCorrupt, type Accumulation, type RecoveredWork, type WorkBinding, type WorkCheckpoint, type WorkKind,
 } from "./checkpoint.js";
 import { acceptResult, completionVerdict, renderOpenRequests, type AcceptedResult, type CompletionVerdict, type OpenRequest } from "./completion.js";
+import type { DiagnosisRecord } from "../../shared/diagnoses.js";
 
 // 논리 작업 실행기의 입력(구현·수정 공통).
 interface WorkSetup {
@@ -53,6 +54,9 @@ interface WorkSetup {
   // false 면 모델 턴 없이 완료 판정 루프만 돈다(저장 결과 재사용·확인).
   initialTurn: boolean;
   legacyBase: () => Promise<{ base: AgentResult | null; ledger: ToleranceLedgerEntry[] }>;
+  // 이 작업에 실린 중재자 진단(적용·전달됨). 적용됐고 아직 전달 전(applied)인 것이 있으면 복구 지름길(수락 이어가기·완료 확인 턴·저장 결과 재사용)을
+  // 쓰지 않고 쓰기 턴을 연다 — 진단은 실제 수정 지시다. 전달은 쓰기 턴의 spawn 에, 처분은 수락 경계에서 기록한다.
+  diagnoses?: DiagnosisRecord[];
   // 수락의 세 부분(CF-01): persist(비동기 저장 — 보고서 등) → [동기 현재성 검사] → transition(**동기** 상태 전이) → continue(다음 단계).
   // 검사와 전이 사이에 await 가 없어야 늦게 도착한 결정이 전이를 타고 넘어가지 않는다.
   accept: {
@@ -117,19 +121,30 @@ export class DeliveryPipeline {
     }));
     // 결정·증거 원문 산출물(읽기 허용) — 세션 압축 뒤에도 원문을 다시 찾을 수 있다(Codex 감사 D02).
     const decisionsPath = await this.writeDecisionsDigest(topic, signal);
-    const readablePaths = [planPath, decisionsPath];
+    // 적용된 중재자 진단(구현 단계 반환) — 수정 지시로 싣고, findings 계약으로 id 별 처분 보고를 받는다.
+    const diagnoses = this.core.diagnoses.forWork(topicId, "IMPLEMENTING", "work");
+    const diagnosisFindings = this.core.diagnoses.findings(diagnoses);
+    const diagnosisPrompts = await this.core.diagnoses.prompts(diagnoses);
+    const readablePaths = [planPath, decisionsPath, ...diagnosisPrompts.paths];
     // 도구 트리 기준은 산출물(tool-tree-baseline)이다 — 감지된 변경은 중재자가 재동기화 뒤 rebaseline 하기 전까지 재시도로 통과하지 않는다(F04).
     const toolTreesBefore = await this.toolTreeBaseline(topic, signal);
     this.assertToolTreesIntact(topic, toolTreesBefore, "재개 전");
     const promptBase = {
       planMarkdown: plan, planSHA256: topic.planSHA256!, worktreePath: topic.worktreePath, branchName: topic.branchName!, planPath,
-      decisionsPath, implementationNotes,
+      decisionsPath, implementationNotes, diagnoses: diagnosisPrompts.prompts,
     };
     const scopedTopic = topic;
     await this.runWork({
       topicId, topic, kind: "IMPLEMENTATION", work: this.core.checkpoints.binding(topic, "IMPLEMENTATION", existingImplementationSession),
       plan, planPath, readablePaths, baselineHead, toolTreesBefore, inputSequence,
-      check: (r: AgentResult) => { this.core.assertKind(r, "IMPLEMENTATION"); assertFindingCoverage(noteFindings, r.findings, "Claude implementation(구현 노트)"); },
+      check: (r: AgentResult) => {
+        this.core.assertKind(r, "IMPLEMENTATION");
+        assertFindingCoverage(noteFindings, r.findings, "Claude implementation(구현 노트)");
+        if (diagnosisFindings.length) {
+          assertFindingCoverage(diagnosisFindings, r.findings, "Claude implementation(중재자 진단)");
+          assertDispositionsResolved(diagnosisFindings, r, "Claude implementation(중재자 진단)");
+        }
+      },
       carry: this.core.carryForwardNormalizer(noteFindings, "Claude implementation"),
       progressKind: "implementation-progress", resultKind: "implementation-result", deferredSource: "implementation",
       // 이어지는 턴은 계획 본문과 이미 받은 이벤트를 다시 싣지 않는다(2026-09-08 Codex 제안 ⑥). 세션 유실로 새 세션이 되면 실행기가 전문 프롬프트로
@@ -144,6 +159,7 @@ export class DeliveryPipeline {
         }),
       }),
       sessionId: existingImplementationSession,
+      diagnoses,
       // 세션 저장이 검증보다 먼저다 — 검증이 턴을 거부해도 세션이 남아야 재시도가 재구현 없이 resume된다
       // (2026-09-01 S1.1: 저장 전에 거부돼 수동 DB 복구가 필요했던 사건의 프로그램적 방지).
       persistSession: (sessionId) => this.core.dependencies.database.setImplementationSession(topicId, sessionId),
@@ -179,6 +195,7 @@ export class DeliveryPipeline {
     // 워킹트리가 바뀌어 있어도 검증 없이 리뷰로 새지 않게).
     let freshlyVerified = false;
     let initialTurn = setup.initialTurn;
+    const diagnosisPending = (setup.diagnoses ?? []).some((record) => record.status === "applied");
     if (recovered) {
       const checkpoint = recovered.checkpoint;
       const newInput = this.userInputSince(topic, checkpoint.inputSequence);
@@ -189,19 +206,20 @@ export class DeliveryPipeline {
         // 다시 대조·판정을 거친 뒤에만 채택·전이한다. 둘 다 아니면 acceptId 기준으로 남은 후속만 한다.
         const snapshot = await this.core.dependencies.git.snapshot(topic.worktreePath);
         const treeChanged = !checkpoint.worktree || checkpoint.worktree.head !== snapshot.head || checkpoint.worktree.diffSHA256 !== snapshot.diffSHA256;
-        if (!newInput && !treeChanged) {
+        if (!newInput && !treeChanged && !diagnosisPending) {
           await this.finishAccept(setup, checkpoint, signal);
           return;
         }
         this.core.event(topicId, "system", "system",
           `수락 checkpoint #${checkpoint.revision}(${checkpoint.phase}) 뒤에 ${newInput ? "새 결정·증거가 도착해" : "워킹트리가 바뀌어"} 수락을 그대로 이어가지 않습니다 — ${newInput ? "반영할 쓰기 턴을 연 뒤" : "현재 변경분을 다시 대조·판정한 뒤"} 다시 수락합니다.`,
           { acceptNotResumed: checkpoint.revision, newInput: Boolean(newInput), treeChanged });
-        if (!newInput) initialTurn = false;
+        if (!newInput && !diagnosisPending) initialTurn = false;
       } else if (checkpoint.phase === "before-confirmation") {
         // 확인 예약 뒤 종료됐다 — 쓰기를 다시 열지 않는다(CF-05). 실행 기록(confirmationExecuted 이벤트)이 없으면 예약만 된 것이라 그 확인을 이어서
         // 하고, 있으면 확인은 이미 실행됐고 결과만 잃은 것이므로 횟수를 환급하지 않는다(그 결과는 새 결정 없이는 다시 사지 않는다).
-        initialTurn = false;
-        this.core.event(topicId, "system", "system",
+        // 적용된 진단이 있으면 확인 예약은 진단 반영 쓰기 턴으로 대체된다(쓰기를 다시 여는 사유가 결정이 아니라 수정 지시다).
+        if (!diagnosisPending) initialTurn = false;
+        if (!diagnosisPending) this.core.event(topicId, "system", "system",
           `checkpoint #${checkpoint.revision} 는 완료 상태 확인 턴 ${confirmationExecuted ? "실행 뒤 결과 저장 전" : "예약"} 상태였습니다 — 쓰기 턴 없이 ${confirmationExecuted ? "확인 소비를 유지한 채 이어갑니다" : "읽기 전용 확인을 이어갑니다"}.`,
           { confirmationResumed: checkpoint.revision, confirmationExecuted });
       }
@@ -236,7 +254,7 @@ export class DeliveryPipeline {
     let state: WorkState;
     // 멈춘(paused) 결과가 열린 요청만 빼면 완료였고 그 뒤 결정이 올라왔으면 쓰기 턴을 다시 사지 않는다 — 읽기 전용 확인 턴(요청 해소 여부)으로
     // 간다. 결정이 REFIX 를 지시하면 저장 결과는 낡은 것이므로 쓰기 턴을 다시 연다. 미완료(in_progress·blocked)면 쓰기 턴이 남은 단계를 한다.
-    if (recovered && recovered.checkpoint.phase === "paused" && seed.base && initialTurn) {
+    if (recovered && recovered.checkpoint.phase === "paused" && seed.base && initialTurn && !diagnosisPending) {
       const decisions = db.getTimeline(topicId, recovered.checkpoint.inputSequence)
         .filter((event) => event.scopeGeneration === topic.scopeGeneration && event.actor === "user" && event.kind === "decision");
       const completeApartFromRequests = completionVerdict(seed.base, { openRequests: [], decisionAfterRequest: false }).kind === "completed";
@@ -250,9 +268,18 @@ export class DeliveryPipeline {
           { storedResultConfirm: recovered.checkpoint.revision });
       }
     }
+    if (diagnosisPending) {
+      const ids = (setup.diagnoses ?? []).filter((record) => record.status === "applied").map((record) => record.id);
+      this.core.event(topicId, "system", "system",
+        `적용된 중재자 진단 ${ids.join(", ")} 을(를) 전달하는 쓰기 턴을 엽니다 — 수락 이어가기·완료 확인 턴·저장 결과 재사용으로 건너뛰지 않습니다.`, { diagnosisTurn: ids });
+    }
     // 2) 턴 — 실행기가 adapter 호출 전·spawn 직전에 허용 검사를 하고, 응답 수신 시 채택 검사를 한다.
     if (initialTurn) {
       const prompts = setup.prompts(seed.openRequests);
+      // 진단 전달 기록 — 프로세스가 뜨는 순간(spawn). 프로세스를 띄우지 않는 어댑터를 위해 정상 반환 뒤에도 한 번(멱등). spawn 전 거부는 전달이 아니다.
+      const deliverDiagnoses = (moment: "spawn" | "return") => {
+        if (setup.diagnoses?.length) this.core.diagnoses.markDelivered(topicId, setup.diagnoses, { moment, workId: workId(setup.work) });
+      };
       const outcome = await this.core.executor.execute({
         role: "claude", topic, signal, purpose: "턴", inputSequence: setup.inputSequence, expected, write: true, writeGuards,
         session: sessionId
@@ -260,12 +287,14 @@ export class DeliveryPipeline {
           : { mode: "create", onSessionCreated: setup.persistSession },
         prompt: sessionId ? prompts.resume : prompts.fresh, implementation: true, readablePaths: setup.readablePaths,
         settings: this.core.executionSettings(topicId, "claude", true),
+        onSpawn: () => deliverDiagnoses("spawn"),
         // 세션 저장이 검증·채택 검사보다 먼저다 — 검증이 턴을 거부해도 세션이 남아야 재시도가 재구현 없이 resume 된다(2026-09-01 S1.1).
         onResponse: (outcome) => {
           if (outcome.created || outcome.sessionId !== sessionId) setup.persistSession(outcome.sessionId);
           db.updateTopic(topicId, { implementationPromptSequence: setup.inputSequence });
         },
       });
+      deliverDiagnoses("return");
       sessionId = outcome.sessionId;
       work = { ...setup.work, sessionId };
       this.assertToolTreesIntact(topic, setup.toolTreesBefore, `${setup.kind === "FIX" ? "자동 수정" : "구현"} 중`);
@@ -537,6 +566,8 @@ export class DeliveryPipeline {
         { acceptInterrupted: acceptId });
       return;
     }
+    // 진단 처분 기록(반영 보고) — 새 입력 검사와 전이 사이의 동기 구간이다(await 없음). 채택되지 않은(인터럽트된) 결과는 기록하지 않는다.
+    if (setup.diagnoses?.length) this.core.diagnoses.recordAccepted(setup.topicId, setup.diagnoses, accepted, acceptId);
     if (!setup.accept.transition(accepted, acceptId)) return;
     await setup.accept.continue(accepted);
   }
@@ -609,6 +640,8 @@ export class DeliveryPipeline {
       return this.runReview(topicId, signal, false);
     }
     if (state === "CLAUDE_FIX") {
+      // 인도 대기·최종 리뷰 정지에서 반환된 중재자 진단은 진단 전용 수정 작업이다(원본이 리뷰가 아니다).
+      if (this.core.diagnoses.forWork(topicId, "CLAUDE_FIX", "diagnosis-fix").length > 0) return this.runDiagnosisFix(topicId, signal);
       // 2차 패스(첫 패스 소비 뒤)는 최종 리뷰 결과를 고친다.
       const kind = this.core.dependencies.database.getFlags(topicId).fixPassUsed ? "codex-final-review" : "codex-review";
       const review = await this.core.latestResult(topicId, kind);
@@ -619,7 +652,9 @@ export class DeliveryPipeline {
       const hasCheckpoint = flags.implementationSessionId
         ? await this.core.checkpoints.recoverFor(topicId, this.core.checkpoints.binding(topic, "FIX", flags.implementationSessionId, this.fixSource(topicId, flags.fixPassUsed))).then((r) => r !== null).catch(() => true)
         : false;
-      if (!hasCheckpoint && await this.finishStoredFix(topicId, review, kind, signal)) return;
+      // 적용된 진단이 기다리면 저장된 수정 결과를 재사용하지 않는다 — 진단은 쓰기 턴으로 전달한다.
+      const diagnosisPending = this.core.diagnoses.forWork(topicId, "CLAUDE_FIX", "work").some((record) => record.status === "applied");
+      if (!hasCheckpoint && !diagnosisPending && await this.finishStoredFix(topicId, review, kind, signal)) return;
       return this.runFix(topicId, signal, review);
     }
     if (state === "CODEX_FINAL_REVIEW") {
@@ -938,14 +973,22 @@ export class DeliveryPipeline {
     const inputSequence = this.core.latestSequence(topicId);
     const planPath = await this.core.dependencies.artifacts.verifiedPath(topicId, "plan");
     const decisionsPath = await this.writeDecisionsDigest(topic, signal);
-    const fixReadable = [planPath, decisionsPath];
+    // 멈춘 수정 작업에 적용된 중재자 진단 — 같은 수정 작업(세션·누적 기록)에 수정 지시로 싣는다.
+    const diagnoses = this.core.diagnoses.forWork(topicId, "CLAUDE_FIX", "work");
+    const diagnosisFindings = this.core.diagnoses.findings(diagnoses);
+    const diagnosisPrompts = await this.core.diagnoses.prompts(diagnoses);
+    const fixReadable = [planPath, decisionsPath, ...diagnosisPrompts.paths];
     const toolTreesBefore = await this.toolTreeBaseline(topic, signal);
     this.assertToolTreesIntact(topic, toolTreesBefore, "수정 재개 전");
-    const fixBase = { planMarkdown: plan, planSHA256: topic.planSHA256, reviewFindings: review.findings, planPath, decisionsPath };
+    const fixBase = { planMarkdown: plan, planSHA256: topic.planSHA256, reviewFindings: review.findings, planPath, decisionsPath, diagnoses: diagnosisPrompts.prompts };
     const check = (r: AgentResult) => {
       this.core.assertKind(r, "FIX");
       assertFindingCoverage(review.findings, r.findings, "Claude fix");
       assertDispositionsResolved(review.findings, r, "Claude fix");
+      if (diagnosisFindings.length) {
+        assertFindingCoverage(diagnosisFindings, r.findings, "Claude fix(중재자 진단)");
+        assertDispositionsResolved(diagnosisFindings, r, "Claude fix(중재자 진단)");
+      }
     };
     await this.runWork({
       topicId, topic, kind: "FIX", work: this.core.checkpoints.binding(topic, "FIX", flags.implementationSessionId, this.fixSource(topicId, secondPass)),
@@ -965,7 +1008,81 @@ export class DeliveryPipeline {
       persistSession: (sessionId) => this.core.dependencies.database.setImplementationSession(topicId, sessionId),
       initialTurn: true,
       legacyBase: async () => ({ base: await this.legacyPendingOriginal(topicId, topic, "CLAUDE_FIX"), ledger: await this.legacyAcceptedLedger(topicId) }),
+      diagnoses,
       accept: this.fixAcceptance(topicId, topic, review, secondPass, signal),
+    }, signal);
+  }
+
+  // 진단 전용 수정 작업(인도 대기·최종 리뷰 정지에서 반환, 2026-09-14 진단 계획 §2) — 원본은 리뷰가 아니라 중재자 진단이다. 수락하면 최종 리뷰로 간다.
+  // 자동 수정 회차(fixPassUsed·secondFixPassUsed)는 소비하지도 초기화하지도 않는다 — 이 작업의 경계는 구현 리뷰 횟수 한도(최종 리뷰가 소비)다.
+  private async runDiagnosisFix(topicId: string, signal: AbortSignal): Promise<void> {
+    const database = this.core.dependencies.database;
+    const topic = this.core.requireState(topicId, "CLAUDE_FIX");
+    const flags = database.getFlags(topicId);
+    if (!flags.implementationSessionId) throw new Error("Claude 구현 세션을 찾을 수 없습니다.");
+    const diagnoses = this.core.diagnoses.forWork(topicId, "CLAUDE_FIX", "diagnosis-fix");
+    if (diagnoses.length === 0) throw new Error("적용된 진단 전용 수정 작업이 없습니다.");
+    const plan = await this.core.requireStoredPlan(topicId);
+    if (!topic.branchName) throw new Error("수정할 작업 브랜치가 없습니다.");
+    await this.core.dependencies.git.assertCurrentBranch(topic.worktreePath, topic.branchName);
+    const baselineHead = await this.requirePinnedBaseline(topicId, topic.worktreePath);
+    const inputSequence = this.core.latestSequence(topicId);
+    const planPath = await this.core.dependencies.artifacts.verifiedPath(topicId, "plan");
+    const decisionsPath = await this.writeDecisionsDigest(topic, signal);
+    const diagnosisPrompts = await this.core.diagnoses.prompts(diagnoses);
+    const readablePaths = [planPath, decisionsPath, ...diagnosisPrompts.paths];
+    const toolTreesBefore = await this.toolTreeBaseline(topic, signal);
+    this.assertToolTreesIntact(topic, toolTreesBefore, "진단 수정 재개 전");
+    const source = this.core.diagnoses.findings(diagnoses);
+    const ids = diagnoses.map((record) => record.id);
+    const check = (r: AgentResult) => {
+      this.core.assertKind(r, "FIX");
+      assertFindingCoverage(source, r.findings, "Claude fix(중재자 진단)");
+      assertDispositionsResolved(source, r, "Claude fix(중재자 진단)");
+    };
+    const fixBase = {
+      planMarkdown: plan, planSHA256: topic.planSHA256, reviewFindings: source, planPath, decisionsPath, diagnoses: diagnosisPrompts.prompts,
+      heading: "승인된 계획 범위 안에서 중재자 진단(수정 지시)을 반영하세요. 수정 결과는 최종 리뷰를 다시 거쳐야 인도할 수 있습니다.",
+    };
+    await this.runWork({
+      topicId, topic, kind: "FIX", work: this.core.checkpoints.binding(topic, "FIX", flags.implementationSessionId, `diagnosis#${ids.join("+")}`),
+      plan, planPath, readablePaths, baselineHead, toolTreesBefore, inputSequence, check,
+      carry: this.core.carryForwardNormalizer(source, "Claude fix(중재자 진단)"),
+      progressKind: "fix-progress", resultKind: "claude-fix", deferredSource: "fix",
+      pauseFallbackMessage: "진단 수정에 사용자 결정이 필요합니다.",
+      prompts: (openRequests) => ({
+        fresh: buildClaudeFixPrompt({ ...fixBase, openRequests, timeline: database.getPromptTimeline(topicId, topic.scopeGeneration) }),
+        resume: buildClaudeFixPrompt({
+          ...fixBase, openRequests, resumedSession: true,
+          timeline: database.getPromptTimeline(topicId, topic.scopeGeneration, flags.implementationPromptSequence ?? 0),
+        }),
+      }),
+      sessionId: flags.implementationSessionId,
+      persistSession: (sessionId) => database.setImplementationSession(topicId, sessionId),
+      initialTurn: true,
+      // 새 논리 작업이다 — 결과는 이 진단 보고부터 쌓고, 허용 오차 원장은 마지막으로 수락된 원장에서 승계해 전체 diff 로 다시 대조한다.
+      legacyBase: async () => ({ base: null, ledger: await this.legacyAcceptedLedger(topicId) }),
+      diagnoses,
+      accept: {
+        persist: async () => undefined,
+        transition: (fixResult: AcceptedResult) => {
+          const downgraded = dispositionRegressions(source, fixResult.findings);
+          if (downgraded.length > 0) {
+            this.core.interrupt(topicId, "USER_DECISION_REQUIRED",
+              `진단 수정 결과가 중재자 진단의 처분을 되돌렸습니다(${downgraded.join(", ")}) — 최종 리뷰로 넘기지 않았습니다. 중재자가 정정 진단으로 판단하세요.`, "CLAUDE_FIX");
+            return false;
+          }
+          const current = database.getTopic(topicId);
+          assertTransition(current.state, "CODEX_FINAL_REVIEW");
+          database.applyTopicTransition({
+            topicId, changes: { state: "CODEX_FINAL_REVIEW", lastError: null, resumeState: null },
+            events: [{ actor: "system", kind: "system", state: "CODEX_FINAL_REVIEW", body: `Codex가 중재자 진단(${ids.join(", ")}) 수정 결과를 최종 검토합니다.`,
+              payload: { from: current.state, to: "CODEX_FINAL_REVIEW", diagnosisFix: ids } }],
+          });
+          return true;
+        },
+        continue: async () => { await this.runReview(topicId, signal, true); },
+      },
     }, signal);
   }
 
@@ -1353,6 +1470,8 @@ export class DeliveryPipeline {
       pushedOID: null,
     });
     this.core.transition(topicId, "READY_TO_DELIVER", message);
+    // 반영 보고된 중재자 진단은 리뷰를 통과해 인도 준비에 이르렀으므로 해결이다.
+    this.core.diagnoses.resolveReported(topicId, snapshot);
     void this.announceDeferredForDelivery(topicId);
   }
 
@@ -1374,6 +1493,7 @@ export class DeliveryPipeline {
 
   async commit(topicId: string, message: string, paths: string[]): Promise<string> {
     return this.withDeliveryLock(topicId, async (topic) => {
+      this.core.diagnoses.assertDeliverable(topicId, "커밋(commit)");
       if (!topic.branchName) throw new Error("커밋할 작업 브랜치가 없습니다.");
       const flags = this.core.dependencies.database.getFlags(topicId);
       if (!flags.reviewedHead || !flags.reviewedDiffSHA256) throw new Error("최종 리뷰가 확인한 변경 스냅샷이 없습니다.");
@@ -1405,6 +1525,7 @@ export class DeliveryPipeline {
 
   async push(topicId: string): Promise<string> {
     return this.withDeliveryLock(topicId, async (topic) => {
+      this.core.diagnoses.assertDeliverable(topicId, "push");
       if (!topic.branchName) throw new Error("push할 작업 브랜치가 없습니다.");
       const flags = this.core.dependencies.database.getFlags(topicId);
       if (!flags.committedOID) throw new Error("Consensus Room에서 확정한 커밋이 없습니다.");

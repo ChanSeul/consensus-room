@@ -28,6 +28,7 @@ import { DeliveryPipeline } from "./engine/delivery.js";
 import { UsageLimitRetryScheduler, type RetryClock } from "./engine/usageLimitRetry.js";
 
 // 호출 주체 — 브라우저 사용자(기본)와 중재 세션(x-consensus-actor: mediator, 위임 스위치 on 일 때만). 이벤트 payload 에 남긴다(D03).
+import type { DiagnosisInput, DiagnosisRecord } from "../shared/diagnoses.js";
 export interface CallOrigin { actor: "mediator"; delegationSetAt: string | null }
 
 export interface WorkflowDependencies {
@@ -177,6 +178,7 @@ export class WorkflowEngine {
 
   startImplementation(topicId: string, actionId?: string, kickoffDecision?: string): string {
     this.core.assertNotShuttingDown();
+    this.core.diagnoses.assertResumable(topicId, "구현 시작(implement)");
     assertImplementationGate(this.core.dependencies.database.getTopic(topicId));
     if (kickoffDecision !== undefined) {
       // 재계획 트리거 단어는 결정 본문에 쓸 수 없다 — retry 사다리가 그 단어로 DRAFT 리셋을 판단한다(2026-09-07 사고).
@@ -224,6 +226,8 @@ export class WorkflowEngine {
     // 상태를 바꾸기 전에 다른 작업(실행·범위 변경·인도)이 없는지 본다 — 아래 사다리 일부는 startAction 전에 전이하므로,
     // 잠금을 startAction 에서 뒤늦게 만나면 상태만 바뀐 채 고착된다(Codex 후속 지적 2).
     this.core.assertNoActiveWork(topicId);
+    // 공통 진단 상태 검사: 중재자가 처리할 진단(적용 대기·재확인·반박·추가 증거)이 있으면 재개하지 않는다 — 자동 재시도도 이 경로다.
+    this.core.diagnoses.assertResumable(topicId, "재시도(retry)");
     let topic = this.core.dependencies.database.getTopic(topicId);
     const flags = this.core.dependencies.database.getFlags(topicId);
     const resume = flags.resumeState;
@@ -373,6 +377,7 @@ export class WorkflowEngine {
     }
     const topic = this.core.dependencies.database.getTopic(topicId);
     if (topic.state !== "READY_TO_DELIVER") throw new Error("전달 준비가 끝난 주제만 닫을 수 있습니다.");
+    this.core.diagnoses.assertDeliverable(topicId, "주제 닫기(close)");
     const group=this.core.dependencies.database.workGroups.forTopic(topicId);
     if(group && group.links[group.stages.at(-1)!.id]?.topicId!==topicId) {
       const flags=this.core.dependencies.database.getFlags(topicId);
@@ -474,6 +479,7 @@ export class WorkflowEngine {
   // 구현 계속 재개 — 리뷰 한도·실패로 멈춘 토픽의 resume 을 IMPLEMENTING 으로 되돌린다(같은 세션·같은 계획, 리뷰 소비량 불변). 그 뒤 retry.
   resumeImplementation(topicId: string, input: ResumeImplementationInput, origin?: CallOrigin): Topic {
     this.core.assertNoActiveWork(topicId);
+    this.core.diagnoses.assertResumable(topicId, "구현 재개(resume-implementation)");
     const db = this.core.dependencies.database;
     const topic = db.getTopic(topicId);
     if (topic.state !== input.expectedState) throw new Error(`현재 상태 ${topic.state} 가 요청의 기대 상태 ${input.expectedState} 와 다릅니다.`);
@@ -486,6 +492,19 @@ export class WorkflowEngine {
         body: `구현 계속 재개(공식): resume → IMPLEMENTING. ${input.reason}`,
         payload: { implementationResume: { fromState: topic.state, scopeGeneration: topic.scopeGeneration }, ...(origin ? { origin } : {}) } }],
     });
+  }
+
+  // ---- 중재자 진단(2026-09-14) — 저장·조회·적용은 DiagnosisService 한곳, 반환은 공통 재시도 사다리(retry)로 한다.
+  registerDiagnosis(topicId: string, input: DiagnosisInput, requestKey?: string, origin?: CallOrigin): Promise<DiagnosisRecord> {
+    return this.core.diagnoses.register(topicId, input, requestKey, origin);
+  }
+
+  listDiagnoses(topicId: string): DiagnosisRecord[] {
+    return this.core.diagnoses.list(topicId);
+  }
+
+  applyDiagnosis(topicId: string, diagnosisId: string, request: { requestKey?: string; origin?: CallOrigin; actionId?: string }): Promise<string> {
+    return this.core.diagnoses.apply(topicId, diagnosisId, request, (id, actionId) => this.retry(id, actionId));
   }
 
   // 도구 트리 기준 재설정(F04) — 중재자가 tools_sync 로 되돌리거나 새 핀을 배치한 뒤 부른다. 실행 중이면 거부. 유지보수 잠금을 쥔 스크립트의

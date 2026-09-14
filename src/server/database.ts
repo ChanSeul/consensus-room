@@ -2,6 +2,8 @@ import { ReviewLedger } from "./reviewLedger.js";
 import { RevisionLedger } from "./revisionLedger.js";
 import { WorkGroups } from "./workGroups.js";
 import { BudgetLedger } from "./budgetLedger.js";
+import { DiagnosisStore } from "./diagnosisStore.js";
+import { CLOSED_DIAGNOSIS_STATUSES, type DiagnosisBinding, type DiagnosisInput, type DiagnosisOrigin, type DiagnosisRecord, type DiagnosisStatus } from "../shared/diagnoses.js";
 import { EventEmitter } from "node:events";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
@@ -51,12 +53,14 @@ export class ConsensusDatabase {
   readonly reviews: ReviewLedger;
   readonly budgets: BudgetLedger;
   readonly workGroups: WorkGroups;
+  readonly diagnoses: DiagnosisStore;
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
     this.migrate();
+    this.diagnoses = new DiagnosisStore(this.db);
     this.budgets = new BudgetLedger(this.db);
     this.workGroups = new WorkGroups(this.db);
     this.revisions = new RevisionLedger(this.db);
@@ -943,6 +947,68 @@ export class ConsensusDatabase {
   runningActions(): ActionRecord[] {
     const rows = this.db.prepare("SELECT * FROM actions WHERE status = 'running'").all() as Array<Record<string, unknown>>;
     return rows.map((row) => this.mapAction(row));
+  }
+
+  // 마지막 실행(action) — 중재자 진단이 결속하는 "실패" 의 정체성이다. 새 실행이 끝나면 다른 실패로 본다.
+  latestAction(topicId: string): ActionRecord | null {
+    const row = this.db.prepare("SELECT * FROM actions WHERE topic_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1").get(topicId) as Record<string, unknown> | undefined;
+    return row ? this.mapAction(row) : null;
+  }
+
+  // ---- 중재자 진단(DiagnosisStore) — 등록·상태 기록은 타임라인 이벤트(재시작 복구용 requestKey 마커 포함)와 **한 트랜잭션**이다.
+  // 번호 할당·정정 대상 검사(닫힌 진단은 정정할 수 없다)도 같은 트랜잭션 안에서 한다.
+  registerDiagnosis(input: {
+    topicId: string; diagnosis: DiagnosisInput; binding: DiagnosisBinding; origin: DiagnosisOrigin | null;
+    initialStatus: "registered" | "closed_no_action";
+    event: (id: string) => Omit<TimelineEventInput, "topicId">;
+  }): DiagnosisRecord {
+    let recorded: TimelineEvent | null = null;
+    let id = "";
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const number = this.diagnoses.nextNumber(input.topicId);
+      id = `DG-${number}`;
+      const at = now();
+      const supersedes = input.diagnosis.supersedes;
+      if (supersedes) {
+        const previous = this.diagnoses.get(input.topicId, supersedes);
+        if (!previous) throw Object.assign(new Error(`정정 대상 진단 ${supersedes} 가 이 주제에 없습니다.`), { statusCode: 409 });
+        if (CLOSED_DIAGNOSIS_STATUSES.has(previous.status)) {
+          throw Object.assign(new Error(`정정 대상 진단 ${supersedes} 는 이미 닫혔습니다(${previous.status}).`), { statusCode: 409 });
+        }
+      }
+      this.diagnoses.insert({ topicId: input.topicId, id, number, input: input.diagnosis, binding: input.binding, origin: input.origin, createdAt: at });
+      this.diagnoses.log(input.topicId, id, input.initialStatus, supersedes ? { supersedes } : {}, at);
+      if (supersedes) this.diagnoses.log(input.topicId, supersedes, "superseded", { by: id }, at);
+      recorded = this.insertEventInTransaction({ ...input.event(id), topicId: input.topicId });
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    if (recorded) this.emitEvent(recorded);
+    return this.diagnoses.get(input.topicId, id)!;
+  }
+
+  recordDiagnosisStatus(input: {
+    topicId: string;
+    entries: ReadonlyArray<{ diagnosisId: string; status: DiagnosisStatus; detail?: Record<string, unknown> }>;
+    changes?: Parameters<ConsensusDatabase["updateTopic"]>[1];
+    event?: Omit<TimelineEventInput, "topicId">;
+  }): void {
+    let recorded: TimelineEvent | null = null;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const at = now();
+      for (const entry of input.entries) this.diagnoses.log(input.topicId, entry.diagnosisId, entry.status, entry.detail ?? {}, at);
+      if (input.changes && Object.keys(input.changes).length > 0) this.updateTopic(input.topicId, input.changes);
+      if (input.event) recorded = this.insertEventInTransaction({ ...input.event, topicId: input.topicId });
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    if (recorded) this.emitEvent(recorded);
   }
 
   getAction(id: string): ActionRecord | null {
