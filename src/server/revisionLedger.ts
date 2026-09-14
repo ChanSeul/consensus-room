@@ -112,6 +112,16 @@ export class RevisionLedger {
   admit(topicId: string, executionId: string, kind: RewriteKind): void {
     this.transaction(() => this.reserve(topicId, executionId, kind));
   }
+  // spawn 직전 실행 허용 검사에 막혀 **실제 호출이 없었던** 예약을 되돌린다(PLAN §2 검증 조건 1). 카운트된 시도만 used 를 줄인다.
+  release(topicId: string, executionId: string): boolean {
+    return this.transaction(() => {
+      const previous = this.db.prepare("SELECT * FROM revision_attempts WHERE execution_id=?").get(executionId);
+      if (!previous || previous.topic_id !== topicId) return false;
+      this.db.prepare("DELETE FROM revision_attempts WHERE execution_id=?").run(executionId);
+      if (Number(previous.counted) === 1) { const a = this.account(topicId); a.used = Math.max(0, a.used - 1); this.save(a); }
+      return true;
+    });
+  }
   grant(
     topicId: string,
     requestId: string,

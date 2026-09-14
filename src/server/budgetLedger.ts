@@ -28,6 +28,15 @@ export class BudgetLedger {
       pause: null, version: 1, source };
     this.save(account); return account;
   }
+  // 실행 중인 호출의 spawn 직전에 쓰는 검사 — 자기 실행이 '미마감' 이라 assertAvailable 은 쓸 수 없고, 계정의 정지·총량 소진만 본다.
+  assertNotExhausted(ids: string[]): void {
+    for (const id of ids) {
+      const a = this.account(id);
+      if (!a) throw new BudgetBlocked(id, "검증된 기본 예산이 없습니다. 예산을 설정한 뒤 진행하세요.");
+      if (a.pause || BUDGET_KEYS.some(key => a.used[key] >= a.policy.total[key])) throw new BudgetBlocked(id);
+    }
+  }
+
   assertAvailable(ids: string[]): void {
     const unfinished = this.db.prepare("SELECT record_json FROM budget_executions").all()
       .map(row=>JSON.parse(String(row.record_json)) as Execution)

@@ -3,11 +3,19 @@ import { execFileSync } from "node:child_process";
 import type { CommandResult, CommandRunner, CommandSpec } from "./types.js";
 
 export class SpawnCommandRunner implements CommandRunner {
-  run(spec: CommandSpec): Promise<CommandResult> {
+  async run(spec: CommandSpec): Promise<CommandResult> {
+    // 실행 허용 검사는 spawn 직전이다 — 여기까지 온 준비 작업(임시 디렉터리·슬롯)은 끝났고, 이 뒤엔 프로세스가 뜬다.
+    if (spec.signal?.aborted) throw abortError(spec.signal.reason);
+    if (spec.beforeSpawn) await spec.beforeSpawn();     // 비동기 검사(Git 등)
+    return this.spawnAndCollect(spec);                    // 동기 마지막 검사 → spawn (사이에 await 없음)
+  }
+
+  private spawnAndCollect(spec: CommandSpec): Promise<CommandResult> {
     return new Promise((resolve, reject) => {
-      if (spec.signal?.aborted) {
-        reject(abortError(spec.signal.reason));
-        return;
+      // 마지막 동기 검사 — 취소·새 입력·계획·실행 상태. 여기서 던지면 프로세스는 뜨지 않는다.
+      if (spec.signal?.aborted) { reject(abortError(spec.signal.reason)); return; }
+      if (spec.admitSync) {
+        try { spec.admitSync(); } catch (error) { reject(error); return; }
       }
       const child = spawn(spec.command, spec.args, {
         cwd: spec.cwd,

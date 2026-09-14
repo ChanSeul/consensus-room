@@ -22,10 +22,13 @@ async function makeApp(runner?: CommandRunner) {
     run: async () => { throw new Error("이 테스트에서는 명령을 실행하지 않습니다."); },
   };
   const adapterCalls:string[]=[];
+  // 가짜는 프로세스를 띄운 뒤 실패한 호출을 흉내 낸다(onProcessSpawn) — 띄우지 않은 호출은 예약이 해제되므로 집계 테스트의 전제가 달라진다(PLAN §2 검증 조건 1).
+  const fakeSpawn = (turn: { onProcessSpawn?: (process: { pid: number; pgid: number; executable: string; commandLine: string; startedAt: string }) => void }) =>
+    turn.onProcessSpawn?.({ pid: 1, pgid: 1, executable: "fake", commandLine: "fake", startedAt: new Date().toISOString() });
   const adapter = (role: "claude" | "codex"): AgentAdapter => ({
     role,
-    createSession: async () => { adapterCalls.push(role);throw new Error("이 테스트에서는 CLI를 실행하지 않습니다."); },
-    resumeTurn: async () => { adapterCalls.push(role);throw new Error("이 테스트에서는 CLI를 실행하지 않습니다."); },
+    createSession: async (turn) => { adapterCalls.push(role); fakeSpawn(turn); throw new Error("이 테스트에서는 CLI를 실행하지 않습니다."); },
+    resumeTurn: async (turn) => { adapterCalls.push(role); fakeSpawn(turn); throw new Error("이 테스트에서는 CLI를 실행하지 않습니다."); },
     validateExistingSession: async () => false,
   });
   const database = new ConsensusDatabase(join(root, "room.sqlite"));

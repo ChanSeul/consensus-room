@@ -25,6 +25,12 @@ export interface ProjectMemoryWriter {
 }
 
 export interface CommandSpec {
+  // 실행 허용 검사 — 준비(임시 파일·슬롯 대기)가 전부 끝난 뒤 spawn 직전에 부른다. 던지면 spawn 하지 않는다
+  // (PLAN §2 "다음 실행 허용": 취소·새 결정/증거·계획 변경·유지보수·예산은 adapter 호출 전이 아니라 spawn 직전에 본다).
+  //   beforeSpawn : 비동기 검사(Git HEAD 등) — await 한다.
+  //   admitSync   : **동기** 마지막 검사(취소·새 입력·계획·실행 상태) — 이 호출과 spawn 사이에 await 가 없다(비동기 틈 없음).
+  beforeSpawn?: () => void | Promise<void>;
+  admitSync?: () => void;
   onInterruptedOutput?: (output: { stdout: string; stderr: string; jsonLines: unknown[]; truncated: boolean }) => void;
   command: string;
   args: string[];
@@ -68,6 +74,9 @@ export interface SessionTurn {
   prompt: string;
   cwd: string;
   signal?: AbortSignal;
+  // spawn 직전 실행 허용 검사(CommandSpec.beforeSpawn/admitSync 로 그대로 전달). 어댑터의 내부 재시도·슬롯 대기·세션 폴백도 매번 부른다.
+  beforeSpawn?: () => void | Promise<void>;
+  admitSync?: () => void;
   implementation?: boolean;
   // 서버가 지정하는 계획 작성 호출의 종류. 재작성 횟수 집계에 사용한다.
   planningWrite?: import("../shared/revisions.js").RewriteKind;

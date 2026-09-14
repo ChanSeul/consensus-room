@@ -1010,7 +1010,7 @@ describe("리뷰 finding 보존", () => {
       implementationFindings: [agreed],
       originalReviewFindings: [agreed],
       claudeResults: [{
-        kind: "FIX",
+        kind: "FIX", status: "completed",
         summary: "처분을 되돌린 보완",
         findings: [finding("F-1", "첫 리뷰가 고치기로 한 결함", { disposition: "AGREED_NO_ACTION" })],
         evidenceRefs: [],
@@ -1104,7 +1104,7 @@ describe("리뷰 finding 보존", () => {
       originalReviewFindings: [agreed],
       codexResult: remaining,
       codexResults: [remaining, passed],
-      claudeResults: [{ kind: "FIX", summary: "2차 수정", findings: [resolved], evidenceRefs: [] }],
+      claudeResults: [{ kind: "FIX", status: "completed", summary: "2차 수정", findings: [resolved], evidenceRefs: [] }],
     });
     database.updateTopic("topic-1", { fixPassUsed: true });
     database.setImplementationSession("topic-1", "claude-implementation-session");
@@ -1132,7 +1132,7 @@ describe("리뷰 finding 보존", () => {
       codexResult: remaining,
       // 리뷰 2개뿐: 소진 뒤 결정→retry 가 리뷰를 다시 사면 세 번째 호출에서 가짜 응답 부족으로 드러난다.
       codexResults: [remaining, passed],
-      claudeResults: [{ kind: "FIX", summary: "추가 수정", findings: [resolved], evidenceRefs: [] }],
+      claudeResults: [{ kind: "FIX", status: "completed", summary: "추가 수정", findings: [resolved], evidenceRefs: [] }],
     });
     database.updateTopic("topic-1", { fixPassUsed: true, secondFixPassUsed: true });
     database.setImplementationSession("topic-1", "claude-implementation-session");
@@ -1238,35 +1238,42 @@ describe("리뷰 finding 보존", () => {
   });
 });
 
+// 서버가 프롬프트에 적어 준 열린 요청 id(`[Q-xxxxxxxx]`) — 러너는 이 id 로만 요청을 해소한다(PLAN §2 요청별 보존).
+function requestIdsIn(prompt: string): string[] {
+  return [...new Set([...prompt.matchAll(/\[(Q-[0-9a-f]{8})\]/g)].map((match) => match[1]))];
+}
+
+type QueuedResult = AgentResult | ((turn: { prompt: string; protocolOnly?: boolean }) => AgentResult);
+
 class QueuedAdapter implements AgentAdapter {
   readonly calls: string[] = [];
   readonly turns: Array<Parameters<AgentAdapter["resumeTurn"]>[0] | Parameters<AgentAdapter["createSession"]>[0]> = [];
 
   constructor(
     readonly role: "claude" | "codex",
-    private readonly results: AgentResult[],
+    private readonly results: QueuedResult[],
   ) {}
 
   async createSession(turn: Parameters<AgentAdapter["createSession"]>[0]) {
     this.calls.push(turn.prompt);
     this.turns.push(turn);
-    return { sessionId: `${this.role}-created-session`, result: this.next() };
+    return { sessionId: `${this.role}-created-session`, result: this.next(turn) };
   }
 
   async resumeTurn(turn: Parameters<AgentAdapter["resumeTurn"]>[0]) {
     this.calls.push(turn.prompt);
     this.turns.push(turn);
-    return this.next();
+    return this.next(turn);
   }
 
   async validateExistingSession() {
     return true;
   }
 
-  private next(): AgentResult {
+  private next(turn: { prompt: string; protocolOnly?: boolean }): AgentResult {
     const result = this.results.shift();
     if (!result) throw new Error(`${this.role} 가짜 응답이 부족합니다.`);
-    return result;
+    return typeof result === "function" ? result(turn) : result;
   }
 }
 
@@ -1302,7 +1309,7 @@ describe("저장된 구현 세션의 대화 파일이 없을 때", () => {
       role: "claude",
       async createSession(turn) {
         calls.push("create");
-        return { sessionId: "claude-fresh-session", result: { kind: "FIX", summary: "새 세션에서 고침", findings: [resolved], evidenceRefs: ["F-ORIGINAL → 원인 → 파일 → 검증 → 없음"] } };
+        return { sessionId: "claude-fresh-session", result: { kind: "FIX", status: "completed", summary: "새 세션에서 고침", findings: [resolved], evidenceRefs: ["F-ORIGINAL → 원인 → 파일 → 검증 → 없음"] } };
       },
       async resumeTurn(turn) {
         calls.push(`resume:${turn.sessionId}`);
@@ -1421,9 +1428,9 @@ async function makeReviewRecovery(input: {
   implementationFindings: AgentResult["findings"];
   originalReviewFindings: AgentResult["findings"];
   codexResult: AgentResult;
-  claudeResults?: AgentResult[];
+  claudeResults?: QueuedResult[];
   // 지정하면 codex 큐를 그대로 쓴다(2차 수정 패스처럼 최종 리뷰가 두 번 도는 시나리오).
-  codexResults?: AgentResult[];
+  codexResults?: QueuedResult[];
   codex?: AgentAdapter;
   // 지정하면 claude 어댑터를 통째로 바꾼다(턴 도중 입력을 넣는 게이트 어댑터 등).
   claude?: AgentAdapter;
@@ -2626,7 +2633,7 @@ describe("구현·수정 경로의 결과 보존과 멈춘 수정 결과 재사�
   it("수정 턴 도중 결정이 오면 결과를 claude-interrupted 로 보존하고 멈춘다", async () => {
     const agreed = finding("F-1", "결함", { disposition: "AGREED_ACTION" });
     const resolved = finding("F-1", "결함", { disposition: "RESOLVED_BY_FIX" });
-    const claude = new GatedAdapter("claude", [{ kind: "FIX", summary: "게이트 뒤의 수정", findings: [resolved], evidenceRefs: [] }]);
+    const claude = new GatedAdapter("claude", [{ kind: "FIX", status: "completed", summary: "게이트 뒤의 수정", findings: [resolved], evidenceRefs: [] }]);
     const { database, engine, artifacts } = await makeReviewRecovery({
       resumeState: "CLAUDE_FIX", implementationFindings: [agreed], originalReviewFindings: [agreed],
       codexResult: { kind: "FINAL_REVIEW", summary: "사용 안 함", findings: [resolved], evidenceRefs: [] }, claude,
@@ -2651,10 +2658,15 @@ describe("구현·수정 경로의 결과 보존과 멈춘 수정 결과 재사�
       resumeState: "CLAUDE_FIX", implementationFindings: [agreed], originalReviewFindings: [agreed],
       codexResult: { kind: "FINAL_REVIEW", summary: "수정 확인", findings: [resolved], evidenceRefs: [] },
       codexResults: [{ kind: "FINAL_REVIEW", summary: "수정 확인", findings: [resolved], evidenceRefs: [] }],
-      // 수정 응답 하나뿐 — 재개가 수정 턴을 다시 부르면 가짜 응답 부족으로 FAILED 가 되어 드러난다.
+      // 수정 응답 하나 + 읽기 전용 확인 응답 하나 — 재개가 **쓰기** 수정 턴을 다시 부르면 가짜 응답 부족으로 FAILED 가 되어 드러난다.
+      // 결정이 왔다는 이유로 요청이 닫히지 않는다: 러너가 확인 턴에서 요청 id 로 해소를 명시해야 한다(PLAN §2 요청별 보존).
       claudeResults: [{
-        kind: "FIX", summary: "고쳤지만 범위 확인 요청", findings: [resolved], evidenceRefs: ["feature.txt"],
+        kind: "FIX", status: "completed", summary: "고쳤지만 범위 확인 요청", findings: [resolved], evidenceRefs: ["feature.txt"],
         requestedUserDecision: "도구 폴더도 손대도 되는지 확인해 주세요.",
+      }, (turn) => {
+        if (!turn.protocolOnly) throw new Error("확인 턴은 읽기 전용(protocolOnly)이어야 합니다.");
+        return { kind: "FIX", status: "completed", summary: "고쳤지만 범위 확인 요청", findings: [resolved], evidenceRefs: ["feature.txt"],
+          resolvesRequestedDecision: true, resolvedRequestId: requestIdsIn(turn.prompt)[0] };
       }],
     });
     engine.retry("topic-1");
@@ -2666,10 +2678,11 @@ describe("구현·수정 경로의 결과 보존과 멈춘 수정 결과 재사�
     engine.retry("topic-1");
     await waitForActionCompletion(database, "topic-1");
 
-    expect(database.getTopic("topic-1").state).toBe("READY_TO_DELIVER");
+    expect(database.getTopic("topic-1").state, database.getTopic("topic-1").lastError ?? "").toBe("READY_TO_DELIVER");
     expect(database.getFlags("topic-1").fixPassUsed).toBe(true);
     const bodies = database.getTimeline("topic-1").map((event) => event.body);
-    expect(bodies.some((body) => body.includes("저장된 수정 결과") && body.includes("수정 턴을 다시 사지 않습니다"))).toBe(true);
+    expect(bodies.some((body) => body.includes("저장된 수정 결과") && body.includes("쓰기 턴을 다시 사지 않고 읽기 전용 확인 턴으로"))).toBe(true);
+    expect(bodies.some((body) => body.includes("열린 요청 Q-") && body.includes("해소로 확인해 닫았습니다"))).toBe(true);
     database.close();
   });
 });
@@ -2684,8 +2697,9 @@ describe("멈춘 수정의 REFIX", () => {
       codexResult: { kind: "FINAL_REVIEW", summary: "수정 확인", findings: [resolved], evidenceRefs: [] },
       codexResults: [{ kind: "FINAL_REVIEW", summary: "수정 확인", findings: [resolved], evidenceRefs: [] }],
       claudeResults: [
-        { kind: "FIX", summary: "고쳤지만 범위 확인 요청", findings: [resolved], evidenceRefs: ["feature.txt"], requestedUserDecision: "원자를 더 넣어야 하는지 확인해 주세요." },
-        { kind: "FIX", summary: "원자 하나 더 넣고 재측정했다.", findings: [resolved], evidenceRefs: ["feature.txt"] },
+        { kind: "FIX", status: "completed", summary: "고쳤지만 범위 확인 요청", findings: [resolved], evidenceRefs: ["feature.txt"], requestedUserDecision: "원자를 더 넣어야 하는지 확인해 주세요." },
+        (turn) => ({ kind: "FIX", status: "completed", summary: "원자 하나 더 넣고 재측정했다.", findings: [resolved], evidenceRefs: ["feature.txt"],
+          resolvesRequestedDecision: true, resolvedRequestId: requestIdsIn(turn.prompt)[0] }),
       ],
     });
     engine.retry("topic-1");
@@ -2701,7 +2715,7 @@ describe("멈춘 수정의 REFIX", () => {
     // 두 번째 수정 응답이 실제로 소비됐다(수정 턴이 다시 돌았다는 증거).
     expect(bodies.some((body) => body.includes("원자 하나 더 넣고 재측정했다."))).toBe(true);
     expect(bodies.some((body) => body.includes("REFIX 지시로 저장된 수정 결과") && body.includes("수정 턴을 다시 엽니다"))).toBe(true);
-    expect(bodies.some((body) => body.includes("수정 턴을 다시 사지 않습니다"))).toBe(false);
+    expect(bodies.some((body) => body.includes("쓰기 턴을 다시 사지 않고"))).toBe(false);
     database.close();
   });
 });
@@ -2989,7 +3003,7 @@ describe("최종 리뷰 새 쟁점의 분류", () => {
         { kind: "FINAL_REVIEW", summary: "새 확정 결함", findings: [resolved, newAgreed], evidenceRefs: [] },
         { kind: "FINAL_REVIEW", summary: "확인", findings: [resolved, newResolved], evidenceRefs: [] },
       ],
-      claudeResults: [{ kind: "FIX", summary: "2차 수정", findings: [resolved, newResolved], evidenceRefs: [] }],
+      claudeResults: [{ kind: "FIX", status: "completed", summary: "2차 수정", findings: [resolved, newResolved], evidenceRefs: [] }],
     });
     database.updateTopic("topic-1", { fixPassUsed: true });
     database.setImplementationSession("topic-1", "claude-implementation-session");
@@ -3017,7 +3031,7 @@ describe("코드 리뷰 전용 세션", () => {
     const codex = new ReviewSessionAdapter([review, final]);
     const { database, engine, artifacts } = await makeReviewRecovery({
       resumeState: "CODEX_REVIEW", implementationFindings: [], originalReviewFindings: [], codexResult: review, codex,
-      claudeResults: [{ kind: "FIX", summary: "늦은 응답 거부", findings: [resolved], evidenceRefs: ["취소 회귀 테스트"] }],
+      claudeResults: [{ kind: "FIX", status: "completed", summary: "늦은 응답 거부", findings: [resolved], evidenceRefs: ["취소 회귀 테스트"] }],
     });
     database.setImplementationSession("topic-1", "claude-implementation");
     database.updateAgentSettings("topic-1", "codex", { model: "gpt-6-astra", effort: "xhigh" });
@@ -3286,7 +3300,7 @@ describe("settled 쟁점 서버 승계 — 수정·리뷰 경로", () => {
       codexResult: { kind: "FINAL_REVIEW", summary: "수정 확인", findings: [resolved], evidenceRefs: [] },
       codexResults: [{ kind: "FINAL_REVIEW", summary: "수정 확인", findings: [resolved], evidenceRefs: [] }],
       // 수정 응답 하나뿐 — 교정 재제출이 일어나면 가짜 응답 부족으로 FAILED 가 되어 드러난다.
-      claudeResults: [{ kind: "FIX", summary: "F-1 만 고쳤다", findings: [resolved], evidenceRefs: ["feature.txt"] }],
+      claudeResults: [{ kind: "FIX", status: "completed", summary: "F-1 만 고쳤다", findings: [resolved], evidenceRefs: ["feature.txt"] }],
     });
     engine.retry("topic-1");
     await waitForActionCompletion(database, "topic-1");
@@ -3312,7 +3326,7 @@ describe("settled 쟁점 서버 승계 — 수정·리뷰 경로", () => {
       resumeState: "CLAUDE_FIX", implementationFindings: [action], originalReviewFindings: [action, noAction],
       codexResult: { kind: "FINAL_REVIEW", summary: "수정 확인", findings: [], evidenceRefs: [] },
       // F-1(행동 필요)을 빠뜨린 응답 하나뿐 → 교정을 시도하다 가짜 응답 부족으로 실패해야 한다.
-      claudeResults: [{ kind: "FIX", summary: "F-2 만 적었다", findings: [noAction], evidenceRefs: [] }],
+      claudeResults: [{ kind: "FIX", status: "completed", summary: "F-2 만 적었다", findings: [noAction], evidenceRefs: [] }],
     });
     engine.retry("topic-1");
     await waitForActionCompletion(database, "topic-1");
@@ -3355,9 +3369,9 @@ describe("settled 쟁점 서버 승계 — 수정·리뷰 경로", () => {
       codexResults: [{ kind: "FINAL_REVIEW", summary: "수정 확인", findings: [resolved], evidenceRefs: [] }],
       claudeResults: [
         // 1차: 행동 필요 F-1 누락(교정 대상) + settled F-2 생략(승계 대상)
-        { kind: "FIX", summary: "F-1 을 빠뜨렸다", findings: [], evidenceRefs: [] },
+        { kind: "FIX", status: "completed", summary: "F-1 을 빠뜨렸다", findings: [], evidenceRefs: [] },
         // 교정 재제출: F-1 만 적음 — F-2 는 여전히 승계
-        { kind: "FIX", summary: "F-1 고침", findings: [resolved], evidenceRefs: ["feature.txt"] },
+        { kind: "FIX", status: "completed", summary: "F-1 고침", findings: [resolved], evidenceRefs: ["feature.txt"] },
       ],
     });
     engine.retry("topic-1");
@@ -3438,8 +3452,8 @@ it("줄 패치 개정도 감사·종결·ACK를 거쳐 같은 계획으로 승�
 it("완료한 계획을 보존하고 예산 도달 뒤 감사와 일반 재시도를 막는다", async () => {
   const {database,dependencies}=makeEngine("DRAFT",null);
   const artifacts=dependencies.artifacts;
-  let claudeCalls=0,codexCalls=0;
-  dependencies.claude.createSession=async turn=>{claudeCalls++;turn.onUsage?.({inputTokens:10,recordKind:"final"});return {sessionId:"new",result:{kind:"PLAN",summary:"완료",planMarkdown:validPlan("예산"),findings:[],evidenceRefs:[]}};};
+  let claudeCalls=0,codexCalls=0; const claudePrompts:string[]=[];
+  dependencies.claude.createSession=async turn=>{claudeCalls++;claudePrompts.push(turn.prompt);turn.onUsage?.({inputTokens:10,recordKind:"final"});return {sessionId:"new",result:{kind:"PLAN",summary:"완료",planMarkdown:validPlan("예산"),findings:[],evidenceRefs:[]}};};
   dependencies.claude.resumeTurn=async turn=>(await dependencies.claude.createSession(turn)).result;
   dependencies.codex.createSession=async()=>{codexCalls++;throw new Error("호출 금지");};
   dependencies.codex.resumeTurn=async()=>{codexCalls++;throw new Error("호출 금지");};
@@ -3447,7 +3461,7 @@ it("완료한 계획을 보존하고 예산 도달 뒤 감사와 일반 재시�
   database.budgets.configure("topic-1",policy,"test");
   const engine=new WorkflowEngine({...dependencies,enforceBudgets:true});
   engine.startPlan("topic-1");await waitForActionCompletion(database,"topic-1");
-  expect(claudeCalls).toBe(1);expect(codexCalls).toBe(0);
+  expect(claudeCalls, claudePrompts.map((prompt) => prompt.slice(0, 80)).join(" || ")).toBe(1);expect(codexCalls).toBe(0);
   expect(await artifacts.readLatest("topic-1","plan")).not.toBeNull();
   expect(database.getTopic("topic-1").state).toBe("USER_DECISION_REQUIRED");
   expect(database.getFlags("topic-1").resumeState).toBe("CODEX_AUDIT");
@@ -3951,7 +3965,8 @@ describe("Codex 3차 감사 R3-01 — 저장된 미완료 FIX 재사용 금지",
     const f = finding("F-1", "fix", { severity: "HIGH", disposition: "RESOLVED_BY_FIX" });
     const claude = new QueuedAdapter("claude", [
       { kind: "FIX", summary: "code done but P4 remains", status: "in_progress", remainingSteps: ["P4"], requestedUserDecision: "environment ready before remaining P4", findings: [f], evidenceRefs: ["P3-PROOF"] },
-      { kind: "FIX", summary: "P4 done", status: "completed", findings: [f], evidenceRefs: ["P4-PROOF"] },
+      (turn) => ({ kind: "FIX", summary: "P4 done", status: "completed", findings: [f], evidenceRefs: ["P4-PROOF"],
+        resolvesRequestedDecision: true, resolvedRequestId: requestIdsIn(turn.prompt)[0] }),
     ]);
     const codex = new QueuedAdapter("codex", [{ kind: "FINAL_REVIEW", summary: "review", findings: [f], evidenceRefs: [] }]);
     const review = { kind: "REVIEW" as const, summary: "fix", findings: [f], evidenceRefs: [] };
@@ -3965,7 +3980,9 @@ describe("Codex 3차 감사 R3-01 — 저장된 미완료 FIX 재사용 금지",
     expect(claude.calls).toHaveLength(2);           // 남은 P4 를 실행하는 수정 턴 1회
     expect(claude.calls[1]).toContain("환경 준비했으니 남은 P4를 계속해");
     expect(codex.calls).toHaveLength(1);            // 최종 리뷰는 completed 뒤 한 번만
-    expect(database.getTimeline("topic-1").some((event) => event.body.includes("아직 in_progress 입니다") && event.body.includes("재사용하지 않고"))).toBe(true);
+    // 미완료(in_progress) 저장 결과는 읽기 전용 확인이 아니라 쓰기 수정 턴으로 이어진다 — checkpoint(paused)에서 복구했다는 기록이 남는다.
+    expect(database.getTimeline("topic-1").some((event) => event.body.includes("누적 checkpoint #") && event.body.includes("(paused"))).toBe(true);
+    expect(database.getTimeline("topic-1").some((event) => event.body.includes("쓰기 턴을 다시 사지 않고"))).toBe(false);
     const saved = JSON.parse((await artifacts.readLatest("topic-1", "claude-fix"))!);
     expect(saved.status).toBe("completed");
     expect(saved.evidenceRefs).toEqual(expect.arrayContaining(["P3-PROOF", "P4-PROOF"]));   // 미완료 결과 위에 병합

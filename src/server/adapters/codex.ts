@@ -222,6 +222,7 @@ export class CodexAdapter implements AgentAdapter {
     }, 10_000);
     try {
     const output = await this.runner.run({
+      beforeSpawn: turn.beforeSpawn, admitSync: turn.admitSync,   // 슬롯 대기·관리형 홈 준비가 끝난 뒤, spawn 직전
         onInterruptedOutput: turn.onInterruptedOutput,
       onJSONLine: (value, at) => {
         toolTime.observe(value, at); metrics.observe(value);

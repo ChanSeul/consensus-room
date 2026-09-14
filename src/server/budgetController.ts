@@ -40,6 +40,7 @@ export class BudgetController {
     const controller=new AbortController();
     const observed=zeroBudget();
     let failure:unknown; let partial:unknown; let sessionId = (turn as SessionTurn).sessionId;
+    let spawned=false;   // 프로세스가 실제로 떴는가 — 안 떴으면 리뷰·재작성 예약을 되돌린다
     const abort=()=>controller.abort(turn.signal?.reason);
     if(turn.signal?.aborted) abort(); else turn.signal?.addEventListener("abort",abort,{once:true});
     const observe=(usage:Parameters<NonNullable<SessionTurn["onUsage"]>>[0])=> {
@@ -59,6 +60,7 @@ export class BudgetController {
     const timer=setInterval(()=>observe({}),1000);
     try {
       const result=await invoke({...turn,signal:controller.signal,
+        onProcessSpawn:process=>{spawned=true;turn.onProcessSpawn?.(process);},
         onSessionCreated:id=>{sessionId=id;turn.onSessionCreated?.(id);},
         onInterruptedOutput:output=>{partial=output;turn.onInterruptedOutput?.(output);},
         onUsage:usage=>{observe(usage);turn.onUsage?.({...usage,executionId:id});},
@@ -66,6 +68,10 @@ export class BudgetController {
       if(failure) throw failure;
       return result;
     } catch(error) {
+      if(!spawned) {   // 실행 허용 검사가 spawn 직전에 막았다 — 호출이 없었으므로 예약을 되돌린다(PLAN §2 검증 조건 1)
+        if(kind)this.revisions?.release(ctx.topicId,id);
+        if(review)this.reviews?.release(ctx.topicId,id);
+      }
       if(partial!==undefined || sessionId) await this.checkpoint(ctx.topicId,{sessionId,output:partial,incomplete:true});
       throw failure??error;
     } finally {

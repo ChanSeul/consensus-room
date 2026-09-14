@@ -341,7 +341,7 @@ class EditingClaude implements AgentAdapter {
     writeFileSync(join(this.worktree, "feature.txt"), "첫 구현\n");
     return {
       sessionId: "claude-implementation-session",
-      result: result("IMPLEMENTATION", "첫 구현을 마쳤습니다."),
+      result: { ...result("IMPLEMENTATION", "첫 구현을 마쳤습니다."), status: "completed" as const },   // 정상 완료 — 완료 선언 계약(status 필수)
     };
   }
 
@@ -354,7 +354,7 @@ class EditingClaude implements AgentAdapter {
     this.fixPrompts.push(turn.prompt);
     this.readablePaths.push(turn.readablePaths);
     if (this.changeOnFix) writeFileSync(join(this.worktree, "feature.txt"), "보완 완료\n");
-    return result("FIX", "검토 지적을 보완했습니다.", [reviewFinding("RESOLVED_BY_FIX")]);
+    return { ...result("FIX", "검토 지적을 보완했습니다.", [reviewFinding("RESOLVED_BY_FIX")]), status: "completed" as const };
   }
 
   async validateExistingSession() { return true; }

@@ -111,6 +111,16 @@ export class ReviewLedger {
   admit(topicId: string, id: string, scope: ReviewScope): void {
     this.transaction(() => this.reserve(topicId, id, scope));
   }
+  // spawn 직전 실행 허용 검사에 막혀 실제 호출이 없었던 예약을 되돌린다(PLAN §2 검증 조건 1).
+  release(topicId: string, id: string): boolean {
+    return this.transaction(() => {
+      const old = this.db.prepare("SELECT * FROM review_attempts WHERE execution_id=?").get(id);
+      if (!old || old.topic_id !== topicId) return false;
+      this.db.prepare("DELETE FROM review_attempts WHERE execution_id=?").run(id);
+      const a = this.account(topicId, String(old.scope) as ReviewScope); a.used = Math.max(0, a.used - 1); this.save(a);
+      return true;
+    });
+  }
   grant(
     topicId: string,
     scope: ReviewScope,

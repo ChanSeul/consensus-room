@@ -204,6 +204,7 @@ export class ClaudeAdapter implements AgentAdapter {
       }, 10_000);
       try {
       const output = await this.runner.run({
+        beforeSpawn: turn.beforeSpawn, admitSync: turn.admitSync,
         onInterruptedOutput: turn.onInterruptedOutput,
         command: "claude", args, cwd: workspace, stdin,
         signal: turn.signal, onSpawn: turn.onProcessSpawn,

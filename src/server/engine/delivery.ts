@@ -7,6 +7,7 @@ import { digestToolTrees, type ToolTreeDigest } from "../toolTree.js";
 import { redactUnverifiedResult } from "../security.js";
 import {
   buildContinuationPrompt,
+  buildStatusConfirmationPrompt,
   buildClaudeFixPrompt,
   buildCodexReviewPrompt,
   buildImplementationPrompt, buildToleranceCorrectionPrompt,
@@ -26,6 +27,7 @@ import {
   mergeCorrectionResult,
   salvageResultFields,
   mergeFindingSources,
+  assertTransition,
 } from "../../shared/workflow.js";
 import { normalizeCommitPaths } from "../git.js";
 import { redactAgentResult } from "../security.js";
@@ -34,6 +36,35 @@ import {
   type ToleranceLedgerEntry,
 } from "../../shared/tolerance.js";
 import type { ResultNormalizer, EngineCore } from "./core.js";
+import type { TurnExpectation, WriteGuards } from "./turnExecutor.js";
+import {
+  accumulate, requestId, workId, CheckpointCorrupt, type Accumulation, type RecoveredWork, type WorkBinding, type WorkCheckpoint, type WorkKind,
+} from "./checkpoint.js";
+import { acceptResult, completionVerdict, renderOpenRequests, type AcceptedResult, type CompletionVerdict, type OpenRequest } from "./completion.js";
+
+// 논리 작업 실행기의 입력(구현·수정 공통).
+interface WorkSetup {
+  topicId: string; topic: Topic; kind: WorkKind; work: WorkBinding; plan: string; planPath: string; readablePaths: readonly string[];
+  baselineHead: string; toolTreesBefore: ToolTreeDigest; inputSequence: number;
+  check: (result: AgentResult) => void; carry: ResultNormalizer;
+  progressKind: string; resultKind: string; deferredSource: "implementation" | "fix"; pauseFallbackMessage?: string;
+  prompts: (openRequests: readonly OpenRequest[]) => { fresh: string; resume: string };
+  sessionId: string | null; persistSession: (sessionId: string) => void;
+  // false 면 모델 턴 없이 완료 판정 루프만 돈다(저장 결과 재사용·확인).
+  initialTurn: boolean;
+  legacyBase: () => Promise<{ base: AgentResult | null; ledger: ToleranceLedgerEntry[] }>;
+  onAccepted: (accepted: AcceptedResult, acceptId: number) => Promise<void>;
+}
+
+// 복구 직후(턴 전)의 바탕 — 결과가 없을 수 있다.
+interface WorkSeed {
+  base: AgentResult | null;
+  openRequests: OpenRequest[];
+  verifiedLedger: ToleranceLedgerEntry[];
+  confirmations: number;
+}
+// 턴을 흡수한 뒤의 상태 — 완료 판정할 누적 결과가 있다.
+interface WorkState extends WorkSeed { base: AgentResult }
 
 function renderReport(result: AgentResult): string {
   return `# ${result.kind}\n\n${result.summary}\n\n## Findings\n\n\`\`\`json\n${JSON.stringify(result.findings, null, 2)}\n\`\`\`\n\n## Evidence\n\n${result.evidenceRefs.map((item) => `- ${item}`).join("\n") || "- 없음"}\n`;
@@ -80,16 +111,6 @@ export class DeliveryPipeline {
     // 결정·증거 원문 산출물(읽기 허용) — 세션 압축 뒤에도 원문을 다시 찾을 수 있다(Codex 감사 D02).
     const decisionsPath = await this.writeDecisionsDigest(topic, signal);
     const readablePaths = [planPath, decisionsPath];
-    // 직전 교정(허용 오차·계약)이 실패했거나 계속 진행 턴이 끊겼으면 보존해 둔 미완료 결과를 이번 결과에 병합한다(R01·F03).
-    const pendingOriginal = await this.pendingResultOriginal(topicId, topic, "IMPLEMENTING");
-    const baseNormalizer = this.core.carryForwardNormalizer(noteFindings, "Claude implementation");
-    const normalize = pendingOriginal
-      ? (result: AgentResult) => baseNormalizer(mergeCorrectionResult(pendingOriginal, result).result)
-      : baseNormalizer;
-    if (pendingOriginal) {
-      this.core.event(topicId, "system", "system",
-        "직전 턴이 교정·계속 진행 도중 끊겨 보존해 둔 미완료 보고(요약·쟁점·증거·요청 결정)를 이번 재개 결과에 병합합니다.", { pendingCorrectionMerged: true });
-    }
     // 도구 트리 기준은 산출물(tool-tree-baseline)이다 — 감지된 변경은 중재자가 재동기화 뒤 rebaseline 하기 전까지 재시도로 통과하지 않는다(F04).
     const toolTreesBefore = await this.toolTreeBaseline(topic, signal);
     this.assertToolTreesIntact(topic, toolTreesBefore, "재개 전");
@@ -97,61 +118,382 @@ export class DeliveryPipeline {
       planMarkdown: plan, planSHA256: topic.planSHA256!, worktreePath: topic.worktreePath, branchName: topic.branchName!, planPath,
       decisionsPath, implementationNotes,
     };
-    // 이어지는 턴은 계획 본문과 이미 받은 이벤트를 다시 싣지 않는다(2026-09-08 Codex 제안 ⑥). 세션 유실로 새 세션이 되면
-    // resumeImplementationSession 이 전문 프롬프트로 바꿔 쓴다. '전달한 sequence' 는 턴이 실제로 돌아온 뒤에만 적는다 —
-    // 429 로 끊긴 턴이 못 본 이벤트를 다음 retry 가 다시 싣게 하기 위해서다.
-    const prompts = {
-      fresh: buildImplementationPrompt({
-        ...promptBase, timeline: this.core.dependencies.database.getPromptTimeline(topicId, topic.scopeGeneration),
+    const scopedTopic = topic;
+    await this.runWork({
+      topicId, topic, kind: "IMPLEMENTATION", work: this.core.checkpoints.binding(topic, "IMPLEMENTATION", existingImplementationSession),
+      plan, planPath, readablePaths, baselineHead, toolTreesBefore, inputSequence,
+      check: (r: AgentResult) => { this.core.assertKind(r, "IMPLEMENTATION"); assertFindingCoverage(noteFindings, r.findings, "Claude implementation(구현 노트)"); },
+      carry: this.core.carryForwardNormalizer(noteFindings, "Claude implementation"),
+      progressKind: "implementation-progress", resultKind: "implementation-result", deferredSource: "implementation",
+      // 이어지는 턴은 계획 본문과 이미 받은 이벤트를 다시 싣지 않는다(2026-09-08 Codex 제안 ⑥). 세션 유실로 새 세션이 되면 실행기가 전문 프롬프트로
+      // 폴백한다. '전달한 sequence' 는 턴이 실제로 돌아온 뒤에만 적는다 — 429 로 끊긴 턴이 못 본 이벤트를 다음 retry 가 다시 싣게 하기 위해서다.
+      prompts: (openRequests) => ({
+        fresh: buildImplementationPrompt({
+          ...promptBase, openRequests, timeline: this.core.dependencies.database.getPromptTimeline(topicId, scopedTopic.scopeGeneration),
+        }),
+        resume: buildImplementationPrompt({
+          ...promptBase, openRequests, resumedSession: true,
+          timeline: this.core.dependencies.database.getPromptTimeline(topicId, scopedTopic.scopeGeneration, sessionFlags.implementationPromptSequence ?? 0),
+        }),
       }),
-      resume: buildImplementationPrompt({
-        ...promptBase, resumedSession: true,
-        timeline: this.core.dependencies.database.getPromptTimeline(topicId, topic.scopeGeneration, sessionFlags.implementationPromptSequence ?? 0),
+      sessionId: existingImplementationSession,
+      // 세션 저장이 검증보다 먼저다 — 검증이 턴을 거부해도 세션이 남아야 재시도가 재구현 없이 resume된다
+      // (2026-09-01 S1.1: 저장 전에 거부돼 수동 DB 복구가 필요했던 사건의 프로그램적 방지).
+      persistSession: (sessionId) => this.core.dependencies.database.setImplementationSession(topicId, sessionId),
+      initialTurn: true,
+      legacyBase: async () => ({
+        base: await this.legacyPendingOriginal(topicId, scopedTopic, "IMPLEMENTING"), ledger: await this.legacyAcceptedLedger(topicId),
       }),
-    };
-    const fork = existingImplementationSession
-      ? await this.resumeImplementationSession(topicId, existingImplementationSession, prompts, topic.worktreePath, signal, readablePaths)
-      : await this.createFreshImplementationSession(topicId, prompts.fresh, topic.worktreePath, signal, readablePaths);
-    this.core.assertCurrent(topicId, signal, topic.scopeGeneration, "IMPLEMENTING");
-    this.assertToolTreesIntact(topic, toolTreesBefore, "구현 중");
-    // 세션 저장이 검증보다 먼저다 — 검증이 턴을 거부해도 세션이 남아야 재시도가 재구현 없이 resume된다
-    // (2026-09-01 S1.1: 저장 전에 거부돼 수동 DB 복구가 필요했던 사건의 프로그램적 방지).
-    this.core.dependencies.database.setImplementationSession(topicId, fork.sessionId);
-    this.core.dependencies.database.updateTopic(topicId, { implementationPromptSequence: inputSequence });
-    const check = (r: AgentResult) => { this.core.assertKind(r, "IMPLEMENTATION"); assertFindingCoverage(noteFindings, r.findings, "Claude implementation(구현 노트)"); };
-    let implementationResult = await this.core.enforceResultContract("claude", topic, fork.result, fork.sessionId, {
-      signal, implementation: true, planMode: false, startedAfter: inputSequence, check, readablePaths, normalize,
-    });
-    await this.assertBaselineIntact(topic, baselineHead, "구현 중");
-    this.assertToolTreesIntact(topic, toolTreesBefore, "구현 계약 교정 중");
-    const toleranceChecked = await this.enforceTolerance({
-      topicId, topic: this.core.dependencies.database.getTopic(topicId), plan, result: implementationResult, sessionId: fork.sessionId,
-      signal, inputSequence, resumeState: "IMPLEMENTING", check, baselineHead, readablePaths, normalize,
-    });
-    if (!toleranceChecked) return;
-    implementationResult = toleranceChecked;
-    // 코드를 바꿀 수 있는 마지막 호출(허용 오차 교정 → 계약 교정) 뒤에 다시 본다 — 검사가 마지막 호출보다 먼저 끝나면 뚫린다(Codex 후속 지적 1).
-    await this.assertBaselineIntact(topic, baselineHead, "구현 교정 중");
-    this.assertToolTreesIntact(topic, toolTreesBefore, "구현 교정 중");
-    // status=in_progress: 정지 사유(요청 결정·blocked·결정 필요 쟁점·외부 증거·새 사용자 입력)가 없을 때만 같은 세션에서 "계속 진행" 턴을 연다(D01·F02).
-    const continued = await this.continueUntilComplete({
-      topicId, topic, plan, kind: "IMPLEMENTATION", result: implementationResult, sessionId: fork.sessionId, signal, inputSequence,
-      resumeState: "IMPLEMENTING", check, baselineHead, readablePaths, baseNormalizer, toolTreesBefore, progressKind: "implementation-progress",
-    });
-    if (!continued) return;
-    implementationResult = continued;
-    // 러너가 범위 밖으로 판정해 to-do 로 남긴 쟁점(DEFERRED_OUT_OF_SCOPE)은 후속 목록에 올린다 — 인도 전 사용자가 처분한다.
-    await this.core.recordDeferredFindings(topic,
-      implementationResult.findings.filter((finding) => finding.disposition === "DEFERRED_OUT_OF_SCOPE"), "implementation", signal);
-    if (await this.core.interruptPreservingResult(topic, "claude", implementationResult, inputSequence, signal)) return;
-    await this.core.writeArtifact(topic, "implementation", 1, renderReport(implementationResult), signal);
-    await this.core.saveAgentOutput(topic, "claude", implementationResult, "implementation-result", signal);
-    if (this.core.interruptForNewUserInput(topic, inputSequence)) return;
-    if (this.core.pauseForResult(topicId, implementationResult, "IMPLEMENTING", "구현 중 승인 범위 밖 결정이 필요합니다.")) {
+      onAccepted: async (accepted) => {
+        await this.core.writeArtifact(scopedTopic, "implementation", 1, renderReport(accepted), signal);
+        this.core.transition(topicId, "CODEX_REVIEW", "Codex가 구현 결과를 읽기 전용으로 검토합니다.");
+        await this.runReview(topicId, signal, false);
+      },
+    }, signal);
+  }
+
+  // ---- 논리 작업 실행기(구현·수정 공통, PLAN §2): 복구 → 턴 → 흡수(계약·허용 오차·누적 checkpoint) → 완료 판정 루프(계속 진행·확인·정지·수락) ----
+  private async runWork(setup: WorkSetup, signal: AbortSignal): Promise<void> {
+    const { topicId, topic } = setup;
+    const db = this.core.dependencies.database;
+    const expected = { state: setup.work.resumeState, scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch, planSHA256: topic.planSHA256 };
+    const writeGuards: WriteGuards = { requireApprovedPlan: true, baselineHead: setup.baselineHead, toolTreeBaseline: setup.toolTreesBefore };
+    // 1) 복구 — 논리 작업(workId)의 최신 checkpoint. 손상이면 보존한 채 멈춘다. 없으면 옛 산출물(legacy)에서 바탕을 만든다.
+    let recovered: RecoveredWork | null;
+    try {
+      recovered = await this.core.checkpoints.recoverFor(topicId, setup.work);
+    } catch (error) {
+      if (!(error instanceof CheckpointCorrupt)) throw error;
+      this.core.interrupt(topicId, "USER_DECISION_REQUIRED", error.message, setup.work.resumeState, { checkpointCorrupt: error.revision });
       return;
     }
-    this.core.transition(topicId, "CODEX_REVIEW", "Codex가 구현 결과를 읽기 전용으로 검토합니다.");
-    await this.runReview(topicId, signal, false);
+    let seed: WorkSeed;
+    if (recovered) {
+      const checkpoint = recovered.checkpoint;
+      if (checkpoint.phase === "accepting" || checkpoint.phase === "accepted") {
+        await this.finishAccept(setup, checkpoint, signal);
+        return;
+      }
+      const askedText = recovered.accumulated.requestedUserDecision?.trim();
+      const openRequests = checkpoint.openRequests.length === 0 && askedText
+        ? [{ id: requestId(askedText, checkpoint.inputSequence), text: askedText, askedAfterSequence: checkpoint.inputSequence }]
+        : [...checkpoint.openRequests];
+      seed = { base: recovered.accumulated, openRequests, verifiedLedger: [...recovered.verifiedLedger], confirmations: checkpoint.confirmations };
+      this.core.event(topicId, "system", "system",
+        `누적 checkpoint #${checkpoint.revision}(${checkpoint.phase}, ${workId(setup.work)}) 에서 이어갑니다 — 열린 요청 ${seed.openRequests.length}건, 검증 원장 ${seed.verifiedLedger.length}행.`,
+        { checkpointResumed: checkpoint.revision, phase: checkpoint.phase, workId: workId(setup.work) });
+    } else {
+      const legacy = await setup.legacyBase();
+      const asked = legacy.base?.requestedUserDecision?.trim();
+      seed = {
+        base: legacy.base, verifiedLedger: legacy.ledger, confirmations: 0,
+        // 옛 산출물의 요청은 제시 시점을 모른다 — 0 으로 두면 그 뒤의 모든 결정이 "요청 뒤 결정" 이 되어 해소 확인을 거친다.
+        openRequests: asked ? [{ id: requestId(asked, 0), text: asked, askedAfterSequence: 0 }] : [],
+      };
+      if (legacy.base) {
+        this.core.event(topicId, "system", "system",
+          "직전 턴이 교정·계속 진행 도중 끊겨 보존해 둔 미완료 보고(요약·쟁점·증거·요청 결정)를 이번 재개 결과에 병합합니다.", { pendingCorrectionMerged: true });
+      }
+    }
+    let sessionId = setup.work.sessionId;
+    let work: WorkBinding = setup.work;
+    let state: WorkState;
+    // 멈춘(paused) 결과가 열린 요청만 빼면 완료였고 그 뒤 결정이 올라왔으면 쓰기 턴을 다시 사지 않는다 — 읽기 전용 확인 턴(요청 해소 여부)으로
+    // 간다. 결정이 REFIX 를 지시하면 저장 결과는 낡은 것이므로 쓰기 턴을 다시 연다. 미완료(in_progress·blocked)면 쓰기 턴이 남은 단계를 한다.
+    let initialTurn = setup.initialTurn;
+    if (recovered && recovered.checkpoint.phase === "paused" && seed.base && initialTurn) {
+      const decisions = db.getTimeline(topicId, recovered.checkpoint.inputSequence)
+        .filter((event) => event.scopeGeneration === topic.scopeGeneration && event.actor === "user" && event.kind === "decision");
+      const completeApartFromRequests = completionVerdict(seed.base, { openRequests: [], decisionAfterRequest: false }).kind === "completed";
+      if (decisions.some((event) => refixDirective(event.body))) {
+        this.core.event(topicId, "system", "system",
+          `결정의 REFIX 지시로 저장된 ${setup.kind === "FIX" ? "수정" : "구현"} 결과(checkpoint #${recovered.checkpoint.revision})를 재사용하지 않고 ${setup.kind === "FIX" ? "수정" : "구현"} 턴을 다시 엽니다.`);
+      } else if (completeApartFromRequests && seed.openRequests.length > 0 && decisions.length > 0) {
+        initialTurn = false;
+        this.core.event(topicId, "system", "system",
+          `저장된 ${setup.kind === "FIX" ? "수정" : "구현"} 결과(checkpoint #${recovered.checkpoint.revision})는 열린 요청 ${seed.openRequests.length}건 말고는 완료였고 그 뒤 결정이 올라왔습니다 — 쓰기 턴을 다시 사지 않고 읽기 전용 확인 턴으로 해소 여부를 확인합니다.`,
+          { storedResultConfirm: recovered.checkpoint.revision });
+      }
+    }
+    // 2) 턴 — 실행기가 adapter 호출 전·spawn 직전에 허용 검사를 하고, 응답 수신 시 채택 검사를 한다.
+    if (initialTurn) {
+      const prompts = setup.prompts(seed.openRequests);
+      const outcome = await this.core.executor.execute({
+        role: "claude", topic, signal, purpose: "턴", inputSequence: setup.inputSequence, expected, write: true, writeGuards,
+        session: sessionId
+          ? { mode: "resume", sessionId, fallbackFresh: { prompt: prompts.fresh, onSessionCreated: setup.persistSession } }
+          : { mode: "create", onSessionCreated: setup.persistSession },
+        prompt: sessionId ? prompts.resume : prompts.fresh, implementation: true, readablePaths: setup.readablePaths,
+        settings: this.core.executionSettings(topicId, "claude", true),
+        // 세션 저장이 검증·채택 검사보다 먼저다 — 검증이 턴을 거부해도 세션이 남아야 재시도가 재구현 없이 resume 된다(2026-09-01 S1.1).
+        onResponse: (outcome) => {
+          if (outcome.created || outcome.sessionId !== sessionId) setup.persistSession(outcome.sessionId);
+          db.updateTopic(topicId, { implementationPromptSequence: setup.inputSequence });
+        },
+      });
+      sessionId = outcome.sessionId;
+      work = { ...setup.work, sessionId };
+      this.assertToolTreesIntact(topic, setup.toolTreesBefore, `${setup.kind === "FIX" ? "자동 수정" : "구현"} 중`);
+      await this.assertBaselineIntact(topic, setup.baselineHead, `${setup.kind === "FIX" ? "자동 수정" : "구현"} 중`);
+      const absorbed = await this.absorbTurn(setup, work, seed, outcome.result, sessionId, expected, writeGuards, signal);
+      if (!absorbed) return;
+      state = absorbed;
+    } else {
+      if (!seed.base) throw new Error("완료 판정할 결과가 없습니다.");
+      state = { ...seed, base: seed.base };
+    }
+    if (!sessionId) throw new Error("세션 없이 완료 판정 루프에 들어왔습니다.");
+    // 이 action 안에서 워킹트리 대조(허용 오차)를 통과한 누적본인가 — 복구·확인 경로로 왔으면 수락 전에 다시 대조한다(읽기 전용 확인 턴 뒤에
+    // 워킹트리가 바뀌어 있어도 검증 없이 리뷰로 새지 않게).
+    let freshlyVerified = initialTurn;
+    // 3) 완료 판정 루프
+    let continuations = 0;
+    for (;;) {
+      const verdict = completionVerdict(state.base, { openRequests: state.openRequests, decisionAfterRequest: this.decisionAfter(topic, state.openRequests) });
+      if (verdict.kind === "completed") {
+        if (!freshlyVerified) {
+          const reverified = await this.enforceTolerance({
+            topicId, topic: db.getTopic(topicId), plan: setup.plan, result: state.base, sessionId, signal, inputSequence: setup.inputSequence,
+            resumeState: setup.work.resumeState, check: setup.check, baselineHead: setup.baselineHead, readablePaths: setup.readablePaths,
+            previousLedger: state.verifiedLedger, expected, writeGuards, openRequests: state.openRequests,
+          });
+          if (!reverified) {
+            await this.core.checkpoints.record(topic, {
+              work, phase: "paused", accumulated: state.base, verifiedLedger: state.verifiedLedger, inputSequence: setup.inputSequence,
+              openRequests: state.openRequests, confirmations: state.confirmations,
+            }, signal);
+            return;
+          }
+          state = { ...state, base: reverified, verifiedLedger: [...(reverified.toleranceLedger ?? [])] };
+          freshlyVerified = true;
+        }
+        await this.acceptWork(setup, work, state, verdict, signal);
+        return;
+      }
+      if (verdict.kind === "await-input") {
+        await this.pauseWork(setup, work, state, verdict.reason === "external-evidence" ? "BLOCKED_ON_EVIDENCE" : "USER_DECISION_REQUIRED",
+          verdict.message || setup.pauseFallbackMessage || "사용자 결정이 필요합니다.", { verdict: verdict.reason, openRequests: state.openRequests.map((request) => request.id) }, signal);
+        return;
+      }
+      if (verdict.kind === "continue") {
+        if (continuations >= CONTINUATION_LIMIT) {
+          await this.pauseWork(setup, work, state, "USER_DECISION_REQUIRED",
+            `러너가 계속 진행 상한(${CONTINUATION_LIMIT}회)에 닿았는데 아직 in_progress 입니다 — 남은 단계: ${verdict.remainingSteps.join(" · ") || "(명시 없음)"}. 재시도(retry)로 같은 세션에서 이어갑니다.`,
+            { continuationExhausted: true, remainingSteps: verdict.remainingSteps }, signal);
+          return;
+        }
+        continuations += 1;
+        // 호출을 열기 전에 누적본을 보존한다(옛 progress 산출물은 사람·옛 소비처 호환).
+        await this.core.saveAgentOutput(topic, "claude", state.base, setup.progressKind, signal);
+        await this.core.checkpoints.record(topic, {
+          work, phase: "before-continuation", accumulated: state.base, verifiedLedger: state.verifiedLedger, inputSequence: setup.inputSequence,
+          openRequests: state.openRequests, confirmations: state.confirmations,
+        }, signal);
+        this.core.event(topicId, "system", "system",
+          `러너가 진행 중(status=in_progress)으로 멈췄습니다 — 남은 단계 ${verdict.remainingSteps.length}개. 같은 세션에서 계속 진행합니다(${continuations}/${CONTINUATION_LIMIT}).`,
+          { continuation: continuations, remainingSteps: verdict.remainingSteps });
+        const continued = await this.core.executor.execute({
+          role: "claude", topic, signal, purpose: "계속 진행 턴", inputSequence: setup.inputSequence, expected, write: true, writeGuards,
+          session: { mode: "resume", sessionId },
+          prompt: buildContinuationPrompt(verdict.remainingSteps, continuations, CONTINUATION_LIMIT, setup.kind, state.openRequests),
+          implementation: true, readablePaths: setup.readablePaths, settings: this.core.executionSettings(topicId, "claude", true),
+        });
+        await this.assertBaselineIntact(topic, setup.baselineHead, "계속 진행 중");
+        this.assertToolTreesIntact(topic, setup.toolTreesBefore, "계속 진행 중");
+        const absorbed = await this.absorbTurn(setup, work, state, continued.result, sessionId, expected, writeGuards, signal);
+        if (!absorbed) return;
+        state = absorbed;
+        freshlyVerified = true;
+        continue;
+      }
+      // needs-confirmation — 결과마다 읽기 전용 확인은 1회. 그래도 불명확하면 보존한 채 멈춘다(PLAN §3).
+      if (state.confirmations >= 1) {
+        const open = state.openRequests.length ? `\n${renderOpenRequests(state.openRequests)}` : "";
+        await this.pauseWork(setup, work, state, "USER_DECISION_REQUIRED",
+          `완료 상태를 확인하지 못했습니다(읽기 전용 확인 1회 소진): ${verdict.message} — 결과는 보존했습니다. 결정을 올리고 재시도하면 같은 세션에서 이어갑니다.${open}`,
+          { confirmationExhausted: true, verdict: verdict.reason, openRequests: state.openRequests.map((request) => request.id) }, signal);
+        return;
+      }
+      state = { ...state, confirmations: 1 };
+      await this.core.checkpoints.record(topic, {
+        work, phase: "before-confirmation", accumulated: state.base, verifiedLedger: state.verifiedLedger, inputSequence: setup.inputSequence,
+        openRequests: state.openRequests, confirmations: 1,
+      }, signal);
+      this.core.event(topicId, "system", "system", `완료 판정 보류 — ${verdict.message} 읽기 전용 확인 턴을 1회 엽니다.`, { confirmation: verdict.reason });
+      const decisionsSince = state.openRequests.length
+        ? db.getTimeline(topicId, Math.min(...state.openRequests.map((request) => request.askedAfterSequence)))
+          .filter((event) => event.scopeGeneration === topic.scopeGeneration && event.actor === "user" && ["decision", "evidence"].includes(event.kind))
+        : [];
+      const confirmed = await this.core.executor.execute({
+        role: "claude", topic, signal, purpose: "완료 확인", inputSequence: setup.inputSequence, expected, write: false,
+        session: { mode: "resume", sessionId }, implementation: false, protocolOnly: true, readablePaths: setup.readablePaths,
+        prompt: buildStatusConfirmationPrompt({ kind: setup.kind, reason: verdict.message, accumulated: state.base, planPath: setup.planPath, openRequests: state.openRequests, decisionsSince }),
+        settings: { ...this.core.executionSettings(topicId, "claude", true), effort: "low" },
+      });
+      const parsed = AgentResultSchema.safeParse(confirmed.result);
+      if (!parsed.success || parsed.data.kind !== setup.kind) {
+        this.core.event(topicId, "system", "system", "확인 턴 응답이 계약을 어겨 상태를 확정하지 못했습니다(보존).", { confirmationInvalid: true });
+        continue; // confirmations=1 → 다음 반복에서 보존한 채 멈춘다
+      }
+      // 확인 턴은 상태·남은 단계·해소 표식만 바꾼다 — 쟁점·증거·요약은 저장된 값을 유지한다.
+      const confirmation: AgentResult = {
+        kind: setup.kind, summary: state.base.summary, findings: state.base.findings, evidenceRefs: state.base.evidenceRefs,
+        ...(parsed.data.status ? { status: parsed.data.status } : {}),
+        ...(parsed.data.remainingSteps ? { remainingSteps: parsed.data.remainingSteps } : {}),
+        ...(parsed.data.resolvesRequestedDecision ? { resolvesRequestedDecision: true } : {}),
+        ...(parsed.data.resolvedRequestId ? { resolvedRequestId: parsed.data.resolvedRequestId } : {}),
+        ...(parsed.data.status === "blocked" && parsed.data.requestedUserDecision ? { requestedUserDecision: parsed.data.requestedUserDecision } : {}),
+      };
+      const acc = accumulate(state.base, confirmation, state.openRequests, setup.inputSequence);
+      this.reportAccumulation(topicId, acc);
+      state = { ...state, base: acc.result, openRequests: acc.openRequests };
+      await this.core.checkpoints.record(topic, {
+        work, phase: "verified", accumulated: state.base, verifiedLedger: state.verifiedLedger, inputSequence: setup.inputSequence,
+        openRequests: state.openRequests, confirmations: 1,
+      }, signal);
+    }
+  }
+
+  // 턴 응답 하나를 누적본에 흡수한다: turn-result checkpoint(raw) → 계약(교정 전 checkpoint) → 허용 오차(교정 전 checkpoint) → verified checkpoint.
+  // 반환 null = 허용 오차 위반이 남아 정지했다(인터럽트·보존 완료).
+  private async absorbTurn(
+    setup: WorkSetup, work: WorkBinding, state: WorkSeed, raw: AgentResult, sessionId: string,
+    expected: TurnExpectation, writeGuards: WriteGuards, signal: AbortSignal,
+  ): Promise<WorkState | null> {
+    const { topicId, topic } = setup;
+    const salvaged = (value: unknown) => accumulate(state.base, salvageResultFields(value, setup.kind), state.openRequests, setup.inputSequence);
+    const first = salvaged(raw);
+    await this.core.checkpoints.record(topic, {
+      work, phase: "turn-result", raw, accumulated: first.result, verifiedLedger: state.verifiedLedger, inputSequence: setup.inputSequence,
+      openRequests: first.openRequests, confirmations: 0,
+    }, signal);
+    let last: Accumulation | null = null;
+    const latestRequests = () => (last as Accumulation | null)?.openRequests ?? first.openRequests;
+    const normalize: ResultNormalizer = (parsed) => {
+      const acc = accumulate(state.base, parsed, state.openRequests, setup.inputSequence);
+      last = acc;
+      return setup.carry(acc.result);
+    };
+    normalize.carried = () => setup.carry.carried?.() ?? [];
+    normalize.label = setup.carry.label;
+    const contracted = await this.core.enforceResultContract("claude", topic, raw, sessionId, {
+      signal, implementation: true, planMode: false, startedAfter: setup.inputSequence, check: setup.check, readablePaths: setup.readablePaths,
+      normalize, writeGuards,
+      beforeCorrection: async (rejected) => {
+        const acc = salvaged(rejected);
+        await this.core.checkpoints.record(topic, {
+          work, phase: "before-contract-correction", raw: rejected, accumulated: acc.result, verifiedLedger: state.verifiedLedger,
+          inputSequence: setup.inputSequence, openRequests: acc.openRequests, confirmations: 0, pendingCorrection: "contract",
+        }, signal);
+      },
+    });
+    await this.assertBaselineIntact(topic, setup.baselineHead, "계약 교정 중");
+    this.assertToolTreesIntact(topic, setup.toolTreesBefore, "계약 교정 중");
+    const checked = await this.enforceTolerance({
+      topicId, topic: this.core.dependencies.database.getTopic(topicId), plan: setup.plan, result: contracted, sessionId, signal,
+      inputSequence: setup.inputSequence, resumeState: setup.work.resumeState, check: setup.check, baselineHead: setup.baselineHead,
+      readablePaths: setup.readablePaths, normalize, previousLedger: state.verifiedLedger, expected, writeGuards, openRequests: state.openRequests,
+      beforeCorrection: async (original) => {
+        await this.core.checkpoints.record(topic, {
+          work, phase: "before-tolerance-correction", raw: original, accumulated: original, verifiedLedger: state.verifiedLedger,
+          inputSequence: setup.inputSequence, openRequests: latestRequests(), confirmations: 0, pendingCorrection: "tolerance",
+        }, signal);
+      },
+    });
+    if (!checked) {
+      // 허용 오차 위반이 남아 정지했다 — 마지막 누적본을 보존한다(인터럽트는 enforceTolerance 가 했다).
+      await this.core.checkpoints.record(topic, {
+        work, phase: "paused", accumulated: contracted, verifiedLedger: state.verifiedLedger, inputSequence: setup.inputSequence,
+        openRequests: latestRequests(), confirmations: 0,
+      }, signal);
+      return null;
+    }
+    await this.assertBaselineIntact(topic, setup.baselineHead, "허용 오차 교정 중");
+    this.assertToolTreesIntact(topic, setup.toolTreesBefore, "허용 오차 교정 중");
+    const acc = last as Accumulation | null;
+    if (acc) this.reportAccumulation(topicId, acc);
+    const next: WorkState = {
+      base: checked, openRequests: latestRequests(), verifiedLedger: [...(checked.toleranceLedger ?? [])], confirmations: 0,
+    };
+    await this.core.checkpoints.record(topic, {
+      work, phase: "verified", accumulated: next.base, verifiedLedger: next.verifiedLedger, inputSequence: setup.inputSequence,
+      openRequests: next.openRequests, confirmations: 0,
+    }, signal);
+    return next;
+  }
+
+  private reportAccumulation(topicId: string, acc: Accumulation): void {
+    for (const request of acc.resolvedRequests) {
+      this.core.event(topicId, "system", "system", `열린 요청 ${request.id} 를 러너가 해소로 확인해 닫았습니다: ${request.text.slice(0, 120)}`, { resolvedRequest: request.id });
+    }
+    if (acc.unmatchedResolution) {
+      this.core.event(topicId, "system", "system", `해소 표식을 적용하지 않았습니다 — ${acc.unmatchedResolution}`, { unmatchedResolution: acc.unmatchedResolution });
+    }
+  }
+
+  // 가장 오래된 열린 요청이 제시된 뒤 사용자 결정이 올라왔는가.
+  private decisionAfter(topic: Topic, openRequests: readonly OpenRequest[]): boolean {
+    if (openRequests.length === 0) return false;
+    const since = Math.min(...openRequests.map((request) => request.askedAfterSequence));
+    return this.core.dependencies.database.getTimeline(topic.id, since)
+      .some((event) => event.scopeGeneration === topic.scopeGeneration && event.actor === "user" && event.kind === "decision");
+  }
+
+  // 입력·증거 대기 또는 확인 실패 — 결과를 옛 산출물(호환)과 paused checkpoint 로 보존하고 멈춘다.
+  private async pauseWork(
+    setup: WorkSetup, work: WorkBinding, state: WorkState, to: "USER_DECISION_REQUIRED" | "BLOCKED_ON_EVIDENCE",
+    message: string, payload: Record<string, unknown>, signal: AbortSignal,
+  ): Promise<void> {
+    const { topic, topicId } = setup;
+    await this.core.recordDeferredFindings(topic, state.base.findings.filter((finding) => finding.disposition === "DEFERRED_OUT_OF_SCOPE"), setup.deferredSource, signal);
+    await this.core.saveAgentOutput(topic, "claude", state.base, setup.resultKind, signal);
+    await this.core.checkpoints.record(topic, {
+      work, phase: "paused", accumulated: state.base, verifiedLedger: state.verifiedLedger, inputSequence: setup.inputSequence,
+      openRequests: state.openRequests, confirmations: state.confirmations,
+    }, signal);
+    this.core.interrupt(topicId, to, message, setup.work.resumeState, payload);
+  }
+
+  // 완료 판정을 통과한 결과의 수락 — accepting checkpoint(acceptId) → 산출물·메모리·이벤트 → accepted checkpoint → 후속(전이·리뷰).
+  // 강제 종료 뒤 재개는 finishAccept 가 acceptId 로 어디까지 됐는지 판단한다(결과 내용 해시가 아니다).
+  private async acceptWork(setup: WorkSetup, work: WorkBinding, state: WorkState, verdict: CompletionVerdict, signal: AbortSignal): Promise<void> {
+    const { topic } = setup;
+    const base = state.base;
+    await this.core.recordDeferredFindings(topic, base.findings.filter((finding) => finding.disposition === "DEFERRED_OUT_OF_SCOPE"), setup.deferredSource, signal);
+    if (setup.kind === "FIX") await this.core.pruneDeferredFindings(topic, resolvedIDs(base), signal);
+    const accepting = await this.core.checkpoints.record(topic, {
+      work, phase: "accepting", accumulated: base, verifiedLedger: state.verifiedLedger, inputSequence: setup.inputSequence,
+      openRequests: state.openRequests, confirmations: state.confirmations,
+    }, signal);
+    await this.core.saveAgentOutput(topic, "claude", base, setup.resultKind, signal, { acceptId: accepting.revision });
+    await this.core.checkpoints.record(topic, {
+      work, phase: "accepted", accumulated: base, verifiedLedger: state.verifiedLedger, inputSequence: setup.inputSequence,
+      openRequests: state.openRequests, confirmations: state.confirmations, acceptId: accepting.revision,
+    }, signal);
+    await setup.onAccepted(acceptResult(base, verdict), accepting.revision);
+  }
+
+  // 수락 도중(산출물 저장·메모리 반영·이벤트·전이 사이) 종료된 뒤의 재개 — 모델 호출 없이 acceptId 기준으로 남은 단계만 한다.
+  private async finishAccept(setup: WorkSetup, checkpoint: WorkCheckpoint, signal: AbortSignal): Promise<void> {
+    const { topic, topicId } = setup;
+    const acceptId = checkpoint.phase === "accepted" ? (checkpoint.acceptId ?? checkpoint.previous ?? checkpoint.revision) : checkpoint.revision;
+    const base = checkpoint.accumulated;
+    const verdict = completionVerdict(base, { openRequests: checkpoint.openRequests, decisionAfterRequest: false });
+    if (verdict.kind !== "completed") throw new Error(`수락 checkpoint #${checkpoint.revision} 의 누적본이 완료 판정이 아닙니다(${verdict.kind}).`);
+    const outputRecorded = this.core.dependencies.database.getTimeline(topicId)
+      .some((event) => event.kind === "agent_output" && event.payload?.acceptId === acceptId);
+    this.core.event(topicId, "system", "system",
+      `받아들인 결과(acceptId ${acceptId}, ${checkpoint.phase})의 후속 처리를 이어갑니다 — 모델 호출 없음, 산출물·메모리 반영 ${outputRecorded ? "완료" : "미완"}.`,
+      { acceptResumed: acceptId, phase: checkpoint.phase, outputRecorded });
+    if (checkpoint.phase === "accepting") {
+      // 산출물·메모리·이벤트는 한 묶음(saveAgentOutput) — 이벤트가 없으면 다시 돈다. 메모리 갱신은 expectedSHA256 으로 두 번 적용되지 않는다.
+      if (!outputRecorded) await this.core.saveAgentOutput(topic, "claude", base, setup.resultKind, signal, { acceptId });
+      await this.core.checkpoints.record(topic, {
+        work: checkpoint.work, phase: "accepted", accumulated: base, verifiedLedger: checkpoint.verifiedLedger, inputSequence: checkpoint.inputSequence,
+        openRequests: checkpoint.openRequests, confirmations: checkpoint.confirmations, acceptId,
+      }, signal);
+    }
+    await setup.onAccepted(acceptResult(base, verdict), acceptId);
   }
 
   // 최종 리뷰 신규 쟁점 인터럽트(payload.finalReviewNewFindingIDs) 뒤에 사용자 결정이 도착했으면
@@ -194,8 +536,14 @@ export class DeliveryPipeline {
       // 2차 패스(첫 패스 소비 뒤)는 최종 리뷰 결과를 고친다.
       const kind = this.core.dependencies.database.getFlags(topicId).fixPassUsed ? "codex-final-review" : "codex-review";
       const review = await this.core.latestResult(topicId, kind);
-      // 수정 턴이 requestedUserDecision 으로 멈춘 뒤 결정이 올라왔으면 저장된 수정 결과를 재사용한다(수정 턴 재구매 방지).
-      if (await this.finishStoredFix(topicId, review, kind, signal)) return;
+      // 수정 턴이 멈춘 뒤 결정이 올라왔으면 저장된 수정 결과를 재사용한다(수정 턴 재구매 방지) — 단, 논리 작업의 checkpoint 가 있으면
+      // runWork 가 거기서 복구하므로 옛 산출물 경로는 쓰지 않는다.
+      const flags = this.core.dependencies.database.getFlags(topicId);
+      const topic = this.core.dependencies.database.getTopic(topicId);
+      const hasCheckpoint = flags.implementationSessionId
+        ? await this.core.checkpoints.recoverFor(topicId, this.core.checkpoints.binding(topic, "FIX", flags.implementationSessionId, flags.fixPassUsed ? 2 : 1)).then((r) => r !== null).catch(() => true)
+        : false;
+      if (!hasCheckpoint && await this.finishStoredFix(topicId, review, kind, signal)) return;
       return this.runFix(topicId, signal, review);
     }
     if (state === "CODEX_FINAL_REVIEW") {
@@ -515,99 +863,41 @@ export class DeliveryPipeline {
     const planPath = await this.core.dependencies.artifacts.verifiedPath(topicId, "plan");
     const decisionsPath = await this.writeDecisionsDigest(topic, signal);
     const fixReadable = [planPath, decisionsPath];
-    const pendingFixOriginal = await this.pendingResultOriginal(topicId, topic, "CLAUDE_FIX");
     const toolTreesBefore = await this.toolTreeBaseline(topic, signal);
     this.assertToolTreesIntact(topic, toolTreesBefore, "수정 재개 전");
     const fixBase = { planMarkdown: plan, planSHA256: topic.planSHA256, reviewFindings: review.findings, planPath, decisionsPath };
-    const fixPrompts = {
-      fresh: buildClaudeFixPrompt({
-        ...fixBase, timeline: this.core.dependencies.database.getPromptTimeline(topicId, topic.scopeGeneration),
-      }),
-      resume: buildClaudeFixPrompt({
-        ...fixBase, resumedSession: true,
-        timeline: this.core.dependencies.database.getPromptTimeline(topicId, topic.scopeGeneration, flags.implementationPromptSequence ?? 0),
-      }),
-    };
-    // 판단이 끝난 리뷰 쟁점은 서버가 승계한다 — 러너가 되돌려 담지 않아도 재제출을 사지 않는다(2026-09-13).
-    const fixCarry = this.core.carryForwardNormalizer(review.findings, "Claude fix");
-    const fixNormalizer = pendingFixOriginal
-      ? (result: AgentResult) => fixCarry(mergeCorrectionResult(pendingFixOriginal, result).result)
-      : fixCarry;
-    if (pendingFixOriginal) {
-      this.core.event(topicId, "system", "system",
-        "직전 수정 턴이 교정·계속 진행 도중 끊겨 보존해 둔 미완료 보고를 이번 재개 결과에 병합합니다.", { pendingCorrectionMerged: true });
-    }
-    const fixFork = await this.resumeImplementationSession(
-      topicId, flags.implementationSessionId, fixPrompts, topic.worktreePath, signal, fixReadable,
-    );
-    this.assertToolTreesIntact(topic, toolTreesBefore, "자동 수정 중");
-    if (fixFork.sessionId !== flags.implementationSessionId) {
-      this.core.dependencies.database.setImplementationSession(topicId, fixFork.sessionId);
-    }
-    this.core.dependencies.database.updateTopic(topicId, { implementationPromptSequence: inputSequence });
-    const result = fixFork.result;
-    this.core.assertCurrent(topicId, signal, topic.scopeGeneration, "CLAUDE_FIX");
-    await this.core.dependencies.git.assertCurrentBranch(topic.worktreePath, topic.branchName);
-    if (await this.core.dependencies.git.head(topic.worktreePath) !== baselineHead) {
-      throw new Error("Claude가 자동 수정 중 승인되지 않은 git commit을 만들었습니다.");
-    }
-    if (await this.core.interruptPreservingResult(topic, "claude", result, inputSequence, signal)) return;
-    const fixResult = await this.core.enforceResultContract("claude", topic, result, fixFork.sessionId, {
-      signal, implementation: true, planMode: false, startedAfter: inputSequence, readablePaths: fixReadable, normalize: fixNormalizer,
-      check: (r) => {
-        this.core.assertKind(r, "FIX");
-        assertFindingCoverage(review.findings, r.findings, "Claude fix");
-        assertDispositionsResolved(review.findings, r, "Claude fix");
-      },
-    });
-    // 계약 교정 턴도 코드를 바꿀 수 있다 — 교정 뒤 HEAD 를 다시 본다(Codex 후속 지적 1, runFix 경로).
-    await this.assertBaselineIntact(topic, baselineHead, "자동 수정 교정 중");
-    const fixChecked = await this.enforceTolerance({
-      topicId, topic: this.core.dependencies.database.getTopic(topicId), plan, result: fixResult, sessionId: fixFork.sessionId,
-      signal, inputSequence, resumeState: "CLAUDE_FIX", baselineHead, readablePaths: fixReadable, normalize: fixNormalizer,
-      check: (r) => {
-        this.core.assertKind(r, "FIX");
-        assertFindingCoverage(review.findings, r.findings, "Claude fix");
-        assertDispositionsResolved(review.findings, r, "Claude fix");
-      },
-    });
-    if (!fixChecked) return;
-    await this.assertBaselineIntact(topic, baselineHead, "자동 수정 교정 중");
-    this.assertToolTreesIntact(topic, toolTreesBefore, "자동 수정 교정 중");
-    // 수정 턴도 같은 완료 판정을 쓴다 — 미완료(status=in_progress) FIX 가 최종 리뷰를 사서 인도 준비로 가지 않게(F01).
-    const fixCheck = (r: AgentResult) => {
+    const check = (r: AgentResult) => {
       this.core.assertKind(r, "FIX");
       assertFindingCoverage(review.findings, r.findings, "Claude fix");
       assertDispositionsResolved(review.findings, r, "Claude fix");
     };
-    const fixContinued = await this.continueUntilComplete({
-      topicId, topic, plan, kind: "FIX", result: fixChecked, sessionId: fixFork.sessionId, signal, inputSequence, resumeState: "CLAUDE_FIX",
-      check: fixCheck, baselineHead, readablePaths: fixReadable, baseNormalizer: fixCarry, toolTreesBefore, progressKind: "fix-progress",
-    });
-    if (!fixContinued) return;
-    const fixFinal = fixContinued;
-    await this.core.recordDeferredFindings(topic,
-      fixFinal.findings.filter((finding) => finding.disposition === "DEFERRED_OUT_OF_SCOPE"), "fix", signal);
-    await this.core.pruneDeferredFindings(topic, resolvedIDs(fixFinal), signal);
-    await this.core.saveAgentOutput(topic, "claude", fixFinal, "claude-fix", signal);
-    if (this.core.interruptForNewUserInput(topic, inputSequence)) return;
-    if (this.core.pauseForResult(topicId, fixFinal, "CLAUDE_FIX", "수정 범위를 넓히려면 사용자 결정이 필요합니다.")) {
-      return;
-    }
-    await this.finishFix(topicId, topic, review, fixFinal, secondPass, signal);
+    await this.runWork({
+      topicId, topic, kind: "FIX", work: this.core.checkpoints.binding(topic, "FIX", flags.implementationSessionId, secondPass ? 2 : 1),
+      plan, planPath, readablePaths: fixReadable, baselineHead, toolTreesBefore, inputSequence, check,
+      // 판단이 끝난 리뷰 쟁점은 서버가 승계한다 — 러너가 되돌려 담지 않아도 재제출을 사지 않는다(2026-09-13).
+      carry: this.core.carryForwardNormalizer(review.findings, "Claude fix"),
+      progressKind: "fix-progress", resultKind: "claude-fix", deferredSource: "fix",
+      pauseFallbackMessage: "수정 범위를 넓히려면 사용자 결정이 필요합니다.",
+      prompts: (openRequests) => ({
+        fresh: buildClaudeFixPrompt({ ...fixBase, openRequests, timeline: this.core.dependencies.database.getPromptTimeline(topicId, topic.scopeGeneration) }),
+        resume: buildClaudeFixPrompt({
+          ...fixBase, openRequests, resumedSession: true,
+          timeline: this.core.dependencies.database.getPromptTimeline(topicId, topic.scopeGeneration, flags.implementationPromptSequence ?? 0),
+        }),
+      }),
+      sessionId: flags.implementationSessionId,
+      persistSession: (sessionId) => this.core.dependencies.database.setImplementationSession(topicId, sessionId),
+      initialTurn: true,
+      legacyBase: async () => ({ base: await this.legacyPendingOriginal(topicId, topic, "CLAUDE_FIX"), ledger: await this.legacyAcceptedLedger(topicId) }),
+      onAccepted: async (accepted) => { await this.finishFix(topicId, topic, review, accepted, secondPass, signal); },
+    }, signal);
   }
 
-  // 수정 결과가 확정된 뒤의 공통 꼬리: 되돌림 가드(결정으로 뒤집힌 쟁점 제외) → 회차 소비 → 최종 리뷰.
+  // 수정 결과가 확정된 뒤의 공통 꼬리: 되돌림 가드(결정으로 뒤집힌 쟁점 제외) → 회차 소비 + 최종 리뷰 전이(한 트랜잭션) → 최종 리뷰.
+  // AcceptedResult 만 받는다 — 완료 판정을 거치지 않은 결과는 타입이 막는다.
   private async finishFix(
-    topicId: string, topic: Topic, review: AgentResult, fixResult: AgentResult, secondPass: boolean, signal: AbortSignal,
+    topicId: string, topic: Topic, review: AgentResult, fixResult: AcceptedResult, secondPass: boolean, signal: AbortSignal,
   ): Promise<void> {
-    // 공통 진입점에서도 완료를 강제한다 — 어느 경로로 왔든 미완료 수정은 최종 리뷰를 사지 않는다(R3-01).
-    if (implementationInProgress(fixResult)) {
-      this.core.interrupt(topicId, "USER_DECISION_REQUIRED",
-        `수정 결과가 아직 in_progress 입니다 — 남은 단계: ${(fixResult.remainingSteps ?? []).join(" · ") || "(명시 없음)"}. 최종 리뷰로 넘기지 않았습니다. 재시도(retry)로 같은 세션에서 이어갑니다.`,
-        "CLAUDE_FIX", { fixInProgress: true, remainingSteps: fixResult.remainingSteps ?? [] });
-      return;
-    }
     const overruled = this.userOverruledFindings(topic, secondPass ? "codex-final-review" : "codex-review", review.findings);
     this.noteOverruled(topicId, overruled, review.findings, fixResult.findings);
     const downgraded = dispositionRegressions(review.findings, fixResult.findings, overruled);
@@ -620,14 +910,22 @@ export class DeliveryPipeline {
       );
       return;
     }
-    this.core.dependencies.database.updateTopic(topicId, secondPass ? { secondFixPassUsed: true } : { fixPassUsed: true });
-    this.core.transition(topicId, "CODEX_FINAL_REVIEW", "Codex가 수정 결과를 마지막으로 검토합니다.");
+    // 회차 소비와 상태 전이는 한 트랜잭션이다 — 그 사이에서 종료되면 회차만 소비되거나 전이만 된 채 남는다(PLAN §2 검증 조건 3).
+    const current = this.core.dependencies.database.getTopic(topicId);
+    assertTransition(current.state, "CODEX_FINAL_REVIEW");
+    this.core.dependencies.database.applyTopicTransition({
+      topicId,
+      changes: { ...(secondPass ? { secondFixPassUsed: true } : { fixPassUsed: true }), state: "CODEX_FINAL_REVIEW", lastError: null, resumeState: null },
+      events: [{ actor: "system", kind: "system", state: "CODEX_FINAL_REVIEW", body: "Codex가 수정 결과를 마지막으로 검토합니다.",
+        payload: { from: current.state, to: "CODEX_FINAL_REVIEW", fixPassConsumed: secondPass ? 2 : 1 } }],
+    });
     await this.runReview(topicId, signal, true);
   }
 
-  // 멈춘 수정 결과 재사용(2026-09-07, 계획·최종 리뷰 재사용과 같은 계열): 저장된 claude-fix 가 지금 고치는 리뷰보다 뒤이고,
-  // 그 뒤 사용자 decision 이 있고, 그 결과가 수정 계약(kind·쟁점 커버·처분 해소)을 만족하면 수정 턴을 다시 사지 않는다.
-  // 하나라도 어긋나면 false — 호출자가 수정 턴을 돈다. HEAD 가 구현 기준에서 움직였으면 runFix 와 같은 이유로 던진다.
+  // 멈춘 수정 결과 재사용(2026-09-07, 계획·최종 리뷰 재사용과 같은 계열): 저장된 claude-fix 가 지금 고치는 리뷰보다 뒤이고, 그 뒤 사용자 decision 이 있고,
+  // 그 결과가 수정 계약(kind·쟁점 커버·처분 해소)을 만족하고 **완료 판정을 통과**하면 수정 턴을 다시 사지 않는다. 완료 판정이 "상태 확인 필요"
+  // (status 없음·모순)면 읽기 전용 확인 턴 1회를 거친다(PLAN §3 기존 결과 보존 후 확인). 하나라도 어긋나면 false — 호출자가 수정 턴을 돈다.
+  // 논리 작업의 checkpoint 가 있으면 이 경로를 쓰지 않는다(runWork 가 checkpoint 에서 복구한다).
   private async finishStoredFix(topicId: string, review: AgentResult, reviewKind: string, signal: AbortSignal): Promise<boolean> {
     const database = this.core.dependencies.database;
     const topic = this.core.requireState(topicId, "CLAUDE_FIX");
@@ -647,14 +945,6 @@ export class DeliveryPipeline {
       return false;
     }
     const storedResult = await this.core.latestResult(topicId, "claude-fix");
-    // 미완료(status=in_progress·남은 단계) 저장 결과는 "완료된 수정" 이 아니다 — 일반 결정이 올라왔다고 최종 리뷰로 넘기면 남은 단계가
-    // 실행되지 않은 채 인도 준비가 된다(R3-01). 수정 턴을 다시 열어 남은 단계를 이어 간다(재개 턴이 이 결과 위에 병합한다).
-    if (implementationInProgress(storedResult)) {
-      this.core.event(topicId, "system", "system",
-        `저장된 수정 결과(#${storedFix.revision})가 아직 in_progress 입니다(남은 단계: ${(storedResult.remainingSteps ?? []).join(" · ") || "(명시 없음)"}) — 재사용하지 않고 같은 세션에서 수정 턴을 이어 갑니다.`,
-        { storedFixInProgress: true, remainingSteps: storedResult.remainingSteps ?? [] });
-      return false;
-    }
     // 저장된 결과도 같은 승계 규칙으로 본다 — 되돌려 담지 않은 settled 쟁점 때문에 재사용을 포기하지 않는다.
     const fixResult = { ...storedResult, findings: carryForwardFindings(review.findings, storedResult.findings).findings };
     try {
@@ -670,9 +960,38 @@ export class DeliveryPipeline {
     if (await this.core.dependencies.git.head(topic.worktreePath) !== baselineHead) {
       throw new Error("Claude가 자동 수정 중 승인되지 않은 git commit을 만들었습니다.");
     }
+    // 저장된 결과의 요청은 이미 사용자에게 제시됐고 그 뒤 결정이 왔다 — 해소 여부는 러너(확인 턴)가 판단한다(결정이 왔다고 지우지 않는다).
+    const asked = fixResult.requestedUserDecision?.trim();
+    const openRequests: OpenRequest[] = asked ? [{ id: requestId(asked, storedFix.revision), text: asked, askedAfterSequence: storedFix.revision }] : [];
+    const verdict = completionVerdict(fixResult, { openRequests, decisionAfterRequest: decisions.length > 0 });
+    if (verdict.kind === "await-input" || verdict.kind === "continue") {
+      this.core.event(topicId, "system", "system",
+        `저장된 수정 결과(#${storedFix.revision})는 완료가 아닙니다(${verdict.kind}${"remainingSteps" in verdict ? `: ${verdict.remainingSteps.join(" · ")}` : ""}) — 재사용하지 않고 같은 세션에서 수정 턴을 이어 갑니다.`,
+        { storedFixInProgress: true, verdict: verdict.kind });
+      return false;
+    }
+    if (!flags.implementationSessionId) return false;
+    const secondPass = flags.fixPassUsed;
+    const plan = await this.core.requireStoredPlan(topicId);
+    const planPath = await this.core.dependencies.artifacts.verifiedPath(topicId, "plan");
+    const toolTreesBefore = await this.toolTreeBaseline(topic, signal);
     this.core.event(topicId, "system", "system",
-      `결정이 올라온 저장된 수정 결과(#${storedFix.revision})를 재사용해 최종 리뷰로 넘깁니다 — 수정 턴을 다시 사지 않습니다.`);
-    await this.finishFix(topicId, topic, review, fixResult, flags.fixPassUsed, signal);
+      verdict.kind === "completed"
+        ? `결정이 올라온 저장된 수정 결과(#${storedFix.revision})를 재사용해 최종 리뷰로 넘깁니다 — 수정 턴을 다시 사지 않습니다.`
+        : `결정이 올라온 저장된 수정 결과(#${storedFix.revision})의 완료 상태가 불명확합니다(${verdict.message}) — 읽기 전용 확인 턴 1회로 확인합니다.`);
+    // 완료 판정 루프만 돈다(initialTurn=false): 완료면 수락, 확인 필요면 읽기 전용 확인 1회, 그래도 불명확하면 보존한 채 멈춘다.
+    await this.runWork({
+      topicId, topic, kind: "FIX", work: this.core.checkpoints.binding(topic, "FIX", flags.implementationSessionId, secondPass ? 2 : 1),
+      plan, planPath, readablePaths: [planPath], baselineHead, toolTreesBefore, inputSequence: this.core.latestSequence(topicId),
+      check: (r) => { this.core.assertKind(r, "FIX"); assertFindingCoverage(review.findings, r.findings, "Claude fix"); assertDispositionsResolved(review.findings, r, "Claude fix"); },
+      carry: this.core.carryForwardNormalizer(review.findings, "Claude fix"),
+      progressKind: "fix-progress", resultKind: "claude-fix", deferredSource: "fix",
+      pauseFallbackMessage: "수정 범위를 넓히려면 사용자 결정이 필요합니다.",
+      prompts: () => ({ fresh: "", resume: "" }),
+      sessionId: flags.implementationSessionId, persistSession: () => undefined, initialTurn: false,
+      legacyBase: async () => ({ base: fixResult, ledger: [...(fixResult.toleranceLedger ?? [])] }),
+      onAccepted: async (accepted) => { await this.finishFix(topicId, topic, review, accepted, secondPass, signal); },
+    }, signal);
     return true;
   }
 
@@ -709,12 +1028,17 @@ export class DeliveryPipeline {
     baselineHead: string;
     readablePaths?: readonly string[];
     normalize?: ResultNormalizer;
+    // 앞 턴에서 검증을 통과한 누적 원장(checkpoint.verifiedLedger) — 승계 대상.
+    previousLedger: readonly ToleranceLedgerEntry[];
+    expected: TurnExpectation; writeGuards: WriteGuards;
+    openRequests?: readonly OpenRequest[];
+    beforeCorrection?: (original: AgentResult) => Promise<void>;
   }): Promise<AgentResult | null> {
     const policy = parseTolerancePolicy(input.plan);
     if (!policy) return input.result;
-    // 앞 턴에서 받아들인 원장(구현·수정 결과 산출물)은 승계한다 — 같은 파일이 그대로 범위 밖으로 바뀐 채면 러너가 다시
-    // 적지 않아도 교정 턴을 사지 않는다. 술어·상한은 승계된 원장으로 다시 판정한다.
-    const previousLedger = await this.acceptedLedger(input.topicId);
+    // 앞 턴에서 받아들인 원장은 승계한다 — 같은 파일이 그대로 범위 밖으로 바뀐 채면 러너가 다시 적지 않아도 교정 턴을 사지 않는다.
+    // 술어·상한은 승계된 원장으로 다시 판정한다.
+    const previousLedger = input.previousLedger;
     const evaluateWithCarry = async (candidate: AgentResult): Promise<{ result: AgentResult; evaluation: ReturnType<typeof evaluateTolerance> }> => {
       const changed = await this.collectChangedFiles(input.topic);
       const own = candidate.toleranceLedger ?? [];
@@ -730,27 +1054,24 @@ export class DeliveryPipeline {
     let { result, evaluation } = await evaluateWithCarry(input.result);
     if (evaluation.violations.length > 0) {
       const original = result;
-      // 교정 전 원본을 산출물로 보존한다 — 교정 호출이 실패(전송 오류·중단)하면 지역변수의 원본이 사라져 재개가 짧은 원장 보완 결과만으로
-      // 리뷰로 흘렀다(Codex 감사 R01 ①). 재개(pendingCorrectionOriginal)가 세대·계획 sha·단계가 같은 최신 원본을 소비한다.
+      // 교정 전 원본을 산출물로 보존한다(옛 소비처 호환) — 정본 복구는 checkpoint(beforeCorrection)다.
       const sourceRevision = (this.core.dependencies.database.latestArtifact(input.topicId, "tolerance-correction-source")?.revision ?? 0) + 1;
       await this.core.writeArtifact(input.topic, "tolerance-correction-source", sourceRevision, JSON.stringify({
         kind: "tolerance-correction-source", scopeGeneration: input.topic.scopeGeneration, planSHA256: input.topic.planSHA256,
         resumeState: input.resumeState, sessionId: input.sessionId, violations: evaluation.violations,
         original: redactUnverifiedResult(original),
       }, null, 2), input.signal);
-      // 원본을 저장하는 사이 새 결정·증거가 도착했으면 교정 호출을 열지 않는다(R3-03) — 원본은 방금 보존됐으므로 재개가 소비한다.
-      if (this.core.interruptForNewUserInput(input.topic, input.inputSequence)) return null;
+      await input.beforeCorrection?.(original);
       this.core.event(input.topicId, "system", "system",
         `${renderToleranceSummary(evaluation)}\n같은 세션에 돌려보내 1회 교정합니다(되돌리기 또는 원장 보완).`,
         { toleranceViolations: evaluation.violations });
-      const corrected = await this.core.dependencies.claude.resumeTurn({
-        sessionId: input.sessionId, prompt: buildToleranceCorrectionPrompt(evaluation.violations, policy, input.resumeState === "CLAUDE_FIX" ? "FIX" : "IMPLEMENTATION"), cwd: input.topic.worktreePath,
-        signal: input.signal, implementation: true, settings: this.core.executionSettings(input.topicId, "claude", true),
-        readablePaths: input.readablePaths,
-        onProcessSpawn: this.core.processObserver(input.topicId),
-        onUsage: this.core.usageObserver(input.topicId, "claude", "계약 교정 재제출"),
+      // 실행 허용(새 입력·계획 변경·취소·유지보수·예산·쓰기 기준)은 실행기가 spawn 직전에 본다.
+      const { result: corrected } = await this.core.executor.execute({
+        role: "claude", topic: input.topic, signal: input.signal, purpose: "허용 오차 교정", inputSequence: input.inputSequence,
+        expected: input.expected, write: true, writeGuards: input.writeGuards, session: { mode: "resume", sessionId: input.sessionId },
+        prompt: buildToleranceCorrectionPrompt(evaluation.violations, policy, input.resumeState === "CLAUDE_FIX" ? "FIX" : "IMPLEMENTATION", input.openRequests),
+        implementation: true, readablePaths: input.readablePaths, settings: this.core.executionSettings(input.topicId, "claude", true),
       });
-      this.core.assertCurrent(input.topicId, input.signal, input.topic.scopeGeneration, input.resumeState);
       // 교정 턴도 커밋을 만들 수 있다 — 범위 밖 변경을 커밋해 버리면 작업 트리 대조에서 사라진다(2026-09-08 Codex 지적 2).
       await this.assertBaselineIntact(input.topic, input.baselineHead, "허용 오차 교정 중");
       // 교정 재제출은 본 턴 결과 위에 병합한다(쟁점·증거·요청 결정·요약 보존). 파싱 직후·계약 검사 전에 병합해야
@@ -763,7 +1084,7 @@ export class DeliveryPipeline {
       };
       const contracted = await this.core.enforceResultContract("claude", input.topic, corrected, input.sessionId, {
         signal: input.signal, implementation: true, planMode: false, startedAfter: input.inputSequence, check: input.check,
-        readablePaths: input.readablePaths, normalize: mergeNormalizer,
+        readablePaths: input.readablePaths, normalize: mergeNormalizer, writeGuards: input.writeGuards,
       });
       if (preservedParts.length > 0) {
         this.core.event(input.topicId, "system", "system",
@@ -783,12 +1104,10 @@ export class DeliveryPipeline {
     return result;
   }
 
-  // 서버가 받아들인 **가장 최근** 결과(구현·계속 진행·수정 중 최신 산출물) 하나의 원장. 승계된 결과의 원장은 이미 완전한 상태이므로
-  // 여러 결과를 합치지 않는다 — 합치면 같은 파일의 옛 규칙 행(T-1)이 새 규칙 행(T-2)과 함께 승계돼 통과한 변경을 다시 위반으로 만든다
-  // (Codex 감사 R05). 산출물이 없거나 깨졌으면 빈 원장(승계 없음).
-  private async acceptedLedger(topicId: string): Promise<ToleranceLedgerEntry[]> {
+  // ---- 옛 산출물 복구(checkpoint 가 없는 토픽·시드 픽스처 전용) — checkpoint 가 있으면 쓰지 않는다 ----
+  // 서버가 받아들인 **가장 최근** 결과 하나의 원장. 여러 결과를 합치지 않는다(R05). fix-progress 포함(R3-10).
+  private async legacyAcceptedLedger(topicId: string): Promise<ToleranceLedgerEntry[]> {
     const db = this.core.dependencies.database;
-    // fix-progress(수정 계속 진행의 중간 결과)도 받아들인 원장이다 — 빠뜨리면 이미 통과한 변경을 다음 턴이 원장 누락으로 보고 교정 턴을 산다(R3-10).
     const candidates = ["implementation-result", "implementation-progress", "claude-fix", "fix-progress"]
       .map((kind) => db.latestArtifact(topicId, kind))
       .filter((artifact): artifact is NonNullable<typeof artifact> => artifact !== null)
@@ -805,12 +1124,9 @@ export class DeliveryPipeline {
     }
   }
 
-  // 직전 턴이 교정(허용 오차·계약)이나 계속 진행 도중 끊겼을 때 보존해 둔 미완료 결과 — 같은 세대(계획 sha는 원본이 적혀 있으면 대조)이고
-  // 그 뒤 받아들인 결과가 없을 때만 유효하다(R01·F03). 원본이 여럿이면(허용 오차 교정 원본 → 짧은 교정 응답의 계약 교정 원본, 또는
-  // 진행 결과 → 다음 응답의 교정 원본) **가장 최근 하나만 고르지 않고 오래된 것부터 순서대로 병합**한다 — 최신 원본만 쓰면 앞선
-  // 원본에만 있던 미해결 요청 결정·증거가 후속 판단에서 빠진다(R3-02). 받아들였지만 status=in_progress 로 멈춘 최신 결과도 병합
-  // 바탕이다 — 사용자 결정 뒤 재개 턴은 그 위에 남은 단계를 쌓는다(R3-01).
-  private async pendingResultOriginal(topicId: string, topic: Topic, resumeState: "IMPLEMENTING" | "CLAUDE_FIX"): Promise<AgentResult | null> {
+  // 마지막 받아들인 결과 이후의 원본(tolerance/contract/progress)을 오래된 것부터 순서대로 병합한다(R3-02). 받아들였지만 완료가 아닌 최신 결과도 바탕이다(R3-01).
+  // 요청 결정은 결정이 왔다는 이유로 지우지 않는다 — 열린 요청은 runWork 가 요청별로 보존·확인한다.
+  private async legacyPendingOriginal(topicId: string, topic: Topic, resumeState: "IMPLEMENTING" | "CLAUDE_FIX"): Promise<AgentResult | null> {
     const db = this.core.dependencies.database;
     const acceptedArtifacts = ["implementation-result", "claude-fix"].map((kind) => db.latestArtifact(topicId, kind))
       .filter((artifact): artifact is NonNullable<typeof artifact> => artifact !== null)
@@ -823,13 +1139,7 @@ export class DeliveryPipeline {
       try {
         const raw = await this.core.dependencies.artifacts.readLatest(topicId, acceptedKind);
         const parsed = raw ? AgentResultSchema.safeParse(JSON.parse(raw)) : null;
-        if (parsed?.success && implementationInProgress(parsed.data)) {
-          // 이 결과의 요청 결정은 이미 사용자에게 제시됐다(정지) — 그 뒤 결정이 올라왔으면 소비된 것이므로 재개 결과에 되살리지 않는다.
-          const answered = db.getTimeline(topicId).some((event) =>
-            event.actor === "user" && event.kind === "decision" && event.scopeGeneration === topic.scopeGeneration && event.createdAt > latestAccepted.createdAt);
-          const { requestedUserDecision: asked, ...rest } = parsed.data;
-          parts.push(answered || !asked ? rest : parsed.data);
-        }
+        if (parsed?.success && completionVerdict(parsed.data, { openRequests: [], decisionAfterRequest: false }).kind !== "completed") parts.push(parsed.data);
       } catch {
         // 손상된 산출물은 복구 근거가 아니다.
       }
@@ -837,7 +1147,7 @@ export class DeliveryPipeline {
     const kinds = ["tolerance-correction-source", "contract-repair-source", resumeState === "IMPLEMENTING" ? "implementation-progress" : "fix-progress"];
     const candidates = kinds.map((kind) => db.latestArtifact(topicId, kind))
       .filter((artifact): artifact is NonNullable<typeof artifact> => artifact !== null && artifact.createdAt > accepted && artifact.scopeGeneration === topic.scopeGeneration)
-      .sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0));   // 오래된 것부터
+      .sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0));
     for (const artifact of candidates) {
       try {
         const raw = await this.core.dependencies.artifacts.readLatest(topicId, artifact.kind);
@@ -861,75 +1171,7 @@ export class DeliveryPipeline {
       }
     }
     if (parts.length === 0) return null;
-    // 오래된 원본 위에 새 원본을 병합한다(같은 id 쟁점은 새것 우선, 증거 합집합, 요청 결정은 새것이 비우면 옛것 — 해소 표식이면 제외).
     return parts.reduce((base, next) => mergeCorrectionResult(base, next).result);
-  }
-
-  // 구현·수정·계속 진행 턴 공통: status=in_progress 이고 정지 사유가 없으면 같은 세션에서 계속 진행 턴을 연다(상한 CONTINUATION_LIMIT).
-  // 정지 사유(요청 결정·blocked·결정 필요 쟁점·외부 증거 대기·새 사용자 입력)가 있으면 다음 쓰기 호출을 열지 않는다(F02).
-  // 중간 결과는 progress 산출물로 보존하고 다음 결과 위에 병합한다. 반환 null = 호출자가 그대로 return(인터럽트·정지 처리 끝).
-  private async continueUntilComplete(input: {
-    topicId: string; topic: Topic; plan: string; kind: "IMPLEMENTATION" | "FIX"; result: AgentResult; sessionId: string; signal: AbortSignal;
-    inputSequence: number; resumeState: "IMPLEMENTING" | "CLAUDE_FIX"; check: (result: AgentResult) => void; baselineHead: string;
-    readablePaths: readonly string[]; baseNormalizer: ResultNormalizer; toolTreesBefore: ToolTreeDigest; progressKind: string;
-  }): Promise<AgentResult | null> {
-    let result = input.result;
-    let continuations = 0;
-    const stopReason = (candidate: AgentResult): string | null => {
-      if (this.core.resultRequestsPause(candidate)) return "정지 사유(요청 결정·blocked·결정 필요 쟁점·외부 증거)";
-      if (this.core.newUserInputSince(input.topic, input.inputSequence)) return "새 사용자 입력";
-      return null;
-    };
-    while (implementationInProgress(result) && !stopReason(result) && continuations < CONTINUATION_LIMIT) {
-      continuations += 1;
-      const remaining = result.remainingSteps ?? [];
-      await this.core.saveAgentOutput(input.topic, "claude", result, input.progressKind, input.signal);
-      // 저장을 기다리는 사이 새 결정·증거가 도착했으면 다음 쓰기 턴을 열지 않는다 — 마지막 await 뒤·모델 호출 직전의 재검사(R3-03).
-      // 진행 결과는 방금 progress 산출물로 보존됐으므로 재개 턴이 그 위에 병합한다.
-      if (this.core.newUserInputSince(input.topic, input.inputSequence)) {
-        this.core.event(input.topicId, "system", "system",
-          "진행 결과를 저장하는 사이 새 결정·증거가 도착해 다음 계속 진행 턴을 열지 않습니다(진행 결과는 보존됨).", { continuationRefused: "new-user-input" });
-        this.core.interruptForNewUserInput(input.topic, input.inputSequence);
-        return null;
-      }
-      this.core.assertCurrent(input.topicId, input.signal, input.topic.scopeGeneration, input.resumeState);
-      this.core.event(input.topicId, "system", "system",
-        `러너가 진행 중(status=in_progress)으로 멈췄습니다 — 남은 단계 ${remaining.length}개. 같은 세션에서 계속 진행합니다(${continuations}/${CONTINUATION_LIMIT}).`,
-        { continuation: continuations, remainingSteps: remaining });
-      const previous = result;
-      const continued = await this.core.dependencies.claude.resumeTurn({
-        sessionId: input.sessionId, prompt: buildContinuationPrompt(remaining, continuations, CONTINUATION_LIMIT, input.kind), cwd: input.topic.worktreePath,
-        signal: input.signal, implementation: true, readablePaths: input.readablePaths, settings: this.core.executionSettings(input.topicId, "claude", true),
-        onProcessSpawn: this.core.processObserver(input.topicId), onUsage: this.core.usageObserver(input.topicId, "claude", "계속 진행 턴"),
-      });
-      this.core.assertCurrent(input.topicId, input.signal, input.topic.scopeGeneration, input.resumeState);
-      await this.assertBaselineIntact(input.topic, input.baselineHead, "계속 진행 중");
-      this.assertToolTreesIntact(input.topic, input.toolTreesBefore, "계속 진행 중");
-      if (await this.core.interruptPreservingResult(input.topic, "claude", continued, input.inputSequence, input.signal)) return null;
-      const progressNormalizer = (candidate: AgentResult) => input.baseNormalizer(mergeCorrectionResult(previous, candidate).result);
-      const contracted = await this.core.enforceResultContract("claude", input.topic, continued, input.sessionId, {
-        signal: input.signal, implementation: true, planMode: false, startedAfter: input.inputSequence, check: input.check,
-        readablePaths: input.readablePaths, normalize: progressNormalizer,
-      });
-      await this.assertBaselineIntact(input.topic, input.baselineHead, "계속 진행 계약 교정 중");
-      const checked = await this.enforceTolerance({
-        topicId: input.topicId, topic: this.core.dependencies.database.getTopic(input.topicId), plan: input.plan, result: contracted, sessionId: input.sessionId,
-        signal: input.signal, inputSequence: input.inputSequence, resumeState: input.resumeState, check: input.check, baselineHead: input.baselineHead,
-        readablePaths: input.readablePaths, normalize: progressNormalizer,
-      });
-      if (!checked) return null;
-      result = checked;
-      await this.assertBaselineIntact(input.topic, input.baselineHead, "계속 진행 교정 중");
-      this.assertToolTreesIntact(input.topic, input.toolTreesBefore, "계속 진행 교정 중");
-    }
-    if (implementationInProgress(result) && !stopReason(result)) {
-      await this.core.saveAgentOutput(input.topic, "claude", result, input.progressKind, input.signal);
-      this.core.interrupt(input.topicId, "USER_DECISION_REQUIRED",
-        `러너가 계속 진행 상한(${CONTINUATION_LIMIT}회)에 닿았는데 아직 in_progress 입니다 — 남은 단계: ${(result.remainingSteps ?? []).join(" · ") || "(명시 없음)"}. 재시도(retry)로 같은 세션에서 이어갑니다.`,
-        input.resumeState, { continuationExhausted: true, remainingSteps: result.remainingSteps ?? [] });
-      return null;
-    }
-    return result;
   }
 
   // 도구 트리 기준 산출물(tool-tree-baseline, 세대별). 없으면 지금 지문을 첫 기준으로 쓴다. 감지된 변경은 중재자가 재동기화 뒤
@@ -995,43 +1237,6 @@ export class DeliveryPipeline {
     if (await this.core.dependencies.git.head(topic.worktreePath) !== baselineHead) {
       throw new Error(`Claude가 ${phase} 승인되지 않은 git commit을 만들었습니다. 중단합니다.`);
     }
-  }
-
-  // 저장된 세션 id 로 resume 하되, CLI 가 대화 파일을 못 찾으면(턴 시작 직후 stop 되면 id 만 남고 파일이 없다 —
-  // 2026-09-08 S10 실측 "No conversation found with session ID") 실패 대신 새 세션으로 시작하고 그 사실을 남긴다.
-  // prompts.resume 은 세션이 이미 받은 것을 뺀 짧은 프롬프트, prompts.fresh 는 전문이다 — 세션 유실 폴백은 전문을 쓴다.
-  private async resumeImplementationSession(
-    topicId: string, sessionId: string, prompts: { resume: string; fresh: string }, cwd: string, signal: AbortSignal,
-    readablePaths: readonly string[] = [],
-  ): Promise<{ sessionId: string; result: AgentResult }> {
-    try {
-      const result = await this.core.dependencies.claude.resumeTurn({
-        sessionId, prompt: prompts.resume, cwd, signal, implementation: true, readablePaths,
-        settings: this.core.executionSettings(topicId, "claude", true),
-        onProcessSpawn: this.core.processObserver(topicId),
-        onUsage: this.core.usageObserver(topicId, "claude", "턴"),
-      });
-      return { sessionId, result };
-    } catch (error) {
-      if (!isMissingSessionError(error) || signal.aborted) throw error;
-      this.core.event(topicId, "system", "system",
-        `저장된 구현 세션 ${sessionId} 의 대화 파일을 CLI 가 찾지 못해 새 세션으로 시작합니다(직전 턴이 시작 직후 중단됐을 때 생기는 상태).`,
-        { missingSessionId: sessionId });
-      return this.createFreshImplementationSession(topicId, prompts.fresh, cwd, signal, readablePaths);
-    }
-  }
-
-  private async createFreshImplementationSession(
-    topicId: string, prompt: string, cwd: string, signal: AbortSignal, readablePaths: readonly string[] = [],
-  ) {
-    return this.core.dependencies.claude.createSession({
-      prompt, cwd, signal, implementation: true, readablePaths,
-      settings: this.core.executionSettings(topicId, "claude", true),
-      onProcessSpawn: this.core.processObserver(topicId),
-      onUsage: this.core.usageObserver(topicId, "claude", "턴"),
-      // 세션 id 를 실행 전에 저장한다 — 429·stop 으로 턴이 끊겨도 retry 가 같은 세션을 resume 한다(2026-09-03 실측: 완료 뒤 저장이라 NULL 로 남았음).
-      onSessionCreated: (sessionId) => this.core.dependencies.database.setImplementationSession(topicId, sessionId),
-    });
   }
 
   // 브랜치 생성 시점에 고정한 기준 HEAD를 돌려준다. 현재 HEAD가 기준과 다르면 서버 밖에서 커밋이
@@ -1281,10 +1486,7 @@ export class DeliveryPipeline {
   }
 }
 
-export function isMissingSessionError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return /No conversation found with session ID/i.test(message);
-}
+export { isMissingSessionError } from "./turnExecutor.js";
 
 
 // 후속 목록에서 빼야 할 쟁점 id — 뒤 단계가 DEFERRED_OUT_OF_SCOPE 가 아닌 처분(해결·불필요·반박·수정 합의)을 붙인 것.

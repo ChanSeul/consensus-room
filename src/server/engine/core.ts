@@ -44,6 +44,8 @@ import { redactAgentResult, redactRecord, redactUnverifiedResult } from "../secu
 import type { AgentAdapter, AppliedMemoryChange, ParticipantRole, TurnUsage } from "../types.js";
 import { exceededLimits } from "../adapters/executionMetrics.js";
 import type { WorkflowDependencies } from "../workflow.js";
+import { AdmissionRefused, TurnExecutor, type TurnPurpose, type WriteGuards } from "./turnExecutor.js";
+import { WorkCheckpoints } from "./checkpoint.js";
 
 // 결과 JSON 의 표기만 틀린 위반(스키마·kind). 재제출에 판단이 필요 없어 교정 턴의 추론 강도를 low 로 내린다
 // (2026-09-07 Codex 자기 최적화 제안 ③). 쟁점 누락·처분 규칙 위반은 판단이 섞이므로 여기 속하지 않는다.
@@ -107,6 +109,10 @@ export class EngineCore {
   // 새 action 이 시작될 때 알린다 — 그 주제의 예약된 자동 재시도를 취소한다.
   actionObserver?: (topicId: string) => void;
   private readonly warnedLimits = new Map<string, Set<string>>();
+  // 모델 호출의 단일 경계(PLAN §2) — 파이프라인은 adapter 를 직접 부르지 않는다.
+  readonly executor: TurnExecutor;
+  // 논리 작업별 누적 checkpoint(결과 복구의 정본).
+  readonly checkpoints: WorkCheckpoints;
 
   constructor(readonly dependencies: WorkflowDependencies) {
     const controller = new BudgetController(dependencies.database.budgets, cwd => {
@@ -119,6 +125,13 @@ export class EngineCore {
     this.dependencies={...dependencies,
       claude:wrapWorkGroupAdapter(controller.wrap(dependencies.claude),dependencies.database,dependencies.git),
       codex:wrapWorkGroupAdapter(controller.wrap(dependencies.codex),dependencies.database,dependencies.git)};
+    this.executor = new TurnExecutor(this);
+    this.checkpoints = new WorkCheckpoints(this);
+  }
+
+  // 지금 토픽 상태를 실행 기대값으로 고정한다 — 실행기가 spawn 직전에 이 값과 현재를 대조한다.
+  expectationOf(topic: Topic) {
+    return { state: topic.state, scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch, planSHA256: topic.planSHA256 };
   }
 
   budgetAccounts(topicId: string): string[] {
@@ -181,6 +194,18 @@ export class EngineCore {
         const topic = this.dependencies.database.getTopic(topicId);
         this.dependencies.database.finishAction(actionId, "cancelled", error.message);
         this.interrupt(topicId, "USER_DECISION_REQUIRED", error.message, topic.state, error instanceof RevisionBlocked ? {revisionPause:true} : error instanceof ReviewBlocked ? {reviewPause:error.scope} : {budgetPause:true});
+        return;
+      }
+      // spawn 직전 실행 허용 거부(계획 변경·유지보수·예산 소진·쓰기 기준 불일치)는 정상 정지다 — 결과는 checkpoint 로 보존됐고 사람이 재개한다.
+      // FAILED 로 떨어뜨리면 사용 한도 자동 재시도가 같은 거부를 반복한다(PLAN §2 검증 조건 1).
+      if (error instanceof AdmissionRefused && this.isCurrentAction(topicId, actionId, scopeGeneration)) {
+        const topic = this.dependencies.database.getTopic(topicId);
+        this.dependencies.database.finishAction(actionId, "cancelled", error.message);
+        if (topic.state !== "USER_DECISION_REQUIRED" && topic.state !== "BLOCKED_ON_EVIDENCE") {
+          // 예산 소진 거부는 기존 예산 정지와 같은 재개 계약(budgetPause → retry 가 같은 단계를 이어간다, 계획을 다시 만들지 않는다).
+          this.interrupt(topicId, "USER_DECISION_REQUIRED", error.message, topic.state,
+            { admissionRefused: error.reason, ...(error.reason === "budget" ? { budgetPause: true } : {}) });
+        }
         return;
       }
       const cancelled = controller.signal.aborted;
@@ -258,6 +283,7 @@ export class EngineCore {
       normalize?: ResultNormalizer;
       planBase?: string;
       repairContextKey?: string;
+      writeGuards?: WriteGuards;
     } = {},
   ): Promise<AgentResult> {
     const { freshSession = false, planMode = false, check } = options;
@@ -265,7 +291,6 @@ export class EngineCore {
     this.turnInputSequence.set(topic.id, startedAfter);
     const participant = this.participant(topic, role);
     const resumeSessionId = options.session ? options.session.id : participant.sessionId;
-    const adapter = this.adapter(role);
     let executionId: string | undefined;
     const observeUsage = this.usageObserver(topic.id, role, "턴");
     const onUsage = (usage: TurnUsage) => { executionId = usage.executionId; observeUsage(usage); };
@@ -278,45 +303,44 @@ export class EngineCore {
       result=pending.raw;sessionId=pending.sessionId;
       this.event(topic.id,"system","system","저장된 응답의 교정을 같은 세션에서 재개합니다.");
     } else if (freshSession || !resumeSessionId || resumeSessionId.startsWith("pending:")) {
-      const created = await adapter.createSession({
-        prompt, cwd: topic.worktreePath, signal, implementation, planMode,
-        planningWrite: role==="claude" && topic.state==="CLAUDE_PLAN"?"plan":role==="claude"&&topic.state==="CLAUDE_REVISION"?"revision":undefined,
-        onSessionCreated: id => {
+      const planningWrite = role==="claude" && topic.state==="CLAUDE_PLAN"?"plan":role==="claude"&&topic.state==="CLAUDE_REVISION"?"revision":undefined;
+      const created = await this.executor.execute({
+        role, topic, signal, purpose: "턴", inputSequence: startedAfter, expected: this.expectationOf(topic), write: implementation,
+        writeGuards: options.writeGuards,
+        session: { mode: "create", onSessionCreated: id => {
           this.assertCurrent(topic.id,signal,topic.scopeGeneration,topic.state);
           if (options.session) options.session.persist(id);
           else if (!freshSession) {
             if (this.dependencies.database.participantSessionInUse(topic.id,role,id)) throw new Error("세션 충돌");
             this.dependencies.database.upsertParticipant(topic.id,{...participant,sessionId:id,acknowledgedPlanSHA256:null});
           }
+        } },
+        prompt, implementation, planMode, planningWrite, readablePaths: options.readablePaths,
+        settings: this.executionSettings(topic.id, role, implementation), onUsage,
+        // 결과 교정·새 입력 처리(채택 검사) 전에 저장해야 재시도가 같은 세션을 이어 쓸 수 있다.
+        onResponse: (outcome) => {
+          if (options.session) options.session.persist(outcome.sessionId);
+          else if (!freshSession) {
+            if (this.dependencies.database.participantSessionInUse(topic.id, role, outcome.sessionId)) {
+              throw new Error("새 에이전트 세션이 다른 주제 세션과 충돌했습니다.");
+            }
+            this.dependencies.database.upsertParticipant(topic.id, { ...participant, sessionId: outcome.sessionId, acknowledgedPlanSHA256: null });
+          }
         },
-        settings: this.executionSettings(topic.id, role, implementation),
-        onProcessSpawn: this.processObserver(topic.id),
-        onUsage,
-        readablePaths: options.readablePaths,
       });
       this.assertCurrent(topic.id, signal, topic.scopeGeneration, topic.state);
-      if (options.session) {
-        // 결과 교정·새 입력 처리 전에 저장해야 재시도가 같은 세션을 이어 쓸 수 있다.
-        options.session.persist(created.sessionId);
-      } else if (!freshSession) {
-        if (this.dependencies.database.participantSessionInUse(topic.id, role, created.sessionId)) {
-          throw new Error("새 에이전트 세션이 다른 주제 세션과 충돌했습니다.");
-        }
-        this.dependencies.database.upsertParticipant(topic.id, {
-          ...participant, sessionId: created.sessionId, acknowledgedPlanSHA256: null,
-        });
-      }
       result = created.result;
       sessionId = created.sessionId;
     } else {
-      result = await adapter.resumeTurn({
-        sessionId: resumeSessionId, prompt, cwd: topic.worktreePath, signal, implementation, planMode,
+      const resumed = await this.executor.execute({
+        role, topic, signal, purpose: "턴", inputSequence: startedAfter, expected: this.expectationOf(topic), write: implementation,
+        writeGuards: options.writeGuards,
+        session: { mode: "resume", sessionId: resumeSessionId },
+        prompt, implementation, planMode,
         planningWrite: role==="claude" && topic.state==="CLAUDE_PLAN"?"plan":role==="claude"&&topic.state==="CLAUDE_REVISION"?"revision":undefined,
-        settings: this.executionSettings(topic.id, role, implementation),
-        onProcessSpawn: this.processObserver(topic.id),
-        onUsage,
-        readablePaths: options.readablePaths,
+        readablePaths: options.readablePaths, settings: this.executionSettings(topic.id, role, implementation), onUsage,
       });
+      result = resumed.result;
       sessionId = resumeSessionId;
     }
     this.assertCurrent(topic.id, signal, topic.scopeGeneration, topic.state);
@@ -325,6 +349,7 @@ export class EngineCore {
     try {
       const checked = await this.enforceResultContract(role, topic, result, sessionId, {
         signal, implementation, planMode, startedAfter, check, readablePaths: options.readablePaths, normalize: options.normalize, planBase: options.planBase,
+        writeGuards: options.writeGuards,
       });
       accepted = true;
       if(pending)await this.writeArtifact(topic,"pending-contract-repair",this.latestSequence(topic.id)+1,"null",signal);
@@ -384,6 +409,9 @@ export class EngineCore {
       // 파싱 직후·검사 직전에 결과를 손질한다(예: 판단이 끝난 앞 단계 쟁점을 서버가 승계). 교정 재제출의 재파싱에도 같이 적용된다.
       normalize?: ResultNormalizer;
       planBase?: string;
+      writeGuards?: WriteGuards;
+      // 교정 호출을 열기 **전에** 호출자가 누적본을 checkpoint 로 보존한다(PLAN §2: 호출 실패·재시작에도 같은 기록에서 이어간다).
+      beforeCorrection?: (raw: AgentResult, violation: string) => Promise<void>;
     },
   ): Promise<AgentResult> {
     let violation: string;
@@ -400,7 +428,7 @@ export class EngineCore {
       violation = error instanceof Error ? error.message : String(error);
       if (error instanceof ToleranceFormatError) repairPlan = repairablePlan(redactAgentResult(raw), context.planBase);
     }
-    if (repairPlan && this.adapter(role).resumePlanRepair) {
+    if (repairPlan && this.executor.supportsPlanRepair(role)) {
       const usageObserver = this.usageObserver(topic.id, role, "계약 교정 재제출");
       let executionId: string | undefined;
       let repaired: AgentResult | undefined;
@@ -409,12 +437,11 @@ export class EngineCore {
       try {
         const sourceRevision = (this.dependencies.database.latestArtifact(topic.id, "plan-repair-source")?.revision ?? 0) + 1;
         await this.writeArtifact(topic, "plan-repair-source", sourceRevision, JSON.stringify(redactAgentResult(raw)), context.signal);
-        if (this.interruptForNewUserInput(topic, context.startedAfter)) throw new HandledWorkflowInterruption();   // 저장 사이 새 입력(R3-03)
-        const patch = await this.adapter(role).resumePlanRepair!({
-          sessionId, prompt: planRepairPrompt(repairPlan, violation), cwd: topic.worktreePath,
-          signal: context.signal, protocolOnly: true, implementation: false, planMode: false,
+        // 실행 허용(새 입력·계획 변경·취소…)은 실행기가 spawn 직전에 본다(R3-03 → PLAN §2 공통 실행기).
+        const patch = await this.executor.executePlanRepair({
+          role, topic, signal: context.signal, purpose: "계획 교정", inputSequence: context.startedAfter, expected: this.expectationOf(topic), write: false,
+          session: { mode: "resume", sessionId }, prompt: planRepairPrompt(repairPlan, violation), implementation: false, protocolOnly: true,
           settings: { ...this.executionSettings(topic.id, role, false), effort: "low" },
-          onProcessSpawn: this.processObserver(topic.id),
           onUsage: (usage) => { executionId = usage.executionId; usageObserver(usage); },
         });
         responseBytes = Buffer.byteLength(JSON.stringify(patch), "utf8");
@@ -442,22 +469,21 @@ export class EngineCore {
       kind: "contract-repair-source", scopeGeneration: topic.scopeGeneration, planSHA256: topic.planSHA256, state: topic.state,
       original: redactUnverifiedResult(raw),
     }),context.signal);
-    // 원본을 저장하는 사이 새 결정·증거가 도착했으면 교정 호출(쓰기 턴)을 열지 않는다 — 원본은 방금 보존됐으므로 재개가 소비한다(R3-03).
-    if (this.interruptForNewUserInput(topic, context.startedAfter)) throw new HandledWorkflowInterruption();
+    // 호출자가 누적본을 보존한다(구현·수정 경로의 checkpoint) — 교정 호출이 죽어도 같은 기록에서 이어간다.
+    await context.beforeCorrection?.(raw, violation);
     this.event(topic.id, "system", "system",
       `기계 계약 위반을 같은 세션에 돌려보내 1회 교정합니다${formatOnly ? "(표기 교정 — 추론 low)" : ""}: ${violation}`);
     const settings = this.executionSettings(topic.id, role, context.implementation);
-    const corrected = await this.adapter(role).resumeTurn({
-      planningWrite:"repair",
-      sessionId, prompt: buildContractCorrectionPrompt(violation), cwd: topic.worktreePath,
-      signal: context.signal, implementation: context.implementation, planMode: context.planMode,
-      readablePaths: context.readablePaths,
+    // 실행 허용(새 입력·계획 변경·취소·유지보수·예산·쓰기 기준)은 실행기가 adapter 호출 전과 spawn 직전에 본다(R3-03 → PLAN §2).
+    const { result: corrected } = await this.executor.execute({
+      role, topic, signal: context.signal, purpose: "계약 교정 재제출", inputSequence: context.startedAfter,
+      expected: { ...this.expectationOf(topic), state: this.dependencies.database.getTopic(topic.id).state },
+      write: context.implementation, writeGuards: context.writeGuards,
+      session: { mode: "resume", sessionId }, prompt: buildContractCorrectionPrompt(violation), implementation: context.implementation,
+      planMode: context.planMode, planningWrite: "repair", readablePaths: context.readablePaths,
       settings: formatOnly ? { ...settings, effort: "low" } : settings,
-      onProcessSpawn: this.processObserver(topic.id),
-      onUsage: this.usageObserver(topic.id, role, "계약 교정 재제출"),
     });
     this.assertCurrent(topic.id, context.signal, topic.scopeGeneration, this.dependencies.database.getTopic(topic.id).state);
-    if (this.interruptForNewUserInput(topic, context.startedAfter)) throw new HandledWorkflowInterruption();
     // 교정 응답은 원본에서 개별로 유효했던 필드(요약·쟁점·증거·요청 결정·상태) 위에 병합한다 — 교정이 거부된 필드만 고치고
     // 나머지를 비워 내면 본 턴의 보고와 미해결 결정 요청이 흐름에서 사라진다(Codex 감사 R01 ②).
     const parsedCorrection = redactAgentResult(AgentResultSchema.parse(corrected));
@@ -509,13 +535,12 @@ export class EngineCore {
   ): Promise<AgentResult> {
     const startedAfter = this.latestSequence(topic.id);
     this.turnInputSequence.set(topic.id, startedAfter);
-    const created = await this.adapter(role).createSession({
-      prompt, cwd: topic.worktreePath, signal, implementation: false, protocolOnly: true,
+    const created = await this.executor.execute({
+      role, topic, signal, purpose: "프로토콜 확인", inputSequence: startedAfter, expected: this.expectationOf(topic), write: false,
+      session: { mode: "create" }, prompt, implementation: false, protocolOnly: true,
       // 모델은 주제 설정을 따르되 추론 강도는 low로 내린다. 프로토콜 확인에 xhigh/max 추론은
       // thinking 토큰 낭비다(2026-08-29 ACK 실측: output 19,975 중 상당분이 탐색·추론).
       settings: { ...this.executionSettings(topic.id, role), effort: "low" },
-      onProcessSpawn: this.processObserver(topic.id),
-      onUsage: this.usageObserver(topic.id, role, "프로토콜 확인"),
     });
     this.assertCurrent(topic.id, signal, topic.scopeGeneration, topic.state);
     if (this.interruptForNewUserInput(topic, startedAfter)) throw new HandledWorkflowInterruption();
@@ -622,7 +647,7 @@ export class EngineCore {
   // 턴이 쓴 토큰·시간을 타임라인에 남긴다(2026-09-07 Codex 자기 최적화 제안 ④). 이벤트의 state 열이 단계를
   // 가리키므로 단계별 집계는 SQL 로 한다. payload.usage 가 있는 이벤트는 getPromptTimeline 이 걸러 프롬프트에
   // 들어가지 않는다 — 사용량 줄이 에이전트에게 되돌아가면 그 자체가 새 입력 비용이다.
-  usageObserver(topicId: string, role: ParticipantRole, phase: "턴" | "계약 교정 재제출" | "프로토콜 확인" | "계속 진행 턴") {
+  usageObserver(topicId: string, role: ParticipantRole, phase: TurnPurpose) {
     const generation = this.dependencies.database.getTopic(topicId).scopeGeneration;
     const fallbackExecutionId = randomUUID();
     return (observation: TurnUsage) => {
@@ -823,14 +848,14 @@ export class EngineCore {
     return true;
   }
 
-  private async preserveInterruptedResult(topic: Topic, role: ParticipantRole, result: AgentResult, signal: AbortSignal): Promise<void> {
+  async preserveInterruptedResult(topic: Topic, role: ParticipantRole, result: AgentResult, signal: AbortSignal, reason?: string): Promise<void> {
     const parsed = AgentResultSchema.safeParse(result);
     const safe = parsed.success ? redactAgentResult(parsed.data) : redactUnverifiedResult(result);
     const revision = this.dependencies.database.timelineCount(topic.id) + 1;
     try {
       await this.writeArtifact(topic, `${role}-interrupted`, revision, JSON.stringify(safe, null, 2), signal);
       this.event(topic.id, "system", "system",
-        `${role} 턴이 끝나기 전에 새 결정·증거가 도착해 이 결과는 반영하지 않습니다. 산출물 \`${role}-interrupted\`(#${revision}) 로 보존했습니다.`);
+        `${reason ?? `${role} 턴이 끝나기 전에 새 결정·증거가 도착해 이 결과는 반영하지 않습니다.`} 산출물 \`${role}-interrupted\`(#${revision}) 로 보존했습니다.`);
     } catch (error) {
       this.event(topic.id, "system", "system",
         `중단된 ${role} 턴 결과를 보존하지 못했습니다: ${error instanceof Error ? error.message : String(error)}`);
@@ -859,6 +884,7 @@ export class EngineCore {
     result: AgentResult,
     kind: string,
     signal: AbortSignal,
+    extraPayload: Record<string, unknown> = {},
   ): Promise<void> {
     const safeResult = redactAgentResult(result);
     const requestedMemoryUpdates = safeResult.memoryUpdates ?? [];
@@ -879,7 +905,7 @@ export class EngineCore {
     this.event(topic.id, role, "agent_output", safeResult.summary, {
       resultKind: safeResult.kind, findings: safeResult.findings, evidenceRefs: safeResult.evidenceRefs,
       requestedUserDecision: safeResult.requestedUserDecision,
-      memoryChanges,
+      memoryChanges, ...extraPayload,
     });
   }
 

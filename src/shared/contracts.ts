@@ -168,6 +168,9 @@ export const AgentResultSchema = z.object({
   remainingSteps: z.array(z.string().max(500)).max(50).optional(),
   // 허용 오차 교정 재제출이 본 턴의 요청 결정을 **해소**했음을 명시한다(예: 범위 밖 변경을 전부 되돌려 질문이 사라짐, Codex 감사 R07).
   resolvesRequestedDecision: z.boolean().optional(),
+  // 해소 표식이 가리키는 요청 id(서버가 정지 메시지·재개 프롬프트에 적어 준 `Q-xxxxxxxx`). 없으면 지금 열린 요청 하나를 가리킨다.
+  // 다른 요청의 id 를 적으면 서버는 열린 요청을 지우지 않는다(PLAN §2: 해소 표식은 해당 요청에 결속).
+  resolvedRequestId: z.string().min(1).optional(),
   memoryUpdates: z.array(MemoryUpdateSchema).max(10).optional(),
   // 허용 오차 원장 — 승인 범위 밖 변경마다 {ruleId, file, note}. 서버가 git diff 와 대조한다(shared/tolerance.ts).
   // 서버 누적 원장(승계 포함)의 저장 계약엔 상한이 없다 — 상한은 정책(규칙 수×파일 수)이 정하고, 모델 한 번 응답의 상한(500행)은
@@ -396,7 +399,7 @@ export const AgentResultJsonSchema = {
   required: [
     "kind", "summary", "planMarkdown", "planEdits", "planLineEdits", "planSHA256",
     "findings", "evidenceRefs", "requestedUserDecision", "memoryUpdates", "toleranceLedger",
-    "status", "remainingSteps", "resolvesRequestedDecision",
+    "status", "remainingSteps", "resolvesRequestedDecision", "resolvedRequestId",
   ],
   properties: {
     kind: { enum: AgentResultSchema.shape.kind.options },
@@ -452,6 +455,7 @@ export const AgentResultJsonSchema = {
     status: { anyOf: [{ enum: ["completed", "in_progress", "blocked"] }, { type: "null" }] },
     remainingSteps: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "null" }] },
     resolvesRequestedDecision: { anyOf: [{ type: "boolean" }, { type: "null" }] },
+    resolvedRequestId: { anyOf: [{ type: "string" }, { type: "null" }] },
     toleranceLedger: {
       anyOf: [
         {
