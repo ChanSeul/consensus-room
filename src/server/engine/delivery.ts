@@ -350,14 +350,23 @@ export class DeliveryPipeline {
         ? db.getTimeline(topicId, Math.min(...state.openRequests.map((request) => request.askedAfterSequence)))
           .filter((event) => event.scopeGeneration === topic.scopeGeneration && event.actor === "user" && ["decision", "evidence"].includes(event.kind))
         : [];
+      // 실행 기록(영속, CF-05): 프로세스가 **뜨는 순간**(spawn) 남긴다 — 실행 뒤 오류로 끝나도 "실행했다" 는 기록이 남아 재개가 미실행으로 환급하지
+      // 않는다(r3). 프로세스를 띄우지 않는 어댑터를 위해 정상 반환 뒤에도 같은 기록을 한 번 남긴다. spawn 전 거부(허용 검사)는 기록이 없어 환급된다.
+      let executionRecorded = false;
+      const recordExecution = (moment: "spawn" | "return") => {
+        if (executionRecorded) return;
+        executionRecorded = true;
+        this.core.event(topicId, "system", "system", `완료 상태 확인 턴 실행(${moment === "spawn" ? "프로세스 시작" : "응답 수신"}, checkpoint #${reservation.revision}).`,
+          { confirmationExecuted: reservation.revision, moment });
+      };
       const confirmed = await this.core.executor.execute({
         role: "claude", topic, signal, purpose: "완료 확인", inputSequence: setup.inputSequence, expected, write: false,
         session: { mode: "resume", sessionId }, implementation: false, protocolOnly: true, readablePaths: setup.readablePaths,
         prompt: buildStatusConfirmationPrompt({ kind: setup.kind, reason: verdict.message, accumulated: state.base, planPath: setup.planPath, openRequests: state.openRequests, decisionsSince }),
         settings: { ...this.core.executionSettings(topicId, "claude", true), effort: "low" },
+        onSpawn: () => recordExecution("spawn"),
       });
-      // 실행 기록(영속): 확인 호출이 끝났다 — 결과 checkpoint 저장이 실패해 재개돼도 이 예약을 미실행으로 환급하지 않는다(CF-05 잔여).
-      this.core.event(topicId, "system", "system", `완료 상태 확인 턴 실행 완료(checkpoint #${reservation.revision}).`, { confirmationExecuted: reservation.revision });
+      recordExecution("return");
       const parsed = AgentResultSchema.safeParse(confirmed.result);
       if (!parsed.success || parsed.data.kind !== setup.kind) {
         this.core.event(topicId, "system", "system", "확인 턴 응답이 계약을 어겨 상태를 확정하지 못했습니다(보존).", { confirmationInvalid: true });

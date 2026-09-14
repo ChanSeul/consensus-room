@@ -117,9 +117,12 @@ export function accumulate(
   let unmatchedResolution: string | null = null;
   const asked = next.requestedUserDecision?.trim();
   if (asked) {
-    // 서버가 렌더한 열린 요청 목록(`[Q-…] 문구`)이 교정 병합으로 되돌아온 것은 새 질문이 아니다 — 이미 열린 id 는 그대로, 모르는 id 의 문구만 새 요청.
+    // 서버가 렌더한 열린 요청 목록(`[Q-…] 문구`)이 교정 병합으로 되돌아온 것은 새 질문이 아니다 — **id 와 문구가 모두** 열린 요청과 같을 때만 재출력으로
+    // 본다. 기존 id 를 인용하며 다른 문구를 적은 것은 새 질문이다(r3: id 만 비교해 새 질문 B 를 버렸다).
     const rendered = parseRenderedRequests(asked);
-    const candidates = rendered ? rendered.filter((item) => !openRequests.some((request) => request.id === item.id)).map((item) => item.text) : [asked];
+    const candidates = rendered
+      ? rendered.filter((item) => !openRequests.some((request) => request.id === item.id && request.text === item.text)).map((item) => item.text)
+      : [asked];
     for (const text of candidates) {
       const existing = openRequests.find((request) => request.text === text);
       if (!existing) openRequests.push({ id: requestId(text, askedAfterSequence), text, askedAfterSequence });

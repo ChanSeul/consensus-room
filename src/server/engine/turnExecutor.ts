@@ -50,6 +50,8 @@ export interface TurnRequest {
   readablePaths?: readonly string[];
   settings: AgentExecutionSettings;
   onUsage?: (usage: TurnUsage) => void;
+  // 프로세스가 실제로 떴을 때(spawn 직후) 부른다 — "실행했다" 는 영속 기록을 남기는 데 쓴다(결과가 돌아오기 전에 죽어도 기록은 남는다).
+  onSpawn?: () => void;
   // 응답이 돌아온 직후·채택 검사 전에 부른다 — 세션 id 저장처럼 채택 여부와 무관하게 남아야 하는 것(재시도가 같은 세션을 resume).
   onResponse?: (outcome: TurnOutcome) => void;
 }
@@ -138,7 +140,7 @@ export class TurnExecutor {
       prompt: request.prompt, cwd: request.topic.worktreePath, signal: request.signal, implementation: request.implementation,
       planMode: request.planMode, protocolOnly: request.protocolOnly, planningWrite: request.planningWrite, readablePaths: request.readablePaths,
       settings: request.settings, beforeSpawn: admit.async, admitSync: admit.sync,
-      onProcessSpawn: this.core.processObserver(request.topic.id),
+      onProcessSpawn: ((observe) => (process: Parameters<NonNullable<SessionTurn["onProcessSpawn"]>>[0]) => { observe(process); request.onSpawn?.(); })(this.core.processObserver(request.topic.id)),
       onUsage: request.onUsage ?? this.core.usageObserver(request.topic.id, request.role, request.purpose),
     };
     if (request.session.mode === "create") {
