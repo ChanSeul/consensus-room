@@ -115,6 +115,55 @@ describe("Duse iOS 프로젝트 메모리 읽기", () => {
     expect(prompt).not.toContain("메모리 문서 시작: MEMORY.md");
   });
 
+  // MEMORY.md는 한 줄에 여러 문서를 ` · `로 묶는다. 줄 전체를 모든 링크의 문맥으로 쓰면 한 문서에 맞은 키워드가
+  // 같은 줄의 다른 문서까지 끌어와 라우팅 상한을 채운다(2026-09-14, sample-ios 인덱스를 140줄 아래로 묶기 전 확인).
+  it("MEMORY.md에서 ` · `로 묶은 문서는 자기 조각의 문맥으로만 고른다", async () => {
+    const root = makeMemoryRoot();
+    const grouped = ["sim-keyboard", "shell-split", "secret-leak"];
+    writeFileSync(join(root, "context-router.md"), document("context-router", "shared", "일반 라우터"));
+    writeFileSync(join(root, "MEMORY.md"), document(
+      "project-memory-index",
+      "shared",
+      "- 도구 함정: [시뮬레이터 · 키보드 오염](sim-keyboard.md) · [셸 단어 분리](shell-split.md) · [시크릿 유출](secret-leak.md)",
+    ));
+    for (const name of grouped) {
+      writeFileSync(join(root, `${name}.md`), document(name, "shared", `${name} 본문`));
+    }
+    const reader = new ProjectMemoryReader(root);
+
+    const shell = await reader.buildPrompt("셸 단어 분리 규칙", "claude");
+    expect(shell).toContain("메모리 문서 시작: shell-split.md");
+    expect(shell).not.toContain("메모리 문서 시작: sim-keyboard.md");
+    expect(shell).not.toContain("메모리 문서 시작: secret-leak.md");
+
+    // 링크 이름 안의 ` · `는 구분자가 아니다.
+    const keyboard = await reader.buildPrompt("키보드 오염 재현", "claude");
+    expect(keyboard).toContain("메모리 문서 시작: sim-keyboard.md");
+    expect(keyboard).not.toContain("메모리 문서 시작: shell-split.md");
+
+    // 첫 링크 앞의 주제 라벨은 묶인 문서가 모두 공유한다.
+    const label = await reader.buildPrompt("도구 함정 정리", "claude");
+    for (const name of grouped) {
+      expect(label).toContain(`메모리 문서 시작: ${name}.md`);
+    }
+  });
+
+  it("` · `로 묶지 않은 여러 링크 줄은 줄 전체를 모든 링크의 문맥으로 쓴다", async () => {
+    const root = makeMemoryRoot();
+    writeFileSync(join(root, "context-router.md"), document(
+      "context-router",
+      "shared",
+      "- 결제: [환불 규칙](refund-rule.md), [영수증 규칙](receipt-rule.md) — 정산 전에 둘 다 읽는다",
+    ));
+    writeFileSync(join(root, "refund-rule.md"), document("refund-rule", "shared", "환불"));
+    writeFileSync(join(root, "receipt-rule.md"), document("receipt-rule", "shared", "영수증"));
+
+    const prompt = await new ProjectMemoryReader(root).buildPrompt("정산 점검", "claude");
+
+    expect(prompt).toContain("메모리 문서 시작: refund-rule.md");
+    expect(prompt).toContain("메모리 문서 시작: receipt-rule.md");
+  });
+
   it("라우터 링크가 심볼릭 링크 파일이면 내용을 전달하지 않는다", async () => {
     const root = makeMemoryRoot();
     const outside = mkdtempSync(join(tmpdir(), "consensus-room-memory-outside-"));

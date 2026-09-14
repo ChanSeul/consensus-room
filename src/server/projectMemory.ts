@@ -155,15 +155,48 @@ function memoryUsageRules(
 - 메모리 파일을 도구로 직접 쓰지 마세요. 판단한 결과 재사용할 교훈이 없다면 memoryUpdates를 비워 두는 것이 맞습니다 — 채우려고 없는 교훈을 만들지 마세요.`;
 }
 
+const MARKDOWN_LINK = /\[[^\]]+\]\(([^)]+\.md)(?:#[^)]+)?\)/g;
+// MEMORY.md 가 한 줄에 여러 문서를 묶을 때 쓰는 구분자(`- 주제: [문서](경로) · [문서](경로)`).
+const GROUPED_LINK_SEPARATOR = " · ";
+
 function extractMarkdownLinks(markdown: string): Array<{ path: string; context: string }> {
   const links = new Map<string, string>();
   for (const line of markdown.split(/\r?\n/)) {
-    for (const match of line.matchAll(/\[[^\]]+\]\(([^)]+\.md)(?:#[^)]+)?\)/g)) {
-      const path = normalize(match[1]).replaceAll("\\", "/");
-      if (!path.startsWith("../") && !path.startsWith("/")) links.set(path, line);
+    for (const { target, context } of linkContexts(line)) {
+      const path = normalize(target).replaceAll("\\", "/");
+      if (!path.startsWith("../") && !path.startsWith("/")) links.set(path, context);
     }
   }
   return [...links].map(([path, context]) => ({ path, context }));
+}
+
+// 여러 문서를 ` · `로 묶은 줄에서 줄 전체를 모든 링크의 문맥으로 쓰면 한 문서에 맞은 키워드가 같은 줄의 다른 문서
+// 점수까지 올려 라우팅 상한을 채운다. 그런 줄은 링크 밖의 구분자로 나눈 조각을 그 조각 링크의 문맥으로 쓰고, 첫 링크
+// 앞의 주제 라벨만 모든 조각이 공유한다. 구분자로 묶지 않은 줄(라우터의 `, `·` + ` 나열 포함)은 줄 전체가 문맥이다.
+function linkContexts(line: string): Array<{ target: string; context: string }> {
+  const matches = [...line.matchAll(MARKDOWN_LINK)];
+  const cuts = matches.length < 2 ? [] : separatorsOutsideLinks(line, matches);
+  if (cuts.length === 0) return matches.map((match) => ({ target: match[1], context: line }));
+
+  const label = line.slice(0, matches[0].index).trim();
+  const starts = [0, ...cuts.map((cut) => cut + GROUPED_LINK_SEPARATOR.length)];
+  const ends = [...cuts, line.length];
+  return starts.flatMap((start, index) => {
+    const segment = line.slice(start, ends[index]).trim();
+    const context = index === 0 ? segment : `${label} ${segment}`.trim();
+    return [...segment.matchAll(MARKDOWN_LINK)].map((match) => ({ target: match[1], context }));
+  });
+}
+
+function separatorsOutsideLinks(line: string, links: readonly RegExpExecArray[]): number[] {
+  const cuts: number[] = [];
+  let at = line.indexOf(GROUPED_LINK_SEPARATOR);
+  while (at >= 0) {
+    const cut = at;
+    if (!links.some((link) => cut > link.index && cut < link.index + link[0].length)) cuts.push(cut);
+    at = line.indexOf(GROUPED_LINK_SEPARATOR, at + 1);
+  }
+  return cuts;
 }
 
 function relevanceScore(prompt: string, path: string, context: string): number {
