@@ -18,7 +18,11 @@ export async function scanWorktreeActivity(worktreePath: string, maxEntries = 40
   let latestPath: string | null = null;
   let scanned = 0;
   let truncated = false;
-  const queue: string[] = [worktreePath];
+  // 러너가 쓰는 곳부터 본다 — 큰 트리(Modules 2만+ 파일)를 BFS 로 돌면 상한(40k)에 걸려 `DerivedData/*-logs` 에
+  // 닿기 전에 끊기고, 실제로 방금 쓴 산출물이 있는데 "활동 기록 없음" 이 된다(2026-09-14 S11 24분 턴 실측 truncated=true).
+  const priority = [join(worktreePath, "DerivedData"), join(worktreePath, "docs")];
+  const queue: string[] = [...priority, worktreePath];
+  const visited = new Set<string>();
   while (queue.length > 0) {
     const directory = queue.shift()!;
     let entries: import("node:fs").Dirent[];
@@ -33,6 +37,8 @@ export async function scanWorktreeActivity(worktreePath: string, maxEntries = 40
       if (entry.isDirectory()) {
         if (SKIP_NAMES.has(entry.name)) continue;
         if (relative(worktreePath, directory) === "DerivedData" && !entry.name.endsWith("-logs")) continue;
+        if (visited.has(full)) continue;
+        visited.add(full);
         queue.push(full);
         continue;
       }

@@ -33,6 +33,25 @@ describe("러너 생존 표시 — 작업 트리 최근 변경", () => {
     expect(activity.scanned).toBe(2);
   });
 
+  it("상한이 큰 트리보다 작아도 DerivedData/*-logs 와 docs 를 먼저 봐서 러너 산출물을 놓치지 않는다", async () => {
+    const root = mkdtempSync(join(tmpdir(), "consensus-room-activity-priority-"));
+    temporaryDirectories.push(root);
+    mkdirSync(join(root, "Modules", "Big"), { recursive: true });
+    mkdirSync(join(root, "DerivedData", "s11-logs", "artifacts"), { recursive: true });
+    const old = new Date("2026-09-14T00:00:00Z");
+    const newest = new Date("2026-09-14T01:00:00Z");
+    for (let index = 0; index < 50; index += 1) {
+      writeFileSync(join(root, "Modules", "Big", `f${index}.swift`), "x");
+      utimesSync(join(root, "Modules", "Big", `f${index}.swift`), old, old);
+    }
+    writeFileSync(join(root, "DerivedData", "s11-logs", "artifacts", "p1.log"), "x");
+    utimesSync(join(root, "DerivedData", "s11-logs", "artifacts", "p1.log"), newest, newest);
+    const activity = await scanWorktreeActivity(root, 10);
+    expect(activity.truncated).toBe(true);
+    expect(activity.lastChangedPath).toBe("DerivedData/s11-logs/artifacts/p1.log");
+    expect(activity.lastChangeAt).toBe(newest.toISOString());
+  });
+
   it("빈 트리는 null 을 돌려주고, 상한을 넘으면 truncated 를 표시한다", async () => {
     const root = mkdtempSync(join(tmpdir(), "consensus-room-activity-empty-"));
     temporaryDirectories.push(root);
