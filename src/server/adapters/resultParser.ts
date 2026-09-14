@@ -7,7 +7,7 @@ import { redactSecrets } from "../../shared/workflow.js";
 // memoryUpdates[].expectedSHA256처럼 null 자체가 유효한 값인 필드는 건드리지 않으므로 재귀로 훑지 않는다.
 const OPTIONAL_KEYS = [
   "planMarkdown", "planEdits", "planLineEdits", "planSHA256", "requestedUserDecision", "memoryUpdates", "findings", "evidenceRefs",
-  "toleranceLedger",
+  "toleranceLedger", "status", "remainingSteps", "resolvesRequestedDecision",
 ] as const;
 
 function withoutNullOptionals(value: unknown): unknown {

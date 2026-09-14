@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import { describePrune, pruneBuildTrees } from "./buildTrees.js";
 import { basename, dirname, join } from "node:path";
 import {
+  type ResumeImplementationInput,
   type AgentExecutionSettings,
   type Participant,
   type Topic,
@@ -26,6 +27,9 @@ import { PlanningPipeline } from "./engine/planning.js";
 import { DeliveryPipeline } from "./engine/delivery.js";
 import { UsageLimitRetryScheduler, type RetryClock } from "./engine/usageLimitRetry.js";
 
+// 호출 주체 — 브라우저 사용자(기본)와 중재 세션(x-consensus-actor: mediator, 위임 스위치 on 일 때만). 이벤트 payload 에 남긴다(D03).
+export interface CallOrigin { actor: "mediator"; delegationSetAt: string | null }
+
 export interface WorkflowDependencies {
   database: ConsensusDatabase;
   artifacts: ArtifactStore;
@@ -38,6 +42,8 @@ export interface WorkflowDependencies {
   clock?: RetryClock;
   executionLimits?: ExecutionLimits;
   enforceBudgets?: boolean;
+  // 중재자 유지보수 잠금 파일(도구 트리 교체·서버 교체 중). 있으면 새 실행을 시작하지 않는다(2026-09-14 Codex 감사 R04).
+  maintenanceLockPath?: string;
 }
 
 // 범위 변경을 허용하는 상태. WorkflowState가 늘어나면 이 표가 컴파일을 막아 새 상태를 의식적으로 판단하게 만든다.
@@ -462,11 +468,29 @@ export class WorkflowEngine {
     }
   }
 
+  // 구현 계속 재개 — 리뷰 한도·실패로 멈춘 토픽의 resume 을 IMPLEMENTING 으로 되돌린다(같은 세션·같은 계획, 리뷰 소비량 불변). 그 뒤 retry.
+  resumeImplementation(topicId: string, input: ResumeImplementationInput, origin?: CallOrigin): Topic {
+    this.core.assertNoActiveWork(topicId);
+    const db = this.core.dependencies.database;
+    const topic = db.getTopic(topicId);
+    if (topic.state !== input.expectedState) throw new Error(`현재 상태 ${topic.state} 가 요청의 기대 상태 ${input.expectedState} 와 다릅니다.`);
+    if (topic.scopeGeneration !== input.expectedScopeGeneration) throw new Error("범위 세대가 요청과 다릅니다 — 낡은 재개 요청입니다.");
+    if (!topic.approvedPlanSHA256 || topic.approvedPlanSHA256 !== topic.planSHA256) throw new Error("승인된 계획이 없거나 계획이 바뀌어 구현을 재개할 수 없습니다.");
+    if (!db.getFlags(topicId).implementationSessionId) throw new Error("구현 세션이 없어 재개할 수 없습니다(구현 시작을 쓰세요).");
+    return db.applyTopicTransition({
+      topicId, changes: { resumeState: "IMPLEMENTING" },
+      events: [{ actor: "user", kind: "decision", state: topic.state,
+        body: `구현 계속 재개(공식): resume → IMPLEMENTING. ${input.reason}`,
+        payload: { implementationResume: { fromState: topic.state, scopeGeneration: topic.scopeGeneration }, ...(origin ? { origin } : {}) } }],
+    });
+  }
+
   async postMessage(
     topicId: string,
     kind: "note" | "evidence" | "decision",
     body: string,
     requestKey?: string,
+    origin?: CallOrigin,
   ): Promise<Topic> {
     const topic = this.core.dependencies.database.getTopic(topicId);
     if (topic.state === "AWAITING_USER_APPROVAL") {
@@ -496,7 +520,7 @@ export class WorkflowEngine {
             payload: {
               invalidatedPlanSHA256: topic.planSHA256,
               planEpoch: nextEpoch,
-              ...(requestKey ? { requestKey, requestAction: `message:${kind}` } : {}),
+              ...(origin ? { origin } : {}), ...(requestKey ? { requestKey, requestAction: `message:${kind}` } : {}),
             },
           },
           {

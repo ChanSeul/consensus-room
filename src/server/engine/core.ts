@@ -1,4 +1,5 @@
 import {ReviewBlocked} from "../reviewLedger.js";
+import { existsSync, readFileSync } from "node:fs";
 import {reviewScope} from "../../shared/reviews.js";
 import { RevisionBlocked } from "../revisionLedger.js";
 import { wrapWorkGroupAdapter } from "../workGroupAdapter.js";
@@ -33,11 +34,13 @@ import {
   assertPlanContract,
   assertTransition,
   carryForwardFindings,
+  mergeCorrectionResult,
+  salvageResultFields,
   normalizePlan,
   redactSecrets,
 } from "../../shared/workflow.js";
 import { buildContractCorrectionPrompt } from "../../shared/prompts.js";
-import { redactAgentResult, redactRecord } from "../security.js";
+import { redactAgentResult, redactRecord, redactUnverifiedResult } from "../security.js";
 import type { AgentAdapter, AppliedMemoryChange, ParticipantRole, TurnUsage } from "../types.js";
 import { exceededLimits } from "../adapters/executionMetrics.js";
 import type { WorkflowDependencies } from "../workflow.js";
@@ -212,6 +215,19 @@ export class EngineCore {
         this.deliveryActive.has(topicId) || this.scopeChangeActive.has(topicId) || this.amendmentActive.has(topicId)) {
       throw new Error("이 주제에서 이미 실행 중인 작업이 있습니다.");
     }
+    this.assertNoMaintenanceLock();
+  }
+
+  // 중재자가 도구 트리·서버를 교체하는 동안(next-stop.sh) 새 실행을 시작하지 않는다 — 유휴 확인과 교체 사이의 경쟁을 막는 공유 잠금.
+  // 60분이 지난 잠금은 버려진 것으로 보고 무시한다(스크립트가 죽어 지우지 못한 경우).
+  assertNoMaintenanceLock(): void {
+    const path = this.dependencies.maintenanceLockPath;
+    if (!path || !existsSync(path)) return;
+    let info: { at?: string; reason?: string } = {};
+    try { info = JSON.parse(readFileSync(path, "utf8")) as { at?: string; reason?: string }; } catch { /* 형식 무관 — 파일 존재가 잠금이다 */ }
+    const age = info.at ? Date.now() - Date.parse(info.at) : 0;
+    if (Number.isFinite(age) && age > 60 * 60 * 1000) return;
+    throw new Error(`중재자 유지보수 잠금 중입니다(${info.reason ?? "사유 없음"}, ${info.at ?? "시각 없음"}) — 끝난 뒤 다시 시도하세요.`);
   }
 
   // freshSession: 합의 이력을 물려받지 않는 일회용 세션에서 실행한다. 프롬프트가 판단에 필요한 것을
@@ -413,7 +429,8 @@ export class EngineCore {
       }
     }
     const correctionRevision=(this.dependencies.database.latestArtifact(topic.id,"contract-repair-source")?.revision ?? 0)+1;
-    await this.writeArtifact(topic,"contract-repair-source",correctionRevision,JSON.stringify(redactAgentResult(raw)),context.signal);
+    // 보관은 계약 검증 없이 가린다 — 계약을 어긴 응답을 스키마로 다시 파싱하면 보관에서 죽어 교정에 못 간다(Codex 감사 R08).
+    await this.writeArtifact(topic,"contract-repair-source",correctionRevision,JSON.stringify(redactUnverifiedResult(raw)),context.signal);
     this.event(topic.id, "system", "system",
       `기계 계약 위반을 같은 세션에 돌려보내 1회 교정합니다${formatOnly ? "(표기 교정 — 추론 low)" : ""}: ${violation}`);
     const settings = this.executionSettings(topic.id, role, context.implementation);
@@ -428,7 +445,16 @@ export class EngineCore {
     });
     this.assertCurrent(topic.id, context.signal, topic.scopeGeneration, this.dependencies.database.getTopic(topic.id).state);
     if (this.interruptForNewUserInput(topic, context.startedAfter)) throw new HandledWorkflowInterruption();
-    const reparsed = normalized(context.normalize, redactAgentResult(AgentResultSchema.parse(corrected)));
+    // 교정 응답은 원본에서 개별로 유효했던 필드(요약·쟁점·증거·요청 결정·상태) 위에 병합한다 — 교정이 거부된 필드만 고치고
+    // 나머지를 비워 내면 본 턴의 보고와 미해결 결정 요청이 흐름에서 사라진다(Codex 감사 R01 ②).
+    const parsedCorrection = redactAgentResult(AgentResultSchema.parse(corrected));
+    const salvaged = salvageResultFields(raw, parsedCorrection.kind);
+    const merged = mergeCorrectionResult(salvaged, parsedCorrection);
+    if (merged.preserved.length > 0) {
+      this.event(topic.id, "system", "system", `계약 교정 재제출에 원본의 유효한 필드를 병합했습니다(서버 보존): ${merged.preserved.join(" · ")}`,
+        { correctionPreserved: merged.preserved });
+    }
+    const reparsed = normalized(context.normalize, redactAgentResult(AgentResultSchema.parse(merged.result)));
     context.check?.(reparsed);
     this.reportCarriedFindings(topic.id, context.normalize, true);
     return reparsed;
@@ -583,7 +609,7 @@ export class EngineCore {
   // 턴이 쓴 토큰·시간을 타임라인에 남긴다(2026-09-07 Codex 자기 최적화 제안 ④). 이벤트의 state 열이 단계를
   // 가리키므로 단계별 집계는 SQL 로 한다. payload.usage 가 있는 이벤트는 getPromptTimeline 이 걸러 프롬프트에
   // 들어가지 않는다 — 사용량 줄이 에이전트에게 되돌아가면 그 자체가 새 입력 비용이다.
-  usageObserver(topicId: string, role: ParticipantRole, phase: "턴" | "계약 교정 재제출" | "프로토콜 확인") {
+  usageObserver(topicId: string, role: ParticipantRole, phase: "턴" | "계약 교정 재제출" | "프로토콜 확인" | "계속 진행 턴") {
     const generation = this.dependencies.database.getTopic(topicId).scopeGeneration;
     const fallbackExecutionId = randomUUID();
     return (observation: TurnUsage) => {
@@ -728,7 +754,10 @@ export class EngineCore {
   // 메모리 반영(saveAgentOutput)보다 앞으로 올릴 때 이 예측으로 가드한다(2026-08-31 Codex 지적:
   // 검증 전에 메모리를 바꿔, 계약 위반 응답이 FAILED가 되고도 공용 메모리를 1회 오염).
   resultRequestsPause(result: AgentResult): boolean {
-    const decision = result.requestedUserDecision ??
+    // status=blocked 는 요청 문구가 없어도 정지다(D01: 완료 판단을 요청 필드 유무에만 맡기지 않는다).
+    const blocked = result.status === "blocked"
+      ? `러너가 막힘(blocked)으로 정지했습니다 — 남은 단계: ${(result.remainingSteps ?? []).join(" · ") || "(명시 없음)"}` : undefined;
+    const decision = result.requestedUserDecision ?? blocked ??
       result.findings.find((finding) => finding.requiresUserDecision)?.rationale;
     if (decision) return true;
     return result.findings.some((finding) => finding.disposition === "EXTERNAL_EVIDENCE");
@@ -740,10 +769,13 @@ export class EngineCore {
     resumeState: WorkflowState,
     fallbackMessage: string,
   ): boolean {
-    const decision = result.requestedUserDecision ??
+    const blocked = result.status === "blocked"
+      ? `러너가 막힘(blocked)으로 정지했습니다 — 남은 단계: ${(result.remainingSteps ?? []).join(" · ") || "(명시 없음)"}` : undefined;
+    const decision = result.requestedUserDecision ?? blocked ??
       result.findings.find((finding) => finding.requiresUserDecision)?.rationale;
     if (decision) {
-      this.interrupt(topicId, "USER_DECISION_REQUIRED", decision || fallbackMessage, resumeState);
+      this.interrupt(topicId, "USER_DECISION_REQUIRED", decision || fallbackMessage, resumeState,
+        result.status === "blocked" ? { runnerBlocked: true, remainingSteps: result.remainingSteps ?? [] } : {});
       return true;
     }
     const missingEvidence = result.findings.find((finding) => finding.disposition === "EXTERNAL_EVIDENCE");
@@ -780,7 +812,7 @@ export class EngineCore {
 
   private async preserveInterruptedResult(topic: Topic, role: ParticipantRole, result: AgentResult, signal: AbortSignal): Promise<void> {
     const parsed = AgentResultSchema.safeParse(result);
-    const safe = parsed.success ? redactAgentResult(parsed.data) : result;
+    const safe = parsed.success ? redactAgentResult(parsed.data) : redactUnverifiedResult(result);
     const revision = this.dependencies.database.timelineCount(topic.id) + 1;
     try {
       await this.writeArtifact(topic, `${role}-interrupted`, revision, JSON.stringify(safe, null, 2), signal);

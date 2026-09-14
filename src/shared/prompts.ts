@@ -332,7 +332,7 @@ export function stopPolicyContract(): string {
   return `정지 정책 — requestedUserDecision 은 드물게 씁니다:
 - 승인 범위 밖 변경이 필요한 자리는 먼저 계획의 \`## 허용 오차\` 규칙과 대조하세요. **규칙 술어를 만족하면 구현하고 반환 JSON 의 toleranceLedger 에 {ruleId, file, note} 로 적으세요**(서버가 git diff 로 대조하며, 원장에 없는 범위 밖 변경은 되돌리게 합니다). 규칙 밖(다른 단계가 소유한 파일의 다른 변경, 모듈 선언, 우회 표기가 필요한 자리)은 **코드를 건드리지 말고 to-do 로 남기고 계속**하세요. 원장·보고서에 진단 정체성·원인 선언·필요한 변경·권장 형태를 한 줄로 적고 다음 일로 갑니다. 그 항목 때문에 턴을 끝내지 마세요. 범위 밖을 미리 구현하는 것도 금지입니다(리뷰가 되돌리게 합니다).
 - requestedUserDecision 으로 턴을 끝내는 경우는 넷뿐입니다: (1) 중재자가 실행해야 하는 게이트(시뮬레이터·xcodebuild 등 러너가 돌릴 수 없는 단계), (2) 계획의 전제가 계측으로 반박돼 남은 작업의 방향이 갈릴 때, (3) 되돌리기 어려운 변경(외부 계약·동작 변경)을 피할 수 없을 때, (4) 계획 단계가 남았는데 턴을 끊어야 할 때 — 남은 단계를 적고 "계속 진행 요청" 으로 정지합니다(중재자가 곧 재개합니다).
-- **완료 선언 계약**: requestedUserDecision 이 없는 IMPLEMENTATION 결과는 "계획의 모든 단계가 끝났다" 는 선언이고 서버는 그 즉시 Codex 리뷰로 넘깁니다. 중간 보고·진행 상황 정리는 완료 형식으로 내지 마세요 — 단계가 남았으면 (4) 로 정지하세요(2026-09-14 S11: 완료 형식 중간 보고가 두 번 리뷰로 흘렀습니다).
+- **완료 선언 계약**: 결과 JSON 의 \`status\` 로 진행 상태를 명시하세요 — \`completed\`(계획의 모든 단계가 끝남 → 서버가 즉시 Codex 리뷰로 넘김) · \`in_progress\`(단계가 남았고 같은 세션에서 계속 — \`remainingSteps\` 에 남은 단계를 적으면 서버가 곧바로 "계속 진행" 턴을 엽니다) · \`blocked\`(중재자·사용자 입력이 필요해 정지, \`remainingSteps\` + requestedUserDecision). \`status\` 가 없고 requestedUserDecision 도 없으면 completed 로 봅니다. 중간 보고·진행 상황 정리를 completed 로 내지 마세요(2026-09-14 S11: 완료 형식 중간 보고가 두 번 리뷰로 흘렀습니다).
 - to-do 는 원장·보고서 표와 함께 **반환 findings 에도** 남기세요: id \`TODO-n\`, disposition \`DEFERRED_OUT_OF_SCOPE\`, rationale 에 진단 정체성·원인 선언·필요한 변경·권장 형태. 방이 후속 목록에 기록해 다음 계획 턴에 자동으로 싣고, 인도 전에 사용자가 처분(후속 토픽·다음 계획 포함·폐기)을 정합니다.
 - 그 경우에도 **한 턴에 한 번, 턴 끝에 모아서** 요청하세요. 요청 전에 결정과 무관한 일을 전부 끝내고, 요청문에는 실측 값·후보·권고를 적어 한 번의 답으로 끝나게 하세요.
 - **턴은 도구 호출 없는 텍스트 응답으로 끝납니다**(-p 모드). "기다리겠다"·"끝나면 확인하겠다" 같은 말만 쓰고 멈추면 그 순간 결과 제출이 강제돼 **미완 작업이 그대로 제출**됩니다. 기다림은 말이 아니라 도구 호출로 하세요: 긴 명령은 포그라운드로 timeout 을 넉넉히(최대 600000ms) 주고, 300초를 넘겨 백그라운드로 밀렸으면 \`sleep 60\` 뒤 로그 파일 tail 을 **도구 호출로 반복**하세요. 샌드박스에서 \`ps\`·\`/tmp\` 쓰기는 막히므로 대기 조건은 로그 파일의 종료 줄로 잡으세요. 결과 JSON 은 완료 기준(검증 로그 줄)이 손에 있을 때만 내세요.`;
@@ -366,6 +366,8 @@ export function buildImplementationPrompt(input: {
   timeline: readonly TimelineEvent[];
   resumedSession?: boolean;
   planPath?: string | null;
+  // 결정·증거 원문 전체(서버 보존 산출물, 읽기 허용). 세션 압축 뒤 원문이 필요할 때 조회한다(Codex 감사 D02).
+  decisionsPath?: string | null;
   implementationNotes?: readonly ImplementationNote[];
 }): string {
   return `${input.resumedSession
@@ -380,7 +382,7 @@ ${planSection(input)}
 
 ${continuedTimelineHeading(input.resumedSession, "현재 방의 사용자 결정과 증거:")}
 ${renderTimeline(input.timeline, false, continuedTimelineEmpty(input.resumedSession))}
-
+${decisionsSection(input.decisionsPath)}
 ${input.resumedSession ? "" : renderImplementationNotes(input.implementationNotes, "implementation")}
 구현 중 발견해 이 턴에서 실제로 고친 쟁점은 RESOLVED_BY_FIX로 처분하고 확인 방법을 evidenceRefs에 남기세요.
 
@@ -466,6 +468,25 @@ ${outputLanguageContract({ planBody: false })}
 반환 kind는 ${input.finalPass ? "FINAL_REVIEW" : "REVIEW"}입니다.`;
 }
 
+// 결정·증거 원문 산출물 안내. 프롬프트엔 경로만 싣고(전체 타임라인 재전송 회귀 금지) 필요할 때 읽게 한다.
+function decisionsSection(path?: string | null): string {
+  if (!path) return "";
+  return `결정·증거 원문 전체(서버 보존, 읽기 허용): ${path}
+- 이 세션이 압축돼 어떤 결정([d n])의 원문이 기억에 없으면 이 파일에서 이벤트 번호·결정 번호로 찾아 읽으세요. 계획 문서의 요약을 원문 대신 옮겨 적지 마세요.
+`;
+}
+
+// 러너가 status=in_progress 로 멈춘 뒤 같은 세션에서 여는 "계속 진행" 턴 — 새 결정이 아니라 남은 단계의 이행 요청이다(D01).
+export function buildContinuationPrompt(remainingSteps: readonly string[], round: number, limit: number): string {
+  return `직전 결과가 status=in_progress 였습니다(계속 진행 ${round}/${limit}). 같은 승인 범위에서 남은 단계를 이어서 수행하세요.
+남은 단계(직전 제출):
+${remainingSteps.length ? remainingSteps.map((step) => `- ${step}`).join("\n") : "- (명시 없음 — 계획의 다음 단계)"}
+
+규칙: 결과 JSON 은 이번 턴까지 누적된 보고입니다(직전 findings·evidenceRefs 는 서버가 병합해 보존합니다). 모든 단계가 끝났으면 status=completed, 아직이면 status=in_progress + remainingSteps, 중재자·사용자 입력이 필요하면 status=blocked + requestedUserDecision. 허용 오차 원장(toleranceLedger)은 워킹트리에 남아 있는 범위 밖 변경 전부를 다시 적으세요.
+
+${dispositionContract("IMPLEMENTATION")}`;
+}
+
 export function buildClaudeFixPrompt(input: {
   planMarkdown: string;
   reviewFindings: readonly Finding[];
@@ -474,6 +495,7 @@ export function buildClaudeFixPrompt(input: {
   resumedSession?: boolean;
   planSHA256?: string | null;
   planPath?: string | null;
+  decisionsPath?: string | null;
 }): string {
   return `승인된 계획 범위 안에서 Codex가 확정한 finding을 한 번만 수정하세요.
 
@@ -484,6 +506,7 @@ ${JSON.stringify(input.reviewFindings, null, 2)}
 
 ${continuedTimelineHeading(input.resumedSession, "방에 추가된 사용자 결정과 증거:")}
 ${renderTimeline(input.timeline, false, continuedTimelineEmpty(input.resumedSession))}
+${decisionsSection(input.decisionsPath)}
 
 실제로 고친 finding은 RESOLVED_BY_FIX로 처분하고, **finding 별로** evidenceRefs 에 다음 형식의 한 줄을 남기세요
 (Codex 가 원인과 확인 방법을 다시 찾지 않게): \`F-12 → 발생 원인 → 고친 파일:위치 → 실행한 검증과 로그 경로 → 아직 확인하지 못한 부분\`.
@@ -529,7 +552,7 @@ ${violations.map((violation) => `- ${violation}`).join("\n")}
 할 일:
 1. 규칙 술어를 만족하지 못하는 범위 밖 변경은 **되돌리고**(파일을 기준 커밋 상태로) to-do 로 옮기세요 — 원장·보고서에 진단·원인·필요한 변경을 한 줄로.
 2. 술어를 만족하는 범위 밖 변경은 toleranceLedger 에 {ruleId, file, note} 로 빠짐없이 적으세요. 원장에는 실제로 바뀐 범위 밖 파일만 적습니다(앞 턴에서 서버가 받아들인 행은 같은 파일이 그대로 바뀐 채면 서버가 승계합니다).
-3. 이 재제출이 이 턴의 **최종 보고**가 됩니다. 직전 제출의 summary·findings·evidenceRefs·requestedUserDecision 을 그대로 유지하고 교정으로 바뀐 부분만 더하세요 — 교정 내용만 적어 내면 턴의 성과가 기록에서 사라집니다(서버도 병합해 보존하지만, 원문이 정확합니다).
+3. 이 재제출이 이 턴의 **최종 보고**가 됩니다. 직전 제출의 summary·findings·evidenceRefs·requestedUserDecision·status·remainingSteps 를 그대로 유지하고 교정으로 바뀐 부분만 더하세요 — 교정 내용만 적어 내면 턴의 성과가 기록에서 사라집니다(서버도 병합해 보존하지만, 원문이 정확합니다). 교정(예: 범위 밖 변경을 전부 되돌림)으로 직전 요청 결정이 **해소**됐으면 \`resolvesRequestedDecision: true\` 를 적으세요 — 그때만 서버가 요청을 복원하지 않습니다.
 
 ${dispositionContract(kind)}`;
 }

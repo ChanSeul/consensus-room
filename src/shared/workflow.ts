@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 import type { AgentResult, Finding, Participant, PlanEdit, WorkflowState } from "./contracts";
-import { FIX_AWARE_KINDS, validatePlanHeadings } from "./contracts";
+import { FIX_AWARE_KINDS, FindingSchema, validatePlanHeadings } from "./contracts";
 import { parseTolerancePolicy } from "./tolerance";
 
 export const ACTIVE_WORKFLOW_STATES: ReadonlySet<WorkflowState> = new Set([
@@ -249,19 +249,55 @@ export function mergeCorrectionResult(original: AgentResult, corrected: AgentRes
   const keptEvidence = original.evidenceRefs.filter((ref) => !evidence.includes(ref));
   if (keptEvidence.length) preserved.push(`evidence ${keptEvidence.length}건`);
   const originalDecision = original.requestedUserDecision?.trim() ? original.requestedUserDecision : undefined;
-  const decision = corrected.requestedUserDecision?.trim() ? corrected.requestedUserDecision : originalDecision;
-  if (!corrected.requestedUserDecision?.trim() && originalDecision) preserved.push("요청 결정");
+  // 교정이 요청 결정을 해소했다고 명시하면(resolvesRequestedDecision, 예: 범위 밖 변경을 전부 되돌려 질문이 사라짐) 복원하지 않는다(R07).
+  const resolved = corrected.resolvesRequestedDecision === true;
+  const decision = corrected.requestedUserDecision?.trim() ? corrected.requestedUserDecision : (resolved ? undefined : originalDecision);
+  if (!corrected.requestedUserDecision?.trim() && originalDecision && !resolved) preserved.push("요청 결정");
   const originalSummary = original.summary.trim();
   let summary = corrected.summary;
   if (originalSummary && !corrected.summary.includes(originalSummary)) {
     summary = `${corrected.summary.trimEnd()}${CORRECTION_SUMMARY_SEPARATOR}${originalSummary}`;
     preserved.push("summary");
   }
+  const { requestedUserDecision: _dropped, resolvesRequestedDecision: _flag, ...rest } = corrected;
   const result: AgentResult = {
-    ...corrected, summary, findings: [...corrected.findings, ...keptFindings], evidenceRefs: [...evidence, ...keptEvidence],
+    ...rest, summary, findings: [...corrected.findings, ...keptFindings], evidenceRefs: [...evidence, ...keptEvidence],
     ...(decision !== undefined ? { requestedUserDecision: decision } : {}),
+    ...(corrected.status ?? original.status ? { status: corrected.status ?? original.status } : {}),
+    ...(corrected.remainingSteps ?? original.remainingSteps ? { remainingSteps: corrected.remainingSteps ?? original.remainingSteps } : {}),
   };
   return { result, preserved };
+}
+
+// 구현·수정 결과가 "아직 진행 중" 인가 — status 가 in_progress 이거나, completed 가 아닌데 남은 단계가 적혀 있으면(D01).
+export function implementationInProgress(result: AgentResult): boolean {
+  if (result.status === "in_progress") return true;
+  if (result.status === "completed" || result.status === "blocked") return false; // blocked 는 정지(pauseForResult) 몫
+  return (result.remainingSteps?.length ?? 0) > 0;
+}
+
+// 계약을 어긴 원본 응답에서 **개별로 유효한** 필드만 건진다 — 교정 재제출 위에 병합할 본 턴 보고(요약·쟁점·증거·요청 결정·상태).
+// 검증에 실패한 필드를 무조건 재주입하면 교정이 같은 위반으로 다시 죽는다(2026-09-14 Codex 감사 R01 ②).
+export function salvageResultFields(raw: unknown, kind: AgentResult["kind"]): AgentResult {
+  const record = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+  const findings: Finding[] = [];
+  if (Array.isArray(record.findings)) {
+    for (const candidate of record.findings) {
+      const parsed = FindingSchema.safeParse(candidate);
+      if (parsed.success) findings.push(parsed.data);
+    }
+  }
+  const evidenceRefs = Array.isArray(record.evidenceRefs) ? record.evidenceRefs.filter((ref): ref is string => typeof ref === "string") : [];
+  const summary = typeof record.summary === "string" && record.summary.trim() ? record.summary : "";
+  const decision = typeof record.requestedUserDecision === "string" && record.requestedUserDecision.trim() ? record.requestedUserDecision : undefined;
+  const status = record.status === "completed" || record.status === "in_progress" || record.status === "blocked" ? record.status : undefined;
+  const remainingSteps = Array.isArray(record.remainingSteps)
+    ? record.remainingSteps.filter((step): step is string => typeof step === "string").slice(0, 50) : undefined;
+  return {
+    kind, summary: summary || "(교정 전 원본에 유효한 요약이 없음)", findings, evidenceRefs,
+    ...(decision ? { requestedUserDecision: decision } : {}), ...(status ? { status } : {}),
+    ...(remainingSteps && remainingSteps.length ? { remainingSteps } : {}),
+  };
 }
 
 export function assertFindingCoverage(

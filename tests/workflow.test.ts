@@ -34,6 +34,8 @@ import {
   CORRECTION_SUMMARY_SEPARATOR,
   carryForwardFindings,
   mergeCorrectionResult,
+  salvageResultFields,
+  implementationInProgress,
   isSettledFinding,
   mergeFindingSources,
 } from "../src/shared/workflow";
@@ -747,5 +749,35 @@ describe("mergeCorrectionResult — 교정 재제출을 본 턴 결과 위에 �
   it("본 턴에 요청 결정이 없었고 교정도 없으면 요청 결정 필드를 만들지 않는다", () => {
     const { result } = mergeCorrectionResult({ ...original, requestedUserDecision: undefined }, { kind: "IMPLEMENTATION", summary: "x", findings: [], evidenceRefs: [] });
     expect("requestedUserDecision" in result).toBe(false);
+  });
+});
+
+// 2026-09-14 Codex 감사 R07·R01②·D01 — 요청 결정의 명시적 해소, 계약을 어긴 원본의 필드 구제, 진행 상태 판정.
+describe("mergeCorrectionResult — resolvesRequestedDecision / salvageResultFields / implementationInProgress", () => {
+  const base = { kind: "IMPLEMENTATION" as const, summary: "s", findings: [], evidenceRefs: [] };
+  it("교정이 resolvesRequestedDecision:true 를 적으면 본 턴의 요청 결정을 복원하지 않는다", () => {
+    const original: AgentResult = { ...base, requestedUserDecision: "범위 밖 변경을 유지할까?" };
+    const corrected: AgentResult = { ...base, summary: "전부 되돌렸다", resolvesRequestedDecision: true };
+    const merged = mergeCorrectionResult(original, corrected);
+    expect(merged.result.requestedUserDecision).toBeUndefined();
+    expect("resolvesRequestedDecision" in merged.result).toBe(false);
+    expect(merged.preserved).not.toContain("요청 결정");
+  });
+  it("salvageResultFields 는 개별로 유효한 필드만 건진다(깨진 쟁점은 버리고 유효한 결정·증거·상태는 남긴다)", () => {
+    const raw = { kind: "FIX", summary: "실제 작업", requestedUserDecision: "ORIGINAL-DECISION", evidenceRefs: ["PROOF", 3],
+      findings: [{ id: "ok", title: "t", severity: "LOW", disposition: "AGREED_NO_ACTION", rationale: "r", evidenceRefs: [], requiresUserDecision: false }, { id: "broken" }],
+      status: "in_progress", remainingSteps: ["P4", 7] };
+    const salvaged = salvageResultFields(raw, "IMPLEMENTATION");
+    expect(salvaged).toMatchObject({ kind: "IMPLEMENTATION", summary: "실제 작업", requestedUserDecision: "ORIGINAL-DECISION", evidenceRefs: ["PROOF"], status: "in_progress", remainingSteps: ["P4"] });
+    expect(salvaged.findings.map((finding) => finding.id)).toEqual(["ok"]);
+    const merged = mergeCorrectionResult(salvaged, { ...base, summary: "kind 만 고침" });
+    expect(merged.result.requestedUserDecision).toBe("ORIGINAL-DECISION");
+    expect(merged.result.evidenceRefs).toContain("PROOF");
+  });
+  it("implementationInProgress: in_progress 이거나 completed 가 아닌데 남은 단계가 있으면 진행 중", () => {
+    expect(implementationInProgress({ ...base, status: "in_progress" })).toBe(true);
+    expect(implementationInProgress({ ...base, remainingSteps: ["P4"] })).toBe(true);
+    expect(implementationInProgress({ ...base, status: "completed", remainingSteps: ["메모"] })).toBe(false);
+    expect(implementationInProgress({ ...base })).toBe(false);
   });
 });

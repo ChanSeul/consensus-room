@@ -348,3 +348,15 @@ describe("carryForwardLedger — 앞 턴에서 받아들인 원장 행 승계", 
     expect(ledger).toEqual([{ ruleId: "T-1", file: "s/X.swift", note: `${CARRIED_LEDGER_NOTE_PREFIX}원래` }]);
   });
 });
+
+// 2026-09-14 Codex 감사 R06: 누적 원장은 모델 한 번 응답 상한이 아니라 저장 계약이다 — 501행도 다시 읽힌다.
+describe("누적 원장 저장 계약", () => {
+  it("승계로 501행이 된 원장은 결과 스키마로 다시 읽힌다", async () => {
+    const { AgentResultSchema } = await import("../src/shared/contracts");
+    const old = Array.from({ length: 500 }, (_, i) => ({ ruleId: "T-1", file: `service/${i}.swift`, note: "approved" }));
+    const current = [{ ruleId: "T-1", file: "service/new.swift", note: "current" }];
+    const carried = carryForwardLedger(old, current, [...old, ...current].map((entry) => entry.file));
+    expect(carried.ledger).toHaveLength(501);
+    expect(AgentResultSchema.safeParse({ kind: "IMPLEMENTATION", summary: "s", findings: [], evidenceRefs: [], toleranceLedger: carried.ledger }).success).toBe(true);
+  });
+});

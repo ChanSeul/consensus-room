@@ -426,3 +426,132 @@ describe("허용 오차 — 턴을 넘어 살아야 할 상태는 엔진이 든�
     database.close();
   });
 });
+
+// 2026-09-14 Codex 감사(R01·R02·R05·R06·R07·R08·D01) — 실패 때 결과·진행 상태를 잃지 않고, 도구 트리는 러너 권한 밖이며, 설명 길이는 실패 사유가 아니다.
+describe("Codex 감사 2026-09-14 — 결과 수명·진행 상태·도구 트리·원장 경계", () => {
+  function scripted(turns: Array<(prompt: string) => AgentResult>) {
+    const prompts: string[] = [];
+    let index = 0;
+    const next = (prompt: string) => { const turn = turns[index]; if (!turn) throw new Error(`턴 ${index + 1} 을 기대하지 않았습니다.`); index += 1; return turn(prompt); };
+    const adapter: AgentAdapter = {
+      role: "claude",
+      async createSession(turn) { prompts.push(turn.prompt); return { sessionId: "claude-implementation-session", result: next(turn.prompt) }; },
+      async resumeTurn(turn) { prompts.push(turn.prompt); return next(turn.prompt); },
+      async validateExistingSession() { return true; },
+    };
+    return { adapter, prompts };
+  }
+  const settled = (db: ConsensusDatabase, id: string) => waitUntil(() =>
+    db.runningAction(id) === null && ["READY_TO_DELIVER", "FAILED", "USER_DECISION_REQUIRED"].includes(db.getTopic(id).state));
+
+  it("R01: 허용 오차 교정 호출이 실패해도 본 턴 보고·요청 결정이 보존돼 재개 결과에 병합되고 리뷰로 새지 않는다", async () => {
+    const { worktree, database, artifacts, gitService, topicId } = await setup("r01");
+    let corrections = 0;
+    const claude = scripted([
+      () => { writeFileSync(join(worktree, "service", "S.swift"), "func renamed() {}\nfunc b() {}\n");
+        return result("IMPLEMENTATION", "본 턴 작업", { requestedUserDecision: "P4 가 남았다 — 계속 진행 요청", evidenceRefs: ["ORIGINAL-ONLY"] }); },
+      () => { corrections += 1; writeFileSync(join(worktree, "service", "S.swift"), "func a() {}\nfunc b() {}\n"); throw new Error("교정 전송 실패"); },
+      () => result("IMPLEMENTATION", "원장 보완만"),
+    ]);
+    const engine = new WorkflowEngine({ database, artifacts, git: gitService, claude: claude.adapter, codex: new PassingCodex() });
+    engine.startImplementation(topicId); await settled(database, topicId);
+    expect(database.getTopic(topicId).state).toBe("FAILED");
+    expect(await artifacts.readLatest(topicId, "tolerance-correction-source")).toContain("ORIGINAL-ONLY");
+    engine.retry(topicId); await settled(database, topicId);
+    const topic = database.getTopic(topicId);
+    expect(topic.state, topic.lastError ?? "").toBe("USER_DECISION_REQUIRED");
+    const bodies = database.getTimeline(topicId).map((event) => event.body);
+    expect(bodies.some((body) => body.includes("보존해 둔 본 턴 보고"))).toBe(true);
+    expect(bodies.some((body) => body.includes("P4 가 남았다"))).toBe(true);
+    const saved = JSON.parse((await artifacts.readLatest(topicId, "implementation-result"))!);
+    expect(saved.evidenceRefs).toContain("ORIGINAL-ONLY");
+    expect(saved.requestedUserDecision).toBe("P4 가 남았다 — 계속 진행 요청");
+    database.close();
+  });
+
+  it("D01: status=in_progress 는 같은 세션에서 계속 진행 턴을 열고, completed 가 되면 리뷰로 간다(중간 결과 보존·병합)", async () => {
+    const { worktree, database, artifacts, gitService, topicId } = await setup("d01");
+    const claude = scripted([
+      () => { writeFileSync(join(worktree, "feature.txt"), "1\n"); return result("IMPLEMENTATION", "P3 완료", { status: "in_progress", remainingSteps: ["P3.5 문서 동결", "P3.6"], evidenceRefs: ["p3"] }); },
+      (prompt) => { expect(prompt).toContain("status=in_progress 였습니다(계속 진행 1/4)"); expect(prompt).toContain("- P3.5 문서 동결");
+        writeFileSync(join(worktree, "feature.txt"), "2\n"); return result("IMPLEMENTATION", "P3.5 완료", { status: "in_progress", remainingSteps: ["P3.6"], evidenceRefs: ["p35"] }); },
+      () => { writeFileSync(join(worktree, "feature.txt"), "3\n"); return result("IMPLEMENTATION", "P3.6 완료 — 전부 끝", { status: "completed", evidenceRefs: ["p36"] }); },
+    ]);
+    const codex = new PassingCodex();
+    const engine = new WorkflowEngine({ database, artifacts, git: gitService, claude: claude.adapter, codex });
+    engine.startImplementation(topicId); await settled(database, topicId);
+    const topic = database.getTopic(topicId);
+    expect(topic.state, topic.lastError ?? "").toBe("READY_TO_DELIVER");
+    expect(claude.prompts).toHaveLength(3);
+    const bodies = database.getTimeline(topicId).map((event) => event.body);
+    expect(bodies.filter((body) => body.includes("같은 세션에서 계속 진행합니다")).length).toBe(2);
+    const saved = JSON.parse((await artifacts.readLatest(topicId, "implementation-result"))!);
+    expect(saved.status).toBe("completed");
+    expect(saved.evidenceRefs).toEqual(expect.arrayContaining(["p36", "p35", "p3"]));
+    expect(saved.summary).toContain("P3 완료");
+    expect(await artifacts.readLatest(topicId, "implementation-progress")).toContain("P3.5 완료");
+    database.close();
+  });
+
+  it("D01: 요약이 미완을 말해도 status 가 없고 요청 결정도 없으면 종전대로 완료로 본다(자연어 해석 없음) — status=blocked 는 정지한다", async () => {
+    const { worktree, database, artifacts, gitService, topicId } = await setup("blocked");
+    const claude = scripted([
+      () => { writeFileSync(join(worktree, "feature.txt"), "x\n"); return result("IMPLEMENTATION", "P3 완료, P4 는 아직", { status: "blocked", remainingSteps: ["P4 게이트(중재자)"] }); },
+    ]);
+    const engine = new WorkflowEngine({ database, artifacts, git: gitService, claude: claude.adapter, codex: new PassingCodex() });
+    engine.startImplementation(topicId); await settled(database, topicId);
+    expect(database.getTopic(topicId).state).toBe("USER_DECISION_REQUIRED");
+    expect(database.getTimeline(topicId).map((event) => event.body).some((body) => body.includes("막힘(blocked)") && body.includes("P4 게이트(중재자)"))).toBe(true);
+    database.close();
+  });
+
+  it("R08: 원장 메모가 2,001자여도 턴은 거부되지 않는다", async () => {
+    const { worktree, database, artifacts, gitService, topicId } = await setup("note");
+    const claude = scripted([
+      () => { writeFileSync(join(worktree, "service", "S.swift"), "nonisolated func a() {}\nfunc b() {}\n");
+        return result("IMPLEMENTATION", "구현", { toleranceLedger: [{ ruleId: "T-1", file: "service/S.swift", note: "x".repeat(2001) }] }); },
+    ]);
+    const engine = new WorkflowEngine({ database, artifacts, git: gitService, claude: claude.adapter, codex: new PassingCodex() });
+    engine.startImplementation(topicId); await settled(database, topicId);
+    const topic = database.getTopic(topicId);
+    expect(topic.state, topic.lastError ?? "").toBe("READY_TO_DELIVER");
+    expect(claude.prompts).toHaveLength(1);
+    database.close();
+  });
+
+  it("R02: 러너 턴 도중 도구 트리(DerivedData/*-logs/scripts)가 바뀌면 턴이 실패한다(git 은 ignored 라 못 본다)", async () => {
+    const { root, worktree, database, artifacts, gitService, topicId } = await setup("tooltree");
+    writeFileSync(join(root, "repository", ".git", "info", "exclude"), "DerivedData/\n");
+    const tool = join(worktree, "DerivedData", "s11-logs", "scripts"); mkdirSync(tool, { recursive: true });
+    writeFileSync(join(tool, "gate.py"), "print('tool')\n");
+    const claude = scripted([
+      () => { writeFileSync(join(tool, "gate.py"), "print('changed by runner')\n"); writeFileSync(join(worktree, "feature.txt"), "x\n"); return result("IMPLEMENTATION", "done"); },
+    ]);
+    const engine = new WorkflowEngine({ database, artifacts, git: gitService, claude: claude.adapter, codex: new PassingCodex() });
+    engine.startImplementation(topicId); await settled(database, topicId);
+    const topic = database.getTopic(topicId);
+    expect(topic.state).toBe("FAILED");
+    expect(topic.lastError ?? "").toContain("도구 트리가");
+    expect(database.getTimeline(topicId).map((event) => event.body).some((body) => body.includes("러너는 앱 코드만 고친다"))).toBe(true);
+    database.close();
+  });
+
+  it("D02: 구현·재개 턴은 결정·증거 원문 산출물(decisions)을 읽기 허용 경로로 받고 프롬프트가 그 경로를 안내한다", async () => {
+    const { worktree, database, artifacts, gitService, topicId } = await setup("decisions");
+    const seen: Array<readonly string[] | undefined> = [];
+    const adapter: AgentAdapter = {
+      role: "claude",
+      async createSession(turn) { seen.push(turn.readablePaths); writeFileSync(join(worktree, "feature.txt"), "x\n"); return { sessionId: "s", result: result("IMPLEMENTATION", "done") }; },
+      async resumeTurn() { throw new Error("no"); },
+      async validateExistingSession() { return true; },
+    };
+    const engine = new WorkflowEngine({ database, artifacts, git: gitService, claude: adapter, codex: new PassingCodex() });
+    engine.startImplementation(topicId, undefined, "[d01] 첫 결정 원문");
+    await settled(database, topicId);
+    expect(database.getTopic(topicId).state).toBe("READY_TO_DELIVER");
+    const decisions = await artifacts.readLatest(topicId, "decisions");
+    expect(decisions).toContain("[d01] 첫 결정 원문");
+    expect(seen[0]?.some((path) => path.includes("decisions"))).toBe(true);
+    database.close();
+  });
+});

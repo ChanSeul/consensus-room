@@ -9,6 +9,12 @@ export function redactAgentResult(result: AgentResult): AgentResult {
   return AgentResultSchema.parse(redactValue(result));
 }
 
+// 계약 검증 없이 가린다 — 계약을 어긴 응답을 **보관**(교정 원본·중단 결과)할 때 쓴다. redactAgentResult 는 스키마를 다시
+// 파싱하므로 잘못된 응답의 보관 자체가 실패해 교정에 도달하지 못했다(2026-09-14 Codex 감사 R08).
+export function redactUnverifiedResult(value: unknown): unknown {
+  return redactValue(value);
+}
+
 export function redactRecord(value: Record<string, unknown>): Record<string, unknown> {
   return redactValue(value) as Record<string, unknown>;
 }

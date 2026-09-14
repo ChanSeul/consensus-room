@@ -162,9 +162,16 @@ export const AgentResultSchema = z.object({
   findings: z.array(FindingSchema).default([]),
   evidenceRefs: z.array(z.string()).default([]),
   requestedUserDecision: z.string().min(1).optional(),
+  // 2026-09-14 Codex 감사 D01: 완료 판단을 요청 필드 유무(프롬프트 해석)에만 맡기지 않는다. 구현·수정 결과가 명시하는 진행 상태 —
+  // completed(계획의 모든 단계 끝) · in_progress(단계가 남았고 같은 세션에서 계속) · blocked(사람·중재자 입력 필요). 없으면 종전 규칙.
+  status: z.enum(["completed", "in_progress", "blocked"]).optional(),
+  remainingSteps: z.array(z.string().max(500)).max(50).optional(),
+  // 허용 오차 교정 재제출이 본 턴의 요청 결정을 **해소**했음을 명시한다(예: 범위 밖 변경을 전부 되돌려 질문이 사라짐, Codex 감사 R07).
+  resolvesRequestedDecision: z.boolean().optional(),
   memoryUpdates: z.array(MemoryUpdateSchema).max(10).optional(),
   // 허용 오차 원장 — 승인 범위 밖 변경마다 {ruleId, file, note}. 서버가 git diff 와 대조한다(shared/tolerance.ts).
-  toleranceLedger: z.array(ToleranceLedgerEntrySchema).max(500).optional(),
+  // 상한은 모델 한 번 응답이 아니라 서버 누적 원장(승계 포함)의 저장 계약이다 — 규칙이 파일 1,000개까지 허용하므로 그보다 크게(R06).
+  toleranceLedger: z.array(ToleranceLedgerEntrySchema).max(5000).optional(),
  }).superRefine((result, context) => {
   if (result.planLineEdits && (result.kind !== "REVISION" || result.planEdits !== undefined || result.planMarkdown !== undefined)) {
     context.addIssue({ code: "custom", message: "planLineEdits는 REVISION에서 단독으로 사용해야 합니다." });
@@ -314,6 +321,15 @@ export const AttachParticipantInputSchema = z.discriminatedUnion("mode", [
 export type AttachParticipantInput = z.infer<typeof AttachParticipantInputSchema>;
 
 // 구현 도중 허용 오차 개정(넓히기만): tolerance = 새 블록 JSON 객체 전체, reason = 결정 근거(타임라인 decision 본문).
+// 구현 계속 재개(공식 복구 API, Codex 감사 D01): 러너가 완료 형식으로 리뷰에 들어가 멈췄거나 실패한 토픽을 같은 세션·같은 계획으로
+// IMPLEMENTING 재개 상태로 되돌린다. 기대 상태·세대를 결속해 낡은 요청이 다른 상황에 적용되지 않게 한다(sqlite 직접 수정 대체).
+export const ResumeImplementationInputSchema = z.object({
+  expectedState: z.enum(["USER_DECISION_REQUIRED", "FAILED"]),
+  expectedScopeGeneration: z.number().int().positive(),
+  reason: z.string().trim().min(1).max(4000),
+});
+export type ResumeImplementationInput = z.infer<typeof ResumeImplementationInputSchema>;
+
 export const AmendToleranceInputSchema = z.object({
   tolerance: z.unknown(),
   reason: z.string().trim().min(1).max(20_000),
@@ -370,6 +386,7 @@ export const AgentResultJsonSchema = {
   required: [
     "kind", "summary", "planMarkdown", "planEdits", "planLineEdits", "planSHA256",
     "findings", "evidenceRefs", "requestedUserDecision", "memoryUpdates", "toleranceLedger",
+    "status", "remainingSteps", "resolvesRequestedDecision",
   ],
   properties: {
     kind: { enum: AgentResultSchema.shape.kind.options },
@@ -422,6 +439,9 @@ export const AgentResultJsonSchema = {
     },
     evidenceRefs: { type: "array", items: { type: "string" } },
     requestedUserDecision: { anyOf: [{ type: "string" }, { type: "null" }] },
+    status: { anyOf: [{ enum: ["completed", "in_progress", "blocked"] }, { type: "null" }] },
+    remainingSteps: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "null" }] },
+    resolvesRequestedDecision: { anyOf: [{ type: "boolean" }, { type: "null" }] },
     toleranceLedger: {
       anyOf: [
         {

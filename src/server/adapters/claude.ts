@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { toolTreeDirectories } from "../toolTree.js";
 import { readdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, symlink, unlink, writeFile } from "node:fs/promises";
@@ -346,7 +347,7 @@ export function buildIsolationSettings(
   // deny할 수 없다 — permissions 층에서도 deny가 allow를 이겨 Edit은 경로 deny로, Write는 dontAsk 기본
   // 거부로 막힌다(2026-08-30 실측). sandbox와 같은 carve-out을 여기에도 적용한다.
   const deniedEditPaths = implementation
-    ? [...protectedGitPaths, ...protectedRulePaths.flatMap((path) => carveOutWorkspace(path, workspace))]
+    ? [...protectedGitPaths, ...protectedRulePaths.flatMap((path) => carveOutWorkspace(path, workspace)), ...toolTreeDirectories(workspace)]
     : [...protectedGitPaths, ...protectedRulePaths];
   const editRules = ["Edit", "Write"].flatMap((tool) =>
     deniedEditPaths.flatMap((path) => [
@@ -428,8 +429,9 @@ export function buildIsolationSettings(
         // 보호 경로가 worktree를 품고 있으면(dataDirectory가 그렇다) 통째로 deny할 수 없다 — deny가
         // allowWrite를 이기기 때문이다. 그렇다고 통째로 빼면 원장 DB·다른 주제 worktree·codex-home까지
         // 열린다. 그래서 worktree로 가는 길만 열고 형제 항목은 그대로 막는다(carveOutWorkspace).
+        // 단계 도구 트리(DerivedData/*-logs/{scripts,…})는 구현 턴에서도 쓰기 거부 — "러너는 앱 코드만" 이 권한이 된다(Codex 감사 R02).
         denyWrite: implementation
-          ? [...protectedGitPaths, ...protectedRulePaths.flatMap((path) => carveOutWorkspace(path, workspace))]
+          ? [...protectedGitPaths, ...protectedRulePaths.flatMap((path) => carveOutWorkspace(path, workspace)), ...toolTreeDirectories(workspace)]
           : [workspace, ...protectedGitPaths, ...protectedRulePaths],
         denyRead: [home, credentialPath],
         allowRead: [

@@ -3892,3 +3892,27 @@ describe("Codex 후속 리뷰 2026-09-14 — 줄 범위 도구 증거·개정 �
     database.close();
   });
 });
+
+
+// 2026-09-14 Codex 감사 D01·R01② — 공식 구현 재개 API 와 계약 교정의 원본 필드 병합(공개 경계).
+describe("Codex 감사 2026-09-14 — resume-implementation / 계약 교정 원본 병합", () => {
+  it("리뷰 한도로 멈춘 토픽을 resume-implementation 으로 IMPLEMENTING 재개 상태로 되돌린다(기대 상태·세대 결속, 리뷰 소비량 불변)", async () => {
+    const { database, engine } = await makeReviewRecovery({
+      resumeState: "CODEX_REVIEW", implementationFindings: [], originalReviewFindings: [],
+      codexResult: { kind: "REVIEW", summary: "unused", findings: [], evidenceRefs: [] },
+    });
+    database.setImplementationSession("topic-1", "claude-implementation-session");
+    database.updateTopic("topic-1", { state: "USER_DECISION_REQUIRED" });
+    const before = database.reviews.account("topic-1", "implementation").used;
+    expect(() => engine.resumeImplementation("topic-1", { expectedState: "FAILED", expectedScopeGeneration: 1, reason: "x" })).toThrow("기대 상태");
+    expect(() => engine.resumeImplementation("topic-1", { expectedState: "USER_DECISION_REQUIRED", expectedScopeGeneration: 9, reason: "x" })).toThrow("범위 세대");
+    const topic = engine.resumeImplementation("topic-1", { expectedState: "USER_DECISION_REQUIRED", expectedScopeGeneration: 1, reason: "완료 형식 중간 보고를 되돌림" }, { actor: "mediator", delegationSetAt: "2026-09-14T00:00:00Z" });
+    expect(topic.state).toBe("USER_DECISION_REQUIRED");
+    expect(database.getFlags("topic-1").resumeState).toBe("IMPLEMENTING");
+    expect(database.reviews.account("topic-1", "implementation").used).toBe(before);
+    const event = database.getTimeline("topic-1").at(-1)!;
+    expect(event.body).toContain("구현 계속 재개(공식)");
+    expect(event.payload.origin).toEqual({ actor: "mediator", delegationSetAt: "2026-09-14T00:00:00Z" });
+    database.close();
+  });
+});

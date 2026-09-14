@@ -1,5 +1,7 @@
 import {ReviewGrantInputSchema} from "../shared/reviews.js";
-import { AmendToleranceInputSchema } from "../shared/contracts.js";
+import { readFileSync } from "node:fs";
+import {
+  ResumeImplementationInputSchema, AmendToleranceInputSchema } from "../shared/contracts.js";
 import { RevisionGrantInputSchema } from "../shared/revisions.js";
 import { WorkGroupInputSchema } from "../shared/workGroups.js";
 import { WorkGroupService } from "./workGroupService.js";
@@ -30,7 +32,8 @@ import { GitService } from "./git.js";
 import { redactRecord, safeError } from "./security.js";
 import { redactSecrets } from "../shared/workflow.js";
 import type { AgentAdapter, CommandRunner, ParticipantRole } from "./types.js";
-import { WorkflowEngine } from "./workflow.js";
+import {
+  type CallOrigin, WorkflowEngine } from "./workflow.js";
 import { ProcessSupervisor } from "./processSupervisor.js";
 import { ProjectMemoryStore } from "./memoryStore.js";
 import { readMediationAutonomy, writeMediationAutonomy } from "./mediationAutonomy.js";
@@ -66,7 +69,21 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     memory: new ProjectMemoryStore(config.memoryDirectory),
     executionLimits: config.executionLimits,
     enforceBudgets: config.enforceBudgets ?? true,
+    maintenanceLockPath: join(config.dataDirectory, "maintenance.lock"),
   });
+  // 중재 세션의 호출은 헤더 x-consensus-actor: mediator 로 구분한다. 결정·승인·실행·인도 류는 위임 스위치(mediation-autonomy.json)가
+  // on 일 때만 받는다(off 면 403) — "중재자가 사용자와 같은 인증으로 무엇이든 부른다" 를 닫는다(2026-09-14 Codex 감사 D03).
+  const delegationPath = join(config.dataDirectory, "mediation-autonomy.json");
+  const DELEGATED_ACTIONS = new Set(["approve", "implement", "commit", "push", "close", "review-resume", "revision-resume", "budget-configure", "budget-resume", "amend-tolerance", "resume-implementation", "reconcile-delivery", "discard-orphan-commit"]);
+  const callOrigin = (request: { headers: Record<string, unknown> }, subject: string): CallOrigin | undefined => {
+    if (request.headers["x-consensus-actor"] !== "mediator") return undefined;
+    let doc: { autonomy?: string; set_at?: string } = {};
+    try { doc = JSON.parse(readFileSync(delegationPath, "utf8")) as { autonomy?: string; set_at?: string }; } catch { doc = {}; }
+    if (doc.autonomy !== "on") {
+      throw Object.assign(new Error(`중재자 위임이 off 입니다 — ${subject} 는 사용자 승인이 필요합니다(mediation_autonomy.sh on).`), { statusCode: 403 });
+    }
+    return { actor: "mediator", delegationSetAt: doc.set_at ?? null };
+  };
   const workGroups = new WorkGroupService(database,git,config.repositoryPath,config.worktreesDirectory,config.defaultAgentSettings);
   // 시작 URL의 일회성 token이나 인증 헤더가 request log에 남지 않도록 HTTP request logging을 끈다.
   const app = Fastify({ logger: false });
@@ -287,9 +304,10 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   app.post<{ Params: { id: string } }>("/api/topics/:id/messages", async (request, reply) => {
     const input = PostMessageInputSchema.parse(request.body);
     const ledger = actionLedger(database, request.params.id, `message:${input.kind}`);
+    const origin = input.kind === "note" ? undefined : callOrigin(request, `message:${input.kind}`);
     return runIdempotent(request, reply, ledger, 200, (idempotencyKey) => input.kind === "scope_change"
       ? workflow.handleScopeChange(request.params.id, input.body, idempotencyKey)
-      : workflow.postMessage(request.params.id, input.kind, input.body, idempotencyKey));
+      : workflow.postMessage(request.params.id, input.kind, input.body, idempotencyKey, origin));
   });
 
   app.post<{ Params: { id: string; action: string } }>("/api/topics/:id/actions/:action", async (request, reply) => {
@@ -297,10 +315,19 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     const action = request.params.action;
     // 커밋·되돌리기 등 worktree를 바꾸는 action 뒤에는 목록이 즉시 갱신돼야 한다.
     changedPathsCache.delete(topicId);
+    const origin = DELEGATED_ACTIONS.has(action) ? callOrigin(request, `action:${action}`) : undefined;
     return runIdempotent(request, reply, actionLedger(database, topicId, action), 200, async (idempotencyKey) => {
       const actionId = requestActionId(topicId, action, idempotencyKey);
+      if (origin) {
+        database.appendEvent({ topicId, actor: "system", kind: "system", state: database.getTopic(topicId).state,
+          body: `중재자 위임 호출: ${action}(위임 on, set_at ${origin.delegationSetAt ?? "?"})`, payload: { origin, action } });
+      }
       let response: unknown;
-      if(action === "review-resume") {
+      if(action === "resume-implementation") {
+        const input = ResumeImplementationInputSchema.parse(request.body);
+        response = accepted(randomUUID(), workflow.resumeImplementation(topicId, input, origin));
+      }
+      else if(action === "review-resume") {
         workflow.assertBudgetEditable(topicId);
         const input=ReviewGrantInputSchema.parse(request.body);
         if(workflow.reviewPaused(topicId)!==input.scope)throw new Error("추가 승인이 필요한 리뷰 중단 상태가 아닙니다.");

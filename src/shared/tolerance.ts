@@ -55,7 +55,8 @@ export type TolerancePolicy = z.infer<typeof TolerancePolicySchema>;
 export const ToleranceLedgerEntrySchema = z.object({
   ruleId: z.string().trim().min(1).max(20),
   file: z.string().trim().min(1).max(500),
-  note: z.string().max(2000).default(""),
+  // 설명용 메모는 실행 판단에 쓰지 않는다 — 길이만으로 턴을 거부하지 않는다(2026-09-14 Codex 감사 R08: 2,001자 메모가 FAILED).
+  note: z.string().max(20000).default(""),
 });
 export type ToleranceLedgerEntry = z.infer<typeof ToleranceLedgerEntrySchema>;
 

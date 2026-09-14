@@ -3,7 +3,10 @@
 import {
   AgentResultSchema, DeliveryInputSchema, type AgentResult, type Finding, type TimelineEvent, type Topic, type WorkflowState,
 } from "../../shared/contracts.js";
+import { digestToolTrees } from "../toolTree.js";
+import { redactUnverifiedResult } from "../security.js";
 import {
+  buildContinuationPrompt,
   buildClaudeFixPrompt,
   buildCodexReviewPrompt,
   buildImplementationPrompt, buildToleranceCorrectionPrompt,
@@ -19,6 +22,7 @@ import {
   shouldRunFixPass,
   routeMediatorOwnedFindings,
   carryForwardFindings,
+  implementationInProgress,
   mergeCorrectionResult,
   mergeFindingSources,
 } from "../../shared/workflow.js";
@@ -33,6 +37,9 @@ import type { ResultNormalizer, EngineCore } from "./core.js";
 function renderReport(result: AgentResult): string {
   return `# ${result.kind}\n\n${result.summary}\n\n## Findings\n\n\`\`\`json\n${JSON.stringify(result.findings, null, 2)}\n\`\`\`\n\n## Evidence\n\n${result.evidenceRefs.map((item) => `- ${item}`).join("\n") || "- 없음"}\n`;
 }
+
+// status=in_progress 로 멈춘 러너를 같은 액션 안에서 다시 여는 상한. 그 뒤엔 USER_DECISION_REQUIRED(resume IMPLEMENTING)로 넘겨 retry 로 잇는다.
+const CONTINUATION_LIMIT = 4;
 
 function isWithinSelectedPaths(path: string, selectedPaths: readonly string[]): boolean {
   return selectedPaths.some((scope) => path === scope || path.startsWith(`${scope.replace(/\/$/, "")}/`));
@@ -69,9 +76,23 @@ export class DeliveryPipeline {
       id: note.id, title: note.title, severity: note.severity, disposition: "AGREED_ACTION", rationale: note.rationale,
       evidenceRefs: [], requiresUserDecision: false,
     }));
+    // 결정·증거 원문 산출물(읽기 허용) — 세션 압축 뒤에도 원문을 다시 찾을 수 있다(Codex 감사 D02).
+    const decisionsPath = await this.writeDecisionsDigest(topic, signal);
+    const readablePaths = [planPath, decisionsPath];
+    // 직전 허용 오차 교정이 실패로 끝났으면 그 원본(요약·쟁점·증거·요청 결정)을 이번 결과에 병합한다(Codex 감사 R01 ①).
+    const pendingOriginal = await this.pendingCorrectionOriginal(topicId, topic, "IMPLEMENTING");
+    const baseNormalizer = this.core.carryForwardNormalizer(noteFindings, "Claude implementation");
+    const normalize = pendingOriginal
+      ? (result: AgentResult) => baseNormalizer(mergeCorrectionResult(pendingOriginal, result).result)
+      : baseNormalizer;
+    if (pendingOriginal) {
+      this.core.event(topicId, "system", "system",
+        "직전 허용 오차 교정이 실패로 끝나 보존해 둔 본 턴 보고(요약·쟁점·증거·요청 결정)를 이번 재개 결과에 병합합니다.", { pendingCorrectionMerged: true });
+    }
+    const toolTreesBefore = digestToolTrees(topic.worktreePath);
     const promptBase = {
       planMarkdown: plan, planSHA256: topic.planSHA256!, worktreePath: topic.worktreePath, branchName: topic.branchName!, planPath,
-      implementationNotes,
+      decisionsPath, implementationNotes,
     };
     // 이어지는 턴은 계획 본문과 이미 받은 이벤트를 다시 싣지 않는다(2026-09-08 Codex 제안 ⑥). 세션 유실로 새 세션이 되면
     // resumeImplementationSession 이 전문 프롬프트로 바꿔 쓴다. '전달한 sequence' 는 턴이 실제로 돌아온 뒤에만 적는다 —
@@ -86,29 +107,69 @@ export class DeliveryPipeline {
       }),
     };
     const fork = existingImplementationSession
-      ? await this.resumeImplementationSession(topicId, existingImplementationSession, prompts, topic.worktreePath, signal, [planPath])
-      : await this.createFreshImplementationSession(topicId, prompts.fresh, topic.worktreePath, signal, [planPath]);
+      ? await this.resumeImplementationSession(topicId, existingImplementationSession, prompts, topic.worktreePath, signal, readablePaths)
+      : await this.createFreshImplementationSession(topicId, prompts.fresh, topic.worktreePath, signal, readablePaths);
     this.core.assertCurrent(topicId, signal, topic.scopeGeneration, "IMPLEMENTING");
+    this.assertToolTreesIntact(topic, toolTreesBefore, "구현 중");
     // 세션 저장이 검증보다 먼저다 — 검증이 턴을 거부해도 세션이 남아야 재시도가 재구현 없이 resume된다
     // (2026-09-01 S1.1: 저장 전에 거부돼 수동 DB 복구가 필요했던 사건의 프로그램적 방지).
     this.core.dependencies.database.setImplementationSession(topicId, fork.sessionId);
     this.core.dependencies.database.updateTopic(topicId, { implementationPromptSequence: inputSequence });
+    const check = (r: AgentResult) => { this.core.assertKind(r, "IMPLEMENTATION"); assertFindingCoverage(noteFindings, r.findings, "Claude implementation(구현 노트)"); };
     let implementationResult = await this.core.enforceResultContract("claude", topic, fork.result, fork.sessionId, {
-      signal, implementation: true, planMode: false, startedAfter: inputSequence,
-      check: (r) => { this.core.assertKind(r, "IMPLEMENTATION"); assertFindingCoverage(noteFindings, r.findings, "Claude implementation(구현 노트)"); },
-      readablePaths: [planPath], normalize: this.core.carryForwardNormalizer(noteFindings, "Claude implementation"),
+      signal, implementation: true, planMode: false, startedAfter: inputSequence, check, readablePaths, normalize,
     });
     await this.assertBaselineIntact(topic, baselineHead, "구현 중");
+    this.assertToolTreesIntact(topic, toolTreesBefore, "구현 계약 교정 중");
     const toleranceChecked = await this.enforceTolerance({
       topicId, topic: this.core.dependencies.database.getTopic(topicId), plan, result: implementationResult, sessionId: fork.sessionId,
-      signal, inputSequence, resumeState: "IMPLEMENTING",
-      check: (r) => { this.core.assertKind(r, "IMPLEMENTATION"); assertFindingCoverage(noteFindings, r.findings, "Claude implementation(구현 노트)"); },
-      baselineHead, readablePaths: [planPath], normalize: this.core.carryForwardNormalizer(noteFindings, "Claude implementation"),
+      signal, inputSequence, resumeState: "IMPLEMENTING", check, baselineHead, readablePaths, normalize,
     });
     if (!toleranceChecked) return;
     implementationResult = toleranceChecked;
     // 코드를 바꿀 수 있는 마지막 호출(허용 오차 교정 → 계약 교정) 뒤에 다시 본다 — 검사가 마지막 호출보다 먼저 끝나면 뚫린다(Codex 후속 지적 1).
     await this.assertBaselineIntact(topic, baselineHead, "구현 교정 중");
+    this.assertToolTreesIntact(topic, toolTreesBefore, "구현 교정 중");
+    // status=in_progress: 같은 세션에서 "계속 진행" 턴을 연다(상한 안에서). 중간 결과는 산출물로 보존하고 다음 결과 위에 병합한다(D01).
+    let continuations = 0;
+    while (implementationInProgress(implementationResult) && !implementationResult.requestedUserDecision && continuations < CONTINUATION_LIMIT) {
+      continuations += 1;
+      const remaining = implementationResult.remainingSteps ?? [];
+      await this.core.saveAgentOutput(topic, "claude", implementationResult, "implementation-progress", signal);
+      this.core.event(topicId, "system", "system",
+        `러너가 진행 중(status=in_progress)으로 멈췄습니다 — 남은 단계 ${remaining.length}개. 같은 세션에서 계속 진행합니다(${continuations}/${CONTINUATION_LIMIT}).`,
+        { continuation: continuations, remainingSteps: remaining });
+      const previous = implementationResult;
+      const continued = await this.core.dependencies.claude.resumeTurn({
+        sessionId: fork.sessionId, prompt: buildContinuationPrompt(remaining, continuations, CONTINUATION_LIMIT), cwd: topic.worktreePath,
+        signal, implementation: true, readablePaths, settings: this.core.executionSettings(topicId, "claude", true),
+        onProcessSpawn: this.core.processObserver(topicId), onUsage: this.core.usageObserver(topicId, "claude", "계속 진행 턴"),
+      });
+      this.core.assertCurrent(topicId, signal, topic.scopeGeneration, "IMPLEMENTING");
+      await this.assertBaselineIntact(topic, baselineHead, "계속 진행 중");
+      this.assertToolTreesIntact(topic, toolTreesBefore, "계속 진행 중");
+      if (await this.core.interruptPreservingResult(topic, "claude", continued, inputSequence, signal)) return;
+      const progressNormalizer = (result: AgentResult) => baseNormalizer(mergeCorrectionResult(previous, result).result);
+      const contracted = await this.core.enforceResultContract("claude", topic, continued, fork.sessionId, {
+        signal, implementation: true, planMode: false, startedAfter: inputSequence, check, readablePaths, normalize: progressNormalizer,
+      });
+      await this.assertBaselineIntact(topic, baselineHead, "계속 진행 계약 교정 중");
+      const checked = await this.enforceTolerance({
+        topicId, topic: this.core.dependencies.database.getTopic(topicId), plan, result: contracted, sessionId: fork.sessionId,
+        signal, inputSequence, resumeState: "IMPLEMENTING", check, baselineHead, readablePaths, normalize: progressNormalizer,
+      });
+      if (!checked) return;
+      implementationResult = checked;
+      await this.assertBaselineIntact(topic, baselineHead, "계속 진행 교정 중");
+      this.assertToolTreesIntact(topic, toolTreesBefore, "계속 진행 교정 중");
+    }
+    if (implementationInProgress(implementationResult) && !implementationResult.requestedUserDecision) {
+      await this.core.saveAgentOutput(topic, "claude", implementationResult, "implementation-progress", signal);
+      this.core.interrupt(topicId, "USER_DECISION_REQUIRED",
+        `러너가 계속 진행 상한(${CONTINUATION_LIMIT}회)에 닿았는데 아직 in_progress 입니다 — 남은 단계: ${(implementationResult.remainingSteps ?? []).join(" · ") || "(명시 없음)"}. 재시도(retry)로 같은 세션에서 이어갑니다.`,
+        "IMPLEMENTING", { continuationExhausted: true, remainingSteps: implementationResult.remainingSteps ?? [] });
+      return;
+    }
     // 러너가 범위 밖으로 판정해 to-do 로 남긴 쟁점(DEFERRED_OUT_OF_SCOPE)은 후속 목록에 올린다 — 인도 전 사용자가 처분한다.
     await this.core.recordDeferredFindings(topic,
       implementationResult.findings.filter((finding) => finding.disposition === "DEFERRED_OUT_OF_SCOPE"), "implementation", signal);
@@ -482,7 +543,11 @@ export class DeliveryPipeline {
     const baselineHead = await this.requirePinnedBaseline(topicId, topic.worktreePath);
     const inputSequence = this.core.latestSequence(topicId);
     const planPath = await this.core.dependencies.artifacts.verifiedPath(topicId, "plan");
-    const fixBase = { planMarkdown: plan, planSHA256: topic.planSHA256, reviewFindings: review.findings, planPath };
+    const decisionsPath = await this.writeDecisionsDigest(topic, signal);
+    const fixReadable = [planPath, decisionsPath];
+    const pendingFixOriginal = await this.pendingCorrectionOriginal(topicId, topic, "CLAUDE_FIX");
+    const toolTreesBefore = digestToolTrees(topic.worktreePath);
+    const fixBase = { planMarkdown: plan, planSHA256: topic.planSHA256, reviewFindings: review.findings, planPath, decisionsPath };
     const fixPrompts = {
       fresh: buildClaudeFixPrompt({
         ...fixBase, timeline: this.core.dependencies.database.getPromptTimeline(topicId, topic.scopeGeneration),
@@ -493,10 +558,18 @@ export class DeliveryPipeline {
       }),
     };
     // 판단이 끝난 리뷰 쟁점은 서버가 승계한다 — 러너가 되돌려 담지 않아도 재제출을 사지 않는다(2026-09-13).
-    const fixNormalizer = this.core.carryForwardNormalizer(review.findings, "Claude fix");
+    const fixCarry = this.core.carryForwardNormalizer(review.findings, "Claude fix");
+    const fixNormalizer = pendingFixOriginal
+      ? (result: AgentResult) => fixCarry(mergeCorrectionResult(pendingFixOriginal, result).result)
+      : fixCarry;
+    if (pendingFixOriginal) {
+      this.core.event(topicId, "system", "system",
+        "직전 허용 오차 교정이 실패로 끝나 보존해 둔 수정 턴 보고를 이번 재개 결과에 병합합니다.", { pendingCorrectionMerged: true });
+    }
     const fixFork = await this.resumeImplementationSession(
-      topicId, flags.implementationSessionId, fixPrompts, topic.worktreePath, signal, [planPath],
+      topicId, flags.implementationSessionId, fixPrompts, topic.worktreePath, signal, fixReadable,
     );
+    this.assertToolTreesIntact(topic, toolTreesBefore, "자동 수정 중");
     if (fixFork.sessionId !== flags.implementationSessionId) {
       this.core.dependencies.database.setImplementationSession(topicId, fixFork.sessionId);
     }
@@ -509,7 +582,7 @@ export class DeliveryPipeline {
     }
     if (await this.core.interruptPreservingResult(topic, "claude", result, inputSequence, signal)) return;
     const fixResult = await this.core.enforceResultContract("claude", topic, result, fixFork.sessionId, {
-      signal, implementation: true, planMode: false, startedAfter: inputSequence, readablePaths: [planPath], normalize: fixNormalizer,
+      signal, implementation: true, planMode: false, startedAfter: inputSequence, readablePaths: fixReadable, normalize: fixNormalizer,
       check: (r) => {
         this.core.assertKind(r, "FIX");
         assertFindingCoverage(review.findings, r.findings, "Claude fix");
@@ -520,7 +593,7 @@ export class DeliveryPipeline {
     await this.assertBaselineIntact(topic, baselineHead, "자동 수정 교정 중");
     const fixChecked = await this.enforceTolerance({
       topicId, topic: this.core.dependencies.database.getTopic(topicId), plan, result: fixResult, sessionId: fixFork.sessionId,
-      signal, inputSequence, resumeState: "CLAUDE_FIX", baselineHead, readablePaths: [planPath], normalize: fixNormalizer,
+      signal, inputSequence, resumeState: "CLAUDE_FIX", baselineHead, readablePaths: fixReadable, normalize: fixNormalizer,
       check: (r) => {
         this.core.assertKind(r, "FIX");
         assertFindingCoverage(review.findings, r.findings, "Claude fix");
@@ -529,6 +602,7 @@ export class DeliveryPipeline {
     });
     if (!fixChecked) return;
     await this.assertBaselineIntact(topic, baselineHead, "자동 수정 교정 중");
+    this.assertToolTreesIntact(topic, toolTreesBefore, "자동 수정 교정 중");
     await this.core.recordDeferredFindings(topic,
       fixChecked.findings.filter((finding) => finding.disposition === "DEFERRED_OUT_OF_SCOPE"), "fix", signal);
     await this.core.pruneDeferredFindings(topic, resolvedIDs(fixChecked), signal);
@@ -658,6 +732,14 @@ export class DeliveryPipeline {
     let { result, evaluation } = await evaluateWithCarry(input.result);
     if (evaluation.violations.length > 0) {
       const original = result;
+      // 교정 전 원본을 산출물로 보존한다 — 교정 호출이 실패(전송 오류·중단)하면 지역변수의 원본이 사라져 재개가 짧은 원장 보완 결과만으로
+      // 리뷰로 흘렀다(Codex 감사 R01 ①). 재개(pendingCorrectionOriginal)가 세대·계획 sha·단계가 같은 최신 원본을 소비한다.
+      const sourceRevision = (this.core.dependencies.database.latestArtifact(input.topicId, "tolerance-correction-source")?.revision ?? 0) + 1;
+      await this.core.writeArtifact(input.topic, "tolerance-correction-source", sourceRevision, JSON.stringify({
+        kind: "tolerance-correction-source", scopeGeneration: input.topic.scopeGeneration, planSHA256: input.topic.planSHA256,
+        resumeState: input.resumeState, sessionId: input.sessionId, violations: evaluation.violations,
+        original: redactUnverifiedResult(original),
+      }, null, 2), input.signal);
       this.core.event(input.topicId, "system", "system",
         `${renderToleranceSummary(evaluation)}\n같은 세션에 돌려보내 1회 교정합니다(되돌리기 또는 원장 보완).`,
         { toleranceViolations: evaluation.violations });
@@ -701,20 +783,74 @@ export class DeliveryPipeline {
     return result;
   }
 
-  // 서버가 받아들인 마지막 구현·수정 결과의 원장 합집합. 산출물이 없거나 깨졌으면 빈 원장(승계 없음).
+  // 서버가 받아들인 **가장 최근** 결과(구현·계속 진행·수정 중 최신 산출물) 하나의 원장. 승계된 결과의 원장은 이미 완전한 상태이므로
+  // 여러 결과를 합치지 않는다 — 합치면 같은 파일의 옛 규칙 행(T-1)이 새 규칙 행(T-2)과 함께 승계돼 통과한 변경을 다시 위반으로 만든다
+  // (Codex 감사 R05). 산출물이 없거나 깨졌으면 빈 원장(승계 없음).
   private async acceptedLedger(topicId: string): Promise<ToleranceLedgerEntry[]> {
-    const entries: ToleranceLedgerEntry[] = [];
-    for (const kind of ["implementation-result", "claude-fix"]) {
-      try {
-        const raw = await this.core.dependencies.artifacts.readLatest(topicId, kind);
-        if (!raw) continue;
-        const parsed = AgentResultSchema.safeParse(JSON.parse(raw));
-        if (parsed.success) entries.push(...(parsed.data.toleranceLedger ?? []));
-      } catch {
-        // 손상된 산출물은 승계 근거가 아니다 — 러너 원장만으로 판정한다.
-      }
+    const db = this.core.dependencies.database;
+    const candidates = ["implementation-result", "implementation-progress", "claude-fix"]
+      .map((kind) => db.latestArtifact(topicId, kind))
+      .filter((artifact): artifact is NonNullable<typeof artifact> => artifact !== null)
+      .sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
+    const latest = candidates[0];
+    if (!latest) return [];
+    try {
+      const raw = await this.core.dependencies.artifacts.readLatest(topicId, latest.kind);
+      if (!raw) return [];
+      const parsed = AgentResultSchema.safeParse(JSON.parse(raw));
+      return parsed.success ? [...(parsed.data.toleranceLedger ?? [])] : [];
+    } catch {
+      return []; // 손상된 산출물은 승계 근거가 아니다 — 러너 원장만으로 판정한다.
     }
-    return entries;
+  }
+
+  // 직전 허용 오차 교정이 실패로 끝났을 때 보존해 둔 원본 — 같은 세대·계획 sha·단계이고, 그 뒤에 받아들인 결과가 없을 때만 유효하다.
+  private async pendingCorrectionOriginal(topicId: string, topic: Topic, resumeState: "IMPLEMENTING" | "CLAUDE_FIX"): Promise<AgentResult | null> {
+    const db = this.core.dependencies.database;
+    const source = db.latestArtifact(topicId, "tolerance-correction-source");
+    if (!source) return null;
+    const acceptedAfter = ["implementation-result", "implementation-progress", "claude-fix"]
+      .map((kind) => db.latestArtifact(topicId, kind))
+      .some((artifact) => artifact !== null && artifact.createdAt >= source.createdAt);
+    if (acceptedAfter) return null;
+    try {
+      const raw = await this.core.dependencies.artifacts.readLatest(topicId, "tolerance-correction-source");
+      if (!raw) return null;
+      const record = JSON.parse(raw) as { scopeGeneration?: number; planSHA256?: string | null; resumeState?: string; original?: unknown };
+      if (record.scopeGeneration !== topic.scopeGeneration || record.planSHA256 !== topic.planSHA256 || record.resumeState !== resumeState) return null;
+      const parsed = AgentResultSchema.safeParse(record.original);
+      return parsed.success ? parsed.data : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // 사용자 결정·증거·범위 변경 원문 전체를 읽기 전용 산출물로 쓴다(내용이 같으면 새 판 없음). 반환: sha 검증한 정본 경로.
+  private async writeDecisionsDigest(topic: Topic, signal: AbortSignal): Promise<string> {
+    const events = this.core.dependencies.database.getScopedTimeline(topic.id, topic.scopeGeneration)
+      .filter((event) => event.actor === "user" && ["decision", "evidence", "scope_change"].includes(event.kind));
+    const body = [
+      "# 결정·증거 원문(서버 보존, 읽기 전용)", "",
+      `주제 ${topic.id} · 범위 세대 ${topic.scopeGeneration} · ${events.length}건. 결정 번호([d n])는 본문 첫 줄에 있다.`, "",
+      ...events.map((event) => `## 이벤트 #${event.sequence} · ${event.kind} · ${event.createdAt}\n\n${event.body}\n`),
+    ].join("\n");
+    const latest = await this.core.dependencies.artifacts.readLatest(topic.id, "decisions");
+    if (latest !== body) {
+      const revision = (this.core.dependencies.database.latestArtifact(topic.id, "decisions")?.revision ?? 0) + 1;
+      await this.core.writeArtifact(topic, "decisions", revision, body, signal);
+    }
+    return this.core.dependencies.artifacts.verifiedPath(topic.id, "decisions");
+  }
+
+  // 단계 도구 트리(gitignore 된 DerivedData/*-logs/{scripts,…})가 에이전트 호출 중 바뀌었으면 턴을 실패시킨다 — git 변경 목록은
+  // ignored 파일을 보지 않으므로 별도 대조(Codex 감사 R02). 중재자가 tools_sync 로 되돌린 뒤 retry 한다.
+  private assertToolTreesIntact(topic: Topic, before: ReturnType<typeof digestToolTrees>, phase: string): void {
+    const after = digestToolTrees(topic.worktreePath);
+    if (after.sha256 === before.sha256) return;
+    this.core.event(topic.id, "system", "system",
+      `도구 트리가 ${phase} 바뀌었습니다(파일 ${before.files} → ${after.files}, ${before.sha256.slice(0, 12)} → ${after.sha256.slice(0, 12)}) — 러너는 앱 코드만 고친다. 중재자가 tools_sync 로 되돌린 뒤 재시도한다.`,
+      { toolTreeDrift: { before: before.sha256, after: after.sha256, directories: after.directories } });
+    throw new Error(`도구 트리가 ${phase} 바뀌었습니다 — 러너 권한 밖(중재자 재동기화 필요).`);
   }
 
   // 브랜치가 그대로이고 HEAD 가 구현 기준과 같은지 — 에이전트 호출(교정 포함) 뒤마다 부른다. 커밋으로 범위 밖 변경을 숨기면 여기서 멈춘다.
