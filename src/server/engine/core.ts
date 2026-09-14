@@ -92,6 +92,8 @@ export class EngineCore {
   }>();
   readonly deliveryActive = new Set<string>();
   readonly scopeChangeActive = new Set<string>();
+  // 허용 오차 개정(amendTolerance)이 계획을 읽고 쓰는 동안 — 범위 변경·재개와 직렬화한다(2026-09-14 Codex High 2).
+  readonly amendmentActive = new Set<string>();
   readonly turnInputSequence = new Map<string, number>();
   shuttingDown = false;
   // 주제가 FAILED 로 떨어진 직후(원장 마감 뒤) 알린다 — 사용 한도 자동 재시도 예약(engine/usageLimitRetry.ts).
@@ -207,7 +209,7 @@ export class EngineCore {
 
   assertNoActiveWork(topicId: string): void {
     if (this.active.has(topicId) || this.dependencies.database.runningAction(topicId) ||
-        this.deliveryActive.has(topicId) || this.scopeChangeActive.has(topicId)) {
+        this.deliveryActive.has(topicId) || this.scopeChangeActive.has(topicId) || this.amendmentActive.has(topicId)) {
       throw new Error("이 주제에서 이미 실행 중인 작업이 있습니다.");
     }
   }

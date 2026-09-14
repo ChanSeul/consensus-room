@@ -16,7 +16,7 @@ import {
   bothAgentsAcknowledged,
   canTransition,
   redactSecrets, replanDirective } from "../shared/workflow.js";
-import { ArtifactStore } from "./artifacts.js";
+import { ArtifactStore, StaleArtifactError } from "./artifacts.js";
 import { ConsensusDatabase } from "./database.js";
 import { GitService } from "./git.js";
 import { redactRecord } from "./security.js";
@@ -398,42 +398,68 @@ export class WorkflowEngine {
   async amendTolerance(topicId: string, input: { tolerance: unknown; reason: string }, requestKey?: string): Promise<Topic> {
     this.core.assertNotShuttingDown();
     this.core.assertNoActiveWork(topicId);
-    const db = this.core.dependencies.database;
-    const topic = db.getTopic(topicId);
-    const resume = db.getFlags(topicId).resumeState;
-    if (!["USER_DECISION_REQUIRED", "FAILED"].includes(topic.state) || !["IMPLEMENTING", "CLAUDE_FIX"].includes(resume ?? ""))
-      throw new Error(`허용 오차 개정은 구현·수정 단계가 멈춘 상태에서만 가능합니다(현재 ${topic.state}/${resume ?? "-"}).`);
-    const previousPlan = await this.core.dependencies.artifacts.readLatest(topicId, "plan");
-    if (!previousPlan) throw new Error("저장된 계획이 없습니다.");
-    const previous = parseTolerancePolicy(previousPlan);
-    if (!previous) throw new Error("계획에 허용 오차 블록이 없어 개정할 수 없습니다.");
-    const parsed = TolerancePolicySchema.safeParse(input.tolerance);
-    if (!parsed.success) {
-      const issue = parsed.error.issues[0];
-      throw new Error(`허용 오차 블록 형식 오류: ${issue ? `${issue.path.join(".")} ${issue.message}` : "unknown"}`);
+    if (this.core.amendmentActive.has(topicId)) throw new Error("허용 오차 개정이 이미 진행 중입니다.");
+    // 개정 자체를 이 주제의 진행 중 작업으로 등록한다 — 읽기(readLatest)와 쓰기 사이에 범위 변경·재개·다른 개정이 끼지 못한다.
+    this.core.amendmentActive.add(topicId);
+    try {
+      const db = this.core.dependencies.database;
+      const topic = db.getTopic(topicId);
+      const resume = db.getFlags(topicId).resumeState;
+      if (!["USER_DECISION_REQUIRED", "FAILED"].includes(topic.state) || !["IMPLEMENTING", "CLAUDE_FIX"].includes(resume ?? ""))
+        throw new Error(`허용 오차 개정은 구현·수정 단계가 멈춘 상태에서만 가능합니다(현재 ${topic.state}/${resume ?? "-"}).`);
+      const previousPlan = await this.core.dependencies.artifacts.readLatest(topicId, "plan");
+      if (!previousPlan) throw new Error("저장된 계획이 없습니다.");
+      const previous = parseTolerancePolicy(previousPlan);
+      if (!previous) throw new Error("계획에 허용 오차 블록이 없어 개정할 수 없습니다.");
+      const parsed = TolerancePolicySchema.safeParse(input.tolerance);
+      if (!parsed.success) {
+        const issue = parsed.error.issues[0];
+        throw new Error(`허용 오차 블록 형식 오류: ${issue ? `${issue.path.join(".")} ${issue.message}` : "unknown"}`);
+      }
+      assertToleranceWidening(previous, parsed.data);
+      const markdown = normalizePlan(normalizeToleranceBlocks(replaceToleranceBlock(previousPlan, parsed.data)));
+      if (!parseTolerancePolicy(markdown)) throw new Error("개정 뒤 계획에서 허용 오차 블록을 다시 읽지 못했습니다.");
+      // 저장 직전 세대·계획 버전·상태를 다시 본다(await 사이의 변화 방어) — 산출물 저장의 accept 와 DB 확정 둘 다 같은 조건이다.
+      const unchanged = () => {
+        const now = db.getTopic(topicId);
+        return now.scopeGeneration === topic.scopeGeneration && now.planSHA256 === topic.planSHA256
+          && now.approvedPlanSHA256 === topic.approvedPlanSHA256 && now.state === topic.state
+          && db.getFlags(topicId).resumeState === resume && !this.core.scopeChangeActive.has(topicId);
+      };
+      if (!unchanged()) throw new Error("개정 도중 주제의 세대·계획·상태가 바뀌었습니다. 다시 시도하세요.");
+      const revision = db.latestArtifactRevision(topicId, "plan") + 1;
+      let artifact;
+      try {
+        artifact = await this.core.dependencies.artifacts.write(topicId, "plan", revision, markdown, { scopeGeneration: topic.scopeGeneration, accept: unchanged });
+      } catch (error) {
+        if (error instanceof StaleArtifactError) throw new Error("개정 도중 주제의 세대·계획·상태가 바뀌었습니다. 다시 시도하세요.");
+        throw error;
+      }
+      const sha256 = artifact.sha256;
+      if (sha256 !== hashPlan(markdown)) throw new Error("개정 계획의 sha 가 산출물과 다릅니다.");
+      const addedRules = parsed.data.rules.filter((rule) => !previous.rules.some((old) => old.id === rule.id)).map((rule) => rule.id);
+      const addedScope = parsed.data.scopePaths.filter((path) => !previous.scopePaths.includes(path));
+      // 두 에이전트의 계획 확인(acknowledgedPlanSHA256)도 새 sha 로 옮긴다 — 개정은 허용 오차 블록만 넓힌 중재자 결정이고,
+      // 그 내용은 decision 이벤트와 planPath 로 다음 프롬프트에 실린다. 안 옮기면 재개가 "같은 계획 버전을 확인하지 않았습니다" 로 죽는다.
+      const participants = topic.participants
+        .filter((participant) => participant.acknowledgedPlanSHA256 === topic.approvedPlanSHA256 || participant.acknowledgedPlanSHA256 === topic.planSHA256)
+        .map((participant) => ({ ...participant, acknowledgedPlanSHA256: sha256 }));
+      if (!unchanged()) throw new Error("개정 도중 주제의 세대·계획·상태가 바뀌었습니다. 다시 시도하세요.");
+      // 계획 sha·승인·participant·이벤트를 한 transaction 으로 확정한다.
+      return db.applyTopicTransition({
+        topicId,
+        changes: { planSHA256: sha256, approvedPlanSHA256: sha256 },
+        participants,
+        events: [{
+          actor: "user", kind: "decision", state: topic.state,
+          body: `허용 오차 개정(넓히기, 중재자 결정) — 계획 산출물 ${revision}판 ${sha256.slice(0, 12)}…\n추가 규칙: ${addedRules.join(", ") || "없음"} · 추가 scopePaths: ${addedScope.join(", ") || "없음"}\n\n${input.reason}`,
+          payload: { toleranceAmendment: { addedRules, addedScope, previousPlanSHA256: topic.planSHA256, planSHA256: sha256, artifactRevision: artifact.revision },
+            ...(requestKey ? { requestKey, requestAction: "action:amend-tolerance" } : {}) },
+        }],
+      });
+    } finally {
+      this.core.amendmentActive.delete(topicId);
     }
-    assertToleranceWidening(previous, parsed.data);
-    const markdown = normalizePlan(normalizeToleranceBlocks(replaceToleranceBlock(previousPlan, parsed.data)));
-    const check = parseTolerancePolicy(markdown);
-    if (!check) throw new Error("개정 뒤 계획에서 허용 오차 블록을 다시 읽지 못했습니다.");
-    const revision = db.latestArtifactRevision(topicId, "plan") + 1;
-    const artifact = await this.core.dependencies.artifacts.write(topicId, "plan", revision, markdown, { scopeGeneration: topic.scopeGeneration });
-    const sha256 = artifact.sha256;
-    if (sha256 !== hashPlan(markdown)) throw new Error("개정 계획의 sha 가 산출물과 다릅니다.");
-    const addedRules = parsed.data.rules.filter((rule) => !previous.rules.some((old) => old.id === rule.id)).map((rule) => rule.id);
-    const addedScope = parsed.data.scopePaths.filter((path) => !previous.scopePaths.includes(path));
-    db.updateTopic(topicId, { planSHA256: sha256, approvedPlanSHA256: sha256 });
-    // 두 에이전트의 계획 확인(acknowledgedPlanSHA256)도 새 sha 로 옮긴다 — 개정은 허용 오차 블록만 넓힌 중재자 결정이고,
-    // 그 내용은 decision 이벤트와 planPath 로 다음 프롬프트에 실린다. 안 옮기면 재개가 "같은 계획 버전을 확인하지 않았습니다" 로 죽는다(2026-09-14 실측).
-    for (const participant of topic.participants) {
-      if (participant.acknowledgedPlanSHA256 === topic.approvedPlanSHA256 || participant.acknowledgedPlanSHA256 === topic.planSHA256)
-        db.upsertParticipant(topicId, { ...participant, acknowledgedPlanSHA256: sha256 });
-    }
-    this.core.event(topicId, "user", "decision",
-      `허용 오차 개정(넓히기, 중재자 결정) — 계획 산출물 ${revision}판 ${sha256.slice(0, 12)}…\n추가 규칙: ${addedRules.join(", ") || "없음"} · 추가 scopePaths: ${addedScope.join(", ") || "없음"}\n\n${input.reason}`,
-      { toleranceAmendment: { addedRules, addedScope, previousPlanSHA256: topic.planSHA256, planSHA256: sha256, artifactRevision: artifact.revision },
-        ...(requestKey ? { requestKey, requestAction: "action:amend-tolerance" } : {}) });
-    return db.getTopic(topicId);
   }
 
   async postMessage(
@@ -505,6 +531,7 @@ export class WorkflowEngine {
       throw new Error("결과가 불명확한 commit 또는 push가 있습니다. 전달 결과를 먼저 확인한 뒤 범위를 바꿔 주세요.");
     }
     if (this.core.scopeChangeActive.has(topicId)) throw new Error("이미 범위를 바꾸고 있습니다.");
+    if (this.core.amendmentActive.has(topicId)) throw new Error("허용 오차 개정이 진행 중입니다. 끝난 뒤 범위를 바꿔 주세요.");
     const topic = this.core.dependencies.database.getTopic(topicId);
     if (topic.state === "CLOSED") {
       throw new Error("이미 닫은 주제는 범위를 바꿀 수 없습니다. 새 주제를 만들어 주세요.");

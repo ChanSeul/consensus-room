@@ -3754,6 +3754,29 @@ describe("허용 오차 개정(amend-tolerance)", () => {
     await expect(engine.amendTolerance("topic-1", { tolerance: widened, reason: "x" })).rejects.toThrow("구현·수정 단계가 멈춘 상태");
     database.close();
   });
+
+  // 2026-09-14 Codex High 2: 개정이 계획을 읽는 동안 범위 변경이 끝나면 새 세대에 옛 계획의 승인·세션이 기록됐다.
+  it("개정이 진행 중이면 범위 변경을 거부하고, 개정 도중 세대가 바뀌면 개정을 거부한다", async () => {
+    const result: AgentResult = { kind: "REVIEW", summary: "재검토", findings: [], evidenceRefs: [] };
+    const { database, engine, artifacts } = await makeReviewRecovery({ resumeState: "CLAUDE_FIX", implementationFindings: [], originalReviewFindings: [], codexResult: result });
+    database.updateTopic("topic-1", { state: "USER_DECISION_REQUIRED", resumeState: "CLAUDE_FIX" });
+    const widened = { scopePaths: ["**"], rules: [{ id: "T-5", title: "t", paths: ["AppRouteContractTests/**"], hunk: "insert-token", tokens: ["@MainActor"], maxFiles: 6, maxHunks: 60 }] };
+    // 계획 읽기를 보류해 개정을 중간에 멈춰 둔다.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const original = artifacts.readLatest.bind(artifacts);
+    artifacts.readLatest = (async (topicId: string, kind: string) => { const value = await original(topicId, kind); if (kind === "plan") await gate; return value; }) as typeof artifacts.readLatest;
+    const pending = engine.amendTolerance("topic-1", { tolerance: widened, reason: "동시성" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await expect(engine.handleScopeChange("topic-1", "범위 변경 시도")).rejects.toThrow("허용 오차 개정이 진행 중");
+    // 개정이 잠근 동안 세대가 (다른 경로로) 바뀌었다면 개정은 저장하지 않는다.
+    database.updateTopic("topic-1", { scopeGeneration: 2 });
+    release();
+    await expect(pending).rejects.toThrow("세대·계획·상태가 바뀌었습니다");
+    expect(database.latestArtifact("topic-1", "plan", 1)?.revision).toBe(2);
+    expect(database.getTopic("topic-1").approvedPlanSHA256).toBe(hashPlan(validPlan("검토 finding 보존")));
+    database.close();
+  });
 });
 
 // 2026-09-14 S11: 러너가 중간 보고를 완료 형식으로 닫아 리뷰로 넘어가 한도에서 멈춘 뒤, 중재자가 resume_state 를

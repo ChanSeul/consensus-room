@@ -318,14 +318,32 @@ export function dispositionRegressions(
 // Swift 변경은 1회차에 검증이 끝났다. 도구는 중재자가 실물 트리에서 직접 고치고 자기검사를 돌리는 편이 싸고 정확하다.
 // 판정: 증거 경로(`경로[:줄]` 모양, .md 문서 인용은 제외) 가 1개 이상 있고 **전부** 중재자 소유 패턴이면 그 지적은 중재자 몫이다.
 // 경로가 하나도 없거나 앱 소스가 섞여 있으면 종전대로 러너가 고친다.
-export const MEDIATOR_OWNED_PATH_PATTERNS: readonly RegExp[] = [/(^|\/)DerivedData\//, /(^|\/)\.build\//];
-const PATH_REF = /^[A-Za-z0-9_./@+~-]+(?::\d+(?::\d+)?)?$/;
+// 도구 트리·중재 저장소 자체(`swift6-tools`, `consensus-room`, `mediator-<stage>/`)도 중재자 소유다(2026-09-14 Codex Medium 5).
+export const MEDIATOR_OWNED_PATH_PATTERNS: readonly RegExp[] = [
+  /(^|\/)DerivedData\//, /(^|\/)\.build\//, /(^|\/)swift6-tools\//, /(^|\/)consensus-room(-public)?\//, /(^|\/)mediator-[a-z0-9]+\//,
+];
+// 경로 인용: 디렉터리 이름에는 공백을 허용한다(실제 워크트리가 `Library/Application Support/...` 아래에 있다 — 공백을 막으면
+// 절대경로 증거가 전부 버려져 기본값(러너 수정)으로 흘렀다). 마지막 항목(파일명)엔 공백이 없어야 문장과 구분된다.
+const PATH_REF = /^\/?(?:[A-Za-z0-9_.@+~ -]+\/)*[A-Za-z0-9_.@+~-]+(?::\d+(?::\d+)?)?$/;
 
-export function isMediatorOwnedFinding(finding: Finding, patterns: readonly RegExp[] = MEDIATOR_OWNED_PATH_PATTERNS): boolean {
+// 절대경로는 worktree 기준 상대경로로 정규화한다(worktreePath 가 주어졌을 때). 밖의 절대경로는 그대로 패턴에 댄다.
+export function normalizeEvidencePath(ref: string, worktreePath?: string | null): string {
+  const bare = ref.replace(/:\d+(?::\d+)?$/, "");
+  if (worktreePath) {
+    const root = worktreePath.replace(/\/+$/, "");
+    if (bare === root) return ".";
+    if (bare.startsWith(root + "/")) return bare.slice(root.length + 1);
+  }
+  return bare;
+}
+
+export function isMediatorOwnedFinding(
+  finding: Finding, patterns: readonly RegExp[] = MEDIATOR_OWNED_PATH_PATTERNS, worktreePath?: string | null,
+): boolean {
   const paths = finding.evidenceRefs
     .map((ref) => ref.trim())
     .filter((ref) => ref.includes("/") && PATH_REF.test(ref))
-    .map((ref) => ref.replace(/:\d+(?::\d+)?$/, ""))
+    .map((ref) => normalizeEvidencePath(ref, worktreePath))
     .filter((path) => !/\.md$/i.test(path));
   if (paths.length === 0) return false;
   return paths.every((path) => patterns.some((pattern) => pattern.test(path)));
@@ -338,10 +356,11 @@ export const MEDIATOR_OWNED_PREFIX = "중재자 소유 경로(앱 밖 도구 코
 export function routeMediatorOwnedFindings(
   findings: readonly Finding[],
   patterns: readonly RegExp[] = MEDIATOR_OWNED_PATH_PATTERNS,
+  worktreePath?: string | null,
 ): { findings: Finding[]; routed: string[] } {
   const routed: string[] = [];
   const next = findings.map((finding) => {
-    if (finding.disposition !== "AGREED_ACTION" || !isMediatorOwnedFinding(finding, patterns)) return finding;
+    if (finding.disposition !== "AGREED_ACTION" || !isMediatorOwnedFinding(finding, patterns, worktreePath)) return finding;
     routed.push(finding.id);
     return {
       ...finding,

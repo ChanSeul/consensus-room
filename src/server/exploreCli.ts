@@ -62,6 +62,11 @@ async function archiveHead(root: string): Promise<string> {
     archive.stderr.on("data", (chunk: string) => { stderr += chunk; });
     extract.stderr.on("data", (chunk: string) => { stderr += chunk; });
     archive.stdout.pipe(extract.stdin);
+    // tar 가 먼저 죽으면(빈 트리·오류) pipe 의 write 가 EPIPE 로 stdin 'error' 를 올린다 — 리스너가 없으면 프로세스 전체가
+    // unhandled error 로 죽는다(2026-09-14 전체 검사에서 1건 관측). 종료는 close 경로가 exit code 로 정리한다.
+    const ignoreBrokenPipe = (error: NodeJS.ErrnoException) => { if (error.code !== "EPIPE" && error.code !== "ERR_STREAM_DESTROYED") fail(error); };
+    extract.stdin.on("error", ignoreBrokenPipe);
+    archive.stdout.on("error", ignoreBrokenPipe);
     const fail = (error: Error) => {
       archive.kill("SIGTERM");
       extract.kill("SIGTERM");

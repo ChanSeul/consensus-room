@@ -254,7 +254,7 @@ export class DeliveryPipeline {
     // 중재자 소유 경로(gitignore 된 도구 트리)의 확정 결함은 러너 수정 회차를 열지 않는다 — EXTERNAL_EVIDENCE 로 바꿔 아래
     // BLOCKED_ON_EVIDENCE 분기로 보낸다. 중재자가 고치고 evidence + retry 하면 같은 리뷰 단계가 다시 돌아 재검증한다
     // (2026-09-14 사용자 지시 "러너는 앱 코드만"; S10H 도구 결함 수정 4회 루프의 처방).
-    const routed = routeMediatorOwnedFindings(review.findings);
+    const routed = routeMediatorOwnedFindings(review.findings, undefined, topic.worktreePath);
     if (routed.routed.length > 0) {
       review = { ...review, findings: routed.findings };
       this.core.event(topicId, "system", "system",
