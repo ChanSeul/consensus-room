@@ -313,6 +313,13 @@ export const AttachParticipantInputSchema = z.discriminatedUnion("mode", [
 ]);
 export type AttachParticipantInput = z.infer<typeof AttachParticipantInputSchema>;
 
+// 구현 도중 허용 오차 개정(넓히기만): tolerance = 새 블록 JSON 객체 전체, reason = 결정 근거(타임라인 decision 본문).
+export const AmendToleranceInputSchema = z.object({
+  tolerance: z.unknown(),
+  reason: z.string().trim().min(1).max(20_000),
+});
+export type AmendToleranceInput = z.infer<typeof AmendToleranceInputSchema>;
+
 export const PostMessageInputSchema = z.object({
   kind: z.enum(["note", "scope_change", "evidence", "decision"]),
   body: z.string().trim().min(1).max(50_000),

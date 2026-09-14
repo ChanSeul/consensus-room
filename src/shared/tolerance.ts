@@ -454,3 +454,33 @@ export function renderToleranceSummary(evaluation: ToleranceEvaluation): string 
     ? `허용 오차 대조 통과 — 범위 밖 파일 ${evaluation.outOfScopeFiles.length}개${usage ? ` (${usage})` : ""}${notes}`
     : `허용 오차 위반 ${evaluation.violations.length}건:\n${evaluation.violations.map((line) => `- ${line}`).join("\n")}${notes}`;
 }
+
+
+// ── 구현 도중 허용 오차 개정(2026-09-14 S11): 넓히기만 허용한다 ─────────────────────────────────────────────
+// 계획 전제가 구현에서 반증돼 범위 밖 파일을 고쳐야 할 때(예: 계약 테스트가 D1 앱 API 를 동기 호출해 122건 오류),
+// scope_change 는 토픽을 처음부터 리셋하고 계획 개정 루프는 구현 중엔 없다. 그래서 승인된 계획의 허용 오차 블록만
+// **넓히는** 개정을 중재자 결정으로 허용한다 — 있던 scopePaths·규칙은 하나도 못 지우고, 규칙은 같거나 더 넓어야 한다.
+export function assertToleranceWidening(previous: TolerancePolicy, next: TolerancePolicy): void {
+  for (const path of previous.scopePaths) {
+    if (!next.scopePaths.includes(path)) throw new ToleranceFormatError(`허용 오차 개정은 넓히기만 가능합니다: scopePaths 에서 ${path} 가 빠졌습니다.`);
+  }
+  const nextRules = new Map(next.rules.map((rule) => [rule.id, rule] as const));
+  for (const rule of previous.rules) {
+    const after = nextRules.get(rule.id);
+    if (!after) throw new ToleranceFormatError(`허용 오차 개정은 넓히기만 가능합니다: 규칙 ${rule.id} 가 빠졌습니다.`);
+    if (after.hunk !== rule.hunk) throw new ToleranceFormatError(`규칙 ${rule.id}: hunk 술어(${rule.hunk})는 바꿀 수 없습니다.`);
+    for (const path of rule.paths) if (!after.paths.includes(path)) throw new ToleranceFormatError(`규칙 ${rule.id}: 경로 ${path} 가 빠졌습니다.`);
+    for (const token of rule.tokens) if (!after.tokens.includes(token)) throw new ToleranceFormatError(`규칙 ${rule.id}: 토큰 ${token} 이 빠졌습니다.`);
+    if (after.maxFiles < rule.maxFiles || after.maxHunks < rule.maxHunks) throw new ToleranceFormatError(`규칙 ${rule.id}: 상한은 줄일 수 없습니다.`);
+  }
+}
+
+// 계획 본문의 tolerance 블록 하나를 새 정책으로 바꾼다(다른 줄은 그대로). 블록이 없으면 개정할 것이 없다.
+export function replaceToleranceBlock(planMarkdown: string, policy: TolerancePolicy): string {
+  if (!TOLERANCE_FENCE.test(planMarkdown)) throw new ToleranceFormatError("계획에 허용 오차 블록이 없어 개정할 수 없습니다.");
+  const body = JSON.stringify(policy, null, 2);
+  return planMarkdown.replace(TOLERANCE_FENCE, (match) => {
+    const opening = match.slice(0, match.indexOf("\n") + 1);
+    return `${opening}${body}\n\`\`\``;
+  });
+}

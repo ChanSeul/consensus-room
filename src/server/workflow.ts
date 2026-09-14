@@ -1,4 +1,6 @@
 import {reviewScope,type ReviewScope} from "../shared/reviews.js";
+import { assertToleranceWidening, normalizeToleranceBlocks, parseTolerancePolicy, replaceToleranceBlock, TolerancePolicySchema } from "../shared/tolerance.js";
+import { hashPlan, normalizePlan } from "../shared/workflow.js";
 import { RevisionBlocked } from "./revisionLedger.js";
 import { randomUUID } from "node:crypto";
 import { describePrune, pruneBuildTrees } from "./buildTrees.js";
@@ -388,6 +390,44 @@ export class WorkflowEngine {
     input: { idempotencyKey: string; outcome: "succeeded" | "failed"; oid?: string },
   ): Promise<Topic> {
     return this.delivery.reconcileDelivery(topicId, input);
+  }
+
+  // 구현 도중 허용 오차 개정(2026-09-14 S11). 정지 상태(USER_DECISION_REQUIRED/FAILED, 재개 단계 IMPLEMENTING/CLAUDE_FIX)에서만,
+  // 넓히기만 허용한다(assertToleranceWidening). 새 plan 산출물을 쓰고 plan/approved sha 를 그 값으로 옮기며 decision 이벤트를 남긴다 —
+  // 이후 enforceTolerance·리뷰 프롬프트·재개 프롬프트(planPath)는 모두 최신 plan 산출물을 읽으므로 새 규칙이 곧바로 적용된다.
+  async amendTolerance(topicId: string, input: { tolerance: unknown; reason: string }, requestKey?: string): Promise<Topic> {
+    this.core.assertNotShuttingDown();
+    this.core.assertNoActiveWork(topicId);
+    const db = this.core.dependencies.database;
+    const topic = db.getTopic(topicId);
+    const resume = db.getFlags(topicId).resumeState;
+    if (!["USER_DECISION_REQUIRED", "FAILED"].includes(topic.state) || !["IMPLEMENTING", "CLAUDE_FIX"].includes(resume ?? ""))
+      throw new Error(`허용 오차 개정은 구현·수정 단계가 멈춘 상태에서만 가능합니다(현재 ${topic.state}/${resume ?? "-"}).`);
+    const previousPlan = await this.core.dependencies.artifacts.readLatest(topicId, "plan");
+    if (!previousPlan) throw new Error("저장된 계획이 없습니다.");
+    const previous = parseTolerancePolicy(previousPlan);
+    if (!previous) throw new Error("계획에 허용 오차 블록이 없어 개정할 수 없습니다.");
+    const parsed = TolerancePolicySchema.safeParse(input.tolerance);
+    if (!parsed.success) {
+      const issue = parsed.error.issues[0];
+      throw new Error(`허용 오차 블록 형식 오류: ${issue ? `${issue.path.join(".")} ${issue.message}` : "unknown"}`);
+    }
+    assertToleranceWidening(previous, parsed.data);
+    const markdown = normalizePlan(normalizeToleranceBlocks(replaceToleranceBlock(previousPlan, parsed.data)));
+    const check = parseTolerancePolicy(markdown);
+    if (!check) throw new Error("개정 뒤 계획에서 허용 오차 블록을 다시 읽지 못했습니다.");
+    const revision = db.latestArtifactRevision(topicId, "plan") + 1;
+    const artifact = await this.core.dependencies.artifacts.write(topicId, "plan", revision, markdown, { scopeGeneration: topic.scopeGeneration });
+    const sha256 = artifact.sha256;
+    if (sha256 !== hashPlan(markdown)) throw new Error("개정 계획의 sha 가 산출물과 다릅니다.");
+    const addedRules = parsed.data.rules.filter((rule) => !previous.rules.some((old) => old.id === rule.id)).map((rule) => rule.id);
+    const addedScope = parsed.data.scopePaths.filter((path) => !previous.scopePaths.includes(path));
+    db.updateTopic(topicId, { planSHA256: sha256, approvedPlanSHA256: sha256 });
+    this.core.event(topicId, "user", "decision",
+      `허용 오차 개정(넓히기, 중재자 결정) — 계획 산출물 ${revision}판 ${sha256.slice(0, 12)}…\n추가 규칙: ${addedRules.join(", ") || "없음"} · 추가 scopePaths: ${addedScope.join(", ") || "없음"}\n\n${input.reason}`,
+      { toleranceAmendment: { addedRules, addedScope, previousPlanSHA256: topic.planSHA256, planSHA256: sha256, artifactRevision: artifact.revision },
+        ...(requestKey ? { requestKey, requestAction: "action:amend-tolerance" } : {}) });
+    return db.getTopic(topicId);
   }
 
   async postMessage(

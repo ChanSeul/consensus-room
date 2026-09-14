@@ -1,4 +1,5 @@
 import {ReviewGrantInputSchema} from "../shared/reviews.js";
+import { AmendToleranceInputSchema } from "../shared/contracts.js";
 import { RevisionGrantInputSchema } from "../shared/revisions.js";
 import { WorkGroupInputSchema } from "../shared/workGroups.js";
 import { WorkGroupService } from "./workGroupService.js";
@@ -309,6 +310,10 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
         try {database.budgets.assertAvailable(group?[topicId,group.id]:[topicId]);} catch {budgetBlocked=true;}
         response=budgetBlocked?{...accepted(actionId,database.getTopic(topicId)),resumeBlocked:"리뷰 1회를 추가했습니다. 토큰·시간 예산도 추가한 뒤 재개하세요."}
           :accepted(workflow.retry(topicId,actionId),database.getTopic(topicId));
+      }
+      else if(action === "amend-tolerance") {
+        const input=AmendToleranceInputSchema.parse(request.body);
+        response=accepted(actionId, await workflow.amendTolerance(topicId,input,idempotencyKey));
       }
       else if(action === "revision-resume") {
         workflow.assertBudgetEditable(topicId);

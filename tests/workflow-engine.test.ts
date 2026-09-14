@@ -3727,6 +3727,34 @@ it("세 번째 구현 리뷰는 전달 준비까지 완료하고 네 번째 호�
  expect(database.reviews.account("topic-1","implementation").used).toBe(3);database.close();
 });
 
+// 2026-09-14 S11: 구현 도중 계획 전제가 반증돼 범위 밖 파일(계약 테스트)을 고쳐야 할 때 — 허용 오차를 **넓히기만** 하는 개정.
+describe("허용 오차 개정(amend-tolerance)", () => {
+  it("멈춘 구현 단계에서 규칙을 추가하면 새 plan 산출물·sha 갱신·decision 이벤트가 남고 좁히기는 거부한다", async () => {
+    const result: AgentResult = { kind: "REVIEW", summary: "재검토", findings: [], evidenceRefs: [] };
+    const { database, engine, artifacts } = await makeReviewRecovery({ resumeState: "CLAUDE_FIX", implementationFindings: [], originalReviewFindings: [], codexResult: result });
+    database.updateTopic("topic-1", { state: "USER_DECISION_REQUIRED", resumeState: "CLAUDE_FIX" });
+    const before = database.getTopic("topic-1");
+    const widened = { scopePaths: ["**"], rules: [{ id: "T-5", title: "계약 테스트 격리 표기", paths: ["AppRouteContractTests/**"], hunk: "insert-token", tokens: ["@MainActor"], maxFiles: 6, maxHunks: 60 }] };
+    const topic = await engine.amendTolerance("topic-1", { tolerance: widened, reason: "계약 2 반증 — 계약 테스트가 D1 앱 API 를 동기 호출" }, "key-1");
+    expect(topic.planSHA256).not.toBe(before.planSHA256);
+    expect(topic.approvedPlanSHA256).toBe(topic.planSHA256);
+    const plan = await artifacts.readLatest("topic-1", "plan");
+    expect(parseTolerancePolicy(plan!)?.rules.map((rule) => rule.id)).toEqual(["T-5"]);
+    expect(database.latestArtifact("topic-1", "plan")?.revision).toBe(3);
+    const event = database.getTimeline("topic-1").filter((e) => e.kind === "decision").at(-1)!;
+    expect(event.body).toContain("추가 규칙: T-5");
+    expect(event.payload?.toleranceAmendment).toMatchObject({ addedRules: ["T-5"], planSHA256: topic.planSHA256 });
+    // 좁히기(기존 scopePaths 삭제·기존 규칙 삭제·상한 축소)는 거부
+    await expect(engine.amendTolerance("topic-1", { tolerance: { scopePaths: ["a/**"], rules: widened.rules }, reason: "x" })).rejects.toThrow("넓히기만");
+    await expect(engine.amendTolerance("topic-1", { tolerance: { scopePaths: ["**"], rules: [] }, reason: "x" })).rejects.toThrow("T-5 가 빠졌습니다");
+    await expect(engine.amendTolerance("topic-1", { tolerance: { scopePaths: ["**"], rules: [{ ...widened.rules[0], maxFiles: 1 }] }, reason: "x" })).rejects.toThrow("상한은 줄일 수 없습니다");
+    // 리뷰 단계에서 멈춘 상태(재개 단계가 구현·수정이 아님)면 거부
+    database.updateTopic("topic-1", { resumeState: "CODEX_REVIEW" });
+    await expect(engine.amendTolerance("topic-1", { tolerance: widened, reason: "x" })).rejects.toThrow("구현·수정 단계가 멈춘 상태");
+    database.close();
+  });
+});
+
 // 2026-09-14 S11: 러너가 중간 보고를 완료 형식으로 닫아 리뷰로 넘어가 한도에서 멈춘 뒤, 중재자가 resume_state 를
 // IMPLEMENTING 으로 되돌리면 리뷰 승인 없이 retry 가 구현을 재개해야 한다(한도 정지는 그 리뷰 단계 재개에만 걸린다).
 it("리뷰 한도 정지 뒤 resume_state 를 다른 단계로 되돌리면 retry 가 리뷰 승인 없이 그 단계를 재개한다",async()=>{
