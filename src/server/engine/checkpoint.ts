@@ -77,6 +77,18 @@ export function requestId(text: string, askedAfterSequence: number): string {
   return `Q-${createHash("sha256").update(`${text.trim()}#${askedAfterSequence}`, "utf8").digest("hex").slice(0, 8)}`;
 }
 
+// 렌더된 요청 목록(renderOpenRequests 출력) 해석 — 전체가 `[Q-xxxxxxxx] 문구` 블록들이면 그 목록, 아니면 null(평문 요청).
+export function parseRenderedRequests(text: string): Array<{ id: string; text: string }> | null {
+  const blocks = text.split(/\n\n(?=\[Q-[0-9a-f]{8}\] )/);
+  const parsed: Array<{ id: string; text: string }> = [];
+  for (const block of blocks) {
+    const match = /^\[(Q-[0-9a-f]{8})\] ([\s\S]+)$/.exec(block.trim());
+    if (!match) return null;
+    parsed.push({ id: match[1], text: match[2].trim() });
+  }
+  return parsed.length ? parsed : null;
+}
+
 // 논리 작업 id — 구현 세대(계획 epoch·sha 포함) 또는 수정 회차. 복구·확인 횟수·중복 재소비의 공통 기준.
 export function workId(binding: WorkBinding): string {
   const base = `${binding.kind}:g${binding.scopeGeneration}:e${binding.planEpoch}:${(binding.planSHA256 ?? "-").slice(0, 12)}:${binding.resumeState}`;
@@ -105,8 +117,13 @@ export function accumulate(
   let unmatchedResolution: string | null = null;
   const asked = next.requestedUserDecision?.trim();
   if (asked) {
-    const existing = openRequests.find((request) => request.text === asked);
-    if (!existing) openRequests.push({ id: requestId(asked, askedAfterSequence), text: asked, askedAfterSequence });
+    // 서버가 렌더한 열린 요청 목록(`[Q-…] 문구`)이 교정 병합으로 되돌아온 것은 새 질문이 아니다 — 이미 열린 id 는 그대로, 모르는 id 의 문구만 새 요청.
+    const rendered = parseRenderedRequests(asked);
+    const candidates = rendered ? rendered.filter((item) => !openRequests.some((request) => request.id === item.id)).map((item) => item.text) : [asked];
+    for (const text of candidates) {
+      const existing = openRequests.find((request) => request.text === text);
+      if (!existing) openRequests.push({ id: requestId(text, askedAfterSequence), text, askedAfterSequence });
+    }
   }
   if (next.resolvesRequestedDecision === true) {
     const id = next.resolvedRequestId?.trim();

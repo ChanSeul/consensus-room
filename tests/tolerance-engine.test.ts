@@ -1191,6 +1191,126 @@ describe("Astra 리뷰 2026-09-14 — 수락 현재성·재판정·작업 id·�
     database.close();
   });
 
+  // ---- 2차 재검토(r2) — 저장·재시작까지 포함한 같은 경계의 반례.
+  it.each(["normal-report", "recovery-checkpoint"] as const)("CF-01(r2): 마지막 비동기 저장 도중 도착한 결정은 전이 직전 동기 검사가 잡는다 — %s", async (scenario) => {
+    const { worktree, database, artifacts, gitService, topicId } = await setup("cf01-final");
+    const write = artifacts.write.bind(artifacts); let stopped = false, injected = false;
+    const initial = scripted([() => { writeFileSync(join(worktree, "feature.txt"), "x\n"); return result("IMPLEMENTATION", "done", { status: "completed" }); }]);
+    const codex = new PassingCodex(); let engine = new WorkflowEngine({ database, artifacts, git: gitService, claude: initial.adapter, codex });
+    artifacts.write = async (...args: Parameters<ArtifactStore["write"]>) => {
+      if (scenario === "recovery-checkpoint" && !stopped && args[1] === "work-checkpoint" && args[3].includes('"phase": "accepted"')) { stopped = true; throw new Error("accepted 전 종료"); }
+      if (scenario === "normal-report" && !injected && args[1] === "implementation") { injected = true; await engine.postMessage(topicId, "decision", "REFIX feature.txt 재수정 — 새 요구부터 반영"); }
+      return write(...args);
+    };
+    engine.startImplementation(topicId); await settled(database, topicId);
+    if (scenario === "recovery-checkpoint") {
+      expect(database.getTopic(topicId).state).toBe("FAILED");
+      engine = new WorkflowEngine({ database, artifacts, git: gitService, claude: scripted([]).adapter, codex });
+      artifacts.write = async (...args: Parameters<ArtifactStore["write"]>) => {
+        if (!injected && args[1] === "work-checkpoint" && args[3].includes('"phase": "accepted"')) { injected = true; await engine.postMessage(topicId, "decision", "REFIX feature.txt 새 요구부터 반영"); }
+        return write(...args);
+      };
+      engine.retry(topicId); await settled(database, topicId);
+    }
+    expect(injected).toBe(true);
+    expect(codex.prompts).toHaveLength(0);
+    expect(database.getTopic(topicId).state).toBe("USER_DECISION_REQUIRED");
+    database.close();
+  });
+
+  it("CF-01(r2): 복구 저장도 워킹트리를 보존해 또 한 번의 재시작이 같은 결과를 다시 수락하지 않는다", async () => {
+    const { worktree, database, artifacts, gitService, topicId } = await setup("cf01-worktree");
+    const write = artifacts.write.bind(artifacts); let failures = 0, memoryCalls = 0;
+    const memory = { apply: async (_role: string, updates: readonly { path: string; reason: string }[]) => { memoryCalls++; return updates.map((u) => ({ path: u.path, previousSHA256: null, sha256: "0".repeat(64), reason: u.reason, status: "written" as const })); } };
+    artifacts.write = async (...args: Parameters<ArtifactStore["write"]>) => {
+      if (failures === 0 && args[1] === "work-checkpoint" && args[3].includes('"phase": "accepted"')) { failures++; throw new Error("accepted 전 종료"); }
+      if (failures === 1 && args[1] === "implementation") { failures++; throw new Error("복구 보고서 저장 중 종료"); }
+      return write(...args);
+    };
+    const first = scripted([() => { writeFileSync(join(worktree, "feature.txt"), "x\n"); return result("IMPLEMENTATION", "done", { status: "completed", memoryUpdates: [{ path: "notes/a.md", content: "a", expectedSHA256: null, reason: "r" }] }); }]);
+    const codex = new PassingCodex(); const deps = { database, artifacts, git: gitService, codex, memory };
+    const e1 = new WorkflowEngine({ ...deps, claude: first.adapter }); e1.startImplementation(topicId); await settled(database, topicId);
+    expect(database.getTopic(topicId).state).toBe("FAILED"); expect(memoryCalls).toBe(1);
+    const e2 = new WorkflowEngine({ ...deps, claude: scripted([]).adapter }); e2.retry(topicId); await settled(database, topicId);
+    expect(database.getTopic(topicId).state).toBe("FAILED");
+    const middle = JSON.parse((await artifacts.readLatest(topicId, "work-checkpoint"))!);
+    expect(middle.phase).toBe("accepted"); expect(middle.worktree).toBeTruthy();
+    const e3 = new WorkflowEngine({ ...deps, claude: scripted([]).adapter }); e3.retry(topicId); await settled(database, topicId);
+    expect(database.getTopic(topicId).state, database.getTopic(topicId).lastError ?? "").toBe("READY_TO_DELIVER");
+    const outputs = database.getTimeline(topicId).filter((e) => e.actor === "claude" && e.kind === "agent_output" && e.payload?.acceptId).map((e) => e.payload?.acceptId);
+    expect(memoryCalls).toBe(1); expect(outputs).toHaveLength(1);
+    database.close();
+  });
+
+  it("CF-04(r2): 재대조가 연 교정 응답의 새 질문 B 는 중첩 계약 교정이 실패해도 복구 목록에 남아 승인 없이 완료되지 않는다", async () => {
+    const { worktree, database, artifacts, gitService, topicId } = await setup("cf04-nested");
+    const first = scripted([
+      () => { writeFileSync(join(worktree, "feature.txt"), "x\n"); return result("IMPLEMENTATION", "done", { status: "completed", requestedUserDecision: "A?" }); },
+      (turn) => result("IMPLEMENTATION", "confirmed", { status: "completed", resolvesRequestedDecision: true, resolvedRequestId: requestIdsIn(turn.prompt)[0] }),
+      () => { writeFileSync(join(worktree, "service/S.swift"), "func a() {}\nfunc b() {}\n"); return result("FIX", "wrong kind from tolerance correction", { status: "completed", requestedUserDecision: "B?" }); },
+      () => { throw new Error("B 보고 뒤 계약 교정 실패"); },
+    ]);
+    const e1 = new WorkflowEngine({ database, artifacts, git: gitService, claude: first.adapter, codex: new PassingCodex() });
+    e1.startImplementation(topicId); await settled(database, topicId);
+    await e1.postMessage(topicId, "decision", "A approved");
+    writeFileSync(join(worktree, "service/S.swift"), "func forbiddenChange() {}\n");
+    e1.retry(topicId); await settled(database, topicId);
+    expect(database.getTopic(topicId).state).toBe("FAILED");
+    const failed = JSON.parse((await artifacts.readLatest(topicId, "work-checkpoint"))!);
+    expect(failed.openRequests.map((r: { text: string }) => r.text)).toContain("B?");
+    const second = scripted([() => result("IMPLEMENTATION", "resumed", { status: "completed" })]);
+    const codex = new PassingCodex();
+    const e2 = new WorkflowEngine({ database, artifacts, git: gitService, claude: second.adapter, codex });
+    e2.retry(topicId); await settled(database, topicId);
+    const cp = JSON.parse((await artifacts.readLatest(topicId, "work-checkpoint"))!);
+    expect(cp.openRequests.map((r: { text: string }) => r.text)).toContain("B?");
+    expect(codex.prompts).toHaveLength(0);
+    expect(database.getTopic(topicId).state).toBe("USER_DECISION_REQUIRED");
+    database.close();
+  });
+
+  it("CF-04(r2): 허용 오차 교정이 질문을 생략해도 표시 문자열이 두 번째 질문으로 등록되지 않는다", async () => {
+    const { worktree, database, artifacts, gitService, topicId } = await setup("cf04-render");
+    const claude = scripted([
+      () => { writeFileSync(join(worktree, "feature.txt"), "x\n"); writeFileSync(join(worktree, "service/S.swift"), "func forbiddenChange() {}\n"); return result("IMPLEMENTATION", "done awaiting A", { status: "completed", requestedUserDecision: "A?" }); },
+      () => { writeFileSync(join(worktree, "service/S.swift"), "func a() {}\nfunc b() {}\n"); return result("IMPLEMENTATION", "fixed violation", { status: "completed" }); },
+      (turn) => result("IMPLEMENTATION", "A approved", { status: "completed", resolvesRequestedDecision: true, resolvedRequestId: requestIdsIn(turn.prompt)[0] }),
+    ]);
+    const codex = new PassingCodex(); const engine = new WorkflowEngine({ database, artifacts, git: gitService, claude: claude.adapter, codex });
+    engine.startImplementation(topicId); await settled(database, topicId);
+    const before = JSON.parse((await artifacts.readLatest(topicId, "work-checkpoint"))!);
+    expect(before.openRequests).toHaveLength(1);
+    await engine.postMessage(topicId, "decision", "A approved"); engine.retry(topicId); await settled(database, topicId);
+    const after = JSON.parse((await artifacts.readLatest(topicId, "work-checkpoint"))!);
+    expect(after.openRequests).toHaveLength(0);
+    expect(database.getTopic(topicId).state, database.getTopic(topicId).lastError ?? "").toBe("READY_TO_DELIVER");
+    database.close();
+  });
+
+  it("CF-05(r2): 확인 호출이 끝난 뒤 결과 저장에 실패하면 재개는 그 확인을 다시 사지 않는다(실행 기록으로 판단)", async () => {
+    const { worktree, database, artifacts, gitService, topicId } = await setup("cf05-ran");
+    const originalWrite = artifacts.write.bind(artifacts); let completedConfirmations = 0, killed = false;
+    artifacts.write = async (...args: Parameters<ArtifactStore["write"]>) => {
+      if (!killed && completedConfirmations === 1 && args[1] === "work-checkpoint" && args[3].includes('"phase": "verified"')) { killed = true; throw new Error("확인 뒤 결과 저장 전 종료"); }
+      return originalWrite(...args);
+    };
+    const first = scripted([
+      () => { writeFileSync(join(worktree, "feature.txt"), "x\n"); return result("IMPLEMENTATION", "status missing"); },
+      (turn) => { expect(turn.protocolOnly).toBe(true); completedConfirmations++; return result("IMPLEMENTATION", "still unclear"); },
+    ]);
+    const e1 = new WorkflowEngine({ database, artifacts, git: gitService, claude: first.adapter, codex: new PassingCodex() });
+    e1.startImplementation(topicId); await settled(database, topicId);
+    expect(database.getTopic(topicId).state).toBe("FAILED");
+    expect(JSON.parse((await artifacts.readLatest(topicId, "work-checkpoint"))!).phase).toBe("before-confirmation");
+    const second = scripted([(turn) => { expect(turn.protocolOnly).toBe(true); completedConfirmations++; return result("IMPLEMENTATION", "still unclear"); }]);
+    const e2 = new WorkflowEngine({ database, artifacts, git: gitService, claude: second.adapter, codex: new PassingCodex() });
+    e2.retry(topicId); await settled(database, topicId);
+    expect(completedConfirmations).toBe(1);
+    expect(database.getTopic(topicId).state).toBe("USER_DECISION_REQUIRED");
+    expect(database.getTopic(topicId).lastError).toContain("1회 소진");
+    database.close();
+  });
+
   it("CF-06: 상태 확인은 원본의 memoryUpdates 를 보존한다(메모리 1회 반영)", async () => {
     const { worktree, database, artifacts, gitService, topicId } = await setup("cf06");
     const applied: string[] = [];

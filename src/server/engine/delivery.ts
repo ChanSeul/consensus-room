@@ -53,7 +53,14 @@ interface WorkSetup {
   // false 면 모델 턴 없이 완료 판정 루프만 돈다(저장 결과 재사용·확인).
   initialTurn: boolean;
   legacyBase: () => Promise<{ base: AgentResult | null; ledger: ToleranceLedgerEntry[] }>;
-  onAccepted: (accepted: AcceptedResult, acceptId: number) => Promise<void>;
+  // 수락의 세 부분(CF-01): persist(비동기 저장 — 보고서 등) → [동기 현재성 검사] → transition(**동기** 상태 전이) → continue(다음 단계).
+  // 검사와 전이 사이에 await 가 없어야 늦게 도착한 결정이 전이를 타고 넘어가지 않는다.
+  accept: {
+    persist: (accepted: AcceptedResult, acceptId: number) => Promise<void>;
+    // false 면 전이하지 않았다(가드로 정지) — 호출자는 continue 를 부르지 않는다.
+    transition: (accepted: AcceptedResult, acceptId: number) => boolean;
+    continue: (accepted: AcceptedResult) => Promise<void>;
+  };
 }
 
 // 복구 직후(턴 전)의 바탕 — 결과가 없을 수 있다.
@@ -144,10 +151,10 @@ export class DeliveryPipeline {
       legacyBase: async () => ({
         base: await this.legacyPendingOriginal(topicId, scopedTopic, "IMPLEMENTING"), ledger: await this.legacyAcceptedLedger(topicId),
       }),
-      onAccepted: async (accepted) => {
-        await this.core.writeArtifact(scopedTopic, "implementation", 1, renderReport(accepted), signal);
-        this.core.transition(topicId, "CODEX_REVIEW", "Codex가 구현 결과를 읽기 전용으로 검토합니다.");
-        await this.runReview(topicId, signal, false);
+      accept: {
+        persist: async (accepted) => { await this.core.writeArtifact(scopedTopic, "implementation", 1, renderReport(accepted), signal); },
+        transition: () => { this.core.transition(topicId, "CODEX_REVIEW", "Codex가 구현 결과를 읽기 전용으로 검토합니다."); return true; },
+        continue: async () => { await this.runReview(topicId, signal, false); },
       },
     }, signal);
   }
@@ -175,6 +182,8 @@ export class DeliveryPipeline {
     if (recovered) {
       const checkpoint = recovered.checkpoint;
       const newInput = this.userInputSince(topic, checkpoint.inputSequence);
+      const confirmationExecuted = checkpoint.phase === "before-confirmation" && db.getTimeline(topicId)
+        .some((event) => event.payload?.confirmationExecuted === checkpoint.revision);
       if (checkpoint.phase === "accepting" || checkpoint.phase === "accepted") {
         // 수락 복구도 일반 수락과 같은 현재성 검사에 결속된다(CF-01): 새 결정·증거가 왔으면 반영할 쓰기 턴을, 워킹트리가 수락 시점과 다르면
         // 다시 대조·판정을 거친 뒤에만 채택·전이한다. 둘 다 아니면 acceptId 기준으로 남은 후속만 한다.
@@ -189,10 +198,12 @@ export class DeliveryPipeline {
           { acceptNotResumed: checkpoint.revision, newInput: Boolean(newInput), treeChanged });
         if (!newInput) initialTurn = false;
       } else if (checkpoint.phase === "before-confirmation") {
-        // 확인 예약만 남기고 종료됐다 — 쓰기를 다시 열지 않고 그 확인(읽기 전용)을 이어서 한다(CF-05). 예약은 실행이 아니므로 횟수에서 뺀다.
+        // 확인 예약 뒤 종료됐다 — 쓰기를 다시 열지 않는다(CF-05). 실행 기록(confirmationExecuted 이벤트)이 없으면 예약만 된 것이라 그 확인을 이어서
+        // 하고, 있으면 확인은 이미 실행됐고 결과만 잃은 것이므로 횟수를 환급하지 않는다(그 결과는 새 결정 없이는 다시 사지 않는다).
         initialTurn = false;
-        this.core.event(topicId, "system", "system", `checkpoint #${checkpoint.revision} 는 완료 상태 확인 턴 예약 상태였습니다 — 쓰기 턴 없이 읽기 전용 확인을 이어갑니다.`,
-          { confirmationResumed: checkpoint.revision });
+        this.core.event(topicId, "system", "system",
+          `checkpoint #${checkpoint.revision} 는 완료 상태 확인 턴 ${confirmationExecuted ? "실행 뒤 결과 저장 전" : "예약"} 상태였습니다 — 쓰기 턴 없이 ${confirmationExecuted ? "확인 소비를 유지한 채 이어갑니다" : "읽기 전용 확인을 이어갑니다"}.`,
+          { confirmationResumed: checkpoint.revision, confirmationExecuted });
       }
       const askedText = recovered.accumulated.requestedUserDecision?.trim();
       const openRequests = checkpoint.openRequests.length === 0 && askedText
@@ -200,7 +211,8 @@ export class DeliveryPipeline {
         : [...checkpoint.openRequests];
       // 확인 횟수: 예약(before-confirmation)은 실행이 아니다. 멈춘 뒤 새 결정이 올라왔으면 그 결정에 대해 확인 1회를 다시 허용한다(자동 무제한이
       // 아니라 사용자 결정 1건당 1회 — "결정을 올리고 재시도" 안내가 실제로 통하게, CF-05).
-      const confirmations = checkpoint.phase === "before-confirmation" ? Math.max(0, checkpoint.confirmations - 1)
+      const confirmations = checkpoint.phase === "before-confirmation"
+        ? (confirmationExecuted ? checkpoint.confirmations : Math.max(0, checkpoint.confirmations - 1))
         : (checkpoint.phase === "paused" && newInput ? 0 : checkpoint.confirmations);
       seed = { base: recovered.accumulated, openRequests, verifiedLedger: [...recovered.verifiedLedger], confirmations };
       this.core.event(topicId, "system", "system",
@@ -273,27 +285,12 @@ export class DeliveryPipeline {
       const verdict = completionVerdict(state.base, { openRequests: state.openRequests, decisionAfterRequest: this.decisionAfter(topic, state.openRequests) });
       if (verdict.kind === "completed") {
         if (!freshlyVerified) {
-          const reverified = await this.enforceTolerance({
-            topicId, topic: db.getTopic(topicId), plan: setup.plan, result: state.base, sessionId, signal, inputSequence: setup.inputSequence,
-            resumeState: setup.work.resumeState, check: setup.check, baselineHead: setup.baselineHead, readablePaths: setup.readablePaths,
-            previousLedger: state.verifiedLedger, expected, writeGuards, openRequests: state.openRequests,
-          });
-          if (!reverified) {
-            await this.core.checkpoints.record(topic, {
-              work, phase: "paused", accumulated: state.base, verifiedLedger: state.verifiedLedger, inputSequence: setup.inputSequence,
-              openRequests: state.openRequests, confirmations: state.confirmations,
-            }, signal);
-            return;
-          }
-          // 재대조가 쓰기 교정을 열었을 수 있다 — 교정 응답은 요청·증거·원장까지 누적됐고 상태가 바뀌었을 수 있으므로 **다시 판정**한다(CF-02).
-          const acc = accumulate(state.base, reverified, state.openRequests, setup.inputSequence);
-          this.reportAccumulation(topicId, acc);
-          state = { ...state, base: acc.result, openRequests: acc.openRequests, verifiedLedger: [...(reverified.toleranceLedger ?? [])] };
+          // 재대조는 새 턴과 같은 흡수 경로(absorbTurn)를 지난다 — 재대조가 연 허용 오차 교정과 그 안의 계약 교정도 같은 checkpoint·누적 계약을 받고,
+          // 교정 응답(요청·증거·원장·상태)은 누적된 뒤 **다시 판정**된다(CF-02·CF-04 잔여).
+          const reverified = await this.absorbTurn(setup, work, state, state.base, sessionId, expected, writeGuards, signal, state.confirmations);
+          if (!reverified) return;
+          state = reverified;
           freshlyVerified = true;
-          await this.core.checkpoints.record(topic, {
-            work, phase: "verified", accumulated: state.base, verifiedLedger: state.verifiedLedger, inputSequence: setup.inputSequence,
-            openRequests: state.openRequests, confirmations: state.confirmations,
-          }, signal);
           continue;
         }
         await this.acceptWork(setup, work, state, verdict, signal);
@@ -344,7 +341,7 @@ export class DeliveryPipeline {
         return;
       }
       state = { ...state, confirmations: 1 };
-      await this.core.checkpoints.record(topic, {
+      const reservation = await this.core.checkpoints.record(topic, {
         work, phase: "before-confirmation", accumulated: state.base, verifiedLedger: state.verifiedLedger, inputSequence: setup.inputSequence,
         openRequests: state.openRequests, confirmations: 1,
       }, signal);
@@ -359,6 +356,8 @@ export class DeliveryPipeline {
         prompt: buildStatusConfirmationPrompt({ kind: setup.kind, reason: verdict.message, accumulated: state.base, planPath: setup.planPath, openRequests: state.openRequests, decisionsSince }),
         settings: { ...this.core.executionSettings(topicId, "claude", true), effort: "low" },
       });
+      // 실행 기록(영속): 확인 호출이 끝났다 — 결과 checkpoint 저장이 실패해 재개돼도 이 예약을 미실행으로 환급하지 않는다(CF-05 잔여).
+      this.core.event(topicId, "system", "system", `완료 상태 확인 턴 실행 완료(checkpoint #${reservation.revision}).`, { confirmationExecuted: reservation.revision });
       const parsed = AgentResultSchema.safeParse(confirmed.result);
       if (!parsed.success || parsed.data.kind !== setup.kind) {
         this.core.event(topicId, "system", "system", "확인 턴 응답이 계약을 어겨 상태를 확정하지 못했습니다(보존).", { confirmationInvalid: true });
@@ -390,6 +389,8 @@ export class DeliveryPipeline {
   private async absorbTurn(
     setup: WorkSetup, work: WorkBinding, state: WorkSeed, raw: AgentResult, sessionId: string,
     expected: TurnExpectation, writeGuards: WriteGuards, signal: AbortSignal,
+    // 새 턴 응답이면 0(결과마다 확인 1회), 재대조(같은 결과)면 지금 값을 유지한다.
+    confirmations = 0,
   ): Promise<WorkState | null> {
     const { topicId, topic } = setup;
     // 누적의 입력은 항상 **최신** 누적본이다 — 계약 교정·허용 오차 교정이 같은 normalizer 를 다시 부를 때 턴 시작 전 상태로 되돌아가면 앞 응답이
@@ -399,7 +400,7 @@ export class DeliveryPipeline {
     const first = salvaged(raw);
     await this.core.checkpoints.record(topic, {
       work, phase: "turn-result", raw, accumulated: first.result, verifiedLedger: state.verifiedLedger, inputSequence: setup.inputSequence,
-      openRequests: first.openRequests, confirmations: 0,
+      openRequests: first.openRequests, confirmations,
     }, signal);
     let last: Accumulation | null = null;
     const latestRequests = () => (last as Accumulation | null)?.openRequests ?? first.openRequests;
@@ -418,7 +419,7 @@ export class DeliveryPipeline {
         const acc = salvaged(rejected);
         await this.core.checkpoints.record(topic, {
           work, phase: "before-contract-correction", raw: rejected, accumulated: acc.result, verifiedLedger: state.verifiedLedger,
-          inputSequence: setup.inputSequence, openRequests: acc.openRequests, confirmations: 0, pendingCorrection: "contract",
+          inputSequence: setup.inputSequence, openRequests: acc.openRequests, confirmations, pendingCorrection: "contract",
         }, signal);
       },
     });
@@ -431,15 +432,23 @@ export class DeliveryPipeline {
       beforeCorrection: async (original) => {
         await this.core.checkpoints.record(topic, {
           work, phase: "before-tolerance-correction", raw: original, accumulated: original, verifiedLedger: state.verifiedLedger,
-          inputSequence: setup.inputSequence, openRequests: latestRequests(), confirmations: 0, pendingCorrection: "tolerance",
+          inputSequence: setup.inputSequence, openRequests: latestRequests(), confirmations, pendingCorrection: "tolerance",
+        }, signal);
+      },
+      // 허용 오차 교정 응답의 계약 교정(중첩) 직전에도 최신 누적본(교정 응답이 낸 새 질문 포함)을 보존한다(CF-04 잔여).
+      beforeNestedCorrection: async (rejected) => {
+        const acc = salvaged(rejected);
+        await this.core.checkpoints.record(topic, {
+          work, phase: "before-contract-correction", raw: rejected, accumulated: acc.result, verifiedLedger: state.verifiedLedger,
+          inputSequence: setup.inputSequence, openRequests: acc.openRequests, confirmations, pendingCorrection: "contract",
         }, signal);
       },
     });
     if (!checked) {
       // 허용 오차 위반이 남아 정지했다 — 마지막 누적본을 보존한다(인터럽트는 enforceTolerance 가 했다).
       await this.core.checkpoints.record(topic, {
-        work, phase: "paused", accumulated: contracted, verifiedLedger: state.verifiedLedger, inputSequence: setup.inputSequence,
-        openRequests: latestRequests(), confirmations: 0,
+        work, phase: "paused", accumulated: (last as Accumulation | null)?.result ?? contracted, verifiedLedger: state.verifiedLedger, inputSequence: setup.inputSequence,
+        openRequests: latestRequests(), confirmations,
       }, signal);
       return null;
     }
@@ -448,11 +457,11 @@ export class DeliveryPipeline {
     const acc = last as Accumulation | null;
     if (acc) this.reportAccumulation(topicId, acc);
     const next: WorkState = {
-      base: checked, openRequests: latestRequests(), verifiedLedger: [...(checked.toleranceLedger ?? [])], confirmations: 0,
+      base: checked, openRequests: latestRequests(), verifiedLedger: [...(checked.toleranceLedger ?? [])], confirmations,
     };
     await this.core.checkpoints.record(topic, {
       work, phase: "verified", accumulated: next.base, verifiedLedger: next.verifiedLedger, inputSequence: setup.inputSequence,
-      openRequests: next.openRequests, confirmations: 0,
+      openRequests: next.openRequests, confirmations,
     }, signal);
     return next;
   }
@@ -506,14 +515,21 @@ export class DeliveryPipeline {
       work, phase: "accepted", accumulated: base, verifiedLedger: state.verifiedLedger, inputSequence: setup.inputSequence,
       openRequests: state.openRequests, confirmations: state.confirmations, acceptId: accepting.revision, worktree,
     }, signal);
-    // 채택·전이 직전의 현재성 검사 — 저장하는 사이 새 결정·증거가 왔으면 결과는 보존됐지만 채택하지 않는다(CF-01). 재개는 수락 checkpoint 를
-    // 보고 반영할 쓰기 턴을 연다.
-    if (this.core.interruptForNewUserInput(topic, setup.inputSequence)) {
-      this.core.event(topic.id, "system", "system", "수락 절차 도중 새 결정·증거가 도착해 채택·전이를 멈췄습니다(결과·산출물은 보존됨) — 재시도가 결정을 반영하는 턴을 엽니다.",
-        { acceptInterrupted: accepting.revision });
+    await this.completeAcceptance(setup, acceptResult(base, verdict), accepting.revision, setup.inputSequence);
+  }
+
+  // 수락의 마지막 경계(정상·복구 공통): 비동기 저장(persist) 을 전부 끝낸 뒤 **동기**로 새 결정·증거를 검사하고, 같은 동기 구간에서 상태를 전이한다.
+  // 검사와 전이 사이에 await 가 없다 — 늦게 도착한 결정이 전이를 타고 넘어갈 틈이 없다(CF-01 잔여). 새 입력이면 결과·산출물은 보존한 채 멈추고
+  // 재개가 수락 checkpoint 를 보고 반영 턴을 연다.
+  private async completeAcceptance(setup: WorkSetup, accepted: AcceptedResult, acceptId: number, inputSequence: number): Promise<void> {
+    await setup.accept.persist(accepted, acceptId);
+    if (this.core.interruptForNewUserInput(setup.topic, inputSequence)) {
+      this.core.event(setup.topic.id, "system", "system", "수락 절차 도중 새 결정·증거가 도착해 채택·전이를 멈췄습니다(결과·산출물은 보존됨) — 재시도가 결정을 반영하는 턴을 엽니다.",
+        { acceptInterrupted: acceptId });
       return;
     }
-    await setup.onAccepted(acceptResult(base, verdict), accepting.revision);
+    if (!setup.accept.transition(accepted, acceptId)) return;
+    await setup.accept.continue(accepted);
   }
 
   // 결정·증거 중 checkpoint 이후의 것(같은 세대).
@@ -537,12 +553,14 @@ export class DeliveryPipeline {
     if (checkpoint.phase === "accepting") {
       // 산출물·메모리·이벤트는 한 묶음(saveAgentOutput) — 이벤트가 없으면 다시 돈다. 메모리 갱신은 expectedSHA256 으로 두 번 적용되지 않는다.
       if (!outputRecorded) await this.core.saveAgentOutput(topic, "claude", base, setup.resultKind, signal, { acceptId });
+      // 검증된 워킹트리 스냅샷은 복구 저장에도 그대로 남긴다 — 빠지면 다음 재개가 "트리 변경" 으로 보고 같은 결과를 새 acceptId 로 다시 수락한다(CF-01 회귀).
       await this.core.checkpoints.record(topic, {
         work: checkpoint.work, phase: "accepted", accumulated: base, verifiedLedger: checkpoint.verifiedLedger, inputSequence: checkpoint.inputSequence,
-        openRequests: checkpoint.openRequests, confirmations: checkpoint.confirmations, acceptId,
+        openRequests: checkpoint.openRequests, confirmations: checkpoint.confirmations, acceptId, worktree: checkpoint.worktree,
       }, signal);
     }
-    await setup.onAccepted(acceptResult(base, verdict), acceptId);
+    // 복구 수락도 같은 마지막 경계를 지난다 — 이 재개 action 이 시작된 뒤(checkpoint 이후) 도착한 입력은 recovery 진입에서 걸렀고, 저장 사이에 온 것은 여기서 건다.
+    await this.completeAcceptance(setup, acceptResult(base, verdict), acceptId, checkpoint.inputSequence);
   }
 
   // 최종 리뷰 신규 쟁점 인터럽트(payload.finalReviewNewFindingIDs) 뒤에 사용자 결정이 도착했으면
@@ -938,7 +956,7 @@ export class DeliveryPipeline {
       persistSession: (sessionId) => this.core.dependencies.database.setImplementationSession(topicId, sessionId),
       initialTurn: true,
       legacyBase: async () => ({ base: await this.legacyPendingOriginal(topicId, topic, "CLAUDE_FIX"), ledger: await this.legacyAcceptedLedger(topicId) }),
-      onAccepted: async (accepted) => { await this.finishFix(topicId, topic, review, accepted, secondPass, signal); },
+      accept: this.fixAcceptance(topicId, topic, review, secondPass, signal),
     }, signal);
   }
 
@@ -949,33 +967,33 @@ export class DeliveryPipeline {
     return `${kind}#${this.core.dependencies.database.latestArtifact(topicId, kind)?.revision ?? 0}`;
   }
 
-  // 수정 결과가 확정된 뒤의 공통 꼬리: 되돌림 가드(결정으로 뒤집힌 쟁점 제외) → 회차 소비 + 최종 리뷰 전이(한 트랜잭션) → 최종 리뷰.
-  // AcceptedResult 만 받는다 — 완료 판정을 거치지 않은 결과는 타입이 막는다.
-  private async finishFix(
-    topicId: string, topic: Topic, review: AgentResult, fixResult: AcceptedResult, secondPass: boolean, signal: AbortSignal,
-  ): Promise<void> {
-    const overruled = this.userOverruledFindings(topic, secondPass ? "codex-final-review" : "codex-review", review.findings);
-    this.noteOverruled(topicId, overruled, review.findings, fixResult.findings);
-    const downgraded = dispositionRegressions(review.findings, fixResult.findings, overruled);
-    if (downgraded.length > 0) {
-      this.core.interrupt(
-        topicId,
-        "USER_DECISION_REQUIRED",
-        `수정 단계가 고치기로 합의한 쟁점의 처분을 되돌렸습니다(${downgraded.join(", ")}). 최종 리뷰로 넘기지 않았습니다.`,
-        "CLAUDE_FIX",
-      );
-      return;
-    }
-    // 회차 소비와 상태 전이는 한 트랜잭션이다 — 그 사이에서 종료되면 회차만 소비되거나 전이만 된 채 남는다(PLAN §2 검증 조건 3).
-    const current = this.core.dependencies.database.getTopic(topicId);
-    assertTransition(current.state, "CODEX_FINAL_REVIEW");
-    this.core.dependencies.database.applyTopicTransition({
-      topicId,
-      changes: { ...(secondPass ? { secondFixPassUsed: true } : { fixPassUsed: true }), state: "CODEX_FINAL_REVIEW", lastError: null, resumeState: null },
-      events: [{ actor: "system", kind: "system", state: "CODEX_FINAL_REVIEW", body: "Codex가 수정 결과를 마지막으로 검토합니다.",
-        payload: { from: current.state, to: "CODEX_FINAL_REVIEW", fixPassConsumed: secondPass ? 2 : 1 } }],
-    });
-    await this.runReview(topicId, signal, true);
+  // 수정 수락의 세 부분: persist 없음 → transition = 되돌림 가드(결정으로 뒤집힌 쟁점 제외) + 회차 소비 + 최종 리뷰 전이(한 트랜잭션, 동기) →
+  // continue = 최종 리뷰. AcceptedResult 만 받는다 — 완료 판정을 거치지 않은 결과는 타입이 막는다.
+  private fixAcceptance(topicId: string, topic: Topic, review: AgentResult, secondPass: boolean, signal: AbortSignal): WorkSetup["accept"] {
+    return {
+      persist: async () => undefined,
+      transition: (fixResult: AcceptedResult) => {
+        const overruled = this.userOverruledFindings(topic, secondPass ? "codex-final-review" : "codex-review", review.findings);
+        this.noteOverruled(topicId, overruled, review.findings, fixResult.findings);
+        const downgraded = dispositionRegressions(review.findings, fixResult.findings, overruled);
+        if (downgraded.length > 0) {
+          this.core.interrupt(topicId, "USER_DECISION_REQUIRED",
+            `수정 단계가 고치기로 합의한 쟁점의 처분을 되돌렸습니다(${downgraded.join(", ")}). 최종 리뷰로 넘기지 않았습니다.`, "CLAUDE_FIX");
+          return false;
+        }
+        // 회차 소비와 상태 전이는 한 트랜잭션이다 — 그 사이에서 종료되면 회차만 소비되거나 전이만 된 채 남는다(PLAN §2 검증 조건 3).
+        const current = this.core.dependencies.database.getTopic(topicId);
+        assertTransition(current.state, "CODEX_FINAL_REVIEW");
+        this.core.dependencies.database.applyTopicTransition({
+          topicId,
+          changes: { ...(secondPass ? { secondFixPassUsed: true } : { fixPassUsed: true }), state: "CODEX_FINAL_REVIEW", lastError: null, resumeState: null },
+          events: [{ actor: "system", kind: "system", state: "CODEX_FINAL_REVIEW", body: "Codex가 수정 결과를 마지막으로 검토합니다.",
+            payload: { from: current.state, to: "CODEX_FINAL_REVIEW", fixPassConsumed: secondPass ? 2 : 1 } }],
+        });
+        return true;
+      },
+      continue: async () => { await this.runReview(topicId, signal, true); },
+    };
   }
 
   // 멈춘 수정 결과 재사용(2026-09-07, 계획·최종 리뷰 재사용과 같은 계열): 저장된 claude-fix 가 지금 고치는 리뷰보다 뒤이고, 그 뒤 사용자 decision 이 있고,
@@ -1046,7 +1064,7 @@ export class DeliveryPipeline {
       prompts: () => ({ fresh: "", resume: "" }),
       sessionId: flags.implementationSessionId, persistSession: () => undefined, initialTurn: false,
       legacyBase: async () => ({ base: fixResult, ledger: [...(fixResult.toleranceLedger ?? [])] }),
-      onAccepted: async (accepted) => { await this.finishFix(topicId, topic, review, accepted, secondPass, signal); },
+      accept: this.fixAcceptance(topicId, topic, review, secondPass, signal),
     }, signal);
     return true;
   }
@@ -1089,6 +1107,8 @@ export class DeliveryPipeline {
     expected: TurnExpectation; writeGuards: WriteGuards;
     openRequests?: readonly OpenRequest[];
     beforeCorrection?: (original: AgentResult) => Promise<void>;
+    // 허용 오차 교정 응답이 계약을 어겨 다시 교정할 때(중첩), 그 호출 직전에 부른다.
+    beforeNestedCorrection?: (rejected: AgentResult, violation: string) => Promise<void>;
   }): Promise<AgentResult | null> {
     const policy = parseTolerancePolicy(input.plan);
     if (!policy) return input.result;
@@ -1140,7 +1160,7 @@ export class DeliveryPipeline {
       };
       const contracted = await this.core.enforceResultContract("claude", input.topic, corrected, input.sessionId, {
         signal: input.signal, implementation: true, planMode: false, startedAfter: input.inputSequence, check: input.check,
-        readablePaths: input.readablePaths, normalize: mergeNormalizer, writeGuards: input.writeGuards,
+        readablePaths: input.readablePaths, normalize: mergeNormalizer, writeGuards: input.writeGuards, beforeCorrection: input.beforeNestedCorrection,
       });
       if (preservedParts.length > 0) {
         this.core.event(input.topicId, "system", "system",
