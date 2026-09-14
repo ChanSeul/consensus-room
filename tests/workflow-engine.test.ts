@@ -3741,6 +3741,7 @@ describe("허용 오차 개정(amend-tolerance)", () => {
     const plan = await artifacts.readLatest("topic-1", "plan");
     expect(parseTolerancePolicy(plan!)?.rules.map((rule) => rule.id)).toEqual(["T-5"]);
     expect(database.latestArtifact("topic-1", "plan")?.revision).toBe(3);
+    for (const participant of database.getTopic("topic-1").participants) expect(participant.acknowledgedPlanSHA256).toBe(topic.planSHA256);
     const event = database.getTimeline("topic-1").filter((e) => e.kind === "decision").at(-1)!;
     expect(event.body).toContain("추가 규칙: T-5");
     expect(event.payload?.toleranceAmendment).toMatchObject({ addedRules: ["T-5"], planSHA256: topic.planSHA256 });

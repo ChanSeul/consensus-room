@@ -423,6 +423,12 @@ export class WorkflowEngine {
     const addedRules = parsed.data.rules.filter((rule) => !previous.rules.some((old) => old.id === rule.id)).map((rule) => rule.id);
     const addedScope = parsed.data.scopePaths.filter((path) => !previous.scopePaths.includes(path));
     db.updateTopic(topicId, { planSHA256: sha256, approvedPlanSHA256: sha256 });
+    // 두 에이전트의 계획 확인(acknowledgedPlanSHA256)도 새 sha 로 옮긴다 — 개정은 허용 오차 블록만 넓힌 중재자 결정이고,
+    // 그 내용은 decision 이벤트와 planPath 로 다음 프롬프트에 실린다. 안 옮기면 재개가 "같은 계획 버전을 확인하지 않았습니다" 로 죽는다(2026-09-14 실측).
+    for (const participant of topic.participants) {
+      if (participant.acknowledgedPlanSHA256 === topic.approvedPlanSHA256 || participant.acknowledgedPlanSHA256 === topic.planSHA256)
+        db.upsertParticipant(topicId, { ...participant, acknowledgedPlanSHA256: sha256 });
+    }
     this.core.event(topicId, "user", "decision",
       `허용 오차 개정(넓히기, 중재자 결정) — 계획 산출물 ${revision}판 ${sha256.slice(0, 12)}…\n추가 규칙: ${addedRules.join(", ") || "없음"} · 추가 scopePaths: ${addedScope.join(", ") || "없음"}\n\n${input.reason}`,
       { toleranceAmendment: { addedRules, addedScope, previousPlanSHA256: topic.planSHA256, planSHA256: sha256, artifactRevision: artifact.revision },
