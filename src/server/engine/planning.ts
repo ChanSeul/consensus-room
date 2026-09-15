@@ -7,8 +7,10 @@ import {
   buildClaudeRevisionPrompt,
   buildCodexAuditPrompt,
   buildCodexCloseoutPrompt,
+  buildDiagnosisPlanRevisionPrompt,
   buildPlanAckPrompt,
 } from "../../shared/prompts.js";
+import { applyInfo, diagnosisFinding, type DiagnosisRecord } from "../../shared/diagnoses.js";
 import {
   assertDispositionsResolved,
   assertFindingCoverage,
@@ -21,7 +23,9 @@ import {
   isSettledFinding,
   newFindingIDs,
   normalizePlan,
-  redactSecrets, replanDirective } from "../../shared/workflow.js";
+  redactSecrets, replanDirective,
+  salvageResultFields,
+} from "../../shared/workflow.js";
 import type { EngineCore } from "./core.js";
 import { preparePlanningContext } from "./planningContext.js";
 
@@ -60,6 +64,97 @@ export class PlanningPipeline {
     if (this.core.interruptForLatestTurnInput(topic)) return;
 
     await this.runPlanningFromAudit(topicId, claudePlan, storedFirstPlan, signal);
+  }
+
+  // ---- 중재자 진단의 계획 개정(2026-09-14 진단 계획 §2) -------------------------------------------------------------------
+  // 계획 변경이 필요한 진단을 적용하면 공통 재시도 사다리의 첫 분기가 여기로 온다. 승인 계획(승계 기록의 기준본)을 진단·현재 코드·남은 작업에 맞춰 고친
+  // 개정 계획을 저장하고(승인·ACK 무효화·새 주기 회차 초기화 — markPlanRevised, 한 transaction), 기존 감사 → 개정 → 종결 → ACK → 사용자 승인으로 넘긴다.
+  // 작업 트리·브랜치·구현 기준 커밋·미커밋 변경·구현 세션은 건드리지 않는다(범위 변경 경로가 아니다). 원 응답은 diagnosis-plan-revision, 개정본 전문을
+  // 담은 PLAN 결과는 claude-plan 으로 저장한다 — 감사·재개 사다리(pausedPlanReusable·resumePlanningAtAudit)가 그대로 읽는다.
+  async runDiagnosisPlanRevision(topicId: string, signal: AbortSignal): Promise<void> {
+    let topic = this.core.dependencies.database.getTopic(topicId);
+    this.core.requireParticipants(topic);
+    const record = this.core.diagnoses.pendingPlanRevision(topicId);
+    if (!record) throw new Error("진단 계획 개정을 열 계획 변경 진단이 없습니다.");
+    const carry = await this.core.diagnoses.planRevisionCarry(record);
+    if (hashPlan(carry.basePlan) !== carry.basePlanSHA256) throw new Error(`계획 변경 진단 ${record.id} 의 기준 계획 해시가 맞지 않습니다(승계 기록 손상).`);
+    const delivered = await this.core.diagnoses.prompts([record]);
+    const carryPath = await this.core.diagnoses.carryPath(record);
+    const finding = diagnosisFinding(record);
+    const label = "Claude 계획 개정(중재자 진단)";
+    const salvaged = await this.salvagedRevisionAfterApply(topic, record);
+    topic = this.core.transition(topicId, "CLAUDE_PLAN",
+      `중재자 진단 ${record.id} 로 승인 계획을 개정합니다 — 작업 트리·브랜치·구현 기준 커밋·미커밋 변경은 그대로 둡니다. 개정 계획은 감사·종결 확인·ACK·사용자 승인을 거친 뒤에만 구현으로 돌아갑니다.`);
+    // 앞 개정 턴의 반박이 계약 교정 도중 끊겨 교정 원본에만 남았으면 새 턴을 열지 않고 기록한 뒤 중재자에게 돌려보낸다 — runWork 의 복구 시점 검사와 같은
+    // 규칙이다(2026-09-15 감사: retry 가 같은 지시로 개정 턴을 다시 사 재작성 한도를 소진했다).
+    if (salvaged) {
+      const recovered = this.core.diagnoses.returnedBy([record], salvaged);
+      if (recovered.length > 0) {
+        const message = this.core.diagnoses.recordReturned(topicId, recovered, "진단 계획 개정 턴(교정 도중 끊긴 응답)");
+        this.core.interrupt(topicId, "USER_DECISION_REQUIRED", message, "CLAUDE_PLAN", { diagnosisReturned: recovered.map((item) => item.record.id) });
+        return;
+      }
+    }
+    const revision = await this.core.turn("claude", topic, buildDiagnosisPlanRevisionPrompt({
+      planMarkdown: carry.basePlan, scopeGeneration: topic.scopeGeneration, worktreePath: topic.worktreePath, branchName: topic.branchName ?? "-",
+      diagnoses: delivered.prompts,
+      carry: {
+        remainingSteps: carry.remainingSteps, openRequests: carry.openRequests, changedPaths: carry.changedPaths,
+        lastSummary: carry.lastSummary, verifiedLedgerRows: carry.verifiedLedger.length,
+      },
+      timeline: this.core.dependencies.database.getPromptTimeline(topicId, topic.scopeGeneration),
+    }), signal, false, {
+      // 일회용 세션·계획 모드(읽기 전용). 재작성 집계는 revision — 승인 계획의 개정이라 무료 최초 계획 자격을 쓰지 않는다.
+      freshSession: true, planMode: true, planBase: carry.basePlan, planningWrite: "revision",
+      // 교정 대기본(pending-contract-repair)은 이 진단의 이 적용 시도에만 결속한다 — 정정한 새 진단의 개정 턴이 앞 진단의 응답을 재사용해 새 진단 원문이
+      // 러너에게 한 번도 전달되지 않았다(2026-09-15 감사 2차).
+      repairContextKey: `diagnosis-plan-revision:${record.id}#${applyInfo(record)?.seq ?? 0}`,
+      readablePaths: [...delivered.paths, ...(carryPath ? [carryPath] : [])],
+      check: (r) => {
+        this.core.assertKind(r, "REVISION");
+        assertFindingCoverage([finding], r.findings, label);
+        assertDispositionsResolved([finding], r, label);
+        const verdict = r.findings.find((item) => item.id === record.id);
+        if (!verdict || verdict.disposition !== "AGREED_ACTION" || verdict.requiresUserDecision || this.core.resultRequestsPause(r)) return;
+        const revised = this.core.requireRevisedPlan(r, carry.basePlan);
+        if (normalizePlan(revised) === normalizePlan(carry.basePlan)) {
+          throw new Error(`계획 변경이 필요한 진단 ${record.id} 를 AGREED_ACTION 으로 처분했지만 개정이 계획을 바꾸지 않았습니다 — 진단이 요구하는 변경을 planLineEdits 로 반영하거나, 변경이 필요 없다고 판단하면 REFUTED 로 처분하세요.`);
+        }
+      },
+    });
+    // 반박·증거 요청은 계획을 고치지 않고 중재자에게 돌아간다(같은 지시를 자동으로 반복하지 않는다). 기록은 산출물 저장보다 먼저다 — 저장 도중 끊겨도
+    // 반박을 잃지 않는다(2026-09-15 감사). 인터럽트는 저장 뒤다(인터럽트 뒤의 쓰기는 늦은 산출물로 버려진다).
+    const returned = this.core.diagnoses.returnedBy([record], revision);
+    const returnMessage = returned.length > 0 ? this.core.diagnoses.recordReturned(topicId, returned, "진단 계획 개정 턴") : null;
+    await this.core.saveAgentOutput(topic, "claude", revision, "diagnosis-plan-revision", signal, { diagnosisPlanRevision: record.id });
+    if (returnMessage) {
+      this.core.interrupt(topicId, "USER_DECISION_REQUIRED", returnMessage, "CLAUDE_PLAN", { diagnosisReturned: returned.map((item) => item.record.id) });
+      return;
+    }
+    if (this.core.pauseForResult(topicId, revision, "CLAUDE_PLAN", "계획 개정에 사용자 결정이나 외부 증거가 필요합니다.")) return;
+    const revised = this.core.requireRevisedPlan(revision, carry.basePlan);
+    const planResult: AgentResult = {
+      kind: "PLAN", summary: revision.summary, findings: revision.findings, evidenceRefs: revision.evidenceRefs, planMarkdown: revised,
+    };
+    await this.core.writeArtifact(topic, "claude-plan", this.core.dependencies.database.timelineCount(topicId) + 1, JSON.stringify(planResult, null, 2), signal);
+    const stored = await this.saveDiagnosisRevisedPlan(topic, revised, record, carry.basePlanSHA256, signal);
+    if (this.core.interruptForLatestTurnInput(topic)) return;
+    await this.runPlanningFromAudit(topicId, planResult, stored, signal);
+  }
+
+  private async saveDiagnosisRevisedPlan(
+    topic: Topic, markdown: string, record: DiagnosisRecord, previousPlanSHA256: string, signal: AbortSignal,
+  ): Promise<{ markdown: string; sha256: string }> {
+    assertPlanContract(markdown);
+    const normalized = normalizePlan(normalizeToleranceBlocks(redactSecrets(markdown)));
+    // 계획 산출물 revision 은 증가 순서로 둔다(허용 오차 개정이 planRevision 과 무관하게 올린다). planRevision 은 판 번호(표시)다.
+    const artifactRevision = this.core.dependencies.database.latestArtifactRevision(topic.id, "plan") + 1;
+    const artifact = await this.core.writeArtifact(topic, "plan", artifactRevision, normalized, signal);
+    this.core.assertCurrent(topic.id, signal, topic.scopeGeneration, topic.state);
+    this.core.diagnoses.markPlanRevised(topic, record, {
+      planRevision: topic.planRevision + 1, sha256: artifact.sha256, previousPlanSHA256, artifactRevision: artifact.revision,
+    });
+    return { markdown: normalized, sha256: artifact.sha256 };
   }
 
   // 계획 턴이 requestedUserDecision 으로 멈춘 뒤(claude-plan 산출물은 저장됨) 사용자 결정이 올라왔으면, 그 계획을
@@ -158,6 +253,32 @@ export class PlanningPipeline {
     return { markdown, sha256: hashPlan(markdown) };
   }
 
+  // 진단 계획 개정이 저장된 직후(감사 전)에 멈췄으면 저장된 개정 계획으로 감사부터 잇는다 — 개정 턴을 다시 사지 않고, 전체 재계획으로 떨어져 저장된 개정을
+  // 버리지도 않는다(2026-09-15 감사). 멈춘 상태에서 감사로 곧장 가는 전이가 없으므로 계획 턴 단계를 거친다.
+  async resumeSavedDiagnosisRevision(topicId: string, signal: AbortSignal): Promise<void> {
+    this.core.transition(topicId, "CLAUDE_PLAN", "저장된 진단 개정 계획으로 감사부터 이어갑니다 — 개정 턴을 다시 사지 않습니다.");
+    await this.resumePlanningAtAudit(topicId, signal);
+  }
+
+  // 이 진단의 마지막 적용 뒤, 같은 세대·같은 기준 계획으로 계약 교정에 들어간 개정 응답(교정 원본) — 교정이 끝나기 전에 끊겼으면 이것만 남는다.
+  private async salvagedRevisionAfterApply(topic: Topic, record: DiagnosisRecord): Promise<AgentResult | null> {
+    const applied = [...record.history].reverse().find((entry) => entry.status === "applied");
+    const artifact = this.core.dependencies.database.latestArtifact(topic.id, "contract-repair-source");
+    if (!applied || !artifact || artifact.createdAt < applied.at) return null;
+    // 교정이 끝나 개정 턴 결과가 저장됐으면(교정 재제출이 반박을 철회했을 수 있다) 교정 원본을 재생하지 않는다 — 원본은 교정 도중 끊긴 경우에만 쓴다
+    // (2026-09-15 감사 2차: 교정이 결정 요청으로 멈춘 뒤 retry 가 철회된 반박을 refuted 로 기록했다).
+    const completed = this.core.dependencies.database.latestArtifact(topic.id, "diagnosis-plan-revision");
+    if (completed && completed.createdAt >= artifact.createdAt) return null;
+    try {
+      const raw = await this.core.dependencies.artifacts.readLatest(topic.id, "contract-repair-source");
+      const parsed = raw ? JSON.parse(raw) as { state?: string; scopeGeneration?: number; planSHA256?: string | null; original?: unknown } : null;
+      if (!parsed || parsed.state !== "CLAUDE_PLAN" || parsed.scopeGeneration !== topic.scopeGeneration || parsed.planSHA256 !== topic.planSHA256) return null;
+      return salvageResultFields(parsed.original, "REVISION");
+    } catch {
+      return null;
+    }
+  }
+
   async resumePlanningAtAudit(topicId: string, signal: AbortSignal): Promise<void> {
     this.core.requireParticipants(this.core.dependencies.database.getTopic(topicId));
     const stored = await this.storedPlanForResume(topicId);
@@ -173,6 +294,8 @@ export class PlanningPipeline {
   ): Promise<void> {
     let topic = this.core.transition(topicId, "CODEX_AUDIT", "Codex가 계획을 읽기 전용으로 감사합니다.");
     const context = await preparePlanningContext(this.core, topic, storedFirstPlan.markdown, storedFirstPlan.sha256);
+    // 진단 계획 개정 뒤의 감사면 진단 원문·이전 승인 계획·이미 바뀐 파일을 함께 싣는다(구현 도중의 개정).
+    const revisionContext = await this.core.diagnoses.revisionAuditContext(topicId);
     const prompt = buildCodexAuditPrompt({
       title: topic.title, planMarkdown: context.text, planSHA256: storedFirstPlan.sha256,
       scopeGeneration: topic.scopeGeneration,
@@ -180,9 +303,10 @@ export class PlanningPipeline {
       planningContextMode: context.mode,
       claudePlan,
       deferredFindings: await this.core.deferredFindingsFor(topicId),
+      diagnosisRevision: revisionContext?.context,
     });
     const audit = await this.core.turn("codex", topic, prompt, signal, false, {
-      readablePaths: context.readablePaths,
+      readablePaths: [...context.readablePaths, ...(revisionContext?.paths ?? [])],
       normalize: this.core.carryForwardNormalizer(claudePlan.findings, "Codex audit", { forReview: true }),
       check: (r) => {
         this.core.assertKind(r, "AUDIT");
@@ -287,7 +411,8 @@ export class PlanningPipeline {
     await this.core.saveAgentOutput(topic, "claude", revision, "claude-revision", signal);
     if (this.core.pauseForResult(topicId, revision, "CLAUDE_REVISION", "계획을 고치려면 사용자 결정이나 외부 증거가 필요합니다.")) return;
     if (revisedPlan === null) throw new Error("개정 검증 경로 불변식 위반: pause 예측이 어긋났습니다.");
-    const storedRevisedPlan = await this.savePlan(topic, revisedPlan, 2, signal);
+    // 판 번호는 앞으로만 간다 — 진단 계획 개정 뒤의 감사 답변 개정이 판 번호를 2로 되돌리지 않게(첫 주기는 종전대로 2판).
+    const storedRevisedPlan = await this.savePlan(topic, revisedPlan, Math.max(2, topic.planRevision + 1), signal);
     if (this.core.interruptForLatestTurnInput(topic)) return;
 
     await this.runPlanningFromCloseout(topicId, revision, storedRevisedPlan, signal);

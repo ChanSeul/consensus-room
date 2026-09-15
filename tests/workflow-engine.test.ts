@@ -1423,6 +1423,31 @@ function makePlanningEngine(input: {
   return { database, artifacts, engine, claude, codex };
 }
 
+// 수락된 수정 결과의 기록 — 실제 엔진은 수락 경로에서 accepting checkpoint(acceptId = 그 revision)를 쓰고, 수정 출력(agent_output, payload.acceptId)을
+// 남긴 뒤 CLAUDE_FIX → 최종 리뷰로 전이한다. 계약 없는 최종 리뷰의 대조 보고는 이 기록이 있는 수정 결과만 쓴다(2026-09-15 감사 4차 — claude-fix 산출물만으로는
+// 반박으로 멈추며 저장한 결과와 구별되지 않는다).
+async function recordAcceptedFix(database: ConsensusDatabase, artifacts: ArtifactStore, result: { findings: AgentResult["findings"] }) {
+  const topic = database.getTopic("topic-1");
+  await artifacts.write("topic-1", "work-checkpoint", 1, JSON.stringify({
+    kind: "work-checkpoint", version: 1, revision: 1, previous: null,
+    work: {
+      kind: "FIX", resumeState: "CLAUDE_FIX", scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch, planSHA256: topic.planSHA256,
+      sessionId: "claude-implementation-session", fixSource: "codex-review#1",
+    },
+    phase: "accepting", accumulated: result, verifiedLedger: [], next: { remainingSteps: [], pendingCorrection: null }, openRequests: [], confirmations: 0,
+    inputSequence: 0, at: "2026-08-23T00:00:00.000Z",
+  }, null, 2));
+  const output = database.appendEvent({
+    topicId: "topic-1", actor: "claude", kind: "agent_output", state: "CLAUDE_FIX", body: "검토할 구현 결과",
+    payload: { resultKind: "FIX", findings: result.findings, acceptId: 1 },
+  });
+  await artifacts.write("topic-1", "claude-fix", output.sequence, JSON.stringify(result));
+  database.appendEvent({
+    topicId: "topic-1", actor: "system", kind: "system", state: "CODEX_FINAL_REVIEW", body: "Codex가 수정 결과를 마지막으로 검토합니다.",
+    payload: { from: "CLAUDE_FIX", to: "CODEX_FINAL_REVIEW" },
+  });
+}
+
 async function makeReviewRecovery(input: {
   resumeState: "CLAUDE_FIX" | "CODEX_REVIEW" | "CODEX_FINAL_REVIEW";
   implementationFindings: AgentResult["findings"];
@@ -1468,13 +1493,14 @@ async function makeReviewRecovery(input: {
   }
   const artifacts = new ArtifactStore(join(root, "topics"), database);
   await artifacts.write("topic-1", "plan", 2, plan);
-  const implementationKind = input.resumeState === "CODEX_FINAL_REVIEW" ? "claude-fix" : "implementation-result";
-  await artifacts.write("topic-1", implementationKind, 1, JSON.stringify({
+  const implementation = {
     kind: input.resumeState === "CODEX_FINAL_REVIEW" ? "FIX" : "IMPLEMENTATION",
     summary: "검토할 구현 결과",
     findings: input.implementationFindings,
     evidenceRefs: [],
-  }));
+  };
+  if (input.resumeState === "CODEX_FINAL_REVIEW") await recordAcceptedFix(database, artifacts, implementation);
+  else await artifacts.write("topic-1", "implementation-result", 1, JSON.stringify(implementation));
   if (input.resumeState !== "CODEX_REVIEW") {
     await artifacts.write("topic-1", "codex-review", 1, JSON.stringify({
       kind: "REVIEW",
@@ -2363,7 +2389,7 @@ function makeGatedPlanningEngine(claude: AgentAdapter, codex: AgentAdapter) {
 // 2026-09-07 엔진 수정(Codex 2차 제안 ①②③ + 중재자 #7, 사용자 승인 "그렇게 해라"): 회차는 완주 시점에 소비,
 // 종료 시 실행 중 에이전트 정리, note 는 턴을 멈추지 않음, 사용자 결정이 id 로 뒤집은 처분은 가드 통과.
 describe("2026-09-07 엔진 수정: 회차 소비·종료 정리·메모 비중단·결정으로 뒤집힌 처분", () => {
-  it("#7 사용자 결정이 finding id 를 명시하면 최종 리뷰의 하향 처분이 가드에 걸리지 않고 전달 준비로 간다", async () => {
+  it("#7 사용자 결정이 줄 머리 OVERRULE <id> 로 지시하면 최종 리뷰의 하향 처분이 가드에 걸리지 않고 전달 준비로 간다(2026-09-15 감사 3차: 지시어로 한정)", async () => {
     const agreed = finding("F-ORIGINAL", "첫 리뷰가 고치기로 한 결함", { disposition: "AGREED_ACTION" });
     const overruled = finding("F-ORIGINAL", "첫 리뷰가 고치기로 한 결함", { disposition: "AGREED_NO_ACTION" });
     const { database, engine } = await makeReviewRecovery({
@@ -2372,9 +2398,9 @@ describe("2026-09-07 엔진 수정: 회차 소비·종료 정리·메모 비중�
       originalReviewFindings: [agreed],
       codexResult: { kind: "FINAL_REVIEW", summary: "결정대로 닫은 최종 리뷰", findings: [overruled], evidenceRefs: [] },
     });
-    // 첫 리뷰 산출물(revision 1) 뒤의 시퀀스를 만들고, 결정 본문에 id 를 통째로 적는다.
+    // 첫 리뷰 산출물(revision 1) 뒤의 시퀀스를 만들고, 결정 줄 머리에 OVERRULE 지시어로 id 를 적는다.
     await engine.postMessage("topic-1", "note", "참고 메모");
-    await engine.postMessage("topic-1", "decision", "`F-ORIGINAL` 은 중재자 예외로 확정한다(AGREED_NO_ACTION). 최종 리뷰는 이 결정을 따른다.");
+    await engine.postMessage("topic-1", "decision", "OVERRULE F-ORIGINAL\n`F-ORIGINAL` 은 중재자 예외로 확정한다(AGREED_NO_ACTION). 최종 리뷰는 이 결정을 따른다.");
 
     engine.retry("topic-1");
     await waitForActionCompletion(database, "topic-1");
@@ -2382,6 +2408,30 @@ describe("2026-09-07 엔진 수정: 회차 소비·종료 정리·메모 비중�
     expect(database.getTopic("topic-1").state).toBe("READY_TO_DELIVER");
     const bodies = database.getTimeline("topic-1").map((event) => event.body);
     expect(bodies.some((body) => body.includes("사용자 결정이 처분 변경을 허용한 쟁점: F-ORIGINAL(AGREED_ACTION → AGREED_NO_ACTION)"))).toBe(true);
+    database.close();
+  });
+
+  it("#7 OVERRULE 지시어 없이 id 를 언급만 한 결정은 하향 처분을 허용하지 않는다 — 수정을 요구하는 결정이 하향 허용으로 세지지 않는다(2026-09-15 감사 3차 #7)", async () => {
+    const agreed = finding("F-ORIGINAL", "첫 리뷰가 고치기로 한 결함", { disposition: "AGREED_ACTION" });
+    const overruled = finding("F-ORIGINAL", "첫 리뷰가 고치기로 한 결함", { disposition: "AGREED_NO_ACTION" });
+    const { database, engine } = await makeReviewRecovery({
+      resumeState: "CODEX_FINAL_REVIEW",
+      implementationFindings: [overruled],
+      originalReviewFindings: [agreed],
+      codexResult: { kind: "FINAL_REVIEW", summary: "결정을 오해해 닫은 최종 리뷰", findings: [overruled], evidenceRefs: [] },
+    });
+    await engine.postMessage("topic-1", "note", "참고 메모");
+    // id 를 통째로 적었지만 지시어가 아니다 — 오히려 수정을 요구한다(2026-09-07 규칙은 이것도 하향 허용으로 셌다).
+    await engine.postMessage("topic-1", "decision", "`F-ORIGINAL` 은 반드시 고쳐 주세요.");
+
+    engine.retry("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+
+    expect(database.getTopic("topic-1")).toMatchObject({
+      state: "USER_DECISION_REQUIRED", lastError: expect.stringContaining("수정 확인 없이 닫았습니다(F-ORIGINAL)"),
+    });
+    const bodies = database.getTimeline("topic-1").map((event) => event.body);
+    expect(bodies.some((body) => body.includes("사용자 결정이 처분 변경을 허용한 쟁점"))).toBe(false);
     database.close();
   });
 
@@ -2422,7 +2472,7 @@ describe("2026-09-07 엔진 수정: 회차 소비·종료 정리·메모 비중�
     });
     expect(database.getFlags("topic-1").resumeState).toBe("CODEX_FINAL_REVIEW");
 
-    await engine.postMessage("topic-1", "decision", "F-ORIGINAL 은 중재자 예외(AGREED_NO_ACTION)로 확정한다.");
+    await engine.postMessage("topic-1", "decision", "OVERRULE F-ORIGINAL\nF-ORIGINAL 은 중재자 예외(AGREED_NO_ACTION)로 확정한다.");
     engine.retry("topic-1");
     await waitForActionCompletion(database, "topic-1");
 
@@ -3778,8 +3828,9 @@ describe("허용 오차 개정(amend-tolerance)", () => {
     // 계획 읽기를 보류해 개정을 중간에 멈춰 둔다.
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
-    const original = artifacts.readLatest.bind(artifacts);
-    artifacts.readLatest = (async (topicId: string, kind: string) => { const value = await original(topicId, kind); if (kind === "plan") await gate; return value; }) as typeof artifacts.readLatest;
+    // 개정은 계획 본문과 경로를 현재 계획 sha 의 산출물 한 건에서 읽는다(requireCurrentPlanArtifact → verifiedLatest) — 그 읽기를 보류한다.
+    const original = artifacts.verifiedLatest.bind(artifacts);
+    artifacts.verifiedLatest = (async (topicId: string, kind: string) => { const value = await original(topicId, kind); if (kind === "plan") await gate; return value; }) as typeof artifacts.verifiedLatest;
     const pending = engine.amendTolerance("topic-1", { tolerance: widened, reason: "동시성" });
     await new Promise((resolve) => setTimeout(resolve, 10));
     await expect(engine.handleScopeChange("topic-1", "범위 변경 시도")).rejects.toThrow("허용 오차 개정이 진행 중");
@@ -3987,5 +4038,248 @@ describe("Codex 3차 감사 R3-01 — 저장된 미완료 FIX 재사용 금지",
     expect(saved.status).toBe("completed");
     expect(saved.evidenceRefs).toEqual(expect.arrayContaining(["P3-PROOF", "P4-PROOF"]));   // 미완료 결과 위에 병합
     database.close();
+  });
+
+  it("진단 없는 토픽에서 최종 리뷰 #1 이 연 2차 수정이 고친 쟁점(F-2)을 최종 리뷰 #2 가 수정 불필요로 닫아도 멈추지 않고 전달 준비로 간다 — 리뷰 수정 계약의 원본은 최종 리뷰 되돌림 검사 대상이 아니다(계약 도입 전 동작 유지, 2026-09-15 감사 3차 #13)", async () => {
+    const agreed = finding("F-ORIGINAL", "첫 리뷰가 고치기로 한 결함", { disposition: "AGREED_ACTION", severity: "HIGH" });
+    const fixed = { ...agreed, disposition: "RESOLVED_BY_FIX" as const };
+    const f2 = finding("F-2", "최종 리뷰 신규 확정 결함", { disposition: "AGREED_ACTION", severity: "HIGH" });
+    const firstFinal: AgentResult = { kind: "FINAL_REVIEW", summary: "#1 신규 확정 결함", findings: [fixed, f2], evidenceRefs: [] };
+    const codex = new QueuedAdapter("codex", [
+      firstFinal,
+      { kind: "FINAL_REVIEW", summary: "#2 재검토", findings: [fixed, { ...f2, disposition: "AGREED_NO_ACTION", rationale: "재검토: 조치 불필요" }], evidenceRefs: [] },
+    ]);
+    const claude = new QueuedAdapter("claude", [
+      { kind: "FIX", status: "completed", summary: "F-2 를 고쳤습니다.", findings: [fixed, { ...f2, disposition: "RESOLVED_BY_FIX" }], evidenceRefs: [] },
+    ]);
+    const { database, engine } = await makeReviewRecovery({
+      resumeState: "CODEX_FINAL_REVIEW", implementationFindings: [fixed], originalReviewFindings: [agreed], codexResult: firstFinal, codex, claude,
+    });
+    database.updateTopic("topic-1", { fixPassUsed: true });
+    database.setImplementationSession("topic-1", "claude-implementation-session");
+
+    engine.retry("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+
+    // 최종 리뷰 #1 → 2차 수정(F-2 반영) → 최종 리뷰 #2 가 F-2 를 수정 불필요로 닫는다 — 되돌림 정지 없이 전달 준비다.
+    const topic = database.getTopic("topic-1");
+    expect(topic.state, topic.lastError ?? "").toBe("READY_TO_DELIVER");
+    expect(database.getFlags("topic-1")).toMatchObject({ resumeState: null, secondFixPassUsed: true });
+    expect(codex.calls).toHaveLength(2);
+    expect(claude.calls).toHaveLength(1);
+    expect(database.getTimeline("topic-1").some((event) => event.body.includes("수정 확인 없이 닫았습니다"))).toBe(false);
+    database.close();
+  });
+
+  it("최종 리뷰 되돌림 정지('수정 확인 없이 닫았습니다')는 줄 머리 OVERRULE 지시어 해법을 안내하고, 그 안내대로 결정을 올려 retry 하면 같은 정지로 돌아가지 않고 저장된 최종 리뷰로 전달 준비에 이른다(2026-09-15 감사 4차 #3·#10)", async () => {
+    const agreed = finding("F-1", "첫 리뷰가 고치기로 한 결함", { disposition: "AGREED_ACTION", severity: "HIGH" });
+    const closed = { ...agreed, disposition: "AGREED_NO_ACTION" as const };
+    const review: AgentResult = { kind: "FINAL_REVIEW", summary: "수정 확인 없이 닫은 최종 리뷰", findings: [closed], evidenceRefs: [] };
+    const { database, engine } = await makeReviewRecovery({
+      resumeState: "CODEX_FINAL_REVIEW", implementationFindings: [closed], originalReviewFindings: [agreed], codexResult: review,
+      // 최종 리뷰 한 번뿐 — 결정 뒤 retry 가 Codex 를 다시 부르면 가짜 응답 부족으로 드러난다.
+      codexResults: [review],
+    });
+
+    engine.retry("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+    const stopped = database.getTopic("topic-1");
+    expect(stopped.state).toBe("USER_DECISION_REQUIRED");
+    expect(stopped.lastError).toContain("수정 확인 없이 닫았습니다(F-1)");
+    // 멈춤 안내가 실제로 통하는 해법(줄 머리 OVERRULE 지시어)을 알린다.
+    expect(stopped.lastError).toContain("OVERRULE <id>");
+    expect(database.getFlags("topic-1").resumeState).toBe("CODEX_FINAL_REVIEW");
+
+    await engine.postMessage("topic-1", "decision", "OVERRULE F-1\nF-1 은 이번 범위에서 고치지 않기로 확정한다.");
+    engine.retry("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+
+    const topic = database.getTopic("topic-1");
+    expect(topic.state, topic.lastError ?? "").toBe("READY_TO_DELIVER");
+    expect(database.getTimeline("topic-1").filter((event) => event.body.includes("수정 확인 없이 닫았습니다"))).toHaveLength(1);
+    database.close();
+  });
+
+  it("최종 리뷰 되돌림 검사도 OVERRULE 줄에 설명 문장이 붙은 결정('OVERRULE F-3 — F-1 은 반드시 고쳐 주세요.')을 무효로 본다 — 문장 속 F-1 을 면제로 세지 않아 최종 리뷰의 F-1 하향이 전달 준비로 새지 않는다(2026-09-15 감사 4차 #6)", async () => {
+    const agreed = finding("F-1", "첫 리뷰가 고치기로 한 결함", { disposition: "AGREED_ACTION", severity: "HIGH" });
+    const closed = { ...agreed, disposition: "AGREED_NO_ACTION" as const };
+    const { database, engine } = await makeReviewRecovery({
+      resumeState: "CODEX_FINAL_REVIEW", implementationFindings: [closed], originalReviewFindings: [agreed],
+      codexResult: { kind: "FINAL_REVIEW", summary: "결정을 오해해 닫은 최종 리뷰", findings: [closed], evidenceRefs: [] },
+    });
+    await engine.postMessage("topic-1", "note", "참고 메모");
+    await engine.postMessage("topic-1", "decision", "OVERRULE F-3 — F-1 은 반드시 고쳐 주세요.");
+
+    engine.retry("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+
+    expect(database.getTopic("topic-1")).toMatchObject({
+      state: "USER_DECISION_REQUIRED", lastError: expect.stringContaining("수정 확인 없이 닫았습니다(F-1)"),
+    });
+    expect(database.getTimeline("topic-1").some((event) => event.body.includes("사용자 결정이 처분 변경을 허용한 쟁점"))).toBe(false);
+    database.close();
+  });
+
+  // ---- 2026-09-15 감사 5차 #6 (g4) ----
+  // 입력 검사와 인도 대기 전이 사이의 await 창에 사용자 결정을 끼운다 — 엔진이 그 창에서 기다리는 의존성(산출물 저장소의 method)을 감싸, 그 호출 안에서 운영과
+  // 같은 경로(engine.postMessage — POST /messages 는 토픽 잠금 없이 곧바로 appendEvent 한다)로 결정을 올린 뒤 원래 호출을 잇는다. 시간 대기 없이 결정이 반드시
+  // 그 await 안에 기록된다. when 을 처음 만족한 호출에서 한 번만 올린다.
+  const decisionInsideArtifactCall = (
+    engine: WorkflowEngine, database: ConsensusDatabase, artifacts: ArtifactStore,
+    method: "verifiedByRevision" | "write", when: (kind: string) => boolean, body: string,
+  ) => {
+    const posted = { sequence: null as number | null, state: null as string | null };
+    const store = artifacts as unknown as Record<string, (topicId: string, kind: string, ...rest: unknown[]) => Promise<unknown>>;
+    const original = store[method].bind(artifacts);
+    let armed = true;
+    store[method] = async (topicId: string, kind: string, ...rest: unknown[]) => {
+      if (armed && when(kind)) {
+        armed = false;
+        posted.state = database.getTopic(topicId).state;
+        await engine.postMessage(topicId, "decision", body);
+        posted.sequence = database.getTimeline(topicId).findLast((event) => event.actor === "user" && event.kind === "decision")?.sequence ?? null;
+      }
+      return original(topicId, kind, ...rest);
+    };
+    return posted;
+  };
+  // 이번 retry 가 저장한 Codex 리뷰 뒤의 판정 읽기(fixContracts.reviewVerdicts → verifiedByRevision) — 리뷰 산출물 종류만 센다(checkpoint 읽기는 다른 종류다).
+  const reviewVerdictRead = (database: ConsensusDatabase) => (kind: string) =>
+    (kind === "codex-review" || kind === "codex-final-review")
+    && database.getTimeline("topic-1").some((event) => event.actor === "codex" && event.kind === "agent_output");
+  const LATE_DECISION = "리뷰 판정을 읽는 동안 올린 결정: 인도 전에 F-X 를 고쳐 주세요.";
+
+  it("첫 코드 리뷰가 통과해도 판정 읽기(reviewVerdicts) await 동안 도착한 사용자 결정은 인도 대기로 건너뛰지 않는다 — 턴 도중 입력과 같은 규칙으로 USER_DECISION_REQUIRED('에이전트가 답하는 동안 새 메시지가 추가되었습니다', 재개 CODEX_REVIEW)로 멈춘다(2026-09-15 감사 5차 #6)", async () => {
+    const review: AgentResult = { kind: "REVIEW", summary: "통과", findings: [], evidenceRefs: [] };
+    const { database, engine, artifacts } = await makeReviewRecovery({
+      resumeState: "CODEX_REVIEW", implementationFindings: [], originalReviewFindings: [], codexResult: review,
+    });
+    const posted = decisionInsideArtifactCall(engine, database, artifacts, "verifiedByRevision", reviewVerdictRead(database), LATE_DECISION);
+
+    engine.retry("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+
+    const topic = database.getTopic("topic-1");
+    expect(topic.state, topic.lastError ?? "").toBe("USER_DECISION_REQUIRED");
+    expect(topic.lastError).toContain("에이전트가 답하는 동안 새 메시지가 추가되었습니다");
+    expect(database.getFlags("topic-1").resumeState).toBe("CODEX_REVIEW");
+    // 결정은 리뷰 저장 뒤 판정 읽기 안에서, 전이 전(CODEX_REVIEW)에 기록됐다.
+    expect(posted).toMatchObject({ state: "CODEX_REVIEW", sequence: expect.any(Number) });
+    expect(database.getTimeline("topic-1").some((event) => event.payload?.to === "READY_TO_DELIVER")).toBe(false);
+    database.close();
+  });
+
+  it("최종 리뷰가 통과해도 판정 읽기(reviewVerdicts) await 동안 도착한 사용자 결정은 인도 대기로 건너뛰지 않는다 — USER_DECISION_REQUIRED('에이전트가 답하는 동안 새 메시지가 추가되었습니다', 재개 CODEX_FINAL_REVIEW)로 멈춘다(2026-09-15 감사 5차 #6)", async () => {
+    const agreed = finding("F-1", "첫 리뷰가 고치기로 한 결함", { disposition: "AGREED_ACTION" });
+    const fixed = finding("F-1", "첫 리뷰가 고치기로 한 결함", { disposition: "RESOLVED_BY_FIX" });
+    const review: AgentResult = { kind: "FINAL_REVIEW", summary: "통과", findings: [fixed], evidenceRefs: [] };
+    const { database, engine, artifacts } = await makeReviewRecovery({
+      resumeState: "CODEX_FINAL_REVIEW", implementationFindings: [fixed], originalReviewFindings: [agreed], codexResult: review,
+    });
+    const posted = decisionInsideArtifactCall(engine, database, artifacts, "verifiedByRevision", reviewVerdictRead(database), LATE_DECISION);
+
+    engine.retry("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+
+    const topic = database.getTopic("topic-1");
+    expect(topic.state, topic.lastError ?? "").toBe("USER_DECISION_REQUIRED");
+    expect(topic.lastError).toContain("에이전트가 답하는 동안 새 메시지가 추가되었습니다");
+    expect(database.getFlags("topic-1").resumeState).toBe("CODEX_FINAL_REVIEW");
+    expect(posted).toMatchObject({ state: "CODEX_FINAL_REVIEW", sequence: expect.any(Number) });
+    expect(database.getTimeline("topic-1").some((event) => event.payload?.to === "READY_TO_DELIVER")).toBe(false);
+    database.close();
+  });
+
+  it("최종 리뷰의 새 쟁점을 후속 목록에 기록하는(recordDeferredFindings) await 동안 도착한 사용자 결정은 인도 대기로 건너뛰지 않는다 — 기록은 마치고 USER_DECISION_REQUIRED('에이전트가 답하는 동안 새 메시지가 추가되었습니다', 재개 CODEX_FINAL_REVIEW)로 멈춘다(2026-09-15 감사 5차 #6)", async () => {
+    const deferredNew = finding("F-DEFER", "범위 밖 개선 제안", { disposition: "DEFERRED_OUT_OF_SCOPE" });
+    const { database, engine, artifacts } = await makeReviewRecovery({
+      resumeState: "CODEX_FINAL_REVIEW", implementationFindings: [], originalReviewFindings: [],
+      codexResult: { kind: "FINAL_REVIEW", summary: "이연 1건", findings: [deferredNew], evidenceRefs: [] },
+    });
+    // 후속 목록 쓰기(core.recordDeferredFindings → writeArtifact → artifacts.write("deferred-findings")) 안에서 결정을 올린다.
+    const posted = decisionInsideArtifactCall(engine, database, artifacts, "write", (kind) => kind === "deferred-findings",
+      "후속 목록을 기록하는 동안 올린 결정: F-DEFER 는 이번 범위에서 고쳐 주세요.");
+
+    engine.retry("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+
+    const topic = database.getTopic("topic-1");
+    expect(topic.state, topic.lastError ?? "").toBe("USER_DECISION_REQUIRED");
+    expect(topic.lastError).toContain("에이전트가 답하는 동안 새 메시지가 추가되었습니다");
+    expect(database.getFlags("topic-1").resumeState).toBe("CODEX_FINAL_REVIEW");
+    expect(posted).toMatchObject({ state: "CODEX_FINAL_REVIEW", sequence: expect.any(Number) });
+    // 결정은 리뷰 저장 뒤, 후속 목록 기록 도중에 들어왔다 — 기록 자체는 끝났고(산출물·이벤트) 인도 대기 전이는 없다.
+    const timeline = database.getTimeline("topic-1");
+    const reviewSaved = timeline.find((event) => event.actor === "codex" && event.kind === "agent_output");
+    expect(reviewSaved).toBeDefined();
+    expect(posted.sequence!).toBeGreaterThan(reviewSaved!.sequence);
+    expect(await artifacts.readLatest("topic-1", "deferred-findings")).toContain("F-DEFER");
+    expect(timeline.some((event) => event.body.includes("후속 목록에 기록") && event.body.includes("F-DEFER"))).toBe(true);
+    expect(timeline.some((event) => event.payload?.to === "READY_TO_DELIVER")).toBe(false);
+    database.close();
+  });
+
+  it("결정 뒤 저장된 최종 리뷰를 재사용하는 경로(finalizeStoredFinalReview)는 판정 읽기 await 동안 도착한 두 번째 결정도 통과 판정에 반영한다 — 그 사이 올라온 'OVERRULE F-1' 이 되돌림 면제로 세어져 Codex 턴 없이 인도 대기에 이르고, 판정(처분 변경 허용·재사용 안내)은 그 결정 뒤에 내려진다(2026-09-15 감사 5차 #6)", async () => {
+    const agreed = finding("F-1", "첫 리뷰가 고치기로 한 결함", { disposition: "AGREED_ACTION", severity: "HIGH" });
+    const closed = { ...agreed, disposition: "AGREED_NO_ACTION" as const };
+    const review: AgentResult = { kind: "FINAL_REVIEW", summary: "수정 확인 없이 닫은 최종 리뷰", findings: [closed], evidenceRefs: [] };
+    // 결정 뒤 retry 가 저장된 리뷰를 재사용하지 못하면 Codex 를 다시 부른다 — 호출 수로 드러난다.
+    const codex = new QueuedAdapter("codex", [review, review]);
+    const { database, engine, artifacts } = await makeReviewRecovery({
+      resumeState: "CODEX_FINAL_REVIEW", implementationFindings: [closed], originalReviewFindings: [agreed], codexResult: review, codex,
+    });
+    engine.retry("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+    expect(database.getTopic("topic-1").lastError).toContain("수정 확인 없이 닫았습니다(F-1)");
+    expect(codex.calls).toHaveLength(1);
+
+    // 첫 결정은 면제가 아니다 — 이것만으로는 저장된 리뷰가 통과 조건(되돌림 면제)을 만족하지 않는다.
+    await engine.postMessage("topic-1", "decision", "F-1 처분은 정리해서 곧 올리겠습니다.");
+    // 두 번째 결정은 재개한 finalizeStoredFinalReview 가 저장된 리뷰들의 판정을 읽는 await(reviewVerdicts → verifiedByRevision) 안에서 도착한다.
+    const posted = decisionInsideArtifactCall(engine, database, artifacts, "verifiedByRevision",
+      (kind) => kind === "codex-review" || kind === "codex-final-review", "OVERRULE F-1\nF-1 은 이번 범위에서 고치지 않기로 확정한다.");
+    engine.retry("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+
+    const topic = database.getTopic("topic-1");
+    expect(topic.state, topic.lastError ?? "").toBe("READY_TO_DELIVER");
+    expect(codex.calls).toHaveLength(1);
+    expect(posted).toMatchObject({ state: "CODEX_FINAL_REVIEW", sequence: expect.any(Number) });
+    const timeline = database.getTimeline("topic-1");
+    const allowed = timeline.find((event) => event.body.includes("사용자 결정이 처분 변경을 허용한 쟁점: F-1(AGREED_ACTION → AGREED_NO_ACTION)"));
+    const reused = timeline.find((event) => event.body.includes("저장된 최종 리뷰(#") && event.body.includes("Codex 턴 없이"));
+    const ready = timeline.find((event) => event.payload?.to === "READY_TO_DELIVER");
+    expect([allowed, reused, ready].every(Boolean)).toBe(true);
+    expect([posted.sequence! < allowed!.sequence, allowed!.sequence < reused!.sequence, reused!.sequence < ready!.sequence]).toEqual([true, true, true]);
+    expect(timeline.filter((event) => event.body.includes("수정 확인 없이 닫았습니다"))).toHaveLength(1);
+    database.close();
+  });
+
+  it("delivery.ts 의 markReady( 호출은 인자 목록에 await 를 두지 않는다 — 인도 대기 전이에 넘길 판정은 입력 검사 전에 계산해 두어 검사와 전이 사이에 판정 읽기 await 가 끼지 않는다(2026-09-15 감사 5차 #6)", async () => {
+    const { readFileSync } = await import("node:fs");
+    const source = readFileSync(new URL("../src/server/engine/delivery.ts", import.meta.url), "utf8");
+    // this.markReady( 호출마다 괄호 짝으로 인자 목록을 떼어 낸다(문자열·템플릿 리터럴 안의 괄호는 세지 않는다).
+    const argumentLists: string[] = [];
+    for (const match of source.matchAll(/this\.markReady\(/g)) {
+      const open = match.index! + match[0].length - 1;
+      let depth = 0;
+      let quote: string | null = null;
+      for (let at = open; at < source.length; at += 1) {
+        const char = source[at];
+        if (quote) {
+          if (char === "\\") at += 1;
+          else if (char === quote) quote = null;
+          continue;
+        }
+        if (char === '"' || char === "'" || char === "`") quote = char;
+        else if (char === "(") depth += 1;
+        else if (char === ")" && --depth === 0) {
+          argumentLists.push(source.slice(open + 1, at));
+          break;
+        }
+      }
+    }
+    expect(argumentLists.length).toBeGreaterThanOrEqual(3);
+    expect(argumentLists.filter((args) => /\bawait\b/.test(args))).toEqual([]);
   });
 });

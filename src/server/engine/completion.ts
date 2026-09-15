@@ -15,6 +15,14 @@ import type { AgentResult } from "../../shared/contracts.js";
 // 열린 요청 — id 는 문구와 제시 시점(sequence)으로 만든다: 같은 질문을 나중에 다시 하면 새 요청, 아직 열린 채 다시 하면 같은 요청.
 export interface OpenRequest { id: string; text: string; askedAfterSequence: number }
 
+// 정지를 만드는 모든 사용자 요청을 같은 형태로 보존한다. 이후 응답에서 표시가 사라져도 열린 요청은 남는다.
+export function decisionRequestTexts(result: Pick<AgentResult, "requestedUserDecision" | "findings" | "status" | "summary" | "remainingSteps">): string[] {
+  const requests = [result.requestedUserDecision?.trim(),
+    ...result.findings.filter((finding) => finding.requiresUserDecision).map((finding) => finding.rationale.trim() || finding.title.trim())];
+  if (result.status === "blocked" && !requests.some(Boolean)) requests.push(`러너가 막힘(blocked)으로 정지했습니다 — ${result.summary} — 남은 단계: ${(result.remainingSteps ?? []).join(" · ") || "(명시 없음)"}`);
+  return [...new Set(requests.filter((text): text is string => Boolean(text)))];
+}
+
 export function renderOpenRequests(requests: readonly OpenRequest[]): string {
   return requests.map((request) => `[${request.id}] ${request.text}`).join("\n\n");
 }
@@ -29,6 +37,9 @@ export interface VerdictContext {
   openRequests: readonly OpenRequest[];
   // 열린 요청(가장 오래된 것 기준)이 제시된 뒤 사용자 결정이 도착했는가(타임라인 대조, 호출자가 계산).
   decisionAfterRequest: boolean;
+  // 이 작업에 실린 진단 중 결과가 반영(RESOLVED_BY_FIX)도 반환(반박·증거 요청)도 보고하지 않은 것(AGREED_ACTION·누락). completed 와 함께면 모순이다 —
+  // 진단이 전달됨인 채 리뷰·인도 대기로 넘어갔다(2026-09-15 감사, PLAN 3단계 완료 모순 판정).
+  unresolvedDiagnoses?: readonly string[];
 }
 
 declare const acceptedBrand: unique symbol;
@@ -61,6 +72,11 @@ export function completionVerdict(result: AgentResult, context: VerdictContext):
   }
   if (result.status === "completed" && remaining.length > 0) {
     return { kind: "needs-confirmation", reason: "contradiction", message: `status=completed 인데 남은 단계가 적혀 있습니다(${remaining.join(" · ")}) — 완료로 보지 않고 확인합니다.` };
+  }
+  const unresolved = context.unresolvedDiagnoses ?? [];
+  if (result.status === "completed" && unresolved.length > 0) {
+    return { kind: "continue", remainingSteps: [...remaining, ...unresolved.map((id) =>
+      `중재자 진단 ${id}: 반영했으면 RESOLVED_BY_FIX, 반박·증거 요청이면 그 처분으로 보고(지금은 미반영 처분인 채 status=completed)`)] };
   }
   if (result.status === "in_progress") return { kind: "continue", remainingSteps: remaining };
   return { kind: "completed" };

@@ -94,13 +94,14 @@ describe("CLI JSONL 처리", () => {
     // planEdits:null 누락이 2026-08-31 closeout 재실행을 통째로 거부시켰다(스키마에 키를 추가하며
     // OPTIONAL_KEYS 갱신을 빠뜨림). 스키마의 null 허용 키는 반드시 이 테스트에도 함께 추가한다.
     const text = '{"kind":"AUDIT","summary":"probe","planMarkdown":null,"planEdits":null,"planSHA256":null,'
-      + '"findings":[],"evidenceRefs":[],"requestedUserDecision":null,"memoryUpdates":null}';
+      + '"findings":[],"evidenceRefs":[],"requestedUserDecision":null,"memoryUpdates":null,"reviewDecisionAnswers":null}';
 
     const parsed = parseAgentResult([{ item: { type: "agent_message", text } }], "");
 
     expect(parsed).toMatchObject({ kind: "AUDIT", summary: "probe", findings: [], evidenceRefs: [] });
     expect(parsed.planMarkdown).toBeUndefined();
     expect(parsed.planEdits).toBeUndefined();
+    expect(parsed.reviewDecisionAnswers).toBeUndefined();
     expect(parsed.memoryUpdates).toBeUndefined();
   });
 

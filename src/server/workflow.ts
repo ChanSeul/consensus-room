@@ -226,18 +226,20 @@ export class WorkflowEngine {
     // 상태를 바꾸기 전에 다른 작업(실행·범위 변경·인도)이 없는지 본다 — 아래 사다리 일부는 startAction 전에 전이하므로,
     // 잠금을 startAction 에서 뒤늦게 만나면 상태만 바뀐 채 고착된다(Codex 후속 지적 2).
     this.core.assertNoActiveWork(topicId);
-    // 공통 진단 상태 검사: 중재자가 처리할 진단(적용 대기·재확인·반박·추가 증거)이 있으면 재개하지 않는다 — 자동 재시도도 이 경로다.
-    this.core.diagnoses.assertResumable(topicId, "재시도(retry)");
     let topic = this.core.dependencies.database.getTopic(topicId);
     const flags = this.core.dependencies.database.getFlags(topicId);
     const resume = flags.resumeState;
+    // 공통 진단 상태 검사: 중재자가 처리할 진단(적용 대기·재확인·반박·추가 증거)이 있으면 재개하지 않는다 — 자동 재시도도 이 경로다.
+    // 계획 단계 재시도는 전체 재계획이 재확인으로 돌린 진단에 막히지 않는다(host-review R9) — 재개 단계를 함께 넘긴다.
+    this.core.diagnoses.assertResumable(topicId, "재시도(retry)", resume);
     const interruption = this.core.dependencies.database.getTimeline(topicId).filter(event =>
       event.scopeGeneration === topic.scopeGeneration && event.actor === "system" && event.payload?.resumeState).at(-1);
     // 리뷰 한도 정지는 **그 리뷰 단계를 재개할 때만** 막는다. 중재자가 resume_state 를 다른 단계(예: 러너가 중간 보고를
     // 완료 형식으로 닫아 리뷰로 넘어간 것을 IMPLEMENTING 으로 되돌림, 2026-09-14 S11)로 바꿨으면 리뷰 승인은 필요 없다.
     if(interruption?.payload?.reviewPause && topic.state==="USER_DECISION_REQUIRED" && interruption.payload.resumeState===resume)
       this.core.dependencies.database.reviews.assertAvailable(topicId,interruption.payload.reviewPause as ReviewScope);
-    if(interruption?.payload?.revisionPause===true && topic.state==="USER_DECISION_REQUIRED")
+    // 재작성 한도 정지도 **그 계획 단계를 재개할 때만** 막는다 — 정정이 재개 단계를 구현으로 되돌렸으면 쓰지 않을 재작성 승인을 요구하지 않는다(2026-09-15 감사 2차).
+    if(interruption?.payload?.revisionPause===true && topic.state==="USER_DECISION_REQUIRED" && interruption.payload.resumeState===resume)
       this.core.dependencies.database.revisions.assertAvailable(topicId,resume==="CLAUDE_PLAN"?"plan":"revision");
     // 실행 환경 때문에 멈춘 정지(예산·한도·spawn 직전 허용 거부: 유지보수 잠금·계획 변경·기준 불일치)는 사람의 제품 결정이 아니다 — 저장된 같은 단계로
     // 재개하고 계획을 다시 만들지 않는다(CF-07: 유지보수 거부 뒤 retry 가 계획부터 다시 만들었다).
@@ -247,7 +249,17 @@ export class WorkflowEngine {
       // Budget pauses resume the exact infrastructure stage, without consuming a product decision or resetting the plan.
       topic = this.core.dependencies.database.updateTopic(topicId, {state:"FAILED"});
     }
+    // 계획 변경 진단(적용됨·개정 저장 전)은 멈춘 단계와 무관하게 진단 계획 개정 턴으로 간다 — 옛 승인 계획으로의 구현 재개나 전체 재계획
+    // (restartPlanning)으로 새지 않는다. 한도 정지(재작성·리뷰·예산) 검사는 위에서 이미 거쳤다(한도는 초기화·추가 승인하지 않는다).
+    if (this.core.diagnoses.pendingPlanRevision(topicId)) {
+      return this.core.startAction(topicId, "retry", (signal) => this.planning.runDiagnosisPlanRevision(topicId, signal), actionId);
+    }
     if (!resume) throw new Error("재시도할 단계가 기록되어 있지 않습니다.");
+    // 진단 계획 개정이 저장된 직후(감사 전)에 멈춰 재개 단계가 계획 턴으로 남았으면 저장된 개정 계획으로 감사부터 잇는다 — 전체 재계획으로 떨어져 저장된
+    // 개정을 버리고 진단을 재계획 stale 로 돌리지 않는다(2026-09-15 감사).
+    if (resume === "CLAUDE_PLAN" && this.core.diagnoses.savedRevisionAwaitingAudit(topicId)) {
+      return this.core.startAction(topicId, "retry", (signal) => this.planning.resumeSavedDiagnosisRevision(topicId, signal), actionId);
+    }
     // 개정 턴이 결정을 물어 멈췄고 결정이 올라왔다 — 그 개정본을 저장해 종결 확인으로 넘긴다(개정 턴 재구매 방지).
     // 아래 사다리(resumers)가 CLAUDE_REVISION 을 "개정 재실행" 으로 잡기 전에 먼저 본다.
     if (resume === "CLAUDE_REVISION" && this.planning.replanRequested(topicId)) {
@@ -413,6 +425,7 @@ export class WorkflowEngine {
     this.core.assertNotShuttingDown();
     this.core.assertNoActiveWork(topicId);
     if (this.core.amendmentActive.has(topicId)) throw new Error("허용 오차 개정이 이미 진행 중입니다.");
+    this.core.diagnoses.assertNoPlanRevision(topicId, "허용 오차 개정(amend-tolerance)");
     // 개정 자체를 이 주제의 진행 중 작업으로 등록한다 — 읽기(readLatest)와 쓰기 사이에 범위 변경·재개·다른 개정이 끼지 못한다.
     this.core.amendmentActive.add(topicId);
     try {
@@ -421,8 +434,12 @@ export class WorkflowEngine {
       const resume = db.getFlags(topicId).resumeState;
       if (!["USER_DECISION_REQUIRED", "FAILED"].includes(topic.state) || !["IMPLEMENTING", "CLAUDE_FIX"].includes(resume ?? ""))
         throw new Error(`허용 오차 개정은 구현·수정 단계가 멈춘 상태에서만 가능합니다(현재 ${topic.state}/${resume ?? "-"}).`);
-      const previousPlan = await this.core.dependencies.artifacts.readLatest(topicId, "plan");
-      if (!previousPlan) throw new Error("저장된 계획이 없습니다.");
+      // 개정의 바탕은 현재(승인) 계획 sha 의 산출물이다 — 최신 산출물이 저장만 되고 승인되지 않은 개정본이면 그 문구가 감사·승인 없이 승인 계획이 됐다
+      // (2026-09-15 감사 2차). 결속한 본문이 현재 sha 와 다르면 개정하지 않는다.
+      const { content: previousPlan } = await this.core.requireCurrentPlanArtifact(topicId);
+      if (hashPlan(previousPlan) !== topic.planSHA256) {
+        throw Object.assign(new Error("현재 계획 sha 와 계획 산출물이 맞지 않아 허용 오차를 개정하지 않습니다 — 계획 상태를 먼저 확인하세요."), { statusCode: 409 });
+      }
       const previous = parseTolerancePolicy(previousPlan);
       if (!previous) throw new Error("계획에 허용 오차 블록이 없어 개정할 수 없습니다.");
       const parsed = TolerancePolicySchema.safeParse(input.tolerance);
@@ -480,14 +497,26 @@ export class WorkflowEngine {
   resumeImplementation(topicId: string, input: ResumeImplementationInput, origin?: CallOrigin): Topic {
     this.core.assertNoActiveWork(topicId);
     this.core.diagnoses.assertResumable(topicId, "구현 재개(resume-implementation)");
+    this.core.diagnoses.assertNoPlanRevision(topicId, "구현 재개(resume-implementation)");
     const db = this.core.dependencies.database;
     const topic = db.getTopic(topicId);
     if (topic.state !== input.expectedState) throw new Error(`현재 상태 ${topic.state} 가 요청의 기대 상태 ${input.expectedState} 와 다릅니다.`);
     if (topic.scopeGeneration !== input.expectedScopeGeneration) throw new Error("범위 세대가 요청과 다릅니다 — 낡은 재개 요청입니다.");
     if (!topic.approvedPlanSHA256 || topic.approvedPlanSHA256 !== topic.planSHA256) throw new Error("승인된 계획이 없거나 계획이 바뀌어 구현을 재개할 수 없습니다.");
     if (!db.getFlags(topicId).implementationSessionId) throw new Error("구현 세션이 없어 재개할 수 없습니다(구현 시작을 쓰세요).");
+    // 열린 수정 작업에 실린 진단(처분 보고 전)이 있으면 구현으로 되돌리지 않는다 — 되돌리면 그 전달·반박이 묻히고 뒤의 수정 턴이 같은 지시를 다시 실었다
+    // (2026-09-15 감사 2차). 재시도가 수정 작업을 이어 반박을 기록하거나 처분을 받는다. 실린 진단이 없으면 열린 계약은 버려진 것으로 남긴다.
+    const open = this.core.fixContracts.open(topicId);
+    // 계약 도입 전의 수정 작업(열린 계약 없음)은 적용 기록으로 본다 — 멈춘 수정 작업에 실린 처분 전 진단(2026-09-15 감사 3차).
+    const carried = open ? this.core.fixContracts.diagnoses(topicId, open)
+      : db.getFlags(topicId).resumeState === "CLAUDE_FIX"
+        ? [...this.core.diagnoses.forWork(topicId, "CLAUDE_FIX", "work"), ...this.core.diagnoses.forWork(topicId, "CLAUDE_FIX", "diagnosis-fix")] : [];
+    if (carried.length > 0) {
+      throw Object.assign(new Error(`수정 작업 ${open ? open.contractId : "(계약 도입 전)"} 에 실린 진단 ${carried.map((record) => record.id).join(", ")} 이(가) 처분 보고 전입니다 — 구현으로 되돌리면 `
+        + "그 전달·처분이 묻힙니다. 재시도(retry)로 수정 작업을 이어 처분을 받거나, 정정(supersedes)으로 닫은 뒤 재개하세요."), { statusCode: 409 });
+    }
     return db.applyTopicTransition({
-      topicId, changes: { resumeState: "IMPLEMENTING" },
+      topicId, changes: { resumeState: "IMPLEMENTING" }, contracts: open ? [{ ...open, status: "abandoned" as const }] : undefined,
       events: [{ actor: "user", kind: "decision", state: topic.state,
         body: `구현 계속 재개(공식): resume → IMPLEMENTING. ${input.reason}`,
         payload: { implementationResume: { fromState: topic.state, scopeGeneration: topic.scopeGeneration }, ...(origin ? { origin } : {}) } }],
@@ -503,7 +532,8 @@ export class WorkflowEngine {
     return this.core.diagnoses.list(topicId);
   }
 
-  applyDiagnosis(topicId: string, diagnosisId: string, request: { requestKey?: string; origin?: CallOrigin; actionId?: string }): Promise<string> {
+  // null: 적용은 기록했지만 등록된 다른 수정 진단이 적용을 기다려 실행을 열지 않았다(순차 적용 — 마지막 적용이 재개한다).
+  applyDiagnosis(topicId: string, diagnosisId: string, request: { requestKey?: string; origin?: CallOrigin; actionId?: string }): Promise<string | null> {
     return this.core.diagnoses.apply(topicId, diagnosisId, request, (id, actionId) => this.retry(id, actionId));
   }
 
@@ -529,6 +559,9 @@ export class WorkflowEngine {
     if (topic.state === "AWAITING_USER_APPROVAL") {
       // 계획만 무효화하는 경로다. 범위는 그대로이므로 세대·세션·worktree·타임라인을 유지하고
       // planEpoch만 올린다 — 두 에이전트가 같은 대화 위에서 다시 수렴한다.
+      // 전체 재계획(계획 주기 +1) — 이전 계획에 묶인 진행 중 진단을 먼저 재확인으로 돌린다. resetToDraft 와 같은 규칙이다
+      // (2026-09-15 감사: 승인 대기 중 메시지로 일어나는 재계획만 이 규칙이 빠져, 개정 계획이 승인되지 않은 계획 변경 진단이 새 계획에 전달·해결됐다).
+      this.core.diagnoses.staleOnReplan(topic);
       const nextEpoch = topic.planEpoch + 1;
       await this.core.dependencies.artifacts.clearCurrentAliases(topicId);
       // 승인 무효화와 requestKey 마커도 한 transaction이다. scope_change와 같은 이유다.

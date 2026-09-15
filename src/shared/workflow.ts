@@ -36,7 +36,8 @@ const NEXT_STATES: Readonly<Record<WorkflowState, ReadonlySet<WorkflowState>>> =
   CLAUDE_FIX: new Set(["CODEX_FINAL_REVIEW", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED", "FAILED"]),
   CODEX_FINAL_REVIEW: new Set(["READY_TO_DELIVER", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED", "FAILED", "CLAUDE_FIX"]),
   // CLAUDE_FIX: 인도 대기 중 발견한 외부 검증 실패를 중재자 진단으로 반환한다 — 진단 전용 수정 작업 → 최종 리뷰(2026-09-14 진단 계획).
-  READY_TO_DELIVER: new Set(["CLOSED", "DRAFT", "FAILED", "CLAUDE_FIX"]),
+  // CLAUDE_PLAN: 계획 변경이 필요한 중재자 진단 — 진단 계획 개정 턴(→ 감사·종결·ACK·사용자 승인). 작업 트리·브랜치·구현 기준은 보존한다.
+  READY_TO_DELIVER: new Set(["CLOSED", "DRAFT", "FAILED", "CLAUDE_FIX", "CLAUDE_PLAN"]),
   CLOSED: new Set(),
   BLOCKED_ON_EVIDENCE: new Set([
     "DRAFT", "CLAUDE_PLAN", "CODEX_AUDIT", "CLAUDE_REVISION", "CODEX_CLOSEOUT",
@@ -202,6 +203,18 @@ export function mergeFindingSources(...sources: ReadonlyArray<readonly Finding[]
     }
   }
   return merged;
+}
+
+// 합의 기준 병합 — mergeFindingSources 처럼 앞(최신)이 우선하되, 판정이 끝나지 않은 처분(처분 없음·EXTERNAL_EVIDENCE·사용자 판정 필요)은 뒤(앞선 단계)의
+// 합의(AGREED_ACTION)를 가리지 못한다 — 그 id 는 합의한 판 그대로(심각도 포함) 남는다. 합의는 수정 확인·OVERRULE·중재자 종결로만 풀린다. 되돌림 검사의 기준
+// (진단 전용 계약 원본·첫 리뷰)은 이것으로 합친다(2026-09-15 감사 6차 #5: 뒤 정지의 EXTERNAL_EVIDENCE 가 앞선 계약의 AGREED_ACTION 을 가려 OVERRULE 없이 커밋됐다).
+export function mergeAgreedSources(...sources: ReadonlyArray<readonly Finding[] | undefined>): Finding[] {
+  const layers = sources.map((source) => source ?? []);
+  return mergeFindingSources(...layers).map((finding) => {
+    const unjudged = finding.disposition === undefined || finding.disposition === "EXTERNAL_EVIDENCE" || finding.requiresUserDecision;
+    if (finding.disposition === "AGREED_ACTION" || !unjudged) return finding;
+    return layers.flat().find((older) => older.id === finding.id && older.disposition === "AGREED_ACTION") ?? finding;
+  });
 }
 
 // 계획 개정을 여는 심각도. 그 아래(MEDIUM·LOW·INFO)는 "경미" — 개정 턴 대신 구현 노트로 러너에게 전달한다
@@ -521,3 +534,61 @@ export function replanDirective(body: string): boolean {
 export function refixDirective(body: string): boolean {
   return /^\s*REFIX\b/m.test(body) || /\bREFIX\s*$/.test(body.trimEnd());
 }
+
+// 처분 하향 허용 지시 — 사용자 결정의 줄 머리 `OVERRULE <id>[, <id>]`. 그 줄은 쉼표로 구분한 id 목록뿐이어야 한다(토큰 안에 공백이 있으면, 즉 설명 문장이 같은
+// 줄에 붙으면 지시 전체가 무효 — 설명은 다음 줄에). 줄을 넘지 않고, id 형식은 제한하지 않는다(finding id 는 스키마상 임의 문자열 — `S6.5-GATE2` 등).
+// 공백·쉼표가 든 id 는 따옴표(" ')나 백틱으로 감싼다 — 감싼 안이 그대로 id 다(2026-09-15 감사 5차 #7: `GATE 2` 같은 스키마상 유효한 id 를 표현할 문법이 없어
+// 되돌림 가드 정지를 결정으로 풀 수 없었다). 감싸지 않은 토큰은 앞뒤 백틱·괄호·끝 구두점을 벗긴 형태도 함께 넣는다(원 토큰도 남긴다 — id 자체의 문자를 잃지
+// 않게). 2026-09-15 감사 4차: 줄 나머지의 id 모양 토큰을 모두 세어 "OVERRULE F-3 — F-1 은 반드시 고쳐 주세요" 가 F-1 도 허용했고(\s 가 줄바꿈도 넘었다),
+// 점이 든 id 는 버려졌다.
+export function overruleDirectiveIDs(body: string): Set<string> {
+  const ids = new Set<string>();
+  for (const raw of body.split("\n")) {
+    for (const token of overruleLineTokens(raw.replace(/\r$/, "")) ?? []) {
+      if (token.quoted) {
+        ids.add(token.text);
+        if (token.text.trim()) ids.add(token.text.trim());
+        continue;
+      }
+      ids.add(token.text);
+      const bare = token.text.replace(/^[`'"([]+/, "").replace(/[`'")\].;:]+$/, "");
+      if (bare) ids.add(bare);
+    }
+  }
+  return ids;
+}
+
+// 지시 줄의 토큰 — 줄 머리 `OVERRULE`(뒤에 콜론 또는 공백) 뒤를 앞에서부터 한 번 훑는다(정규식 역추적 없음). 토큰은 따옴표·백틱으로 감싼 것(닫는 문자 뒤가
+// 쉼표나 줄 끝이어야 한다 — 아니면 감싸지 않은 토큰으로 읽는다) 또는 공백·쉼표 없는 문자열이고, 토큰 사이는 쉼표(앞뒤 공백·탭 허용), 끝 쉼표 하나까지 허용한다.
+// 어긋나면 null(지시 무효). 2026-09-15 감사 6차 #6: 대안이 겹치는 반복 정규식(감싼 토큰과 `[^\s,]+` 가 같은 `"F-1"` 에 맞는다)이 무효 줄에서 토큰 수에 지수로
+// 역추적해 서버 이벤트 루프를 멈췄다.
+function overruleLineTokens(line: string): Array<{ text: string; quoted: boolean }> | null {
+  const head = /^[ \t]*OVERRULE(?:[ \t]*:[ \t]*|[ \t]+)/.exec(line);
+  if (!head) return null;
+  const blank = (at: number) => { while (at < line.length && (line[at] === " " || line[at] === "\t")) at += 1; return at; };
+  const tokens: Array<{ text: string; quoted: boolean }> = [];
+  let at = head[0].length;
+  for (;;) {
+    const open = line[at];
+    const close = open === '"' || open === "'" || open === "`" ? line.indexOf(open, at + 1) : -1;
+    const afterClose = close > at + 1 ? blank(close + 1) : -1;
+    if (afterClose !== -1 && (afterClose === line.length || line[afterClose] === ",")) {
+      tokens.push({ text: line.slice(at + 1, close), quoted: true });
+      at = close + 1;
+    } else {
+      const start = at;
+      while (at < line.length && !/[\s,]/.test(line[at])) at += 1;
+      if (at === start) return null;
+      tokens.push({ text: line.slice(start, at), quoted: false });
+    }
+    at = blank(at);
+    if (at === line.length) return tokens;
+    if (line[at] !== ",") return null;
+    at = blank(at + 1);
+    if (at === line.length) return tokens;
+  }
+}
+
+// 처분 되돌림으로 멈출 때 사용자에게 알리는 해법(수락 가드·최종 리뷰 되돌림 가드가 같은 문구를 쓴다).
+export const OVERRULE_GUIDANCE = "처분 변경을 허용하려면 사용자가 결정문 줄 머리에 `OVERRULE <id>[, <id>]`(그 줄에는 쉼표로 구분한 id 만, 설명은 다음 줄 — 공백·쉼표가 "
+  + "든 id 는 따옴표나 백틱으로 감싼다)를 올리고 재시도하세요 — id 를 언급만 한 결정은 허용이 아닙니다.";

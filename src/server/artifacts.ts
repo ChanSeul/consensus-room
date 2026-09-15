@@ -74,6 +74,12 @@ export class ArtifactStore {
     return artifact.path;
   }
 
+  // 최신 산출물의 본문과 정본 blob 경로를 같은 원장 행에서 함께 읽는다 — 본문과 경로를 따로 읽으면 그 사이 새 판이 끼어 둘이 다른 판을 가리킬 수 있다.
+  async verifiedLatest(topicId: string, kind: string): Promise<{ path: string; content: string } | null> {
+    const artifact = this.database.latestArtifact(topicId, kind);
+    return artifact ? { path: artifact.path, content: await readVerified(artifact) } : null;
+  }
+
   async readLatest(topicId: string, kind: string): Promise<string | null> {
     const artifact = this.database.latestArtifact(topicId, kind);
     if (!artifact) return null;
@@ -83,6 +89,12 @@ export class ArtifactStore {
   async readPrevious(topicId: string, kind: string): Promise<string | null> {
     const artifact = this.database.artifactsForScope(topicId, kind)[1];
     return artifact ? readVerified(artifact) : null;
+  }
+
+  // 현재 세대의 특정 revision 산출물(검증된 본문·경로) — 수락 checkpoint 처럼 "그 기록" 을 가리킬 때 쓴다(최신 하나가 아니라).
+  async verifiedByRevision(topicId: string, kind: string, revision: number): Promise<{ path: string; content: string } | null> {
+    const artifact = this.database.artifactsForScope(topicId, kind).find((entry) => entry.revision === revision);
+    return artifact ? { path: artifact.path, content: await readVerified(artifact) } : null;
   }
 
   async verifiedRevision(topicId: string, kind: string, sha256: string): Promise<{ path: string; content: string } | null> {
@@ -97,6 +109,14 @@ export class ArtifactStore {
         if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
       }),
     ));
+  }
+}
+
+// 원장 sha 와 본문이 다르다(변조 또는 손상) — 호출자가 형식 오류와 구별해 처리할 수 있게 타입으로 던진다(checkpoint 는 CheckpointCorrupt 로 올린다).
+export class ArtifactIntegrityError extends Error {
+  constructor(readonly path: string) {
+    super(`아티팩트가 기록된 SHA-256과 다릅니다(변조 또는 손상): ${path}`);
+    this.name = "ArtifactIntegrityError";
   }
 }
 
@@ -124,7 +144,7 @@ async function readVerified(artifact: StoredArtifact): Promise<string> {
   const content = await readFile(artifact.path, "utf8");
   const actual = createHash("sha256").update(content, "utf8").digest("hex");
   if (actual !== artifact.sha256) {
-    throw new Error(`아티팩트가 기록된 SHA-256과 다릅니다(변조 또는 손상): ${artifact.path}`);
+    throw new ArtifactIntegrityError(artifact.path);
   }
   return content;
 }

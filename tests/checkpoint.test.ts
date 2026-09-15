@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { accumulate, requestId, workId, type WorkBinding } from "../src/server/engine/checkpoint";
+import { accumulate, checkpointOpenRequests, requestId, workId, type WorkBinding } from "../src/server/engine/checkpoint";
 import { completionVerdict, acceptResult, type OpenRequest } from "../src/server/engine/completion";
 import type { AgentResult } from "../src/shared/contracts";
 
@@ -84,5 +84,21 @@ describe("completionVerdict — 판정표", () => {
     const verdict = completionVerdict(result({ status: "completed" }), { openRequests: [], decisionAfterRequest: false });
     expect(acceptResult(result({ status: "completed" }), verdict).kind).toBe("IMPLEMENTATION");
     expect(() => acceptResult(result(), { kind: "continue", remainingSteps: [] })).toThrow("완료 판정이 아닌");
+  });
+});
+
+
+describe("R10 runner request preservation", () => {
+  it.each(["finding", "blocked"] as const)("%s survives a later completed response until its request id is resolved", (form) => {
+    const input = form === "blocked" ? result({ status: "blocked", summary: "사용자 승인 필요" })
+      : result({ status: "completed", findings: [{ id: "F-1", title: "승인", severity: "HIGH", disposition: "AGREED_NO_ACTION", rationale: "사용자 승인 필요", evidenceRefs: [], requiresUserDecision: true }] });
+    const first = accumulate(null, input, [], 10);
+    expect(first.openRequests).toHaveLength(1);
+    expect(checkpointOpenRequests({ accumulated: input, openRequests: [], inputSequence: 10 })).toEqual(first.openRequests);
+    const next = accumulate(first.result, result({ status: "completed" }), first.openRequests, 20);
+    expect(next.openRequests).toEqual(first.openRequests);
+    expect(completionVerdict(next.result, { openRequests: next.openRequests, decisionAfterRequest: false }).kind).toBe("await-input");
+    const resolved = accumulate(next.result, result({ status: "completed", resolvesRequestedDecision: true, resolvedRequestId: first.openRequests[0].id }), next.openRequests, 30);
+    expect(resolved.openRequests).toEqual([]);
   });
 });

@@ -2,6 +2,7 @@ import {ReviewBlocked} from "../reviewLedger.js";
 import { existsSync, readFileSync } from "node:fs";
 import {reviewScope} from "../../shared/reviews.js";
 import { RevisionBlocked } from "../revisionLedger.js";
+import type { RewriteKind } from "../../shared/revisions.js";
 import { wrapWorkGroupAdapter } from "../workGroupAdapter.js";
 import { BudgetController } from "../budgetController.js";
 import { BudgetBlocked } from "../budgetLedger.js";
@@ -33,6 +34,7 @@ import {
   assertFixDispositionAllowed,
   assertPlanContract,
   assertTransition,
+  hashPlan,
   carryForwardFindings,
   mergeCorrectionResult,
   salvageResultFields,
@@ -46,6 +48,7 @@ import { exceededLimits } from "../adapters/executionMetrics.js";
 import type { WorkflowDependencies } from "../workflow.js";
 import { AdmissionRefused, TurnExecutor, type TurnPurpose, type WriteGuards } from "./turnExecutor.js";
 import { WorkCheckpoints } from "./checkpoint.js";
+import { FixContracts } from "./fixContracts.js";
 import { DiagnosisService } from "./diagnoses.js";
 
 // 결과 JSON 의 표기만 틀린 위반(스키마·kind). 재제출에 판단이 필요 없어 교정 턴의 추론 강도를 low 로 내린다
@@ -93,6 +96,8 @@ const DEFERRED_SOURCE_LABEL: Record<DeferredFinding["source"], string> = {
   closeout: "종결 확인", "final-review": "최종 리뷰", implementation: "구현 to-do", fix: "수정 to-do",
 };
 
+type TransitionInput = Parameters<WorkflowDependencies["database"]["applyTopicTransition"]>[0];
+
 export class EngineCore {
   readonly active = new Map<string, {
     actionId: string;
@@ -118,6 +123,8 @@ export class EngineCore {
   readonly checkpoints: WorkCheckpoints;
   // 중재자 진단 서비스(저장·조회·적용·재개 검사·전달 기록) — 2026-09-14 진단 계획.
   readonly diagnoses: DiagnosisService;
+  // 수정 작업 계약(원본 쟁점·판정 면제·회차·실은 진단) — 2026-09-15 "작업 계약을 기록으로".
+  readonly fixContracts: FixContracts;
 
   constructor(readonly dependencies: WorkflowDependencies) {
     const controller = new BudgetController(dependencies.database.budgets, cwd => {
@@ -133,6 +140,7 @@ export class EngineCore {
     this.executor = new TurnExecutor(this);
     this.checkpoints = new WorkCheckpoints(this);
     this.diagnoses = new DiagnosisService(this);
+    this.fixContracts = new FixContracts(this);
   }
 
   // 지금 토픽 상태를 실행 기대값으로 고정한다 — 실행기가 spawn 직전에 이 값과 현재를 대조한다.
@@ -290,6 +298,9 @@ export class EngineCore {
       planBase?: string;
       repairContextKey?: string;
       writeGuards?: WriteGuards;
+      // 재작성 집계 종류를 명시한다 — 없으면 상태로 정한다(CLAUDE_PLAN=plan, CLAUDE_REVISION=revision). 진단 계획 개정은 CLAUDE_PLAN 에서 돌지만
+      // 승인 계획의 개정이라 revision 으로 센다(무료 최초 계획 자격을 쓰지 않는다).
+      planningWrite?: RewriteKind;
     } = {},
   ): Promise<AgentResult> {
     const { freshSession = false, planMode = false, check } = options;
@@ -309,7 +320,7 @@ export class EngineCore {
       result=pending.raw;sessionId=pending.sessionId;
       this.event(topic.id,"system","system","저장된 응답의 교정을 같은 세션에서 재개합니다.");
     } else if (freshSession || !resumeSessionId || resumeSessionId.startsWith("pending:")) {
-      const planningWrite = role==="claude" && topic.state==="CLAUDE_PLAN"?"plan":role==="claude"&&topic.state==="CLAUDE_REVISION"?"revision":undefined;
+      const planningWrite = options.planningWrite ?? (role==="claude" && topic.state==="CLAUDE_PLAN"?"plan":role==="claude"&&topic.state==="CLAUDE_REVISION"?"revision":undefined);
       const created = await this.executor.execute({
         role, topic, signal, purpose: "턴", inputSequence: startedAfter, expected: this.expectationOf(topic), write: implementation,
         writeGuards: options.writeGuards,
@@ -343,7 +354,7 @@ export class EngineCore {
         writeGuards: options.writeGuards,
         session: { mode: "resume", sessionId: resumeSessionId },
         prompt, implementation, planMode,
-        planningWrite: role==="claude" && topic.state==="CLAUDE_PLAN"?"plan":role==="claude"&&topic.state==="CLAUDE_REVISION"?"revision":undefined,
+        planningWrite: options.planningWrite ?? (role==="claude" && topic.state==="CLAUDE_PLAN"?"plan":role==="claude"&&topic.state==="CLAUDE_REVISION"?"revision":undefined),
         readablePaths: options.readablePaths, settings: this.executionSettings(topic.id, role, implementation), onUsage,
       });
       result = resumed.result;
@@ -590,6 +601,21 @@ export class EngineCore {
     return updated;
   }
 
+  // 상태 전이를 수정 작업 계약 행·진단 상태 기록·추가 이벤트와 **한 transaction** 으로 — 수정 작업을 여는 전이(계약 생성)와 수락 전이(회차 소비·계약 수락·
+  // 반영 보고)가 중간에 끊겨 갈라지지 않게(2026-09-15 감사 2차). 이벤트의 비밀값 가림은 DB 저장 경계가 한다.
+  transitionWith(topicId: string, to: WorkflowState, message: string, extras: {
+    changes?: TransitionInput["changes"]; contracts?: TransitionInput["contracts"]; diagnosisEntries?: TransitionInput["diagnosisEntries"];
+    payload?: Record<string, unknown>; events?: TransitionInput["events"];
+  } = {}): Topic {
+    const topic = this.dependencies.database.getTopic(topicId);
+    assertTransition(topic.state, to);
+    return this.dependencies.database.applyTopicTransition({
+      topicId, changes: { state: to, lastError: null, resumeState: null, ...(extras.changes ?? {}) },
+      contracts: extras.contracts, diagnosisEntries: extras.diagnosisEntries,
+      events: [{ actor: "system", kind: "system", state: to, body: message, payload: { from: topic.state, to, ...(extras.payload ?? {}) } }, ...(extras.events ?? [])],
+    });
+  }
+
   interrupt(
     topicId: string,
     state: "BLOCKED_ON_EVIDENCE" | "USER_DECISION_REQUIRED",
@@ -604,6 +630,8 @@ export class EngineCore {
   }
 
   resetToDraft(topic: Topic, message: string): void {
+    // 이전 계획에 묶인 진행 중 진단을 먼저 재확인으로 돌린다 — 초기화 도중 끊겨도 옛 개정·지시가 새 계획에 실리지 않는 쪽으로 멈춘다(fail-closed).
+    this.diagnoses.staleOnReplan(topic);
     this.dependencies.database.updateTopic(topic.id, {
       state: "DRAFT", planRevision: 0, planEpoch: topic.planEpoch + 1,
       planSHA256: null, approvedPlanSHA256: null, lastError: null,
@@ -910,8 +938,8 @@ export class EngineCore {
         }));
     this.event(topic.id, role, "agent_output", safeResult.summary, {
       resultKind: safeResult.kind, findings: safeResult.findings, evidenceRefs: safeResult.evidenceRefs,
-      requestedUserDecision: safeResult.requestedUserDecision,
-      memoryChanges, ...extraPayload,
+      requestedUserDecision: safeResult.requestedUserDecision, status: safeResult.status, remainingSteps: safeResult.remainingSteps,
+      memoryChanges, ...extraPayload, artifactRevision: revision,
     });
   }
 
@@ -969,6 +997,19 @@ export class EngineCore {
     const plan = await this.dependencies.artifacts.readLatest(topicId, "plan");
     if (!plan) throw new Error("저장된 plan.md가 없습니다.");
     return plan;
+  }
+
+  // 구현·리뷰·수정이 읽는 계획 — 본문과 러너·리뷰어에게 넘기는 정본 blob 경로를 **같은 산출물 한 건**에서 꺼내 현재 계획 sha 에 결속한다. 최신 plan
+  // 산출물이 그 sha 가 아니면(개정 계획 저장과 계획 전환 사이에 끊김 등) 그 sha 의 산출물을 쓰고, 그것도 없으면 멈춘다(2026-09-15 감사: 최신 산출물을 해시
+  // 대조 없이 읽어 승인되지 않은 개정 계획으로 구현·리뷰했다 — 본문만 결속하자 읽기 허용 경로가 여전히 미승인 개정본을 가리켰다).
+  async requireCurrentPlanArtifact(topicId: string): Promise<{ content: string; path: string }> {
+    const planSHA256 = this.dependencies.database.getTopic(topicId).planSHA256;
+    const latest = await this.dependencies.artifacts.verifiedLatest(topicId, "plan");
+    if (!latest) throw new Error("저장된 plan.md가 없습니다.");
+    if (!planSHA256 || hashPlan(latest.content) === planSHA256) return latest;
+    const bound = await this.dependencies.artifacts.verifiedRevision(topicId, "plan", planSHA256);
+    if (bound) return bound;
+    throw new Error(`저장된 최신 계획이 현재 계획 sha(${planSHA256.slice(0, 12)}…)와 다르고 그 sha 의 계획 산출물도 없습니다 — 계획 상태를 먼저 확인하세요.`);
   }
 
   assertKind(result: AgentResult, expected: AgentResult["kind"]): void {

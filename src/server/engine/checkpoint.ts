@@ -12,8 +12,9 @@ import { createHash } from "node:crypto";
 import { AgentResultSchema, type AgentResult, type Topic } from "../../shared/contracts.js";
 import type { ToleranceLedgerEntry } from "../../shared/tolerance.js";
 import { mergeCorrectionResult } from "../../shared/workflow.js";
+import { ArtifactIntegrityError } from "../artifacts.js";
 import { redactAgentResult, redactUnverifiedResult } from "../security.js";
-import { renderOpenRequests, type OpenRequest } from "./completion.js";
+import { decisionRequestTexts, renderOpenRequests, type OpenRequest } from "./completion.js";
 import type { EngineCore } from "./core.js";
 
 export const WORK_CHECKPOINT_KIND = "work-checkpoint";
@@ -104,6 +105,11 @@ export interface Accumulation {
   unmatchedResolution: string | null;
 }
 
+// 구버전 checkpoint 가 목록에 담지 않았던 finding·blocked 요청도 저장된 응답에서 복구한다.
+export function checkpointOpenRequests(checkpoint: Pick<WorkCheckpoint, "accumulated" | "openRequests" | "inputSequence">): OpenRequest[] {
+  return accumulate(null, checkpoint.accumulated, checkpoint.openRequests, checkpoint.inputSequence).openRequests;
+}
+
 // 누적 규칙(한 곳): 새 응답을 누적본 위에 병합한다. 요청 결정은 요청별로 보존한다 —
 //   (1) 새 응답의 requestedUserDecision 은 열린 요청 목록에 **추가**된다(같은 문구가 아직 열려 있으면 같은 요청).
 //   (2) 해소는 resolvesRequestedDecision + resolvedRequestId 가 열린 요청의 id 와 **일치할 때만** 그 요청 하나를 닫는다. id 없는 표식은 해소가 아니다.
@@ -115,8 +121,7 @@ export function accumulate(
   let openRequests = [...open];
   const resolvedRequests: OpenRequest[] = [];
   let unmatchedResolution: string | null = null;
-  const asked = next.requestedUserDecision?.trim();
-  if (asked) {
+  for (const asked of decisionRequestTexts(next)) {
     // 서버가 렌더한 열린 요청 목록(`[Q-…] 문구`)이 교정 병합으로 되돌아온 것은 새 질문이 아니다 — **id 와 문구가 모두** 열린 요청과 같을 때만 재출력으로
     // 본다. 기존 id 를 인용하며 다른 문구를 적은 것은 새 질문이다(r3: id 만 비교해 새 질문 B 를 버렸다).
     const rendered = parseRenderedRequests(asked);
@@ -197,17 +202,30 @@ export class WorkCheckpoints {
     const db = this.core.dependencies.database;
     const artifact = db.latestArtifact(topicId, WORK_CHECKPOINT_KIND);
     if (!artifact) return null;
-    const raw = await this.core.dependencies.artifacts.readLatest(topicId, WORK_CHECKPOINT_KIND);
-    if (!raw) throw new CheckpointCorrupt(artifact.revision, "본문 없음");
-    let record: Partial<WorkCheckpoint>;
-    try { record = JSON.parse(raw) as Partial<WorkCheckpoint>; } catch { throw new CheckpointCorrupt(artifact.revision, "JSON 아님"); }
-    if (record.kind !== WORK_CHECKPOINT_KIND || record.version !== 1 || !record.work || !record.phase || !record.accumulated || !Array.isArray(record.verifiedLedger)
-      || !Array.isArray(record.openRequests) || typeof record.confirmations !== "number") {
-      throw new CheckpointCorrupt(artifact.revision, "필드 누락");
+    let raw: string | null;
+    try {
+      raw = await this.core.dependencies.artifacts.readLatest(topicId, WORK_CHECKPOINT_KIND);
+    } catch (error) {
+      // 원장 sha 불일치(변조·손상)도 손상이다 — 형식 오류와 같은 CheckpointCorrupt 로 올려 재개·등록·적용이 같은 정지·거부를 한다(2026-09-15 감사 4차 E:
+      // 평범한 Error 로 올라와 등록 경로가 삼키고 201 을 줬다).
+      if (error instanceof ArtifactIntegrityError) throw new CheckpointCorrupt(artifact.revision, "원장 sha 불일치 — 변조 또는 손상");
+      if (isMissingFile(error)) throw new CheckpointCorrupt(artifact.revision, "원장 행은 있는데 본문 파일이 없음");
+      throw error;
     }
-    const accumulated = AgentResultSchema.safeParse(record.accumulated);
-    if (!accumulated.success) throw new CheckpointCorrupt(artifact.revision, "누적 결과가 계약을 어김");
-    return { ...(record as WorkCheckpoint), accumulated: accumulated.data, revision: artifact.revision };
+    return parseCheckpoint(artifact.revision, raw);
+  }
+
+  // 현재 세대의 특정 revision checkpoint(수락 checkpoint 등) — 없으면 null, 손상이면 CheckpointCorrupt.
+  async byRevision(topicId: string, revision: number): Promise<WorkCheckpoint | null> {
+    let stored: { path: string; content: string } | null;
+    try {
+      stored = await this.core.dependencies.artifacts.verifiedByRevision(topicId, WORK_CHECKPOINT_KIND, revision);
+    } catch (error) {
+      if (error instanceof ArtifactIntegrityError) throw new CheckpointCorrupt(revision, "원장 sha 불일치 — 변조 또는 손상");
+      if (isMissingFile(error)) throw new CheckpointCorrupt(revision, "원장 행은 있는데 본문 파일이 없음");
+      throw error;
+    }
+    return stored ? parseCheckpoint(revision, stored.content) : null;
   }
 
   // 지금 논리 작업(workId: 세대·epoch·계획 sha·재개 상태·수정 회차)의 최신 checkpoint 를 복구 바탕으로 돌려준다. 다른 작업의 기록이면 null.
@@ -216,6 +234,24 @@ export class WorkCheckpoints {
     return checkpoint && workId(checkpoint.work) === workId(work)
       ? { checkpoint, accumulated: checkpoint.accumulated, verifiedLedger: checkpoint.verifiedLedger } : null;
   }
+}
+
+// 원장 행이 가리키는 본문 파일이 없다(삭제·이동) — 형식 오류·sha 불일치와 같은 손상이다(2026-09-15 감사 6차 #4: 평범한 ENOENT 로 올라와 등록·적용이 500 이었다).
+function isMissingFile(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && "code" in error && (error as { code?: unknown }).code === "ENOENT");
+}
+
+function parseCheckpoint(revision: number, raw: string | null): WorkCheckpoint {
+  if (!raw) throw new CheckpointCorrupt(revision, "본문 없음");
+  let record: Partial<WorkCheckpoint>;
+  try { record = JSON.parse(raw) as Partial<WorkCheckpoint>; } catch { throw new CheckpointCorrupt(revision, "JSON 아님"); }
+  if (record.kind !== WORK_CHECKPOINT_KIND || record.version !== 1 || !record.work || !record.phase || !record.accumulated || !Array.isArray(record.verifiedLedger)
+    || !Array.isArray(record.openRequests) || typeof record.confirmations !== "number") {
+    throw new CheckpointCorrupt(revision, "필드 누락");
+  }
+  const accumulated = AgentResultSchema.safeParse(record.accumulated);
+  if (!accumulated.success) throw new CheckpointCorrupt(revision, "누적 결과가 계약을 어김");
+  return { ...(record as WorkCheckpoint), accumulated: accumulated.data, revision };
 }
 
 export function resultSHA256(result: AgentResult): string {

@@ -171,6 +171,8 @@ export const AgentResultSchema = z.object({
   // 해소 표식이 가리키는 요청 id(서버가 정지 메시지·재개 프롬프트에 적어 준 `Q-xxxxxxxx`). **id 가 없거나 열린 요청과 다르면 서버는 어떤
   // 요청도 닫지 않는다**(PLAN §2: 해소 표식은 해당 요청에 결속 — 요청 하나씩 명시).
   resolvedRequestId: z.string().min(1).optional(),
+  // 읽기 전용 리뷰 답변 확인 결과. 요청별로 실제 답변인 사용자 decision 순번을 인용한다.
+  reviewDecisionAnswers: z.array(z.object({ requestId: z.string().min(1), decisionSequence: z.number().int().positive() }).strict()).max(100).optional(),
   memoryUpdates: z.array(MemoryUpdateSchema).max(10).optional(),
   // 허용 오차 원장 — 승인 범위 밖 변경마다 {ruleId, file, note}. 서버가 git diff 와 대조한다(shared/tolerance.ts).
   // 서버 누적 원장(승계 포함)의 저장 계약엔 상한이 없다 — 상한은 정책(규칙 수×파일 수)이 정하고, 모델 한 번 응답의 상한(500행)은
@@ -399,7 +401,7 @@ export const AgentResultJsonSchema = {
   required: [
     "kind", "summary", "planMarkdown", "planEdits", "planLineEdits", "planSHA256",
     "findings", "evidenceRefs", "requestedUserDecision", "memoryUpdates", "toleranceLedger",
-    "status", "remainingSteps", "resolvesRequestedDecision", "resolvedRequestId",
+    "status", "remainingSteps", "resolvesRequestedDecision", "resolvedRequestId", "reviewDecisionAnswers",
   ],
   properties: {
     kind: { enum: AgentResultSchema.shape.kind.options },
@@ -456,6 +458,10 @@ export const AgentResultJsonSchema = {
     remainingSteps: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "null" }] },
     resolvesRequestedDecision: { anyOf: [{ type: "boolean" }, { type: "null" }] },
     resolvedRequestId: { anyOf: [{ type: "string" }, { type: "null" }] },
+    reviewDecisionAnswers: { anyOf: [{ type: "array", maxItems: 100, items: {
+      type: "object", additionalProperties: false, required: ["requestId", "decisionSequence"],
+      properties: { requestId: { type: "string" }, decisionSequence: { type: "integer", minimum: 1 } },
+    } }, { type: "null" }] },
     toleranceLedger: {
       anyOf: [
         {

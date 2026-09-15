@@ -58,7 +58,8 @@ export type DiagnosisInput = z.infer<typeof DiagnosisInputSchema>;
 // 상태(추가 전용 기록의 마지막 값):
 //   registered       등록됨 — 중재자가 적용하거나 정정해야 한다(재개를 막는다)
 //   stale            적용 시점에 계획·코드·세대·실패가 달라 적용하지 않음 — 정정(새 진단)으로만 넘어간다(재개를 막는다)
-//   applied          적용됨 — 다음 쓰기 턴이 전달한다
+//   applied          적용됨 — 다음 쓰기 턴이 전달한다(계획 변경 진단은 먼저 진단 계획 개정 턴이 승인 계획을 고친다)
+//   plan_revised     계획 변경 진단의 개정 계획이 저장됐다 — 감사·종결·ACK·사용자 승인을 거친 뒤 첫 구현 턴이 전달한다
 //   delivered        그 쓰기 턴의 프로세스가 실제로 시작됐다(프롬프트 생성만으로는 기록하지 않는다)
 //   fix_reported     러너가 반영(RESOLVED_BY_FIX)을 보고했고 그 결과가 수락됐다 — 리뷰가 확인해야 해결이다
 //   refuted          러너가 반박했다 — 중재자에게 돌아간다(같은 지시를 자동으로 반복하지 않는다)
@@ -67,7 +68,7 @@ export type DiagnosisInput = z.infer<typeof DiagnosisInputSchema>;
 //   superseded       정정 기록이 대체했다
 //   closed_no_action 수정 불필요 결론(no_action 기록 자신)
 export const DIAGNOSIS_STATUSES = [
-  "registered", "stale", "applied", "delivered", "fix_reported", "refuted", "needs_evidence", "resolved", "superseded", "closed_no_action",
+  "registered", "stale", "applied", "plan_revised", "delivered", "fix_reported", "refuted", "needs_evidence", "resolved", "superseded", "closed_no_action",
 ] as const;
 export type DiagnosisStatus = (typeof DIAGNOSIS_STATUSES)[number];
 
@@ -114,13 +115,25 @@ export interface DiagnosisRecord {
   history: DiagnosisHistoryEntry[];
 }
 
-// 마지막 적용 기록(경로·반환 단계). 적용 전이면 null.
-export function applyInfo(record: DiagnosisRecord): { mode: DiagnosisApplyMode; target: DiagnosisTarget; seq: number } | null {
+// 마지막 적용 기록(경로·반환 단계·반환 전 재개 단계). 적용 전이면 null.
+export function applyInfo(record: DiagnosisRecord): { mode: DiagnosisApplyMode; target: DiagnosisTarget; seq: number; fromResume: string | null } | null {
   const entry = [...record.history].reverse().find((item) => item.status === "applied");
   if (!entry) return null;
   const mode = entry.detail.mode as DiagnosisApplyMode | undefined;
   const target = entry.detail.target as DiagnosisTarget | undefined;
-  return mode && target ? { mode, target, seq: entry.seq } : null;
+  const fromResume = typeof entry.detail.fromResume === "string" ? entry.detail.fromResume : null;
+  return mode && target ? { mode, target, seq: entry.seq, fromResume } : null;
+}
+
+// 계획 변경 진단(적용 경로 plan-revision)인가.
+export function isPlanRevision(record: DiagnosisRecord): boolean {
+  return applyInfo(record)?.mode === "plan-revision";
+}
+
+// 쓰기 턴이 전달할 차례인가 — 같은 계획 안의 진단은 적용 직후(applied), 계획 변경 진단은 개정 계획이 저장된 뒤(plan_revised).
+// 계획 변경 진단의 applied 는 아직 계획을 고치기 전이라 구현 턴에 싣지 않는다.
+export function awaitingDelivery(record: DiagnosisRecord): boolean {
+  return isPlanRevision(record) ? record.status === "plan_revised" : record.status === "applied";
 }
 
 // 진단을 기존 findings 계약에 싣는다 — id 가 곧 진단 id 이고, 러너는 이 id 로 반영(RESOLVED_BY_FIX)·반박(REFUTED)·추가 증거 필요(EXTERNAL_EVIDENCE)를
@@ -151,6 +164,7 @@ export interface DiagnosisPrompt {
   evidenceRefs: string[];
   relatedRequestIds: string[];
   supersedes: string | null;
+  planChange: { required: boolean; reason: string } | null;
   path: string | null;
 }
 
@@ -159,6 +173,7 @@ export function toDiagnosisPrompt(record: DiagnosisRecord, path: string | null):
     id: record.id, title: record.input.title, severity: record.input.severity, observedFailure: record.input.observedFailure,
     cause: record.input.cause, uncertainty: record.input.uncertainty, instructions: record.input.instructions,
     verificationCriteria: [...record.input.verificationCriteria], evidenceRefs: [...record.input.evidenceRefs],
-    relatedRequestIds: [...record.input.relatedRequestIds], supersedes: record.input.supersedes ?? null, path,
+    relatedRequestIds: [...record.input.relatedRequestIds], supersedes: record.input.supersedes ?? null,
+    planChange: record.input.planChange ? { ...record.input.planChange } : null, path,
   };
 }

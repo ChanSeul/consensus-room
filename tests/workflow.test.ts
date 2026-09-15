@@ -37,7 +37,7 @@ import {
   salvageResultFields,
   implementationInProgress,
   isSettledFinding,
-  mergeFindingSources,
+  mergeAgreedSources, mergeFindingSources, overruleDirectiveIDs
 } from "../src/shared/workflow";
 
 function completePlan(extra = ""): string {
@@ -630,8 +630,8 @@ describe("applyPlanEdits", () => {
 describe("프롬프트 처분 계약 스위프", () => {
   it("finding을 방출하는 모든 build*Prompt는 dispositionContract를 포함한다", () => {
     const source = readFileSync(join(__dirname, "..", "src", "shared", "prompts.ts"), "utf8");
-    // finding을 방출하지 않는 빌더만 예외: ACK(프로토콜 확인), 교정(메타 프롬프트).
-    const exempt = new Set(["buildPlanAckPrompt", "buildContractCorrectionPrompt"]);
+    // finding을 방출하지 않는 빌더만 예외: ACK·리뷰 답변 확인(프로토콜 확인), 교정(메타 프롬프트).
+    const exempt = new Set(["buildPlanAckPrompt", "buildContractCorrectionPrompt", "buildReviewAnswerConfirmationPrompt"]);
     const names = [...source.matchAll(/export function (build\w*Prompt)/g)].map((match) => match[1]);
     expect(names.length).toBeGreaterThanOrEqual(8);
     const boundaries = [...source.matchAll(/export function build\w*Prompt/g)].map((match) => match.index!);
@@ -781,5 +781,234 @@ describe("mergeCorrectionResult — resolvesRequestedDecision / salvageResultFie
     expect(implementationInProgress({ ...base, remainingSteps: ["P4"] })).toBe(true);
     expect(implementationInProgress({ ...base, status: "completed", remainingSteps: ["메모"] })).toBe(false);
     expect(implementationInProgress({ ...base })).toBe(false);
+  });
+
+  it("OVERRULE 지시의 기본 형식 — 줄 머리 `OVERRULE <id>[, <id>]`(키워드 뒤 콜론·끝 쉼표 허용)는 적은 id 만 내고, 여러 줄 본문에서는 지시 줄만 센다(2026-09-15 감사 4차 #6)", () => {
+    const ids = (body: string) => [...overruleDirectiveIDs(body)].sort();
+    expect(ids("OVERRULE F-1")).toEqual(["F-1"]);
+    expect(ids("OVERRULE F-1, F-2")).toEqual(["F-1", "F-2"]);
+    expect(ids("OVERRULE: F-1")).toEqual(["F-1"]);
+    expect(ids("OVERRULE F-1,")).toEqual(["F-1"]);
+    // 설명은 다음 줄 — 다음 줄의 id(수정 요구)는 지시가 아니다.
+    expect(ids("OVERRULE F-1\nF-2 는 반드시 고쳐 주세요")).toEqual(["F-1"]);
+  });
+
+  it("OVERRULE 줄에 설명 문장·괄호 설명·콜론 설명이 붙거나 id 를 공백으로 나열하면 지시 전체가 무효이고(id 0개), 지시는 다음 줄로 넘어가지 않으며, 키워드가 줄 머리가 아니면 지시가 아니다 — 수정을 요구한 문장 속 id 를 면제로 세지 않는다(2026-09-15 감사 4차 #6)", () => {
+    const bodies = [
+      "OVERRULE F-3 — F-1 은 반드시 고쳐 주세요.",
+      "OVERRULE F-3 (F-1 은 반드시 고쳐 주세요)",
+      "OVERRULE F-3: F-1 과 달리 F-3 은 고치지 않는다",
+      "OVERRULE\nF-1 은 반드시 고쳐 주세요.",
+      "OVERRULE F-1 F-2",
+      "  xOVERRULE F-1",
+      "OVERRULEF-1",
+      // 키워드를 백틱으로 감싼 줄은 지시어를 언급한 문장이다 — REFIX·REPLAN 과 같은 줄 머리 규칙이라 지시로 세지 않는다.
+      "`OVERRULE` F-1",
+    ];
+    expect(Object.fromEntries(bodies.map((body) => [body, [...overruleDirectiveIDs(body)]])))
+      .toEqual(Object.fromEntries(bodies.map((body) => [body, []])));
+  });
+
+  it("OVERRULE 지시의 id 형식은 제한하지 않는다 — 점·콜론·비ASCII 가 든 스키마상 유효한 finding id(S6.5-GATE2, R3:01, 리뷰-1)와 백틱으로 감싼 id(`F-1` → F-1)도 지시한 id 로 센다(2026-09-15 감사 4차 #11)", () => {
+    const cases: Array<[string, string[]]> = [
+      ["OVERRULE S6.5-GATE2", ["S6.5-GATE2"]],
+      ["OVERRULE R3:01", ["R3:01"]],
+      ["OVERRULE 리뷰-1", ["리뷰-1"]],
+      ["OVERRULE `F-1`", ["F-1"]],
+      ["OVERRULE S7P-01, S6.5-GATE2", ["S7P-01", "S6.5-GATE2"]],
+    ];
+    const directed = (body: string, expected: string[]) => expected.every((id) => overruleDirectiveIDs(body).has(id));
+    expect(Object.fromEntries(cases.map(([body, expected]) => [body, directed(body, expected)])))
+      .toEqual(Object.fromEntries(cases.map(([body]) => [body, true])));
+  });
+
+  // ---- 2026-09-15 감사 5차 #7 (g4) ----
+  it("OVERRULE 지시에서 따옴표(\" ')·백틱으로 감싼 토큰은 안의 공백·쉼표까지 그대로 하나의 id 다 — 스키마상 유효한 공백·쉼표 포함 id(GATE 2, A, B)를 지시할 수 있고, 감싼 id 를 조각(GATE·2·A·B)으로 쪼개 세지 않는다(2026-09-15 감사 5차 #7)", () => {
+    const cases: Array<[string, string[], string[]]> = [
+      ['OVERRULE "GATE 2"', ["GATE 2"], ["GATE", "2", '"GATE', '2"']],
+      ["OVERRULE 'A, B', F-3", ["A, B", "F-3"], ["A", "B", "'A", "B'"]],
+      ["OVERRULE `GATE 2`", ["GATE 2"], ["GATE", "2", "`GATE", "2`"]],
+      ['OVERRULE: "GATE 2",', ["GATE 2"], ["GATE", "2"]],
+    ];
+    const observed = (body: string, expected: string[], fragments: string[]) => {
+      const ids = overruleDirectiveIDs(body);
+      return { directed: expected.filter((id) => ids.has(id)), fragments: fragments.filter((id) => ids.has(id)) };
+    };
+    expect(Object.fromEntries(cases.map(([body, expected, fragments]) => [body, observed(body, expected, fragments)])))
+      .toEqual(Object.fromEntries(cases.map(([body, expected]) => [body, { directed: expected, fragments: [] }])));
+  });
+
+  it("따옴표로 감싼 id 에도 줄 머리 지시 규칙은 그대로다 — 감싼 id 뒤에 설명 문장이 붙거나(OVERRULE \"GATE 2\" 는 고치지 않는다) 감싼 토큰을 쉼표 없이 나열하면 지시 전체가 무효(id 0개)다(2026-09-15 감사 5차 #7)", () => {
+    const bodies = [
+      'OVERRULE "GATE 2" 는 고치지 않는다',
+      "OVERRULE `GATE 2` — GATE 3 은 반드시 고쳐 주세요.",
+      "OVERRULE 'A, B' F-3",
+      'OVERRULE "GATE 2" "GATE 3"',
+    ];
+    expect(Object.fromEntries(bodies.map((body) => [body, [...overruleDirectiveIDs(body)]])))
+      .toEqual(Object.fromEntries(bodies.map((body) => [body, []])));
+  });
+
+  it("닫히지 않은 따옴표('OVERRULE \"GATE')는 감싼 토큰이 아니라 감싸지 않은 토큰으로 읽혀 원 토큰(\"GATE)과 앞 따옴표를 벗긴 GATE 를 내고, 감싸지 않은 토큰은 종전 규칙 그대로다(쉼표 목록·공백 나열 무효·괄호와 끝 구두점 벗김)(2026-09-15 감사 5차 #7)", () => {
+    const ids = (body: string) => [...overruleDirectiveIDs(body)].sort();
+    expect(ids('OVERRULE "GATE')).toEqual(['"GATE', "GATE"]);
+    expect(ids("OVERRULE F-1, F-2")).toEqual(["F-1", "F-2"]);
+    expect(ids("OVERRULE F-1 F-2")).toEqual([]);
+    expect(ids("OVERRULE (F-1).")).toEqual(["(F-1).", "F-1"]);
+  });
+
+  // ---- 2026-09-15 감사 6차 #5·#6·#9 (g6d) ----
+  it("합의 기준 병합(mergeAgreedSources)은 최신 우선이되, 판정이 끝나지 않은 새 처분(처분 없음·EXTERNAL_EVIDENCE·사용자 판정 필요)은 앞선 층의 같은 id 합의(AGREED_ACTION)를 가리지 못해 그 합의 판(심각도·근거 포함)이 그대로 남고, 새 합의와 판정이 끝난 새 처분(수정 불필요·수정 확인·반박)은 앞선 합의보다 우선한다(2026-09-15 감사 6차 #5)", () => {
+    const agreed = finding({ id: "F-2", severity: "HIGH", rationale: "FC-2 원본: 고치기로 합의", requiresUserDecision: true });
+    // 1) 판정이 끝나지 않은 새 처분은 앞선 합의를 가리지 못한다 — 앞선 합의 판이 그대로 남는다.
+    const unjudged: Record<string, Finding> = {
+      "처분 없음": finding({ id: "F-2", severity: "LOW", disposition: undefined, rationale: "처분 없음" }),
+      EXTERNAL_EVIDENCE: finding({ id: "F-2", severity: "MEDIUM", disposition: "EXTERNAL_EVIDENCE", rationale: "게이트 로그 없이는 확인 불가" }),
+      "사용자 판정 필요(AGREED_NO_ACTION)": finding({ id: "F-2", severity: "MEDIUM", disposition: "AGREED_NO_ACTION", requiresUserDecision: true, rationale: "수정 불필요 — 판정 필요" }),
+      "사용자 판정 필요(REFUTED)": finding({ id: "F-2", severity: "MEDIUM", disposition: "REFUTED", requiresUserDecision: true, rationale: "반박 — 판정 필요" }),
+    };
+    expect(Object.fromEntries(Object.entries(unjudged).map(([label, newer]) => [label, mergeAgreedSources([newer], [agreed])])))
+      .toEqual(Object.fromEntries(Object.keys(unjudged).map((label) => [label, [agreed]])));
+    // 2) 새 합의(판정 필요여도)와 판정이 끝난 새 처분은 최신 우선 그대로다.
+    const decided: Record<string, Finding> = {
+      "새 합의(AGREED_ACTION, 판정 필요)": finding({ id: "F-2", severity: "MEDIUM", rationale: "최종 리뷰 재판정", requiresUserDecision: true }),
+      "수정 불필요(AGREED_NO_ACTION)": finding({ id: "F-2", disposition: "AGREED_NO_ACTION", rationale: "OVERRULE 뒤 수정 불필요" }),
+      "수정 확인(RESOLVED_BY_FIX)": finding({ id: "F-2", disposition: "RESOLVED_BY_FIX", rationale: "수정 확인" }),
+      "반박(REFUTED)": finding({ id: "F-2", disposition: "REFUTED", rationale: "반박 확정" }),
+    };
+    expect(Object.fromEntries(Object.entries(decided).map(([label, newer]) => [label, mergeAgreedSources([newer], [agreed])])))
+      .toEqual(Object.fromEntries(Object.entries(decided).map(([label, newer]) => [label, [newer]])));
+    // 3) 앞선 합의가 없으면 판정이 끝나지 않은 새 처분도 그대로 남는다 — 앞선 층의 판정 끝난 처분으로 되돌리지 않는다.
+    const evidence = unjudged.EXTERNAL_EVIDENCE;
+    expect(mergeAgreedSources([evidence], [finding({ id: "F-2", disposition: "AGREED_NO_ACTION", rationale: "첫 리뷰: 수정 불필요" })])).toEqual([evidence]);
+    expect(mergeAgreedSources([evidence])).toEqual([evidence]);
+    // 4) 여러 층: 빈 층을 건너뛰고 id 순서·다른 id 의 판은 mergeFindingSources 와 같다 — 판정이 끝나지 않은 처분이 겹겹이 있어도 가려진 id 만 가장 최신 합의 판으로 남는다.
+    const layers: Array<Finding[] | undefined> = [
+      undefined,
+      [evidence, finding({ id: "F-1", disposition: "RESOLVED_BY_FIX", rationale: "F-1 수정 확인" })],
+      [unjudged["처분 없음"], finding({ id: "F-3", disposition: "AGREED_NO_ACTION", rationale: "F-3 경미" })],
+      undefined,
+      [agreed, finding({ id: "F-1", rationale: "F-1 합의" })],
+      [finding({ id: "F-2", severity: "BLOCKER", rationale: "첫 리뷰: 고치기로 합의" }), finding({ id: "F-4", rationale: "F-4 합의" })],
+    ];
+    const view = (merged: Finding[]) => merged.map((x) => [x.id, x.disposition ?? null, x.severity, x.rationale]);
+    expect(view(mergeFindingSources(...layers))).toEqual([
+      ["F-2", "EXTERNAL_EVIDENCE", "MEDIUM", "게이트 로그 없이는 확인 불가"], ["F-1", "RESOLVED_BY_FIX", "HIGH", "F-1 수정 확인"],
+      ["F-3", "AGREED_NO_ACTION", "HIGH", "F-3 경미"], ["F-4", "AGREED_ACTION", "HIGH", "F-4 합의"],
+    ]);
+    expect(view(mergeAgreedSources(...layers))).toEqual([
+      ["F-2", "AGREED_ACTION", "HIGH", "FC-2 원본: 고치기로 합의"], ["F-1", "RESOLVED_BY_FIX", "HIGH", "F-1 수정 확인"],
+      ["F-3", "AGREED_NO_ACTION", "HIGH", "F-3 경미"], ["F-4", "AGREED_ACTION", "HIGH", "F-4 합의"],
+    ]);
+    // 되돌림 검사는 이 병합 결과의 합의만 본다 — 가려지지 않은 F-2 합의를 수정 확인 없이 닫으면 되돌림이다.
+    const closed = [finding({ id: "F-2", disposition: "AGREED_NO_ACTION", rationale: "수정 확인 없이 닫음" })];
+    expect([dispositionRegressions(mergeFindingSources(...layers), closed), dispositionRegressions(mergeAgreedSources(...layers), closed)]).toEqual([[], ["F-2"]]);
+  });
+
+  // 퇴행 감지 사다리: 크기를 2개씩 늘려 가며 잰다 — 지수 역추적으로 퇴행하면 한도(1초)를 처음 넘는 크기에서 실패하므로(한 칸에 약 4배) 40개 입력으로 곧장 수십 시간
+  // 멈추는 대신 수 초 안에 끝난다. 858c974 정규식 실측(무효 줄, 큰따옴표): 16개 6ms · 18개 22ms · 20개 89ms · 22개 357ms, 새 스캐너 40개 0.3ms 미만.
+  it("OVERRULE 지시 줄 판정은 토큰 수에 선형이다 — 따옴표·작은따옴표·백틱으로 감싼 id 40개 뒤에 같은 줄 설명을 붙인 무효 줄은 id 0개, 설명을 다음 줄로 뺀 유효 줄은 그 40개를 정확히 내고, 크기마다 둘 다 1초 안에 끝난다(옛 정규식은 무효 줄에서 id 2개마다 약 4배로 늘었다)(2026-09-15 감사 6차 #6·#9)", () => {
+    for (let n = 2; n <= 40; n += 2) {
+      const ids = Array.from({ length: n }, (_, index) => `G-${index + 1}`);
+      for (const quote of ['"', "'", "`"]) {
+        const list = ids.map((id) => `${quote}${id}${quote}`).join(", ");
+        const invalidStarted = performance.now();
+        const invalid = [...overruleDirectiveIDs(`OVERRULE ${list} 은 고치지 않는다\nG-1 은 고치세요.`)];
+        const invalidMs = performance.now() - invalidStarted;
+        const validStarted = performance.now();
+        const valid = [...overruleDirectiveIDs(`OVERRULE ${list}\nG-1 은 고치세요.`)].sort();
+        const validMs = performance.now() - validStarted;
+        expect({ n, quote, invalid, valid, invalidUnderOneSecond: invalidMs < 1000, validUnderOneSecond: validMs < 1000 },
+          `n=${n} ${quote} 무효 ${invalidMs.toFixed(1)}ms · 유효 ${validMs.toFixed(1)}ms`)
+          .toEqual({ n, quote, invalid: [], valid: [...ids].sort(), invalidUnderOneSecond: true, validUnderOneSecond: true });
+      }
+    }
+  });
+
+  it("OVERRULE 지시 줄 스캐너는 문서화된 문법 그대로다 — 줄 머리 OVERRULE(뒤에 콜론 또는 공백·탭), 토큰은 닫는 문자 뒤가 쉼표·줄 끝인 따옴표·작은따옴표·백틱 감싼 토큰(안의 문자 그대로 + 앞뒤 공백을 벗긴 형태) 또는 공백·쉼표 없는 감싸지 않은 토큰(원 토큰 + 앞 따옴표·백틱·괄호와 끝 따옴표·괄호·구두점을 벗긴 형태), 토큰 사이 쉼표(앞뒤 공백·탭), 끝 쉼표 하나, 줄 끝 CR 무시이고 어긋나면 그 줄 전체가 무효다 — 기존 OVERRULE 사례와 경계(감싼 토큰 뒤 설명·다른 감싼 토큰 속 쉼표·탭·CRLF·빈 따옴표·연속 쉼표·선행 쉼표·유니코드 따옴표)의 id 집합이 정확히 이것이다(2026-09-15 감사 6차 #6·#9)", () => {
+    const cases: Array<[string, string[]]> = [
+      // 기존 사례(감사 4차 #6·#11, 5차 #7) — 정확한 집합
+      ["OVERRULE F-1", ["F-1"]],
+      ["OVERRULE F-1, F-2", ["F-1", "F-2"]],
+      ["OVERRULE: F-1", ["F-1"]],
+      ["OVERRULE F-1,", ["F-1"]],
+      ["OVERRULE F-1\nF-2 는 반드시 고쳐 주세요", ["F-1"]],
+      ["OVERRULE F-3 — F-1 은 반드시 고쳐 주세요.", []],
+      ["OVERRULE F-3 (F-1 은 반드시 고쳐 주세요)", []],
+      ["OVERRULE F-3: F-1 과 달리 F-3 은 고치지 않는다", []],
+      ["OVERRULE\nF-1 은 반드시 고쳐 주세요.", []],
+      ["OVERRULE F-1 F-2", []],
+      ["  xOVERRULE F-1", []],
+      ["OVERRULEF-1", []],
+      ["`OVERRULE` F-1", []],
+      ["OVERRULE S6.5-GATE2", ["S6.5-GATE2"]],
+      ["OVERRULE R3:01", ["R3:01"]],
+      ["OVERRULE 리뷰-1", ["리뷰-1"]],
+      ["OVERRULE `F-1`", ["F-1"]],
+      ["OVERRULE S7P-01, S6.5-GATE2", ["S7P-01", "S6.5-GATE2"]],
+      ['OVERRULE "GATE 2"', ["GATE 2"]],
+      ["OVERRULE 'A, B', F-3", ["A, B", "F-3"]],
+      ["OVERRULE `GATE 2`", ["GATE 2"]],
+      ['OVERRULE: "GATE 2",', ["GATE 2"]],
+      ['OVERRULE "GATE 2" 는 고치지 않는다', []],
+      ["OVERRULE `GATE 2` — GATE 3 은 반드시 고쳐 주세요.", []],
+      ["OVERRULE 'A, B' F-3", []],
+      ['OVERRULE "GATE 2" "GATE 3"', []],
+      ['OVERRULE "GATE', ['"GATE', "GATE"]],
+      ["OVERRULE (F-1).", ["(F-1).", "F-1"]],
+      // 감싼 토큰 뒤 설명 — 같은 줄 설명은 공백이 없는 id 여도 줄 전체를 무효로 만든다.
+      ['OVERRULE "F-1" 은 고치지 않는다', []],
+      ['OVERRULE "F-1"은 고치지 않는다', []],
+      ["OVERRULE `F-1`, 'F-2' — 설명", []],
+      ["OVERRULE 'A', 'B, C' 설명", []],
+      // 닫는 따옴표 뒤 쉼표, 다른 감싼 토큰 속 쉼표 — 감싼 토큰 속 쉼표는 구분자가 아니다.
+      ['OVERRULE "F-1", "F-2, F-3"', ["F-1", "F-2, F-3"]],
+      ['OVERRULE "A", B"', ["A", 'B"', "B"]],
+      // 탭
+      ["OVERRULE\tF-1\t,\tF-2\t", ["F-1", "F-2"]],
+      ["OVERRULE:\t\"GATE 2\",\t'A, B'", ["GATE 2", "A, B"]],
+      ["\tOVERRULE F-1", ["F-1"]],
+      ["OVERRULE F-1\tF-2", []],
+      ['OVERRULE "GATE\t2"', ["GATE\t2"]],
+      // CRLF — 줄 끝 CR 만 벗긴다. 줄 가운데 CR 은 구분자가 아니다.
+      ["OVERRULE F-1, F-2\r\nF-3 은 고치세요\r\n", ["F-1", "F-2"]],
+      ['OVERRULE "GATE 2"\r\nOVERRULE `A, B`\r\n', ["GATE 2", "A, B"]],
+      ["OVERRULE F-3 — 설명\r\nOVERRULE F-1\r\n", ["F-1"]],
+      ["OVERRULE F-1 \r", ["F-1"]],
+      ["OVERRULE F-1\r, F-2", []],
+      // 빈 따옴표 — 감싼 토큰은 한 글자 이상이다. 빈 따옴표는 감싸지 않은 토큰("")이고, 벗긴 형태가 비면 원 토큰만 남는다.
+      ['OVERRULE ""', ['""']],
+      ['OVERRULE "", F-1', ['""', "F-1"]],
+      ["OVERRULE ''", ["''"]],
+      ['OVERRULE " "', [" "]],
+      ['OVERRULE "" 은 고치지 않는다', []],
+      // 연속 쉼표·선행 쉼표·빈 토큰
+      ["OVERRULE F-1,,", []],
+      ["OVERRULE , F-1", []],
+      ["OVERRULE ,", []],
+      ["OVERRULE F-1, ,F-2", []],
+      // 유니코드 따옴표는 감싸는 문자가 아니다 — 감싸지 않은 토큰으로 읽혀 공백이 들면 줄 전체가 무효이고, 쉼표가 들면 두 토큰으로 갈린다.
+      ["OVERRULE “GATE 2”", []],
+      ["OVERRULE “GATE 2”, F-3", []],
+      ["OVERRULE “F-1”", ["“F-1”"]],
+      ["OVERRULE “F-1”, “F-2”", ["“F-1”", "“F-2”"]],
+      ["OVERRULE ‘A, B’", ["‘A", "B’"]],
+      // 여러 지시 줄은 합친다.
+      ['OVERRULE F-1\nOVERRULE "GATE 2"', ["F-1", "GATE 2"]],
+    ];
+    expect(new Set(cases.map(([body]) => body)).size).toBe(cases.length);
+    expect(Object.fromEntries(cases.map(([body]) => [body, [...overruleDirectiveIDs(body)].sort()])))
+      .toEqual(Object.fromEntries(cases.map(([body, expected]) => [body, [...expected].sort()])));
+  });
+
+  it("감싼 토큰은 닫는 따옴표·백틱 바로 뒤가 쉼표나 줄 끝일 때만 감싼 토큰이다 — 닫는 문자 뒤에 다른 문자가 붙으면 줄 판정과 id 추출이 같은 한 번의 훑기로 그 자리를 감싸지 않은 토큰으로 읽고, 줄은 감싸지 않은 토큰으로 통과시킨 뒤 id 는 감싼 토큰으로 뽑아 줄에 토큰으로 적히지 않은 조각(OVERRULE \"F-1\"은 의 F-1·은, OVERRULE 'F-1, F-2'x 의 F-1, F-2·x)을 면제로 세지 않는다(2026-09-15 감사 6차 #6·#9)", () => {
+    const cases: Array<[string, string[]]> = [
+      ['OVERRULE "F-1"은', ['"F-1"은', 'F-1"은']],
+      ["OVERRULE 'F-1, F-2'x", ["'F-1", "F-1", "F-2'x"]],
+      ['OVERRULE "a"b, c', ['"a"b', 'a"b', "c"]],
+      ['OVERRULE "A, "B"', ['"A', "A", "B"]],
+    ];
+    expect(Object.fromEntries(cases.map(([body]) => [body, [...overruleDirectiveIDs(body)].sort()])))
+      .toEqual(Object.fromEntries(cases.map(([body, expected]) => [body, [...expected].sort()])));
   });
 });

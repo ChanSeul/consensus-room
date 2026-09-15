@@ -251,7 +251,8 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     const detail: TopicDetail = {
       topic,
       timeline: database.getTimeline(topic.id, Number.isFinite(after) ? after : 0),
-      currentPlan: await artifacts.readLatest(topic.id, "plan"),
+      // 현재 계획은 현재 계획 sha 에 결속한 산출물이다 — 저장만 되고 승인되지 않은 개정본을 현재 계획으로 보여 주지 않는다(sha 가 없는 계획 전에는 최신 저장본).
+      currentPlan: (topic.planSHA256 ? (await artifacts.verifiedRevision(topic.id, "plan", topic.planSHA256))?.content : undefined) ?? await artifacts.readLatest(topic.id, "plan"),
       previousPlan: await artifacts.readPrevious(topic.id, "plan"),
       consensus: await readJsonArtifact(artifacts, topic.id, "consensus"),
       implementationReport: await artifacts.readLatest(topic.id, "implementation"),
@@ -498,7 +499,8 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   return app;
 }
 
-function accepted(actionId: string, topic: ReturnType<ConsensusDatabase["getTopic"]>) {
+// actionId null: 실행을 열지 않았다(예: 등록된 다른 수정 진단의 적용을 기다리는 순차 적용).
+function accepted(actionId: string | null, topic: ReturnType<ConsensusDatabase["getTopic"]>) {
   return { accepted: true, actionId, topic };
 }
 

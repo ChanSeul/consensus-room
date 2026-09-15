@@ -3,6 +3,8 @@ import { RevisionLedger } from "./revisionLedger.js";
 import { WorkGroups } from "./workGroups.js";
 import { BudgetLedger } from "./budgetLedger.js";
 import { DiagnosisStore } from "./diagnosisStore.js";
+import { FixContractStore } from "./fixContractStore.js";
+import type { FixContract } from "../shared/fixContract.js";
 import { CLOSED_DIAGNOSIS_STATUSES, type DiagnosisBinding, type DiagnosisInput, type DiagnosisOrigin, type DiagnosisRecord, type DiagnosisStatus } from "../shared/diagnoses.js";
 import { EventEmitter } from "node:events";
 import { mkdirSync } from "node:fs";
@@ -54,6 +56,7 @@ export class ConsensusDatabase {
   readonly budgets: BudgetLedger;
   readonly workGroups: WorkGroups;
   readonly diagnoses: DiagnosisStore;
+  readonly fixContracts: FixContractStore;
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true });
@@ -61,6 +64,7 @@ export class ConsensusDatabase {
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
     this.migrate();
     this.diagnoses = new DiagnosisStore(this.db);
+    this.fixContracts = new FixContractStore(this.db);
     this.budgets = new BudgetLedger(this.db);
     this.workGroups = new WorkGroups(this.db);
     this.revisions = new RevisionLedger(this.db);
@@ -714,11 +718,17 @@ export class ConsensusDatabase {
     clearAcknowledgements?: boolean;
     participants?: Participant[];
     events: Array<Omit<TimelineEventInput, "topicId">>;
+    // 전이와 한 transaction 으로 남길 수정 작업 계약 행과 진단 상태 기록(수락 전이·회차 소비·반영 보고가 갈라지지 않게, 2026-09-15 감사 2차).
+    contracts?: readonly FixContract[];
+    diagnosisEntries?: ReadonlyArray<{ diagnosisId: string; status: DiagnosisStatus; detail?: Record<string, unknown> }>;
   }): Topic {
     const recorded: TimelineEvent[] = [];
     this.db.exec("BEGIN IMMEDIATE");
     try {
       this.updateTopic(input.topicId, input.changes);
+      const at = now();
+      for (const contract of input.contracts ?? []) this.fixContracts.append(input.topicId, contract, at);
+      for (const entry of input.diagnosisEntries ?? []) this.diagnoses.log(input.topicId, entry.diagnosisId, entry.status, entry.detail ?? {}, at);
       if (input.clearAcknowledgements) this.clearAcknowledgements(input.topicId);
       for (const participant of input.participants ?? []) {
         this.upsertParticipant(input.topicId, participant);
@@ -955,12 +965,31 @@ export class ConsensusDatabase {
     return row ? this.mapAction(row) : null;
   }
 
+  // 수정 작업 계약 행 하나를 이벤트와 함께 남긴다(옛 토픽 이관 등 전이 없는 기록).
+  recordFixContract(topicId: string, contract: FixContract, event?: Omit<TimelineEventInput, "topicId">): void {
+    let recorded: TimelineEvent | null = null;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.fixContracts.append(topicId, contract, now());
+      if (event) recorded = this.insertEventInTransaction({ ...event, topicId });
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    if (recorded) this.emitEvent(recorded);
+  }
+
   // ---- 중재자 진단(DiagnosisStore) — 등록·상태 기록은 타임라인 이벤트(재시작 복구용 requestKey 마커 포함)와 **한 트랜잭션**이다.
   // 번호 할당·정정 대상 검사(닫힌 진단은 정정할 수 없다)도 같은 트랜잭션 안에서 한다.
   registerDiagnosis(input: {
     topicId: string; diagnosis: DiagnosisInput; binding: DiagnosisBinding; origin: DiagnosisOrigin | null;
     initialStatus: "registered" | "closed_no_action";
     event: (id: string) => Omit<TimelineEventInput, "topicId">;
+    // 등록과 한 transaction 으로 바꿀 주제 필드(예: 저장 전 계획 개정을 정정하면 멈췄던 구현 단계로 재개 단계를 되돌린다).
+    changes?: Parameters<ConsensusDatabase["updateTopic"]>[1];
+    // 등록과 한 transaction 으로 남길 수정 작업 계약 행(진단 전용 수정을 수정 불필요로 닫으면 계약도 closed).
+    contracts?: readonly FixContract[];
   }): DiagnosisRecord {
     let recorded: TimelineEvent | null = null;
     let id = "";
@@ -980,6 +1009,8 @@ export class ConsensusDatabase {
       this.diagnoses.insert({ topicId: input.topicId, id, number, input: input.diagnosis, binding: input.binding, origin: input.origin, createdAt: at });
       this.diagnoses.log(input.topicId, id, input.initialStatus, supersedes ? { supersedes } : {}, at);
       if (supersedes) this.diagnoses.log(input.topicId, supersedes, "superseded", { by: id }, at);
+      if (input.changes && Object.keys(input.changes).length > 0) this.updateTopic(input.topicId, input.changes);
+      for (const contract of input.contracts ?? []) this.fixContracts.append(input.topicId, contract, at);
       recorded = this.insertEventInTransaction({ ...input.event(id), topicId: input.topicId });
       this.db.exec("COMMIT");
     } catch (error) {
@@ -994,14 +1025,20 @@ export class ConsensusDatabase {
     topicId: string;
     entries: ReadonlyArray<{ diagnosisId: string; status: DiagnosisStatus; detail?: Record<string, unknown> }>;
     changes?: Parameters<ConsensusDatabase["updateTopic"]>[1];
+    // 두 에이전트의 계획 확인(ACK)을 같은 transaction 에서 지운다(개정 계획 저장).
+    clearAcknowledgements?: boolean;
     event?: Omit<TimelineEventInput, "topicId">;
+    // 진단 적용과 한 transaction 으로 남길 수정 작업 계약 행(새 계약·진단 덧붙임·버려진 계약).
+    contracts?: readonly FixContract[];
   }): void {
     let recorded: TimelineEvent | null = null;
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const at = now();
       for (const entry of input.entries) this.diagnoses.log(input.topicId, entry.diagnosisId, entry.status, entry.detail ?? {}, at);
+      for (const contract of input.contracts ?? []) this.fixContracts.append(input.topicId, contract, at);
       if (input.changes && Object.keys(input.changes).length > 0) this.updateTopic(input.topicId, input.changes);
+      if (input.clearAcknowledgements) this.clearAcknowledgements(input.topicId);
       if (input.event) recorded = this.insertEventInTransaction({ ...input.event, topicId: input.topicId });
       this.db.exec("COMMIT");
     } catch (error) {
