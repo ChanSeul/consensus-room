@@ -5,7 +5,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { buildApp } from "../src/server/app";
 import { ArtifactStore } from "../src/server/artifacts";
@@ -18,6 +18,7 @@ import { hashPlan } from "../src/shared/workflow";
 
 const temporaryDirectories: string[] = [];
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const directory of temporaryDirectories.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
 
@@ -4619,7 +4620,9 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     }));
     expect((await r.call("POST", `/api/topics/${r.topicId}/messages`, { kind: "decision", body: "OVERRULE F-1\nF-1 은 영향이 없으니 이번 범위에서 고치지 않습니다." })).status).toBe(200);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(200);
-    const after = await settledState(r, "overrule-guidance-retry");
+    expect(await settledState(r, "overrule-guidance-retry")).toBe("USER_DECISION_REQUIRED");
+    expect(r.database.getTopic(r.topicId).lastError).toContain("구현 리뷰 한도");
+    const after = await g6aSettleWithGrants(r, "overrule-guidance-retry");
     expect(after, r.database.getTopic(r.topicId).lastError ?? "").toBe("READY_TO_DELIVER");
     const bodies = r.database.getTimeline(r.topicId).map((event) => event.body);
     expect(bodies.filter((body) => body.includes("처분을 되돌렸습니다"))).toHaveLength(1);
@@ -5458,7 +5461,9 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     const decision = "OVERRULE \"GATE 2\"\nGATE 2 는 영향이 없으니 이번 범위에서 고치지 않습니다.";
     expect((await r.call("POST", `/api/topics/${r.topicId}/messages`, { kind: "decision", body: decision })).status).toBe(200);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(200);
-    const after = await settledState(r, "overrule-quoted-id-retry");
+    expect(await settledState(r, "overrule-quoted-id-retry")).toBe("USER_DECISION_REQUIRED");
+    expect(r.database.getTopic(r.topicId).lastError).toContain("구현 리뷰 한도");
+    const after = await g6aSettleWithGrants(r, "overrule-quoted-id-retry");
     expect(after, r.database.getTopic(r.topicId).lastError ?? "").toBe("READY_TO_DELIVER");
     const timeline = r.database.getTimeline(r.topicId);
     expect(timeline.filter((event) => event.body.includes("처분을 되돌렸습니다"))).toHaveLength(1);
@@ -6573,7 +6578,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     r.database.close();
   });
 
-  it("R10 여러 질문 중 확인된 답변만 해소하고 저장된 코드 리뷰와 같은 세션으로 나머지를 잇는다", async () => {
+  it.each([false, true])("R10 여러 질문의 부분 답변과 이전 승인 취소를 재확인한다(revoked=%s)", async (revoked) => {
     class TwoQuestions extends EchoCodex {
       override async resumeTurn(turn: SessionTurn): Promise<AgentResult> {
         const review = await super.resumeTurn(turn);
@@ -6595,13 +6600,22 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.getTopic(r.topicId).lastError).toContain("배포 시간?");
     expect(r.database.getTopic(r.topicId).lastError).not.toContain("배포 채널?");
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "미답변", paths: ["feature.txt"] })).status).not.toBe(200);
-    await r.call("POST", `/api/topics/${r.topicId}/messages`, { kind: "decision", body: "배포 시간은 오후 8시" });
+    await r.call("POST", `/api/topics/${r.topicId}/messages`, { kind: "decision", body: revoked ? "채널 A 승인은 취소, 배포 시간은 오후 8시" : "배포 시간은 오후 8시" });
     await r.call("POST", `/api/topics/${r.topicId}/actions/retry`);
     await r.idle("USER_DECISION_REQUIRED");
     expect(r.codex.answerConfirmations).toHaveLength(1); // 답변 확인도 3회 한도를 우회하지 않는다.
+    if (revoked) r.codex.answerHandlers.push(({ requests, decisions }) => [{ requestId: requests.find(request => request.question.includes("배포 시간?"))!.id, decisionSequence: decisions.at(-1)!.sequence }]);
     const { version } = r.database.reviews.account(r.topicId, "implementation");
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/review-resume`, { scope: "implementation", version })).status).toBe(200);
     await r.call("POST", `/api/topics/${r.topicId}/actions/retry`);
+    if (revoked) {
+      await r.idle("USER_DECISION_REQUIRED");
+      expect(r.database.getTopic(r.topicId).lastError).toContain("배포 채널?");
+      expect(r.codex.answerConfirmations.at(-1)?.prompt).toContain("배포 채널?");
+      expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "취소", paths: ["feature.txt"] })).status).not.toBe(200);
+      r.database.close();
+      return;
+    }
     await r.idle("READY_TO_DELIVER");
     expect(r.codex.prompts).toHaveLength(2);
     expect(r.codex.answerConfirmations).toHaveLength(2);
@@ -6746,5 +6760,90 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "완료 리뷰 확인", paths: ["feature.txt"] })).status).toBe(200);
     r.database.close();
   });
+
+describe("R1/R2 delivery admission", () => {
+  it("R1 진단 등록 대기 중 commit은 Git 진입 전 거부한다", async () => {
+    const r = await room("r1-registration-race", []);
+    r.claude["steps"].push(() => { writeFileSync(join(r.worktree, "feature.txt"), "구현\n"); return result("IMPLEMENTATION", "완료", { status: "completed" }); });
+    await r.call("POST", `/api/topics/${r.topicId}/actions/implement`);
+    await r.idle("READY_TO_DELIVER");
+    const committedOID = r.database.getFlags(r.topicId).committedOID;
+    const original = GitService.prototype.snapshot;
+    let release!: () => void, entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let first = true;
+    vi.spyOn(GitService.prototype, "snapshot").mockImplementation(async function (this: GitService, ...args) { if (first && args[0] === r.worktree) { first = false; entered(); await held; } return original.apply(this, args); });
+    const before = git(r.worktree, ["rev-parse", "HEAD"]);
+    const registration = r.call("POST", `/api/topics/${r.topicId}/diagnoses`, fixDiagnosis(), { mediator: true });
+    await started;
+    let response;
+    try { response = await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "race", paths: ["feature.txt"] }); }
+    finally { release(); }
+    await registration;
+    expect(response.status).not.toBe(200);
+    expect(git(r.worktree, ["rev-parse", "HEAD"])).toBe(before);
+    expect(r.database.getFlags(r.topicId).committedOID).toBe(committedOID);
+    r.database.close();
+  });
+
+  it("R1 commit 대기 중 진단·결정은 거부하고 실패 후 잠금을 해제한다", async () => {
+    const r = await room("r1-delivery-race", []);
+    r.claude["steps"].push(() => { writeFileSync(join(r.worktree, "feature.txt"), "구현\n"); return result("IMPLEMENTATION", "완료", { status: "completed" }); });
+    await r.call("POST", `/api/topics/${r.topicId}/actions/implement`);
+    await r.idle("READY_TO_DELIVER");
+    const original = GitService.prototype.snapshot;
+    let release!: () => void, entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let first = true;
+    vi.spyOn(GitService.prototype, "snapshot").mockImplementation(async function (this: GitService, ...args) {
+      if (first && args[0] === r.worktree) { first = false; entered(); await held; throw new Error("snapshot failure"); }
+      return original.apply(this, args);
+    });
+    const commit = r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "race", paths: ["feature.txt"] });
+    await started;
+    try {
+      expect((await r.call("POST", `/api/topics/${r.topicId}/diagnoses`, fixDiagnosis(), { mediator: true })).status).not.toBe(200);
+      expect((await r.call("POST", `/api/topics/${r.topicId}/messages`, { kind: "decision", body: "전달 중 취소" })).status).not.toBe(200);
+      expect(r.database.getTimeline(r.topicId).some(event => event.body === "전달 중 취소")).toBe(false);
+    } finally { release(); }
+    expect((await commit).status).not.toBe(200);
+    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "retry", paths: ["feature.txt"] })).status).toBe(200);
+    r.database.close();
+  });
+
+  it.each([false, true])("R2 READY 이후 승인 취소와 재승인은 코드 재리뷰 없이 복구한다(committed=%s)", async (committed) => {
+    const { r } = await r10FinalQuestionStop("r2-ready-revoke");
+    await r.call("POST", `/api/topics/${r.topicId}/messages`, { kind: "decision", body: "오늘 배포 승인" });
+    await r.call("POST", `/api/topics/${r.topicId}/actions/retry`);
+    expect(await g6aSettleWithGrants(r, "최초 승인")).toBe("READY_TO_DELIVER");
+    if (committed) expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "approved", paths: ["feature.txt"] })).status).toBe(200);
+    const oid = r.database.getFlags(r.topicId).committedOID;
+    const reviews = r.codex.prompts.length;
+    r.codex.answerHandlers.push(() => []);
+    await r.call("POST", `/api/topics/${r.topicId}/messages`, { kind: "decision", body: "앞선 배포 승인 취소, 보류" });
+    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/${committed ? "push" : "commit"}`, committed ? undefined : { message: "revoked", paths: ["feature.txt"] })).status).not.toBe(200);
+    await r.call("POST", `/api/topics/${r.topicId}/actions/retry`);
+    const stopped = await g6aSettleWithGrants(r, "취소 확인");
+    expect(stopped).toBe("USER_DECISION_REQUIRED");
+    expect(r.codex.answerConfirmations.at(-1)?.prompt).toContain(R10_FINAL_QUESTION);
+    await r.call("POST", `/api/topics/${r.topicId}/messages`, { kind: "decision", body: "내일 오후 8시 배포 재승인" });
+    await r.call("POST", `/api/topics/${r.topicId}/actions/retry`);
+    expect(await g6aSettleWithGrants(r, "재승인 확인")).toBe("READY_TO_DELIVER");
+    expect(r.codex.prompts).toHaveLength(reviews);
+    expect(r.database.getFlags(r.topicId).committedOID).toBe(oid);
+    if (committed) {
+      const remote = mkdtempSync(join(tmpdir(), "r2-push-remote-"));
+      temporaryDirectories.push(remote);
+      git(remote, ["init", "--bare"]);
+      git(r.worktree, ["remote", "add", "origin", remote]);
+      expect((await r.call("POST", `/api/topics/${r.topicId}/actions/push`)).status).toBe(200);
+      expect(r.database.getFlags(r.topicId).pushedOID).toBe(oid);
+      expect(git(remote, ["rev-parse", `refs/heads/${r.database.getTopic(r.topicId).branchName}`])).toBe(oid);
+    }
+    r.database.close();
+  });
+});
 
 });

@@ -39,3 +39,20 @@ describe("review request ledger", () => {
     expect(pendingReviewRequests([question(), response], 1)).toHaveLength(1);
   });
 });
+
+describe("R2 confirmed answer revocation", () => {
+  it("retains resolved questions for rechecking after a later decision", () => {
+    const records = [question(), decision(2, "A 채널 승인")];
+    const [request] = pendingReviewRequests(records, 1);
+    records.push(event(3, "system", "system", { reviewRequestAnswers: [{ requestId: request.id, decisionSequence: 2 }], reviewAnswersThrough: 2 }));
+    expect(pendingReviewRequests(records, 1)).toEqual([]);
+    records.push(decision(4, "채널 승인 취소, 보류"));
+    expect(pendingReviewRequests(records, 1).map(r => r.id)).toEqual([request.id]);
+    records.push(event(5, "system", "system", { reviewRequestAnswers: [], reviewAnswersThrough: 4 }));
+    expect(pendingReviewRequests(records, 1).map(r => r.id)).toEqual([request.id]);
+    records.push(decision(6, "A 채널 재승인"));
+    records.push(event(7, "system", "system", { reviewRequestAnswers: [{ requestId: request.id, decisionSequence: 6 }], reviewAnswersThrough: 6 }));
+    expect(pendingReviewRequests(records, 1)).toEqual([]);
+    expect(reviewAnswerCandidate(event(8, "user", "decision", { oid: "abc", paths: ["a"] }))).toBe(false);
+  });
+});

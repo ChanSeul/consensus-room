@@ -3,30 +3,38 @@ import { AgentResultSchema } from "../../shared/contracts.js";
 import { requestId } from "./checkpoint.js";
 import { decisionRequestTexts } from "./completion.js";
 
-export interface ReviewRequest { id: string; sequence: number; question: string }
+export interface ReviewRequest { id: string; sequence: number; question: string; answerDecisionSequence?: number; checkedThrough?: number }
 
 // 상태를 바꾸는 자동 decision 이벤트는 질문의 답변이 아니다.
 export function reviewAnswerCandidate(event: TimelineEvent): boolean {
   return event.actor === "user" && event.kind === "decision" && !event.payload?.implementationResume
+    && !(event.payload?.oid && (event.payload?.paths || event.payload?.branchName)) && !event.payload?.deliveryAction
     && !event.payload?.toleranceAmendment && !String(event.payload?.requestAction ?? "").startsWith("action:");
 }
 
 // 사용자 메시지는 요청을 지우지 않는다. 해당 요청·사용자 답변을 대조한 확인 결과만 해소 기록이다.
 export function pendingReviewRequests(events: readonly TimelineEvent[], generation: number): ReviewRequest[] {
-  let pending: ReviewRequest[] = [];
+  const requests: ReviewRequest[] = [];
+  let latestDecision = 0;
+  const pending = () => requests.filter((r) => r.answerDecisionSequence === undefined || (r.checkedThrough ?? 0) < latestDecision);
   let lastReview: TimelineEvent | null = null;
   const decisions = new Map<number, TimelineEvent>();
   const append = (question: string, sequence: number) => {
-    if (!pending.some((item) => item.question === question)) pending.push({ id: "R" + requestId(question, sequence), sequence, question });
+    if (!pending().some((item) => item.question === question)) requests.push({ id: "R" + requestId(question, sequence), sequence, question });
   };
   for (const event of events) {
     if (event.scopeGeneration !== generation) continue;
-    if (reviewAnswerCandidate(event)) decisions.set(event.sequence, event);
+    if (reviewAnswerCandidate(event)) { decisions.set(event.sequence, event); latestDecision = event.sequence; }
     if (event.actor === "system" && event.kind === "system" && Array.isArray(event.payload?.reviewRequestAnswers)) {
       for (const answer of event.payload.reviewRequestAnswers) {
-        const request = pending.find((item) => item.id === answer?.requestId);
+        const request = requests.find((item) => item.id === answer?.requestId);
         const decision = decisions.get(answer?.decisionSequence);
-        if (request && decision && decision.sequence > request.sequence) pending = pending.filter((item) => item.id !== request.id);
+        const through = event.payload.reviewAnswersThrough ?? latestDecision;
+        if (request && decision && decision.sequence > request.sequence && typeof through === "number"
+          && Number.isSafeInteger(through) && through >= latestDecision && through < event.sequence && decision.sequence <= through) {
+          request.answerDecisionSequence = decision.sequence;
+          request.checkedThrough = through;
+        }
       }
     }
     if (event.kind === "agent_output") {
@@ -42,12 +50,12 @@ export function pendingReviewRequests(events: readonly TimelineEvent[], generati
     // 구버전은 출력 이벤트에 status 를 남기지 않았다. 바로 그 리뷰를 멈춘 runnerBlocked 기록으로 복구한다.
     if (lastReview && event.actor === "system" && event.payload?.runnerBlocked === true
       && ["CODEX_REVIEW", "CODEX_FINAL_REVIEW"].includes(String(event.payload?.resumeState))
-      && lastReview.payload?.status === undefined && !pending.some((item) => item.sequence === lastReview!.sequence)) {
+      && lastReview.payload?.status === undefined && !pending().some((item) => item.sequence === lastReview!.sequence)) {
       const texts = decisionRequestTexts({ findings: [], status: "blocked", summary: lastReview.body,
         requestedUserDecision: undefined, remainingSteps: Array.isArray(event.payload.remainingSteps) ? event.payload.remainingSteps : [] });
       for (const text of texts) append(text, lastReview.sequence);
       lastReview = null;
     }
   }
-  return pending;
+  return pending();
 }

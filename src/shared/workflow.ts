@@ -37,7 +37,7 @@ const NEXT_STATES: Readonly<Record<WorkflowState, ReadonlySet<WorkflowState>>> =
   CODEX_FINAL_REVIEW: new Set(["READY_TO_DELIVER", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED", "FAILED", "CLAUDE_FIX"]),
   // CLAUDE_FIX: 인도 대기 중 발견한 외부 검증 실패를 중재자 진단으로 반환한다 — 진단 전용 수정 작업 → 최종 리뷰(2026-09-14 진단 계획).
   // CLAUDE_PLAN: 계획 변경이 필요한 중재자 진단 — 진단 계획 개정 턴(→ 감사·종결·ACK·사용자 승인). 작업 트리·브랜치·구현 기준은 보존한다.
-  READY_TO_DELIVER: new Set(["CLOSED", "DRAFT", "FAILED", "CLAUDE_FIX", "CLAUDE_PLAN"]),
+  READY_TO_DELIVER: new Set(["CLOSED", "DRAFT", "FAILED", "CLAUDE_FIX", "CLAUDE_PLAN", "USER_DECISION_REQUIRED"]),
   CLOSED: new Set(),
   BLOCKED_ON_EVIDENCE: new Set([
     "DRAFT", "CLAUDE_PLAN", "CODEX_AUDIT", "CLAUDE_REVISION", "CODEX_CLOSEOUT",

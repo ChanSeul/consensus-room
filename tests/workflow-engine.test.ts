@@ -3784,6 +3784,8 @@ it("세 번째 구현 리뷰는 전달 준비까지 완료하고 네 번째 호�
  engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");
  expect(database.getTopic("topic-1").state).toBe("READY_TO_DELIVER");
  expect(database.reviews.account("topic-1","implementation").used).toBe(3);
+ // 새 증거로 기존 통과 판정 재사용을 막아 실제 네 번째 호출이 필요한 상태를 만든다.
+ await engine.postMessage("topic-1", "evidence", "추가 검증 결과를 검토해야 합니다.");
  database.updateTopic("topic-1",{state:"FAILED",resumeState:"CODEX_FINAL_REVIEW"});
  engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");
  expect(database.getTopic("topic-1").state).toBe("USER_DECISION_REQUIRED");

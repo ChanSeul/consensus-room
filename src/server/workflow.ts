@@ -555,6 +555,9 @@ export class WorkflowEngine {
     requestKey?: string,
     origin?: CallOrigin,
   ): Promise<Topic> {
+    if (kind === "decision" && this.core.deliveryActive.has(topicId)) {
+      throw new Error("커밋 또는 push가 끝난 뒤 사용자 결정을 변경하세요.");
+    }
     const topic = this.core.dependencies.database.getTopic(topicId);
     if (topic.state === "AWAITING_USER_APPROVAL") {
       // 계획만 무효화하는 경로다. 범위는 그대로이므로 세대·세션·worktree·타임라인을 유지하고
@@ -606,6 +609,15 @@ export class WorkflowEngine {
       body: redactSecrets(body),
       payload: { ...(origin ? { origin } : {}), ...(requestKey ? { requestKey, requestAction: `message:${kind}` } : {}) },
     });
+    if (kind === "decision" && topic.state === "READY_TO_DELIVER"
+      && this.core.fixContracts.unansweredReviewQuestions(topic).length > 0) {
+      const reviews = ["codex-review", "codex-final-review"]
+        .map(name => this.core.dependencies.database.latestArtifact(topicId, name, topic.scopeGeneration))
+        .filter(item => item !== null).sort((a, b) => b.revision - a.revision);
+      const resume = reviews[0]?.kind === "codex-final-review" ? "CODEX_FINAL_REVIEW" : "CODEX_REVIEW";
+      this.core.interrupt(topicId, "USER_DECISION_REQUIRED", "새 결정에 기존 리뷰 답변의 취소·변경이 있는지 재확인해야 합니다. 재시도하세요.", resume,
+        { reviewDeliveryRecheck: true });
+    }
     if ((kind === "evidence" && topic.state === "BLOCKED_ON_EVIDENCE") ||
         (kind === "decision" && topic.state === "USER_DECISION_REQUIRED")) {
       this.core.event(topicId, "system", "system", "새 정보가 추가되었습니다. 재시도를 눌러 해당 단계를 다시 실행하세요.");

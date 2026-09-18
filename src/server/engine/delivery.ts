@@ -768,6 +768,11 @@ export class DeliveryPipeline {
   }
 
   async resumeDelivery(topicId: string, state: WorkflowState, signal: AbortSignal): Promise<void> {
+    const recheck = this.core.dependencies.database.getTimeline(topicId).findLast(event =>
+      event.scopeGeneration === this.core.dependencies.database.getTopic(topicId).scopeGeneration
+      && event.actor === "system" && typeof event.payload?.reviewDeliveryRecheck === "boolean");
+    if (["CODEX_REVIEW", "CODEX_FINAL_REVIEW"].includes(state) && recheck?.payload?.reviewDeliveryRecheck === true
+      && await this.resumeDeliveryAnswers(topicId, signal)) return;
     if (state === "IMPLEMENTING") return this.runImplementation(topicId, signal);
     if (state === "CODEX_REVIEW") {
       await this.confirmReviewAnswers(topicId, signal);
@@ -1120,7 +1125,7 @@ export class DeliveryPipeline {
       planEpoch: topic.planEpoch, planSHA256: topic.planSHA256, reviewedHead: snapshot.head, reviewedDiffSHA256: snapshot.diffSHA256 };
     const old = database.getTimeline(topic.id).findLast((event) => event.scopeGeneration === topic.scopeGeneration && event.payload?.reviewCodePassed === true);
     if (old && Object.entries(payload).every(([key, value]) => old.payload?.[key] === value)) return;
-    this.core.event(topic.id, "system", "system", "코드 검토는 통과했으며 사용자 결정만 기다립니다.", payload);
+    this.core.event(topic.id, "system", "system", "현재 계획과 변경 스냅샷에 대한 코드 검토 통과를 보존했습니다.", payload);
   }
 
   // 사용자 결정 하나당 확인 호출은 최대 한 번이다. 실패·보류·부분 답변도 같은 결정을 반복 호출하지 않는다.
@@ -1170,7 +1175,44 @@ export class DeliveryPipeline {
       this.core.event(topicId, "system", "system", "답변 확인의 요청 ID 또는 결정 순번이 일치하지 않아 요청을 보존합니다.");
       return;
     }
-    this.core.event(topicId, "system", "system", `답변을 확인한 리뷰 요청 ${answers.length}개를 해소했습니다.`, { reviewRequestAnswers: answers });
+    this.core.event(topicId, "system", "system", `답변을 확인한 리뷰 요청 ${answers.length}개를 해소했습니다.`, { reviewRequestAnswers: answers, reviewAnswersThrough: inputSequence });
+  }
+
+  // READY에서 새 답변만 확인할 때는 이미 확정한 로컬 커밋과 코드 판정을 보존한다.
+  private async resumeDeliveryAnswers(topicId: string, signal: AbortSignal): Promise<boolean> {
+    const database = this.core.dependencies.database;
+    const topic = database.getTopic(topicId);
+    const flags = database.getFlags(topicId);
+    const inputSequence = this.core.latestSequence(topicId);
+    await this.confirmReviewAnswers(topicId, signal);
+    const kind = topic.state === "CODEX_FINAL_REVIEW" ? "codex-final-review" : "codex-review";
+    const stored = database.latestArtifact(topicId, kind, topic.scopeGeneration);
+    const review = stored ? await this.core.latestResult(topicId, kind) : null;
+    const passed = stored && database.getScopedTimeline(topicId, topic.scopeGeneration).findLast((event) =>
+      event.actor === "system" && event.payload?.reviewCodePassed === true && event.payload?.reviewRevision === stored.revision
+      && event.payload?.planEpoch === topic.planEpoch && event.payload?.planSHA256 === topic.planSHA256
+      && event.payload?.reviewState === topic.state && event.payload?.reviewedHead === flags.reviewedHead
+      && event.payload?.reviewedDiffSHA256 === flags.reviewedDiffSHA256);
+    const snapshot = await this.core.dependencies.git.snapshot(topic.worktreePath, flags.reviewedHead ?? undefined);
+    this.core.assertCurrent(topicId, signal, topic.scopeGeneration, topic.state);
+    if (this.core.interruptForNewUserInput(topic, inputSequence)) return true;
+    if (!stored || !review || !passed || !this.canReuseReview(topic, stored.revision, review)
+      || snapshot.head !== (flags.committedOID ?? flags.reviewedHead) || snapshot.diffSHA256 !== flags.reviewedDiffSHA256) {
+      if (flags.committedOID) {
+        this.core.interrupt(topicId, "USER_DECISION_REQUIRED", "확정된 커밋의 코드·증거가 바뀌어 답변 확인만으로 push할 수 없습니다. 커밋을 보존하고 변경을 확인하세요.", topic.state);
+        return true;
+      }
+      this.core.event(topicId, "system", "system", "코드·증거 변경을 정상 리뷰에서 확인합니다.", { reviewDeliveryRecheck: false });
+      return false;
+    }
+    if (this.core.fixContracts.unansweredReviewQuestions(topic).length > 0) {
+      this.core.interrupt(topicId, "USER_DECISION_REQUIRED", "취소되었거나 확인되지 않은 리뷰 답변이 남았습니다. 답변 후 재시도하세요.", topic.state);
+      return true;
+    }
+    this.core.diagnoses.assertDeliverable(topicId, "답변 확인 후 인도");
+    this.core.event(topicId, "system", "system", "기존 코드 판정과 커밋을 보존하고 답변을 재확인했습니다.", { reviewDeliveryRecheck: false });
+    this.core.transition(topicId, "READY_TO_DELIVER", "현재 사용자 답변을 확인했습니다.");
+    return true;
   }
 
   private reviewWorkCompleted(review: AgentResult): boolean {
@@ -1736,8 +1778,8 @@ export class DeliveryPipeline {
     const database = this.core.dependencies.database;
     const topic = database.getTopic(topicId);
     const unanswered = this.core.fixContracts.unansweredReviewQuestions(topic);
+    this.recordCodeReviewPassed(topic, snapshot);
     if (unanswered.length > 0) {
-      this.recordCodeReviewPassed(topic, snapshot);
       this.core.interrupt(topicId, "USER_DECISION_REQUIRED",
         `리뷰가 사용자에게 물은 질문에 아직 결정이 없어 인도 대기로 넘기지 않았습니다 — ${unanswered.map((item) => `#${item.sequence} ${item.question}`).join(" / ")}. `
           + "결정을 올리고 재시도하세요(진단 적용·정정이나 결정 없는 재시도는 이 질문을 해소하지 않습니다).",
@@ -1774,6 +1816,7 @@ export class DeliveryPipeline {
 
   async commit(topicId: string, message: string, paths: string[]): Promise<string> {
     return this.withDeliveryLock(topicId, async (topic) => {
+      this.assertReviewAnswersForDelivery(topic);
       this.core.diagnoses.assertDeliverable(topicId, "커밋(commit)");
       if (!topic.branchName) throw new Error("커밋할 작업 브랜치가 없습니다.");
       const flags = this.core.dependencies.database.getFlags(topicId);
@@ -1799,13 +1842,14 @@ export class DeliveryPipeline {
       }
       // 이 커밋이 확정되면 앞서 거부됐던 커밋 기록은 더 이상 처분 대상이 아니다.
       this.core.dependencies.database.updateTopic(topicId, { committedOID: oid, pushedOID: null, orphanCommitOID: null });
-      this.core.event(topicId, "user", "decision", "선택한 변경을 커밋했습니다.", { oid, paths });
+      this.core.event(topicId, "user", "decision", "선택한 변경을 커밋했습니다.", { oid, paths, deliveryAction: "commit" });
       return oid;
     });
   }
 
   async push(topicId: string): Promise<string> {
     return this.withDeliveryLock(topicId, async (topic) => {
+      this.assertReviewAnswersForDelivery(topic);
       this.core.diagnoses.assertDeliverable(topicId, "push");
       if (!topic.branchName) throw new Error("push할 작업 브랜치가 없습니다.");
       const flags = this.core.dependencies.database.getFlags(topicId);
@@ -1816,7 +1860,7 @@ export class DeliveryPipeline {
       const oid = await this.core.dependencies.git.push(topic.worktreePath, topic.branchName);
       this.assertDeliverySnapshot(topic);
       this.core.dependencies.database.updateTopic(topicId, { pushedOID: oid });
-      this.core.event(topicId, "user", "decision", "작업 브랜치를 원격 저장소에 push했습니다.", { oid, branchName: topic.branchName });
+      this.core.event(topicId, "user", "decision", "작업 브랜치를 원격 저장소에 push했습니다.", { oid, branchName: topic.branchName, deliveryAction: "push" });
       return oid;
     });
   }
@@ -1935,11 +1979,14 @@ export class DeliveryPipeline {
     return this.core.dependencies.database.getTopic(topicId);
   }
 
-  private async withDeliveryLock<T>(topicId: string, work: (topic: Topic) => Promise<T>): Promise<T> {
-    this.core.assertNoMaintenanceLock();
-    if (this.core.active.has(topicId) || this.core.scopeChangeActive.has(topicId) || this.core.deliveryActive.has(topicId)) {
-      throw new Error("이 주제에서 다른 작업이 진행 중입니다.");
+  private assertReviewAnswersForDelivery(topic: Topic): void {
+    if (this.core.fixContracts.unansweredReviewQuestions(topic).length > 0) {
+      throw new Error("리뷰 답변의 확인이 필요해 전달을 막았습니다. 사용자 결정을 확인하고 재시도하세요.");
     }
+  }
+
+  private async withDeliveryLock<T>(topicId: string, work: (topic: Topic) => Promise<T>): Promise<T> {
+    this.core.assertNoActiveWork(topicId);
     const topic = this.core.requireState(topicId, "READY_TO_DELIVER");
     this.core.deliveryActive.add(topicId);
     try {
