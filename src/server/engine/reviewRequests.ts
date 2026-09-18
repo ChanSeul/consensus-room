@@ -9,6 +9,7 @@ export interface ReviewRequest { id: string; sequence: number; question: string;
 export function reviewAnswerCandidate(event: TimelineEvent): boolean {
   return event.actor === "user" && event.kind === "decision" && !event.payload?.implementationResume
     && !(event.payload?.oid && (event.payload?.paths || event.payload?.branchName)) && !event.payload?.deliveryAction
+    && !(event.payload?.discardedCommitOID && event.payload?.restoredHead)
     && !event.payload?.toleranceAmendment && !String(event.payload?.requestAction ?? "").startsWith("action:");
 }
 

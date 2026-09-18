@@ -9,6 +9,7 @@ import { ConsensusDatabase } from "../src/server/database";
 import { GitService } from "../src/server/git";
 import { SpawnCommandRunner } from "../src/server/processRunner";
 import type { AgentAdapter, SessionTurn } from "../src/server/types";
+import { pendingReviewRequests } from "../src/server/engine/reviewRequests";
 import { WorkflowEngine } from "../src/server/workflow";
 import { REQUIRED_PLAN_HEADINGS, type AgentResult } from "../src/shared/contracts";
 import { hashPlan } from "../src/shared/workflow";
@@ -214,6 +215,26 @@ describe("사후 검증이 거부한 커밋 처분", () => {
     const clean = await setupReadyToDeliver("orphan-discard-recommit");
     expect(await clean.engine.commit(clean.topicId, "합의된 변경", ["feature.txt"])).toBeTruthy();
     clean.database.close();
+    database.close();
+  });
+
+  it.each([false, true])("R5 답변 확인 뒤 커밋 복구가 질문을 다시 열지 않는다(half=%s)", async (half) => {
+    const { database, engine, dependencies, parentMismatchEngine, topicId } = await setupReadyToDeliver("r5-recovery");
+    const append = (actor: "codex" | "user" | "system", kind: "agent_output" | "decision" | "system", payload: Record<string, unknown>) =>
+      database.appendEvent({ topicId, actor, kind, state: "READY_TO_DELIVER", body: "fixture", payload });
+    append("codex", "agent_output", { resultKind: "FINAL_REVIEW", findings: [], requestedUserDecision: "배포 승인?" });
+    const request = pendingReviewRequests(database.getTimeline(topicId), 1)[0];
+    append("user", "decision", {});
+    const decision = database.getTimeline(topicId).at(-1)!.sequence;
+    append("system", "system", { reviewRequestAnswers: [{ requestId: request.id, decisionSequence: decision }], reviewAnswersThrough: decision });
+    await expect(parentMismatchEngine.commit(topicId, "orphan", ["feature.txt"])).rejects.toThrow("부모가 최종 리뷰 기준과 다릅니다");
+    if (half) {
+      const halfEngine = new WorkflowEngine({ ...dependencies, git: new ParentMismatchGitWithFailingReset(new ResetFailingRunner()) });
+      await expect(halfEngine.discardOrphanCommit(topicId)).rejects.toThrow("index 재정렬");
+    }
+    await parentMismatchEngine.discardOrphanCommit(topicId);
+    expect(pendingReviewRequests(database.getTimeline(topicId), 1)).toEqual([]);
+    expect(await engine.commit(topicId, "recovered", ["feature.txt"])).toBeTruthy();
     database.close();
   });
 

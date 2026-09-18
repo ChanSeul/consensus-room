@@ -54,5 +54,7 @@ describe("R2 confirmed answer revocation", () => {
     records.push(event(7, "system", "system", { reviewRequestAnswers: [{ requestId: request.id, decisionSequence: 6 }], reviewAnswersThrough: 6 }));
     expect(pendingReviewRequests(records, 1)).toEqual([]);
     expect(reviewAnswerCandidate(event(8, "user", "decision", { oid: "abc", paths: ["a"] }))).toBe(false);
+    records.push(event(8, "user", "decision", { discardedCommitOID: "abc", restoredHead: "def" }));
+    expect(pendingReviewRequests(records, 1)).toEqual([]);
   });
 });

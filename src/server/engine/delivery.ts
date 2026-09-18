@@ -1889,7 +1889,7 @@ export class DeliveryPipeline {
           await this.core.dependencies.git.resyncIndex(topic.worktreePath, topic.branchName);
           this.core.dependencies.database.updateTopic(topicId, { orphanCommitOID: null });
           this.core.event(topicId, "user", "decision", "중단됐던 되돌리기를 마저 끝냈습니다. 파일 변경은 그대로 남았습니다.", {
-            discardedCommitOID: flags.orphanCommitOID,
+            discardedCommitOID: flags.orphanCommitOID, deliveryAction: "discard-orphan-commit",
             restoredHead,
           });
           return this.core.dependencies.database.getTopic(topicId);
@@ -1900,7 +1900,7 @@ export class DeliveryPipeline {
       await this.core.dependencies.git.resetToCommit(topic.worktreePath, topic.branchName, restoredHead, head);
       this.core.dependencies.database.updateTopic(topicId, { orphanCommitOID: null });
       this.core.event(topicId, "user", "decision", "전달하지 못한 로컬 커밋을 되돌렸습니다. 파일 변경은 그대로 남았습니다.", {
-        discardedCommitOID: flags.orphanCommitOID,
+        discardedCommitOID: flags.orphanCommitOID, deliveryAction: "discard-orphan-commit",
         restoredHead,
       });
       return this.core.dependencies.database.getTopic(topicId);
