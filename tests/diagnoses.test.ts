@@ -15,6 +15,7 @@ import { SpawnCommandRunner } from "../src/server/processRunner";
 import type { AgentAdapter, SessionTurn } from "../src/server/types";
 import { REQUIRED_PLAN_HEADINGS, type AgentResult, type Finding } from "../src/shared/contracts";
 import { hashPlan } from "../src/shared/workflow";
+import { pendingReviewRequests } from "../src/server/engine/reviewRequests";
 
 const temporaryDirectories: string[] = [];
 afterEach(() => {
@@ -66,6 +67,7 @@ class ScriptedClaude implements AgentAdapter {
 class EchoCodex implements AgentAdapter {
   readonly role = "codex" as const;
   readonly answerConfirmations: SessionTurn[] = [];
+  readonly assessmentHandlers: Array<(input: { requests: Array<{ id: string; sequence: number; question: string }>; decisions: Array<{ sequence: number; body: string }> }) => NonNullable<AgentResult["decisionAssessments"]> | Promise<NonNullable<AgentResult["decisionAssessments"]>>> = [];
   readonly answerHandlers: Array<(input: { requests: Array<{ id: string; sequence: number; question: string }>; decisions: Array<{ sequence: number; body: string }> }) => NonNullable<AgentResult["reviewDecisionAnswers"]> | Promise<NonNullable<AgentResult["reviewDecisionAnswers"]>>> = [];
   readonly prompts: string[] = [];
   readonly readable: Array<readonly string[]> = [];
@@ -373,8 +375,12 @@ async function room(label: string, steps: Step[], options: { autonomy?: "on" | "
     const input = JSON.parse(turn.prompt.split("REVIEW_ANSWER_INPUT\n")[1].split("\nEND_REVIEW_ANSWER_INPUT")[0]);
     const handler = codex.answerHandlers.shift();
     // 정상 fixture 의 답변이다. 거부 사례는 테스트가 부분·빈·잘못된 확인 결과를 명시한다.
-    const answers = handler ? await handler(input) : input.requests.map((request: { id: string }) => ({ requestId: request.id, decisionSequence: input.decisions.at(-1).sequence }));
-    return result("REVIEW", "질문 답변 확인", { status: "completed", reviewDecisionAnswers: answers });
+    const answerDecisions = [...(input.answerEvidence ?? []), ...input.decisions].sort((a, b) => a.sequence - b.sequence);
+    const answers = handler ? await handler(input) : input.requests.map((request: { id: string }) => ({ requestId: request.id, decisionSequence: answerDecisions.at(-1).sequence }));
+    // 결정별 판정(계약: 입력 결정 전부, 하나씩) — 정상 fixture 는 전부 "구현 변경 요구 아님". 변경 요구·누락은 테스트가 assessmentHandlers 로 명시한다.
+    const assess = codex.assessmentHandlers.shift();
+    const decisionAssessments = assess ? await assess(input) : input.decisions.map((decision: { sequence: number }) => ({ decisionSequence: decision.sequence, changesImplementation: false }));
+    return result("REVIEW", "질문 답변 확인", { status: "completed", reviewDecisionAnswers: answers, decisionAssessments });
   };
   const app = await buildApp({
     config: {
@@ -5552,7 +5558,8 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     const revisedSHA = r.database.getTopic(r.topicId).planSHA256;
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/approve`, { planSHA256: revisedSHA })).status).toBe(200);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/implement`)).status).toBe(200);
-    await r.idle("READY_TO_DELIVER");
+    // 1주기의 F-3 판정 결정은 확인자가 판정했고(호출 1회, 구현 리뷰 한도를 우회하지 않는다 — R10), 개정 구현의 첫 리뷰가 네 번째 호출이라 승인 1회가 필요하다(revisedCycleReady 와 같다).
+    expect(await g6aSettleWithGrants(r, `${label}-revised`)).toBe("READY_TO_DELIVER");
     const cycleStart = r.database.latestArtifact(r.topicId, "implementation-result")!.revision;
     expect((JSON.parse((await r.artifacts.readLatest(r.topicId, "implementation-result"))!) as AgentResult).summary).toBe("개정 계획대로 구현했습니다.");
     // 전제 확인: 1주기의 새 쟁점 인터럽트와 그 판정 결정은 모두 2주기 시작 전이다(사용자 decision 은 F-3 판정과 개정 계획 승인뿐이다).
@@ -5623,7 +5630,8 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     const codexBefore = r.codex.prompts.length;
     expect((await r.call("POST", `/api/topics/${r.topicId}/messages`, { kind: "decision", body: "F-3(권한 검사 누락)도 확인했습니다 — 그대로 둡니다." })).status).toBe(200);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(200);
-    await r.idle("READY_TO_DELIVER");
+    // 이 결정도 확인자가 판정한다(호출 1회, 구현 리뷰 한도를 우회하지 않는다 — R10) — 한도를 다 쓴 주제라 승인 1회 뒤 저장 리뷰를 재사용한다(리뷰 재구매 없음).
+    expect(await g6aSettleWithGrants(r, "g6a-adjudicated-cycle-new 판정")).toBe("READY_TO_DELIVER");
     expect(r.codex.prompts).toHaveLength(codexBefore);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "2주기 F-3 판정 뒤 인도", paths: ["feature.txt"] })).status).toBe(200);
     r.database.close();
@@ -6422,7 +6430,12 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     // 3) 사용자가 줄 머리 'OVERRULE F-1' 결정을 올리고 재시도해야 인도 대기·커밋에 이른다.
     expect((await r.call("POST", `/api/topics/${r.topicId}/messages`, { kind: "decision", body: "OVERRULE F-1\nF-1 은 수정하지 않아도 됩니다." })).status).toBe(200);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(200);
-    expect(await settledState(r, "g6d-first-review-agreed OVERRULE")).toBe("READY_TO_DELIVER");
+    // OVERRULE 결정도 확인자가 판정한다(host-review 2026-09-21 5회차: OVERRULE 지시어는 그 쟁점의 처분 변경 허용일 뿐 메시지 전체의 판정이 아니다) — 그 확인 호출은
+    // 구현 리뷰 한도를 우회하지 않으므로(R10) 세 리뷰를 다 쓴 이 주제는 승인 1회 뒤 저장된 최종 리뷰를 재사용한다.
+    const reviewsBeforeOverrule = r.codex.prompts.length;
+    expect(await g6aSettleWithGrants(r, "g6d-first-review-agreed OVERRULE")).toBe("READY_TO_DELIVER");
+    expect(r.codex.prompts.length).toBe(reviewsBeforeOverrule);   // 리뷰는 다시 사지 않았다 — 확인자 판정 뒤 저장된 최종 리뷰 재사용
+    expect(r.codex.answerConfirmations.length).toBeGreaterThanOrEqual(1);
     expect((await r.diagnoses()).map((record) => [record.id, record.status])).toEqual([["DG-1", "resolved"]]);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "OVERRULE F-1 뒤 인도", paths: ["feature.txt", "other.txt"] })).status).toBe(200);
     r.database.close();
@@ -6844,6 +6857,529 @@ describe("R1/R2 delivery admission", () => {
     }
     r.database.close();
   });
+});
+
+// host-review 2026-09-21 R1~R8 — 인도 대기의 새 결정은 전부 재확인(R7), 확인자의 결정별 판정만 재사용 근거(R1·R6), 커밋 뒤 진단 가드 상태 무관(R2),
+// 커밋 뒤 새 증거는 정상 리뷰로·확정 커밋 보존(R3), 커밋 뒤 재리뷰가 수정을 내면 수정 작업을 열지 않고 멈춤(R8). 진입은 실제 경로(/messages decision → 재확인 정지 → retry)로 만든다.
+describe("R1~R8 committed delivery recheck", () => {
+  type Room = Awaited<ReturnType<typeof room>>;
+  const bodies = (r: Room) => r.database.getTimeline(r.topicId).map((event) => event.body ?? "");
+  const since = (r: Room, sequence: number) => r.database.getTimeline(r.topicId).filter((event) => event.sequence > sequence).map((event) => event.body ?? "");
+  // 구현이 두 파일을 바꾸고 C1 은 feature.txt 만 커밋한다 — second.txt 는 리뷰된 채 남아 C2 의 내용이 된다(인도 사슬).
+  const ready = async (label: string, options: Parameters<typeof room>[2] = {}) => {
+    const r = await room(label, [], options);
+    r.claude["steps"].push(() => {
+      writeFileSync(join(r.worktree, "feature.txt"), "구현 완료\n");
+      writeFileSync(join(r.worktree, "second.txt"), "두 번째 커밋 내용\n");
+      return result("IMPLEMENTATION", "구현을 마쳤습니다.", { status: "completed" });
+    });
+    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/implement`)).status).toBe(200);
+    await r.idle("READY_TO_DELIVER");
+    return r;
+  };
+  const committed = async (label: string, options: Parameters<typeof room>[2] = {}) => {
+    const r = await ready(label, options);
+    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "C1", paths: ["feature.txt"] })).status).toBe(200);
+    const c1 = r.database.getFlags(r.topicId).committedOID!;
+    expect(c1).toMatch(/^[0-9a-f]{40}$/);
+    return { r, c1 };
+  };
+  // 실제 진입: 인도 대기에 결정을 올리면 서버가 재확인 정지(USER_DECISION_REQUIRED, reviewDeliveryRecheck)로 옮긴다(R7: 열린 질문이 없어도).
+  const decide = async (r: Room, body: string) => {
+    expect((await r.call("POST", `/api/topics/${r.topicId}/messages`, { kind: "decision", body })).status).toBe(200);
+    const sequence = r.database.getTimeline(r.topicId).filter((event) => event.actor === "user" && event.kind === "decision").at(-1)!.sequence;
+    expect(r.database.getTopic(r.topicId).state).toBe("USER_DECISION_REQUIRED");
+    expect(r.database.getTimeline(r.topicId).at(-1)?.payload?.reviewDeliveryRecheck).toBe(true);
+    return sequence;
+  };
+  const retry = async (r: Room) => expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(200);
+  const question = (r: Room, text: string) => {
+    r.database.appendEvent({ topicId: r.topicId, actor: "codex", kind: "agent_output", state: r.database.getTopic(r.topicId).state, body: "fixture",
+      payload: { resultKind: "REVIEW", findings: [], requestedUserDecision: text } });
+    return pendingReviewRequests(r.database.getTimeline(r.topicId), 1).at(-1)!;
+  };
+
+  // 공개 messages → retry → commit 경계에서 확인한다. 가짜 Codex만 통제하며 DB·스키마·리뷰 예산은 실제 구현이다.
+  it("R13 유효한 리뷰의 finding 질문 100개와 단독 질문 1개를 나눠 확인한다", async () => {
+    class ManyQuestionsCodex extends EchoCodex {
+      override async resumeTurn(turn: SessionTurn): Promise<AgentResult> {
+        const review = await super.resumeTurn(turn);
+        const first = this.prompts.length === 1;
+        return { ...review, requestedUserDecision: first ? "실행 일정?" : undefined,
+          findings: Array.from({ length: 100 }, (_, index) => ({ id: `Q-${index}`, title: `결정 ${index}?`,
+            rationale: `결정 ${index}?`, severity: "LOW" as const, disposition: "AGREED_NO_ACTION" as const,
+            requiresUserDecision: first, evidenceRefs: [] })) };
+      }
+    }
+    const r = await room("r13-valid-review-101", [], { codexInstance: new ManyQuestionsCodex() });
+    r.claude["steps"].push(() => { writeFileSync(join(r.worktree, "feature.txt"), "구현\n"); return result("IMPLEMENTATION", "완료", { status: "completed" }); });
+    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/implement`)).status).toBe(200);
+    await r.idle("USER_DECISION_REQUIRED");
+    expect(pendingReviewRequests(r.database.getTimeline(r.topicId), 1)).toHaveLength(101);
+    expect((await r.call("POST", `/api/topics/${r.topicId}/messages`, { kind: "decision", body: "101개 질문 모두 기존 제안을 승인합니다." })).status).toBe(200);
+    await retry(r);
+    expect(await g6aSettleWithGrants(r, "질문 확인 이후 필요한 리뷰 승인")).toBe("READY_TO_DELIVER");
+    expect(r.codex.answerConfirmations.map((turn) => JSON.parse(turn.prompt.split("REVIEW_ANSWER_INPUT\n")[1].split("\nEND_REVIEW_ANSWER_INPUT")[0]).requests.length)).toEqual([100, 1]);
+    expect(pendingReviewRequests(r.database.getTimeline(r.topicId), 1)).toHaveLength(0);
+    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "질문 전체 확인", paths: ["feature.txt"] })).status).toBe(200);
+    r.database.close();
+  }, 30_000);
+
+  it("R13 질문 201개는 한도 정지 후 이미 확인한 200개를 반복하지 않고 남은 1개를 확인한다", async () => {
+    const r = await ready("r13-questions-budget");
+    for (let i = 0; i < 201; i++) question(r, `실행 조건 ${i}?`);
+    await decide(r, "모두 기존 제안대로 진행합니다.");
+    await retry(r);
+    expect(await settledState(r, "r13-budget-stop")).toBe("USER_DECISION_REQUIRED");
+    expect(pendingReviewRequests(r.database.getTimeline(r.topicId), 1)).toHaveLength(1);
+    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "미확인 질문", paths: ["feature.txt"] })).status).not.toBe(200);
+    expect(await g6aSettleWithGrants(r, "남은 질문 한 묶음 승인")).toBe("READY_TO_DELIVER");
+    expect(r.codex.answerConfirmations.map((turn) => JSON.parse(turn.prompt.split("REVIEW_ANSWER_INPUT\n")[1].split("\nEND_REVIEW_ANSWER_INPUT")[0]).requests.length)).toEqual([100, 100, 1]);
+    expect(r.codex.prompts).toHaveLength(1);
+    r.database.close();
+  }, 30_000);
+
+  it("R13 질문 묶음의 실제 부분 답변은 새 입력 없이 다시 묻지 않고 새 답변 뒤 분할을 재개한다", async () => {
+    const r = await ready("r13-partial-question-batch");
+    for (let i = 0; i < 101; i++) question(r, `실행 조건 ${i}?`);
+    await decide(r, "99개 조건은 승인하고 나머지는 보류합니다.");
+    r.codex.answerHandlers.push(({ requests, decisions }) => requests.slice(0, 99).map((request) => ({ requestId: request.id, decisionSequence: decisions.at(-1)!.sequence })));
+    await retry(r);
+    expect(await settledState(r, "r13-partial")).toBe("USER_DECISION_REQUIRED");
+    expect(pendingReviewRequests(r.database.getTimeline(r.topicId), 1)).toHaveLength(2);
+    expect(r.codex.answerConfirmations).toHaveLength(1);
+    await retry(r);
+    expect(await settledState(r, "r13-partial-no-repeat")).toBe("USER_DECISION_REQUIRED");
+    expect(r.codex.answerConfirmations).toHaveLength(1);
+    expect((await r.call("POST", `/api/topics/${r.topicId}/messages`, { kind: "decision", body: "나머지도 승인하며 기존 승인도 유지합니다." })).status).toBe(200);
+    await retry(r);
+    expect(await g6aSettleWithGrants(r, "남은 질문 확인 승인")).toBe("READY_TO_DELIVER");
+    expect(r.codex.answerConfirmations).toHaveLength(3);
+    expect(pendingReviewRequests(r.database.getTimeline(r.topicId), 1)).toHaveLength(0);
+    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "부분 답변 해소", paths: ["feature.txt"] })).status).toBe(200);
+    r.database.close();
+  }, 30_000);
+
+  it("R12 과거 결정 200개 뒤 새 결정은 과거 답변 근거와 분리해 확인한다", async () => {
+    const r = await ready("r12-history-200");
+    const request = question(r, "배포 공지는 언제 올릴까요?");
+    const first = await decide(r, "내일 올립니다.");
+    for (let i = 1; i < 200; i++) expect((await r.call("POST", `/api/topics/${r.topicId}/messages`, { kind: "decision", body: `공지 참고 ${i}` })).status).toBe(200);
+    const answer = () => [{ requestId: request.id, decisionSequence: first }];
+    r.codex.answerHandlers.push(answer);
+    await retry(r);
+    expect(await settledState(r, "r12-initial-200")).toBe("READY_TO_DELIVER");
+    const latest = await decide(r, "공지 내용은 그대로 유지합니다.");
+    r.codex.answerHandlers.push(answer);
+    await retry(r);
+    expect(await settledState(r, "r12-history-plus-one")).toBe("READY_TO_DELIVER");
+    expect(r.codex.answerConfirmations).toHaveLength(2);
+    const input = JSON.parse(r.codex.answerConfirmations[1].prompt.split("REVIEW_ANSWER_INPUT\n")[1].split("\nEND_REVIEW_ANSWER_INPUT")[0]);
+    expect(input.decisions.map((item: { sequence: number }) => item.sequence)).toEqual([latest]);
+    expect(input.answerEvidence.map((item: { sequence: number }) => item.sequence)).toContain(first);
+    expect(r.codex.prompts).toHaveLength(1);
+    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "과거 답변 확인", paths: ["feature.txt"] })).status).toBe(200);
+    r.database.close();
+  }, 30_000);
+
+  it("R12 새 결정 401개는 예산 안에서 나누고 승인 후 남은 결정만 확인한다", async () => {
+    const r = await ready("r12-batches-budget");
+    question(r, "배포 공지는 언제 올릴까요?");
+    for (let i = 0; i < 401; i++) expect((await r.call("POST", `/api/topics/${r.topicId}/messages`, { kind: "decision", body: `내일 공지합니다. 참고 ${i}` })).status).toBe(200);
+    await retry(r);
+    expect(await settledState(r, "r12-budget-stop")).toBe("USER_DECISION_REQUIRED");
+    expect(r.codex.answerConfirmations).toHaveLength(2);
+    const sizes = () => r.codex.answerConfirmations.map((turn) => JSON.parse(turn.prompt.split("REVIEW_ANSWER_INPUT\n")[1].split("\nEND_REVIEW_ANSWER_INPUT")[0]).decisions.length);
+    expect(sizes()).toEqual([200, 200]);
+    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "미확인 결정", paths: ["feature.txt"] })).status).not.toBe(200);
+    expect(await g6aSettleWithGrants(r, "남은 확인 묶음 승인")).toBe("READY_TO_DELIVER");
+    expect(sizes()).toEqual([200, 200, 1]);
+    expect(r.codex.prompts).toHaveLength(1);
+    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "전체 확인", paths: ["feature.txt"] })).status).toBe(200);
+    r.database.close();
+  }, 30_000);
+
+  it("R12 뒤 묶음의 누락 응답은 앞 판정만 보존하고 같은 입력을 재호출하거나 인도하지 않는다", async () => {
+    const r = await ready("r12-invalid-later-batch");
+    question(r, "배포 공지는 언제 올릴까요?");
+    for (let i = 0; i < 201; i++) expect((await r.call("POST", `/api/topics/${r.topicId}/messages`, { kind: "decision", body: `내일 공지합니다. 참고 ${i}` })).status).toBe(200);
+    r.codex.assessmentHandlers.push(
+      (input) => input.decisions.map((decision) => ({ decisionSequence: decision.sequence, changesImplementation: false })),
+      () => [],
+    );
+    await retry(r);
+    expect(await settledState(r, "r12-invalid-batch")).toBe("USER_DECISION_REQUIRED");
+    expect(r.codex.answerConfirmations).toHaveLength(2);
+    expect(r.database.getTimeline(r.topicId).flatMap((event) => event.payload?.reviewDecisionAssessments ?? [])).toHaveLength(200);
+    expect(pendingReviewRequests(r.database.getTimeline(r.topicId), 1)).toHaveLength(1);
+    await retry(r);
+    expect(await settledState(r, "r12-no-repeat")).toBe("USER_DECISION_REQUIRED");
+    expect(r.codex.answerConfirmations).toHaveLength(2);
+    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "불완전 응답", paths: ["feature.txt"] })).status).not.toBe(200);
+    expect((await r.call("POST", `/api/topics/${r.topicId}/messages`, { kind: "decision", body: "기존 답변을 유지합니다." })).status).toBe(200);
+    await retry(r);
+    expect(await g6aSettleWithGrants(r, "새 입력 확인 승인")).toBe("READY_TO_DELIVER");
+    const input = JSON.parse(r.codex.answerConfirmations.at(-1)!.prompt.split("REVIEW_ANSWER_INPUT\n")[1].split("\nEND_REVIEW_ANSWER_INPUT")[0]);
+    expect(input.decisions).toHaveLength(2); // 실패한 마지막 결정과 새 결정만 남는다.
+    expect(r.codex.prompts).toHaveLength(1);
+    r.database.close();
+  }, 30_000);
+
+  it("R12 앞 묶음의 변경 요구는 뒤 묶음의 false 판정으로 사라지지 않고 정상 리뷰를 요구한다", async () => {
+    const r = await ready("r12-change-in-first-batch");
+    question(r, "배포 공지는 언제 올릴까요?");
+    for (let i = 0; i < 201; i++) expect((await r.call("POST", `/api/topics/${r.topicId}/messages`, { kind: "decision", body: i === 0 ? "형식을 B로 바꾸세요." : `내일 공지합니다. 참고 ${i}` })).status).toBe(200);
+    r.codex.assessmentHandlers.push((input) => input.decisions.map((decision, index) => ({ decisionSequence: decision.sequence, changesImplementation: index === 0 })));
+    await retry(r);
+    expect(await g6aSettleWithGrants(r, "변경 요구 정상 리뷰 승인")).toBe("READY_TO_DELIVER");
+    expect(r.codex.answerConfirmations).toHaveLength(2);
+    expect(r.codex.prompts).toHaveLength(2);
+    expect(bodies(r).some((body) => body.includes("코드·증거 변경을 정상 리뷰에서 확인합니다."))).toBe(true);
+    r.database.close();
+  }, 30_000);
+
+  it("R7 질문 없이 인도 대기에 이른 주제도 새 결정은 재확인 정지를 거친다 — 멈춘 동안 commit 은 거부되고, 판정 false 면 재시도 뒤 재사용한다", async () => {
+    const r = await ready("r7-no-question-recheck");
+    const sequence = await decide(r, "배포 공지는 내일 올립니다.");
+    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "C1", paths: ["feature.txt"] })).status).not.toBe(200);
+    const reviewsBefore = r.codex.prompts.length;
+    await retry(r);
+    await r.idle("READY_TO_DELIVER");
+    expect(r.codex.answerConfirmations.length).toBe(1);   // 열린 질문이 없어도 확인자가 결정을 판정했다
+    expect(since(r, sequence).some((body) => body.includes("기존 코드 판정과 커밋을 보존하고 답변을 재확인했습니다."))).toBe(true);
+    expect(r.codex.prompts.length).toBe(reviewsBefore);
+    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "C1", paths: ["feature.txt"] })).status).toBe(200);
+    r.database.close();
+  });
+
+  it("R7·R1 질문 없이 올라온 구현 변경 요구(판정 true)는 코드 판정을 재사용하지 않고 정상 리뷰로 보낸다", async () => {
+    const r = await ready("r7-change-demand");
+    const sequence = await decide(r, "형식을 B 로 바꾸세요.");
+    r.codex.assessmentHandlers.push((input) => input.decisions.map((decision) => ({ decisionSequence: decision.sequence, changesImplementation: true })));
+    const reviewsBefore = r.codex.prompts.length;
+    await retry(r);
+    await r.idle("READY_TO_DELIVER");
+    const tail = since(r, sequence);
+    expect(tail.some((body) => body.includes("구현 변경을 요구하는 결정: #" + sequence))).toBe(true);
+    expect(tail.some((body) => body.includes("코드·증거 변경을 정상 리뷰에서 확인합니다."))).toBe(true);
+    expect(tail.some((body) => body.includes("기존 코드 판정과 커밋을 보존하고 답변을 재확인했습니다."))).toBe(false);
+    expect(r.codex.prompts.length).toBeGreaterThan(reviewsBefore);
+    r.database.close();
+  });
+
+  it("R1 답변 확인이 결정을 다 판정하지 않으면 확인 결과를 받지 않고, 판정 없는 결정은 재사용 근거가 아니라 정상 리뷰로 간다", async () => {
+    const { r, c1 } = await committed("r1-assessment-incomplete");
+    const sequence = await decide(r, "아니오, 형식 B 로 바꾸세요.");
+    r.codex.assessmentHandlers.push(() => []);
+    const reviewsBefore = r.codex.prompts.length;
+    await retry(r);
+    await r.idle("READY_TO_DELIVER");
+    const tail = since(r, sequence);
+    expect(tail.some((body) => body.includes("결정 판정(decisionAssessments)이 결정을 다 다루지 않아"))).toBe(true);
+    expect(tail.some((body) => body.includes("코드·증거 변경을 정상 리뷰에서 확인합니다."))).toBe(true);
+    expect(tail.some((body) => body.includes("기존 코드 판정과 커밋을 보존하고 답변을 재확인했습니다."))).toBe(false);
+    expect(r.codex.prompts.length).toBeGreaterThan(reviewsBefore);
+    expect(r.database.getFlags(r.topicId).committedOID).toBe(c1);
+    r.database.close();
+  });
+
+  it("R6 한 결정이 두 질문에 답해도 판정은 결정 하나에 하나다 — 판정 true 면 답변이 몇 개든 재사용하지 않는다", async () => {
+    const { r, c1 } = await committed("r6-one-decision-two-answers");
+    const first = question(r, "형식 A 를 유지할까요?");
+    const second = question(r, "로그 경로도 유지할까요?");
+    const sequence = await decide(r, "둘 다 B 로 바꾸세요.");
+    r.codex.answerHandlers.push(() => [{ requestId: first.id, decisionSequence: sequence }, { requestId: second.id, decisionSequence: sequence }]);
+    r.codex.assessmentHandlers.push(() => [{ decisionSequence: sequence, changesImplementation: true }]);
+    const reviewsBefore = r.codex.prompts.length;
+    await retry(r);
+    await r.idle("READY_TO_DELIVER");
+    const tail = since(r, sequence);
+    expect(tail.some((body) => body.includes("답변을 확인한 리뷰 요청 2개를 해소했습니다."))).toBe(true);
+    expect(tail.some((body) => body.includes("코드·증거 변경을 정상 리뷰에서 확인합니다."))).toBe(true);
+    expect(r.codex.prompts.length).toBeGreaterThan(reviewsBefore);
+    expect(r.database.getFlags(r.topicId).committedOID).toBe(c1);
+    r.database.close();
+  });
+
+  it("R1 미커밋·질문 없는 주제에서 확인자가 판정을 빠뜨리면 저장된 리뷰 재사용 경로로 빠지지 않고 정상 리뷰가 돈다", async () => {
+    const r = await ready("r1-uncommitted-missing-assessment");
+    const sequence = await decide(r, "형식을 B 로 바꾸세요.");
+    r.codex.assessmentHandlers.push(() => []);
+    const reviewsBefore = r.codex.prompts.length;
+    await retry(r);
+    await r.idle("READY_TO_DELIVER");
+    const tail = since(r, sequence);
+    expect(tail.some((body) => body.includes("결정 판정(decisionAssessments)이 결정을 다 다루지 않아"))).toBe(true);
+    expect(tail.some((body) => body.includes("코드·증거 변경을 정상 리뷰에서 확인합니다."))).toBe(true);
+    expect(tail.some((body) => body.includes("사용자 결정을 확인해 통과한 코드 리뷰를 재사용합니다."))).toBe(false);
+    expect(r.codex.prompts.length).toBeGreaterThan(reviewsBefore);   // 정상 리뷰가 실제로 돌았다
+    r.database.close();
+  });
+
+  it("R1 재확인 거절 뒤 정상 리뷰가 결과 저장 전에 실패하면 다음 재시도도 저장된 리뷰를 재사용하지 않고 리뷰를 다시 돈다", async () => {
+    // 두 번째 REVIEW 호출만 결과 없이 죽는 Codex — 거절 뒤 첫 정상 리뷰가 저장 전에 실패한 상황.
+    class FailOnceReviewCodex extends EchoCodex {
+      private reviews = 0;
+      override async resumeTurn(turn: SessionTurn): Promise<AgentResult> {
+        const review = await super.resumeTurn(turn);
+        if (review.kind !== "REVIEW") return review;
+        this.reviews += 1;
+        if (this.reviews === 2) throw new Error("리뷰 프로세스가 결과 없이 죽었습니다.");
+        return review;
+      }
+    }
+    const r = await ready("r1-review-fails-before-save", { codexInstance: new FailOnceReviewCodex() });
+    const sequence = await decide(r, "형식을 B 로 바꾸세요.");
+    r.codex.assessmentHandlers.push(() => []);
+    const reviewsBefore = r.codex.prompts.length;
+    await retry(r);
+    await r.idle("FAILED");
+    expect(r.codex.prompts.length).toBe(reviewsBefore + 1);
+    await retry(r);
+    expect(await g6aSettleWithGrants(r, "거절 뒤 재리뷰 추가 승인")).toBe("READY_TO_DELIVER");
+    const tail = since(r, sequence);
+    expect(r.codex.prompts.length).toBeGreaterThanOrEqual(reviewsBefore + 2);   // 실패 뒤 재시도가 리뷰를 다시 샀다(한도 승인 뒤)
+    expect(tail.some((body) => body.includes("사용자 결정을 확인해 통과한 코드 리뷰를 재사용합니다."))).toBe(false);
+    expect(tail.some((body) => body.includes("기존 코드 판정과 커밋을 보존하고 답변을 재확인했습니다."))).toBe(false);
+    r.database.close();
+  }, 30_000);
+
+  it("R9 답한 뒤 정상 리뷰가 다시 돌아 통과했어도, 질문이 다시 열리면 마지막 리뷰보다 앞선 원래 답을 인용한 확인을 받는다", async () => {
+    const r = await ready("r9-answer-before-latest-review");
+    const request = question(r, "형식 A 를 유지할까요?");
+    const answered = await decide(r, "A 를 유지하세요.");
+    await retry(r);
+    await r.idle("READY_TO_DELIVER");
+    // 구현 변경 요구 → 정상 리뷰가 다시 돌아 통과(새 reviewInputSequence 가 원래 답 뒤에 놓인다)
+    await decide(r, "형식을 B 로 바꾸세요.");
+    r.codex.assessmentHandlers.push((input) => input.decisions.map((decision) => ({ decisionSequence: decision.sequence, changesImplementation: true })));
+    const reviewsBefore = r.codex.prompts.length;
+    await retry(r);
+    expect(await g6aSettleWithGrants(r, "변경 요구 재리뷰 추가 승인")).toBe("READY_TO_DELIVER");
+    expect(r.codex.prompts.length).toBeGreaterThanOrEqual(reviewsBefore + 1);
+    const reviewsAfter = r.codex.prompts.length;
+    // 무관한 결정으로 질문이 다시 열린다 — 확인자는 원래 답(마지막 리뷰 입력보다 앞)을 인용한다
+    const sequence = await decide(r, "배포 공지는 내일 올립니다.");
+    r.codex.answerHandlers.push((input) => input.requests.map((item) => ({ requestId: item.id, decisionSequence: (item as { answerDecisionSequence?: number }).answerDecisionSequence ?? answered })));
+    await retry(r);
+    expect(await g6aSettleWithGrants(r, "재확인")).toBe("READY_TO_DELIVER");
+    const tail = since(r, sequence);
+    expect(tail.some((body) => body.includes("요청 ID 또는 결정 순번이 일치하지 않아"))).toBe(false);
+    expect(tail.some((body) => body.includes("기존 코드 판정과 커밋을 보존하고 답변을 재확인했습니다."))).toBe(true);
+    expect(r.codex.prompts.length).toBe(reviewsAfter);   // 재확인만 했고 리뷰는 다시 사지 않았다
+    expect(pendingReviewRequests(r.database.getTimeline(r.topicId), 1).map((item) => item.id)).not.toContain(request.id);
+    r.database.close();
+  }, 30_000);
+
+  it("R9 답한 질문이 새 결정으로 다시 열리면 확인자가 원래 답(이전 결정)을 인용해도 받아들이고 재사용한다", async () => {
+    const r = await ready("r9-reconfirm-original-answer");
+    const request = question(r, "형식 A 를 유지할까요?");
+    const answered = await decide(r, "A 를 유지하세요.");
+    await retry(r);
+    await r.idle("READY_TO_DELIVER");
+    expect(r.codex.answerConfirmations).toHaveLength(1);
+    const sequence = await decide(r, "배포 공지는 내일 올립니다.");
+    // 확인자는 다시 열린 질문의 답으로 **원래 결정**(answerDecisionSequence)을 돌려준다 — 입력에 그 결정이 있어야 정당한 재확인이다.
+    r.codex.answerHandlers.push((input) => input.requests.map((item) => ({ requestId: item.id, decisionSequence: (item as { answerDecisionSequence?: number }).answerDecisionSequence ?? answered })));
+    const reviewsBefore = r.codex.prompts.length;
+    await retry(r);
+    await r.idle("READY_TO_DELIVER");
+    const tail = since(r, sequence);
+    expect(tail.some((body) => body.includes("요청 ID 또는 결정 순번이 일치하지 않아"))).toBe(false);
+    expect(tail.some((body) => body.includes("기존 코드 판정과 커밋을 보존하고 답변을 재확인했습니다."))).toBe(true);
+    expect(r.codex.answerConfirmations).toHaveLength(2);
+    expect(r.codex.prompts.length).toBe(reviewsBefore);
+    expect(pendingReviewRequests(r.database.getTimeline(r.topicId), 1).map((item) => item.id)).not.toContain(request.id);
+    r.database.close();
+  });
+
+  it("R1 확인된 답변이고 판정 false 면 커밋 뒤에도 코드 판정과 커밋을 보존해 재사용한다", async () => {
+    const { r, c1 } = await committed("r1-answer-reuse");
+    question(r, "형식 A 를 유지할까요?");
+    const sequence = await decide(r, "A 를 유지하세요.");
+    const reviewsBefore = r.codex.prompts.length;
+    await retry(r);
+    await r.idle("READY_TO_DELIVER");
+    expect(since(r, sequence).some((body) => body.includes("기존 코드 판정과 커밋을 보존하고 답변을 재확인했습니다."))).toBe(true);
+    expect(r.codex.prompts.length).toBe(reviewsBefore);
+    expect(r.database.getFlags(r.topicId).committedOID).toBe(c1);
+    r.database.close();
+  });
+
+  it("R2 커밋 뒤 결정으로 멈춘 USER_DECISION_REQUIRED 에서도 수정·조사 진단 등록을 409 로 거부한다(상태 무관)", async () => {
+    const { r } = await committed("r2-committed-stopped");
+    await decide(r, "배포 공지는 내일 올립니다.");
+    const fix = await r.call("POST", `/api/topics/${r.topicId}/diagnoses`, fixDiagnosis({ title: "커밋 뒤 결함" }), { mediator: true });
+    expect(fix.status).toBe(409);
+    expect(String(fix.body.error)).toContain("커밋");
+    const investigation = { kind: "investigation", title: "커밋 뒤 조사", observedFailure: "간헐 실패", cause: "가설", uncertainty: "재현 안 됨" };
+    const investigated = await r.call("POST", `/api/topics/${r.topicId}/diagnoses`, investigation, { mediator: true });
+    expect(investigated.status).toBe(409);
+    expect(await r.diagnoses()).toEqual([]);
+    expect(r.database.getTopic(r.topicId).state).toBe("USER_DECISION_REQUIRED");
+    r.database.close();
+  });
+
+  it("R3 커밋 뒤 재확인 정지 중 새 증거가 올라오면 정지를 반복하지 않고 정상 리뷰로 보내며 확정 커밋을 보존해 C2 를 잇는다", async () => {
+    const { r, c1 } = await committed("r3-evidence-after-commit");
+    const sequence = await decide(r, "배포 공지는 내일 올립니다.");
+    expect((await r.call("POST", `/api/topics/${r.topicId}/messages`, { kind: "evidence", body: "실기기 로그를 추가했습니다." })).status).toBe(200);
+    const reviewsBefore = r.codex.prompts.length;
+    await retry(r);
+    await r.idle("READY_TO_DELIVER");
+    const tail = since(r, sequence);
+    expect(tail.some((body) => body.includes("코드·증거 변경을 정상 리뷰에서 확인합니다."))).toBe(true);
+    expect(tail.some((body) => body.includes("확정된 커밋의 코드가 바뀌어"))).toBe(false);
+    expect(r.codex.prompts.length).toBeGreaterThan(reviewsBefore);
+    expect(r.database.getFlags(r.topicId).committedOID).toBe(c1);
+    expect(git(r.worktree, ["rev-parse", "HEAD"])).toBe(c1);
+    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "C2", paths: ["second.txt"] })).status).toBe(200);
+    expect(git(r.worktree, ["rev-parse", "HEAD^"])).toBe(c1);
+    expect(r.database.getFlags(r.topicId).committedOID).toBe(git(r.worktree, ["rev-parse", "HEAD"]));
+    r.database.close();
+  });
+
+  it("R3 커밋 뒤 코드가 실제로 바뀌면 여전히 멈춘다(재확인만으로 push 하지 않는다)", async () => {
+    const { r, c1 } = await committed("r3-code-changed-after-commit");
+    const sequence = await decide(r, "배포 공지는 내일 올립니다.");
+    writeFileSync(join(r.worktree, "second.txt"), "두 번째 커밋 내용\n리뷰 뒤 편집\n");
+    await retry(r);
+    await r.idle("USER_DECISION_REQUIRED");
+    expect(since(r, sequence).some((body) => body.includes("확정된 커밋의 코드가 바뀌어"))).toBe(true);
+    expect(r.database.getFlags(r.topicId).committedOID).toBe(c1);
+    r.database.close();
+  });
+
+  it("R8 커밋 뒤 재리뷰가 수정할 결함을 내면 수정 작업을 열지 않고 범위 변경 안내로 멈춘다(확정 커밋 보존)", async () => {
+    // 두 번째 REVIEW 에서만 확정 결함을 내는 Codex — 첫 리뷰는 통과해 C1 을 확정하고, 재리뷰가 AGREED_ACTION 을 낸다.
+    class SecondReviewDefectCodex extends EchoCodex {
+      private reviews = 0;
+      override async resumeTurn(turn: SessionTurn): Promise<AgentResult> {
+        const review = await super.resumeTurn(turn);
+        if (review.kind !== "REVIEW") return review;
+        this.reviews += 1;
+        return this.reviews === 2 ? { ...review, summary: "고쳐야 할 결함이 있습니다.", findings: [...review.findings, REVIEW_DEFECT_FINDING] } : review;
+      }
+    }
+    const { r, c1 } = await committed("r8-fix-after-commit", { codexInstance: new SecondReviewDefectCodex() });
+    const sequence = await decide(r, "형식을 B 로 바꾸세요.");
+    r.codex.assessmentHandlers.push((input) => input.decisions.map((decision) => ({ decisionSequence: decision.sequence, changesImplementation: true })));
+    await retry(r);
+    await r.idle("USER_DECISION_REQUIRED");
+    const tail = since(r, sequence);
+    expect(tail.some((body) => body.includes("코드·증거 변경을 정상 리뷰에서 확인합니다."))).toBe(true);
+    expect(tail.some((body) => body.includes("재리뷰가 수정할 결함을 냈습니다") && body.includes("범위 변경(scope_change)"))).toBe(true);
+    expect(r.database.getFlags(r.topicId).resumeState).not.toBe("CLAUDE_FIX");
+    expect(r.database.getFlags(r.topicId).committedOID).toBe(c1);
+    expect(git(r.worktree, ["rev-parse", "HEAD"])).toBe(c1);
+    expect(r.claude.turns).toHaveLength(1);   // 수정 턴을 열지 않았다
+    r.database.close();
+  });
+
+  // 최종 리뷰 결과가 **저장된 직후**, 엔진이 통과 판정용 진단 처분(reviewVerdicts)을 읽는 사이에 사용자 결정이 도착하는 경우(host-review 2026-09-21 5회차 R1) — 실행기의 턴 중
+  // 가드("codex 턴이 끝나기 전에 새 결정")는 이미 지났고, 인도 대기 전이 전의 입력 검사(interruptForLatestTurnInput)가 재확인 표식 없이 CODEX_FINAL_REVIEW 로 멈춘다. 그 창은
+  // 내부 await 라 reviewVerdicts 가 부르는 DB 호출을 잡아 같은 순간에 결정 이벤트를 넣는다(이 상태에서는 /messages 경로도 표식 없이 같은 이벤트를 남긴다).
+  const stoppedDuringFinalReview = async (label: string) => {
+    const r = await room(label, [], { codex: "review-defect" });
+    r.claude["steps"].push(
+      () => { writeFileSync(join(r.worktree, "feature.txt"), "구현 완료\n"); return result("IMPLEMENTATION", "구현을 마쳤습니다.", { status: "completed" }); },
+      () => { writeFileSync(join(r.worktree, "feature.txt"), "F-1 수정\n"); return result("FIX", "F-1 수정 보고", { status: "completed", findings: [resolved("F-1")] }); },
+    );
+    const database = r.database as unknown as { artifactsForScope: (topicId: string, kind: string) => unknown };
+    const original = database.artifactsForScope.bind(r.database);
+    let injected = false;
+    database.artifactsForScope = (topicId: string, kind: string) => {
+      if (!injected && kind === "codex-final-review" && r.database.latestArtifact(r.topicId, "codex-final-review")) {
+        injected = true;
+        database.artifactsForScope = original;
+        r.database.appendEvent({ topicId: r.topicId, actor: "user", kind: "decision", state: r.database.getTopic(r.topicId).state, body: "형식을 B 로 바꾸세요.", payload: {} });
+      }
+      return original(topicId, kind);
+    };
+    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/implement`)).status).toBe(200);
+    await r.idle("USER_DECISION_REQUIRED");
+    expect(injected).toBe(true);
+    expect(r.database.latestArtifact(r.topicId, "codex-final-review")).not.toBeNull();   // 최종 리뷰 결과는 저장됐다
+    expect(r.database.getFlags(r.topicId).resumeState).toBe("CODEX_FINAL_REVIEW");
+    expect(r.database.getTimeline(r.topicId).some((event) => event.payload?.reviewDeliveryRecheck === true)).toBe(false);   // 재확인 표식 없이 멈췄다
+    expect(r.codex.answerConfirmations).toHaveLength(0);
+    return r;
+  };
+
+  it("R1 최종 리뷰 도중 도착한 결정은 재확인 표식 없이 재개돼도 확인자 판정 없이는 저장된 최종 리뷰를 재사용하지 않고 리뷰를 다시 돈다", async () => {
+    const r = await stoppedDuringFinalReview("r1-decision-during-final-review-unjudged");
+    r.codex.assessmentHandlers.push(() => []);   // 확인자가 판정을 빠뜨린다
+    const sequence = r.database.getTimeline(r.topicId).at(-1)!.sequence;
+    const reviewsBefore = r.codex.prompts.length;
+    await retry(r);
+    expect(await g6aSettleWithGrants(r, "판정 없는 결정 뒤 최종 리뷰 재구매")).toBe("READY_TO_DELIVER");
+    const tail = since(r, sequence);
+    expect(r.codex.answerConfirmations).toHaveLength(1);   // 재개 경로가 재사용 판단 전에 확인자를 불렀다
+    expect(tail.some((body) => body.includes("결정 판정(decisionAssessments)이 결정을 다 다루지 않아"))).toBe(true);
+    expect(tail.some((body) => body.includes("Codex 턴 없이 전달 준비로 넘깁니다"))).toBe(false);
+    expect(r.codex.prompts.length).toBeGreaterThan(reviewsBefore);   // 최종 리뷰를 다시 샀다
+    r.database.close();
+  }, 30_000);
+
+  it("대조군: 최종 리뷰 도중 도착한 결정을 확인자가 구현 변경 요구 아님으로 판정하면 저장된 최종 리뷰를 재사용한다(리뷰 재구매 없음)", async () => {
+    const r = await stoppedDuringFinalReview("r1-decision-during-final-review-judged-false");
+    const sequence = r.database.getTimeline(r.topicId).at(-1)!.sequence;
+    const reviewsBefore = r.codex.prompts.length;
+    await retry(r);
+    await r.idle("READY_TO_DELIVER");
+    const tail = since(r, sequence);
+    expect(r.codex.answerConfirmations).toHaveLength(1);
+    expect(tail.some((body) => body.includes("Codex 턴 없이 전달 준비로 넘깁니다"))).toBe(true);
+    expect(r.codex.prompts.length).toBe(reviewsBefore);
+    r.database.close();
+  });
+
+  it("R1 OVERRULE 지시어와 함께 적힌 구현 변경 요구는 판정이 빠지면 OVERRULE 을 근거로 통과시키지 않고 정상 리뷰로 간다", async () => {
+    const r = await ready("r1-overrule-with-change-demand");
+    const sequence = await decide(r, "OVERRULE F-9\n그리고 형식을 B 로 바꾸세요.");
+    r.codex.assessmentHandlers.push(() => []);
+    const reviewsBefore = r.codex.prompts.length;
+    await retry(r);
+    await r.idle("READY_TO_DELIVER");
+    const tail = since(r, sequence);
+    expect(tail.some((body) => body.includes("결정 판정(decisionAssessments)이 결정을 다 다루지 않아"))).toBe(true);
+    expect(tail.some((body) => body.includes("기존 코드 판정과 커밋을 보존하고 답변을 재확인했습니다."))).toBe(false);
+    expect(tail.some((body) => body.includes("코드·증거 변경을 정상 리뷰에서 확인합니다."))).toBe(true);
+    expect(r.codex.prompts.length).toBeGreaterThan(reviewsBefore);   // 정상 리뷰가 실제로 돌았다
+    r.database.close();
+  });
+
+  it("R9 한 결정이 두 질문의 답이었으면 다시 열린 재확인 입력에 그 결정을 한 번만 넣는다 — 확인자가 입력 원소마다 판정해도 중복으로 거부되지 않는다", async () => {
+    const r = await ready("r9-two-questions-one-answer-dedupe");
+    const first = question(r, "형식 A 를 유지할까요?");
+    const second = question(r, "로그 경로도 유지할까요?");
+    const answered = await decide(r, "둘 다 유지하세요.");
+    const citeOriginal = () => [{ requestId: first.id, decisionSequence: answered }, { requestId: second.id, decisionSequence: answered }];
+    r.codex.answerHandlers.push(citeOriginal);
+    await retry(r);
+    await r.idle("READY_TO_DELIVER");
+    // 구현 변경 요구 → 정상 리뷰 재통과(원래 답이 새 리뷰 입력보다 앞에 놓인다)
+    await decide(r, "형식을 B 로 바꾸세요.");
+    r.codex.answerHandlers.push(citeOriginal);
+    r.codex.assessmentHandlers.push((input) => input.decisions.map((decision) => ({ decisionSequence: decision.sequence, changesImplementation: decision.sequence !== answered })));
+    await retry(r);
+    expect(await g6aSettleWithGrants(r, "변경 요구 재리뷰 추가 승인")).toBe("READY_TO_DELIVER");
+    const reviewsAfter = r.codex.prompts.length;
+    // 무관한 결정으로 두 질문이 다시 열린다 — 입력에 원래 답(두 질문의 answerDecisionSequence)이 한 번만 있어야 한다
+    const sequence = await decide(r, "배포 공지는 내일 올립니다.");
+    let seen: number[] = [];
+    r.codex.answerHandlers.push((input) => { seen = [...input.decisions, ...((input as { answerEvidence?: Array<{ sequence: number }> }).answerEvidence ?? [])].map((decision) => decision.sequence); return citeOriginal(); });
+    await retry(r);
+    expect(await g6aSettleWithGrants(r, "재확인")).toBe("READY_TO_DELIVER");
+    expect(seen).toContain(answered);
+    expect(new Set(seen).size).toBe(seen.length);
+    const tail = since(r, sequence);
+    expect(tail.some((body) => body.includes("같은 결정을 두 번 다뤄"))).toBe(false);
+    expect(tail.some((body) => body.includes("기존 코드 판정과 커밋을 보존하고 답변을 재확인했습니다."))).toBe(true);
+    expect(r.codex.prompts.length).toBe(reviewsAfter);
+    expect(pendingReviewRequests(r.database.getTimeline(r.topicId), 1).map((item) => item.id)).not.toContain(first.id);
+    r.database.close();
+  }, 30_000);
 });
 
 });

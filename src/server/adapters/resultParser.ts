@@ -1,4 +1,6 @@
-import { PlanRepairSchema, type PlanRepair, AgentResultSchema, RESPONSE_LEDGER_LIMIT, type AgentResult } from "../../shared/contracts.js";
+import {
+  PlanRepairSchema, type PlanRepair, AgentResultSchema, RESPONSE_LEDGER_LIMIT, RESPONSE_RESOLVED_IDS_LIMIT, type AgentResult,
+} from "../../shared/contracts.js";
 import { redactSecrets } from "../../shared/workflow.js";
 
 // AgentResultJsonSchema는 선택 필드를 "required + null 허용"으로 표현한다 — OpenAI 구조화 출력이
@@ -7,7 +9,7 @@ import { redactSecrets } from "../../shared/workflow.js";
 // memoryUpdates[].expectedSHA256처럼 null 자체가 유효한 값인 필드는 건드리지 않으므로 재귀로 훑지 않는다.
 const OPTIONAL_KEYS = [
   "planMarkdown", "planEdits", "planLineEdits", "planSHA256", "requestedUserDecision", "memoryUpdates", "findings", "evidenceRefs",
-  "toleranceLedger", "status", "remainingSteps", "resolvesRequestedDecision", "resolvedRequestId", "reviewDecisionAnswers",
+  "toleranceLedger", "status", "remainingSteps", "resolvesRequestedDecision", "resolvedRequestId", "resolvedRequestIds", "reviewDecisionAnswers", "decisionAssessments",
 ] as const;
 
 function withoutNullOptionals(value: unknown): unknown {
@@ -32,6 +34,10 @@ function parseResult(value: unknown) {
   const parsed = AgentResultSchema.safeParse(withoutNullOptionals(value));
   if (parsed.success && (parsed.data.toleranceLedger?.length ?? 0) > RESPONSE_LEDGER_LIMIT) {
     return { success: false as const, error: new Error(`toleranceLedger 가 한 번 응답 한도 ${RESPONSE_LEDGER_LIMIT}행을 넘습니다(서버가 앞 턴 원장을 승계하므로 이번 턴 변경분만 적으세요)`) };
+  }
+  // 해소 요청 id 도 같은 분리 — 응답 한도는 여기서, 저장 계약(교정 병합 합집합)은 무제한(host-review R02).
+  if (parsed.success && (parsed.data.resolvedRequestIds?.length ?? 0) > RESPONSE_RESOLVED_IDS_LIMIT) {
+    return { success: false as const, error: new Error(`resolvedRequestIds 가 한 번 응답 한도 ${RESPONSE_RESOLVED_IDS_LIMIT}개를 넘습니다(열린 요청과 일치하는 id 만 적으세요)`) };
   }
   return parsed;
 }

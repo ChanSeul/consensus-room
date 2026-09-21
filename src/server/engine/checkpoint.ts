@@ -10,6 +10,10 @@
 import { createHash } from "node:crypto";
 
 import { AgentResultSchema, type AgentResult, type Topic } from "../../shared/contracts.js";
+import { resolutionIds } from "../../shared/workflow.js";
+
+// 해소 표식의 id 정규화는 공유 규칙(shared/workflow.ts)이다 — salvage·교정 병합·누적이 같은 함수를 쓴다.
+export { resolutionIds };
 import type { ToleranceLedgerEntry } from "../../shared/tolerance.js";
 import { mergeCorrectionResult } from "../../shared/workflow.js";
 import { ArtifactIntegrityError } from "../artifacts.js";
@@ -59,7 +63,7 @@ export interface WorkCheckpoint {
   verifiedLedger: ToleranceLedgerEntry[];
   next: { remainingSteps: string[]; pendingCorrection: "tolerance" | "contract" | null };
   // 지금 열려 있는 요청 결정들(id·원문·제시 시점). 결정이 왔다는 이유로 지우지 않고, 새 질문이 앞 질문을 덮지도 않는다 — 러너가
-  // resolvesRequestedDecision + resolvedRequestId(요청 id 일치)로 해소를 확인하거나 읽기 전용 확인 턴이 확인해야 그 요청만 닫힌다.
+  // resolvesRequestedDecision + resolvedRequestId(s)(요청 id 일치)로 해소를 확인하거나 읽기 전용 확인 턴이 확인해야 그 요청들만 닫힌다.
   openRequests: OpenRequest[];
   // 이 논리 작업에서 완료 상태 확인 턴을 몇 번 썼는가(최대 1회).
   confirmations: number;
@@ -112,7 +116,8 @@ export function checkpointOpenRequests(checkpoint: Pick<WorkCheckpoint, "accumul
 
 // 누적 규칙(한 곳): 새 응답을 누적본 위에 병합한다. 요청 결정은 요청별로 보존한다 —
 //   (1) 새 응답의 requestedUserDecision 은 열린 요청 목록에 **추가**된다(같은 문구가 아직 열려 있으면 같은 요청).
-//   (2) 해소는 resolvesRequestedDecision + resolvedRequestId 가 열린 요청의 id 와 **일치할 때만** 그 요청 하나를 닫는다. id 없는 표식은 해소가 아니다.
+//   (2) 해소는 resolvesRequestedDecision + resolvedRequestId·resolvedRequestIds 의 id 가 열린 요청의 id 와 **일치하는 것만** 각각 닫는다(한 응답에서
+//       여러 요청, 2026-09-21). id 없는 표식은 해소가 아니고, 일치하지 않는 id 는 아무 요청도 닫지 않은 채 진단으로 남는다.
 //   (3) 그 밖의 열린 요청은 그대로 남는다. "결정이 도착했다" 는 여기서 요청을 지우는 사유가 아니다.
 export function accumulate(
   base: AgentResult | null, next: AgentResult, open: readonly OpenRequest[], askedAfterSequence: number,
@@ -134,17 +139,25 @@ export function accumulate(
     }
   }
   if (next.resolvesRequestedDecision === true) {
-    const id = next.resolvedRequestId?.trim();
-    const target = id ? openRequests.find((request) => request.id === id) : undefined;
-    if (target) {
-      resolvedRequests.push(target);
-      openRequests = openRequests.filter((request) => request.id !== target.id);
-    } else {
-      unmatchedResolution = id ? `resolvedRequestId ${id} 는 열린 요청이 아닙니다(열린 요청: ${openRequests.map((request) => request.id).join(", ") || "없음"})`
-        : "resolvesRequestedDecision 에 resolvedRequestId 가 없어 어느 요청도 닫지 않았습니다";
+    const ids = resolutionIds(next);
+    const unmatched: string[] = [];
+    for (const id of ids) {
+      const target = openRequests.find((request) => request.id === id);
+      if (target) {
+        resolvedRequests.push(target);
+        openRequests = openRequests.filter((request) => request.id !== target.id);
+      } else {
+        unmatched.push(id);
+      }
+    }
+    if (ids.length === 0) {
+      unmatchedResolution = "resolvesRequestedDecision 에 resolvedRequestId(s) 가 없어 어느 요청도 닫지 않았습니다";
+    } else if (unmatched.length > 0) {
+      const stillOpen = openRequests.map((request) => request.id).join(", ") || "없음";
+      unmatchedResolution = `resolvedRequestId ${unmatched.join(", ")} 는 열린 요청이 아닙니다(열린 요청: ${stillOpen}${resolvedRequests.length ? `; 이 응답으로 닫힘: ${resolvedRequests.map((request) => request.id).join(", ")}` : ""})`;
     }
   }
-  const { requestedUserDecision: _decision, resolvesRequestedDecision: _flag, resolvedRequestId: _rid, ...rest } = merged.result;
+  const { requestedUserDecision: _decision, resolvesRequestedDecision: _flag, resolvedRequestId: _rid, resolvedRequestIds: _rids, ...rest } = merged.result;
   const result: AgentResult = openRequests.length > 0 ? { ...rest, requestedUserDecision: renderOpenRequests(openRequests) } : rest;
   return { result, openRequests, preserved: merged.preserved, resolvedRequests, unmatchedResolution };
 }

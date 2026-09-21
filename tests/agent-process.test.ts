@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { describeCommandFailure, parseAgentResult } from "../src/server/adapters/resultParser";
+import { resolutionIds } from "../src/shared/workflow";
 import { SpawnCommandRunner } from "../src/server/processRunner";
 
 const temporaryDirectories: string[] = [];
@@ -94,7 +95,8 @@ describe("CLI JSONL 처리", () => {
     // planEdits:null 누락이 2026-08-31 closeout 재실행을 통째로 거부시켰다(스키마에 키를 추가하며
     // OPTIONAL_KEYS 갱신을 빠뜨림). 스키마의 null 허용 키는 반드시 이 테스트에도 함께 추가한다.
     const text = '{"kind":"AUDIT","summary":"probe","planMarkdown":null,"planEdits":null,"planSHA256":null,'
-      + '"findings":[],"evidenceRefs":[],"requestedUserDecision":null,"memoryUpdates":null,"reviewDecisionAnswers":null}';
+      + '"findings":[],"evidenceRefs":[],"requestedUserDecision":null,"memoryUpdates":null,"reviewDecisionAnswers":null,'
+      + '"resolvesRequestedDecision":null,"resolvedRequestId":null,"resolvedRequestIds":null}';
 
     const parsed = parseAgentResult([{ item: { type: "agent_message", text } }], "");
 
@@ -103,6 +105,26 @@ describe("CLI JSONL 처리", () => {
     expect(parsed.planEdits).toBeUndefined();
     expect(parsed.reviewDecisionAnswers).toBeUndefined();
     expect(parsed.memoryUpdates).toBeUndefined();
+    expect(parsed.resolvedRequestIds).toBeUndefined();
+  });
+
+  // 구조화 출력 스키마는 minLength 를 못 걸어(OpenAI strict) 모델이 빈 문자열 id 를 낼 수 있다 — 응답을 버리지 않고 빈 id 만 resolutionIds 가 버린다
+  // (2026-09-21 사전 검증 #2: zod min(1) 이 "" 하나로 응답 전체를 폐기해 유효한 나머지 해소까지 잃었다).
+  it("resolvedRequestIds 에 빈 문자열 항목이 있어도 응답을 버리지 않는다", () => {
+    const text = '{"kind":"IMPLEMENTATION","summary":"done","findings":[],"evidenceRefs":[],"status":"completed",'
+      + '"resolvesRequestedDecision":true,"resolvedRequestId":"","resolvedRequestIds":["Q-1a2b3c4d",""]}';
+    const parsed = parseAgentResult([{ item: { type: "agent_message", text } }], "");
+    expect(parsed.resolvedRequestIds).toEqual(["Q-1a2b3c4d", ""]);
+    expect(resolutionIds(parsed)).toEqual(["Q-1a2b3c4d"]);
+  });
+
+  it("resolvedRequestIds 가 한 번 응답 한도 100 을 넘으면 그 응답을 거부한다 — 저장 계약(교정 병합 합집합)과 분리(host-review R02)", () => {
+    const ids = Array.from({ length: 101 }, (_, index) => `"Q-${index}"`).join(",");
+    const text = `{"kind":"IMPLEMENTATION","summary":"done","findings":[],"evidenceRefs":[],"status":"completed","resolvesRequestedDecision":true,"resolvedRequestIds":[${ids}]}`;
+    expect(() => parseAgentResult([{ item: { type: "agent_message", text } }], "")).toThrow();
+    const hundred = Array.from({ length: 100 }, (_, index) => `"Q-${index}"`).join(",");
+    const okText = text.replace(`[${ids}]`, `[${hundred}]`);
+    expect(parseAgentResult([{ item: { type: "agent_message", text: okText } }], "").resolvedRequestIds).toHaveLength(100);
   });
 
   // stderr만 담으면 "실행 실패(1): "만 남아 스키마 거부인지 사용량 소진인지 구별할 수 없다.

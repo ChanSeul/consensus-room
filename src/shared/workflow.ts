@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 import type { AgentResult, Finding, Participant, PlanEdit, WorkflowState } from "./contracts";
-import { FIX_AWARE_KINDS, FindingSchema, validatePlanHeadings } from "./contracts";
+import { FIX_AWARE_KINDS, FindingSchema, RESPONSE_RESOLVED_IDS_LIMIT, validatePlanHeadings } from "./contracts";
 import { parseTolerancePolicy } from "./tolerance";
 
 export const ACTIVE_WORKFLOW_STATES: ReadonlySet<WorkflowState> = new Set([
@@ -247,6 +247,20 @@ export function carryForwardFindings(
   return { findings: carried.length ? [...response, ...carried] : [...response], carried: carried.map((finding) => finding.id) };
 }
 
+// 해소 표식이 가리키는 요청 id 들 — 단수·복수 필드를 합쳐 공백을 지우고 중복을 없앤다(순서 유지). 빈 문자열·공백은 id 가 아니다: 구조화 출력
+// 스키마는 minLength 를 못 걸어(OpenAI strict) 모델이 "" 를 낼 수 있고, 그것이 zod 에서 응답 전체를 거부시키면 유효한 나머지 id 의 해소까지
+// 잃는다(2026-09-21 사전 검증 #2) — 스키마는 문자열을 받고 여기서 거른다.
+export function resolutionIds(result: Pick<AgentResult, "resolvedRequestId" | "resolvedRequestIds">): string[] {
+  const raw = [result.resolvedRequestId, ...(result.resolvedRequestIds ?? [])];
+  const seen = new Set<string>();
+  const ids: string[] = [];
+  for (const value of raw) {
+    const id = typeof value === "string" ? value.trim() : "";
+    if (id && !seen.has(id)) { seen.add(id); ids.push(id); }
+  }
+  return ids;
+}
+
 export const CORRECTION_SUMMARY_SEPARATOR = "\n\n---\n교정 전 턴 보고(서버 보존):\n";
 
 // 허용 오차 교정 재제출은 그 턴의 최종 결과가 된다 — 러너가 교정만 적고 본 턴 보고(summary·findings·evidence·요청 결정)를
@@ -264,7 +278,18 @@ export function mergeCorrectionResult(original: AgentResult, corrected: AgentRes
   if (keptEvidence.length) preserved.push(`evidence ${keptEvidence.length}건`);
   const originalDecision = original.requestedUserDecision?.trim() ? original.requestedUserDecision : undefined;
   // 교정이 요청 결정을 해소했다고 명시하면(resolvesRequestedDecision, 예: 범위 밖 변경을 전부 되돌려 질문이 사라짐) 복원하지 않는다(R07).
+  // 이 판단은 **교정 자신의** 표식만 본다 — 원본의 표식은 앞 요청을 닫은 것이지 본 턴 질문이 사라졌다는 뜻이 아니다.
   const resolved = corrected.resolvesRequestedDecision === true;
+  // 해소 표식·요청 id 는 교정이 되풀이하지 않아도 원본 것을 보존한다(합집합·중복 제거) — 계약 교정 프롬프트에는 열린 요청 절이 없어 러너가 id 를
+  // 다시 적을 수 없고, salvage 원본 위에 교정만 얹으면 한 응답으로 닫은 N 건이 한꺼번에 되살아났다(2026-09-21 사전 검증 #1).
+  const originalResolved = original.resolvesRequestedDecision === true;
+  const resolutionFlag = resolved || originalResolved;
+  if (!resolved && originalResolved) preserved.push("해소 표식");
+  // 각 응답의 id 는 **그 응답의 표식이 true 일 때만** 해소 대상이다 — 표식 없는 응답의 id 를 다른 응답의 표식과 결합하면 보류 중인 요청까지
+  // 닫힌다(host-review R01: 원본 {false, A} + 교정 {true, B} 는 B 만). 합집합은 응답 한도(100)를 넘을 수 있고 저장 계약은 그것을 받는다(R02).
+  const resolvedIds = resolutionIds({
+    resolvedRequestIds: [...(resolved ? resolutionIds(corrected) : []), ...(originalResolved ? resolutionIds(original) : [])],
+  });
   const decision = corrected.requestedUserDecision?.trim() ? corrected.requestedUserDecision : (resolved ? undefined : originalDecision);
   if (!corrected.requestedUserDecision?.trim() && originalDecision && !resolved) preserved.push("요청 결정");
   const originalSummary = original.summary.trim();
@@ -273,12 +298,13 @@ export function mergeCorrectionResult(original: AgentResult, corrected: AgentRes
     summary = `${corrected.summary.trimEnd()}${CORRECTION_SUMMARY_SEPARATOR}${originalSummary}`;
     preserved.push("summary");
   }
-  const { requestedUserDecision: _dropped, resolvesRequestedDecision: _flag, ...rest } = corrected;
+  const { requestedUserDecision: _dropped, resolvesRequestedDecision: _flag, resolvedRequestId: _rid, resolvedRequestIds: _rids, ...rest } = corrected;
   const result: AgentResult = {
     ...rest, summary, findings: [...corrected.findings, ...keptFindings], evidenceRefs: [...evidence, ...keptEvidence],
     ...(decision !== undefined ? { requestedUserDecision: decision } : {}),
     // 해소 표식은 최종 병합·소비까지 유지한다 — 실패 원본 복구와 교정 병합이 겹치면 바깥 병합이 원래 질문을 되살렸다(F08).
-    ...(resolved ? { resolvesRequestedDecision: true } : {}),
+    ...(resolutionFlag ? { resolvesRequestedDecision: true } : {}),
+    ...(resolvedIds.length ? { resolvedRequestIds: resolvedIds } : {}),
     ...(corrected.status ?? original.status ? { status: corrected.status ?? original.status } : {}),
     // 교정이 completed 를 선언하면 옛 remainingSteps 를 끌고 오지 않는다(완료 결과에 남은 단계가 붙어 모순이 되지 않게, R3-01).
     ...((corrected.remainingSteps ?? (corrected.status === "completed" ? undefined : original.remainingSteps))
@@ -294,8 +320,10 @@ export function implementationInProgress(result: AgentResult): boolean {
   return (result.remainingSteps?.length ?? 0) > 0;
 }
 
-// 계약을 어긴 원본 응답에서 **개별로 유효한** 필드만 건진다 — 교정 재제출 위에 병합할 본 턴 보고(요약·쟁점·증거·요청 결정·상태).
+// 계약을 어긴 원본 응답에서 **개별로 유효한** 필드만 건진다 — 교정 재제출 위에 병합할 본 턴 보고(요약·쟁점·증거·요청 결정·상태·해소 표식).
 // 검증에 실패한 필드를 무조건 재주입하면 교정이 같은 위반으로 다시 죽는다(2026-09-14 Codex 감사 R01 ②).
+// 해소 표식(게이트·단수·복수 id)도 건진다 — 빠뜨리면 turn-result·before-contract-correction checkpoint 가 요청을 열린 채 기록하고 서버 재시작·
+// 계약 교정 뒤 러너가 같은 해소를 다시 해야 한다(2026-09-21 사전 검증 #1; 단수 시절부터의 구멍이 목록으로 규모가 커졌다).
 export function salvageResultFields(raw: unknown, kind: AgentResult["kind"]): AgentResult {
   const record = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
   const findings: Finding[] = [];
@@ -311,10 +339,18 @@ export function salvageResultFields(raw: unknown, kind: AgentResult["kind"]): Ag
   const status = record.status === "completed" || record.status === "in_progress" || record.status === "blocked" ? record.status : undefined;
   const remainingSteps = Array.isArray(record.remainingSteps)
     ? record.remainingSteps.filter((step): step is string => typeof step === "string").slice(0, 50) : undefined;
+  const resolves = record.resolvesRequestedDecision === true;
+  const resolvedId = typeof record.resolvedRequestId === "string" && record.resolvedRequestId.trim() ? record.resolvedRequestId.trim() : undefined;
+  const resolvedIds = Array.isArray(record.resolvedRequestIds)
+    ? record.resolvedRequestIds.filter((id): id is string => typeof id === "string" && id.trim().length > 0).map((id) => id.trim()).slice(0, RESPONSE_RESOLVED_IDS_LIMIT)
+    : undefined;
   return {
     kind, summary: summary || "(교정 전 원본에 유효한 요약이 없음)", findings, evidenceRefs,
     ...(decision ? { requestedUserDecision: decision } : {}), ...(status ? { status } : {}),
     ...(remainingSteps && remainingSteps.length ? { remainingSteps } : {}),
+    ...(resolves ? { resolvesRequestedDecision: true } : {}),
+    ...(resolvedId ? { resolvedRequestId: resolvedId } : {}),
+    ...(resolvedIds && resolvedIds.length ? { resolvedRequestIds: resolvedIds } : {}),
   };
 }
 

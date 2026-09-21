@@ -216,15 +216,15 @@ export class DiagnosisService {
   }
 
   private assertRegistrable(topic: Topic, resume: string | null, kind: DiagnosisInput["kind"]): void {
-    if (topic.state === "READY_TO_DELIVER") {
-      // 커밋(또는 push)한 결과에는 수정·조사 진단을 적용할 수 없다 — 등록만 받으면 적용도 인도도 못 하는 진단이 남아 push·close 가 막혔다(2026-09-15 감사 2차).
-      const flags = this.db.getFlags(topic.id);
-      if (kind !== "no_action" && (flags.committedOID || flags.pushedOID)) {
-        throw new DiagnosisConflict("이미 커밋(또는 push)한 결과에는 수정·조사 진단을 등록하지 않습니다 — 인도를 마친 뒤 새 주제에서 진단하거나, "
-          + "범위 변경(scope_change)으로 새 세대를 열어 고치세요. 열린 진단은 수정 불필요(no_action, supersedes)로 닫을 수 있습니다.");
-      }
-      return;
+    // 커밋(또는 push)한 결과에는 **상태와 무관하게** 수정·조사 진단을 등록하지 않는다 — 등록만 받으면 적용도 인도도 못 하는 진단이 남아 push·close 가 막혔고
+    // (2026-09-15 감사 2차), 커밋된 인도 대기 주제가 새 결정으로 USER_DECISION_REQUIRED 로 옮겨 간 뒤에는 이 검사가 빠져 확정 커밋과 다른 기준으로 재개하다
+    // requirePinnedBaseline 에서 멈추고 되돌릴 길이 없었다(host-review 2026-09-21 R2).
+    const flags = this.db.getFlags(topic.id);
+    if (kind !== "no_action" && (flags.committedOID || flags.pushedOID)) {
+      throw new DiagnosisConflict("이미 커밋(또는 push)한 결과에는 수정·조사 진단을 등록하지 않습니다 — 인도를 마친 뒤 새 주제에서 진단하거나, "
+        + "범위 변경(scope_change)으로 새 세대를 열어 고치세요. 열린 진단은 수정 불필요(no_action, supersedes)로 닫을 수 있습니다.");
     }
+    if (topic.state === "READY_TO_DELIVER") return;
     if (STOPPED_STATES.has(topic.state) && resume && DELIVERY_RESUME_STATES.has(resume)) return;
     throw new DiagnosisConflict(`진단은 구현·수정이 멈춘 상태(재개 단계: 구현·리뷰·수정·최종 리뷰)나 인도 대기에서만 등록합니다(현재 ${topic.state}/${resume ?? "-"}).`);
   }
@@ -288,7 +288,8 @@ export class DiagnosisService {
       if (this.db.unknownDeliveryAction(topicId)) {
         throw new DiagnosisConflict("결과가 불명확한 commit 또는 push 가 있습니다 — 기존 전달 복구(reconcile-delivery)를 먼저 따르세요.");
       }
-      if (topic.state === "READY_TO_DELIVER" && (flags.committedOID || flags.pushedOID)) {
+      // 상태와 무관하다(host-review 2026-09-21 R2): 커밋 뒤 결정으로 멈춘 USER_DECISION_REQUIRED 에서 적용을 받으면 확정 커밋과 다른 기준으로 재개하다 멈추고 되돌릴 수 없다.
+      if (flags.committedOID || flags.pushedOID) {
         throw new DiagnosisConflict("이미 커밋(또는 push)한 결과는 같은 주제에서 이어 고칠 수 없습니다 — 이 진단은 수정 불필요(no_action, supersedes)로 닫고, "
           + "고칠 것이 있으면 범위 변경(scope_change)으로 새 세대를 열거나 인도 뒤 새 주제에서 진단하세요.");
       }

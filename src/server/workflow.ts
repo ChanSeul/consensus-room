@@ -399,8 +399,8 @@ export class WorkflowEngine {
   }
 
   // 전달(commit/push/처분) API는 DeliveryPipeline에 위임한다.
-  commit(topicId: string, message: string, paths: string[]): Promise<string> {
-    return this.delivery.commit(topicId, message, paths);
+  commit(topicId: string, message: string, paths: string[], idempotencyKey?: string): Promise<string> {
+    return this.delivery.commit(topicId, message, paths, idempotencyKey);
   }
 
   push(topicId: string): Promise<string> {
@@ -609,13 +609,14 @@ export class WorkflowEngine {
       body: redactSecrets(body),
       payload: { ...(origin ? { origin } : {}), ...(requestKey ? { requestKey, requestAction: `message:${kind}` } : {}) },
     });
-    if (kind === "decision" && topic.state === "READY_TO_DELIVER"
-      && this.core.fixContracts.unansweredReviewQuestions(topic).length > 0) {
+    // 인도 대기의 **모든** 새 결정은 재확인을 거친다(host-review 2026-09-21 R7) — 열린 질문이 없어도 결정이 구현 변경을 요구할 수 있고, 그 판정은 답변 확인자(decisionAssessments)만 내린다.
+    // 종전엔 열린 질문이 있을 때만 멈춰, 질문 없이 인도 대기에 이른 주제의 변경 요구가 commit/push 를 그대로 지났다.
+    if (kind === "decision" && topic.state === "READY_TO_DELIVER") {
       const reviews = ["codex-review", "codex-final-review"]
         .map(name => this.core.dependencies.database.latestArtifact(topicId, name, topic.scopeGeneration))
         .filter(item => item !== null).sort((a, b) => b.revision - a.revision);
       const resume = reviews[0]?.kind === "codex-final-review" ? "CODEX_FINAL_REVIEW" : "CODEX_REVIEW";
-      this.core.interrupt(topicId, "USER_DECISION_REQUIRED", "새 결정에 기존 리뷰 답변의 취소·변경이 있는지 재확인해야 합니다. 재시도하세요.", resume,
+      this.core.interrupt(topicId, "USER_DECISION_REQUIRED", "새 결정이 기존 리뷰 답변을 바꾸거나 구현 변경을 요구하는지 재확인해야 합니다. 재시도하세요.", resume,
         { reviewDeliveryRecheck: true });
     }
     if ((kind === "evidence" && topic.state === "BLOCKED_ON_EVIDENCE") ||

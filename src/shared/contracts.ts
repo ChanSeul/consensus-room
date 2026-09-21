@@ -4,6 +4,10 @@ import { RevisionAllowanceSchema } from "./revisions.js";
 import { z } from "zod";
 import { ToleranceLedgerEntrySchema } from "./tolerance";
 
+// 확인 입력 분할과 응답 스키마가 같은 호출당 상한을 쓴다.
+export const REVIEW_DECISION_BATCH_LIMIT = 200;
+export const REVIEW_ANSWER_BATCH_LIMIT = 100;
+
 export const WORKFLOW_STATES = [
   "DRAFT",
   "CLAUDE_PLAN",
@@ -169,10 +173,18 @@ export const AgentResultSchema = z.object({
   // 허용 오차 교정 재제출이 본 턴의 요청 결정을 **해소**했음을 명시한다(예: 범위 밖 변경을 전부 되돌려 질문이 사라짐, Codex 감사 R07).
   resolvesRequestedDecision: z.boolean().optional(),
   // 해소 표식이 가리키는 요청 id(서버가 정지 메시지·재개 프롬프트에 적어 준 `Q-xxxxxxxx`). **id 가 없거나 열린 요청과 다르면 서버는 어떤
-  // 요청도 닫지 않는다**(PLAN §2: 해소 표식은 해당 요청에 결속 — 요청 하나씩 명시).
-  resolvedRequestId: z.string().min(1).optional(),
+  // 요청도 닫지 않는다**(PLAN §2: 해소 표식은 해당 요청에 결속). 빈 문자열은 거부하지 않고 `resolutionIds` 가 버린다 — 구조화 출력 스키마
+  // (AgentResultJsonSchema)는 minLength 를 못 걸어 모델이 낸 "" 하나가 응답 전체를 폐기시켰다(2026-09-21 사전 검증 #2).
+  resolvedRequestId: z.string().optional(),
+  // 한 응답이 여러 열린 요청을 해소할 때의 id 목록(2026-09-21: S11 인도 단계에서 stale 중복 요청 28건을 응답당 하나씩만 닫아야 해 러너 턴 28번이
+  // 필요했다). 단수 resolvedRequestId 와 합쳐 **열린 요청과 일치하는 것만 각각** 닫고, 일치하지 않는 id 는 이벤트로 기록한다. 게이트는 여전히
+  // resolvesRequestedDecision: true 다.
+  resolvedRequestIds: z.array(z.string()).optional(),
   // 읽기 전용 리뷰 답변 확인 결과. 요청별로 실제 답변인 사용자 decision 순번을 인용한다.
-  reviewDecisionAnswers: z.array(z.object({ requestId: z.string().min(1), decisionSequence: z.number().int().positive() }).strict()).max(100).optional(),
+  reviewDecisionAnswers: z.array(z.object({ requestId: z.string().min(1), decisionSequence: z.number().int().positive() }).strict()).max(REVIEW_ANSWER_BATCH_LIMIT).optional(),
+  // 답변 확인 호출의 decisions(이번 묶음)에 대한 판정(host-review 2026-09-21 R1·R6): 그 결정이(답변이든 아니든) 이미 리뷰한 코드·계획을 바꾸라고
+  // 요구하면 true. 결정 하나당 판정 하나 — 서버는 입력 결정을 전부 다루지 않은 확인 결과를 받지 않고, true 인 결정이 있으면 코드 판정을 재사용하지 않는다.
+  decisionAssessments: z.array(z.object({ decisionSequence: z.number().int().positive(), changesImplementation: z.boolean() }).strict()).max(REVIEW_DECISION_BATCH_LIMIT).optional(),
   memoryUpdates: z.array(MemoryUpdateSchema).max(10).optional(),
   // 허용 오차 원장 — 승인 범위 밖 변경마다 {ruleId, file, note}. 서버가 git diff 와 대조한다(shared/tolerance.ts).
   // 서버 누적 원장(승계 포함)의 저장 계약엔 상한이 없다 — 상한은 정책(규칙 수×파일 수)이 정하고, 모델 한 번 응답의 상한(500행)은
@@ -344,6 +356,9 @@ export const ToolTreeRebaselineInputSchema = ReasonInputSchema.extend({
 });
 export type ToolTreeRebaselineInput = z.infer<typeof ToolTreeRebaselineInputSchema>;
 export const RESPONSE_LEDGER_LIMIT = 500;
+// 한 번 응답이 나열할 수 있는 해소 요청 id 상한(JSON 스키마 maxItems·파서 검사). 저장 계약(AgentResultSchema)에는 상한이 없다 — 교정 병합이
+// 원본과 교정의 id 를 합치면 응답 한도를 넘을 수 있고, 그 병합본을 다시 파싱하는 core 가 거부하면 교정 전체가 죽는다(host-review R02; F10 과 같은 분리).
+export const RESPONSE_RESOLVED_IDS_LIMIT = 100;
 
 export const AmendToleranceInputSchema = z.object({
   tolerance: z.unknown(),
@@ -401,7 +416,7 @@ export const AgentResultJsonSchema = {
   required: [
     "kind", "summary", "planMarkdown", "planEdits", "planLineEdits", "planSHA256",
     "findings", "evidenceRefs", "requestedUserDecision", "memoryUpdates", "toleranceLedger",
-    "status", "remainingSteps", "resolvesRequestedDecision", "resolvedRequestId", "reviewDecisionAnswers",
+    "status", "remainingSteps", "resolvesRequestedDecision", "resolvedRequestId", "resolvedRequestIds", "reviewDecisionAnswers", "decisionAssessments",
   ],
   properties: {
     kind: { enum: AgentResultSchema.shape.kind.options },
@@ -458,9 +473,15 @@ export const AgentResultJsonSchema = {
     remainingSteps: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "null" }] },
     resolvesRequestedDecision: { anyOf: [{ type: "boolean" }, { type: "null" }] },
     resolvedRequestId: { anyOf: [{ type: "string" }, { type: "null" }] },
-    reviewDecisionAnswers: { anyOf: [{ type: "array", maxItems: 100, items: {
+    resolvedRequestIds: { anyOf: [{ type: "array", maxItems: RESPONSE_RESOLVED_IDS_LIMIT, items: { type: "string" } }, { type: "null" }] },
+    reviewDecisionAnswers: { anyOf: [{ type: "array", maxItems: REVIEW_ANSWER_BATCH_LIMIT, items: {
       type: "object", additionalProperties: false, required: ["requestId", "decisionSequence"],
       properties: { requestId: { type: "string" }, decisionSequence: { type: "integer", minimum: 1 } },
+    } }, { type: "null" }] },
+    // 결정별 판정 — 구조화 출력 규칙대로 required + null 허용(host-review 2026-09-21 R5: properties 에만 넣으면 invalid_json_schema 로 호출 전에 죽는다).
+    decisionAssessments: { anyOf: [{ type: "array", maxItems: REVIEW_DECISION_BATCH_LIMIT, items: {
+      type: "object", additionalProperties: false, required: ["decisionSequence", "changesImplementation"],
+      properties: { decisionSequence: { type: "integer", minimum: 1 }, changesImplementation: { type: "boolean" } },
     } }, { type: "null" }] },
     toleranceLedger: {
       anyOf: [

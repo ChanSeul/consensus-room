@@ -286,6 +286,8 @@ export class ConsensusDatabase {
     this.ensureColumn("action_requests", "response_json", "TEXT");
     this.ensureColumn("action_requests", "request_json", "TEXT NOT NULL DEFAULT '{}'");
     this.ensureColumn("action_requests", "error", "TEXT");
+    // 인도 요청의 시작 HEAD(parent) 등 실행 전 좌표 — 재시작 복구가 "이 요청이 실제로 커밋을 만들었는가" 를 판정할 근거(2026-09-21 host-review R1·R2).
+    this.ensureColumn("action_requests", "annotation_json", "TEXT");
     this.ensureColumn("topics", "reviewed_head", "TEXT");
     this.ensureColumn("topics", "reviewed_diff_sha256", "TEXT");
     this.ensureColumn("topics", "committed_oid", "TEXT");
@@ -1082,6 +1084,21 @@ export class ConsensusDatabase {
     };
   }
 
+  // claim 이후·부작용 이전에 요청의 실행 좌표를 남긴다(실행 중인 요청에만). 재시작 복구는 요청 본문이 아니라 이 좌표로 성공 여부를 판정한다.
+  annotateActionRequest(topicId: string, action: string, idempotencyKey: string, annotation: Record<string, unknown>): void {
+    const row = this.db.prepare(
+      "SELECT status, annotation_json FROM action_requests WHERE topic_id = ? AND action = ? AND idempotency_key = ?",
+    ).get(topicId, action, idempotencyKey) as Record<string, unknown> | undefined;
+    if (!row || row.status !== "running") {
+      throw new Error("실행 중인 요청에만 실행 좌표를 남길 수 있습니다.");
+    }
+    const existing = parseRequestRecord(row.annotation_json);
+    this.db.prepare(`
+      UPDATE action_requests SET annotation_json = ?
+      WHERE topic_id = ? AND action = ? AND idempotency_key = ? AND status = 'running'
+    `).run(JSON.stringify({ ...existing, ...annotation }), topicId, action, idempotencyKey);
+  }
+
   finishActionRequest(topicId: string, action: string, idempotencyKey: string, response: unknown): void {
     this.db.prepare(`
       UPDATE action_requests SET status = 'succeeded', response_json = ?, error = NULL
@@ -1263,9 +1280,10 @@ export class ConsensusDatabase {
     idempotencyKey: string;
     createdAt: string;
     request: Record<string, unknown>;
+    annotation: Record<string, unknown>;
   } | null {
     const row = this.db.prepare(`
-      SELECT action, idempotency_key, created_at, request_json FROM action_requests
+      SELECT action, idempotency_key, created_at, request_json, annotation_json FROM action_requests
       WHERE topic_id = ? AND status = 'unknown' AND action IN ('commit', 'push')
       ORDER BY created_at DESC, rowid DESC LIMIT 1
     `).get(topicId) as Record<string, unknown> | undefined;
@@ -1275,6 +1293,7 @@ export class ConsensusDatabase {
       idempotencyKey: String(row.idempotency_key),
       createdAt: String(row.created_at),
       request: row.request_json ? JSON.parse(String(row.request_json)) as Record<string, unknown> : {},
+      annotation: parseRequestRecord(row.annotation_json),
     };
   }
 

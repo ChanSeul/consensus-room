@@ -62,6 +62,7 @@ describe("정지 정책 — requestedUserDecision 은 드물게", () => {
     expect(prompt).toContain("최종 보고");
     expect(prompt).toContain("직전 제출의 summary·findings·evidenceRefs·requestedUserDecision·status·remainingSteps 를 그대로 유지");
     expect(prompt).toContain("resolvesRequestedDecision: true");
+    expect(prompt).toContain("resolvedRequestIds");
     expect(prompt).toContain("서버가 승계합니다");
   });
 

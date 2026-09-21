@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { accumulate, checkpointOpenRequests, requestId, workId, type WorkBinding } from "../src/server/engine/checkpoint";
+import { accumulate, checkpointOpenRequests, requestId, resolutionIds, workId, type WorkBinding } from "../src/server/engine/checkpoint";
 import { completionVerdict, acceptResult, type OpenRequest } from "../src/server/engine/completion";
 import type { AgentResult } from "../src/shared/contracts";
 
@@ -30,7 +30,7 @@ describe("accumulate — 요청별 보존", () => {
     const b = accumulate(a.result, result({ requestedUserDecision: "B?" }), a.openRequests, 20);
     const noId = accumulate(b.result, result({ resolvesRequestedDecision: true }), b.openRequests, 30);
     expect(noId.openRequests).toHaveLength(2);
-    expect(noId.unmatchedResolution).toContain("resolvedRequestId 가 없어");
+    expect(noId.unmatchedResolution).toContain("resolvedRequestId(s) 가 없어");
     const wrong = accumulate(b.result, result({ resolvesRequestedDecision: true, resolvedRequestId: "Q-deadbeef" }), b.openRequests, 30);
     expect(wrong.openRequests).toHaveLength(2);
     expect(wrong.unmatchedResolution).toContain("Q-deadbeef");
@@ -40,6 +40,42 @@ describe("accumulate — 요청별 보존", () => {
     expect(right.result.requestedUserDecision).toContain("B?");
     expect(right.result.requestedUserDecision).not.toContain("A?");
     expect(right.result.resolvesRequestedDecision).toBeUndefined();
+  });
+  it("resolvedRequestIds 로 한 응답이 여러 열린 요청을 닫는다 — 일치하는 것만 각각 닫고, 불일치 id 는 진단으로 남기며, 단수 필드와 합쳐 중복 없이 본다", () => {
+    const a = accumulate(null, result({ requestedUserDecision: "A?" }), [], 10);
+    const b = accumulate(a.result, result({ requestedUserDecision: "B?" }), a.openRequests, 20);
+    const c = accumulate(b.result, result({ requestedUserDecision: "C?" }), b.openRequests, 30);
+    const [idA, idB, idC] = c.openRequests.map((request) => request.id);
+    // 2026-09-21 S11 인도 단계: stale 중복 요청 28건을 응답당 하나씩만 닫아야 해 러너 턴이 28번 필요했다 — 목록으로 한 번에 닫는다.
+    const two = accumulate(c.result, result({ resolvesRequestedDecision: true, resolvedRequestIds: [idA, idC] }), c.openRequests, 40);
+    expect(two.openRequests.map((request) => request.id)).toEqual([idB]);
+    expect(two.resolvedRequests.map((request) => request.text)).toEqual(["A?", "C?"]);
+    expect(two.unmatchedResolution).toBeNull();
+    expect(two.result.requestedUserDecision).toContain("B?");
+    expect(two.result.requestedUserDecision).not.toContain("A?");
+    expect(two.result.resolvedRequestIds).toBeUndefined();
+    expect(two.result.resolvedRequestId).toBeUndefined();
+    // 단수 + 복수 + 공백 + 중복: 같은 id 는 한 번만 닫고, 열린 요청이 아닌 id 는 닫힌 것과 함께 진단에 남는다(닫힌 요청은 되살아나지 않는다).
+    const mixed = accumulate(c.result, result({ resolvesRequestedDecision: true, resolvedRequestId: ` ${idB} `, resolvedRequestIds: [idB, "Q-deadbeef", idA] }), c.openRequests, 40);
+    expect(mixed.openRequests.map((request) => request.id)).toEqual([idC]);
+    expect(mixed.resolvedRequests.map((request) => request.id)).toEqual([idB, idA]);
+    expect(mixed.unmatchedResolution).toContain("Q-deadbeef");
+    expect(mixed.unmatchedResolution).toContain(`이 응답으로 닫힘: ${idB}, ${idA}`);
+    expect(mixed.unmatchedResolution).toContain(`열린 요청: ${idC}`);
+    // 빈 목록은 id 없음과 같다 — 아무것도 닫지 않는다.
+    const empty = accumulate(c.result, result({ resolvesRequestedDecision: true, resolvedRequestIds: [] }), c.openRequests, 40);
+    expect(empty.openRequests).toHaveLength(3);
+    expect(empty.unmatchedResolution).toContain("resolvedRequestId(s) 가 없어");
+    // 게이트는 여전히 resolvesRequestedDecision 이다 — 표식 없는 목록은 해소가 아니다.
+    const noFlag = accumulate(c.result, result({ resolvedRequestIds: [idA] }), c.openRequests, 40);
+    expect(noFlag.openRequests).toHaveLength(3);
+    expect(noFlag.resolvedRequests).toEqual([]);
+    expect(noFlag.result.resolvedRequestIds).toBeUndefined();
+  });
+  it("resolutionIds 는 단수·복수를 합쳐 공백을 지우고 순서를 지키며 중복을 없앤다", () => {
+    expect(resolutionIds({})).toEqual([]);
+    expect(resolutionIds({ resolvedRequestId: " Q-1 " })).toEqual(["Q-1"]);
+    expect(resolutionIds({ resolvedRequestId: "Q-1", resolvedRequestIds: ["Q-2", " Q-1", "", "Q-3", "Q-2"] })).toEqual(["Q-1", "Q-2", "Q-3"]);
   });
   it("결정이 도착했다는 사실만으로는 아무 요청도 지워지지 않는다(보류 결정) — accumulate 는 결정을 보지 않는다", () => {
     const a = accumulate(null, result({ requestedUserDecision: "A?" }), [], 10);

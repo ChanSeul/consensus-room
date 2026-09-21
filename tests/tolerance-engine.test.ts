@@ -43,6 +43,19 @@ function result(kind: AgentResult["kind"], summary: string, extra: Partial<Agent
   return { kind, summary, findings: [], evidenceRefs: ["검증"], ...extra };
 }
 
+// 리뷰 답변 확인 프롬프트(REVIEW_ANSWER_INPUT)에 대한 정상 fixture 응답 — 인도 대기·재개의 모든 새 결정은 확인자의 결정별 판정을 거친다(host-review 2026-09-21 R1·R7):
+// 열린 질문은 마지막 결정으로 답하고 결정 전부를 "구현 변경 요구 아님(false)" 으로 판정한다. 확인 프롬프트가 아니면 null.
+function confirmAnswers(prompt: string): AgentResult | null {
+  if (!prompt.includes("REVIEW_ANSWER_INPUT\n")) return null;
+  const input = JSON.parse(prompt.split("REVIEW_ANSWER_INPUT\n")[1].split("\nEND_REVIEW_ANSWER_INPUT")[0]) as { requests: Array<{ id: string }>; decisions: Array<{ sequence: number }>; answerEvidence?: Array<{ sequence: number }> };
+  const last = [...(input.answerEvidence ?? []), ...input.decisions].sort((a, b) => a.sequence - b.sequence).at(-1);
+  return result("REVIEW", "질문 답변 확인", {
+    status: "completed", findings: [], evidenceRefs: [],
+    reviewDecisionAnswers: last ? input.requests.map((request) => ({ requestId: request.id, decisionSequence: last.sequence })) : [],
+    decisionAssessments: input.decisions.map((decision) => ({ decisionSequence: decision.sequence, changesImplementation: false })),
+  });
+}
+
 async function setup(label: string) {
   const root = mkdtempSync(join(tmpdir(), `consensus-room-tolerance-${label}-`));
   temporaryDirectories.push(root);
@@ -907,6 +920,57 @@ describe("PLAN 2026-09-14 — 완료 판정·상태 확인·요청별 보존·ch
     database.close();
   });
 
+  it("여러 요청을 한 응답으로 닫는다 — resolvedRequestIds 에 나열한 id 가 각각 닫히고 확인 턴 없이 인도 대기로 간다(2026-09-21)", async () => {
+    const { worktree, database, artifacts, gitService, topicId } = await setup("multi-resolve");
+    const claude = scripted([
+      () => { writeFileSync(join(worktree, "feature.txt"), "x\n"); return result("IMPLEMENTATION", "P3", { status: "blocked", remainingSteps: ["P4"], requestedUserDecision: "A?" }); },
+      // 결정 없이 같은 요청을 다시 물어 stale 중복이 쌓인 상황: A 를 닫지 않고 B 를 새로 연다.
+      (turn) => { expect(requestIdsIn(turn.prompt)).toHaveLength(1); return result("IMPLEMENTATION", "P4 하다가 B 질문", { status: "blocked", remainingSteps: ["P5"], requestedUserDecision: "B?" }); },
+      (turn) => {
+        const ids = requestIdsIn(turn.prompt);
+        expect(ids).toHaveLength(2);
+        expect(turn.prompt).toContain("resolvedRequestIds");
+        return result("IMPLEMENTATION", "P5 done — A·B 모두 같은 결정으로 해소", { status: "completed", resolvesRequestedDecision: true, resolvedRequestIds: ids });
+      },
+    ]);
+    const engine = new WorkflowEngine({ database, artifacts, git: gitService, claude: claude.adapter, codex: new PassingCodex() });
+    engine.startImplementation(topicId); await settled(database, topicId);
+    expect(database.getTopic(topicId).lastError).toContain("A?");
+    await engine.postMessage(topicId, "decision", "일단 계속"); engine.retry(topicId); await settled(database, topicId);
+    const mid = database.getTopic(topicId);
+    expect(mid.state).toBe("USER_DECISION_REQUIRED");
+    expect(mid.lastError).toContain("A?"); expect(mid.lastError).toContain("B?");
+    await engine.postMessage(topicId, "decision", "A·B 둘 다 답"); engine.retry(topicId); await settled(database, topicId);
+    expect(database.getTopic(topicId).state, database.getTopic(topicId).lastError ?? "").toBe("READY_TO_DELIVER");
+    expect(claude.calls()).toBe(3);   // 읽기 전용 확인 턴 없음
+    expect(database.getTimeline(topicId).filter((event) => event.body.includes("해소로 확인해 닫았습니다"))).toHaveLength(2);
+    expect(database.getTimeline(topicId).filter((event) => event.body.includes("해소 표식을 적용하지 않았습니다"))).toHaveLength(0);
+    const checkpoint = JSON.parse((await artifacts.readLatest(topicId, "work-checkpoint"))!);
+    expect(checkpoint.openRequests).toEqual([]);
+    database.close();
+  });
+
+  it("허용 오차 교정 프롬프트는 이번 턴이 새로 연 요청의 id 도 싣는다 — 교정이 원인을 되돌렸으면 그 요청을 resolvedRequestIds 로 닫을 수 있다(host-review R03)", async () => {
+    const { worktree, database, artifacts, gitService, topicId } = await setup("r03-latest");
+    const claude = scripted([
+      () => { writeFileSync(join(worktree, "service", "S.swift"), "func renamed() {}\nfunc b() {}\n");
+        return result("IMPLEMENTATION", "범위 밖 변경 + 질문", { status: "completed", requestedUserDecision: "renamed 를 유지할까?" }); },
+      (turn) => {
+        const ids = requestIdsIn(turn.prompt);
+        expect(ids, "교정 프롬프트에 이번 턴 질문의 서버 id 가 없다").toHaveLength(1);
+        writeFileSync(join(worktree, "service", "S.swift"), "func a() {}\nfunc b() {}\n");
+        return result("IMPLEMENTATION", "되돌려 질문이 사라짐", { status: "completed", resolvesRequestedDecision: true, resolvedRequestIds: ids });
+      },
+    ]);
+    const engine = new WorkflowEngine({ database, artifacts, git: gitService, claude: claude.adapter, codex: new PassingCodex() });
+    engine.startImplementation(topicId); await settled(database, topicId);
+    expect(database.getTopic(topicId).state, database.getTopic(topicId).lastError ?? "").toBe("READY_TO_DELIVER");
+    expect(claude.calls()).toBe(2);   // 교정 1회, 확인 턴 없음
+    const checkpoint = JSON.parse((await artifacts.readLatest(topicId, "work-checkpoint"))!);
+    expect(checkpoint.openRequests).toEqual([]);
+    database.close();
+  });
+
   it("서버 재시작(새 엔진 인스턴스) 뒤에도 checkpoint 에서 이어간다 — 계속 진행 턴이 죽은 자리부터, 증거·원장 보존", async () => {
     const { worktree, database, artifacts, gitService, topicId } = await setup("restart");
     const first = scripted([
@@ -1125,13 +1189,19 @@ describe("Astra 리뷰 2026-09-14 — 수락 현재성·재판정·작업 id·�
     const codex: AgentAdapter = {
       role: "codex", validateExistingSession: async () => true,
       createSession: async () => { reviews++; return { sessionId: "review-session", result: result("REVIEW", "bug", { findings: [agreed] }) }; },
-      resumeTurn: async () => { reviews++; return result("FINAL_REVIEW", "review", { findings: [reviews >= 4 ? resolved : agreed] }); },
+      // 답변 확인(프로토콜 확인)은 리뷰 턴이 아니다 — 리뷰 카운터를 올리지 않는다.
+      resumeTurn: async (turn) => confirmAnswers(turn.prompt) ?? (() => { reviews++; return result("FINAL_REVIEW", "review", { findings: [reviews >= 4 ? resolved : agreed] }); })(),
     };
     const engine = new WorkflowEngine({ database, artifacts, git: gitService, claude, codex });
     engine.startImplementation(topicId); await settled(database, topicId);
     expect(database.getTopic(topicId).state).toBe("USER_DECISION_REQUIRED");
     expect(fixes).toBe(2);
     await engine.postMessage(topicId, "decision", "F-1 추가 수정 회차 승인. REFIX feature.txt 실제 수정 필요");
+    engine.retry(topicId); await settled(database, topicId);
+    // 그 결정은 확인자가 판정한다(host-review 2026-09-21 5회차) — 리뷰 세 번을 다 쓴 주제라 그 확인 호출에 리뷰 승인 1회가 필요하다(답변 확인도 한도를 우회하지 않는다, R10).
+    expect(database.getTopic(topicId).lastError).toContain("구현 리뷰 한도");
+    expect(fixes).toBe(2);
+    database.reviews.grant(topicId, "implementation", "cf03-confirm-grant", database.reviews.account(topicId, "implementation").version);
     engine.retry(topicId); await settled(database, topicId);
     expect(fixes).toBe(3);
     expect(readFileSync(join(worktree, "feature.txt"), "utf8")).toBe("fix3\n");

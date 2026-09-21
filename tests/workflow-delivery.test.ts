@@ -159,6 +159,119 @@ describe("승인 뒤 구현부터 전달까지", () => {
   });
 });
 
+describe("인도 커밋 사슬(C1→C2→C3) — 2026-09-21", () => {
+  // S11 계획([d02] S11-A03)은 소스·flip·문서를 세 커밋으로 순서대로 인도한다. 이전 엔진은 기준을 리뷰 HEAD 로 고정해 두 번째 커밋부터
+  // "worktree 가 바뀌었다" 로 거부했다(모든 이전 단계가 커밋 1회라 드러나지 않았다). 기준은 마지막 확정 커밋, 내용 불변은 리뷰 HEAD 기준이다.
+  async function setupTwoFiles(label: string) {
+    const ready = await setupReadyToDeliver(label);
+    writeFileSync(join(ready.worktree, "second.txt"), "둘째 파일\n");
+    const reviewed = await ready.gitService.snapshot(ready.worktree);   // 리뷰가 두 파일 변경을 본 상태
+    ready.database.updateTopic(ready.topicId, { reviewedHead: reviewed.head, reviewedDiffSHA256: reviewed.diffSHA256 });
+    return { ...ready, reviewed };
+  }
+
+  it("두 번째 커밋의 기준·부모는 첫 확정 커밋이고, 남은 변경이 없으면 세 번째는 거부되며, push 는 마지막 커밋을 보낸다", async () => {
+    const { database, engine, worktree, remote, branchName, topicId, reviewed } = await setupTwoFiles("chain");
+    const c1 = await engine.commit(topicId, "C1 소스", ["feature.txt"]);
+    expect(git(worktree, ["rev-parse", `${c1}^`])).toBe(reviewed.head);
+    expect(database.getFlags(topicId)).toMatchObject({ committedOID: c1, orphanCommitOID: null });
+    const c2 = await engine.commit(topicId, "C2 둘째", ["second.txt"]);
+    expect(git(worktree, ["rev-parse", `${c2}^`])).toBe(c1);
+    expect(git(worktree, ["show", "--pretty=format:", "--name-only", c2])).toBe("second.txt");
+    expect(database.getFlags(topicId)).toMatchObject({ committedOID: c2, pushedOID: null, orphanCommitOID: null });
+    expect(database.getTimeline(topicId).at(-1)?.payload).toMatchObject({ oid: c2, parent: c1, deliveryAction: "commit" });
+    await expect(engine.commit(topicId, "C3 없음", ["feature.txt"])).rejects.toThrow("커밋할 변경이 없습니다");
+    const pushed = await engine.push(topicId);
+    expect(pushed).toBe(c2);
+    expect(git(remote, ["rev-parse", `refs/heads/${branchName}`])).toBe(c2);
+    database.close();
+  });
+
+  it("첫 커밋 뒤 파일 내용이 바뀌면 두 번째 커밋은 거부된다(내용 불변은 리뷰 HEAD 기준)", async () => {
+    const { database, engine, worktree, topicId } = await setupTwoFiles("chain-drift");
+    const c1 = await engine.commit(topicId, "C1 소스", ["feature.txt"]);
+    writeFileSync(join(worktree, "second.txt"), "리뷰 뒤 바뀐 내용\n");
+    await expect(engine.commit(topicId, "C2 둘째", ["second.txt"])).rejects.toThrow("최종 리뷰 뒤 worktree가 바뀌었습니다");
+    expect(database.getFlags(topicId)).toMatchObject({ committedOID: c1 });
+    expect(git(worktree, ["rev-parse", "HEAD"])).toBe(c1);
+    database.close();
+  });
+
+  it("첫 커밋 뒤 두 번째 커밋이 결과 기록 전에 끊겨도 복구(reconcile)는 마지막 확정 커밋을 기준으로 성공을 판정한다", async () => {
+    const { database, engine, worktree, topicId } = await setupTwoFiles("chain-reconcile");
+    const c1 = await engine.commit(topicId, "C1 소스", ["feature.txt"]);
+    git(worktree, ["add", "--", "second.txt"]); git(worktree, ["commit", "-m", "C2 둘째(기록 전 중단)"]);
+    const c2 = git(worktree, ["rev-parse", "HEAD"])!;
+    database.claimActionRequest(topicId, "commit", "chain-c2", { message: "C2 둘째", paths: ["second.txt"] });
+    database.recoverInterruptedDeliveryRequests();
+    await expect(engine.reconcileDelivery(topicId, { idempotencyKey: "chain-c2", outcome: "succeeded", oid: c1 }))
+      .rejects.toThrow("현재 HEAD와 다릅니다");
+    await engine.reconcileDelivery(topicId, { idempotencyKey: "chain-c2", outcome: "succeeded", oid: c2 });
+    expect(database.getFlags(topicId)).toMatchObject({ committedOID: c2, pushedOID: null });
+    database.close();
+  });
+
+  it("확정 기록(committedOID) 뒤·요청 완료 기록 전에 끊긴 커밋도 복구는 요청 좌표(시작 HEAD)로 성공을 받고, 같은 메시지의 미실행 요청은 거부한다(host-review R1·R2)", async () => {
+    const { database, engine, worktree, topicId } = await setupTwoFiles("chain-reconcile-confirmed");
+    const c1 = await engine.commit(topicId, "C1 소스", ["feature.txt"]);
+    // API 경로처럼 요청을 걸고(claim) commit() 이 시작 HEAD 를 좌표로 남긴 뒤 확정까지 됐지만 요청 완료 기록 전에 서버가 죽었다.
+    database.claimActionRequest(topicId, "commit", "chain-c2-confirmed", { message: "C2 둘째\n\n본문  \n\n\n끝", paths: ["second.txt"] });
+    const c2 = await engine.commit(topicId, "C2 둘째\n\n본문  \n\n\n끝", ["second.txt"], "chain-c2-confirmed");   // git 이 공백을 정리하는 메시지
+    expect(database.getFlags(topicId).committedOID).toBe(c2);
+    expect(database.unknownDeliveryAction(topicId)).toBeNull();
+    database.recoverInterruptedDeliveryRequests();   // 서버 재시작: running → unknown
+    expect(database.unknownDeliveryAction(topicId)).toMatchObject({ idempotencyKey: "chain-c2-confirmed", annotation: { parent: c1 } });
+    await engine.reconcileDelivery(topicId, { idempotencyKey: "chain-c2-confirmed", outcome: "succeeded", oid: c2 });
+    expect(database.getFlags(topicId)).toMatchObject({ committedOID: c2, pushedOID: null });
+    expect(git(worktree, ["rev-parse", "HEAD"])).toBe(c2);
+    // R2: 같은 메시지·넓은 paths 로 다음 요청을 걸고 git 실행 전에 죽었다 — 좌표(parent=c2) 와 HEAD 가 같으므로 성공이 아니다.
+    database.claimActionRequest(topicId, "commit", "chain-c3-never", { message: "C2 둘째", paths: ["feature.txt", "second.txt"] });
+    database.annotateActionRequest(topicId, "commit", "chain-c3-never", { parent: c2 });
+    database.recoverInterruptedDeliveryRequests();
+    await expect(engine.reconcileDelivery(topicId, { idempotencyKey: "chain-c3-never", outcome: "succeeded", oid: c2 }))
+      .rejects.toThrow("커밋 전 리뷰 기준과 같아");
+    await engine.reconcileDelivery(topicId, { idempotencyKey: "chain-c3-never", outcome: "failed" });
+    // 좌표가 없는 옛 요청도 확정 기록된 HEAD 를 성공으로 인정하지 않는다(보수적).
+    database.claimActionRequest(topicId, "commit", "chain-legacy", { message: "C2 둘째", paths: ["second.txt"] });
+    database.recoverInterruptedDeliveryRequests();
+    await expect(engine.reconcileDelivery(topicId, { idempotencyKey: "chain-legacy", outcome: "succeeded", oid: c2 }))
+      .rejects.toThrow("커밋 전 리뷰 기준과 같아");
+    await engine.reconcileDelivery(topicId, { idempotencyKey: "chain-legacy", outcome: "failed" });
+    expect(database.getFlags(topicId).committedOID).toBe(c2);
+    database.close();
+  });
+
+  it("확정 커밋 바로 뒤에 붙은 고아는 되돌려 확정 커밋으로 복귀하고, 그 뒤 정상 커밋이 사슬을 잇는다", async () => {
+    const { database, engine, parentMismatchEngine, gitService, worktree, topicId } = await setupTwoFiles("chain-orphan");
+    const c1 = await engine.commit(topicId, "C1 소스", ["feature.txt"]);
+    // 사후 검증(부모 대조)이 거부한 커밋 — 실제 git 부모는 c1 이다.
+    await expect(parentMismatchEngine.commit(topicId, "C2 고아", ["second.txt"])).rejects.toThrow("부모가 최종 리뷰 기준과 다릅니다");
+    const orphan = git(worktree, ["rev-parse", "HEAD"]);
+    expect(database.getFlags(topicId)).toMatchObject({ committedOID: c1, orphanCommitOID: orphan });
+    const restored = await engine.discardOrphanCommit(topicId);
+    expect(restored.state).toBe("READY_TO_DELIVER");
+    expect(await gitService.head(worktree)).toBe(c1);
+    expect(database.getFlags(topicId)).toMatchObject({ committedOID: c1, orphanCommitOID: null });
+    expect(readFileSync(join(worktree, "second.txt"), "utf8")).toBe("둘째 파일\n");
+    const c2 = await engine.commit(topicId, "C2 둘째", ["second.txt"]);
+    expect(git(worktree, ["rev-parse", `${c2}^`])).toBe(c1);
+    database.close();
+  });
+
+  it("확정 커밋 이전으로 돌아가야 하는 고아(부모가 확정 커밋이 아님)는 되돌리지 않는다", async () => {
+    const { database, engine, worktree, topicId } = await setupTwoFiles("chain-orphan-deep");
+    const c1 = await engine.commit(topicId, "C1 소스", ["feature.txt"]);
+    git(worktree, ["add", "--", "second.txt"]); git(worktree, ["commit", "-m", "X"]);
+    git(worktree, ["commit", "--allow-empty", "-m", "Y"]);
+    const y = git(worktree, ["rev-parse", "HEAD"])!;
+    database.updateTopic(topicId, { orphanCommitOID: y });   // 부모 X ≠ 확정 커밋 c1
+    await expect(engine.discardOrphanCommit(topicId)).rejects.toThrow("이미 확정한 커밋이 있어 되돌리지 않았습니다");
+    expect(git(worktree, ["rev-parse", "HEAD"])).toBe(y);
+    expect(database.getFlags(topicId)).toMatchObject({ committedOID: c1, orphanCommitOID: y });
+    database.close();
+  });
+});
+
 describe("사후 검증이 거부한 커밋 처분", () => {
   it("사용자가 ./로 시작하는 경로를 골라도 커밋을 확정하고 원장에 기록한다", async () => {
     const { database, engine, worktree, topicId, reviewed } = await setupReadyToDeliver("prefix-path");

@@ -60,7 +60,7 @@ export function completionVerdict(result: AgentResult, context: VerdictContext):
     }
     return {
       kind: "needs-confirmation", reason: "open-request-after-decision", requests,
-      message: `열린 요청(${requests.map((request) => request.id).join(", ")}) 뒤에 결정이 올라왔지만 러너가 해소 여부(resolvesRequestedDecision + resolvedRequestId)를 밝히지 않았습니다 — 읽기 전용으로 확인합니다.`,
+      message: `열린 요청(${requests.map((request) => request.id).join(", ")}) 뒤에 결정이 올라왔지만 러너가 해소 여부(resolvesRequestedDecision + resolvedRequestIds)를 밝히지 않았습니다 — 읽기 전용으로 확인합니다.`,
     };
   }
   const findingDecision = result.findings.find((finding) => finding.requiresUserDecision);

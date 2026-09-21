@@ -420,7 +420,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       }
       else if (action === "commit") {
         const input = DeliveryInputSchema.parse(request.body);
-        const oid = await workflow.commit(topicId, input.message, input.paths);
+        const oid = await workflow.commit(topicId, input.message, input.paths, idempotencyKey);
         response = { accepted: true, actionId: oid, topic: database.getTopic(topicId) };
       } else if (action === "push") {
         const oid = await workflow.push(topicId);

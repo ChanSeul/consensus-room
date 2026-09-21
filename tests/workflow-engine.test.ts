@@ -1254,13 +1254,21 @@ class QueuedAdapter implements AgentAdapter {
     private readonly results: QueuedResult[],
   ) {}
 
+  // 리뷰 답변 확인 호출(프로토콜 확인) — 큐를 소비하지 않고 여기 따로 기록한다. 인도 대기·재개의 모든 새 결정은 확인자의 결정별 판정을 거친다(host-review 2026-09-21 R1·R7):
+  // 정상 fixture 는 열린 질문을 마지막 결정으로 답하고 결정 전부를 "구현 변경 요구 아님(false)" 으로 판정한다. `calls` 는 리뷰·수정 등 실제 턴만 센다.
+  readonly confirmations: string[] = [];
+
   async createSession(turn: Parameters<AgentAdapter["createSession"]>[0]) {
+    const confirmation = this.confirm(turn.prompt);
+    if (confirmation) return { sessionId: `${this.role}-created-session`, result: confirmation };
     this.calls.push(turn.prompt);
     this.turns.push(turn);
     return { sessionId: `${this.role}-created-session`, result: this.next(turn) };
   }
 
   async resumeTurn(turn: Parameters<AgentAdapter["resumeTurn"]>[0]) {
+    const confirmation = this.confirm(turn.prompt);
+    if (confirmation) return confirmation;
     this.calls.push(turn.prompt);
     this.turns.push(turn);
     return this.next(turn);
@@ -1268,6 +1276,20 @@ class QueuedAdapter implements AgentAdapter {
 
   async validateExistingSession() {
     return true;
+  }
+
+  private confirm(prompt: string): AgentResult | null {
+    if (this.role !== "codex" || !prompt.includes("REVIEW_ANSWER_INPUT\n")) return null;
+    this.confirmations.push(prompt);
+    const input = JSON.parse(prompt.split("REVIEW_ANSWER_INPUT\n")[1].split("\nEND_REVIEW_ANSWER_INPUT")[0]) as {
+      requests: Array<{ id: string }>; decisions: Array<{ sequence: number }>; answerEvidence?: Array<{ sequence: number }>;
+    };
+    const last = [...(input.answerEvidence ?? []), ...input.decisions].sort((a, b) => a.sequence - b.sequence).at(-1);
+    return {
+      kind: "REVIEW", summary: "질문 답변 확인", status: "completed", findings: [], evidenceRefs: [],
+      reviewDecisionAnswers: last ? input.requests.map((request) => ({ requestId: request.id, decisionSequence: last.sequence })) : [],
+      decisionAssessments: input.decisions.map((decision) => ({ decisionSequence: decision.sequence, changesImplementation: false })),
+    };
   }
 
   private next(turn: { prompt: string; protocolOnly?: boolean }): AgentResult {
@@ -4242,11 +4264,17 @@ describe("Codex 3차 감사 R3-01 — 저장된 미완료 FIX 재사용 금지",
       (kind) => kind === "codex-review" || kind === "codex-final-review", "OVERRULE F-1\nF-1 은 이번 범위에서 고치지 않기로 확정한다.");
     engine.retry("topic-1");
     await waitForActionCompletion(database, "topic-1");
+    // 판정 읽기 사이에 도착한 결정은 확인자가 아직 판정하지 않았다 — 판정 없는 결정으로는 저장 리뷰를 재사용하지 않으므로(canReuseReview, host-review 2026-09-21 5회차) 새 입력 정지로
+    // 멈추고, 재시도가 확인자를 거쳐 그 결정을 판정한 뒤 저장된 최종 리뷰를 재사용한다(Codex 리뷰 턴 없음). 종전엔 그 결정을 되돌림 면제로만 세고 판정 없이 인도 대기로 갔다.
+    expect(database.getTopic("topic-1")).toMatchObject({ state: "USER_DECISION_REQUIRED", lastError: expect.stringContaining("새 메시지가 추가되었습니다") });
+    expect(posted).toMatchObject({ state: "CODEX_FINAL_REVIEW", sequence: expect.any(Number) });
+    engine.retry("topic-1");
+    await waitForActionCompletion(database, "topic-1");
 
     const topic = database.getTopic("topic-1");
     expect(topic.state, topic.lastError ?? "").toBe("READY_TO_DELIVER");
     expect(codex.calls).toHaveLength(1);
-    expect(posted).toMatchObject({ state: "CODEX_FINAL_REVIEW", sequence: expect.any(Number) });
+    expect(codex.confirmations.length).toBeGreaterThanOrEqual(2);   // 첫 결정의 판정 + 늦게 도착한 OVERRULE 결정의 판정
     const timeline = database.getTimeline("topic-1");
     const allowed = timeline.find((event) => event.body.includes("사용자 결정이 처분 변경을 허용한 쟁점: F-1(AGREED_ACTION → AGREED_NO_ACTION)"));
     const reused = timeline.find((event) => event.body.includes("저장된 최종 리뷰(#") && event.body.includes("Codex 턴 없이"));

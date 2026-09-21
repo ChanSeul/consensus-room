@@ -2,8 +2,9 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
+import { accumulate } from "../src/server/engine/checkpoint";
 import type { AgentResult, Finding, Participant, TimelineEvent } from "../src/shared/contracts";
-import { BranchNameSchema, CreateTopicInputSchema, REQUIRED_PLAN_HEADINGS } from "../src/shared/contracts";
+import { AgentResultSchema, BranchNameSchema, CreateTopicInputSchema, REQUIRED_PLAN_HEADINGS } from "../src/shared/contracts";
 import {
   buildClaudeFixPrompt,
   buildImplementationPrompt,
@@ -775,6 +776,66 @@ describe("mergeCorrectionResult — resolvesRequestedDecision / salvageResultFie
     const merged = mergeCorrectionResult(salvaged, { ...base, summary: "kind 만 고침" });
     expect(merged.result.requestedUserDecision).toBe("ORIGINAL-DECISION");
     expect(merged.result.evidenceRefs).toContain("PROOF");
+  });
+  it("salvageResultFields 는 해소 표식(게이트·단수·복수 id)도 개별 유효성으로 건진다 — turn-result·교정 전 checkpoint 가 요청을 열린 채 기록하지 않게(2026-09-21 사전 검증 #1)", () => {
+    const raw = { kind: "IMPLEMENTATION", summary: "A·B 해소", findings: [{ id: "broken" }], evidenceRefs: [], status: "completed",
+      resolvesRequestedDecision: true, resolvedRequestId: " Q-a ", resolvedRequestIds: ["Q-b", "", 7, " Q-a", null] };
+    const salvaged = salvageResultFields(raw, "IMPLEMENTATION");
+    expect(salvaged.resolvesRequestedDecision).toBe(true);
+    expect(salvaged.resolvedRequestId).toBe("Q-a");
+    expect(salvaged.resolvedRequestIds).toEqual(["Q-b", "Q-a"]);
+    // 표식이 true 가 아니거나 id 가 문자열이 아니면 건지지 않는다.
+    const none = salvageResultFields({ kind: "IMPLEMENTATION", summary: "x", resolvesRequestedDecision: "yes", resolvedRequestId: 3, resolvedRequestIds: "Q-a" }, "IMPLEMENTATION");
+    expect(none.resolvesRequestedDecision).toBeUndefined();
+    expect(none.resolvedRequestId).toBeUndefined();
+    expect(none.resolvedRequestIds).toBeUndefined();
+    // salvage 결과를 누적하면 열린 요청이 닫힌다 — turn-result checkpoint 가 기록하는 값이 [] 이다.
+    const a = accumulate(null, { ...base, requestedUserDecision: "A?" }, [], 10);
+    const b = accumulate(a.result, { ...base, requestedUserDecision: "B?" }, a.openRequests, 20);
+    const [idA, idB] = b.openRequests.map((request) => request.id);
+    const rawDone = { kind: "IMPLEMENTATION", summary: "done", status: "completed", resolvesRequestedDecision: true, resolvedRequestIds: [idA, idB] };
+    const acc = accumulate(b.result, salvageResultFields(rawDone, "IMPLEMENTATION"), b.openRequests, 30);
+    expect(acc.openRequests).toEqual([]);
+    expect(acc.resolvedRequests.map((request) => request.id)).toEqual([idA, idB]);
+    // salvage 원본 위에 표식 없는 계약 교정을 얹어도 해소는 남는다.
+    const merged = mergeCorrectionResult(salvageResultFields(rawDone, "IMPLEMENTATION"), { ...base, summary: "kind 만 고침", status: "completed" });
+    const after = accumulate(b.result, merged.result, b.openRequests, 30);
+    expect(after.openRequests).toEqual([]);
+    expect(after.resolvedRequests).toHaveLength(2);
+  });
+  it("mergeCorrectionResult 는 교정이 해소 표식을 되풀이하지 않아도 원본의 표식·id 를 보존한다(합집합·중복 제거) — 본 턴 질문 복원(R07)은 교정 자신의 표식만 본다", () => {
+    const original: AgentResult = { ...base, requestedUserDecision: "B?", resolvesRequestedDecision: true, resolvedRequestIds: ["Q-a", "Q-c"] };
+    // 교정이 표식을 되풀이하지 않음 → 원본 표식·id 보존; 교정의 id 는 표식이 없으니 세지 않는다(R01); 본 턴 질문은 복원된다(R07 은 교정 자신의 표식만).
+    const merged = mergeCorrectionResult(original, { ...base, summary: "kind 만 고침", resolvedRequestId: "Q-c", resolvedRequestIds: ["Q-d"] });
+    expect(merged.result.resolvesRequestedDecision).toBe(true);
+    expect(merged.result.resolvedRequestIds).toEqual(["Q-a", "Q-c"]);
+    expect(merged.result.resolvedRequestId).toBeUndefined();
+    expect(merged.result.requestedUserDecision).toBe("B?");   // 원본의 표식은 앞 요청을 닫은 것 — 본 턴 질문은 복원된다
+    expect(merged.preserved).toContain("해소 표식");
+    // 교정이 스스로 표식을 적으면(R07) 질문은 복원하지 않고, id 는 합집합(교정 먼저)·중복 제거.
+    const r07 = mergeCorrectionResult(original, { ...base, summary: "전부 되돌림", resolvesRequestedDecision: true, resolvedRequestId: "Q-c", resolvedRequestIds: ["Q-d"] });
+    expect(r07.result.requestedUserDecision).toBeUndefined();
+    expect(r07.result.resolvedRequestIds).toEqual(["Q-c", "Q-d", "Q-a"]);
+    expect(r07.preserved).not.toContain("해소 표식");
+    // 둘 다 표식이 없으면 아무것도 만들어 내지 않는다.
+    const plain = mergeCorrectionResult({ ...base, requestedUserDecision: "B?" }, { ...base, summary: "x" });
+    expect(plain.result.resolvesRequestedDecision).toBeUndefined();
+    expect(plain.result.resolvedRequestIds).toBeUndefined();
+    // 표식 없는 응답의 id 는 다른 응답의 표식과 결합하지 않는다(host-review R01): 원본 {false, A} + 교정 {true, B} → B 만, 반대 방향은 A 만.
+    const r01 = mergeCorrectionResult({ ...base, resolvedRequestId: "Q-a" }, { ...base, summary: "x", resolvesRequestedDecision: true, resolvedRequestIds: ["Q-b"] });
+    expect(r01.result.resolvedRequestIds).toEqual(["Q-b"]);
+    const r01b = mergeCorrectionResult({ ...base, resolvesRequestedDecision: true, resolvedRequestIds: ["Q-a"] }, { ...base, summary: "x", resolvedRequestIds: ["Q-b"] });
+    expect(r01b.result.resolvedRequestIds).toEqual(["Q-a"]);
+    expect(r01b.result.resolvesRequestedDecision).toBe(true);
+  });
+  it("병합 합집합은 한 번 응답 한도(100)를 넘을 수 있다 — 저장 계약은 상한이 없고 한도는 파서가 응답마다 본다(host-review R02, F10 과 같은 분리)", () => {
+    const many = Array.from({ length: 100 }, (_, index) => `Q-${String(index).padStart(8, "0")}`);
+    const merged = mergeCorrectionResult(
+      { ...base, resolvesRequestedDecision: true, resolvedRequestIds: many },
+      { ...base, summary: "kind 만 고침", resolvesRequestedDecision: true, resolvedRequestId: "Q-extra" },
+    );
+    expect(merged.result.resolvedRequestIds).toHaveLength(101);
+    expect(AgentResultSchema.safeParse(merged.result).success).toBe(true);
   });
   it("implementationInProgress: in_progress 이거나 completed 가 아닌데 남은 단계가 있으면 진행 중", () => {
     expect(implementationInProgress({ ...base, status: "in_progress" })).toBe(true);
