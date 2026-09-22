@@ -71,7 +71,7 @@ export class EvidenceStore {
       const row = this.db.prepare("SELECT lease_until FROM evidence_sources WHERE id=?").get(sourceId)!;
       if (Number(row.lease_until ?? 0) > this.clock()) fail("원문 수집 중에는 연결 방식을 바꿀 수 없습니다.");
       const next: EvidenceSource = source.mode === "rest" ? source
-        : { ...source, mode: "rest", checkedAt: null, nextCheckAt: source.error ? source.nextCheckAt : 0 };
+        : { ...source, mode: "rest", revision: null, checkedAt: null, nextCheckAt: source.error ? source.nextCheckAt : 0 };
       this.save(next);
       this.db.exec("COMMIT"); return next;
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }

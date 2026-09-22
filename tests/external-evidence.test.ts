@@ -341,6 +341,43 @@ it("does not override provider backoff by switching from connector to REST", () 
   expect(db.evidence.begin(source.id, true)).toBeNull();
 });
 
+// Regression boundary: connector tree -> REST conversion -> mediator receives child-node comments.
+// The pre-fix conversion fails this test because the same file version incorrectly skips /nodes.
+it("rebuilds connector Figma trees on REST conversion without dropping child comments", async () => {
+  const { db, root, topic, source: slack } = setup(); db.evidence.detach(topic.id, slack.id);
+  const source = db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc/Name?node-id=1-2" });
+  const tree = { id: "1:2", type: "FRAME", children: [{ id: "1:3", type: "TEXT", characters: "Policy" }] };
+  db.evidence.ingest(source.id, { checkId: db.evidence.begin(source.id)!.checkId, revision: "v1", units: [
+    { id: "node:1:2", kind: "design", content: JSON.stringify(tree) },
+    { id: "comment:old", kind: "comment", content: "Existing child decision" },
+  ] });
+  const old = db.evidence.mediatorBatch(topic, "s"); db.evidence.acknowledgeMediator(topic, "s", old.batchId!);
+  const urls: string[] = [];
+  const request = vi.fn(async (url: any) => {
+    const value = String(url); urls.push(value);
+    if (value.endsWith("/meta")) return Response.json({ file: { version: "v1" } });
+    if (value.endsWith("/comments")) return Response.json({ comments: [
+      { id: "old", message: "Existing child decision", client_meta: { node_id: "1:3" } },
+      { id: "new", message: "New child decision", client_meta: { node_id: "1:3" } },
+    ] });
+    if (value.includes("/nodes?")) return Response.json({ nodes: { "1:2": { document: tree } } });
+    if (value.includes("/images/")) return Response.json({ images: { "1:2": "https://assets.figma.com/design.png" } });
+    return new Response(Buffer.from(png, "base64"));
+  });
+  const service = new EvidenceService(db.evidence, new RestEvidenceConnector({ figmaToken: "secret" }, request as typeof fetch), undefined, join(root, "images"));
+  db.evidence.useRest(source.id);
+  const next = await service.prepareMediator(db, topic.id, "s");
+  expect(next.changes.map(unit => unit.id)).toContain("comment:new");
+  expect(next.removedUnits).not.toContainEqual({ sourceId: source.id, unitId: "comment:old" });
+  expect(db.evidence.snapshot(source.id)!.units.find(unit => unit.id === "comment:old")?.content).toContain("Existing child decision");
+  db.evidence.acknowledgeMediator(topic, "s", next.batchId!);
+  await service.refresh(source.id, true);
+  expect((await service.prepareMediator(db, topic.id, "s")).changes).toEqual([]);
+  expect(urls.filter(url => url.includes("/nodes?"))).toHaveLength(1);
+  expect(urls.filter(url => url.endsWith("design.png"))).toHaveLength(1);
+  await service.stop();
+});
+
 it("does not return old bytes when an external lease is still refreshing an overdue source", async () => {
   const { db, topic, source, ingest } = setup(); ingest([unit("1", "old")]); db.evidence.useRest(source.id);
   const lease = db.evidence.begin(source.id, true)!;
