@@ -1505,3 +1505,11 @@ it("managed source evidence disables direct provider reads and permits only the 
   expect(config).toContain("web_search = false");
   expect(config).toContain(`"${cachedImage}" = "read"`);
 });
+
+ it("keeps host evidence credentials out of every model subprocess environment", () => {
+  for (const key of ["CONSENSUS_EVIDENCE_SLACK_TOKEN", "CONSENSUS_EVIDENCE_JIRA_TOKEN", "CONSENSUS_EVIDENCE_FIGMA_TOKEN", "CONSENSUS_EVIDENCE_JIRA_EMAIL"]) {
+    const old = process.env[key]; process.env[key] = "private-evidence-value";
+    try { expect(agentEnvironment()).not.toHaveProperty(key); }
+    finally { if (old === undefined) delete process.env[key]; else process.env[key] = old; }
+  }
+});

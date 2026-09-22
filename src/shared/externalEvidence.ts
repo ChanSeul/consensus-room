@@ -54,6 +54,7 @@ export interface EvidenceTopicState {
   reviewed: boolean;
   ready: boolean;
   sources: EvidenceSource[];
+  connections?: Array<{ sourceId: string; configured: boolean; sharedTopics: number }>;
 }
 
 // URL query fragments and display names are not resource identity. Reject credentials and arbitrary hosts.
@@ -78,4 +79,20 @@ export function parseEvidenceSource(input: EvidenceSourceInput): Pick<EvidenceSo
       url: `https://www.figma.com/design/${figma[1]}?node-id=${node.replace(":", "-")}` };
   }
   throw new Error("Slack 스레드, Jira 이슈, Figma 노드 링크를 입력하세요. Figma는 node-id가 필요합니다.");
+}
+
+export const MediatorEvidenceInputSchema = z.object({ sessionId: z.string().trim().min(1).max(200) }).strict();
+export const MediatorEvidenceAckSchema = MediatorEvidenceInputSchema.extend({ batchId: z.string().uuid() });
+export interface MediatorEvidenceBatch {
+  batchId: string | null;
+  digest: string;
+  sources: Array<Pick<EvidenceSource, "id" | "url" | "contentHash" | "checkedAt">>;
+  changes: Array<EvidenceUnit & { sourceId: string }>;
+  removedSources: string[];
+  removedUnits: Array<{ sourceId: string; unitId: string }>;
+  images: Array<{ hash: string; path: string }>;
+}
+export interface MediatorEvidenceResponse extends MediatorEvidenceBatch {
+  currentDigest: string;
+  superseded: boolean;
 }

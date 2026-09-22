@@ -5,7 +5,7 @@ import { api } from "./api";
 export function EvidencePanel({ topicId, busy }: { topicId: string; busy: boolean }) {
   const [state, setState] = useState<EvidenceTopicState | null>(null);
   const [url, setURL] = useState(""); const [label, setLabel] = useState("");
-  const [mode, setMode] = useState<"connector" | "rest">("connector");
+  const [mode, setMode] = useState<"connector" | "rest">("rest");
   const [reason, setReason] = useState(""); const [error, setError] = useState(""); const [saving, setSaving] = useState(false);
   const requestVersion = useRef(0); const mutating = useRef(false); const mounted = useRef(true);
   useEffect(() => { setReason(""); }, [state?.digest, state?.plan.scopeGeneration, state?.plan.planEpoch, state?.plan.planSHA256]);
@@ -33,12 +33,16 @@ export function EvidencePanel({ topicId, busy }: { topicId: string; busy: boolea
   };
   return <details className="evidence-panel">
     <summary>Slack · Jira · Figma 근거 {state ? `(${state.sources.length}) · ${!state.ready ? "원문 확인 필요" : state.reviewed ? "검토됨" : "변경 영향 확인 필요"}` : ""}</summary>
-    <p>원문이 바뀌면 변경된 내용만 전달합니다. 변경 감지가 요구사항 확정을 뜻하지는 않습니다.</p>
+    <p>서버 수집에는 호스트의 읽기 인증 설정이 필요합니다. 원문이 바뀌면 변경된 내용만 전달합니다. 변경 감지가 요구사항 확정을 뜻하지는 않습니다.</p>
     {state?.sources.map(source => <div key={source.id}>
       <a href={source.url} target="_blank" rel="noreferrer">{source.label}</a>{" · "}
       {source.checkedAt ? new Date(source.checkedAt).toLocaleString() : "아직 확인하지 않음"}
+      {state.connections?.filter(connection => connection.sourceId === source.id).map(connection => <span key={connection.sourceId}>
+        {connection.configured ? " · 서버 인증 설정 있음 (접근 성공은 마지막 수집 결과 확인)" : " · 서버 읽기 인증 설정 필요"}
+        {` · 공유 주제 ${connection.sharedTopics}개`}
+      </span>)}
       {source.error && <span role="status"> · {source.error}</span>}
-      {source.mode === "rest" ? <button disabled={busy || saving} onClick={() => void run(() => api.checkEvidence(source.id))}>원문 갱신</button> : <span> · 호스트 연결로 확인</span>}
+      {source.mode === "rest" ? <button disabled={busy || saving} onClick={() => void run(() => api.checkEvidence(source.id))}>원문 갱신</button> : <span> · 호스트 연결로 확인 <button disabled={busy || saving} onClick={() => void run(() => api.useRestEvidence(source.id))}>서버 수집으로 전환 (공유 주제 모두 적용)</button></span>}
     </div>)}
     <form onSubmit={event => { event.preventDefault(); void run(() => api.addEvidence(topicId, { url, label, mode, intervalSeconds: 900 })); }}>
       <input aria-label="원문 이름" placeholder="기획·디자인·백엔드 자료 이름" value={label} onChange={event => setLabel(event.target.value)} required />

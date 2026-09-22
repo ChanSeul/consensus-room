@@ -3,7 +3,7 @@ import { evidenceHash, stableJSON } from "./store.js";
 
 type JSONRecord = Record<string, any>;
 export interface EvidenceFetchResult { revision: string; units?: EvidenceUnitInput[]; unchanged?: boolean }
-export interface EvidenceConnector { fetch(source: EvidenceSource, previous: EvidenceSnapshot | null, signal: AbortSignal): Promise<EvidenceFetchResult> }
+export interface EvidenceConnector { configured?(source: EvidenceSource): boolean; fetch(source: EvidenceSource, previous: EvidenceSnapshot | null, signal: AbortSignal, onBytes?: (bytes: number) => void): Promise<EvidenceFetchResult> }
 export interface EvidenceCredentials { slackToken?: string; slackWorkspace?: string; jiraSite?: string; jiraEmail?: string; jiraToken?: string; figmaToken?: string }
 export class EvidenceFetchError extends Error { constructor(message: string, readonly retryAfterSeconds = 300) { super(message); } }
 
@@ -13,13 +13,13 @@ export function evidenceCredentials(env = process.env): EvidenceCredentials {
     jiraSite: env.CONSENSUS_EVIDENCE_JIRA_SITE, jiraEmail: env.CONSENSUS_EVIDENCE_JIRA_EMAIL,
     jiraToken: env.CONSENSUS_EVIDENCE_JIRA_TOKEN, figmaToken: env.CONSENSUS_EVIDENCE_FIGMA_TOKEN };
 }
-async function boundedBody(response: Response, limit: number): Promise<Buffer> {
+async function boundedBody(response: Response, limit: number, onBytes?: (bytes: number) => void): Promise<Buffer> {
   if (!response.body) throw new EvidenceFetchError("원문 응답이 비어 있습니다.");
   const reader = response.body.getReader(); const chunks: Uint8Array[] = []; let size = 0;
   try {
     while (true) {
       const result = await reader.read(); if (result.done) break;
-      size += result.value.length;
+      size += result.value.length; onBytes?.(result.value.length);
       if (size > limit) throw new EvidenceFetchError("원문이 너무 큽니다. 확인 범위를 나누세요.");
       chunks.push(result.value);
     }
@@ -27,7 +27,13 @@ async function boundedBody(response: Response, limit: number): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 export class RestEvidenceConnector implements EvidenceConnector {
-  constructor(private readonly credentials: EvidenceCredentials, private readonly request: typeof fetch = fetch) {}
+  constructor(private readonly credentials: EvidenceCredentials, private readonly request: typeof fetch = fetch, private readonly onBytes?: (bytes: number) => void) {}
+  configured(source: EvidenceSource): boolean {
+    const c = this.credentials;
+    if (source.provider === "slack") return Boolean(c.slackToken && c.slackWorkspace === source.resource.split("/")[0]);
+    if (source.provider === "jira") return Boolean(c.jiraEmail && c.jiraToken && c.jiraSite === `https://${source.resource.split("/")[0]}`);
+    return Boolean(c.figmaToken);
+  }
   private async json(url: URL, headers: Record<string, string>, signal: AbortSignal): Promise<JSONRecord> {
     const response = await this.request(url, { headers, signal, redirect: "error" });
     if (!response.ok) {
@@ -36,13 +42,14 @@ export class RestEvidenceConnector implements EvidenceConnector {
       const seconds = retry && /^\d+$/.test(retry) ? Number(retry) : retry ? Math.ceil((Date.parse(retry) - Date.now()) / 1000) : 300;
       throw new EvidenceFetchError(`원문 조회 실패 (HTTP ${response.status}). 연결 권한과 요청 한도를 확인하세요.`, Number.isFinite(seconds) ? seconds : 300);
     }
-    return JSON.parse((await boundedBody(response, 12_000_000)).toString("utf8"));
+    return JSON.parse((await boundedBody(response, 12_000_000, this.onBytes)).toString("utf8"));
   }
-  async fetch(source: EvidenceSource, previous: EvidenceSnapshot | null, signal: AbortSignal): Promise<EvidenceFetchResult> {
+  async fetch(source: EvidenceSource, previous: EvidenceSnapshot | null, signal: AbortSignal, onBytes?: (bytes: number) => void): Promise<EvidenceFetchResult> {
+    const reader = new RestEvidenceConnector(this.credentials, this.request, onBytes);
     const bounded = AbortSignal.any([signal, AbortSignal.timeout(90_000)]);
-    if (source.provider === "slack") return this.slack(source, bounded);
-    if (source.provider === "jira") return this.jira(source, previous, bounded);
-    return this.figma(source, previous, bounded);
+    if (source.provider === "slack") return reader.slack(source, bounded);
+    if (source.provider === "jira") return reader.jira(source, previous, bounded);
+    return reader.figma(source, previous, bounded);
   }
   private async slack(source: EvidenceSource, signal: AbortSignal): Promise<EvidenceFetchResult> {
     const [workspace, channel] = source.resource.split("/");
@@ -150,7 +157,7 @@ export class RestEvidenceConnector implements EvidenceConnector {
           ![".amazonaws.com", ".figma.com"].some(suffix => asset.hostname.endsWith(suffix))) throw new EvidenceFetchError("허용하지 않은 Figma 이미지 주소입니다.");
         const image = await this.request(asset, { signal, redirect: "error" });
         if (!image.ok) { await image.body?.cancel(); throw new EvidenceFetchError("Figma 이미지를 받지 못했습니다."); }
-        render.imageBase64 = (await boundedBody(image, 4_000_000)).toString("base64");
+        render.imageBase64 = (await boundedBody(image, 4_000_000, this.onBytes)).toString("base64");
       }
       units.push(render);
     }

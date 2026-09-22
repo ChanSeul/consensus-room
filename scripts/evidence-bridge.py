@@ -28,12 +28,14 @@ def connection(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--launch-file", type=Path, default=Path.home() / "Library/Application Support/ConsensusRoom/consensus-room.url")
-    parser.add_argument("command", choices=["due", "claim", "snapshot", "unchanged", "failure", "attach", "status"])
+    parser.add_argument("command", choices=["due", "claim", "snapshot", "unchanged", "failure", "attach", "status", "batch", "ack", "connections", "use-rest", "metrics"])
     parser.add_argument("--id", help="source ID, or topic ID for attach/status")
     parser.add_argument("--input", type=Path, help="JSON file (do not place secret credentials here)")
+    parser.add_argument("--session", help="실제 중재자 세션 ID; batch/ack에 필수")
+    parser.add_argument("--batch", help="읽기를 마친 batchId; ack에 필수")
     args = parser.parse_args()
     base, token = connection(args.launch_file)
-    if args.command != "due" and not args.id:
+    if args.command not in {"due", "connections"} and not args.id:
         parser.error("--id is required")
     source_id = quote(args.id or "", safe="")
     route = {
@@ -41,11 +43,19 @@ def main():
         "snapshot": f"/api/evidence/{source_id}/snapshot", "unchanged": f"/api/evidence/{source_id}/unchanged",
         "failure": f"/api/evidence/{source_id}/failure", "attach": f"/api/topics/{source_id}/evidence/sources",
         "status": f"/api/topics/{source_id}/evidence",
+        "connections": "/api/evidence/connections", "use-rest": f"/api/evidence/{source_id}/use-rest",
+        "batch": f"/api/topics/{source_id}/evidence/mediator/batch",
+        "ack": f"/api/topics/{source_id}/evidence/mediator/ack",
+        "metrics": f"/api/topics/{source_id}/evidence/metrics",
     }[args.command]
     data = None
-    if args.command not in {"due", "status"}:
-        if args.command == "claim":
+    if args.command not in {"due", "status", "connections", "metrics"}:
+        if args.command in {"claim", "use-rest"}:
             data = b"{}"
+        elif args.command in {"batch", "ack"}:
+            if not args.session or (args.command == "ack" and not args.batch):
+                parser.error("batch/ack에는 --session, ack에는 --batch가 필요합니다")
+            data = json.dumps({"sessionId": args.session, **({"batchId": args.batch} if args.command == "ack" else {})}).encode()
         else:
             if not args.input:
                 parser.error("--input is required")
@@ -56,12 +66,12 @@ def main():
         "x-consensus-token": token, "x-consensus-actor": "mediator", "content-type": "application/json",
     })
     try:
-        with build_opener(NoRedirect).open(request, timeout=100) as response:
+        with build_opener(NoRedirect).open(request, timeout=200) as response:
             result = json.load(response)
     except HTTPError as error:
         # Server errors can contain operator data; return only code, no request headers/URL token.
         raise ValueError(f"Consensus Room returned HTTP {error.code}") from None
-    # Ingestion endpoints return metadata, never the original document or design image.
+    # Only an explicit batch request returns changed source text. No command acknowledges it automatically.
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

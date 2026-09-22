@@ -72,7 +72,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
         body: `외부 원문 변경 감지: ${source.label}. 변경이 요구사항에 미치는 영향은 재확인이 필요합니다.`,
         payload: { sourceId: source.id, contentHash: source.contentHash } });
     }
-  });
+  }, join(config.dataDirectory, "evidence-images"));
   const workflow = new WorkflowEngine({
     database,
     artifacts,

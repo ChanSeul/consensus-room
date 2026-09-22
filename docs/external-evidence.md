@@ -92,3 +92,51 @@ REST 연결 환경변수는 `CONSENSUS_EVIDENCE_SLACK_TOKEN`, `CONSENSUS_EVIDENC
 [Figma 파일·노드·렌더 API](https://developers.figma.com/docs/rest-api/file-endpoints/).
 
 운영 DB·원문·PNG·인증정보는 공개 export에 포함하지 않는다. 코드 배포와 운영 서버 재시작은 별도 단계다.
+
+## 모델 호출 없이 갱신하고 중재자가 변경분 받기
+
+주기 확인은 REST 방식으로 등록한 원문을 서버 코드가 처리한다. 원문이 바뀌어도 Codex 세션을 깨우거나
+알림용 모델을 호출하지 않는다. 중재자는 다음 작업을 시작하거나 재개할 때만 변경분을 요청한다.
+기존 연결 도구로 전체 원문을 다시 받는 수집 비용까지 캐시가 없애는 것은 아니므로, 이 경로에서는
+connector 자료를 자동으로 읽지 않고 REST 연결 필요 상태를 반환한다.
+
+호스트에 위 환경변수로 읽기 인증을 설정한 뒤 `connections`로 설정 여부와 마지막 오류를 확인한다.
+설정 있음은 실제 접근 성공을 뜻하지 않는다. 읽기 인증은 모델 환경으로 전달되지 않는다.
+기존 자료는 `use-rest`로 전환한다. 원문 ID·스냅샷을 유지하며 공유 주제 모두에 적용된다.
+연결된 주제에 실행 중인 작업이 있거나 수집 잠금이 있으면 전환을 거부하고, 429 대기 시간을 유지한다.
+중재자 호출의 연결 전환은 기존 중재 위임 권한을 요구한다. 인증정보는 CLI 인자로 넣지 않는다.
+
+```sh
+python3 scripts/evidence-bridge.py connections
+python3 scripts/evidence-bridge.py use-rest --id SOURCE_ID
+python3 scripts/evidence-bridge.py batch --id TOPIC_ID --session ACTUAL_MEDIATOR_SESSION_ID
+# 반환된 자료를 읽은 뒤에만 별도 실행한다. 조회 성공만으로 자동 확인하지 않는다.
+python3 scripts/evidence-bridge.py ack --id TOPIC_ID --session ACTUAL_MEDIATOR_SESSION_ID --batch BATCH_ID
+python3 scripts/evidence-bridge.py metrics --id TOPIC_ID
+```
+
+`batch`는 확인 기한이 지난 원문의 서버 수집을 기다린다. 실패·수집 잠금·429 대기 중이면 예전 본문을
+새 자료로 반환하지 않는다. 한 번의 요청은 90초가 지나면 다음 원문 수집을 시작하지 않으며, 진행 중인
+원문 요청의 최대 90초를 더 기다릴 수 있다. 이미 수집한 자료는 보존하고 남은 자료는 다음 요청에서 확인한다.
+
+첫 배치는 현재 등록 범위의 자료를 제공한다. 다음부터는 메시지·댓글·디자인 노드 단위의 새 본문과
+삭제 ID만 제공하며 줄 단위 diff는 아니다. 같은 PNG는 수신 확인한 이미지 해시와 비교해 경로를 생략한다.
+모델은 원문을 신뢰하지 않는 참고 자료로 읽고 작성자·적용 플랫폼·후속 답변·반대 근거를 대조해야 한다.
+
+배치는 주제·범위 세대·실제 중재자 세션에 묶인다. 미확인 배치는 서버 재시작·중단 뒤에도 같은 batchId로
+다시 받는다. `ack`는 해당 배치의 원문 버전만 확인하며 동시에 도착한 새 변경을 지우지 않는다.
+이미 확인한 배치의 중복 ack는 새 배치를 소비하지 않는다. 새로운 세션에는 첫 자료를 다시 제공한다.
+`batchId: null`은 전달할 변경이 없다는 뜻이며 ack하지 않는다. `superseded: true`이면 현재 원문이 배치보다
+앞서 있다. 읽기를 확인하고 다음 배치를 받아 `digest`와 `currentDigest`가 같아진 뒤 영향 검토를 마친다.
+수신 확인과 계획 검토는 별개이며, 기존 계획·원문 해시에 묶인 승인 검사는 계속 적용된다.
+
+API는 `POST /api/topics/:id/evidence/mediator/batch`에 sessionId,
+`POST /api/topics/:id/evidence/mediator/ack`에 sessionId·batchId를 받는다.
+기존 로컬 인증과 중재자 헤더가 필요하다. 두 API는 계획 승인이나 위임 설정을 변경하지 않는다.
+`GET /api/evidence/connections`는 인증값 없이 설정 여부·연결 주제·수집 통계를 제공한다.
+
+통계는 원문별 `receivedBytes`(REST 응답 본문에서 실제 읽은 바이트), `fetchAttempts`, `reusedImages`,
+주제별 `mediator.deliveredBytes`(변경분 API 응답), `runner.deliveredBytes`(외부 근거 텍스트),
+`runner.modelCalls`(외부 근거를 붙여 호출한 러너)를 분리한다. 실패·재전달도 실제 소비한 분량에 포함한다.
+미기록 항목은 계측되지 않은 값이며 과거 소비 0을 뜻하지 않는다. HTTP 압축 전송량, 이미지 모델 토큰,
+전체 모델 입력·캐시 토큰, 이 중재자 세션의 실제 과금은 이 바이트 통계로 계산하지 않는다.

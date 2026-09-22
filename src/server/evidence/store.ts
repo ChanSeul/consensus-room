@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { EvidenceSnapshotInputSchema, EvidenceSourceInputSchema, parseEvidenceSource,
-  type EvidenceCheck, type EvidenceDependency, type EvidencePlanBinding, type EvidenceSnapshot, type EvidenceSnapshotInput,
+  type MediatorEvidenceBatch, type EvidenceCheck, type EvidenceDependency, type EvidencePlanBinding, type EvidenceSnapshot, type EvidenceSnapshotInput,
   type EvidenceSource, type EvidenceSourceInput, type EvidenceStatus, type EvidenceTopicState, type EvidenceUnit } from "../../shared/externalEvidence.js";
 import type { Topic } from "../../shared/contracts.js";
 import { redactSecrets } from "../../shared/workflow.js";
@@ -25,6 +25,10 @@ export class EvidenceStore {
       CREATE TABLE IF NOT EXISTS evidence_images(hash TEXT PRIMARY KEY, bytes BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS evidence_topics(topic_id TEXT NOT NULL REFERENCES topics(id), source_id TEXT NOT NULL REFERENCES evidence_sources(id), PRIMARY KEY(topic_id,source_id));
       CREATE TABLE IF NOT EXISTS evidence_reviews(topic_id TEXT PRIMARY KEY REFERENCES topics(id), binding TEXT NOT NULL, digest TEXT NOT NULL, reason TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS evidence_mediator_consumers(consumer TEXT PRIMARY KEY, manifest TEXT NOT NULL, ack_id TEXT);
+      CREATE TABLE IF NOT EXISTS evidence_mediator_acks(consumer TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY(consumer,id));
+      CREATE TABLE IF NOT EXISTS evidence_mediator_batches(consumer TEXT PRIMARY KEY, id TEXT NOT NULL, manifest TEXT NOT NULL, packet TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS evidence_metrics(scope TEXT NOT NULL, name TEXT NOT NULL, value INTEGER NOT NULL, PRIMARY KEY(scope,name));
       CREATE TABLE IF NOT EXISTS evidence_receipts(consumer TEXT NOT NULL, source_id TEXT NOT NULL, unit_id TEXT NOT NULL, hash TEXT NOT NULL, PRIMARY KEY(consumer,source_id,unit_id));
     `);
   }
@@ -57,6 +61,81 @@ export class EvidenceStore {
       .all().map(row => JSON.parse(String(row.record)));
   }
   detach(topicId: string, sourceId: string): void { this.db.prepare("DELETE FROM evidence_topics WHERE topic_id=? AND source_id=?").run(topicId, sourceId); }
+  linkedTopics(sourceId: string): string[] {
+    return this.db.prepare("SELECT topic_id FROM evidence_topics WHERE source_id=?").all(sourceId).map(row => String(row.topic_id));
+  }
+  useRest(sourceId: string): EvidenceSource {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const source = this.get(sourceId);
+      const row = this.db.prepare("SELECT lease_until FROM evidence_sources WHERE id=?").get(sourceId)!;
+      if (Number(row.lease_until ?? 0) > this.clock()) fail("원문 수집 중에는 연결 방식을 바꿀 수 없습니다.");
+      const next: EvidenceSource = source.mode === "rest" ? source
+        : { ...source, mode: "rest", checkedAt: null, nextCheckAt: source.error ? source.nextCheckAt : 0 };
+      this.save(next);
+      this.db.exec("COMMIT"); return next;
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+  measure(scope: string, name: string, value: number): void {
+    this.db.prepare("INSERT INTO evidence_metrics(scope,name,value) VALUES (?,?,?) ON CONFLICT(scope,name) DO UPDATE SET value=value+excluded.value")
+      .run(scope, name, value);
+  }
+  metrics(scope: string): Record<string, number> {
+    return Object.fromEntries(this.db.prepare("SELECT name,value FROM evidence_metrics WHERE scope=?").all(scope).map(row => [String(row.name), Number(row.value)]));
+  }
+  mediatorBatch(topic: Binding, sessionId: string): MediatorEvidenceBatch {
+    const consumer = stableJSON([topic.id, topic.scopeGeneration, sessionId]);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.assertReady(topic, false);
+      const pending = this.db.prepare("SELECT packet FROM evidence_mediator_batches WHERE consumer=?").get(consumer);
+      if (pending) { this.db.exec("COMMIT"); return JSON.parse(String(pending.packet)); }
+      const saved = this.db.prepare("SELECT manifest FROM evidence_mediator_consumers WHERE consumer=?").get(consumer);
+      const previous: Array<[string, string]> = saved ? JSON.parse(String(saved.manifest)) : [];
+      const current = this.topic(topic);
+      const manifest = current.sources.map(source => [source.id, source.contentHash!] as [string, string]);
+      const packet: MediatorEvidenceBatch = { batchId: null, digest: current.digest,
+        sources: current.sources.map(({ id, url, contentHash, checkedAt }) => ({ id, url, contentHash, checkedAt })),
+        changes: [], removedSources: previous.filter(([id]) => !manifest.some(([now]) => now === id)).map(([id]) => id),
+        removedUnits: [], images: [] };
+      const previousImages = new Set(previous.flatMap(([id, hash]) => this.snapshot(id, hash)?.units.flatMap(unit => unit.imageHash ? [unit.imageHash] : []) ?? []));
+      for (const source of current.sources) {
+        const oldHash = previous.find(([id]) => id === source.id)?.[1];
+        if (oldHash === source.contentHash) continue;
+        const old = new Map((oldHash ? this.snapshot(source.id, oldHash)?.units ?? [] : []).map(unit => [unit.id, unit.contentHash]));
+        for (const unit of this.snapshot(source.id)!.units) {
+          if (old.get(unit.id) !== unit.contentHash) packet.changes.push({ ...unit, sourceId: source.id });
+          old.delete(unit.id);
+        }
+        for (const unitId of old.keys()) packet.removedUnits.push({ sourceId: source.id, unitId });
+      }
+      packet.images = [...new Set(packet.changes.flatMap(unit => unit.imageHash && !previousImages.has(unit.imageHash) ? [unit.imageHash] : []))]
+        .map(hash => ({ hash, path: "" }));
+      if (stableJSON(previous) !== stableJSON(manifest)) {
+        packet.batchId = randomUUID();
+        const encoded = JSON.stringify(packet);
+        if (Buffer.byteLength(encoded) > 240_000) fail("중재자에게 전달할 근거가 너무 큽니다. 원문 범위를 나누세요.");
+        this.db.prepare("INSERT INTO evidence_mediator_batches(consumer,id,manifest,packet) VALUES (?,?,?,?)")
+          .run(consumer, packet.batchId, JSON.stringify(manifest), encoded);
+      }
+      this.db.exec("COMMIT"); return packet;
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+  acknowledgeMediator(topic: Binding, sessionId: string, batchId: string): void {
+    const consumer = stableJSON([topic.id, topic.scopeGeneration, sessionId]);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const acknowledged = this.db.prepare("SELECT id FROM evidence_mediator_acks WHERE consumer=? AND id=?").get(consumer, batchId);
+      if (acknowledged) { this.db.exec("COMMIT"); return; }
+      const pending = this.db.prepare("SELECT id,manifest FROM evidence_mediator_batches WHERE consumer=?").get(consumer);
+      if (!pending || pending.id !== batchId) return fail("현재 중재자 세션의 미확인 배치가 아닙니다.");
+      this.db.prepare("INSERT INTO evidence_mediator_consumers(consumer,manifest,ack_id) VALUES (?,?,?) ON CONFLICT(consumer) DO UPDATE SET manifest=excluded.manifest,ack_id=excluded.ack_id")
+        .run(consumer, pending.manifest, batchId);
+      this.db.prepare("INSERT INTO evidence_mediator_acks(consumer,id) VALUES (?,?)").run(consumer, batchId);
+      this.db.prepare("DELETE FROM evidence_mediator_batches WHERE consumer=?").run(consumer);
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
   // Cross-process lease prevents two host sessions from reading the same source concurrently.
   begin(id: string, force = false): EvidenceCheck | null {
     const now = this.clock();

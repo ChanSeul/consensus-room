@@ -155,3 +155,48 @@ it.each([
     expect(f.database.evidence.topic(f.database.getTopic(f.topic.id)).reviewed).toBe(true);
   } finally { await app.close(); }
 });
+
+it("uses mediator HTTP and CLI batches without model calls or implicit acknowledgement", async () => {
+  const f = fixture(); f.database.updateTopic(f.topic.id, { state: "AWAITING_USER_APPROVAL" });
+  const config = loadConfig({ repositoryPath: f.root, dataDirectory: f.root, webDirectory: join(f.root, "no-web"), launchToken: "test-token", enforceBudgets: false });
+  let configured = false;
+  const fetch = vi.fn(async () => ({ revision: "server-r1", units: [{ id: "issue", kind: "issue" as const, content: "server body" }] }));
+  const app = await buildApp({ config, database: f.database, runner: f.runner, claude: f.adapter, codex: { ...f.adapter, role: "codex" },
+    evidenceConnector: { configured: () => configured, fetch } });
+  const headers = { "x-consensus-token": "test-token" }; const mediator = { ...headers, "x-consensus-actor": "mediator" };
+  try {
+    const url = "/api/topics/t/evidence/mediator/batch";
+    expect((await app.inject({ method: "POST", url, payload: { sessionId: "s" } })).statusCode).toBe(401);
+    expect((await app.inject({ method: "POST", url, headers, payload: { sessionId: "s" } })).statusCode).toBe(403);
+    expect((await app.inject({ method: "POST", url, headers: mediator, payload: { sessionId: "s" } })).statusCode).not.toBe(200);
+    expect(fetch).not.toHaveBeenCalled();
+    expect((await app.inject({ method: "POST", url: `/api/evidence/${f.source.id}/use-rest`, headers: mediator, payload: {} })).statusCode).toBe(403);
+    const convert = () => app.inject({ method: "POST", url: `/api/evidence/${f.source.id}/use-rest`, headers, payload: {} });
+    expect((await convert()).statusCode).not.toBe(200);
+    configured = true;
+    const shared = f.database.createTopic({ ...f.topic, id: "shared", slug: "shared", worktreePath: join(f.root, "shared"), state: "DRAFT" });
+    f.database.evidence.register(shared.id, sourceInput);
+    f.database.startAction({ id: "shared-action", topicId: shared.id, kind: "plan", status: "running", createdAt: new Date().toISOString(),
+      finishedAt: null, error: null, pid: null, pgid: null, processCommand: null, processExecutable: null, processStartedAt: null });
+    expect((await convert()).statusCode).not.toBe(200);
+    expect(f.database.evidence.get(f.source.id).mode).toBe("connector");
+    f.database.finishAction("shared-action", "succeeded");
+    expect((await convert()).statusCode).toBe(200);
+    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const launch = join(f.root, "bridge.url"); writeFileSync(launch, `${address}/?token=test-token`, { mode: 0o600 });
+    const cli = (...args: string[]) => promisify(execFile)("python3", ["scripts/evidence-bridge.py", "--launch-file", launch, ...args]);
+    const first = JSON.parse((await cli("batch", "--id", "t", "--session", "actual-session")).stdout);
+    expect(first.changes.map((u: any) => u.content)).toEqual(["server body"]);
+    expect(JSON.stringify(first)).not.toContain("test-token");
+    expect(JSON.parse((await cli("batch", "--id", "t", "--session", "actual-session")).stdout).batchId).toBe(first.batchId);
+    f.ingest("arrived after batch");
+    await cli("ack", "--id", "t", "--session", "actual-session", "--batch", first.batchId);
+    const next = JSON.parse((await cli("batch", "--id", "t", "--session", "actual-session")).stdout);
+    expect(next.changes.map((u: any) => u.content)).toEqual(["arrived after batch"]);
+    expect(next.batchId).not.toBe(first.batchId);
+    const connections = (await app.inject({ method: "GET", url: "/api/evidence/connections", headers })).json();
+    expect(connections[0]).toMatchObject({ configured: true, mode: "rest", topics: expect.arrayContaining(["t", "shared"]) });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(f.adapter.createSession).not.toHaveBeenCalled(); expect(f.adapter.resumeTurn).not.toHaveBeenCalled();
+  } finally { await app.close(); dbs.splice(dbs.indexOf(f.database), 1); }
+});

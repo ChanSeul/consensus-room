@@ -1,13 +1,48 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { EvidenceDependencySchema, EvidenceReviewInputSchema, EvidenceSnapshotInputSchema, EvidenceSourceInputSchema } from "../../shared/externalEvidence.js";
+import { MediatorEvidenceInputSchema, MediatorEvidenceAckSchema, EvidenceDependencySchema, EvidenceReviewInputSchema, EvidenceSnapshotInputSchema, EvidenceSourceInputSchema } from "../../shared/externalEvidence.js";
 import type { ConsensusDatabase } from "../database.js";
 import type { WorkflowEngine } from "../workflow.js";
 import type { EvidenceService } from "./service.js";
 
 export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDatabase, workflow: WorkflowEngine, service: EvidenceService,
   authorizeReview: (headers: Record<string, unknown>) => void): void {
-  app.get<{ Params: { id: string } }>("/api/topics/:id/evidence", async request => db.evidence.topic(db.getTopic(request.params.id)));
+  const mediator = (headers: Record<string, unknown>) => {
+    if (headers["x-consensus-actor"] !== "mediator") throw Object.assign(new Error("중재자 세션에서 호출하세요."), { statusCode: 403 });
+  };
+  app.get("/api/evidence/connections", async () => db.evidence.list().map(source => ({
+    id: source.id, provider: source.provider, mode: source.mode, ...service.connection(source),
+    topics: db.evidence.linkedTopics(source.id), metrics: db.evidence.metrics(source.id),
+  })));
+  app.post<{ Params: { id: string } }>("/api/evidence/:id/use-rest", async request => {
+    authorizeReview(request.headers);
+    z.object({}).strict().parse(request.body);
+    const source = db.evidence.get(request.params.id);
+    for (const topicId of db.evidence.linkedTopics(source.id)) workflow.assertBudgetEditable(topicId);
+    if (!db.evidence.activeSources().some(item => item.id === source.id)) throw new Error("열린 주제에 연결된 원문만 전환할 수 있습니다.");
+    if (!service.connection(source).configured) throw new Error("서버의 읽기 인증 설정이 필요합니다.");
+    return db.evidence.useRest(source.id);
+  });
+  app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/mediator/batch", async request => {
+    mediator(request.headers);
+    const input = MediatorEvidenceInputSchema.parse(request.body);
+    return service.prepareMediator(db, request.params.id, input.sessionId);
+  });
+  app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/mediator/ack", async request => {
+    mediator(request.headers);
+    const input = MediatorEvidenceAckSchema.parse(request.body);
+    db.evidence.acknowledgeMediator(db.getTopic(request.params.id), input.sessionId, input.batchId);
+    return { ok: true };
+  });
+  app.get<{ Params: { id: string } }>("/api/topics/:id/evidence/metrics", async request => {
+    db.getTopic(request.params.id);
+    return { mediator: db.evidence.metrics(`mediator:${request.params.id}`), runner: db.evidence.metrics(`runner:${request.params.id}`) };
+  });
+  app.get<{ Params: { id: string } }>("/api/topics/:id/evidence", async request => {
+    const state = db.evidence.topic(db.getTopic(request.params.id));
+    return { ...state, connections: state.sources.map(source => ({ sourceId: source.id, configured: service.connection(source).configured,
+      sharedTopics: db.evidence.linkedTopics(source.id).length })) };
+  });
   app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/sources", async request => {
     const topic = db.getTopic(request.params.id);
     workflow.assertBudgetEditable(topic.id);

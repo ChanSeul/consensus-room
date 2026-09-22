@@ -246,3 +246,108 @@ it("tells an existing session when its last source was removed", async () => {
   await adapter.resumeTurn({ sessionId: "s", cwd: root, prompt: "Continue" });
   expect(prompts[2]).toBe("Continue");
 });
+
+// Mediator contract: explicit batch read -> separate ack -> next delta. No model is involved.
+// New feature: no historical bug to restore. Scope/session, failure, persistence and late updates are real DB boundaries.
+it("keeps a mediator batch pending across restart, acknowledges exactly that version, and isolates sessions/scopes", () => {
+  const { db, root, topic, source, ingest } = setup();
+  ingest([unit("1", "A"), unit("2", "remove")]);
+  const first = db.evidence.mediatorBatch(topic, "mediator-1");
+  expect(first.changes.map(u => u.content)).toEqual(["A", "remove"]);
+  const reopened = new ConsensusDatabase(join(root, "room.sqlite")); databases.push(reopened);
+  expect(reopened.evidence.mediatorBatch(topic, "mediator-1")).toEqual(first);
+  ingest([unit("1", "B")]);
+  expect(db.evidence.mediatorBatch(topic, "mediator-1")).toEqual(first);
+  expect(() => db.evidence.acknowledgeMediator(topic, "other", first.batchId!)).toThrow();
+  expect(() => db.evidence.acknowledgeMediator({ ...topic, scopeGeneration: 2 }, "mediator-1", first.batchId!)).toThrow();
+  db.evidence.acknowledgeMediator(topic, "mediator-1", first.batchId!);
+  const second = db.evidence.mediatorBatch(topic, "mediator-1");
+  expect(second.changes.map(u => u.content)).toEqual(["B"]);
+  expect(second.removedUnits).toEqual([{ sourceId: source.id, unitId: "2" }]);
+  db.evidence.acknowledgeMediator(topic, "mediator-1", first.batchId!); // old duplicate cannot consume the newer batch
+  expect(db.evidence.mediatorBatch(topic, "mediator-1").batchId).toBe(second.batchId);
+  db.evidence.acknowledgeMediator(topic, "mediator-1", second.batchId!);
+  db.evidence.acknowledgeMediator(topic, "mediator-1", first.batchId!);
+  expect(db.evidence.mediatorBatch(topic, "mediator-1")).toMatchObject({ batchId: null, changes: [] });
+  expect(db.evidence.mediatorBatch(topic, "new-session").changes).toHaveLength(1);
+  expect(db.evidence.mediatorBatch({ ...topic, scopeGeneration: 2 }, "mediator-1").changes).toHaveLength(1);
+  expect(db.evidence.packet(topic, "claude", "mediator-1").text).toContain('"content":"B"');
+  db.evidence.detach(topic.id, source.id);
+  const removed = db.evidence.mediatorBatch(topic, "mediator-1");
+  expect(removed.removedSources).toEqual([source.id]);
+  db.evidence.acknowledgeMediator(topic, "mediator-1", removed.batchId!);
+  expect(db.evidence.mediatorBatch(topic, "mediator-1").batchId).toBeNull();
+});
+
+it("preserves cache on REST conversion, rejects a live collection lease, and requires fresh REST collection", () => {
+  const { db, topic, source, ingest } = setup(); ingest([unit("1", "A")]);
+  const hash = db.evidence.get(source.id).contentHash;
+  const lease = db.evidence.begin(source.id, true)!;
+  expect(() => db.evidence.useRest(source.id)).toThrow("수집 중");
+  db.evidence.unchanged(source.id, lease.checkId, hash!, "r1");
+  expect(db.evidence.useRest(source.id)).toMatchObject({ mode: "rest", contentHash: hash, checkedAt: null, nextCheckAt: 0 });
+  expect(() => db.evidence.mediatorBatch(topic, "s")).toThrow("원문 확인");
+});
+
+it("waits for a shared pending REST fetch, returns only changed PNG paths, and never calls a model", async () => {
+  const { db, root, topic, source } = setup(); db.evidence.useRest(source.id);
+  let finish!: (value: any) => void;
+  const fetch = vi.fn(() => new Promise<any>(resolve => { finish = resolve; }));
+  const service = new EvidenceService(db.evidence, { fetch }, undefined, join(root, "images"));
+  const first = service.prepareMediator(db, topic.id, "s");
+  const second = service.prepareMediator(db, topic.id, "s");
+  expect(fetch).toHaveBeenCalledTimes(1);
+  finish({ revision: "r1", units: [{ id: "render", kind: "render", content: "design", imageBase64: png }] });
+  const a = await first; const b = await second;
+  expect(a.batchId).toBe(b.batchId); expect(a.images).toHaveLength(1);
+  expect(a.images[0].path).toContain(join(root, "images"));
+  db.evidence.acknowledgeMediator(topic, "s", a.batchId!);
+  const same = await service.prepareMediator(db, topic.id, "s");
+  expect(same).toMatchObject({ batchId: null, changes: [], images: [] });
+  expect(fetch).toHaveBeenCalledTimes(1);
+  expect(db.evidence.metrics(`runner:${topic.id}`)).toEqual({});
+  const lease = db.evidence.begin(source.id, true)!;
+  db.evidence.failed(source.id, lease.checkId, "429", 300);
+  await expect(service.prepareMediator(db, topic.id, "s")).rejects.toThrow("실패");
+  expect(fetch).toHaveBeenCalledTimes(1);
+  await service.stop();
+});
+
+it("measures actual REST response bytes without exposing credentials", async () => {
+  const { db, source } = setup(); const reply = { ok: true, messages: [{ ts: source.selector, text: "A" }] };
+  let bytes = 0;
+  const connector = new RestEvidenceConnector({ slackToken: "secret", slackWorkspace: "team.slack.com" }, vi.fn(async () => Response.json(reply)) as typeof fetch);
+  await connector.fetch(source, null, new AbortController().signal, n => { bytes += n; });
+  expect(bytes).toBe(Buffer.byteLength(JSON.stringify(reply)));
+  expect(connector.configured(source)).toBe(true);
+  expect(new RestEvidenceConnector({}).configured(source)).toBe(false);
+});
+
+it("does not resend an already acknowledged PNG when its text unit changes", () => {
+  const { db, topic, ingest } = setup();
+  ingest([{ id: "render", kind: "render", content: "old", imageBase64: png }]);
+  const first = db.evidence.mediatorBatch(topic, "s"); expect(first.images).toHaveLength(1);
+  db.evidence.acknowledgeMediator(topic, "s", first.batchId!);
+  ingest([{ id: "render", kind: "render", content: "new", imageBase64: png }]);
+  const next = db.evidence.mediatorBatch(topic, "s");
+  expect(next.changes).toHaveLength(1); expect(next.images).toEqual([]);
+});
+
+it("does not override provider backoff by switching from connector to REST", () => {
+  const { db, source } = setup(); const lease = db.evidence.begin(source.id, true)!;
+  db.evidence.failed(source.id, lease.checkId, "429", 900);
+  const retryAt = db.evidence.get(source.id).nextCheckAt;
+  expect(db.evidence.useRest(source.id).nextCheckAt).toBe(retryAt);
+  expect(db.evidence.begin(source.id, true)).toBeNull();
+});
+
+it("does not return old bytes when an external lease is still refreshing an overdue source", async () => {
+  const { db, topic, source, ingest } = setup(); ingest([unit("1", "old")]); db.evidence.useRest(source.id);
+  const lease = db.evidence.begin(source.id, true)!;
+  const fetch = vi.fn(); const service = new EvidenceService(db.evidence, { fetch });
+  await expect(service.prepareMediator(db, topic.id, "s")).rejects.toThrow("수집이 진행 중");
+  expect(fetch).not.toHaveBeenCalled();
+  db.evidence.ingest(source.id, { checkId: lease.checkId, revision: "new", units: [unit("1", "new")] });
+  expect((await service.prepareMediator(db, topic.id, "s")).changes[0].content).toBe("new");
+  await service.stop();
+});
