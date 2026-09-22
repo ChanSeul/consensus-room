@@ -313,6 +313,7 @@ export class EngineCore {
     const onUsage = (usage: TurnUsage) => { executionId = usage.executionId; observeUsage(usage); };
     let result: AgentResult;
     let sessionId: string;
+    const evidenceDigest = this.dependencies.database.evidence.topic(topic).digest;
     const pending=await this.pendingRepair(topic.id,topic.state);
     const reuse=pending && pending.role===role && pending.contextKey===(options.repairContextKey??null)
       && (!options.session || options.session.id===pending.sessionId);
@@ -322,6 +323,7 @@ export class EngineCore {
     } else if (freshSession || !resumeSessionId || resumeSessionId.startsWith("pending:")) {
       const planningWrite = options.planningWrite ?? (role==="claude" && topic.state==="CLAUDE_PLAN"?"plan":role==="claude"&&topic.state==="CLAUDE_REVISION"?"revision":undefined);
       const created = await this.executor.execute({
+        evidenceDigest,
         role, topic, signal, purpose: "턴", inputSequence: startedAfter, expected: this.expectationOf(topic), write: implementation,
         writeGuards: options.writeGuards,
         session: { mode: "create", onSessionCreated: id => {
@@ -350,6 +352,7 @@ export class EngineCore {
       sessionId = created.sessionId;
     } else {
       const resumed = await this.executor.execute({
+        evidenceDigest,
         role, topic, signal, purpose: "턴", inputSequence: startedAfter, expected: this.expectationOf(topic), write: implementation,
         writeGuards: options.writeGuards,
         session: { mode: "resume", sessionId: resumeSessionId },
@@ -365,6 +368,7 @@ export class EngineCore {
     let accepted = false;
     try {
       const checked = await this.enforceResultContract(role, topic, result, sessionId, {
+        evidenceDigest,
         signal, implementation, planMode, startedAfter, check, readablePaths: options.readablePaths, normalize: options.normalize, planBase: options.planBase,
         writeGuards: options.writeGuards,
       });
@@ -376,7 +380,7 @@ export class EngineCore {
         await this.writeArtifact(topic,"pending-contract-repair",this.latestSequence(topic.id)+1,JSON.stringify({
           role,stage:topic.state,scopeGeneration:topic.scopeGeneration,planEpoch:topic.planEpoch,planSHA256:topic.planSHA256,
           participantSessionId:this.participant(this.dependencies.database.getTopic(topic.id),role).sessionId,
-          sessionId,raw:redactAgentResult(result),contextKey:options.repairContextKey??null,startedAfter,
+          sessionId,raw:redactAgentResult(result),contextKey:options.repairContextKey??null,startedAfter,evidenceDigest,
         }),signal);
       }
       throw error;
@@ -392,13 +396,16 @@ export class EngineCore {
 
   async pendingRepair(topicId:string,stage:string):Promise<{
     role:ParticipantRole;stage:string;scopeGeneration:number;planEpoch:number;planSHA256:string|null;
-    participantSessionId:string|null;sessionId:string;raw:AgentResult;contextKey:string|null;startedAfter:number;
+    participantSessionId:string|null;sessionId:string;raw:AgentResult;contextKey:string|null;startedAfter:number;evidenceDigest:string;
   }|null> {
     const stored=await this.dependencies.artifacts.readLatest(topicId,"pending-contract-repair");
     if(!stored)return null;
     const pending=JSON.parse(stored);
     if(!pending)return null;
     const topic=this.dependencies.database.getTopic(topicId);
+    const evidence=this.dependencies.database.evidence.topic(topic);
+    // Records from before evidence binding was introduced cannot prove which sources produced the response.
+    if(!evidence.ready || pending.evidenceDigest!==evidence.digest)return null;
     if(pending.stage!==stage || pending.scopeGeneration!==topic.scopeGeneration || pending.planEpoch!==topic.planEpoch
       || pending.planSHA256!==topic.planSHA256 || this.newUserInputSince(topic,pending.startedAfter))return null;
     if(pending.role!=="claude" && pending.role!=="codex")throw new Error("교정 재개 기록의 역할이 올바르지 않습니다.");
@@ -420,6 +427,7 @@ export class EngineCore {
       implementation: boolean;
       planMode: boolean;
       startedAfter: number;
+      evidenceDigest: string;
       check?: (result: AgentResult) => void;
       // 본 턴과 같은 읽기 허용(계획 정본 등) — 교정 턴에서만 권한이 빠지면 "필요하면 읽으라" 고 안내한 파일을 못 읽는다(Codex 후속 지적 7).
       readablePaths?: readonly string[];
@@ -431,6 +439,13 @@ export class EngineCore {
       beforeCorrection?: (raw: AgentResult, violation: string) => Promise<void>;
     },
   ): Promise<AgentResult> {
+    const evidence = this.dependencies.database.evidence.topic(this.dependencies.database.getTopic(topic.id));
+    const evidenceDigest = context.evidenceDigest;
+    if (!evidence.ready || evidence.digest !== evidenceDigest) {
+      await this.preserveInterruptedResult(topic, role, raw, context.signal, "원문 확인 상태가 바뀌어 교정 전 응답을 보존만 합니다.");
+      this.interrupt(topic.id, "BLOCKED_ON_EVIDENCE", "교정할 응답의 원문이 바뀌었습니다. 최신 근거로 다시 작업하세요.", topic.state, { externalEvidence: true });
+      throw new HandledWorkflowInterruption();
+    }
     let violation: string;
     let formatOnly = false;
     let repairPlan: string | null = null;
@@ -456,6 +471,7 @@ export class EngineCore {
         await this.writeArtifact(topic, "plan-repair-source", sourceRevision, JSON.stringify(redactAgentResult(raw)), context.signal);
         // 실행 허용(새 입력·계획 변경·취소…)은 실행기가 spawn 직전에 본다(R3-03 → PLAN §2 공통 실행기).
         const patch = await this.executor.executePlanRepair({
+          evidenceDigest,
           role, topic, signal: context.signal, purpose: "계획 교정", inputSequence: context.startedAfter, expected: this.expectationOf(topic), write: false,
           session: { mode: "resume", sessionId }, prompt: planRepairPrompt(repairPlan, violation), implementation: false, protocolOnly: true,
           settings: { ...this.executionSettings(topic.id, role, false), effort: "low" },
@@ -493,6 +509,7 @@ export class EngineCore {
     const settings = this.executionSettings(topic.id, role, context.implementation);
     // 실행 허용(새 입력·계획 변경·취소·유지보수·예산·쓰기 기준)은 실행기가 adapter 호출 전과 spawn 직전에 본다(R3-03 → PLAN §2).
     const { result: corrected } = await this.executor.execute({
+      evidenceDigest,
       role, topic, signal: context.signal, purpose: "계약 교정 재제출", inputSequence: context.startedAfter,
       expected: { ...this.expectationOf(topic), state: this.dependencies.database.getTopic(topic.id).state },
       write: context.implementation, writeGuards: context.writeGuards,

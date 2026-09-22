@@ -41,8 +41,12 @@ import { ProjectMemoryStore } from "./memoryStore.js";
 import { readMediationAutonomy, writeMediationAutonomy } from "./mediationAutonomy.js";
 import { scanWorktreeActivity } from "./activity.js";
 import { VerificationService, completeVerificationSchema } from "./verifications.js";
+import { EvidenceService, withEvidence } from "./evidence/service.js";
+import { RestEvidenceConnector, evidenceCredentials, type EvidenceConnector } from "./evidence/connectors.js";
+import { registerEvidenceRoutes } from "./evidence/routes.js";
 
 export interface AppDependencies {
+  evidenceConnector?: EvidenceConnector;
   config?: ServerConfig;
   database?: ConsensusDatabase;
   runner: CommandRunner;
@@ -61,12 +65,20 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   const artifacts = new ArtifactStore(config.topicsDirectory, database);
   const git = new GitService(dependencies.runner);
   const verifications = new VerificationService(database, artifacts, config.dataDirectory);
+  const evidence = new EvidenceService(database.evidence, dependencies.evidenceConnector ?? new RestEvidenceConnector(evidenceCredentials()), source => {
+    for (const topic of database.listTopics()) {
+      if (topic.state === "CLOSED" || !database.evidence.list(topic.id).some(item => item.id === source.id)) continue;
+      database.appendEvent({ topicId: topic.id, actor: "system", kind: "system", state: topic.state,
+        body: `외부 원문 변경 감지: ${source.label}. 변경이 요구사항에 미치는 영향은 재확인이 필요합니다.`,
+        payload: { sourceId: source.id, contentHash: source.contentHash } });
+    }
+  });
   const workflow = new WorkflowEngine({
     database,
     artifacts,
     git,
-    claude: dependencies.claude,
-    codex: dependencies.codex,
+    claude: withEvidence(dependencies.claude, database, join(config.dataDirectory, "evidence-images")),
+    codex: withEvidence(dependencies.codex, database, join(config.dataDirectory, "evidence-images")),
     verifications,
     memory: new ProjectMemoryStore(config.memoryDirectory),
     executionLimits: config.executionLimits,
@@ -111,6 +123,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   });
 
   app.get("/api/health", async () => ({ ok: true }));
+  registerEvidenceRoutes(app, database, workflow, evidence, headers => { callOrigin({ headers }, "evidence:review"); });
   app.get("/api/config", async () => ({
     repositoryPath: config.repositoryPath,
     memoryDirectory: config.memoryDirectory,
@@ -479,6 +492,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   // 실수로 띄우면 포트 바인드에서 먼저 죽어야지, 첫 서버의 정상 작업을 회수(=강제 종료)하고
   // 죽으면 안 된다(2026-08-31 Codex 지적: 부팅 회수가 bind보다 먼저라 소유권 없이 남의 작업을 죽임).
   app.addHook("onListen", async () => {
+    evidence.start();
     await verifications.recoverExpired();
     await new ProcessSupervisor().recover(database.runningActions());
     database.recoverInterruptedActions();
@@ -492,6 +506,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   // 종료 순서: 새 요청 차단(shuttingDown) → 실행 중 에이전트 중단·원장 마감 → DB 닫기. DB 만 닫으면 에이전트 프로세스가
   // 고아로 남고 원장이 running 인 채 재시작 회수에 기대야 했다(2026-09-07 Codex 제안 ②).
   app.addHook("onClose", async () => {
+    await evidence.stop();
     const stopped = await workflow.shutdown();
     if (stopped > 0) process.stdout.write(`종료: 실행 중이던 action ${stopped}건을 중단하고 원장을 마감했습니다.\n`);
     database.close();

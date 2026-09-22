@@ -3486,7 +3486,8 @@ it("설명 길이와 마지막 쉼표 때문에 모델 교정을 요청하지 �
   core.startAction("topic-1", "plan", async signal => {
     result = await core.enforceResultContract("claude", database.getTopic("topic-1"),
       {kind:"PLAN",summary:"계획",planMarkdown:plan,findings:[],evidenceRefs:[]}, "session", {
-        signal, implementation:false, planMode:true, startedAfter:0, check:r => {core.requirePlan(r);},
+        signal, implementation:false, planMode:true, startedAfter:0,
+        evidenceDigest: database.evidence.topic(database.getTopic("topic-1")).digest, check:r => {core.requirePlan(r);},
       });
   });
   await waitForActionCompletion(database,"topic-1");
@@ -4312,4 +4313,93 @@ describe("Codex 3차 감사 R3-01 — 저장된 미완료 FIX 재사용 금지",
     expect(argumentLists.length).toBeGreaterThanOrEqual(3);
     expect(argumentLists.filter((args) => /\bawait\b/.test(args))).toEqual([]);
   });
+});
+
+it("원문 변경 뒤 교정 대기를 재개하면 옛 응답 대신 새 계획을 작성한다",async()=>{
+ const {database,dependencies}=makeEngine("DRAFT",null);
+ database.updateTopic("topic-1",{state:"CLAUDE_PLAN"});
+ const source=database.evidence.register("topic-1",{url:"https://team.atlassian.net/browse/APP-1",label:"Planning",mode:"connector",intervalSeconds:300});
+ const ingest=(content:string)=>{const check=database.evidence.begin(source.id,true)!;database.evidence.ingest(source.id,{checkId:check.checkId,revision:content,units:[{id:"issue",kind:"issue",content}]});};
+ ingest("old decision");
+ const original=normalizePlan(validPlan("old decision")).replace('"rules":[]','"rules":[],');
+ const updated=normalizePlan(validPlan("new decision"));
+ const calls:string[]=[];
+ dependencies.claude.createSession=async()=>{calls.push("create");return {sessionId:`partial-session-${calls.length}`,result:{kind:"PLAN",summary:"plan",planMarkdown:calls.length===1?original:updated,findings:[],evidenceRefs:[]}};};
+ dependencies.claude.resumePlanRepair=async turn=>{calls.push(`repair:${turn.sessionId}`);return {baseSHA256:hashPlan(original),edits:[{find:'"rules":[],',replace:'"rules":[]'}]};};
+ for(const id of ["a","b","c"])database.revisions.admit("topic-1",id,"revision");
+ let checked:AgentResult|undefined;
+ const run=(core:EngineCore)=>core.startAction("topic-1","test",async signal=>{
+  checked=await core.turn("claude",database.getTopic("topic-1"),"Write current plan",signal,false,{freshSession:true,check:r=>{if(r.planMarkdown?.includes('"rules":[],'))throw new ToleranceFormatError("부분 교정이 필요한 형식 오류");}});
+ });
+ run(new EngineCore(dependencies));await waitForActionCompletion(database,"topic-1");
+ expect(database.getTopic("topic-1").state).toBe("USER_DECISION_REQUIRED");expect(calls).toEqual(["create"]);
+ ingest("new decision");
+ database.revisions.grant("topic-1","allow",1);database.updateTopic("topic-1",{state:"CLAUDE_PLAN"});
+ run(new EngineCore(dependencies));await waitForActionCompletion(database,"topic-1");
+ expect(calls).toEqual(["create","create"]);
+ expect(checked?.planMarkdown,database.getTopic("topic-1").lastError??"").toBe(updated);
+ expect(await dependencies.artifacts.readLatest("topic-1","pending-contract-repair")).toContain("old decision");
+ database.close();
+});
+
+it("교정 호출 직전에 원문이 바뀌면 원본 응답을 보존하고 호출을 차단한다",async()=>{
+ const {database,dependencies}=makeEngine("DRAFT",null);
+ database.updateTopic("topic-1",{state:"CLAUDE_PLAN"});
+ const source=database.evidence.register("topic-1",{url:"https://team.atlassian.net/browse/APP-1",label:"Planning",mode:"connector",intervalSeconds:300});
+ const ingest=(content:string)=>{const check=database.evidence.begin(source.id,true)!;database.evidence.ingest(source.id,{checkId:check.checkId,revision:content,units:[{id:"issue",kind:"issue",content}]});};
+ ingest("old decision");
+ const original=normalizePlan(validPlan("old decision")).replace('"rules":[]','"rules":[],');
+ dependencies.claude.createSession=async()=>({sessionId:"partial-session",result:{kind:"PLAN",summary:"old decision",planMarkdown:original,findings:[],evidenceRefs:[]}});
+ let repairCalls=0;
+ dependencies.claude.resumePlanRepair=async()=>{repairCalls++;return {baseSHA256:hashPlan(original),edits:[{find:'"rules":[],',replace:'"rules":[]'}]};};
+ const write=dependencies.artifacts.write.bind(dependencies.artifacts);
+ dependencies.artifacts.write=async(...args)=>{
+  const result=await write(...args);if(args[1]==="plan-repair-source")ingest("new decision");return result;
+ };
+ let checked:AgentResult|undefined;
+ const core=new EngineCore(dependencies);
+ core.startAction("topic-1","test",async signal=>{
+  checked=await core.turn("claude",database.getTopic("topic-1"),"Write current plan",signal,false,{freshSession:true,check:()=>{throw new ToleranceFormatError("부분 교정이 필요한 형식 오류");}});
+ });
+ await waitForActionCompletion(database,"topic-1");
+ expect(repairCalls).toBe(0);expect(checked).toBeUndefined();
+ expect(database.getTopic("topic-1").state).toBe("BLOCKED_ON_EVIDENCE");
+ expect(await dependencies.artifacts.readLatest("topic-1","plan-repair-source")).toContain("old decision");
+ database.close();
+});
+
+it.each((["IMPLEMENTING", "CLAUDE_FIX"] as const).flatMap(stage =>
+ ["turn-result", "accepting", "accepted"].map(phase => ({ stage, phase, decision: false, remove: false }))).concat(
+ [false, true].map(remove => ({ stage: "CLAUDE_FIX" as const, phase: "accepted", decision: true, remove }))))(
+ "원문 변경이 %s 결과의 저장 중 발생하면 수락을 막고 재시도에서 새 결과를 받는다", async ({stage,phase,decision,remove}) => {
+ const kind=stage==="IMPLEMENTING"?"IMPLEMENTATION":"FIX";
+ const result=(summary:string):AgentResult=>({kind,summary,status:"completed",findings:[],evidenceRefs:[],toleranceLedger:[]});
+ const claude=new QueuedAdapter("claude",[result("old source result"),result("new source result")]);
+ const codex=new QueuedAdapter("codex",[{kind:stage==="IMPLEMENTING"?"REVIEW":"FINAL_REVIEW",summary:"reviewed",findings:[],evidenceRefs:[]}]);
+ const {database,engine,artifacts}=await makeReviewRecovery({resumeState:"CLAUDE_FIX",implementationFindings:[],originalReviewFindings:[],codexResult:{kind:"REVIEW",summary:"unused",findings:[],evidenceRefs:[]},claude,codex});
+ database.updateTopic("topic-1",{resumeState:stage});
+ const source=database.evidence.register("topic-1",{url:"https://team.atlassian.net/browse/APP-1",label:"Planning",mode:"connector",intervalSeconds:300});
+ const ingest=(content:string)=>{const check=database.evidence.begin(source.id,true)!;database.evidence.ingest(source.id,{checkId:check.checkId,revision:content,units:[{id:"issue",kind:"issue",content}]});};
+ const review=()=>{const topic=database.getTopic("topic-1");database.evidence.review(topic,database.evidence.topic(topic).digest,"Compared plan and sources",topic);};
+ ingest("old decision");review();
+ const originalDigest=database.evidence.topic(database.getTopic("topic-1")).digest;
+ const write=artifacts.write.bind(artifacts);let changed=false;
+ artifacts.write=async(...args)=>{const saved=await write(...args);
+  if(!changed&&args[1]==="work-checkpoint"&&JSON.parse(args[3]).phase===phase){changed=true;ingest("new decision");}
+  return saved;
+ };
+ engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");
+ expect(changed).toBe(true);expect(database.getTopic("topic-1").state,database.getTopic("topic-1").lastError??"").toBe("BLOCKED_ON_EVIDENCE");
+ expect(codex.calls).toHaveLength(0);
+ expect(JSON.parse((await artifacts.readLatest("topic-1","work-checkpoint"))!).work.evidenceDigest).toBe(originalDigest);
+ artifacts.write=write;
+ if(remove)database.evidence.detach("topic-1",source.id);
+ review();
+ if(decision)await engine.postMessage("topic-1","decision","현재 원문을 기준으로 계속 진행하세요.");
+ engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");
+ expect(claude.calls).toHaveLength(2);
+ const accepted=JSON.parse((await artifacts.readLatest("topic-1",stage==="IMPLEMENTING"?"implementation-result":"claude-fix"))!);
+ expect(accepted.summary).toContain("new source result");
+ expect(database.getTopic("topic-1").state,database.getTopic("topic-1").lastError??"").toBe("READY_TO_DELIVER");
+ database.close();
 });

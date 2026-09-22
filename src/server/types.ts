@@ -70,6 +70,8 @@ export interface CommandRunner {
 }
 
 export interface SessionTurn {
+  // A host evidence cache supplied the external sources. Do not open a second direct Figma connection.
+  evidenceManaged?: boolean;
   sessionId: string;
   prompt: string;
   cwd: string;

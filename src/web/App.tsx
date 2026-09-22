@@ -1,4 +1,5 @@
 import {ReviewPanel} from "./ReviewPanel";
+import { EvidencePanel } from "./EvidencePanel";
 import { RevisionPanel } from "./RevisionPanel";
 import { WorkGroupsPanel } from "./WorkGroupsPanel";
 import { BudgetPanel } from "./BudgetPanel";
@@ -535,6 +536,7 @@ export function App() {
         <aside className={`inspector-pane mobile-${mobilePanel}`}>
           {selected && detail ? (
             <Inspector
+              evidenceBusy={Boolean(busyAction) || Boolean(activity?.runningAction) || selected.state === "CLOSED"}
               budgetPaused={Boolean(activity?.budget?.pause || activity?.revisionPaused || activity?.reviewPaused)}
               detail={detail}
               findings={findings}
@@ -737,6 +739,7 @@ function MessageComposer({
 }
 
 function Inspector({
+  evidenceBusy,
   budgetPaused,
   detail,
   findings,
@@ -745,6 +748,7 @@ function Inspector({
   onAction,
   onDelivery,
 }: {
+  evidenceBusy: boolean;
   budgetPaused: boolean;
   detail: TopicDetail;
   findings: Finding[];
@@ -771,6 +775,7 @@ function Inspector({
 
   return (
     <div className="inspector-scroll">
+      <EvidencePanel key={topic.id} topicId={topic.id} busy={evidenceBusy} />
       <section className="inspector-section plan-section">
         <div className="section-heading">
           <div>

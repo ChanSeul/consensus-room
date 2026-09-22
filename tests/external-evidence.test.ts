@@ -1,0 +1,248 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { ConsensusDatabase } from "../src/server/database";
+import { parseEvidenceSource, type EvidenceSourceInput, type EvidenceUnitInput } from "../src/shared/externalEvidence";
+import { EvidenceService, withEvidence } from "../src/server/evidence/service";
+import { RestEvidenceConnector } from "../src/server/evidence/connectors";
+import type { AgentAdapter } from "../src/server/types";
+
+// Public contracts: source ingestion -> topic freshness/gates, packet -> actual adapter prompt,
+// and provider HTTP -> complete snapshots. Fake boundaries model pagination, edits, failure and late replies.
+// No pre-existing implementation exists to restore for RED. UI pixels/live provider auth are separate checks.
+const roots: string[] = []; const databases: ConsensusDatabase[] = [];
+afterEach(() => { vi.restoreAllMocks(); for (const db of databases.splice(0)) db.close(); for (const path of roots.splice(0)) rmSync(path, { recursive: true, force: true }); });
+const sourceInput: EvidenceSourceInput = { url: "https://team.slack.com/archives/C123/p1789709010013729", label: "Planning", mode: "connector", intervalSeconds: 300 };
+function setup() {
+  const root = mkdtempSync(join(tmpdir(), "evidence-")); roots.push(root);
+  const db = new ConsensusDatabase(join(root, "room.sqlite")); databases.push(db);
+  const topic = db.createTopic({ id: "topic", slug: "topic", title: "Evidence", repositoryPath: root, worktreePath: root, baseRef: "main", branchName: null,
+    state: "AWAITING_USER_APPROVAL", scopeGeneration: 1, planRevision: 1, planSHA256: "a".repeat(64), approvedPlanSHA256: "a".repeat(64),
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), lastError: null });
+  const source = db.evidence.register(topic.id, sourceInput);
+  const ingest = (units: EvidenceUnitInput[], revision = "r1") => {
+    const check = db.evidence.begin(source.id, true)!;
+    return db.evidence.ingest(source.id, { checkId: check.checkId, revision, units });
+  };
+  return { root, db, topic, source, ingest };
+}
+const unit = (id: string, content: string): EvidenceUnitInput => ({ id, kind: "message", content, author: "Owner" });
+const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lWQAAAAASUVORK5CYII=";
+
+describe("source identity and persistent content cache", () => {
+  it("normalizes link variants and isolates different resources", () => {
+    const { db, topic, source } = setup();
+    const again = db.evidence.register(topic.id, { ...sourceInput, url: `${sourceInput.url}?thread_ts=1789709010.013729&cid=C123` });
+    expect(again.id).toBe(source.id); expect(db.evidence.list()).toHaveLength(1);
+    const other = db.evidence.register(topic.id, { ...sourceInput, url: sourceInput.url.replace("team.slack", "other.slack") });
+    expect(other.id).not.toBe(source.id);
+    expect(() => parseEvidenceSource({ ...sourceInput, url: "https://team.slack.com.evil.test/archives/C123/p1789709010013729" })).toThrow();
+    expect(() => parseEvidenceSource({ ...sourceInput, url: "https://user:secret@team.atlassian.net/browse/APP-1" })).toThrow();
+    expect(() => parseEvidenceSource({ ...sourceInput, url: "https://www.figma.com/design/abc/Name" })).toThrow();
+  });
+  it("timestamps and revision bumps alone do not resend content; deletion does", () => {
+    const { db, topic, source, ingest } = setup();
+    const first = ingest([{ ...unit("1", "Decision"), changedAt: "old" }, unit("2", "Question")]);
+    const packet = db.evidence.packet(topic, "claude"); db.evidence.receipt(topic, "claude", "s1", packet.delivered);
+    const second = ingest([unit("2", "Question"), { ...unit("1", "Decision"), changedAt: "new" }], "r2");
+    expect(second.contentHash).toBe(first.contentHash);
+    expect(db.evidence.packet(topic, "claude", "s1").text).not.toContain('"content":"Decision"');
+    ingest([unit("1", "Changed")]);
+    const changed = db.evidence.packet(topic, "claude", "s1");
+    expect(changed.text).toContain('"content":"Changed"'); expect(changed.text).toContain('"removedUnitId":"2"');
+    expect(db.evidence.snapshot(source.id, first.contentHash!)?.units).toHaveLength(2);
+    db.evidence.receipt(topic, "claude", "s1", changed.delivered);
+    expect(db.evidence.packet(topic, "claude", "s1").text).not.toContain("removedUnitId");
+    expect(db.evidence.packet(topic, "codex", "s1").text).toContain('"content":"Changed"');
+  });
+  it("leases suppress duplicate readers and reject late responses after expiry", () => {
+    const { db, source } = setup(); let now = Date.now(); vi.spyOn(Date, "now").mockImplementation(() => now);
+    const first = db.evidence.begin(source.id, true)!;
+    expect(db.evidence.begin(source.id, true)).toBeNull();
+    now += 240_001;
+    const renewed = db.evidence.begin(source.id, true)!;
+    expect(renewed.checkId).not.toBe(first.checkId);
+    expect(() => db.evidence.ingest(source.id, { checkId: first.checkId, revision: "expired", units: [] })).toThrow("이전 확인");
+    expect(() => db.evidence.ingest(source.id, { checkId: "00000000-0000-4000-8000-000000000000", revision: "old", units: [unit("1", "stale")] })).toThrow("이전 확인");
+    db.evidence.ingest(source.id, { checkId: renewed.checkId, revision: "ok", units: [] });
+    const next = db.evidence.begin(source.id, true)!;
+    expect(() => db.evidence.ingest(source.id, { checkId: first.checkId, revision: "late", units: [] })).toThrow("이전 확인");
+    db.evidence.failed(source.id, next.checkId, "Access denied");
+    expect(db.evidence.get(source.id).error).toBe("Access denied");
+    expect(db.evidence.begin(source.id, true)).toBeNull();
+  });
+  it("binds review to current content AND plan/scope, failures never mark old content fresh", () => {
+    const { db, topic, source, ingest } = setup(); const first = ingest([unit("1", "A")]);
+    const deps = [{ sourceId: source.id, contentHash: first.contentHash! }];
+    expect(db.evidence.status(deps)).toBe("current");
+    expect(() => db.evidence.assertReady(topic)).toThrow("검토");
+    db.evidence.review(topic, db.evidence.topic(topic).digest, "확정 내용과 계획 대조", topic); db.evidence.assertReady(topic);
+    expect(() => db.evidence.assertReady({ ...topic, planEpoch: topic.planEpoch + 1 })).toThrow("검토");
+    ingest([unit("1", "B")]); expect(db.evidence.status(deps)).toBe("changed");
+    expect(() => db.evidence.assertReady(topic)).toThrow("검토");
+    const check = db.evidence.begin(source.id, true)!; db.evidence.failed(source.id, check.checkId, "429");
+    expect(db.evidence.status(deps)).toBe("unavailable");
+    expect(() => db.evidence.review(topic, db.evidence.topic(topic).digest, "ignore", topic)).toThrow("최신");
+  });
+  it("does not partially replace a source on duplicate units or invalid screenshots", () => {
+    const { db, source, ingest } = setup(); ingest([unit("1", "A")]);
+    const check = db.evidence.begin(source.id, true)!;
+    expect(() => db.evidence.ingest(source.id, { checkId: check.checkId, revision: "r2", units: [unit("1", "B"), unit("1", "C")] })).toThrow("중복");
+    expect(() => db.evidence.ingest(source.id, { checkId: check.checkId, revision: "r2", units: [{ ...unit("1", "B"), imageBase64: "not png" }] })).toThrow("PNG");
+    expect(db.evidence.snapshot(source.id)?.units[0].content).toBe("A");
+  });
+  it("persists receipts and snapshots across database reopening", () => {
+    const { db, root, topic, source, ingest } = setup(); ingest([unit("1", "Kept")]);
+    db.evidence.receipt(topic, "claude", "session", db.evidence.packet(topic, "claude").delivered);
+    const reopened = new ConsensusDatabase(join(root, "room.sqlite")); databases.push(reopened);
+    expect(reopened.evidence.packet(topic, "claude", "session").text).not.toContain('"content":"Kept"');
+    expect(reopened.evidence.snapshot(source.id)?.units[0].content).toBe("Kept");
+    expect(reopened.evidence.packet(topic, "claude", "new").text).toContain('"content":"Kept"');
+  });
+});
+
+describe("delivery to real adapter boundary", () => {
+  it("sends only delta after successful response, repeats after failure, isolates new sessions", async () => {
+    const { db, root, topic, ingest } = setup(); ingest([unit("1", "A"), { ...unit("2", "Image"), kind: "render", imageBase64: png }]);
+    const prompts: string[] = []; const readablePaths: string[][] = []; let fail = true;
+    const raw: AgentAdapter = { role: "claude", validateExistingSession: async () => true,
+      createSession: async () => { throw new Error("unused"); }, resumeTurn: async turn => {
+        prompts.push(turn.prompt); readablePaths.push([...(turn.readablePaths ?? [])]); expect(turn.evidenceManaged).toBe(true);
+        if (fail) throw new Error("failure");
+        return { kind: "IMPLEMENTATION", summary: "done", findings: [] } as any;
+      } };
+    const adapter = withEvidence(raw, db, join(root, "images"));
+    const turn = { sessionId: "session", cwd: root, prompt: "Implement" };
+    await expect(adapter.resumeTurn(turn)).rejects.toThrow("failure"); fail = false;
+    await adapter.resumeTurn(turn); await adapter.resumeTurn(turn);
+    expect(prompts[1]).toContain('"content":"A"'); expect(prompts[1]).toContain(".png");
+    expect(prompts[2]).not.toContain('"content":"A"'); expect(prompts[2]).not.toContain(".png");
+    expect(readablePaths[2]).toEqual(readablePaths[1]); // Later verification can read the local cache, without a remote fetch.
+    ingest([unit("1", "B")]); await adapter.resumeTurn(turn);
+    expect(prompts[3]).toContain('"content":"B"'); expect(prompts[3]).toContain("removedUnitId");
+    expect(db.evidence.packet(topic, "claude", "new-session").text).toContain('"content":"B"');
+  });
+  it("does not acknowledge a cancelled late model response", async () => {
+    const { db, root, topic, ingest } = setup(); ingest([unit("1", "A")]);
+    const abort = new AbortController();
+    const raw: AgentAdapter = { role: "codex", validateExistingSession: async () => true,
+      createSession: async () => { abort.abort(); return { sessionId: "cancelled", result: {} as any }; }, resumeTurn: async () => ({} as any) };
+    await withEvidence(raw, db, join(root, "images")).createSession({ cwd: root, prompt: "P", signal: abort.signal });
+    expect(db.evidence.packet(topic, "codex", "cancelled").text).toContain('"content":"A"');
+  });
+});
+
+describe("read-only provider collection", () => {
+  it("reads all Slack pages and retains edited messages while dropping reaction noise", async () => {
+    const { source } = setup(); const urls: string[] = [];
+    const request = vi.fn(async (url: any, options: any) => {
+      urls.push(String(url)); expect(options.redirect).toBe("error"); expect(options.method).toBeUndefined();
+      return Response.json(urls.length === 1
+        ? { ok: true, messages: [{ ts: source.selector, text: "old", reactions: [1] }], response_metadata: { next_cursor: "next" } }
+        : { ok: true, messages: [{ ts: "2", text: "edit", edited: { ts: "3" }, user: "owner" }], response_metadata: {} });
+    });
+    const connector = new RestEvidenceConnector({ slackToken: "secret", slackWorkspace: "team.slack.com" }, request as typeof fetch);
+    const result = await connector.fetch(source, null, new AbortController().signal);
+    expect(result.units).toHaveLength(2); expect(result.units![1].changedAt).toBe("3");
+    expect(result.units![0].content).not.toContain("reactions"); expect(urls[1]).toContain("cursor=next");
+  });
+  it("does not accept incomplete Slack pages or leak provider error bodies", async () => {
+    const { source } = setup();
+    const incomplete = new RestEvidenceConnector({ slackToken: "secret", slackWorkspace: "team.slack.com" }, vi.fn(async () => Response.json({ ok: true, messages: [], has_more: true })) as typeof fetch);
+    await expect(incomplete.fetch(source, null, new AbortController().signal)).rejects.toThrow("일부");
+    const limited = new RestEvidenceConnector({ slackToken: "secret", slackWorkspace: "team.slack.com" }, vi.fn(async () => new Response("secret content", { status: 429, headers: { "retry-after": "900" } })) as typeof fetch);
+    await expect(limited.fetch(source, null, new AbortController().signal)).rejects.toMatchObject({ retryAfterSeconds: 900 });
+    await expect(limited.fetch(source, null, new AbortController().signal)).rejects.not.toThrow("secret");
+  });
+  it("uses Jira revision probes; paginates comments and rejects an update during collection", async () => {
+    const { db, topic } = setup();
+    const source = db.evidence.register(topic.id, { ...sourceInput, url: "https://team.atlassian.net/browse/APP-12" });
+    const calls: string[] = []; let finalRevision = "r1"; let commentText = "Decision";
+    const request = vi.fn(async (url: any) => {
+      const text = String(url); calls.push(text);
+      if (text.endsWith("fields=updated")) return Response.json({ fields: { updated: calls.length > 1 ? finalRevision : "r1" } });
+      if (text.includes("/comment")) {
+        const startAt = Number(new URL(text).searchParams.get("startAt"));
+        return Response.json({ startAt, total: 2, comments: [{ id: startAt === 0 ? "c1" : "c2", body: { text: startAt === 0 ? commentText : "Latest owner reply" }, author: { displayName: "Owner" } }] });
+      }
+      return Response.json({ fields: { updated: "r1", summary: "Feature", description: { text: "A" } } });
+    });
+    const connector = new RestEvidenceConnector({ jiraSite: "https://team.atlassian.net", jiraEmail: "test", jiraToken: "secret" }, request as typeof fetch);
+    const initial = await connector.fetch(source, null, new AbortController().signal);
+    expect(initial.units).toHaveLength(3);
+    expect(initial.units?.some(unit => unit.content.includes("Latest owner reply"))).toBe(true);
+    calls.length = 0;
+    const cached = { sourceId: source.id, contentHash: "h", units: initial.units!.map(unit => ({ ...unit, contentHash: "h" })) };
+    commentText = "Edited decision";
+    const refreshed = await connector.fetch({ ...source, revision: "r1" }, cached, new AbortController().signal);
+    expect(refreshed.units).toHaveLength(3);
+    expect(refreshed.units?.find(unit => unit.id === "comment:c1")?.content).toContain("Edited decision");
+    expect(calls).toHaveLength(4); expect(calls.some(url => url.includes("fields=summary"))).toBe(false);
+    expect(calls.some(url => url.includes("/comment"))).toBe(true);
+    calls.length = 0; finalRevision = "r2";
+    await expect(connector.fetch(source, null, new AbortController().signal)).rejects.toThrow("변경");
+  });
+  it("does not fetch Figma nodes/images again for unchanged versions but checks comments", async () => {
+    const { db, topic } = setup();
+    const source = db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc/Name?node-id=1-2" });
+    const urls: string[] = [];
+    const request = vi.fn(async (url: any) => {
+      urls.push(String(url));
+      if (String(url).endsWith("/meta")) return Response.json({ file: { version: "v1" } });
+      if (String(url).endsWith("/comments")) return Response.json({ comments: [{ id: "1", message: "New policy", user: { handle: "Designer" } }] });
+      throw new Error("must not fetch content");
+    });
+    const connector = new RestEvidenceConnector({ figmaToken: "secret" }, request as typeof fetch);
+    const result = await connector.fetch({ ...source, revision: "v1" }, { sourceId: source.id, contentHash: "h", units: [{ id: "node:1:2", kind: "design", content: "old node", contentHash: "h" }] }, new AbortController().signal);
+    expect(urls).toHaveLength(2); expect(result.units?.some(u => u.content.includes("New policy"))).toBe(true);
+  });
+  it("single-flights polling", async () => {
+    const { db, topic } = setup(); const source = db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc/Name?node-id=1-2", mode: "rest" });
+    let release!: () => void; const pending = new Promise<void>(resolve => { release = resolve; });
+    const fetch = vi.fn(async () => { await pending; return { revision: "v1", units: [unit("1", "A")] }; });
+    const service = new EvidenceService(db.evidence, { fetch });
+    const first = service.refresh(source.id); const second = service.refresh(source.id);
+    expect(fetch).toHaveBeenCalledTimes(1); release(); await Promise.all([first, second]);
+    expect(db.evidence.topic(topic).sources.find(s => s.id === source.id)?.contentHash).not.toBeNull();
+    await service.stop();
+  });
+});
+
+it("reuses the selected Figma subtree and PNG when only another screen changed", async () => {
+  const { db, topic } = setup();
+  const source = db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc/Name?node-id=1-2", mode: "rest" });
+  let version = "v1"; const urls: string[] = [];
+  const request = vi.fn(async (url: any, options: any) => {
+    const value = String(url); urls.push(value);
+    if (value.endsWith("/meta")) return Response.json({ file: { version } });
+    if (value.endsWith("/comments")) return Response.json({ comments: [] });
+    if (value.includes("/nodes?")) return Response.json({ nodes: { "1:2": { document: { id: "1:2", type: "FRAME", name: "Screen", children: [{ id: "1:3", type: "TEXT", characters: "Policy" }] } } } });
+    if (value.includes("/images/")) return Response.json({ images: { "1:2": "https://assets.figma.com/design.png" } });
+    expect(options.headers).toBeUndefined();
+    return new Response(Buffer.from(png, "base64"));
+  });
+  const service = new EvidenceService(db.evidence, new RestEvidenceConnector({ figmaToken: "secret" }, request as typeof fetch));
+  await service.refresh(source.id, true);
+  const first = db.evidence.get(source.id); expect(first.error).toBeNull();
+  db.evidence.receipt(topic, "claude", "session", db.evidence.packet(topic, "claude").delivered);
+  version = "v2"; await service.refresh(source.id, true);
+  expect(db.evidence.get(source.id)).toMatchObject({ error: null, revision: "v2", contentHash: first.contentHash });
+  expect(urls.filter(url => url.includes("/images/"))).toHaveLength(1);
+  expect(urls.filter(url => url.endsWith("design.png"))).toHaveLength(1);
+  expect(db.evidence.packet(topic, "claude", "session").images).toHaveLength(0);
+  await service.stop();
+});
+it("tells an existing session when its last source was removed", async () => {
+  const { db, root, topic, source, ingest } = setup(); ingest([unit("1", "Old source")]);
+  const prompts: string[] = [];
+  const raw: AgentAdapter = { role: "claude", validateExistingSession: async () => true,
+    createSession: async () => { throw new Error("unused"); }, resumeTurn: async turn => { prompts.push(turn.prompt); return {} as any; } };
+  const adapter = withEvidence(raw, db, join(root, "images"));
+  await adapter.resumeTurn({ sessionId: "s", cwd: root, prompt: "Read" });
+  db.evidence.detach(topic.id, source.id);
+  await adapter.resumeTurn({ sessionId: "s", cwd: root, prompt: "Continue" });
+  expect(prompts[1]).toContain(`"removedSourceId":"${source.id}"`);
+  await adapter.resumeTurn({ sessionId: "s", cwd: root, prompt: "Continue" });
+  expect(prompts[2]).toBe("Continue");
+});

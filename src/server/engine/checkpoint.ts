@@ -22,6 +22,7 @@ import { decisionRequestTexts, renderOpenRequests, type OpenRequest } from "./co
 import type { EngineCore } from "./core.js";
 
 export const WORK_CHECKPOINT_KIND = "work-checkpoint";
+export const EMPTY_EVIDENCE_DIGEST = createHash("sha256").update("[]").digest("hex");
 
 export type WorkKind = "IMPLEMENTATION" | "FIX";
 export type WorkResumeState = "IMPLEMENTING" | "CLAUDE_FIX";
@@ -33,6 +34,7 @@ export interface WorkBinding {
   planEpoch: number;
   planSHA256: string | null;
   sessionId: string | null;
+  evidenceDigest?: string;
   // 수정 작업의 원본 리뷰(종류#산출물 revision) — 리뷰마다 새 논리 작업이다. 회차 번호(1·2)로는 사용자 승인으로 연 3차 수정이 2차와 같은 작업이 됐다(CF-03).
   fixSource?: string;
 }
@@ -96,9 +98,13 @@ export function parseRenderedRequests(text: string): Array<{ id: string; text: s
 
 // 논리 작업 id — 구현 세대(계획 epoch·sha 포함) 또는 수정 회차. 복구·확인 횟수·중복 재소비의 공통 기준.
 export function workId(binding: WorkBinding): string {
-  const base = `${binding.kind}:g${binding.scopeGeneration}:e${binding.planEpoch}:${(binding.planSHA256 ?? "-").slice(0, 12)}:${binding.resumeState}`;
+  const source = workEvidenceDigest(binding);
+  const base = `${binding.kind}:g${binding.scopeGeneration}:e${binding.planEpoch}:${(binding.planSHA256 ?? "-").slice(0, 12)}:${binding.resumeState}${source === EMPTY_EVIDENCE_DIGEST ? "" : `:evidence:${source}`}`;
   return binding.kind === "FIX" ? `${base}:${binding.fixSource ?? "fix?"}` : base;
 }
+
+// Older checkpoints predate source registration. They may only resume a work item with no external sources.
+export function workEvidenceDigest(binding: WorkBinding): string { return binding.evidenceDigest ?? EMPTY_EVIDENCE_DIGEST; }
 
 export interface Accumulation {
   result: AgentResult;
@@ -181,6 +187,7 @@ export class WorkCheckpoints {
     return {
       kind, resumeState: kind === "IMPLEMENTATION" ? "IMPLEMENTING" : "CLAUDE_FIX", scopeGeneration: topic.scopeGeneration,
       planEpoch: topic.planEpoch, planSHA256: topic.planSHA256, sessionId, ...(fixSource !== undefined ? { fixSource } : {}),
+      evidenceDigest: this.core.dependencies.database.evidence.topic(topic).digest,
     };
   }
 
@@ -263,6 +270,9 @@ function parseCheckpoint(revision: number, raw: string | null): WorkCheckpoint {
     throw new CheckpointCorrupt(revision, "필드 누락");
   }
   const accumulated = AgentResultSchema.safeParse(record.accumulated);
+  if (record.work.evidenceDigest !== undefined && (typeof record.work.evidenceDigest !== "string" || !/^[a-f0-9]{64}$/.test(record.work.evidenceDigest))) {
+    throw new CheckpointCorrupt(revision, "외부 근거 해시가 올바르지 않음");
+  }
   if (!accumulated.success) throw new CheckpointCorrupt(revision, "누적 결과가 계약을 어김");
   return { ...(record as WorkCheckpoint), accumulated: accumulated.data, revision };
 }

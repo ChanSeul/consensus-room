@@ -14,13 +14,14 @@ import {
 import { EXECUTION_POLICY_NOTE } from "../../shared/prompts.js";
 import type { AgentAdapter, CommandRunner, CommandResult, CreatedSession, SessionTurn } from "../types.js";
 import { agentEnvironment } from "../security.js";
-import { ProjectMemoryReader } from "../projectMemory.js";
+import { ProjectMemoryReader, type MemoryReaderOptions } from "../projectMemory.js";
 import { readAppliedInstructions } from "../projectInstructions.js";
 import { describeCommandFailure, parsePlanRepair, parseAgentResult, isZeroTurnResult } from "./resultParser.js";
 import { ExecutionMetrics } from "./executionMetrics.js";
 import { createToolTimeMeter } from "./toolTime.js";
 
 export interface ClaudeAdapterOptions {
+  memoryReaderOptions?: MemoryReaderOptions;
   // 정책 3(자기 규칙 변경 차단) 방어 심층화: sandbox 기본 거부에만 의존하지 않고 명시 deny로 회귀를 막는다.
   protectedWritePaths?: readonly string[];
   // v1 MCP allowlist: Figma Dev Mode 서버의 읽기 메서드만. null이면 MCP 전면 차단(기존과 동일).
@@ -75,7 +76,7 @@ export class ClaudeAdapter implements AgentAdapter {
     memoryDirectory?: string,
     private readonly options: ClaudeAdapterOptions = {},
   ) {
-    this.memory = memoryDirectory ? new ProjectMemoryReader(memoryDirectory) : null;
+    this.memory = memoryDirectory ? new ProjectMemoryReader(memoryDirectory, options.memoryReaderOptions) : null;
   }
 
   async createSession(turn: Omit<SessionTurn, "sessionId">): Promise<CreatedSession> {
@@ -121,7 +122,7 @@ export class ClaudeAdapter implements AgentAdapter {
     try {
       const permissionMode = turn.implementation ? "dontAsk" : (turn.planMode ? "plan" : "dontAsk");
       const executionSettings = turn.settings ?? DEFAULT_AGENT_SETTINGS.claude;
-      const figmaMcpUrl = this.options.figmaMcpUrl ?? null;
+      const figmaMcpUrl = turn.evidenceManaged ? null : this.options.figmaMcpUrl ?? null;
       // 빈 객체 {}는 실 CLI가 "Invalid MCP configuration"으로 거부한다(실측). mcpServers 키는 항상 있어야 한다.
       const mcpConfig = {
         mcpServers: figmaMcpUrl ? { "figma-desktop": { type: "http", url: figmaMcpUrl } } : {},
@@ -131,7 +132,7 @@ export class ClaudeAdapter implements AgentAdapter {
       // 웹은 계획 턴에만 연다 — 외부 증거(1차 자료) 수집이 계획 수렴의 정당한 기능이라서다.
       // 구현 턴은 코드 쓰기 접근과 웹이 결합해 유출 표면이 가장 커서 닫는다(2026-08-31 Codex 지적, 정책 c).
       const baseTools = "Read,Glob,Grep,Bash,Skill";
-      const planningTools = `${baseTools},WebSearch,WebFetch`;
+      const planningTools = turn.evidenceManaged ? baseTools : `${baseTools},WebSearch,WebFetch`;
       const { pluginDirectory, skillSourceDirectories } = await this.prepareManagedPlugin();
       const args = [
         "-p",
@@ -377,6 +378,7 @@ export function buildIsolationSettings(
     permissions: {
       allow: [
         `Read(${permissionPath(workspace)}/**)`,
+        ...(options.readablePaths ?? []).map(path => `Read(${permissionPath(path)})`),
         `Edit(${permissionPath(workspace)}/**)`,
         `Write(${permissionPath(workspace)}/**)`,
         "Glob",

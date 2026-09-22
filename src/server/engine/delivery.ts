@@ -41,7 +41,7 @@ import {
 import { HandledWorkflowInterruption, type ResultNormalizer, type EngineCore } from "./core.js";
 import type { TurnExpectation, WriteGuards } from "./turnExecutor.js";
 import {
-  accumulate, checkpointOpenRequests, requestId, workId, CheckpointCorrupt, type Accumulation, type RecoveredWork, type WorkBinding, type WorkCheckpoint, type WorkKind,
+  accumulate, checkpointOpenRequests, requestId, workId, workEvidenceDigest, EMPTY_EVIDENCE_DIGEST, CheckpointCorrupt, type Accumulation, type RecoveredWork, type WorkBinding, type WorkCheckpoint, type WorkKind,
 } from "./checkpoint.js";
 import { acceptResult, completionVerdict, decisionRequestTexts, renderOpenRequests, type AcceptedResult, type CompletionVerdict, type OpenRequest } from "./completion.js";
 import type { DiagnosisRecord } from "../../shared/diagnoses.js";
@@ -92,6 +92,7 @@ interface WorkSeed {
 }
 // 턴을 흡수한 뒤의 상태 — 완료 판정할 누적 결과가 있다.
 interface WorkState extends WorkSeed { base: AgentResult }
+type EvidenceBoundExpectation = TurnExpectation & { evidenceDigest: string };
 
 function renderReport(result: AgentResult): string {
   return `# ${result.kind}\n\n${result.summary}\n\n## Findings\n\n\`\`\`json\n${JSON.stringify(result.findings, null, 2)}\n\`\`\`\n\n## Evidence\n\n${result.evidenceRefs.map((item) => `- ${item}`).join("\n") || "- 없음"}\n`;
@@ -233,7 +234,8 @@ export class DeliveryPipeline {
   private async runWork(setup: WorkSetup, signal: AbortSignal): Promise<void> {
     const { topicId, topic } = setup;
     const db = this.core.dependencies.database;
-    const expected = { state: setup.work.resumeState, scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch, planSHA256: topic.planSHA256 };
+    const expected = { state: setup.work.resumeState, scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch, planSHA256: topic.planSHA256, evidenceDigest: workEvidenceDigest(setup.work) };
+    this.assertWorkEvidence(setup);
     const writeGuards: WriteGuards = { requireApprovedPlan: true, baselineHead: setup.baselineHead, toolTreeBaseline: setup.toolTreesBefore };
     // 1) 복구 — 논리 작업(workId)의 최신 checkpoint. 손상이면 보존한 채 멈춘다. 없으면 옛 산출물(legacy)에서 바탕을 만든다.
     let recovered: RecoveredWork | null;
@@ -243,6 +245,18 @@ export class DeliveryPipeline {
       if (!(error instanceof CheckpointCorrupt)) throw error;
       this.core.interrupt(topicId, "USER_DECISION_REQUIRED", error.message, setup.work.resumeState, { checkpointCorrupt: error.revision });
       return;
+    }
+    // 직전 작업 checkpoint(같은 세대·계획 주기의 최신 checkpoint 가 다른 작업의 것) — 열린 요청 승계와 반박 검사의 근거다. 손상이면 복구와 같은 규칙으로 보존한
+    // 채 멈춘다 — 삼키면 그 작업의 열린 요청·반박을 잃은 채 새 작업을 열었다(2026-09-15 감사 5차 #3).
+    let previous: WorkCheckpoint | null = null;
+    if (!recovered) {
+      try {
+        previous = await this.previousWorkCheckpoint(topic, setup.work);
+      } catch (error) {
+        if (!(error instanceof CheckpointCorrupt)) throw error;
+        this.core.interrupt(topicId, "USER_DECISION_REQUIRED", error.message, setup.work.resumeState, { checkpointCorrupt: error.revision });
+        return;
+      }
     }
     let seed: WorkSeed;
     // 이 action 안에서 워킹트리 대조(허용 오차)를 통과한 누적본인가 — 복구·확인 경로로 왔으면 수락 전에 다시 대조한다(읽기 전용 확인 턴 뒤에
@@ -292,28 +306,18 @@ export class DeliveryPipeline {
     } else if (setup.carriedSeed) {
       seed = await setup.carriedSeed();
     } else {
+      const trackedSources = workEvidenceDigest(setup.work) !== EMPTY_EVIDENCE_DIGEST
+        || (previous !== null && workEvidenceDigest(previous.work) !== EMPTY_EVIDENCE_DIGEST);
       const legacy = await setup.legacyBase();
       const asked = legacy.base ? decisionRequestTexts(legacy.base) : [];
       seed = {
-        base: legacy.base, verifiedLedger: legacy.ledger, confirmations: 0,
+        base: trackedSources ? null : legacy.base, verifiedLedger: trackedSources ? [] : legacy.ledger, confirmations: 0,
         // 옛 산출물의 요청은 제시 시점을 모른다 — 0 으로 두면 그 뒤의 모든 결정이 "요청 뒤 결정" 이 되어 해소 확인을 거친다.
         openRequests: asked.map((text) => ({ id: requestId(text, 0), text, askedAfterSequence: 0 })),
       };
-      if (legacy.base) {
+      if (seed.base) {
         this.core.event(topicId, "system", "system",
           "직전 턴이 교정·계속 진행 도중 끊겨 보존해 둔 미완료 보고(요약·쟁점·증거·요청 결정)를 이번 재개 결과에 병합합니다.", { pendingCorrectionMerged: true });
-      }
-    }
-    // 직전 작업 checkpoint(같은 세대·계획 주기의 최신 checkpoint 가 다른 작업의 것) — 열린 요청 승계와 반박 검사의 근거다. 손상이면 복구와 같은 규칙으로 보존한
-    // 채 멈춘다 — 삼키면 그 작업의 열린 요청·반박을 잃은 채 새 작업을 열었다(2026-09-15 감사 5차 #3).
-    let previous: WorkCheckpoint | null = null;
-    if (!recovered || !seed.base) {
-      try {
-        previous = await this.previousWorkCheckpoint(topic, setup.work);
-      } catch (error) {
-        if (!(error instanceof CheckpointCorrupt)) throw error;
-        this.core.interrupt(topicId, "USER_DECISION_REQUIRED", error.message, setup.work.resumeState, { checkpointCorrupt: error.revision });
-        return;
       }
     }
     // 논리 작업이 바뀌어(진단 추가·정정으로 수정 원본이 바뀜, 허용 오차 개정 등) 이 작업의 checkpoint 가 없으면, 같은 세대·같은 계획 주기의 최신 checkpoint 에 남은 열린 요청을
@@ -567,7 +571,7 @@ export class DeliveryPipeline {
   // 반환 null = 허용 오차 위반이 남아 정지했다(인터럽트·보존 완료).
   private async absorbTurn(
     setup: WorkSetup, work: WorkBinding, state: WorkSeed, raw: AgentResult, sessionId: string,
-    expected: TurnExpectation, writeGuards: WriteGuards, signal: AbortSignal,
+    expected: EvidenceBoundExpectation, writeGuards: WriteGuards, signal: AbortSignal,
     // 새 턴 응답이면 0(결과마다 확인 1회), 재대조(같은 결과)면 지금 값을 유지한다.
     confirmations = 0,
   ): Promise<WorkState | null> {
@@ -592,6 +596,7 @@ export class DeliveryPipeline {
     normalize.carried = () => setup.carry.carried?.() ?? [];
     normalize.label = setup.carry.label;
     const contracted = await this.core.enforceResultContract("claude", topic, raw, sessionId, {
+      evidenceDigest: workEvidenceDigest(work),
       signal, implementation: true, planMode: false, startedAfter: setup.inputSequence, check: setup.check, readablePaths: setup.readablePaths,
       normalize, writeGuards,
       beforeCorrection: async (rejected) => {
@@ -698,7 +703,9 @@ export class DeliveryPipeline {
       work, phase: "accepting", accumulated: base, verifiedLedger: state.verifiedLedger, inputSequence: setup.inputSequence,
       openRequests: state.openRequests, confirmations: state.confirmations, worktree,
     }, signal);
+    this.assertWorkEvidence(setup);
     await this.core.saveAgentOutput(topic, "claude", base, setup.resultKind, signal, { acceptId: accepting.revision });
+    this.assertWorkEvidence(setup);
     await this.core.checkpoints.record(topic, {
       work, phase: "accepted", accumulated: base, verifiedLedger: state.verifiedLedger, inputSequence: setup.inputSequence,
       openRequests: state.openRequests, confirmations: state.confirmations, acceptId: accepting.revision, worktree,
@@ -711,6 +718,7 @@ export class DeliveryPipeline {
   // 재개가 수락 checkpoint 를 보고 반영 턴을 연다.
   private async completeAcceptance(setup: WorkSetup, accepted: AcceptedResult, acceptId: number, inputSequence: number): Promise<void> {
     await setup.accept.persist(accepted, acceptId);
+    this.assertWorkEvidence(setup);
     if (this.core.interruptForNewUserInput(setup.topic, inputSequence)) {
       this.core.event(setup.topic.id, "system", "system", "수락 절차 도중 새 결정·증거가 도착해 채택·전이를 멈췄습니다(결과·산출물은 보존됨) — 재시도가 결정을 반영하는 턴을 엽니다.",
         { acceptInterrupted: acceptId });
@@ -723,6 +731,15 @@ export class DeliveryPipeline {
     await setup.accept.continue(accepted);
   }
 
+  private assertWorkEvidence(setup: WorkSetup): void {
+    const current = this.core.dependencies.database.getTopic(setup.topicId);
+    const evidence = this.core.dependencies.database.evidence.topic(current);
+    if (!evidence.ready || !evidence.reviewed || evidence.digest !== workEvidenceDigest(setup.work)) {
+      this.core.interrupt(setup.topicId, "BLOCKED_ON_EVIDENCE", "구현 결과의 외부 근거가 바뀌었습니다. 결과를 보존하고 최신 원문을 확인한 뒤 다시 작업하세요.", setup.work.resumeState, { externalEvidence: true });
+      throw new HandledWorkflowInterruption();
+    }
+  }
+
   // 결정·증거 중 checkpoint 이후의 것(같은 세대).
   private userInputSince(topic: Topic, afterSequence: number): TimelineEvent | null {
     return this.core.dependencies.database.getTimeline(topic.id, afterSequence).find((event) =>
@@ -731,6 +748,7 @@ export class DeliveryPipeline {
 
   // 수락 도중(산출물 저장·메모리 반영·이벤트·전이 사이) 종료된 뒤의 재개 — 모델 호출 없이 acceptId 기준으로 남은 단계만 한다.
   private async finishAccept(setup: WorkSetup, checkpoint: WorkCheckpoint, signal: AbortSignal): Promise<void> {
+    this.assertWorkEvidence(setup);
     const { topic, topicId } = setup;
     const acceptId = checkpoint.phase === "accepted" ? (checkpoint.acceptId ?? checkpoint.previous ?? checkpoint.revision) : checkpoint.revision;
     const base = checkpoint.accumulated;
@@ -1591,7 +1609,13 @@ export class DeliveryPipeline {
     if (storedFix.scopeGeneration !== topic.scopeGeneration) return false;
     const decisions = database.getTimeline(topicId, storedFix.revision)
       .filter((event) => event.scopeGeneration === topic.scopeGeneration && event.actor === "user" && event.kind === "decision");
-    if (decisions.length === 0) return false;
+    if (decisions.length === 0 || !flags.implementationSessionId) return false;
+    const work = this.core.checkpoints.binding(topic, "FIX", flags.implementationSessionId, contract.contractId);
+    const previous = await this.previousWorkCheckpoint(topic, work);
+    // 원문을 추적한 결과는 checkpoint의 원문 해시가 맞아야 재사용한다. 이 옛 산출물 경로에는 그 보장이 없으므로
+    // 새 수정 턴으로 이어간다. 마지막 원문을 제거한 경우에도 이전 checkpoint의 추적 이력을 확인한다.
+    if (workEvidenceDigest(work) !== EMPTY_EVIDENCE_DIGEST
+      || (previous !== null && workEvidenceDigest(previous.work) !== EMPTY_EVIDENCE_DIGEST)) return false;
     // 결정이 수정을 더 요구하면(REFIX) 저장 결과는 낡은 것이다 — 재사용하지 않고 수정 턴을 다시 연다.
     if (decisions.some((event) => refixDirective(event.body))) {
       this.core.event(topicId, "system", "system",
@@ -1635,7 +1659,7 @@ export class DeliveryPipeline {
         : `결정이 올라온 저장된 수정 결과(#${storedFix.revision})의 완료 상태가 불명확합니다(${verdict.message}) — 읽기 전용 확인 턴 1회로 확인합니다.`);
     // 완료 판정 루프만 돈다(initialTurn=false): 완료면 수락, 확인 필요면 읽기 전용 확인 1회, 그래도 불명확하면 보존한 채 멈춘다.
     await this.runWork({
-      topicId, topic, kind: "FIX", work: this.core.checkpoints.binding(topic, "FIX", flags.implementationSessionId, contract.contractId),
+      topicId, topic, kind: "FIX", work,
       plan, planPath, readablePaths: [planPath], baselineHead, toolTreesBefore, inputSequence: this.core.latestSequence(topicId),
       check: (r) => { this.core.assertKind(r, "FIX"); assertFindingCoverage(source, r.findings, "Claude fix"); assertDispositionsResolved(source, r, "Claude fix"); },
       carry: this.core.carryForwardNormalizer(source, "Claude fix"),
@@ -1684,7 +1708,7 @@ export class DeliveryPipeline {
     normalize?: ResultNormalizer;
     // 앞 턴에서 검증을 통과한 누적 원장(checkpoint.verifiedLedger) — 승계 대상.
     previousLedger: readonly ToleranceLedgerEntry[];
-    expected: TurnExpectation; writeGuards: WriteGuards;
+    expected: EvidenceBoundExpectation; writeGuards: WriteGuards;
     openRequests?: readonly OpenRequest[];
     beforeCorrection?: (original: AgentResult) => Promise<void>;
     // 허용 오차 교정 응답이 계약을 어겨 다시 교정할 때(중첩), 그 호출 직전에 부른다.
@@ -1739,6 +1763,7 @@ export class DeliveryPipeline {
         return input.normalize ? input.normalize(merged.result) : merged.result;
       };
       const contracted = await this.core.enforceResultContract("claude", input.topic, corrected, input.sessionId, {
+        evidenceDigest: input.expected.evidenceDigest,
         signal: input.signal, implementation: true, planMode: false, startedAfter: input.inputSequence, check: input.check,
         readablePaths: input.readablePaths, normalize: mergeNormalizer, writeGuards: input.writeGuards, beforeCorrection: input.beforeNestedCorrection,
       });
@@ -1990,6 +2015,7 @@ export class DeliveryPipeline {
       if (idempotencyKey) {
         this.core.dependencies.database.annotateActionRequest(topicId, "commit", idempotencyKey, { parent: deliveryBase });
       }
+      this.core.dependencies.database.evidence.assertReady(this.core.dependencies.database.getTopic(topicId));
       const oid = await this.core.dependencies.git.commit(topic.worktreePath, topic.branchName, message, paths);
       this.assertDeliverySnapshot(topic);
       if (await this.core.dependencies.git.commitParent(topic.worktreePath, oid) !== deliveryBase) {
@@ -2020,6 +2046,7 @@ export class DeliveryPipeline {
       if (await this.core.dependencies.git.head(topic.worktreePath) !== flags.committedOID) {
         throw new Error("확정한 커밋 뒤 HEAD가 바뀌어 push를 중단했습니다.");
       }
+      this.core.dependencies.database.evidence.assertReady(this.core.dependencies.database.getTopic(topicId));
       const oid = await this.core.dependencies.git.push(topic.worktreePath, topic.branchName);
       this.assertDeliverySnapshot(topic);
       this.core.dependencies.database.updateTopic(topicId, { pushedOID: oid });

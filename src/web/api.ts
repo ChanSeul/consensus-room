@@ -1,4 +1,5 @@
 import type { WorkGroup, WorkGroupInput } from "../shared/workGroups";
+import type { EvidenceSourceInput, EvidenceSource, EvidenceTopicState, EvidenceReviewInput } from "../shared/externalEvidence";
 import type { BudgetAccount } from "../shared/budgets";
 import type {
   ActionResponse,
@@ -94,6 +95,10 @@ function unwrapTopics(payload: Topic[] | { topics: Topic[] }): Topic[] {
 }
 
 export const api = {
+  evidence: (id: string) => request<EvidenceTopicState>(`/topics/${encodeURIComponent(id)}/evidence`),
+  addEvidence: (id: string, input: EvidenceSourceInput) => request<EvidenceSource>(`/topics/${encodeURIComponent(id)}/evidence/sources`, { method: "POST", body: JSON.stringify(input) }),
+  checkEvidence: (id: string) => request(`/evidence/${encodeURIComponent(id)}/check`, { method: "POST", body: JSON.stringify({ force: true }) }),
+  reviewEvidence: (id: string, input: EvidenceReviewInput) => request(`/topics/${encodeURIComponent(id)}/evidence/review`, { method: "POST", body: JSON.stringify(input) }),
   listWorkGroups:()=>request<Array<WorkGroup & {budget:BudgetAccount|null;stageStates:Record<string,string|null>}>>("/work-groups"),
   createWorkGroup:(input:WorkGroupInput)=>request<WorkGroup>("/work-groups",{method:"POST",body:JSON.stringify(input)}),
   nextWorkStage:(id:string)=>request<Topic>(`/work-groups/${id}/next`,{method:"POST",body:"{}"}),

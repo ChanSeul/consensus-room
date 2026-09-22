@@ -246,3 +246,12 @@ h3 { font-size: 17px; }
 .work-groups input, .work-groups textarea { width: 100%; min-width: 0; }
 .work-groups fieldset { min-width: 0; }
 .work-groups button { margin-block: 4px; }
+.evidence-panel { padding: 12px 20px; border-bottom: 1px solid var(--line); font-size: 13px; line-height: 1.5; max-height: 42vh; min-height: 45px; overflow-y: auto; }
+.evidence-panel summary { cursor: pointer; color: var(--green); }
+.evidence-panel p { margin: 10px 0; color: var(--muted); }
+.evidence-panel > div { margin: 8px 0; overflow-wrap: anywhere; }
+.evidence-panel a { color: var(--blue); }
+.evidence-panel form { display: grid; gap: 8px; margin: 12px 0; }
+.evidence-panel input, .evidence-panel select { width: 100%; min-width: 0; padding: 8px; border: 1px solid var(--line-strong); border-radius: 7px; color: var(--text); background: var(--bg); }
+.evidence-panel button { padding: 7px 10px; border: 1px solid var(--line-strong); border-radius: 7px; color: var(--text); background: var(--panel-raised); cursor: pointer; }
+.evidence-panel p[role="alert"] { color: var(--red); }

@@ -4,6 +4,7 @@ import { WorkGroups } from "./workGroups.js";
 import { BudgetLedger } from "./budgetLedger.js";
 import { DiagnosisStore } from "./diagnosisStore.js";
 import { FixContractStore } from "./fixContractStore.js";
+import { EvidenceStore } from "./evidence/store.js";
 import type { FixContract } from "../shared/fixContract.js";
 import { CLOSED_DIAGNOSIS_STATUSES, type DiagnosisBinding, type DiagnosisInput, type DiagnosisOrigin, type DiagnosisRecord, type DiagnosisStatus } from "../shared/diagnoses.js";
 import { EventEmitter } from "node:events";
@@ -57,6 +58,7 @@ export class ConsensusDatabase {
   readonly workGroups: WorkGroups;
   readonly diagnoses: DiagnosisStore;
   readonly fixContracts: FixContractStore;
+  readonly evidence: EvidenceStore;
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true });
@@ -65,6 +67,7 @@ export class ConsensusDatabase {
     this.migrate();
     this.diagnoses = new DiagnosisStore(this.db);
     this.fixContracts = new FixContractStore(this.db);
+    this.evidence = new EvidenceStore(this.db);
     this.budgets = new BudgetLedger(this.db);
     this.workGroups = new WorkGroups(this.db);
     this.revisions = new RevisionLedger(this.db);

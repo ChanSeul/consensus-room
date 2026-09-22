@@ -1,6 +1,8 @@
 import { ClaudeAdapter } from "./adapters/claude.js";
 import { CodexAdapter } from "./adapters/codex.js";
 import { buildApp } from "./app.js";
+import { ConsensusDatabase } from "./database.js";
+import type { MemoryReaderOptions } from "./projectMemory.js";
 import { loadConfig } from "./config.js";
 import { SpawnCommandRunner } from "./processRunner.js";
 import { writeFileSync } from "node:fs";
@@ -8,10 +10,14 @@ import { join } from "node:path";
 
 const config = loadConfig();
 const runner = new SpawnCommandRunner();
+const database = new ConsensusDatabase(config.databasePath);
+const memoryReaderOptions: MemoryReaderOptions = { resolveEvidenceStatus: dependencies => database.evidence.status(dependencies) };
 const app = await buildApp({
   config,
+  database,
   runner,
   claude: new ClaudeAdapter(runner, config.memoryDirectory, {
+    memoryReaderOptions,
     protectedWritePaths: [config.dataDirectory, config.memoryDirectory],
     figmaMcpUrl: config.figmaMcpUrl,
     skillsDirectories: config.claudeSkillDirectories,
@@ -24,7 +30,7 @@ const app = await buildApp({
     join(config.dataDirectory, "agent-result.schema.json"),
     undefined,
     config.memoryDirectory,
-    { skillsDirectories: config.codexSkillDirectories, repositoryPath: config.repositoryPath, maxConcurrentTurns: config.codexConcurrency },
+    { memoryReaderOptions, skillsDirectories: config.codexSkillDirectories, repositoryPath: config.repositoryPath, maxConcurrentTurns: config.codexConcurrency },
   ),
 });
 

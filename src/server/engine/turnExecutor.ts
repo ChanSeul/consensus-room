@@ -16,6 +16,7 @@ import { HandledWorkflowInterruption } from "./core.js";
 export type TurnPurpose = "턴" | "계약 교정 재제출" | "프로토콜 확인" | "계속 진행 턴" | "허용 오차 교정" | "완료 확인" | "계획 교정";
 
 export interface TurnExpectation {
+  evidenceDigest?: string;
   state: WorkflowState;
   scopeGeneration: number;
   planEpoch: number;
@@ -30,6 +31,7 @@ export interface WriteGuards {
 }
 
 export interface TurnRequest {
+  evidenceDigest?: string;
   role: ParticipantRole;
   topic: Topic;
   signal: AbortSignal;
@@ -79,11 +81,17 @@ export class TurnExecutor {
   // 새 사용자 입력은 인터럽트(상태 전이)까지 하고 HandledWorkflowInterruption 을 던진다.
   admission(request: TurnRequest): { sync: () => void; async: () => Promise<void> } {
     const { topic, signal, expected } = request;
+    request.evidenceDigest ??= expected.evidenceDigest ?? this.core.dependencies.database.evidence.topic(topic).digest;
     const sync = () => {
       if (signal.aborted) throw signal.reason ?? new AdmissionRefused("cancelled", "실행이 취소되었습니다.");
       const db = this.core.dependencies.database;
       const current = db.getTopic(topic.id);
       this.core.assertCurrent(topic.id, signal, expected.scopeGeneration, expected.state);
+      const evidence = db.evidence.topic(current);
+      if (!evidence.ready || evidence.digest !== request.evidenceDigest || (request.write && !evidence.reviewed)) {
+        this.core.interrupt(topic.id, "BLOCKED_ON_EVIDENCE", "외부 근거가 바뀌었거나 확인이 필요합니다. 원문을 갱신하고 현재 계획에 미치는 영향을 확인하세요.", expected.state, { externalEvidence: true });
+        throw new HandledWorkflowInterruption();
+      }
       if (current.planEpoch !== expected.planEpoch || current.planSHA256 !== expected.planSHA256) {
         this.refuse(request, "plan-changed", `계획이 바뀌어 ${request.purpose} 을 열지 않습니다(epoch ${expected.planEpoch}→${current.planEpoch}, sha ${(expected.planSHA256 ?? "-").slice(0, 12)}→${(current.planSHA256 ?? "-").slice(0, 12)}).`);
       }
@@ -177,6 +185,12 @@ export class TurnExecutor {
     const { topic, signal, expected } = request;
     this.core.assertCurrent(topic.id, signal, expected.scopeGeneration, expected.state);
     const current = this.core.dependencies.database.getTopic(topic.id);
+    const evidence = this.core.dependencies.database.evidence.topic(current);
+    if (!evidence.ready || evidence.digest !== request.evidenceDigest) {
+      await this.core.preserveInterruptedResult(topic, request.role, result, signal, "원문 확인 상태가 바뀌어 이전 근거로 만든 결과를 보존만 합니다.");
+      this.core.interrupt(topic.id, "BLOCKED_ON_EVIDENCE", "외부 근거가 실행 중 바뀌었습니다. 변경 영향을 확인한 뒤 재개하세요.", expected.state, { externalEvidence: true });
+      throw new HandledWorkflowInterruption();
+    }
     if (current.planEpoch !== expected.planEpoch || current.planSHA256 !== expected.planSHA256) {
       await this.core.preserveInterruptedResult(topic, request.role, result, signal,
         `${request.role} 턴이 도는 동안 계획이 바뀌어(epoch ${expected.planEpoch}→${current.planEpoch}) 이 결과는 채택하지 않습니다.`);
@@ -193,12 +207,14 @@ export class TurnExecutor {
     if (!adapter.resumePlanRepair || request.session.mode !== "resume") throw new Error("계획 교정을 지원하지 않는 어댑터·세션입니다.");
     const admit = this.admission(request);
     await admit.async();
-    return adapter.resumePlanRepair({
+    const result = await adapter.resumePlanRepair({
       sessionId: request.session.sessionId, prompt: request.prompt, cwd: request.topic.worktreePath, signal: request.signal,
       protocolOnly: true, implementation: false, planMode: false, settings: request.settings, beforeSpawn: admit.async, admitSync: admit.sync,
       onProcessSpawn: this.core.processObserver(request.topic.id),
       onUsage: request.onUsage ?? this.core.usageObserver(request.topic.id, request.role, request.purpose),
     });
+    admit.sync();
+    return result;
   }
 
   supportsPlanRepair(role: ParticipantRole): boolean {

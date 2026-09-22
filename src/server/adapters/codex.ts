@@ -13,12 +13,13 @@ import { EXECUTION_POLICY_NOTE } from "../../shared/prompts.js";
 import { readAppliedInstructions } from "../projectInstructions.js";
 import type { AgentAdapter, CommandRunner, CreatedSession, SessionTurn } from "../types.js";
 import { agentEnvironment } from "../security.js";
-import { ProjectMemoryReader } from "../projectMemory.js";
+import { ProjectMemoryReader, type MemoryReaderOptions } from "../projectMemory.js";
 import { describeCommandFailure, parseAgentResult } from "./resultParser.js";
 import { codexHomeUsage, ExecutionMetrics } from "./executionMetrics.js";
 import { createToolTimeMeter } from "./toolTime.js";
 
 export interface CodexAdapterOptions {
+  memoryReaderOptions?: MemoryReaderOptions;
   // 서버가 검토한 native skill 디렉터리만 관리형 CODEX_HOME/skills 아래에 연결한다.
   skillsDirectories?: readonly string[];
   // 원본 저장소. worktree 에 AGENTS.md 가 없으면(gitignored) 여기 것을 stdin 에 넣는다(projectInstructions.ts).
@@ -40,6 +41,7 @@ interface CodexPermissionBoundary {
   sourceAuthPath: string;
   codexExecutable: string;
   protocolOnly: boolean;
+  evidenceManaged: boolean;
   // 턴 단위 추가 읽기 허용(주제 plan.md 등).
   readablePaths: readonly string[];
 }
@@ -77,7 +79,7 @@ function managedConfigBody(boundary: CodexPermissionBoundary): string {
     // 프로토콜 확인 턴은 판단에 필요한 값을 프롬프트가 다 담고 있으므로 웹 검색과 하위 에이전트를 닫는다.
     "# 정책: 웹 검색과 공개 문서 읽기는 기본 개방. 확장 서버·알림 훅은 계속 차단(sandbox 밖 프로세스).",
     "[tools]",
-    `web_search = ${boundary.protocolOnly ? "false" : "true"}`,
+    `web_search = ${boundary.protocolOnly || boundary.evidenceManaged ? "false" : "true"}`,
     "",
     "[features.multi_agent_v2]",
     `enabled = ${boundary.protocolOnly ? "false" : "true"}`,
@@ -116,7 +118,7 @@ export class CodexAdapter implements AgentAdapter {
     memoryDirectory?: string,
     private readonly options: CodexAdapterOptions = {},
   ) {
-    this.memory = memoryDirectory ? new ProjectMemoryReader(memoryDirectory) : null;
+    this.memory = memoryDirectory ? new ProjectMemoryReader(memoryDirectory, options.memoryReaderOptions) : null;
     this.slots = new Semaphore(Math.max(1, options.maxConcurrentTurns ?? 2));
   }
 
@@ -190,7 +192,7 @@ export class CodexAdapter implements AgentAdapter {
     await mkdir(dirname(this.schemaPath), { recursive: true });
     await writeFile(this.schemaPath, JSON.stringify(AgentResultJsonSchema, null, 2), { mode: 0o600 });
     const executionSettings = turn.settings ?? DEFAULT_AGENT_SETTINGS.codex;
-    const topicHome = await this.prepareManagedHome(turn.cwd, Boolean(turn.protocolOnly), turn.readablePaths ?? []);
+    const topicHome = await this.prepareManagedHome(turn.cwd, Boolean(turn.protocolOnly), turn.readablePaths ?? [], Boolean(turn.evidenceManaged));
     // 메모리는 세션 생성 턴에만 주입한다(claude 어댑터와 같은 근거 — resume은 스레드가 이미 기억,
     // 매 턴 재주입은 턴당 ~20K자 중복). protocolOnly 턴은 새 세션이어도 주입하지 않는다.
     const injectMemory = Boolean(this.memory) && newSession && !turn.protocolOnly;
@@ -280,7 +282,7 @@ export class CodexAdapter implements AgentAdapter {
 
   // 홈 자체는 지속되지만 설정은 턴마다 다시 쓴다. 외부에서 드리프트가 생겨도 다음 턴에 사라지게 하려는 것이고,
   // schemaPath를 매번 쓰는 위 패턴과 같다. 공유 홈(인증·skills·전역 규칙·세션 상태)을 먼저 정리한 뒤 토픽 홈을 그 위에 얹는다.
-  private async prepareManagedHome(cwd: string, protocolOnly: boolean, readablePaths: readonly string[] = []): Promise<string> {
+  private async prepareManagedHome(cwd: string, protocolOnly: boolean, readablePaths: readonly string[] = [], evidenceManaged = false): Promise<string> {
     const workspace = resolve(cwd);
     const shared = this.sharedHomeQueue.then(() => this.prepareSharedHome());
     this.sharedHomeQueue = shared.catch(() => undefined);
@@ -303,6 +305,7 @@ export class CodexAdapter implements AgentAdapter {
       sourceAuthPath: join(this.userCodexHome(), "auth.json"),
       codexExecutable: resolveCodexExecutable(),
       protocolOnly,
+      evidenceManaged,
       readablePaths,
     };
     await writeFile(join(topicHome, "config.toml"), managedConfigBody(boundary), { mode: 0o600 });

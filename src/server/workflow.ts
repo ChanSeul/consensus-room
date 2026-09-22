@@ -180,6 +180,7 @@ export class WorkflowEngine {
     this.core.assertNotShuttingDown();
     this.core.diagnoses.assertResumable(topicId, "구현 시작(implement)");
     assertImplementationGate(this.core.dependencies.database.getTopic(topicId));
+    this.core.dependencies.database.evidence.assertReady(this.core.dependencies.database.getTopic(topicId));
     if (kickoffDecision !== undefined) {
       // 재계획 트리거 단어는 결정 본문에 쓸 수 없다 — retry 사다리가 그 단어로 DRAFT 리셋을 판단한다(2026-09-07 사고).
       if (replanDirective(kickoffDecision)) throw new Error("시작 결정문에는 재계획 트리거 지시(줄 머리 또는 본문 끝의 REPLAN)를 쓸 수 없습니다.");
@@ -368,6 +369,7 @@ export class WorkflowEngine {
 
   approve(topicId: string, planSHA256: string): Topic {
     const topic = this.core.dependencies.database.getTopic(topicId);
+    this.core.dependencies.database.evidence.assertReady(topic);
     if (topic.state !== "AWAITING_USER_APPROVAL" || topic.planSHA256 !== planSHA256) {
       throw new Error("현재 승인을 기다리는 계획 해시와 일치하지 않습니다.");
     }
@@ -380,6 +382,7 @@ export class WorkflowEngine {
   }
 
   close(topicId: string): Topic {
+    this.core.dependencies.database.evidence.assertReady(this.core.dependencies.database.getTopic(topicId));
     if (this.core.active.has(topicId) || this.core.deliveryActive.has(topicId) || this.core.scopeChangeActive.has(topicId)) {
       throw new Error("다른 작업이 끝난 뒤 주제를 닫아 주세요.");
     }
@@ -400,10 +403,12 @@ export class WorkflowEngine {
 
   // 전달(commit/push/처분) API는 DeliveryPipeline에 위임한다.
   commit(topicId: string, message: string, paths: string[], idempotencyKey?: string): Promise<string> {
+    this.core.dependencies.database.evidence.assertReady(this.core.dependencies.database.getTopic(topicId));
     return this.delivery.commit(topicId, message, paths, idempotencyKey);
   }
 
   push(topicId: string): Promise<string> {
+    this.core.dependencies.database.evidence.assertReady(this.core.dependencies.database.getTopic(topicId));
     return this.delivery.push(topicId);
   }
 

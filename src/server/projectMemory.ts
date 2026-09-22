@@ -1,30 +1,17 @@
 import { createHash } from "node:crypto";
 import { lstat, readFile, realpath } from "node:fs/promises";
-import { basename, dirname, isAbsolute, normalize, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, normalize, relative, resolve, sep } from "node:path";
 
 import { redactSecrets } from "../shared/workflow.js";
 import type { ParticipantRole } from "./types.js";
+import { memoryRelevance } from "./memoryRetrieval.js";
+import { wikiEvidenceNotice, type MemoryReaderOptions } from "./wikiEvidence.js";
+export type { MemoryReaderOptions, MemoryEvidenceDependency, MemoryEvidenceStatus } from "./wikiEvidence.js";
 
 const ROUTER_FILE = "context-router.md";
 const MAX_ROUTED_DOCUMENTS = 4;
 const MAX_DOCUMENT_BYTES = 80_000;
 const MAX_CONTEXT_BYTES = 180_000;
-const DOMAIN_ALIASES: Readonly<Record<string, readonly string[]>> = {
-  "숏폼": ["shortform"],
-  "매물상세": ["housedetail", "house-detail"],
-  "매물등록": ["houseregist", "houseregister", "house-register"],
-  "채팅": ["chat"],
-  "지도": ["mainmap", "map"],
-  "로그인": ["login", "auth"],
-  "알림": ["notification", "push"],
-  "문의": ["inquiry"],
-  "아파트": ["apartment"],
-  "취소": ["cancellation", "cancellationerror"],
-  "동시성": ["concurrency"],
-  "빌드": ["build"],
-  "배포": ["release", "deploy", "ci-cd"],
-};
-
 export interface MemoryDocumentSnapshot {
   path: string;
   sha256: string;
@@ -32,8 +19,14 @@ export interface MemoryDocumentSnapshot {
   redacted: boolean;
 }
 
+export interface MemorySelection {
+  snapshots: MemoryDocumentSnapshot[];
+  decisions: Array<{ path: string; score: number; reason: string; selected: boolean }>;
+  bytes: number;
+}
+
 export class ProjectMemoryReader {
-  constructor(private readonly memoryDirectory: string) {}
+  constructor(private readonly memoryDirectory: string, private readonly options: MemoryReaderOptions = {}) {}
 
   // 본문 없이 현재 SHA-256만 다시 알려 준다. 문서 본문은 세션 생성 턴에 한 번만 싣지만(턴당 ~20K자 중복),
   // 해시는 그 사이 바뀔 수 있어 그대로 두면 에이전트가 낡은 expectedSHA256으로 쓰기를 제안하고 거부당한다.
@@ -41,9 +34,10 @@ export class ProjectMemoryReader {
   async buildManifest(prompt: string, role: ParticipantRole): Promise<string> {
     const snapshots = await this.select(prompt, role);
     if (snapshots.length === 0) return "";
-    const rows = snapshots
-      .map((snapshot) => `- ${snapshot.path} @ ${snapshot.sha256}${snapshot.redacted ? " (민감값 가림)" : ""}`)
-      .join("\n");
+    const rows = (await Promise.all(snapshots.map(async (snapshot) => {
+      const notice = await wikiEvidenceNotice(snapshot.content, this.options);
+      return `- ${snapshot.path} @ ${snapshot.sha256}${snapshot.redacted ? " (민감값 가림)" : ""}${notice ? ` — ${notice}` : ""}`;
+    }))).join("\n");
     return [
       "## 메모리 스냅샷 갱신",
       "",
@@ -57,48 +51,57 @@ export class ProjectMemoryReader {
   async buildPrompt(prompt: string, role: ParticipantRole): Promise<string> {
     const snapshots = await this.select(prompt, role);
     if (snapshots.length === 0) return `${prompt}\n\n${memoryUsageRules(role, this.memoryDirectory, [])}`;
-    const rendered = snapshots.map((snapshot) => [
+    const rendered = (await Promise.all(snapshots.map(async (snapshot) => [
+      await wikiEvidenceNotice(snapshot.content, this.options) ?? "",
       `--- 메모리 문서 시작: ${snapshot.path} ---`,
       `SHA-256: ${snapshot.sha256} / UTF-8 바이트: ${Buffer.byteLength(snapshot.content, "utf8")} / 민감값 가림: ${snapshot.redacted ? "예" : "아니오"}`,
       snapshot.content,
       `--- 메모리 문서 끝: ${snapshot.path} ---`,
-    ].join("\n")).join("\n\n");
+    ].filter(Boolean).join("\n")))).join("\n\n");
     return `${prompt}\n\n${memoryUsageRules(role, this.memoryDirectory, snapshots)}\n\n${rendered}`;
   }
 
   async select(prompt: string, role: ParticipantRole): Promise<MemoryDocumentSnapshot[]> {
+    return (await this.selectWithDiagnostics(prompt, role)).snapshots;
+  }
+
+  async selectWithDiagnostics(prompt: string, role: ParticipantRole): Promise<MemorySelection> {
+    const empty = (): MemorySelection => ({ snapshots: [], decisions: [], bytes: 0 });
     const root = await realpath(this.memoryDirectory).catch(() => null);
-    if (!root) return [];
+    if (!root) return empty();
     const router = await this.readSnapshot(root, ROUTER_FILE, role);
-    if (!router) return [];
-    // MEMORY.md 전문은 모델에 보내지 않는다. 라우터에 직접 없는 문서의 파일명·설명만 찾는 보조 카탈로그로 쓴다.
+    if (!router) return empty();
     const index = await this.readSnapshot(root, "MEMORY.md", role);
-    const candidateContexts = new Map<string, string[]>();
+    const contexts = new Map<string, string[]>();
     for (const source of [router.content, index?.content ?? ""]) {
       for (const candidate of extractMarkdownLinks(source)) {
-        const contexts = candidateContexts.get(candidate.path) ?? [];
-        contexts.push(candidate.context);
-        candidateContexts.set(candidate.path, contexts);
+        if (candidate.path === ROUTER_FILE || candidate.path === "MEMORY.md") continue;
+        contexts.set(candidate.path, [...contexts.get(candidate.path) ?? [], candidate.context]);
       }
     }
-    const candidates = [...candidateContexts]
-      .filter(([path]) => isReadableMemoryPath(path, role))
-      .map(([path, contexts]) => ({ path, score: relevanceScore(prompt, path, contexts.join("\n")) }))
-      .filter((candidate) => candidate.score > 0)
-      .sort((left, right) => right.score - left.score || left.path.localeCompare(right.path));
-
-    const selected: MemoryDocumentSnapshot[] = [router];
-    let usedBytes = Buffer.byteLength(router.content, "utf8");
-    for (const candidate of candidates) {
-      if (selected.length > MAX_ROUTED_DOCUMENTS) break;
-      const snapshot = await this.readSnapshot(root, candidate.path, role);
-      if (!snapshot) continue;
-      const bytes = Buffer.byteLength(snapshot.content, "utf8");
-      if (usedBytes + bytes > MAX_CONTEXT_BYTES) continue;
-      selected.push(snapshot);
-      usedBytes += bytes;
+    const decisions: MemorySelection["decisions"] = [];
+    const candidates: Array<{ snapshot: MemoryDocumentSnapshot; score: number; decision: MemorySelection["decisions"][number] }> = [];
+    for (const [path, labels] of contexts) {
+      if (!isReadableMemoryPath(path, role)) continue;
+      const snapshot = await this.readSnapshot(root, path, role);
+      if (!snapshot) { decisions.push({ path, score: 0, reason: "unreadable", selected: false }); continue; }
+      const relevance = memoryRelevance(prompt, path, labels.join("\n"), snapshot.content);
+      const decision = { path, score: relevance.score, reason: relevance.reason as string, selected: false };
+      decisions.push(decision);
+      if (relevance.score > 0) candidates.push({ snapshot, score: relevance.score, decision });
     }
-    return selected;
+    candidates.sort((a, b) => b.score - a.score || a.snapshot.path.localeCompare(b.snapshot.path));
+    const snapshots = [router];
+    let bytes = Buffer.byteLength(router.content);
+    for (const { snapshot, decision } of candidates) {
+      if (snapshots.length >= MAX_ROUTED_DOCUMENTS + 1) { decision.reason = "document-limit"; continue; }
+      const size = Buffer.byteLength(snapshot.content);
+      if (bytes + size > MAX_CONTEXT_BYTES) { decision.reason = "byte-limit"; continue; }
+      decision.selected = true;
+      snapshots.push(snapshot);
+      bytes += size;
+    }
+    return { snapshots, decisions, bytes };
   }
 
   private async readSnapshot(
@@ -113,7 +116,7 @@ export class ProjectMemoryReader {
       const parent = await realpath(dirname(target));
       if (parent !== dirname(target)) return null;
       const stat = await lstat(target);
-      if (!stat.isFile() || stat.isSymbolicLink()) return null;
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_DOCUMENT_BYTES) return null;
       const rawContent = await readFile(target, "utf8");
       if (Buffer.byteLength(rawContent, "utf8") > MAX_DOCUMENT_BYTES) return null;
       const content = redactSecrets(rawContent);
@@ -197,33 +200,6 @@ function separatorsOutsideLinks(line: string, links: readonly RegExpExecArray[])
     at = line.indexOf(GROUPED_LINK_SEPARATOR, at + 1);
   }
   return cuts;
-}
-
-function relevanceScore(prompt: string, path: string, context: string): number {
-  const tokens = tokenize(prompt);
-  const file = basename(path, ".md").toLowerCase();
-  const linkLine = context.toLowerCase();
-  const searchable = `${file}\n${linkLine}`;
-  const lexicalScore = tokens.reduce((score, token) => {
-    const containsKorean = /[가-힣]/.test(token);
-    const fileScore = file.includes(token) ? (containsKorean ? 10 : token.length >= 7 ? 6 : 2) : 0;
-    const contextScore = linkLine.includes(token) ? (containsKorean ? 8 : token.length >= 7 ? 4 : 1) : 0;
-    return score + fileScore + contextScore;
-  }, 0);
-  const domainScore = Object.entries(DOMAIN_ALIASES).reduce((score, [korean, aliases]) => {
-    if (!prompt.includes(korean)) return score;
-    return score + (aliases.some((alias) => searchable.includes(alias)) ? 30 : 0);
-  }, 0);
-  return lexicalScore + domainScore;
-}
-
-function tokenize(value: string): string[] {
-  return [...new Set(
-    (value.toLowerCase().match(/[a-z0-9][a-z0-9_-]{2,}|[가-힣]{2,}/g) ?? [])
-      .filter((token) => ![
-        "그리고", "합니다", "주세요", "사용자", "계획", "구현", "검토", "코드", "작업",
-      ].includes(token)),
-  )];
 }
 
 function isReadableMemoryPath(path: string, role: ParticipantRole): boolean {

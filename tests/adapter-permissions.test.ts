@@ -1484,3 +1484,24 @@ describe("러너 auto-compact 임계값", () => {
     expect(plan.autoCompactWindow).toBe(800_000);
   });
 });
+
+
+it("managed source evidence disables direct provider reads and permits only the supplied cached PNG", async () => {
+  const cachedImage = "/tmp/evidence-cache/hash.png";
+  const claudeRunner = new RecordingRunner(successfulResult([planResult]));
+  await new ClaudeAdapter(claudeRunner, undefined, { figmaMcpUrl: "http://127.0.0.1:3845/mcp" }).createSession({
+    prompt: "Use cached evidence", cwd: "/tmp/worktree", evidenceManaged: true, readablePaths: [cachedImage],
+  });
+  const args = claudeRunner.calls[0].args;
+  expect(JSON.parse(args[args.indexOf("--mcp-config") + 1])).toEqual({ mcpServers: {} });
+  expect(args[args.indexOf("--tools") + 1]).not.toMatch(/WebFetch|WebSearch/);
+  const settings = JSON.parse(args[args.indexOf("--settings") + 1]);
+  expect(settings.sandbox.filesystem.allowRead).toContain(cachedImage);
+  expect(settings.permissions.allow).toContain("Read(//tmp/evidence-cache/hash.png)");
+  const codexRunner = new RecordingRunner(successfulResult([{ type: "thread.started", thread_id: "evidence-session" }, planResult]));
+  const { adapter } = codexAdapter(codexRunner);
+  await adapter.createSession({ prompt: "Use cached evidence", cwd: "/tmp/worktree", evidenceManaged: true, readablePaths: [cachedImage] });
+  const config = readFileSync(join(adapter.managedHomeFor("/tmp/worktree"), "config.toml"), "utf8");
+  expect(config).toContain("web_search = false");
+  expect(config).toContain(`"${cachedImage}" = "read"`);
+});
