@@ -739,3 +739,13 @@ describe("Codex 후속 F07 — 중재자 권한 경계", () => {
     } finally { await app.close(); }
   });
 });
+
+it("migrates when a bounded stdout tail lost init but verified jsonLines retained it", async () => {
+  const { app, request, store } = await migrationFixture();
+  const artifact = await store.write("migrate", "interrupted-output", 2, JSON.stringify({ sessionId: request.payload.sessionId,
+    output: { stdout: '{"type":"progress"}\n', truncated: true,
+      jsonLines: [{ type: "system", subtype: "init", session_id: request.payload.sessionId, cwd: "/tmp/worktree" }] } }));
+  request.payload.interruptedSHA256 = artifact.sha256;
+  expect((await app.inject(request)).statusCode).toBe(200);
+  await app.close();
+});

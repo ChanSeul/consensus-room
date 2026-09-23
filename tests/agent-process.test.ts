@@ -380,9 +380,12 @@ describe("CLI 출력 상한", () => {
     expect(parseAgentResult(output.jsonLines, output.stdout).summary).toBe("마지막 검토");
   });
 
-  it("큰 JSON progress가 이어져도 파싱 결과 보관량을 바이트 단위로 제한한다", async () => {
+  it.each([
+    { type: "thread.started", thread_id: "thread-1" },
+    { type: "system", subtype: "init", session_id: "session-1", cwd: "/tmp/worktree" },
+  ])("큰 JSON progress 이후에도 초기화 기록을 보존한다: %j", async initialization => {
     const script = [
-      `process.stdout.write(${JSON.stringify(`${JSON.stringify({ type: "thread.started", thread_id: "thread-1" })}\n`)});`,
+      `process.stdout.write(${JSON.stringify(`${JSON.stringify(initialization)}\n`)});`,
       "const progress = JSON.stringify({ type: 'progress', body: 'x'.repeat(1_000_000) }) + '\\n';",
       "for (let index = 0; index < 24; index += 1) process.stdout.write(progress);",
       `process.stdout.write(${JSON.stringify(`${JSON.stringify(finalResult)}\n`)});`,
@@ -398,7 +401,8 @@ describe("CLI 출력 상한", () => {
       0,
     );
     expect(output.exitCode).toBe(0);
-    expect(output.jsonLines[0]).toMatchObject({ type: "thread.started", thread_id: "thread-1" });
+    expect(output.jsonLines[0]).toMatchObject(initialization);
+    expect(output.stdout).not.toContain(JSON.stringify(initialization));
     expect(retainedBytes).toBeLessThanOrEqual(17 * 1024 * 1024);
     expect(parseAgentResult(output.jsonLines, output.stdout).summary).toBe("마지막 검토");
   });

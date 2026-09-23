@@ -183,10 +183,17 @@ export class WorkflowEngine {
     if (!artifact) throw new Error("Interrupted output is unavailable.");
     const output = JSON.parse(artifact.content);
     const topic = db.getTopic(topicId);
-    const init = typeof output.output?.stdout === "string" && output.output.stdout.split("\n").some((line: string) => {
-      try { const row = JSON.parse(line); return row.type === "system" && row.subtype === "init" &&
-        row.session_id === input.sessionId && row.cwd === topic.worktreePath; } catch { return false; }
-    });
+    const matchesInit = (row: unknown): boolean => {
+      if (!row || typeof row !== "object") return false;
+      const value = row as Record<string, unknown>;
+      return value.type === "system" && value.subtype === "init" &&
+        value.session_id === input.sessionId && value.cwd === topic.worktreePath;
+    };
+    // Structured output pins initialization even when the bounded stdout tail has evicted it.
+    const init = (Array.isArray(output.output?.jsonLines) && output.output.jsonLines.some(matchesInit)) ||
+      (typeof output.output?.stdout === "string" && output.output.stdout.split("\n").some((line: string) => {
+        try { return matchesInit(JSON.parse(line)); } catch { return false; }
+      }));
     if (output.sessionId !== input.sessionId || !init) throw new Error("Interrupted output does not verify this session and worktree.");
     if (snapshot() !== before) throw new Error("Topic changed during migration validation.");
     if (input.apply) db.applyTopicTransition({ topicId, changes: {}, planningMigration: input, events: [{

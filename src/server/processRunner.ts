@@ -231,7 +231,7 @@ function appendJSONLine(buffer: JSONLineBuffer, line: string): unknown {
   try {
     const parsed = JSON.parse(line) as unknown;
     const entry = { value: parsed, bytes: Buffer.byteLength(line, "utf8") };
-    if (isThreadStarted(parsed)) {
+    if (isSessionInitialization(parsed)) {
       buffer.threadStarted ??= entry;
       return parsed;
     }
@@ -255,10 +255,12 @@ function jsonLineValues(buffer: JSONLineBuffer): unknown[] {
   ];
 }
 
-function isThreadStarted(value: unknown): boolean {
+function isSessionInitialization(value: unknown): boolean {
   if (!value || typeof value !== "object") return false;
   const type = (value as Record<string, unknown>).type;
-  return type === "thread.started" || type === "thread_started";
+  const row = value as Record<string, unknown>;
+  return type === "thread.started" || type === "thread_started" ||
+    (type === "system" && row.subtype === "init" && typeof row.session_id === "string" && typeof row.cwd === "string");
 }
 
 function inspectProcess(pid: number, executable: string) {
