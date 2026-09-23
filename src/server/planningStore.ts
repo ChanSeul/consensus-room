@@ -29,7 +29,11 @@ export class PlanningStore {
     const unstartedPlan = !topic?.plan_sha256 && !topic?.implementation_session_id &&
       (["DRAFT", "CLAUDE_PLAN"].includes(String(topic?.state)) ||
         (["USER_DECISION_REQUIRED", "FAILED"].includes(String(topic?.state)) && topic?.resume_state === "CLAUDE_PLAN"));
-    const version = unstartedPlan ? 2 : 1;
+    // A paused response can contain a complete plan before topics.plan_sha256 is assigned.
+    // Preserve every previously executed topic, including saved response reuse and partial calls.
+    const hasHistory = this.db.prepare("SELECT 1 FROM actions WHERE topic_id=? LIMIT 1").get(topicId) ||
+      this.db.prepare("SELECT 1 FROM artifacts WHERE topic_id=? LIMIT 1").get(topicId);
+    const version = unstartedPlan && !hasHistory ? 2 : 1;
     this.db.prepare("INSERT INTO planning_policies VALUES (?,?) ON CONFLICT(topic_id) DO NOTHING").run(topicId, version);
   }
   deliveredToSession(sessionId: string): PlanningFragment[] {

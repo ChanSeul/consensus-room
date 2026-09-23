@@ -2696,7 +2696,7 @@ describe("멈춘 계획의 재사용", () => {
     requestedUserDecision: "게이트 2 주기를 정해 주세요.",
   };
 
-  it("결정이 올라온 뒤 retry 는 계획 턴 없이 저장된 계획으로 감사에 들어간다", async () => {
+  it.each([false, true])("결정이 올라온 뒤 retry 는 계획 턴 없이 저장된 계획으로 감사에 들어간다 (중간 활성화: %s)", async (enableWhilePaused) => {
     const { database, artifacts, engine, claude, codex } = makePlanningEngine({
       slug: "paused-plan-reuse",
       claudeResults: [pausedPlan],
@@ -2707,6 +2707,10 @@ describe("멈춘 계획의 재사용", () => {
     expect(database.getTopic("topic-1").state).toBe("USER_DECISION_REQUIRED");
     expect(database.getFlags("topic-1").resumeState).toBe("CLAUDE_PLAN");
     expect(await artifacts.readLatest("topic-1", "plan")).toBeNull();
+    if (enableWhilePaused) {
+      database.planning.enable("topic-1");
+      expect(database.planning.policyVersion("topic-1")).toBe(1);
+    }
 
     await engine.postMessage("topic-1", "decision", "게이트 2 는 6회 주기로 간다.");
     engine.retry("topic-1");
