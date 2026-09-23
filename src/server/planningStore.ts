@@ -13,6 +13,7 @@ export class PlanningStore {
     db.exec(`CREATE TABLE IF NOT EXISTS planning_policies(topic_id TEXT PRIMARY KEY, version INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS planning_checkpoints(key TEXT PRIMARY KEY, topic_id TEXT NOT NULL, record_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS planning_fragments(key TEXT PRIMARY KEY, record_json TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS planning_sessions(topic_id TEXT PRIMARY KEY, record_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS planning_archives(id INTEGER PRIMARY KEY, topic_id TEXT NOT NULL, record_json TEXT NOT NULL);`);
   }
   enabled(topicId: string): boolean {
@@ -29,8 +30,8 @@ export class PlanningStore {
     this.db.prepare("INSERT INTO planning_checkpoints VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET record_json=excluded.record_json")
       .run(record.key, record.topicId, JSON.stringify(record));
   }
-  latest(topicId: string): PlanningCheckpoint | null {
-    const row = this.db.prepare("SELECT record_json FROM planning_checkpoints WHERE topic_id=? ORDER BY json_extract(record_json,'$.updatedAt') DESC, rowid DESC LIMIT 1").get(topicId);
+  latest(topicId: string, role?: "claude" | "codex"): PlanningCheckpoint | null {
+    const row = this.db.prepare("SELECT record_json FROM planning_checkpoints WHERE topic_id=? AND (? IS NULL OR json_extract(record_json,'$.role')=?) ORDER BY json_extract(record_json,'$.updatedAt') DESC, rowid DESC LIMIT 1").get(topicId, role ?? null, role ?? null);
     return row ? JSON.parse(String(row.record_json)) : null;
   }
   archive(record: PlanningCheckpoint): void {
@@ -44,6 +45,19 @@ export class PlanningStore {
     const rows = this.db.prepare("SELECT record_json FROM planning_checkpoints WHERE json_extract(record_json,'$.sessionId')=?").all(sessionId);
     const records = rows.map(r => JSON.parse(String(r.record_json)) as PlanningCheckpoint);
     return { known: records.some(r => r.started), bytes: records.reduce((sum, r) => sum + r.injectedBytes + (r.responseBytes ?? 0), 0) };
+  }
+  bindSession(topic: Topic, planSHA256: string, sessionId: string, inputSequence: number): void {
+    this.db.prepare("INSERT INTO planning_sessions VALUES (?,?) ON CONFLICT(topic_id) DO UPDATE SET record_json=excluded.record_json")
+      .run(topic.id, JSON.stringify({ scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch,
+        planSHA256, sessionId, inputSequence }));
+  }
+  boundSession(topic: Topic): { sessionId: string; inputSequence: number } | null {
+    const row = this.db.prepare("SELECT record_json FROM planning_sessions WHERE topic_id=?").get(topic.id);
+    if (!row) return null;
+    const binding = JSON.parse(String(row.record_json));
+    return binding.scopeGeneration === topic.scopeGeneration && binding.planEpoch === topic.planEpoch &&
+      binding.planSHA256 === topic.planSHA256 && binding.sessionId === topic.participants.find(p => p.role === "claude")?.sessionId
+      ? { sessionId: binding.sessionId, inputSequence: binding.inputSequence } : null;
   }
   fragment(key: string): PlanningFragment | null {
     const row = this.db.prepare("SELECT record_json FROM planning_fragments WHERE key=?").get(key);

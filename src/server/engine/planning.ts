@@ -95,21 +95,23 @@ export class PlanningPipeline {
         return;
       }
     }
+    const known = await this.knownPlanningContext(topic);
     const revision = await this.core.turn("claude", topic, buildDiagnosisPlanRevisionPrompt({
+      knownPlan: known.knownPlan,
       planMarkdown: carry.basePlan, scopeGeneration: topic.scopeGeneration, worktreePath: topic.worktreePath, branchName: topic.branchName ?? "-",
       diagnoses: delivered.prompts,
       carry: {
         remainingSteps: carry.remainingSteps, openRequests: carry.openRequests, changedPaths: carry.changedPaths,
         lastSummary: carry.lastSummary, verifiedLedgerRows: carry.verifiedLedger.length,
       },
-      timeline: this.core.dependencies.database.getPromptTimeline(topicId, topic.scopeGeneration),
+      timeline: this.core.dependencies.database.getPromptTimeline(topicId, topic.scopeGeneration, known.inputSequence),
     }), signal, false, {
-      // 일회용 세션·계획 모드(읽기 전용). 재작성 집계는 revision — 승인 계획의 개정이라 무료 최초 계획 자격을 쓰지 않는다.
-      freshSession: true, planMode: true, planBase: carry.basePlan, planningWrite: "revision",
+      // 읽기 전용 개정은 revision으로 집계한다. 서버 제어 계획에서는 작성 세션을 유지한다.
+      freshSession: !this.core.dependencies.database.planning.enabled(topic.id), planMode: true, planBase: carry.basePlan, planningWrite: "revision",
       // 교정 대기본(pending-contract-repair)은 이 진단의 이 적용 시도에만 결속한다 — 정정한 새 진단의 개정 턴이 앞 진단의 응답을 재사용해 새 진단 원문이
       // 러너에게 한 번도 전달되지 않았다(2026-09-15 감사 2차).
       repairContextKey: `diagnosis-plan-revision:${record.id}#${applyInfo(record)?.seq ?? 0}`,
-      readablePaths: [...delivered.paths, ...(carryPath ? [carryPath] : [])],
+      readablePaths: [...known.readablePaths, ...delivered.paths, ...(carryPath ? [carryPath] : [])],
       check: (r) => {
         this.core.assertKind(r, "REVISION");
         assertFindingCoverage([finding], r.findings, label);
@@ -154,6 +156,7 @@ export class PlanningPipeline {
     this.core.diagnoses.markPlanRevised(topic, record, {
       planRevision: topic.planRevision + 1, sha256: artifact.sha256, previousPlanSHA256, artifactRevision: artifact.revision,
     });
+    this.bindPlanningSession(topic, artifact.sha256);
     return { markdown: normalized, sha256: artifact.sha256 };
   }
 
@@ -391,13 +394,15 @@ export class PlanningPipeline {
     signal: AbortSignal,
   ): Promise<void> {
     let topic = this.core.transition(topicId, "CLAUDE_REVISION", "Claude가 감사 결과를 한 번 반영합니다.");
-    // 일회용 세션으로 돈다(freshSession). buildClaudeRevisionPrompt가 계획 전문·감사 전문·타임라인·
-    // 처분 계약을 전부 담으므로 합의 대화 이력이 없어도 판단에 필요한 것이 부족하지 않다.
+    // 서버 제어 계획은 기존 Claude 세션을 이어 쓴다. 기존 토픽의 실행 방식은 유지한다.
+    const known = await this.knownPlanningContext(topic);
     const revision = await this.core.turn("claude", topic, buildClaudeRevisionPrompt({
+      knownPlan: known.knownPlan,
       planMarkdown: storedFirstPlan.markdown, audit, scopeGeneration: topic.scopeGeneration,
-      timeline: this.core.dependencies.database.getPromptTimeline(topicId, topic.scopeGeneration),
+      timeline: this.core.dependencies.database.getPromptTimeline(topicId, topic.scopeGeneration, known.inputSequence),
     }), signal, false, {
-      freshSession: true, planMode: audit.findings.length === 0, planBase: storedFirstPlan.markdown,
+      readablePaths: known.readablePaths,
+      freshSession: !this.core.dependencies.database.planning.enabled(topic.id), planMode: audit.findings.length === 0, planBase: storedFirstPlan.markdown,
       normalize: this.core.carryForwardNormalizer(audit.findings, "Claude revision", { forReview: false }),
       check: (r) => {
         this.core.assertKind(r, "REVISION");
@@ -466,12 +471,15 @@ export class PlanningPipeline {
     const roundLabel = this.core.dependencies.database.getTopic(topicId).planRevision >= 3 ? "추가 개정" : "개정 2회차";
     let topic = this.core.transition(topicId, "CLAUDE_REVISION",
       `종결 확인의 필수 쟁점(${newIDs.join(", ")})을 ${roundLabel}로 최신 계획 위에 반영합니다 — 처음부터 다시 돌지 않습니다.`);
+    const known = await this.knownPlanningContext(topic);
     const revision = await this.core.turn("claude", topic, buildClaudeRevisionPrompt({
+      knownPlan: known.knownPlan,
       planMarkdown: storedRevisedPlan.markdown, audit: source, scopeGeneration: topic.scopeGeneration,
-      timeline: this.core.dependencies.database.getPromptTimeline(topicId, topic.scopeGeneration),
+      timeline: this.core.dependencies.database.getPromptTimeline(topicId, topic.scopeGeneration, known.inputSequence),
       source: "closeout",
     }), signal, false, {
-      freshSession: true, planMode: false, planBase: storedRevisedPlan.markdown,
+      readablePaths: known.readablePaths,
+      freshSession: !this.core.dependencies.database.planning.enabled(topic.id), planMode: false, planBase: storedRevisedPlan.markdown,
       normalize: this.core.carryForwardNormalizer(source.findings, "Claude revision(2회차)", { forReview: false }),
       check: (r) => {
         this.core.assertKind(r, "REVISION");
@@ -633,6 +641,29 @@ export class PlanningPipeline {
     return true;
   }
 
+  private async knownPlanningContext(topic: Topic) {
+    const database = this.core.dependencies.database;
+    const binding = database.planning.enabled(topic.id) ? database.planning.boundSession(topic) : null;
+    if (!binding) return { knownPlan: undefined, inputSequence: 0, readablePaths: [] as string[] };
+    const artifact = await this.core.requireCurrentPlanArtifact(topic.id);
+    return { knownPlan: { sha256: topic.planSHA256!, path: artifact.path },
+      inputSequence: Math.max(binding.inputSequence, database.getFlags(topic.id).implementationPromptSequence ?? 0),
+      readablePaths: [artifact.path] };
+  }
+
+  private bindPlanningSession(topic: Topic, sha256: string): void {
+    const database = this.core.dependencies.database;
+    if (!database.planning.enabled(topic.id)) return;
+    const current = database.getTopic(topic.id);
+    const sessionId = current.participants.find(p => p.role === "claude")?.sessionId;
+    if (!sessionId || sessionId.startsWith("pending:")) throw new Error("계획을 작성한 Claude 세션이 없습니다.");
+    const checkpoint = database.planning.latest(topic.id, "claude");
+    if (!checkpoint?.finalized || checkpoint.sessionId !== sessionId || checkpoint.scopeGeneration !== current.scopeGeneration || checkpoint.planEpoch !== current.planEpoch) {
+      throw new Error("현재 계획 응답을 작성한 Claude 세션과 연결 정보를 확인할 수 없습니다.");
+    }
+    database.planning.bindSession(current, sha256, sessionId, checkpoint.inputSequence);
+  }
+
   private async savePlan(
     topic: Topic,
     markdown: string,
@@ -650,6 +681,7 @@ export class PlanningPipeline {
     this.core.event(topic.id, "claude", "agent_output", `계획 ${revision}판을 저장했습니다.`, {
       artifactKind: "plan", revision, artifactRevision: artifact.revision, sha256: artifact.sha256,
     });
+    this.bindPlanningSession(topic, artifact.sha256);
     return { markdown: normalized, sha256: artifact.sha256 };
   }
 }

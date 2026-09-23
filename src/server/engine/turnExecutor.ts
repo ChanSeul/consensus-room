@@ -1,3 +1,4 @@
+import { PlanningPaused } from "../../shared/planningControl.js";
 // 공통 실행기 — 모델 호출은 전부 여기서만 연다(PLAN §2 "다음 실행 허용"). 파이프라인·코어는 adapter 를 직접 부르지 않는다
 // (tests/turn-executor.test.ts 가 소스를 읽어 구조를 검사한다).
 //
@@ -159,10 +160,16 @@ export class TurnExecutor {
     try {
       let sessionId = session.sessionId;
       const result = await adapter.resumeTurn({ ...base, sessionId, onSessionCreated: id => {
+        if (request.role === "claude" && this.core.dependencies.database.planning.enabled(request.topic.id) && id !== session.sessionId) {
+          throw new PlanningPaused("Claude가 다른 세션 ID를 반환했습니다. 기존 세션을 보존하고 중단합니다.");
+        }
         sessionId = id; session.onSessionCreated?.(id);
       } });
       return this.settle(request, { sessionId, result, created: sessionId !== session.sessionId });
     } catch (error) {
+      if (request.role === "claude" && this.core.dependencies.database.planning.enabled(request.topic.id) && isMissingSessionError(error) && !request.signal.aborted) {
+        throw new PlanningPaused("Claude 대화 파일을 찾을 수 없습니다. 새 세션을 생성하지 않고 복구를 기다립니다.");
+      }
       if (!session.fallbackFresh || !isMissingSessionError(error) || request.signal.aborted) throw error;
       // 세션 유실 폴백도 같은 경계다 — 새 spawn 전에 beforeSpawn(admit) 이 다시 돈다.
       this.core.event(request.topic.id, "system", "system",

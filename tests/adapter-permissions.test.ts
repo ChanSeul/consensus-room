@@ -63,6 +63,26 @@ function memoryDocument(name: string, body: string): string {
 }
 
 describe("에이전트별 권한 경계", () => {
+  it("resumes the planning session for Opus implementation with ultracode and write tools", async () => {
+    const root = mkdtempSync(join(tmpdir(), "planning-to-implementation-"));
+    temporaryDirectories.push(root);
+    const runner = new RecordingRunner(successfulResult([planResult]));
+    const adapter = new ClaudeAdapter(runner);
+    const settings = { model: "claude-opus-5-5", effort: "xhigh" } as const;
+    const planned = await adapter.createSession({ cwd: root, prompt: "Plan", settings,
+      planningControl: { admissionId: "plan", maxPromptBytes: 65536 } });
+    await adapter.resumeTurn({ cwd: root, prompt: "Implement approved plan", sessionId: planned.sessionId,
+      implementation: true, settings });
+    const [planning, implementation] = runner.calls;
+    expect(planning.args[planning.args.indexOf("--tools") + 1]).toBe("");
+    expect(implementation.args[implementation.args.indexOf("--resume") + 1]).toBe(planned.sessionId);
+    expect(implementation.args).not.toContain("--session-id");
+    expect(implementation.args[implementation.args.indexOf("--model") + 1]).toBe("claude-opus-5-5");
+    expect(implementation.args[implementation.args.indexOf("--effort") + 1]).toBe("xhigh");
+    expect(implementation.args[implementation.args.indexOf("--tools") + 1]).toContain("Edit,Write,Workflow");
+    expect(JSON.parse(implementation.args[implementation.args.indexOf("--settings") + 1]).ultracode).toBe(true);
+  });
+
   it("controlled planning disables direct sources, preserves instructions, and transports one image separately", async () => {
     const root = mkdtempSync(join(tmpdir(), "controlled-adapter-"));
     temporaryDirectories.push(root);

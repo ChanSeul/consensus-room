@@ -13,7 +13,7 @@ import { PLANNING_LIMITS, type PlanningStep } from "../src/shared/planningContro
 import { WorkflowEngine } from "../src/server/workflow";
 import { ArtifactStore } from "../src/server/artifacts";
 import type { AgentAdapter, SessionTurn, TurnUsage } from "../src/server/types";
-import type { AgentResult } from "../src/shared/contracts";
+import { REQUIRED_PLAN_HEADINGS, type AgentResult } from "../src/shared/contracts";
 
 const cleanups: Array<() => void> = [];
 afterEach(() => { vi.restoreAllMocks(); for (const clean of cleanups.splice(0).reverse()) clean(); });
@@ -85,7 +85,7 @@ it("collects bounded snapshot evidence before returning one final plan and reser
   let restoredSession = "";
   await wrapped.resumeTurn({ cwd: repo, prompt: "Plan navigation without edits.", sessionId: "stale-participant",
     onSessionCreated: id => { restoredSession = id; } });
-  expect(restoredSession).toBe("session-2");
+  expect(restoredSession).toBe("session-1");
   expect(fake.calls).toHaveLength(2);
 });
 
@@ -311,8 +311,8 @@ it("public workflow retry preserves the epoch and blocks a malformed final resul
   expect(fake.calls).toHaveLength(3);
   expect(database.getTopic("topic")).toMatchObject({ state: "USER_DECISION_REQUIRED", planEpoch: checkpoint.planEpoch, approvedPlanSHA256: null });
   expect(database.planning.latest("topic")).toMatchObject({ id: checkpoint.id, finalized: false });
-  expect(database.getTopic("topic").participants.find(p => p.role === "claude")?.sessionId).toBe("session-3");
-  expect(database.planning.latest("topic")?.sessions).toEqual(["session-1", "session-2", "session-3"]);
+  expect(database.getTopic("topic").participants.find(p => p.role === "claude")?.sessionId).toBe("claude-existing");
+  expect(database.planning.latest("topic")?.sessions).toEqual(["claude-existing"]);
   expect(database.revisions.account("topic").used).toBe(0);
   expect(codex.calls).toHaveLength(0);
   await engine.shutdown();
@@ -375,4 +375,106 @@ it("does not double count session discovery time or stop research before the rea
   await guardedPlanning(adapter, database, git).createSession({ cwd: repo, prompt: "Review" });
   expect(calls).toBe(2);
   expect(database.planning.latest("topic")?.usage.durationMs).toBe(10001);
+});
+
+// Public adapter boundary: research continuation must retain identity and omit delivered source bytes.
+it("resumes one Claude research session and does not resend the task or delivered fragments", async () => {
+  const { repo, database, git } = setup();
+  const fake = scripted(async (_turn, n) => n < 3 ? answer(step({ requests: [
+    { kind: "file", selector: "form.swift", question: "Read", offset: 0 },
+  ] })) : answer(step({ questions: [], complete: true })));
+  await guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "UNIQUE_INITIAL_CONTRACT" });
+  expect(fake.calls).toHaveLength(3);
+  expect(fake.calls[1]).toMatchObject({ sessionId: "session-1" });
+  expect(fake.calls[2]).toMatchObject({ sessionId: "session-1" });
+  expect(fake.calls[1].prompt).not.toContain("UNIQUE_INITIAL_CONTRACT");
+  expect(fake.calls[1].prompt).toContain("let step = 0");
+  expect(fake.calls[2].prompt).not.toContain("let step = 0");
+});
+
+// Actual consumer: WorkflowEngine approval -> implementation, with real Git and persisted SQLite.
+// CLI processes are fake: native flags/permissions are checked in adapter-permissions.test.ts.
+it("keeps the plan and revision session through approval, engine restart, implementation and missing-session recovery", async () => {
+  const { root, repo, database, git } = setup();
+  database.updateTopic("topic", { state: "DRAFT" });
+  for (const role of ["claude", "codex"] as const) database.upsertParticipant("topic", {
+    role, sessionId: `pending:${role}`, mode: "created", acknowledgedPlanSHA256: null,
+  });
+  const plan = REQUIRED_PLAN_HEADINGS.map(h => `## ${h}\n\nUNIQUE_PLAN_BODY${h === "허용 오차" ? '\n```tolerance\n{"scopePaths":["**"],"rules":[]}\n```' : ""}`).join("\n\n");
+  const finding = { id: "F-1", title: "Validate navigation", severity: "HIGH" as const, disposition: "AGREED_ACTION" as const,
+    rationale: "Preserve navigation", evidenceRefs: [], requiresUserDecision: false };
+  const modelTurns: SessionTurn[] = [];
+  let creates = 0, unavailable = false;
+  const runClaude = async (t: SessionTurn): Promise<AgentResult> => {
+    if (t.protocolOnly) return { kind: "ACK", summary: "ack", findings: [], evidenceRefs: [], planSHA256: database.getTopic("topic").planSHA256! };
+    modelTurns.push(t);
+    if (unavailable) throw new Error("No conversation found with session ID: " + t.sessionId);
+    t.onSessionCreated?.(t.sessionId);
+    t.onProcessSpawn?.({ pid: 1, pgid: 1, executable: "fake", commandLine: "fake", startedAt: new Date().toISOString() });
+    t.onUsage?.({ inputTokens: 100, outputTokens: 20, durationMs: 1, recordKind: "final" });
+    if (t.implementation) return { kind: "IMPLEMENTATION", summary: "Await decision", status: "blocked", findings: [], evidenceRefs: [], requestedUserDecision: "Confirm completion" };
+    const revision = database.getTopic("topic").state === "CLAUDE_REVISION";
+    return { kind: revision ? "REVISION" : "PLAN", summary: "Plan", planMarkdown: plan,
+      findings: revision ? [finding] : [], evidenceRefs: [], planningStep: step({ questions: [], complete: true }) };
+  };
+  const claude: AgentAdapter = { role: "claude", validateExistingSession: async () => true,
+    createSession: async t => { const id = t.protocolOnly ? "ack-only" : `author-${++creates}`; return { sessionId: id, result: await runClaude({ ...t, sessionId: id }) }; },
+    resumeTurn: runClaude };
+  const codex: AgentAdapter = { role: "codex", validateExistingSession: async () => true,
+    createSession: async t => ({ sessionId: "review", result: await codex.resumeTurn({ ...t, sessionId: "review" }) }),
+    resumeTurn: async t => ({ kind: t.protocolOnly ? "ACK" : database.getTopic("topic").state === "CODEX_AUDIT" ? "AUDIT" : "CLOSEOUT",
+      summary: "Reviewed", findings: t.protocolOnly ? [] : [finding], evidenceRefs: [], planSHA256: database.getTopic("topic").planSHA256! }) };
+  let runtimeDatabase = database;
+  const buildEngine = () => new WorkflowEngine({ database: runtimeDatabase, git, artifacts: new ArtifactStore(join(root, "artifacts"), runtimeDatabase),
+    claude: guardedPlanning(claude, runtimeDatabase, git), codex });
+  let engine = buildEngine();
+  const settle = async () => {
+    const deadline = Date.now() + 8000;
+    while (database.runningAction("topic")) {
+      if (Date.now() > deadline) throw new Error("Workflow timeout");
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+  };
+  engine.startPlan("topic"); await settle();
+  expect(database.getTopic("topic").state, database.getTopic("topic").lastError ?? "").toBe("AWAITING_USER_APPROVAL");
+  expect(creates).toBe(1);
+  expect(modelTurns.map(t => t.sessionId)).toEqual(["author-1", "author-1"]);
+  expect(modelTurns[1].prompt).not.toContain("UNIQUE_PLAN_BODY");
+  const binding = database.planning.boundSession(database.getTopic("topic"));
+  expect(binding?.sessionId).toBe("author-1");
+  engine.approve("topic", database.getTopic("topic").planSHA256!);
+  await engine.shutdown();
+  runtimeDatabase = new ConsensusDatabase(join(root, "room.db"));
+  cleanups.push(() => runtimeDatabase.close());
+  engine = buildEngine();
+  engine.startImplementation("topic", undefined, "ONLY_NEW_KICKOFF"); await settle();
+  expect(database.getTopic("topic").state, database.getTopic("topic").lastError ?? "").toBe("USER_DECISION_REQUIRED");
+  const implementation = modelTurns.at(-1)!;
+  expect(implementation.sessionId).toBe("author-1");
+  expect(implementation.implementation).toBe(true);
+  expect(implementation.prompt).toContain("ONLY_NEW_KICKOFF");
+  expect(implementation.prompt).not.toContain("UNIQUE_PLAN_BODY");
+  expect(database.getFlags("topic").implementationSessionId).toBe("author-1");
+  unavailable = true;
+  engine.retry("topic"); await settle();
+  expect(database.getTopic("topic").state).toBe("USER_DECISION_REQUIRED");
+  expect(creates).toBe(1);
+  expect(database.getFlags("topic").implementationSessionId).toBe("author-1");
+  const callCount = modelTurns.length;
+  database.upsertParticipant("topic", { role: "claude", sessionId: "unrelated-session", mode: "attached", acknowledgedPlanSHA256: database.getTopic("topic").planSHA256 });
+  engine.retry("topic"); await settle();
+  expect(modelTurns).toHaveLength(callCount);
+  expect(database.getTopic("topic").state).toBe("USER_DECISION_REQUIRED");
+  await engine.shutdown();
+});
+
+it("allows an explicit bounded reread after compaction without treating it as new evidence", async () => {
+  const { repo, database, git } = setup();
+  const fake = scripted(async (_t, n) => n < 3 ? answer(step({ requests: [
+    { kind: "file", selector: "form.swift", question: "Read", offset: 0,
+      ...(n === 2 ? { rereadReason: "Compaction omitted the exact declaration" } : {}) },
+  ] })) : answer(step({ questions: [], complete: true })));
+  await guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Plan" });
+  expect(fake.calls[2].prompt).toContain("let step = 0");
+  expect(database.planning.latest("topic")?.delivered).toHaveLength(1);
 });

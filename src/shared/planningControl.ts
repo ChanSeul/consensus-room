@@ -10,6 +10,7 @@ export const PlanningReadSchema = z.object({
   selector: z.string().min(1).max(1024),
   question: z.string().min(1).max(500),
   offset: z.number().int().nonnegative(),
+  rereadReason: z.string().trim().min(1).max(500).optional(),
 }).strict();
 export type PlanningRead = z.infer<typeof PlanningReadSchema>;
 export const PlanningStepSchema = z.object({
@@ -48,6 +49,7 @@ export interface PlanningCheckpoint {
   finalized: boolean; finalAttempted: boolean;
   started: boolean; injectedBytes: number;
   sourceHash?: string;
+  deliveredContractHash?: string;
   peakStep?: PlanningUsage;
   lastRequestInputTokens?: number;
   peakRequestInputTokens?: number;

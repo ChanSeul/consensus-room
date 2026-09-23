@@ -248,6 +248,7 @@ ${dispositionContract("AUDIT")}
 }
 
 export function buildClaudeRevisionPrompt(input: {
+  knownPlan?: { sha256: string; path: string };
   planMarkdown: string;
   audit: AgentResult;
   scopeGeneration: number;
@@ -261,10 +262,7 @@ export function buildClaudeRevisionPrompt(input: {
     : "Codex 감사에 답하고 계획을 한 번만 개정합니다."}
 
 범위 세대: ${input.scopeGeneration}
-기존 계획:
----
-${numberedPlan(input.planMarkdown)}
----
+${input.knownPlan ? `이 세션에서 작성한 기존 계획 SHA-256: ${input.knownPlan.sha256}. 전문은 반복하지 않습니다. 정확한 행 번호나 압축으로 잃은 부분이 필요할 때만 artifact 자료 ${input.knownPlan.path}를 조회하세요.` : `기존 계획:\n---\n${numberedPlan(input.planMarkdown)}\n---`}
 
 ${closeoutRound ? "Codex 종결 확인의 새 쟁점:" : "Codex 감사:"}
 ${JSON.stringify(input.audit, null, 2)}
@@ -307,6 +305,7 @@ export interface DiagnosisPlanRevisionCarry {
 }
 
 export function buildDiagnosisPlanRevisionPrompt(input: {
+  knownPlan?: { sha256: string; path: string };
   planMarkdown: string;
   scopeGeneration: number;
   worktreePath: string;
@@ -323,10 +322,7 @@ export function buildDiagnosisPlanRevisionPrompt(input: {
 범위 세대: ${input.scopeGeneration}
 작업 worktree(읽기 전용으로 확인하세요): ${input.worktreePath}
 작업 브랜치: ${input.branchName}
-기존 계획:
----
-${numberedPlan(input.planMarkdown)}
----
+${input.knownPlan ? `이 세션에서 작성한 기존 계획 SHA-256: ${input.knownPlan.sha256}. 전문은 반복하지 않습니다. 정확한 행 번호나 압축으로 잃은 부분이 필요할 때만 artifact 자료 ${input.knownPlan.path}를 조회하세요.` : `기존 계획:\n---\n${numberedPlan(input.planMarkdown)}\n---`}
 
 ${planRevisionDiagnoses(input.diagnoses)}
 진행 중인 구현의 상태(서버 기록):
@@ -509,6 +505,8 @@ export function buildImplementationPrompt(input: {
   branchName: string;
   timeline: readonly TimelineEvent[];
   resumedSession?: boolean;
+  planningHandoff?: boolean;
+  planAlreadyKnown?: boolean;
   planPath?: string | null;
   // 결정·증거 원문 전체(서버 보존 산출물, 읽기 허용). 세션 압축 뒤 원문이 필요할 때 조회한다(Codex 감사 D02).
   decisionsPath?: string | null;
@@ -519,7 +517,9 @@ export function buildImplementationPrompt(input: {
   // 계획 변경 진단의 개정 계획이 승인된 뒤 첫 구현 — 이어받은 세션에도 개정 계획 전문과 개정 알림을 싣는다.
   planRevised?: PlanRevisionNotice;
 }): string {
-  return `${input.planRevised
+  return `${input.planningHandoff
+    ? "이 세션에서 확정한 계획을 사용자가 승인했습니다. 이제 승인 범위의 구현을 시작하세요."
+    : input.planRevised
     ? "중재자 진단으로 계획이 개정됐고 사용자가 개정 계획을 승인했습니다. 이 세션이 앞서 받은 계획이 아니라 아래 개정 계획의 범위로 이어서 구현하세요."
     : input.resumedSession
     ? "이 구현 세션의 이어지는 턴입니다. 같은 승인 범위를 계속 구현하세요."
@@ -529,12 +529,12 @@ export function buildImplementationPrompt(input: {
 작업 worktree: ${input.worktreePath}
 작업 브랜치: ${input.branchName}
 
-${planSection(input.planRevised ? { ...input, resumedSession: false } : input)}${planRevisedSection(input.planRevised)}
+${planSection(input.planRevised && !input.planAlreadyKnown ? { ...input, resumedSession: false } : input)}${planRevisedSection(input.planRevised)}
 
 ${continuedTimelineHeading(input.resumedSession, "현재 방의 사용자 결정과 증거:")}
 ${renderTimeline(input.timeline, false, continuedTimelineEmpty(input.resumedSession))}
 ${decisionsSection(input.decisionsPath)}
-${openRequestsSection(input.openRequests)}${diagnosesSection(input.diagnoses)}${input.resumedSession ? "" : renderImplementationNotes(input.implementationNotes, "implementation")}
+${openRequestsSection(input.openRequests)}${diagnosesSection(input.diagnoses)}${input.resumedSession && !input.planningHandoff ? "" : renderImplementationNotes(input.implementationNotes, "implementation")}
 구현 중 발견해 이 턴에서 실제로 고친 쟁점은 RESOLVED_BY_FIX로 처분하고 확인 방법을 evidenceRefs에 남기세요.
 
 ${completionStatusContract()}

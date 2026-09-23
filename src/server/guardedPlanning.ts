@@ -54,7 +54,7 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
       scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch, planSHA256: topic.planSHA256, prompt: turn.prompt,
       inputSequence: database.getTimeline(topic.id).at(-1)?.sequence ?? 0,
       admissionId: turn.planningControl?.admissionId ?? randomUUID(), round: 0, stalled: 0,
-      sessionId: adapter.role === "codex" && resume ? (turn as SessionTurn).sessionId : null,
+      sessionId: resume ? (turn as SessionTurn).sessionId : null,
       step: { draft: "", facts: [], contradictions: [], questions: [topic.title], requests: [], complete: false },
       fragments: [], delivered: [], usage: zero(), updatedAt: new Date().toISOString(), stopped: null,
       finalized: false, finalAttempted: false, started: false, injectedBytes: 0,
@@ -180,12 +180,15 @@ Return planningStep on every response: draft, facts with refs to fragment IDs, c
 Request at most ${LIMIT.requests} fragments using kind=file|search|evidence|memory|context|artifact|image, selector, question, offset.
 An image request selects one imageHash from an evidence unit (offset=0). Memory/wiki summaries are not independent product evidence.
 File selectors are snapshot-relative paths. Search selectors are path::literal. Source IDs appear in context:manifest; omit the kind prefix in selector. Only listed artifact paths are allowed.
+Already delivered fragments are omitted. Only if compaction lost a needed fragment, set rereadReason explaining what must be recovered.
 Use returned nextOffset for continuation; omitted text is NOT absent evidence. Do not invent unseen requirements.
 Update the checkpoint, retaining contradictory evidence and unanswered questions. Set complete only when all questions are resolved.
 ${finalizing ? "No more research is available. Return the final contracted result, or requestedUserDecision explaining what is missing." : "If more evidence is necessary return requests and complete=false; otherwise complete=true with the final contracted result."}
 Checkpoint must fit ${LIMIT.checkpointBytes} UTF-8 bytes. Final result must satisfy the task contract below.`;
         // The original task contract and mandatory instructions are never silently truncated.
-        const prompt = `${guidance}\n\n${turn.prompt}\n\nSnapshot ${tree}; evidence ${state.digest}\n` +
+        const contractHash = planningHash(turn.prompt);
+        const task = record.deliveredContractHash === contractHash ? "Continue the task already in this session." : turn.prompt;
+        const prompt = `${guidance}\n\n${task}\n\nSnapshot ${tree}; evidence ${state.digest}\n` +
           `Manifest: ${bytes(manifest) <= 4096 ? JSON.stringify(manifest) : "Read context:manifest in chunks."}\n` +
           `Checkpoint: ${JSON.stringify(record.step)}\nFragments: ${JSON.stringify(record.fragments)}`;
         const packetBytes = bytes([EXECUTION_POLICY_NOTE, ...instructions.blocks, prompt].join("\n\n"));
@@ -255,12 +258,13 @@ Checkpoint must fit ${LIMIT.checkpointBytes} UTF-8 bytes. Final result must sati
             save(); turn.onProcessSpawn?.(process);
           },
           onSessionCreated: id => {
+            if (record.sessionId && record.sessionId !== id) pause("The CLI changed the planning session identity; restore the existing session before retrying.");
             record.sessionId = id; record.sessions = [...new Set([...(record.sessions ?? []), id])];
             save(); turn.onSessionCreated?.(id);
           } };
         let result: AgentResult;
         try {
-          if (adapter.role === "codex" && record.sessionId) {
+          if (record.sessionId) {
             result = await adapter.resumeTurn({ ...roundTurn, sessionId: record.sessionId });
           } else {
             const response = await adapter.createSession(roundTurn);
@@ -270,6 +274,7 @@ Checkpoint must fit ${LIMIT.checkpointBytes} UTF-8 bytes. Final result must sati
           if (!["inputTokens", "outputTokens", "durationMs"].every(k => observed.has(k)) && callStarted) record.usageIncomplete = true;
           save();
         }
+        record.deliveredContractHash = contractHash;
         record.lastResponse = result; record.responseBytes = (record.responseBytes ?? 0) + bytes(result); save();
         await assertCurrent();
         if (record.usageIncomplete) pause("Usage is incomplete; checkpoint saved before another model call.");
@@ -295,6 +300,7 @@ Checkpoint must fit ${LIMIT.checkpointBytes} UTF-8 bytes. Final result must sati
         const fragments: PlanningFragment[] = [];
         for (const request of step.requests) {
           if (request.kind === "image") {
+            if (record.delivered.includes(request.selector) && !request.rereadReason) continue;
             if (record.imageHash || request.offset !== 0 || !imageHashes.has(request.selector)) pause("Only one pinned image per round is allowed.");
             const fragment: PlanningFragment = { id: request.selector, kind: "image", selector: request.selector, hash: request.selector,
               offset: 0, nextOffset: null, content: "Pinned design image attached to this round." };
@@ -306,7 +312,7 @@ Checkpoint must fit ${LIMIT.checkpointBytes} UTF-8 bytes. Final result must sati
           const fragment = database.planning.fragment(cacheKey) ?? await reader.read(request);
           database.planning.saveFragment(cacheKey, fragment);
           if (fragments.some(f => f.id === fragment.id)) continue;
-          if (adapter.role === "codex" && record.delivered.includes(fragment.id)) continue;
+          if (record.delivered.includes(fragment.id) && !request.rereadReason) continue;
           if (bytes([...fragments, fragment]) > LIMIT.batchBytes) break;
           fragments.push(fragment);
         }
