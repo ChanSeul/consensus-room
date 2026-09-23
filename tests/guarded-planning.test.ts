@@ -207,6 +207,31 @@ it("fulfills accepted read requests after a budget increase without repeating th
   expect(database.planning.latest("topic")!.round).toBe(2);
 });
 
+it("retains deferred reads when recovery is interrupted before fragments are saved", async () => {
+  const { repo, database, git } = setup();
+  const fake = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ facts: [{ statement: "Unsupported", refs: ["context:request"] }],
+      questions: [], complete: true }));
+    const fragments = JSON.parse(turn.prompt.split("Fragments: ").at(-1)!) as Array<{ id: string }>;
+    expect(fragments).toHaveLength(1);
+    return answer(step({ facts: [{ statement: "Verified", refs: [fragments[0].id] }], questions: [], complete: true }));
+  });
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("not delivered");
+  const saved = database.planning.latest("topic")!;
+  saved.step = step({ requests: [{ kind: "file", selector: "form.swift", question: "Continue after budget", offset: 0 }] });
+  saved.stopped = "Planning checkpoint saved; insufficient remaining budget for synthesis.";
+  database.planning.save(saved);
+  const read = vi.spyOn(PlanningReader.prototype, "read").mockRejectedValueOnce(new Error("Interrupted read"));
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Interrupted read");
+  expect(database.planning.latest("topic")!.stopped).toBe(saved.stopped);
+  expect(fake.calls).toHaveLength(1);
+  read.mockRestore();
+  const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+  expect(result.result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls).toHaveLength(2);
+});
+
 it("does not recover budget-paused reads from a previous user contract", async () => {
   const { repo, database, git } = setup();
   const fake = scripted(async (turn, n) => {

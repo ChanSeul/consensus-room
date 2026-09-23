@@ -135,7 +135,6 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
       && record.lastResponse && PlanningStepSchema.safeParse(record.lastResponse.planningStep).success
       && record.lastResponse.planningStep?.complete === false && record.lastResponse.planningStep.requests.length
       ? record.lastResponse : null;
-    record.stopped = null; save();
     docs.set("context:manifest", JSON.stringify(manifest));
     const reader = new PlanningReader(turn.cwd, tree, docs);
     const unadoptedFragmentProgress = record.fragments.some(f => !record.delivered.includes(f.id));
@@ -250,14 +249,16 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
       await assertCurrent();
       if (record.usageIncomplete) pause("Usage is incomplete; mediator reconciliation is required before resuming this attempt.");
       if (record.finalResult && record.finalized) {
+        record.stopped = null; save();
         turn.onSessionCreated?.(record.sessionId!);
         return { sessionId: record.sessionId!, result: record.finalResult };
       }
       if (replayResponse) {
         const recovered = await acceptStep(replayResponse, false, unadoptedFragmentProgress);
-        if (recovered) return { sessionId: record.sessionId!, result: recovered };
+        if (recovered) { record.stopped = null; save(); return { sessionId: record.sessionId!, result: recovered }; }
       }
       if (recoverBudgetReads && !softLimit() && record.round < LIMIT.rounds) await fulfillRequests(record.step.requests);
+      if (!recoverBudgetReads || record.fragments.length) { record.stopped = null; save(); }
       while (true) {
         await assertCurrent();
         const finalizing = record.round >= LIMIT.rounds || softLimit();
@@ -341,6 +342,7 @@ Checkpoint must fit ${LIMIT.checkpointBytes} UTF-8 bytes. Final result must sati
           planningControl: { admissionId: record.admissionId, maxPromptBytes: LIMIT.promptBytes, image }, evidenceManaged: true,
           readablePaths: image ? [image.path] : [],
           onUsage, onProcessSpawn: process => {
+            record.stopped = null;
             callStarted = true;
             if (finalizing) record.finalAttempted = true;
             record.started = true; record.round++; record.injectedBytes += packetBytes;
