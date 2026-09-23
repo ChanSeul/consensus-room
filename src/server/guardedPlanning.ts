@@ -130,9 +130,6 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
     }
     record.tree = tree; record.evidenceDigest = state.digest; record.instructionHash = instructionHash; record.sourceHash = sourceHash;
     // A retry rechecks the same limits. It never grants budget or resets a round/session counter.
-    const recoverBudgetReads = !newInput && !sourceChanged &&
-      ["Planning checkpoint saved; insufficient remaining budget for synthesis.", PENDING_READS].includes(record.stopped ?? "")
-      && record.fragments.length === 0 && record.step.requests.length > 0;
     const replayResponse = !newInput && !sourceChanged && record.stopped === "Checkpoint cites evidence that was not delivered."
       && record.lastResponse && PlanningStepSchema.safeParse(record.lastResponse.planningStep).success
       && record.lastResponse.planningStep?.complete === false && record.lastResponse.planningStep.requests.length
@@ -263,8 +260,11 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
         const recovered = await acceptStep(replayResponse, false, unadoptedFragmentProgress);
         if (recovered) { record.stopped = null; save(); return { sessionId: record.sessionId!, result: recovered }; }
       }
-      if (recoverBudgetReads && !softLimit() && record.round < LIMIT.rounds) await fulfillRequests(record.step.requests);
-      if (!recoverBudgetReads || record.fragments.length) { record.stopped = null; save(); }
+      const pendingReads = !newInput && !sourceChanged &&
+        ["Planning checkpoint saved; insufficient remaining budget for synthesis.", PENDING_READS].includes(record.stopped ?? "")
+        && record.fragments.length === 0 && record.step.requests.length > 0;
+      if (pendingReads && !softLimit() && record.round < LIMIT.rounds) await fulfillRequests(record.step.requests);
+      if (!pendingReads || record.fragments.length) { record.stopped = null; save(); }
       while (true) {
         await assertCurrent();
         const finalizing = record.round >= LIMIT.rounds || softLimit();

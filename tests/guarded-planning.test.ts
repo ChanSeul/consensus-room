@@ -173,6 +173,37 @@ it("does not replay an adopted citation response after a crash while saving its 
   expect(fake.calls).toHaveLength(2);
 });
 
+it("keeps citation replay reads pending when the soft budget stops research", async () => {
+  const { repo, database, git } = setup("claude", 100);
+  const fake = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ facts: [{ statement: "Unverified", refs: ["context:request"] }],
+      questions: [], complete: true }));
+    const fragments = JSON.parse(turn.prompt.split("Fragments: ").at(-1)!) as Array<{ id: string }>;
+    expect(fragments).toHaveLength(1);
+    return answer(step({ facts: [{ statement: "Verified", refs: [fragments[0].id] }], questions: [], complete: true }));
+  });
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("not delivered");
+  const saved = database.planning.latest("topic")!;
+  saved.lastResponse = answer(step({ facts: [{ statement: "Unverified", refs: ["context:request"] }],
+    requests: [{ kind: "file", selector: "form.swift", question: "Verify", offset: 0 }] }));
+  database.planning.save(saved);
+  const writeTree = git.writeWorkingTree.bind(git);
+  let reads = 0;
+  const interrupted = vi.spyOn(git, "writeWorkingTree").mockImplementation(async (...args) => {
+    if (++reads === 3) throw new Error("Interrupted before budget pause");
+    return writeTree(...args);
+  });
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Interrupted before budget pause");
+  interrupted.mockRestore();
+  expect(database.planning.latest("topic")!.stopped).toBe("Planning checkpoint accepted; deferred reads pending.");
+  database.budgets.grant("topic", "raise-input", { execution: { inputTokens: 1000, outputTokens: 10000, durationMs: 100000 },
+    total: { inputTokens: 300000, outputTokens: 30000, durationMs: 300000 } }, 1);
+  const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+  expect(result.result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls).toHaveLength(2);
+});
+
 it("counts unadopted delivered fragments as progress when replaying a paused response", async () => {
   const { repo, database, git } = setup();
   const fake = scripted(async (turn, n) => {
