@@ -1,3 +1,4 @@
+import type { PlanningMigration } from "../shared/planningControl.js";
 import {reviewScope,type ReviewScope} from "../shared/reviews.js";
 import { assertToleranceWidening, normalizeToleranceBlocks, parseTolerancePolicy, replaceToleranceBlock, TolerancePolicySchema } from "../shared/tolerance.js";
 import { hashPlan, normalizePlan } from "../shared/workflow.js";
@@ -166,6 +167,36 @@ export class WorkflowEngine {
     });
   }
 
+  async migrateInterruptedPlanning(topicId: string, input: PlanningMigration, requestKey: string, origin?: CallOrigin) {
+    const db = this.core.dependencies.database;
+    const snapshot = () => {
+      this.core.assertNotShuttingDown();
+      this.core.assertNoActiveWork(topicId);
+      const topic = db.getTopic(topicId);
+      db.planning.assertMigration(topic, input);
+      if (db.participantSessionInUse(topicId, "claude", input.sessionId)) throw new Error("Session belongs to another topic.");
+      return JSON.stringify([topic, db.getFlags(topicId), db.getTimeline(topicId).at(-1)?.sequence]);
+    };
+    const before = snapshot();
+    if (!await this.core.adapter("claude").validateExistingSession(input.sessionId)) throw new Error("Planning session is unavailable.");
+    const artifact = await this.core.dependencies.artifacts.verifiedLatest(topicId, "interrupted-output");
+    if (!artifact) throw new Error("Interrupted output is unavailable.");
+    const output = JSON.parse(artifact.content);
+    const topic = db.getTopic(topicId);
+    const init = typeof output.output?.stdout === "string" && output.output.stdout.split("\n").some((line: string) => {
+      try { const row = JSON.parse(line); return row.type === "system" && row.subtype === "init" &&
+        row.session_id === input.sessionId && row.cwd === topic.worktreePath; } catch { return false; }
+    });
+    if (output.sessionId !== input.sessionId || !init) throw new Error("Interrupted output does not verify this session and worktree.");
+    if (snapshot() !== before) throw new Error("Topic changed during migration validation.");
+    if (input.apply) db.applyTopicTransition({ topicId, changes: {}, planningMigration: input, events: [{
+      actor: "system", kind: "system", state: topic.state,
+      body: "중단된 첫 계획을 검증된 기존 세션과 계획 정책 v2로 이전했습니다. 사용 예산과 재작성 횟수는 유지합니다.",
+      payload: { planningMigration: input, requestKey, requestAction: "planning:migrate", ...(origin ? { origin } : {}) },
+    }] });
+    return { version: db.planning.policyVersion(topicId), validated: true, applied: input.apply, ...input };
+  }
+
   assertBudgetEditable(topicId: string): void { this.core.assertNoActiveWork(topicId); }
 
   startPlan(topicId: string, actionId?: string): string {
@@ -256,6 +287,16 @@ export class WorkflowEngine {
       return this.core.startAction(topicId, "retry", (signal) => this.planning.runDiagnosisPlanRevision(topicId, signal), actionId);
     }
     if (!resume) throw new Error("재시도할 단계가 기록되어 있지 않습니다.");
+    const migration = this.core.dependencies.database.getTimeline(topicId).filter(e => e.payload?.planningMigration).at(-1)?.payload?.planningMigration as PlanningMigration | undefined;
+    if (resume === "CLAUDE_PLAN" && migration && this.core.dependencies.database.planning.continuityEnabled(topicId) &&
+        migration.scopeGeneration === topic.scopeGeneration && migration.planEpoch === topic.planEpoch &&
+        migration.sessionId === topic.participants.find(p => p.role === "claude")?.sessionId && !topic.planSHA256 &&
+        !this.core.dependencies.database.latestArtifact(topicId, "claude-plan")) {
+      return this.core.startAction(topicId, "retry", async signal => {
+        this.core.dependencies.database.updateTopic(topicId, { state: "DRAFT" });
+        await this.planning.runPlanningLoop(topicId, signal);
+      }, actionId);
+    }
     const planningCheckpoint = this.core.dependencies.database.planning.latest(topicId);
     if (resume === "CLAUDE_PLAN" && planningCheckpoint && !planningCheckpoint.finalized &&
         planningCheckpoint.stage === resume && planningCheckpoint.scopeGeneration === topic.scopeGeneration &&

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { Topic } from "../shared/contracts.js";
-import type { PlanningCheckpoint, PlanningFragment } from "../shared/planningControl.js";
+import type { PlanningCheckpoint, PlanningFragment, PlanningMigration } from "../shared/planningControl.js";
 
 export const planningHash = (value: string) => createHash("sha256").update(value).digest("hex");
 export function planningKey(topic: Topic, role: string, prompt: string): string {
@@ -35,6 +35,24 @@ export class PlanningStore {
       this.db.prepare("SELECT 1 FROM artifacts WHERE topic_id=? LIMIT 1").get(topicId);
     const version = unstartedPlan && !hasHistory ? 2 : 1;
     this.db.prepare("INSERT INTO planning_policies VALUES (?,?) ON CONFLICT(topic_id) DO NOTHING").run(topicId, version);
+  }
+  assertMigration(topic: Topic, input: PlanningMigration): void {
+    const flags = this.db.prepare("SELECT resume_state,implementation_session_id FROM topics WHERE id=?").get(topic.id);
+    const session = topic.participants.find(p => p.role === "claude");
+    const artifact = this.db.prepare("SELECT sha256 FROM artifacts WHERE topic_id=? AND scope_generation=? AND kind='interrupted-output' ORDER BY revision DESC LIMIT 1")
+      .get(topic.id, topic.scopeGeneration);
+    const completed = this.db.prepare("SELECT 1 FROM artifacts WHERE topic_id=? AND kind!='interrupted-output' LIMIT 1").get(topic.id);
+    if (!["USER_DECISION_REQUIRED", "FAILED"].includes(topic.state) || flags?.resume_state !== "CLAUDE_PLAN" ||
+        flags?.implementation_session_id || topic.planSHA256 || topic.approvedPlanSHA256 || topic.planRevision !== 0 ||
+        topic.scopeGeneration !== input.scopeGeneration || topic.planEpoch !== input.planEpoch ||
+        session?.sessionId !== input.sessionId || session.acknowledgedPlanSHA256 ||
+        artifact?.sha256 !== input.interruptedSHA256 || completed || this.latest(topic.id) || this.continuityEnabled(topic.id)) {
+      throw new Error("Only an interrupted initial plan with the exact session and artifact can migrate.");
+    }
+  }
+  migrateInterrupted(topic: Topic, input: PlanningMigration): void {
+    this.assertMigration(topic, input);
+    this.db.prepare("INSERT INTO planning_policies VALUES (?,2) ON CONFLICT(topic_id) DO UPDATE SET version=2").run(topic.id);
   }
   deliveredToSession(sessionId: string): PlanningFragment[] {
     return this.db.prepare("SELECT record_json FROM planning_session_fragments WHERE session_id=?").all(sessionId)

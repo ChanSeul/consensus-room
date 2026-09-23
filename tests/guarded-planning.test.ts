@@ -17,7 +17,7 @@ import { REQUIRED_PLAN_HEADINGS, type AgentResult } from "../src/shared/contract
 
 const cleanups: Array<() => void> = [];
 afterEach(() => { vi.restoreAllMocks(); for (const clean of cleanups.splice(0).reverse()) clean(); });
-function setup(role: "claude" | "codex" = "claude", executionInput = 100000, executionDuration = 100000) {
+function setup(role: "claude" | "codex" = "claude", executionInput = 100000, executionDuration = 100000, enable = true) {
   const root = mkdtempSync(join(tmpdir(), "guarded-planning-"));
   const repo = join(root, "repo");
   execFileSync("git", ["init", "-q", repo]);
@@ -31,7 +31,7 @@ function setup(role: "claude" | "codex" = "claude", executionInput = 100000, exe
     repositoryPath: repo, worktreePath: repo, baseRef: "HEAD", branchName: null,
     state: role === "claude" ? "CLAUDE_PLAN" : "CODEX_AUDIT", scopeGeneration: 1, planRevision: 0,
     planSHA256: null, approvedPlanSHA256: null, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), lastError: null });
-  database.planning.enable(topic.id);
+  if (enable) database.planning.enable(topic.id);
   database.budgets.configure(topic.id, { execution: { inputTokens: executionInput, outputTokens: 10000, durationMs: executionDuration },
     total: { inputTokens: 300000, outputTokens: 30000, durationMs: 300000 } }, "test");
   const git = new GitService(new SpawnCommandRunner());
@@ -508,4 +508,41 @@ it("inherits current delivered evidence across plan and revision without retrans
   database.updateTopic("topic", { planSHA256: "b".repeat(64) });
   await expect(wrapped.resumeTurn({ cwd: repo, prompt: "Revalidate changed source", sessionId: first.sessionId }))
     .rejects.toThrow("not delivered");
+});
+
+
+it("resumes migrated interrupted planning in the same epoch and session with bounded reads and preserved rewrite usage", async () => {
+  const { root, repo, database, git } = setup("claude", 100000, 100000, false);
+  const sessionId = "11111111-1111-4111-8111-111111111111";
+  database.upsertParticipant("topic", { role: "claude", sessionId, mode: "created", acknowledgedPlanSHA256: null });
+  database.upsertParticipant("topic", { role: "codex", sessionId: "pending:review", mode: "created", acknowledgedPlanSHA256: null });
+  database.updateTopic("topic", { state: "USER_DECISION_REQUIRED", resumeState: "CLAUDE_PLAN" });
+  const before = database.getTopic("topic");
+  const artifacts = new ArtifactStore(join(root, "artifacts"), database);
+  const interrupted = await artifacts.write("topic", "interrupted-output", 1, JSON.stringify({ sessionId,
+    output: { stdout: JSON.stringify({ type: "system", subtype: "init", session_id: sessionId, cwd: repo }) } }));
+  database.revisions.reserve("topic", "old-plan", "plan");
+  const revisions = database.revisions.account("topic");
+  const fake = scripted(async (turn, n) => {
+    expect((turn as SessionTurn).sessionId).toBe(sessionId);
+    expect(Buffer.byteLength(turn.prompt)).toBeLessThan(PLANNING_LIMITS.promptBytes);
+    if (n === 1) return answer(step({ requests: [{ kind: "file", selector: "form.swift", offset: 0, question: "Inspect" }] }));
+    throw new Error("transport interruption after bounded read");
+  });
+  const engine = new WorkflowEngine({ database, git, artifacts, enforceBudgets: true,
+    claude: guardedPlanning(fake.adapter, database, git), codex: scripted(async () => { throw new Error("No audit"); }, "codex").adapter });
+  await engine.migrateInterruptedPlanning("topic", { sessionId, scopeGeneration: before.scopeGeneration, planEpoch: before.planEpoch,
+    interruptedSHA256: interrupted.sha256, apply: true }, "migration");
+  expect(database.revisions.account("topic")).toEqual(revisions);
+  engine.retry("topic");
+  const deadline = Date.now() + 8000;
+  while (database.runningAction("topic")) {
+    if (Date.now() > deadline) throw new Error("Workflow timeout");
+    await new Promise<void>(resolve => setImmediate(resolve));
+  }
+  expect(fake.calls).toHaveLength(2);
+  expect(database.getTopic("topic")).toMatchObject({ planEpoch: before.planEpoch, scopeGeneration: before.scopeGeneration });
+  expect(database.revisions.account("topic").used).toBe(revisions.used + 1);
+  expect(database.planning.latest("topic")).toMatchObject({ sessionId, started: true });
+  expect(database.artifactsForScope("topic", "interrupted-output").map(a => a.sha256)).toContain(interrupted.sha256);
 });

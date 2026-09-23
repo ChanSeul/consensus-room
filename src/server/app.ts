@@ -1,3 +1,4 @@
+import { PlanningMigrationSchema } from "../shared/planningControl.js";
 import {ReviewGrantInputSchema} from "../shared/reviews.js";
 import { DIAGNOSIS_ID_PATTERN, DiagnosisInputSchema } from "../shared/diagnoses.js";
 import { readFileSync } from "node:fs";
@@ -347,6 +348,13 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     const ledger = actionLedger(database, request.params.id, `participant-settings:${role}`);
     return runIdempotent(request, reply, ledger, 200,
       (idempotencyKey) => workflow.updateAgentSettings(request.params.id, role, input, idempotencyKey));
+  });
+
+  app.post<{ Params: { id: string } }>("/api/topics/:id/planning-control/migration", async (request, reply) => {
+    const origin = callOrigin(request, "planning:migrate");
+    const input = PlanningMigrationSchema.parse(request.body);
+    return runIdempotent(request, reply, actionLedger(database, request.params.id, "planning:migrate"), 200,
+      key => workflow.migrateInterruptedPlanning(request.params.id, input, key, origin));
   });
 
   app.post<{ Params: { id: string } }>("/api/topics/:id/planning-control", async (request, reply) => {

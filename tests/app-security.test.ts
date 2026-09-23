@@ -1,3 +1,4 @@
+import { ArtifactStore } from "../src/server/artifacts";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -38,13 +39,78 @@ it("enabling planning after approval does not impose a new session contract", as
   await app.close();
 });
 
+// Public API -> persisted policy -> retry routing. No model call is needed to migrate.
+// Fixtures reproduce a hash-verified interrupted CLI output; saved plans and concurrent changes must refuse migration.
+async function migrationFixture(validate: () => Promise<boolean> = async () => true) {
+  const context = await makeApp(undefined, validate);
+  const { database, root } = context;
+  draftTopic(database, "migrate");
+  const sessionId = "11111111-1111-4111-8111-111111111111";
+  database.upsertParticipant("migrate", { role: "claude", sessionId, mode: "created", acknowledgedPlanSHA256: null });
+  database.updateTopic("migrate", { state: "USER_DECISION_REQUIRED", resumeState: "CLAUDE_PLAN" });
+  const store = new ArtifactStore(join(root, "topics"), database);
+  const artifact = await store.write("migrate", "interrupted-output", 1, JSON.stringify({ sessionId,
+    output: { stdout: JSON.stringify({ type: "system", subtype: "init", session_id: sessionId, cwd: "/tmp/worktree" }) } }));
+  const topic = database.getTopic("migrate");
+  const payload = { sessionId, scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch,
+    interruptedSHA256: artifact.sha256, apply: true };
+  const request = { method: "POST" as const, url: "/api/topics/migrate/planning-control/migration",
+    headers: { "x-consensus-token": "launch-token-for-test", "idempotency-key": "migration" }, payload };
+  return { ...context, request, store, artifact };
+}
+
+it("previews and atomically migrates a verified interrupted plan without granting allowances or calling models", async () => {
+  const { app, database, request, adapterCalls } = await migrationFixture();
+  const topic = database.getTopic("migrate");
+  const revisions = database.revisions.account("migrate");
+  const preview = await app.inject({ ...request, headers: { ...request.headers, "idempotency-key": "preview" },
+    payload: { ...request.payload, apply: false } });
+  expect(preview.statusCode).toBe(200);
+  expect(database.planning.policyVersion("migrate")).toBe(0);
+  const first = await app.inject(request);
+  expect(first.statusCode).toBe(200);
+  expect(first.json()).toMatchObject({ version: 2, applied: true });
+  expect((await app.inject(request)).json()).toEqual(first.json());
+  expect(database.getTopic("migrate")).toMatchObject({ scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch,
+    state: topic.state, participants: topic.participants, planSHA256: null });
+  expect(database.revisions.account("migrate")).toEqual(revisions);
+  expect(database.getTimeline("migrate").filter(e => e.payload?.planningMigration)).toHaveLength(1);
+  expect(adapterCalls).toEqual([]);
+  await app.close();
+});
+
+it.each(["missing-session", "saved-plan", "tampered-output", "wrong-session", "wrong-epoch", "mediator-off", "wrong-worktree", "implementation"])(
+  "refuses migration for %s without changing the policy", async reason => {
+    const { app, database, request, store, artifact } = await migrationFixture(async () => reason !== "missing-session");
+    if (reason === "saved-plan") await store.write("migrate", "claude-plan", 1, "saved response before planSHA assignment");
+    if (reason === "tampered-output") writeFileSync(artifact.path, "tampered");
+    if (reason === "wrong-session") request.payload.sessionId = "22222222-2222-4222-8222-222222222222";
+    if (reason === "wrong-epoch") request.payload.planEpoch++;
+    if (reason === "wrong-worktree") database.updateTopic("migrate", { worktreePath: "/tmp/another-worktree" });
+    if (reason === "implementation") database.updateTopic("migrate", { implementationSessionId: request.payload.sessionId });
+    const response = await app.inject({ ...request, headers: { ...request.headers,
+      ...(reason === "mediator-off" ? { "x-consensus-actor": "mediator" } : {}) } });
+    expect(response.statusCode).toBeGreaterThanOrEqual(400);
+    expect(database.planning.policyVersion("migrate")).toBe(0);
+    await app.close();
+  });
+
+it("rejects a changed topic after asynchronous session validation", async () => {
+  let mutate = () => {};
+  const { app, database, request } = await migrationFixture(async () => { mutate(); return true; });
+  mutate = () => database.updateTopic("migrate", { planEpoch: request.payload.planEpoch + 1 });
+  expect((await app.inject(request)).statusCode).toBeGreaterThanOrEqual(400);
+  expect(database.planning.policyVersion("migrate")).toBe(0);
+  await app.close();
+});
+
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
     rmSync(directory, { recursive: true, force: true });
   }
 });
 
-async function makeApp(runner?: CommandRunner) {
+async function makeApp(runner?: CommandRunner, validateSession: () => Promise<boolean> = async () => false) {
   const root = mkdtempSync(join(tmpdir(), "consensus-room-app-"));
   temporaryDirectories.push(root);
   const unavailableRunner: CommandRunner = {
@@ -58,7 +124,7 @@ async function makeApp(runner?: CommandRunner) {
     role,
     createSession: async (turn) => { adapterCalls.push(role); fakeSpawn(turn); throw new Error("이 테스트에서는 CLI를 실행하지 않습니다."); },
     resumeTurn: async (turn) => { adapterCalls.push(role); fakeSpawn(turn); throw new Error("이 테스트에서는 CLI를 실행하지 않습니다."); },
-    validateExistingSession: async () => false,
+    validateExistingSession: validateSession,
   });
   const database = new ConsensusDatabase(join(root, "room.sqlite"));
   const config = {

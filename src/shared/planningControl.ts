@@ -1,5 +1,11 @@
 import { z } from "zod";
 
+export const PlanningMigrationSchema = z.object({
+  sessionId: z.uuid(), scopeGeneration: z.number().int().positive(), planEpoch: z.number().int().nonnegative(),
+  interruptedSHA256: z.string().regex(/^[a-f0-9]{64}$/), apply: z.boolean(),
+}).strict();
+export type PlanningMigration = z.infer<typeof PlanningMigrationSchema>;
+
 export const PLANNING_LIMITS = {
   promptBytes: 64 * 1024, fragmentBytes: 8 * 1024, batchBytes: 24 * 1024,
   checkpointBytes: 12 * 1024, requests: 4, rounds: 8, stalledRounds: 2,

@@ -724,6 +724,7 @@ export class ConsensusDatabase {
     topicId: string;
     changes: Parameters<ConsensusDatabase["updateTopic"]>[1];
     clearAcknowledgements?: boolean;
+    planningMigration?: import("../shared/planningControl.js").PlanningMigration;
     planningSessionAmendment?: { previousSHA256: string; nextSHA256: string };
     participants?: Participant[];
     events: Array<Omit<TimelineEventInput, "topicId">>;
@@ -742,6 +743,7 @@ export class ConsensusDatabase {
         }
         this.planning.bindSession(previous, input.planningSessionAmendment.nextSHA256, binding.sessionId, binding.inputSequence);
       }
+      if (input.planningMigration) this.planning.migrateInterrupted(this.getTopic(input.topicId), input.planningMigration);
       this.updateTopic(input.topicId, input.changes);
       const at = now();
       for (const contract of input.contracts ?? []) this.fixContracts.append(input.topicId, contract, at);
