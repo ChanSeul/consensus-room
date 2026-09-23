@@ -70,6 +70,8 @@ export interface CommandRunner {
 }
 
 export interface SessionTurn {
+  // Bounded planning is tool-free but still receives mandatory project instructions.
+  planningControl?: { admissionId: string; maxPromptBytes: number; image?: { path: string; bytes: number } };
   // A host evidence cache supplied the external sources. Do not open a second direct Figma connection.
   evidenceManaged?: boolean;
   sessionId: string;
@@ -107,6 +109,9 @@ export interface SessionTurn {
 
 // 한 CLI 턴의 사용량. inputTokens 는 캐시 읽기를 포함한 총 입력이고 cachedInputTokens 는 그중 캐시에서 읽은 양이다.
 export interface TurnUsage {
+  lastRequestInputTokens?: number;
+  peakRequestInputTokens?: number;
+  imageBytes?: number;
   // 한 CLI 프로세스를 식별한다. 기존 TurnUsage 소비처는 아래 숫자 필드만 사용해도 된다.
   executionId?: string;
   phase?: string;

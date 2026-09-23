@@ -2,6 +2,7 @@ import {ReviewAllowanceSchema,ReviewScopeSchema} from "./reviews.js";
 import { type BudgetAccount } from "./budgets.js";
 import { RevisionAllowanceSchema } from "./revisions.js";
 import { z } from "zod";
+import { PlanningStepSchema, PlanningStepJsonSchema } from "./planningControl.js";
 import { ToleranceLedgerEntrySchema } from "./tolerance";
 
 // 확인 입력 분할과 응답 스키마가 같은 호출당 상한을 쓴다.
@@ -147,6 +148,7 @@ export const PlanRepairJsonSchema = {
 } as const;
 
 export const AgentResultSchema = z.object({
+  planningStep: PlanningStepSchema.optional(),
   kind: z.enum([
     "PLAN",
     "AUDIT",
@@ -525,6 +527,12 @@ export const AgentResultJsonSchema = {
   },
 } as const;
 
+export const PlanningAgentResultJsonSchema = {
+  ...AgentResultJsonSchema,
+  required: [...AgentResultJsonSchema.required, "planningStep"],
+  properties: { ...AgentResultJsonSchema.properties, planningStep: PlanningStepJsonSchema },
+} as const;
+
 export const REQUIRED_PLAN_HEADINGS = [
   "목표와 완료 기준",
   "기준 리비전",
@@ -579,6 +587,14 @@ export type UpdateMediationAutonomyInput = z.infer<typeof UpdateMediationAutonom
 
 // 러너 생존 표시 — GET /api/topics/:id/activity (2026-09-08).
 export const TopicActivitySchema = z.object({
+  planningProgress: z.object({
+    version: z.number(), checkpointId: z.string(), stage: z.string(), round: z.number(), updatedAt: z.string(),
+    questions: z.array(z.string()), stopped: z.string().nullable(), finalized: z.boolean(),
+    usage: z.object({ inputTokens: z.number(), cachedInputTokens: z.number(), outputTokens: z.number(), durationMs: z.number() }),
+    injectedBytes: z.number(), deliveredFragments: z.number(),
+    lastRequestInputTokens: z.number().nullable().optional(), peakRequestInputTokens: z.number().nullable().optional(),
+    imageBytes: z.number().optional(),
+  }).nullable().optional(),
   state: WorkflowStateSchema,
   runningAction: z.boolean(),
   budget: z.custom<BudgetAccount>().nullable().optional(),

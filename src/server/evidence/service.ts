@@ -102,7 +102,7 @@ export class EvidenceService {
 export function withEvidence(adapter: AgentAdapter, database: ConsensusDatabase, imageDirectory: string): AgentAdapter {
   const run = async <T>(turn: Omit<SessionTurn, "sessionId"> | SessionTurn, invoke: (enriched: typeof turn) => Promise<T>, session: (result: T) => string): Promise<T> => {
     const topic = database.listTopics().find(topic => topic.worktreePath === turn.cwd);
-    if (!topic || turn.protocolOnly) return invoke(turn);
+    if (!topic || turn.protocolOnly || turn.planningControl) return invoke(turn);
     const packet = database.evidence.packet(topic, adapter.role, "sessionId" in turn ? turn.sessionId : undefined);
     if (!packet.text) return invoke(turn);
     const paths: string[] = [];

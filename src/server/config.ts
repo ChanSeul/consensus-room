@@ -34,6 +34,7 @@ export const CODEX_SKILL_DIRECTORIES = [
 ] as const;
 
 export interface ServerConfig {
+  guardedPlanning?: boolean;
   enforceBudgets?: boolean;
   host: "127.0.0.1";
   port: number;
@@ -87,6 +88,7 @@ export function loadConfig(overrides: Partial<ServerConfig> = {}): ServerConfig 
     },
   });
   return {
+    guardedPlanning: overrides.guardedPlanning ?? process.env.CONSENSUS_ROOM_GUARDED_PLANNING === "1",
     enforceBudgets: overrides.enforceBudgets ?? true,
     host: "127.0.0.1",
     port: overrides.port ?? Number(process.env.CONSENSUS_ROOM_PORT ?? 4317),

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { PlanningPaused } from "../../shared/planningControl.js";
 import { toolTreeDirectories } from "../toolTree.js";
 import { readdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
@@ -7,6 +8,7 @@ import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import {
   AgentResultJsonSchema,
+  PlanningAgentResultJsonSchema,
   PlanRepairJsonSchema, type PlanRepair,
   DEFAULT_AGENT_SETTINGS,
   type AgentResult,
@@ -122,7 +124,7 @@ export class ClaudeAdapter implements AgentAdapter {
     try {
       const permissionMode = turn.implementation ? "dontAsk" : (turn.planMode ? "plan" : "dontAsk");
       const executionSettings = turn.settings ?? DEFAULT_AGENT_SETTINGS.claude;
-      const figmaMcpUrl = turn.evidenceManaged ? null : this.options.figmaMcpUrl ?? null;
+      const figmaMcpUrl = turn.evidenceManaged || turn.planningControl ? null : this.options.figmaMcpUrl ?? null;
       // 빈 객체 {}는 실 CLI가 "Invalid MCP configuration"으로 거부한다(실측). mcpServers 키는 항상 있어야 한다.
       const mcpConfig = {
         mcpServers: figmaMcpUrl ? { "figma-desktop": { type: "http", url: figmaMcpUrl } } : {},
@@ -159,7 +161,7 @@ export class ClaudeAdapter implements AgentAdapter {
         // 구현 턴만 Workflow를 연다. 계획 턴은 읽기 전용 계약이라 에이전트 팬아웃을 열지 않는다.
         // Workflow 하위 에이전트는 부모의 --tools 상한을 물려받는다(실측: Read만 준 부모의 에이전트가 Read만 받음).
         // 프로토콜 확인 턴은 도구를 전부 닫는다 — 판단에 필요한 값은 프롬프트가 이미 다 담고 있다.
-        "--tools", turn.protocolOnly
+        "--tools", turn.protocolOnly || turn.planningControl
           ? ""
           : turn.implementation ? `${baseTools},Edit,Write,Workflow` : planningTools,
         ...(pluginDirectory ? ["--plugin-dir", pluginDirectory] : []),
@@ -167,7 +169,7 @@ export class ClaudeAdapter implements AgentAdapter {
         "--output-format", "stream-json",
         "--include-partial-messages",
         "--verbose",
-        "--json-schema", JSON.stringify(outputSchema),
+        "--json-schema", JSON.stringify(turn.planningControl ? PlanningAgentResultJsonSchema : outputSchema),
         ...sessionArgs,
       ];
       // 프로토콜 확인 턴은 판단에 필요한 값을 프롬프트가 다 담고 있어 지시문(CLAUDE.md)도 싣지 않는다
@@ -175,6 +177,7 @@ export class ClaudeAdapter implements AgentAdapter {
       const { blocks: instructions } = turn.protocolOnly
         ? { blocks: [] as string[] }
         : await readAppliedInstructions({
+          strict: Boolean(turn.planningControl),
           workspace, fileName: "CLAUDE.md", repositoryPath: this.options.repositoryPath ?? null,
           globalPath: join(homedir(), ".claude", "CLAUDE.md"), injectWorkspaceFile: true,
         });
@@ -182,11 +185,25 @@ export class ClaudeAdapter implements AgentAdapter {
       // 기억하고 있고, 매 턴 다시 붙이면 턴당 ~20K자가 중복 과금된다(2026-08-30 실측: 55자 프롬프트가
       // 20,735자로 불어남). protocolOnly 턴은 판단에 메모리가 필요 없어 새 세션이어도 주입하지 않는다.
       // 트레이드오프: 주제 진행 중 메모리 문서가 갱신돼도 기존 세션은 예전 내용을 기억한다.
-      const injectMemory = Boolean(this.memory) && newSession && !turn.protocolOnly;
+      const injectMemory = Boolean(this.memory) && newSession && !turn.protocolOnly && !turn.planningControl;
       const enriched = injectMemory
         ? await this.memory!.buildPrompt(turn.prompt, this.role)
-        : await this.withMemoryManifest(turn);
+        : turn.planningControl ? turn.prompt : await this.withMemoryManifest(turn);
       const stdin = [EXECUTION_POLICY_NOTE, ...instructions, enriched].join("\n\n");
+      if (turn.planningControl && Buffer.byteLength(stdin) > turn.planningControl.maxPromptBytes) {
+        throw new PlanningPaused("Final planning input including mandatory instructions exceeds its byte limit.");
+      }
+      const image = turn.planningControl?.image;
+      let transport = stdin;
+      if (image) {
+        const data = await readFile(image.path);
+        if (data.length !== image.bytes || data.length > 5 * 1024 * 1024) throw new PlanningPaused("Image size changed before dispatch.");
+        args.push("--input-format", "stream-json");
+        transport = JSON.stringify({ type: "user", message: { role: "user", content: [
+          { type: "text", text: stdin },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: data.toString("base64") } },
+        ] } }) + "\n";
+      }
       const startedAt = Date.now();
       const toolTime = createToolTimeMeter("claude");
       const metrics = new ExecutionMetrics("claude", Buffer.byteLength(stdin, "utf8"), executionSettings.model, executionSettings.effort, !newSession, startedAt);
@@ -207,7 +224,7 @@ export class ClaudeAdapter implements AgentAdapter {
       const output = await this.runner.run({
         beforeSpawn: turn.beforeSpawn, admitSync: turn.admitSync,
         onInterruptedOutput: turn.onInterruptedOutput,
-        command: "claude", args, cwd: workspace, stdin,
+        command: "claude", args, cwd: workspace, stdin: transport,
         signal: turn.signal, onSpawn: turn.onProcessSpawn,
         onJSONLine: (value, at) => { toolTime.observe(value, at); metrics.observe(value); },
         // stream-json 의 마지막 줄은 {"type":"result"} 다. 그 뒤 2분 안에 프로세스가 안 끝나면 hang 으로 보고 정리한다.

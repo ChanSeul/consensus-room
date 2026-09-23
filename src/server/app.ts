@@ -42,6 +42,7 @@ import { readMediationAutonomy, writeMediationAutonomy } from "./mediationAutono
 import { scanWorktreeActivity } from "./activity.js";
 import { VerificationService, completeVerificationSchema } from "./verifications.js";
 import { EvidenceService, withEvidence } from "./evidence/service.js";
+import { guardedPlanning } from "./guardedPlanning.js";
 import { RestEvidenceConnector, evidenceCredentials, type EvidenceConnector } from "./evidence/connectors.js";
 import { registerEvidenceRoutes } from "./evidence/routes.js";
 
@@ -77,8 +78,8 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     database,
     artifacts,
     git,
-    claude: withEvidence(dependencies.claude, database, join(config.dataDirectory, "evidence-images")),
-    codex: withEvidence(dependencies.codex, database, join(config.dataDirectory, "evidence-images")),
+    claude: guardedPlanning(withEvidence(dependencies.claude, database, join(config.dataDirectory, "evidence-images")), database, git, config.memoryDirectory, join(config.dataDirectory, "evidence-images")),
+    codex: guardedPlanning(withEvidence(dependencies.codex, database, join(config.dataDirectory, "evidence-images")), database, git, config.memoryDirectory, join(config.dataDirectory, "evidence-images")),
     verifications,
     memory: new ProjectMemoryStore(config.memoryDirectory),
     executionLimits: config.executionLimits,
@@ -236,6 +237,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
         planSHA256: null, approvedPlanSHA256: null, createdAt: timestamp, updatedAt: timestamp, lastError: null,
         agentSettings: config.defaultAgentSettings,
       });
+      if (config.guardedPlanning) database.planning.enable(topic.id);
       database.appendEvent({
         topicId: id, actor: "system", kind: "system", state: "DRAFT",
         body: "주제 전용 detached worktree를 만들었습니다.",
@@ -297,6 +299,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       executionUsage: database.getExecutionUsage(topic.id),
       ...activity,
       budget: database.budgets.account(topic.id),
+      planningProgress: database.planning.progress(topic.id),
       revisionAllowance: database.revisions.account(topic.id),
       revisionPaused: workflow.revisionPaused(topic.id),
       reviewAllowances: [database.reviews.account(topic.id,"planning"),database.reviews.account(topic.id,"implementation")],
@@ -344,6 +347,15 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     const ledger = actionLedger(database, request.params.id, `participant-settings:${role}`);
     return runIdempotent(request, reply, ledger, 200,
       (idempotencyKey) => workflow.updateAgentSettings(request.params.id, role, input, idempotencyKey));
+  });
+
+  app.post<{ Params: { id: string } }>("/api/topics/:id/planning-control", async (request, reply) => {
+    callOrigin(request, "planning:enable");
+    workflow.assertBudgetEditable(request.params.id);
+    return runIdempotent(request, reply, actionLedger(database, request.params.id, "planning:enable"), 200, () => {
+      database.planning.enable(request.params.id);
+      return { version: 1, progress: database.planning.progress(request.params.id) };
+    });
   });
 
   app.post<{ Params: { id: string } }>("/api/topics/:id/messages", async (request, reply) => {

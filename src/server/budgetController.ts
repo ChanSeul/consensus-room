@@ -6,13 +6,17 @@ import { BUDGET_KEYS, zeroBudget } from "../shared/budgets.js";
 import { randomUUID } from "node:crypto";
 import type { AgentAdapter, SessionTurn } from "./types.js";
 import { BudgetBlocked, type BudgetLedger } from "./budgetLedger.js";
+import type { ConsensusDatabase } from "./database.js";
+import { planningKey } from "./planningStore.js";
+import { GUARDED_STAGES } from "./guardedPlanning.js";
 
 interface Context { topicId: string; accounts: string[]; stage: string; }
 // All model methods pass through this boundary, including direct delivery/correction calls.
 export class BudgetController {
   constructor(private readonly ledger: BudgetLedger, private readonly context: (cwd:string) => Context,
     private readonly checkpoint: (topicId:string, output:unknown) => Promise<void>,
-    private readonly revisions?: RevisionLedger, private readonly budgetsEnabled = true, private readonly reviews?:ReviewLedger) {}
+    private readonly revisions?: RevisionLedger, private readonly budgetsEnabled = true, private readonly reviews?:ReviewLedger,
+    private readonly database?: ConsensusDatabase) {}
   wrap(adapter: AgentAdapter): AgentAdapter {
     const wrapper: AgentAdapter = {
       role:adapter.role,
@@ -29,12 +33,20 @@ export class BudgetController {
     const kind:RewriteKind|undefined=role==="claude" && ["CLAUDE_PLAN","CLAUDE_REVISION"].includes(ctx.stage)
       ? turn.planningWrite ?? (ctx.stage==="CLAUDE_PLAN"?"plan":"revision") : undefined;
     const review=role==="codex"?reviewScope(ctx.stage):undefined;
+    const guarded = this.database?.planning.enabled(ctx.topicId) && GUARDED_STAGES.has(ctx.stage) && !turn.protocolOnly && !turn.implementation;
+    const latest = guarded ? this.database!.planning.latest(ctx.topicId) : null;
+    const topic = guarded ? this.database!.getTopic(ctx.topicId) : null;
+    const continued = latest && !latest.finalized && latest.stage === ctx.stage && latest.role === role &&
+      latest.scopeGeneration === topic?.scopeGeneration && latest.planEpoch === topic.planEpoch && latest.planSHA256 === topic.planSHA256 ? latest : null;
+    const saved = continued ?? (guarded ? this.database!.planning.get(planningKey(topic!, role, turn.prompt)) : null);
+    const admissionId = saved?.admissionId ?? id;
+    const preparedTurn = guarded ? { ...turn, planningControl: { admissionId, maxPromptBytes: 64 * 1024 } } : turn;
     if(!this.budgetsEnabled) {
-      if(review)this.reviews?.admit(ctx.topicId,id,review);
-      if(kind)this.revisions?.admit(ctx.topicId,id,kind);
-      return invoke(turn);
+      if(review)this.reviews?.admit(ctx.topicId,admissionId,review);
+      if(kind)this.revisions?.admit(ctx.topicId,admissionId,kind);
+      return invoke(preparedTurn);
     }
-    const reserve=()=>{if(kind)this.revisions?.reserve(ctx.topicId,id,kind);if(review)this.reviews?.reserve(ctx.topicId,id,review);};
+    const reserve=()=>{if(kind)this.revisions?.reserve(ctx.topicId,admissionId,kind);if(review)this.reviews?.reserve(ctx.topicId,admissionId,review);};
     this.ledger.start({id,accounts:ctx.accounts,stage:ctx.stage,role,model:turn.settings?.model??"unknown",
       effort:turn.settings?.effort??"unknown",startedAt},reserve);
     const controller=new AbortController();
@@ -59,7 +71,7 @@ export class BudgetController {
     };
     const timer=setInterval(()=>observe({}),1000);
     try {
-      const result=await invoke({...turn,signal:controller.signal,
+      const result=await invoke({...preparedTurn,signal:controller.signal,
         onProcessSpawn:process=>{spawned=true;turn.onProcessSpawn?.(process);},
         onSessionCreated:id=>{sessionId=id;turn.onSessionCreated?.(id);},
         onInterruptedOutput:output=>{partial=output;turn.onInterruptedOutput?.(output);},
@@ -69,8 +81,8 @@ export class BudgetController {
       return result;
     } catch(error) {
       if(!spawned) {   // 실행 허용 검사가 spawn 직전에 막았다 — 호출이 없었으므로 예약을 되돌린다(PLAN §2 검증 조건 1)
-        if(kind)this.revisions?.release(ctx.topicId,id);
-        if(review)this.reviews?.release(ctx.topicId,id);
+        if(!saved?.started && kind)this.revisions?.release(ctx.topicId,admissionId);
+        if(!saved?.started && review)this.reviews?.release(ctx.topicId,admissionId);
       }
       if(partial!==undefined || sessionId) await this.checkpoint(ctx.topicId,{sessionId,output:partial,incomplete:true});
       throw failure??error;

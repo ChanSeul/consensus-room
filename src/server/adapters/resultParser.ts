@@ -8,6 +8,7 @@ import { redactSecrets } from "../../shared/workflow.js";
 // zod에서 그 필드들은 optional이라 null을 받지 못한다. 그래서 파싱 전에 값이 null인 키만 지운다.
 // memoryUpdates[].expectedSHA256처럼 null 자체가 유효한 값인 필드는 건드리지 않으므로 재귀로 훑지 않는다.
 const OPTIONAL_KEYS = [
+  "planningStep",
   "planMarkdown", "planEdits", "planLineEdits", "planSHA256", "requestedUserDecision", "memoryUpdates", "findings", "evidenceRefs",
   "toleranceLedger", "status", "remainingSteps", "resolvesRequestedDecision", "resolvedRequestId", "resolvedRequestIds", "reviewDecisionAnswers", "decisionAssessments",
 ] as const;

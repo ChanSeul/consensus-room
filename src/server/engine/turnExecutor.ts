@@ -42,7 +42,7 @@ export interface TurnRequest {
   write: boolean;
   writeGuards?: WriteGuards;
   session:
-    | { mode: "resume"; sessionId: string; fallbackFresh?: { prompt: string; onSessionCreated?: (sessionId: string) => void; onFallback?: (sessionId: string) => void } }
+    | { mode: "resume"; sessionId: string; onSessionCreated?: (sessionId: string) => void; fallbackFresh?: { prompt: string; onSessionCreated?: (sessionId: string) => void; onFallback?: (sessionId: string) => void } }
     | { mode: "create"; onSessionCreated?: (sessionId: string) => void };
   prompt: string;
   implementation: boolean;
@@ -157,8 +157,11 @@ export class TurnExecutor {
     }
     const session = request.session;
     try {
-      const result = await adapter.resumeTurn({ ...base, sessionId: session.sessionId });
-      return this.settle(request, { sessionId: session.sessionId, result, created: false });
+      let sessionId = session.sessionId;
+      const result = await adapter.resumeTurn({ ...base, sessionId, onSessionCreated: id => {
+        sessionId = id; session.onSessionCreated?.(id);
+      } });
+      return this.settle(request, { sessionId, result, created: sessionId !== session.sessionId });
     } catch (error) {
       if (!session.fallbackFresh || !isMissingSessionError(error) || request.signal.aborted) throw error;
       // 세션 유실 폴백도 같은 경계다 — 새 spawn 전에 beforeSpawn(admit) 이 다시 돈다.

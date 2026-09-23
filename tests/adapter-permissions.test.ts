@@ -63,6 +63,47 @@ function memoryDocument(name: string, body: string): string {
 }
 
 describe("에이전트별 권한 경계", () => {
+  it("controlled planning disables direct sources, preserves instructions, and transports one image separately", async () => {
+    const root = mkdtempSync(join(tmpdir(), "controlled-adapter-"));
+    temporaryDirectories.push(root);
+    writeFileSync(join(root, "CLAUDE.md"), "KEEP_CLAUDE_INSTRUCTIONS");
+    writeFileSync(join(root, "AGENTS.md"), "KEEP_CODEX_INSTRUCTIONS");
+    const image = join(root, "design.png");
+    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j9xkAAAAASUVORK5CYII=", "base64");
+    writeFileSync(image, png);
+    const planningControl = { admissionId: "attempt", maxPromptBytes: 64 * 1024, image: { path: image, bytes: png.length } };
+    const claude = new RecordingRunner(successfulResult([planResult]));
+    await new ClaudeAdapter(claude).createSession({ cwd: root, prompt: "Bounded planning", planningControl });
+    const call = claude.calls[0];
+    expect(call.args[call.args.indexOf("--tools") + 1]).toBe("");
+    expect(call.args[call.args.indexOf("--input-format") + 1]).toBe("stream-json");
+    const message = JSON.parse(call.stdin!);
+    expect(message.message.content[0].text).toContain("KEEP_CLAUDE_INSTRUCTIONS");
+    expect(message.message.content[1].source.data).toBe(png.toString("base64"));
+    const codex = new RecordingRunner(successfulResult([{ type: "thread.started", thread_id: "bounded-thread" }, planResult]));
+    const { adapter } = codexAdapter(codex);
+    await adapter.createSession({ cwd: root, prompt: "Bounded review", planningControl });
+    const config = readFileSync(join(adapter.managedHomeFor(root), "config.toml"), "utf8");
+    for (const name of ["shell_tool", "unified_exec", "view_image", "apps", "browser_use", "computer_use", "multi_agent"]) {
+      expect(config).toContain(`${name} = false`);
+    }
+    expect(codex.calls[0].stdin).toContain("KEEP_CODEX_INSTRUCTIONS");
+    expect(codex.calls[0].args).toContain(image);
+    expect(codex.calls[0].args[codex.calls[0].args.indexOf("--output-schema") + 1]).toContain(".planning.json");
+  });
+
+  it("rejects the final composed planning input including instructions before spawning either CLI", async () => {
+    const root = mkdtempSync(join(tmpdir(), "bounded-instructions-"));
+    temporaryDirectories.push(root);
+    writeFileSync(join(root, "CLAUDE.md"), "Mandatory".repeat(100));
+    writeFileSync(join(root, "AGENTS.md"), "Mandatory".repeat(100));
+    const runner = new RecordingRunner(successfulResult([planResult]));
+    for (const adapter of [new ClaudeAdapter(runner), codexAdapter(runner).adapter]) {
+      await expect(adapter.createSession({ cwd: root, prompt: "Short", planningControl: { admissionId: "attempt", maxPromptBytes: 100 } }))
+        .rejects.toThrow("mandatory instructions");
+    }
+    expect(runner.calls).toHaveLength(0);
+  });
   it("Claude와 Codex에는 선별된 메모리 본문만 주고 메모리 폴더 직접 접근 권한은 주지 않는다", async () => {
     const memoryRoot = mkdtempSync(join(tmpdir(), "consensus-room-adapter-memory-"));
     temporaryDirectories.push(memoryRoot);

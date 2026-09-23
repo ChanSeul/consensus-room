@@ -9,6 +9,22 @@ import type { AgentAdapter, CommandRunner } from "../src/server/types";
 
 const temporaryDirectories: string[] = [];
 
+it("requires authentication and an idempotency key to opt an idle topic into controlled planning", async () => {
+  const { app, database } = await makeApp();
+  draftTopic(database, "planning-topic");
+  const url = "/api/topics/planning-topic/planning-control";
+  expect(database.planning.enabled("planning-topic")).toBe(false);
+  expect((await app.inject({ method: "POST", url })).statusCode).toBe(401);
+  const headers = { "x-consensus-token": "launch-token-for-test" };
+  expect((await app.inject({ method: "POST", url, headers })).statusCode).toBe(400);
+  const request = { method: "POST" as const, url, headers: { ...headers, "idempotency-key": "enable-once" } };
+  const first = await app.inject(request);
+  expect(first.statusCode).toBe(200);
+  expect((await app.inject(request)).json()).toEqual(first.json());
+  expect(database.planning.enabled("planning-topic")).toBe(true);
+  await app.close();
+});
+
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
     rmSync(directory, { recursive: true, force: true });

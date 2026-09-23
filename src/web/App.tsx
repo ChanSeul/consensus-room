@@ -517,6 +517,14 @@ export function App() {
                 onGrant={()=>void run("revision-resume",async()=>{const result=await api.runAction(selected.id,"revision-resume",{version:activity.revisionAllowance!.version});const next=await api.getActivity(selected.id);if(selectedTopicRef.current===selected.id)setActivity(next);return result;})}/>}
               {activity?.reviewAllowances && <ReviewPanel accounts={activity.reviewAllowances} paused={activity.reviewPaused??null}
                 busy={Boolean(busyAction) || activity.runningAction} onGrant={(scope,version)=>void run("review-resume",async()=>{const result=await api.runAction(selected.id,"review-resume",{scope,version});const next=await api.getActivity(selected.id);if(selectedTopicRef.current===selected.id)setActivity(next);return result;})}/>}
+              {activity?.planningProgress && <section className="panel" aria-label="계획 조사 진행">
+                <h3>계획 조사 {activity.planningProgress.round}회 · {activity.planningProgress.finalized ? "최종 결과 저장" : "중간 결과 저장"}</h3>
+                <p>누적 입력 {activity.planningProgress.usage.inputTokens.toLocaleString()} 토큰 · 캐시 읽기 {activity.planningProgress.usage.cachedInputTokens.toLocaleString()} 토큰</p>
+                <p>누적 입력은 현재 문맥 크기나 과금액이 아닙니다.</p>
+                <p>관측한 요청별 최대 입력: {activity.planningProgress.peakRequestInputTokens?.toLocaleString() ?? "측정값 없음"} · 전달한 텍스트 {activity.planningProgress.injectedBytes.toLocaleString()}바이트</p>
+                <p>전달한 자료 {activity.planningProgress.deliveredFragments}개 · 남은 질문 {activity.planningProgress.questions.length}개</p>
+                {activity.planningProgress.stopped && <p role="status">{activity.planningProgress.stopped}</p>}
+              </section>}
               <Timeline events={detail.timeline} />
               <MessageComposer
                 disabled={Boolean(busyAction) || selected.state === "CLOSED"}

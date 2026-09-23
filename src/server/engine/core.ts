@@ -5,6 +5,7 @@ import { RevisionBlocked } from "../revisionLedger.js";
 import type { RewriteKind } from "../../shared/revisions.js";
 import { wrapWorkGroupAdapter } from "../workGroupAdapter.js";
 import { BudgetController } from "../budgetController.js";
+import { PlanningPaused } from "../../shared/planningControl.js";
 import { BudgetBlocked } from "../budgetLedger.js";
 import { applyPlanLineEdits, applyPlanRepair, planRepairPrompt, repairablePlan } from "../../shared/planPatches.js";
 // WorkflowEngine 분해(2026-08-31): 상태 전환·세션·산출물·메모리·전달이 한 클래스(1,504줄)에 있어
@@ -133,7 +134,7 @@ export class EngineCore {
       return {topicId:topic.id,accounts:this.budgetAccounts(topic.id),stage:topic.state};
     }, async(topicId,output)=>{
       await dependencies.artifacts.write(topicId,"interrupted-output",1,JSON.stringify(redactRecord(output as Record<string,unknown>)));
-    },dependencies.database.revisions,Boolean(dependencies.enforceBudgets),dependencies.database.reviews);
+    },dependencies.database.revisions,Boolean(dependencies.enforceBudgets),dependencies.database.reviews, dependencies.database);
     this.dependencies={...dependencies,
       claude:wrapWorkGroupAdapter(controller.wrap(dependencies.claude),dependencies.database,dependencies.git),
       codex:wrapWorkGroupAdapter(controller.wrap(dependencies.codex),dependencies.database,dependencies.git)};
@@ -158,6 +159,10 @@ export class EngineCore {
 
   assertRetryRewriteAvailable(topicId: string): void {
     const stage=this.dependencies.database.getFlags(topicId).resumeState;
+    const checkpoint = this.dependencies.database.planning.latest(topicId);
+    const topic = this.dependencies.database.getTopic(topicId);
+    if (checkpoint?.started && !checkpoint.finalized && checkpoint.stage === stage &&
+        checkpoint.scopeGeneration === topic.scopeGeneration && checkpoint.planEpoch === topic.planEpoch && checkpoint.planSHA256 === topic.planSHA256) return;
     const review=reviewScope(stage??"");
     if(review)this.dependencies.database.reviews.assertAvailable(topicId,review);
     if(stage==="CLAUDE_PLAN" || stage==="CLAUDE_REVISION")
@@ -204,6 +209,12 @@ export class EngineCore {
       if (!this.isCurrentAction(topicId, actionId, scopeGeneration)) return;
       this.dependencies.database.finishAction(actionId, "succeeded");
     }).catch((error: unknown) => {
+      if (error instanceof PlanningPaused && this.isCurrentAction(topicId, actionId, scopeGeneration)) {
+        const topic = this.dependencies.database.getTopic(topicId);
+        this.dependencies.database.finishAction(actionId, "cancelled", error.message);
+        this.interrupt(topicId, "USER_DECISION_REQUIRED", error.message, topic.state, { planningPause: true });
+        return;
+      }
       if ((error instanceof BudgetBlocked || error instanceof RevisionBlocked || error instanceof ReviewBlocked) && this.isCurrentAction(topicId, actionId, scopeGeneration)) {
         const topic = this.dependencies.database.getTopic(topicId);
         this.dependencies.database.finishAction(actionId, "cancelled", error.message);
@@ -355,13 +366,20 @@ export class EngineCore {
         evidenceDigest,
         role, topic, signal, purpose: "턴", inputSequence: startedAfter, expected: this.expectationOf(topic), write: implementation,
         writeGuards: options.writeGuards,
-        session: { mode: "resume", sessionId: resumeSessionId },
+        session: { mode: "resume", sessionId: resumeSessionId, onSessionCreated: id => {
+          this.assertCurrent(topic.id, signal, topic.scopeGeneration, topic.state);
+          if (options.session) options.session.persist(id);
+          else {
+            if (this.dependencies.database.participantSessionInUse(topic.id, role, id)) throw new Error("세션 충돌");
+            this.dependencies.database.upsertParticipant(topic.id, { ...participant, sessionId: id, acknowledgedPlanSHA256: null });
+          }
+        } },
         prompt, implementation, planMode,
         planningWrite: options.planningWrite ?? (role==="claude" && topic.state==="CLAUDE_PLAN"?"plan":role==="claude"&&topic.state==="CLAUDE_REVISION"?"revision":undefined),
         readablePaths: options.readablePaths, settings: this.executionSettings(topic.id, role, implementation), onUsage,
       });
       result = resumed.result;
-      sessionId = resumeSessionId;
+      sessionId = resumed.sessionId;
     }
     this.assertCurrent(topic.id, signal, topic.scopeGeneration, topic.state);
     if (await this.interruptPreservingResult(topic, role, result, startedAfter, signal)) throw new HandledWorkflowInterruption();
@@ -459,6 +477,21 @@ export class EngineCore {
       formatOnly = isFormatOnlyViolation(error);
       violation = error instanceof Error ? error.message : String(error);
       if (error instanceof ToleranceFormatError) repairPlan = repairablePlan(redactAgentResult(raw), context.planBase);
+    }
+    if (this.dependencies.database.planning.enabled(topic.id) &&
+        ["CLAUDE_PLAN", "CLAUDE_REVISION", "CODEX_AUDIT", "CODEX_CLOSEOUT"].includes(topic.state)) {
+      const checkpoint = this.dependencies.database.planning.latest(topic.id);
+      if (checkpoint && checkpoint.stage === topic.state && checkpoint.role === role &&
+          checkpoint.scopeGeneration === topic.scopeGeneration && checkpoint.planEpoch === topic.planEpoch) {
+        checkpoint.finalized = false; checkpoint.finalResult = undefined;
+        checkpoint.step.complete = false;
+        checkpoint.step.questions = [`Repair the final task contract: ${violation}`, ...checkpoint.step.questions];
+        checkpoint.stopped = "Final result failed the task contract; checkpoint and response retained.";
+        checkpoint.updatedAt = new Date().toISOString();
+        this.dependencies.database.planning.save(checkpoint);
+      }
+      // A generic repair call would bypass the bounded research protocol and buy a second logical attempt.
+      throw new PlanningPaused("Final result failed the task contract; resume the saved planning attempt after mediation.");
     }
     if (repairPlan && this.executor.supportsPlanRepair(role)) {
       const usageObserver = this.usageObserver(topic.id, role, "계약 교정 재제출");

@@ -58,6 +58,8 @@ export class ExecutionMetrics {
   private totals: Partial<Pick<TurnUsage, "inputTokens" | "cachedInputTokens" | "outputTokens">> = {};
   private metadata: Partial<Pick<TurnUsage, "costUSD" | "modelTurns" | "apiDurationMs">> = {};
   private internalRequests = 0;
+  private lastRequestInputTokens?: number;
+  private peakRequestInputTokens?: number;
   private finalSourceSeen = false;
   private finalUsageComplete = false;
   private claudeAssistantRequests = 0;
@@ -106,6 +108,11 @@ export class ExecutionMetrics {
       }
       if (!previous) this.claudeAssistantRequests += 1;
       this.claudeMessages.set(id, next);
+      const fields = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"];
+      if (fields.some(key => next[key] !== undefined)) {
+        this.lastRequestInputTokens = fields.reduce((sum, key) => sum + (next[key] ?? 0), 0);
+        this.peakRequestInputTokens = Math.max(this.peakRequestInputTokens ?? 0, this.lastRequestInputTokens);
+      }
       this.internalRequests = this.claudeAssistantRequests;
       const addDelta = (target: "inputTokens" | "cachedInputTokens" | "outputTokens", keys: string[]) => {
         if (!keys.some((key) => next[key] !== undefined)) return;
@@ -208,6 +215,8 @@ export class ExecutionMetrics {
       completeness: observed ? "complete" : "partial",
       source: "cli-stream",
       internalRequests: this.internalRequests,
+      lastRequestInputTokens: this.lastRequestInputTokens,
+      peakRequestInputTokens: this.peakRequestInputTokens,
       toolDurationMs: tool.toolDurationMs,
       toolCalls: tool.toolCalls,
       durationMs: Math.max(0, Date.now() - this.startedAt),

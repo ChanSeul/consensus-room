@@ -10,6 +10,7 @@ export const INSTRUCTION_FILE_LIMIT_BYTES = 32_000;
 // 파일을 대신 읽는다 — 항상 현재 내용이고 worktree 마다 복사할 필요가 없다. 원본 지시문에는 방 계약과 충돌하는
 // 조항(요청 없이 빌드 금지·시뮬 실행·훅 ack·홈 경로 참조)이 있으므로 주입 뒤에 우선순위 규칙을 붙인다.
 export interface AppliedInstructionInput {
+  strict?: boolean;
   workspace: string;
   fileName: string;
   // 원본 저장소. worktree 에 파일이 없을 때만 쓴다.
@@ -29,7 +30,7 @@ export interface AppliedInstructions {
 export async function readAppliedInstructions(input: AppliedInstructionInput): Promise<AppliedInstructions> {
   const blocks: string[] = [];
   if (input.globalPath) {
-    const block = await readInstructionBlock(`사용자 전역 ${input.fileName}`, input.globalPath);
+    const block = await readInstructionBlock(`사용자 전역 ${input.fileName}`, input.globalPath, input.strict);
     if (block) blocks.push(block);
   }
   const workspacePath = join(input.workspace, input.fileName);
@@ -38,13 +39,14 @@ export async function readAppliedInstructions(input: AppliedInstructionInput): P
   let projectBlock: string | null = null;
   if (workspaceHasFile) {
     if (input.injectWorkspaceFile) {
-      projectBlock = await readInstructionBlock(`작업 저장소 ${input.fileName}`, workspacePath);
+      projectBlock = await readInstructionBlock(`작업 저장소 ${input.fileName}`, workspacePath, input.strict);
       if (projectBlock) projectSource = "workspace";
     }
   } else if (input.repositoryPath) {
     projectBlock = await readInstructionBlock(
       `작업 저장소 ${input.fileName} (원본 저장소 사본 — worktree 에는 gitignored 라 없음)`,
       join(input.repositoryPath, input.fileName),
+      input.strict,
     );
     if (projectBlock) projectSource = "repository";
   }
@@ -52,9 +54,12 @@ export async function readAppliedInstructions(input: AppliedInstructionInput): P
   return { blocks, projectSource };
 }
 
-async function readInstructionBlock(label: string, path: string): Promise<string | null> {
+async function readInstructionBlock(label: string, path: string, strict = false): Promise<string | null> {
   const raw = await readFile(path, "utf8").catch(() => null);
   if (!raw) return null;
+  if (strict && Buffer.byteLength(raw) > INSTRUCTION_FILE_LIMIT_BYTES) {
+    throw new Error("Mandatory instruction file exceeds the planning limit; it must not be silently truncated.");
+  }
   const bounded = Buffer.byteLength(raw, "utf8") > INSTRUCTION_FILE_LIMIT_BYTES
     ? `${raw.slice(0, INSTRUCTION_FILE_LIMIT_BYTES)}\n[이하 생략: 지시문이 32KB를 넘었습니다.]`
     : raw;

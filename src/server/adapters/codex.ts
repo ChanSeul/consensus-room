@@ -1,11 +1,13 @@
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { lstat, mkdir, readdir, readFile, readlink, realpath, symlink, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readdir, readFile, readlink, realpath, rename, symlink, unlink, writeFile } from "node:fs/promises";
+import { PlanningPaused } from "../../shared/planningControl.js";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
   AgentResultJsonSchema,
+  PlanningAgentResultJsonSchema,
   DEFAULT_AGENT_SETTINGS,
   type AgentResult,
 } from "../../shared/contracts.js";
@@ -41,6 +43,7 @@ interface CodexPermissionBoundary {
   sourceAuthPath: string;
   codexExecutable: string;
   protocolOnly: boolean;
+  planningControl?: boolean;
   evidenceManaged: boolean;
   // 턴 단위 추가 읽기 허용(주제 plan.md 등).
   readablePaths: readonly string[];
@@ -75,14 +78,18 @@ function managedConfigBody(boundary: CodexPermissionBoundary): string {
   const deniedPaths = uniquePaths([join(boundary.topicHome, "auth.json"), boundary.managedAuthPath, boundary.sourceAuthPath]);
   return [
     ...MANAGED_CONFIG_HEADER,
+    ...(boundary.planningControl ? ["project_doc_max_bytes = 0", "[features]",
+      ...["shell_tool", "unified_exec", "multi_agent", "view_image", "apps", "browser_use", "computer_use",
+        "plugins", "memories", "code_mode_host", "workspace_dependencies", "skill_search", "image_generation"]
+        .map(feature => `${feature} = false`)] : []),
     "",
     // 프로토콜 확인 턴은 판단에 필요한 값을 프롬프트가 다 담고 있으므로 웹 검색과 하위 에이전트를 닫는다.
     "# 정책: 웹 검색과 공개 문서 읽기는 기본 개방. 확장 서버·알림 훅은 계속 차단(sandbox 밖 프로세스).",
     "[tools]",
-    `web_search = ${boundary.protocolOnly || boundary.evidenceManaged ? "false" : "true"}`,
+    `web_search = ${boundary.protocolOnly || boundary.evidenceManaged || boundary.planningControl ? "false" : "true"}`,
     "",
     "[features.multi_agent_v2]",
-    `enabled = ${boundary.protocolOnly ? "false" : "true"}`,
+    `enabled = ${boundary.protocolOnly || boundary.planningControl ? "false" : "true"}`,
     "max_concurrent_threads_per_session = 3",
     "expose_spawn_agent_model_overrides = false",
     `subagent_developer_instructions = ${tomlString("전달받은 범위만 직접 처리하고 추가 하위 에이전트를 생성하거나 위임하지 마세요. 파일을 수정하지 마세요.")}`,
@@ -190,24 +197,35 @@ export class CodexAdapter implements AgentAdapter {
   ) {
     // -s/-a are top-level Codex options. resume 뒤에 놓으면 CLI가 거부한다.
     await mkdir(dirname(this.schemaPath), { recursive: true });
-    await writeFile(this.schemaPath, JSON.stringify(AgentResultJsonSchema, null, 2), { mode: 0o600 });
+    // Separate immutable contents prevent parallel normal/controlled topics from replacing each other's schema.
+    const schemaPath = turn.planningControl ? `${this.schemaPath}.planning.json` : this.schemaPath;
+    const schemaTemp = `${schemaPath}.${randomUUID()}.tmp`;
+    await writeFile(schemaTemp, JSON.stringify(turn.planningControl ? PlanningAgentResultJsonSchema : AgentResultJsonSchema, null, 2), { mode: 0o600 });
+    await rename(schemaTemp, schemaPath);
+    commandArgs = commandArgs.map(arg => arg === this.schemaPath ? schemaPath : arg);
+    if (turn.planningControl?.image) commandArgs.splice(commandArgs.length - 1, 0, "--image", turn.planningControl.image.path);
     const executionSettings = turn.settings ?? DEFAULT_AGENT_SETTINGS.codex;
-    const topicHome = await this.prepareManagedHome(turn.cwd, Boolean(turn.protocolOnly), turn.readablePaths ?? [], Boolean(turn.evidenceManaged));
+    const topicHome = await this.prepareManagedHome(turn.cwd, Boolean(turn.protocolOnly), turn.readablePaths ?? [], Boolean(turn.evidenceManaged), Boolean(turn.planningControl));
     // 메모리는 세션 생성 턴에만 주입한다(claude 어댑터와 같은 근거 — resume은 스레드가 이미 기억,
     // 매 턴 재주입은 턴당 ~20K자 중복). protocolOnly 턴은 새 세션이어도 주입하지 않는다.
-    const injectMemory = Boolean(this.memory) && newSession && !turn.protocolOnly;
+    const injectMemory = Boolean(this.memory) && newSession && !turn.protocolOnly && !turn.planningControl;
     const enriched = injectMemory
       ? await this.memory!.buildPrompt(turn.prompt, this.role)
-      : await this.withMemoryManifest(turn);
+      : turn.planningControl ? turn.prompt : await this.withMemoryManifest(turn);
     // 프로토콜 확인 턴은 판단에 필요한 값을 프롬프트가 다 담고 있어 프로젝트 지시문(AGENTS.md)도 싣지 않는다
     // (2026-09-07 Codex 자기 최적화 제안 ②: ACK 턴마다 지시문 블록을 재전송하던 낭비).
     const { blocks: instructions } = turn.protocolOnly
       ? { blocks: [] as string[] }
       : await readAppliedInstructions({
+        strict: Boolean(turn.planningControl),
         workspace: turn.cwd, fileName: "AGENTS.md", repositoryPath: this.options.repositoryPath ?? null,
-        globalPath: null, injectWorkspaceFile: false,
+        globalPath: turn.planningControl ? join(homedir(), ".codex", "AGENTS.md") : null,
+        injectWorkspaceFile: Boolean(turn.planningControl),
       });
     const stdin = [EXECUTION_POLICY_NOTE, ...instructions, enriched].join("\n\n");
+    if (turn.planningControl && Buffer.byteLength(stdin) > turn.planningControl.maxPromptBytes) {
+      throw new PlanningPaused("Final planning input including mandatory instructions exceeds its byte limit.");
+    }
     const startedAt = Date.now();
     const toolTime = createToolTimeMeter("codex");
     const metrics = new ExecutionMetrics("codex", Buffer.byteLength(stdin, "utf8"), executionSettings.model, executionSettings.effort, !newSession, startedAt);
@@ -282,7 +300,7 @@ export class CodexAdapter implements AgentAdapter {
 
   // 홈 자체는 지속되지만 설정은 턴마다 다시 쓴다. 외부에서 드리프트가 생겨도 다음 턴에 사라지게 하려는 것이고,
   // schemaPath를 매번 쓰는 위 패턴과 같다. 공유 홈(인증·skills·전역 규칙·세션 상태)을 먼저 정리한 뒤 토픽 홈을 그 위에 얹는다.
-  private async prepareManagedHome(cwd: string, protocolOnly: boolean, readablePaths: readonly string[] = [], evidenceManaged = false): Promise<string> {
+  private async prepareManagedHome(cwd: string, protocolOnly: boolean, readablePaths: readonly string[] = [], evidenceManaged = false, planningControl = false): Promise<string> {
     const workspace = resolve(cwd);
     const shared = this.sharedHomeQueue.then(() => this.prepareSharedHome());
     this.sharedHomeQueue = shared.catch(() => undefined);
@@ -305,6 +323,7 @@ export class CodexAdapter implements AgentAdapter {
       sourceAuthPath: join(this.userCodexHome(), "auth.json"),
       codexExecutable: resolveCodexExecutable(),
       protocolOnly,
+      planningControl,
       evidenceManaged,
       readablePaths,
     };

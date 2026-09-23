@@ -244,7 +244,7 @@ export class WorkflowEngine {
       this.core.dependencies.database.revisions.assertAvailable(topicId,resume==="CLAUDE_PLAN"?"plan":"revision");
     // 실행 환경 때문에 멈춘 정지(예산·한도·spawn 직전 허용 거부: 유지보수 잠금·계획 변경·기준 불일치)는 사람의 제품 결정이 아니다 — 저장된 같은 단계로
     // 재개하고 계획을 다시 만들지 않는다(CF-07: 유지보수 거부 뒤 retry 가 계획부터 다시 만들었다).
-    if (topic.state === "USER_DECISION_REQUIRED" && (interruption?.payload?.budgetPause === true || interruption?.payload?.revisionPause === true || Boolean(interruption?.payload?.reviewPause)
+    if (topic.state === "USER_DECISION_REQUIRED" && (interruption?.payload?.planningPause === true || interruption?.payload?.budgetPause === true || interruption?.payload?.revisionPause === true || Boolean(interruption?.payload?.reviewPause)
       || typeof interruption?.payload?.admissionRefused === "string")
       && interruption?.payload?.resumeState === resume) {
       // Budget pauses resume the exact infrastructure stage, without consuming a product decision or resetting the plan.
@@ -256,6 +256,15 @@ export class WorkflowEngine {
       return this.core.startAction(topicId, "retry", (signal) => this.planning.runDiagnosisPlanRevision(topicId, signal), actionId);
     }
     if (!resume) throw new Error("재시도할 단계가 기록되어 있지 않습니다.");
+    const planningCheckpoint = this.core.dependencies.database.planning.latest(topicId);
+    if (resume === "CLAUDE_PLAN" && planningCheckpoint && !planningCheckpoint.finalized &&
+        planningCheckpoint.stage === resume && planningCheckpoint.scopeGeneration === topic.scopeGeneration &&
+        planningCheckpoint.planEpoch === topic.planEpoch && planningCheckpoint.planSHA256 === topic.planSHA256) {
+      return this.core.startAction(topicId, "retry", async signal => {
+        this.core.dependencies.database.updateTopic(topicId, { state: "DRAFT" });
+        await this.planning.runPlanningLoop(topicId, signal);
+      }, actionId);
+    }
     // 진단 계획 개정이 저장된 직후(감사 전)에 멈춰 재개 단계가 계획 턴으로 남았으면 저장된 개정 계획으로 감사부터 잇는다 — 전체 재계획으로 떨어져 저장된
     // 개정을 버리고 진단을 재계획 stale 로 돌리지 않는다(2026-09-15 감사).
     if (resume === "CLAUDE_PLAN" && this.core.diagnoses.savedRevisionAwaitingAudit(topicId)) {

@@ -5,6 +5,17 @@ import { join } from "node:path";
 import { ExecutionMetrics, codexHomeUsage, exceededLimits } from "../src/server/adapters/executionMetrics";
 
 describe("실행별 사용량 계측", () => {
+  it("separates request peak from cumulative/cache input and leaves unobserved request sizes unknown", () => {
+    const meter = new ExecutionMetrics("claude", 42, "test", "xhigh", false, Date.now());
+    meter.observe({ type: "assistant", message: { id: "m1", usage: { input_tokens: 10, cache_read_input_tokens: 90, output_tokens: 2 } } });
+    meter.observe({ type: "assistant", message: { id: "m2", usage: { input_tokens: 20, cache_read_input_tokens: 100, output_tokens: 3 } } });
+    expect(meter.snapshot({ toolDurationMs: 0, toolCalls: 0 }, "final")).toMatchObject({
+      inputTokens: 220, cachedInputTokens: 190, lastRequestInputTokens: 120, peakRequestInputTokens: 120,
+    });
+    const codex = new ExecutionMetrics("codex", 42, "test", "xhigh", false, Date.now());
+    codex.observe({ type: "turn.completed", usage: { input_tokens: 220, output_tokens: 5 } });
+    expect(codex.snapshot({ toolDurationMs: 0, toolCalls: 0 }, "final").peakRequestInputTokens).toBeUndefined();
+  });
   it("같은 응답 ID를 두 번 받아도 누적 요청을 중복 기록하지 않는다", () => {
     const meter = new ExecutionMetrics("codex", 42, "gpt-test", "high", false, Date.now());
     const event = { type: "turn.completed", response_id: "r1", usage: { input_tokens: 10, cached_input_tokens: 2, output_tokens: 3 } };
