@@ -747,7 +747,7 @@ export class EngineCore {
     const existing = await this.deferredFindingsOf(topic.id);
     const recordedAt = new Date().toISOString();
     const additions = findings
-      .filter((finding) => !existing.some((item) => item.id === finding.id && item.source === source))
+      .filter((finding) => !existing.some((item) => item.id === finding.id))
       .map((finding) => ({
         id: finding.id, title: finding.title, severity: finding.severity, rationale: finding.rationale,
         source, topicId: topic.id, recordedAt,

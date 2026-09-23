@@ -2300,6 +2300,25 @@ describe("최종 리뷰 신규 쟁점의 사용자 결정 소비", () => {
     database.close();
   });
 
+  it("첫 리뷰 → 수정 → 최종 리뷰에서도 이연 항목은 최초 출처로 한 번만 보존된다", async () => {
+    const deferred = finding("F-DEFER", "이연", { disposition: "DEFERRED_OUT_OF_SCOPE" });
+    const action = finding("F-ACTION", "수정", { disposition: "AGREED_ACTION" });
+    const resolved = { ...action, disposition: "RESOLVED_BY_FIX" as const };
+    const review: AgentResult = { kind: "REVIEW", summary: "수정과 이연", findings: [action, deferred], evidenceRefs: [] };
+    const { database, engine, artifacts } = await makeReviewRecovery({
+      resumeState: "CODEX_REVIEW", implementationFindings: [], originalReviewFindings: [], codexResult: review,
+      codexResults: [review, { kind: "FINAL_REVIEW", summary: "수정 확인", findings: [resolved, deferred], evidenceRefs: [] }],
+      claudeResults: [{ kind: "FIX", status: "completed", summary: "확정 결함 수정", findings: [resolved], evidenceRefs: [] }],
+    });
+    database.setImplementationSession("topic-1", "claude-implementation-session");
+    engine.retry("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+    expect(database.getTopic("topic-1").state, database.getTopic("topic-1").lastError ?? "").toBe("READY_TO_DELIVER");
+    expect(JSON.parse((await artifacts.readLatest("topic-1", "deferred-findings"))!).findings)
+      .toMatchObject([{ id: "F-DEFER", source: "review" }]);
+    database.close();
+  });
+
   it("첫 리뷰에서 이연한 항목을 뒤 리뷰가 해소하면 후속 목록에서도 제거한다", async () => {
     const deferred = finding("F-DEFER", "이연", { disposition: "DEFERRED_OUT_OF_SCOPE" });
     const { database, engine, artifacts } = await makeReviewRecovery({
