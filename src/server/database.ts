@@ -724,6 +724,7 @@ export class ConsensusDatabase {
     topicId: string;
     changes: Parameters<ConsensusDatabase["updateTopic"]>[1];
     clearAcknowledgements?: boolean;
+    planningSessionAmendment?: { previousSHA256: string; nextSHA256: string };
     participants?: Participant[];
     events: Array<Omit<TimelineEventInput, "topicId">>;
     // 전이와 한 transaction 으로 남길 수정 작업 계약 행과 진단 상태 기록(수락 전이·회차 소비·반영 보고가 갈라지지 않게, 2026-09-15 감사 2차).
@@ -733,6 +734,14 @@ export class ConsensusDatabase {
     const recorded: TimelineEvent[] = [];
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      if (input.planningSessionAmendment && this.planning.continuityEnabled(input.topicId)) {
+        const previous = this.getTopic(input.topicId);
+        const binding = this.planning.boundSession(previous);
+        if (!binding || previous.planSHA256 !== input.planningSessionAmendment.previousSHA256 || input.changes.planSHA256 !== input.planningSessionAmendment.nextSHA256) {
+          throw new Error("허용 오차 개정의 계획–세션 연결이 바뀌었습니다.");
+        }
+        this.planning.bindSession(previous, input.planningSessionAmendment.nextSHA256, binding.sessionId, binding.inputSequence);
+      }
       this.updateTopic(input.topicId, input.changes);
       const at = now();
       for (const contract of input.contracts ?? []) this.fixContracts.append(input.topicId, contract, at);

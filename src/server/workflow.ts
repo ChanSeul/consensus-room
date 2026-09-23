@@ -494,10 +494,11 @@ export class WorkflowEngine {
       return db.applyTopicTransition({
         topicId,
         changes: { planSHA256: sha256, approvedPlanSHA256: sha256 },
+        planningSessionAmendment: { previousSHA256: topic.planSHA256!, nextSHA256: sha256 },
         participants,
         events: [{
           actor: "user", kind: "decision", state: topic.state,
-          body: `허용 오차 개정(넓히기, 중재자 결정) — 계획 산출물 ${revision}판 ${sha256.slice(0, 12)}…\n추가 규칙: ${addedRules.join(", ") || "없음"} · 추가 scopePaths: ${addedScope.join(", ") || "없음"}\n\n${input.reason}`,
+          body: `허용 오차 개정(넓히기, 중재자 결정) — 계획 산출물 ${revision}판 ${sha256.slice(0, 12)}…\n추가 규칙: ${addedRules.join(", ") || "없음"} · 추가 scopePaths: ${addedScope.join(", ") || "없음"}\n\n${input.reason}\n\n적용할 허용 오차 전체:\n${JSON.stringify(parsed.data)}`,
           payload: { toleranceAmendment: { addedRules, addedScope, previousPlanSHA256: topic.planSHA256, planSHA256: sha256, artifactRevision: artifact.revision },
             ...(requestKey ? { requestKey, requestAction: "action:amend-tolerance" } : {}) },
         }],

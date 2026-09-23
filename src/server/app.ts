@@ -354,7 +354,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     workflow.assertBudgetEditable(request.params.id);
     return runIdempotent(request, reply, actionLedger(database, request.params.id, "planning:enable"), 200, () => {
       database.planning.enable(request.params.id);
-      return { version: 1, progress: database.planning.progress(request.params.id) };
+      return { version: database.planning.policyVersion(request.params.id), progress: database.planning.progress(request.params.id) };
     });
   });
 

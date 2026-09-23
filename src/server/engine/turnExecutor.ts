@@ -160,14 +160,14 @@ export class TurnExecutor {
     try {
       let sessionId = session.sessionId;
       const result = await adapter.resumeTurn({ ...base, sessionId, onSessionCreated: id => {
-        if (request.role === "claude" && this.core.dependencies.database.planning.enabled(request.topic.id) && id !== session.sessionId) {
+        if (request.role === "claude" && this.core.dependencies.database.planning.continuityEnabled(request.topic.id) && id !== session.sessionId) {
           throw new PlanningPaused("Claude가 다른 세션 ID를 반환했습니다. 기존 세션을 보존하고 중단합니다.");
         }
         sessionId = id; session.onSessionCreated?.(id);
       } });
       return this.settle(request, { sessionId, result, created: sessionId !== session.sessionId });
     } catch (error) {
-      if (request.role === "claude" && this.core.dependencies.database.planning.enabled(request.topic.id) && isMissingSessionError(error) && !request.signal.aborted) {
+      if (request.role === "claude" && this.core.dependencies.database.planning.continuityEnabled(request.topic.id) && isMissingSessionError(error) && !request.signal.aborted) {
         throw new PlanningPaused("Claude 대화 파일을 찾을 수 없습니다. 새 세션을 생성하지 않고 복구를 기다립니다.");
       }
       if (!session.fallbackFresh || !isMissingSessionError(error) || request.signal.aborted) throw error;

@@ -76,6 +76,10 @@ describe("승인 뒤 구현부터 전달까지", () => {
     });
     await artifacts.write(topicId, "plan", 2, `${plan.trim()}\n`);
 
+    // Enabling reads after approval retains the legacy first-implementation session contract.
+    database.planning.enable(topicId);
+    expect(database.planning.policyVersion(topicId)).toBe(1);
+    expect(database.planning.continuityEnabled(topicId)).toBe(false);
     const claude = new EditingClaude(worktree, changeOnFix);
     const codex = new ReviewingCodex();
     const engine = new WorkflowEngine({ database, artifacts, git: gitService, claude, codex });

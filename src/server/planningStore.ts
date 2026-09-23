@@ -13,14 +13,32 @@ export class PlanningStore {
     db.exec(`CREATE TABLE IF NOT EXISTS planning_policies(topic_id TEXT PRIMARY KEY, version INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS planning_checkpoints(key TEXT PRIMARY KEY, topic_id TEXT NOT NULL, record_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS planning_fragments(key TEXT PRIMARY KEY, record_json TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS planning_session_fragments(session_id TEXT NOT NULL,id TEXT NOT NULL,record_json TEXT NOT NULL,PRIMARY KEY(session_id,id));
       CREATE TABLE IF NOT EXISTS planning_sessions(topic_id TEXT PRIMARY KEY, record_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS planning_archives(id INTEGER PRIMARY KEY, topic_id TEXT NOT NULL, record_json TEXT NOT NULL);`);
   }
-  enabled(topicId: string): boolean {
-    return Boolean(this.db.prepare("SELECT 1 FROM planning_policies WHERE topic_id=? AND version=1").get(topicId));
+  policyVersion(topicId: string): number {
+    const row = this.db.prepare("SELECT version FROM planning_policies WHERE topic_id=?").get(topicId);
+    return row ? Number(row.version) : 0;
   }
+  enabled(topicId: string): boolean { return this.policyVersion(topicId) > 0; }
+  continuityEnabled(topicId: string): boolean { return this.policyVersion(topicId) === 2; }
   enable(topicId: string): void {
-    this.db.prepare("INSERT INTO planning_policies VALUES (?,1) ON CONFLICT(topic_id) DO NOTHING").run(topicId);
+    // Existing policies and in-flight/approved work retain their original session contract.
+    const topic = this.db.prepare("SELECT state,resume_state,plan_sha256,implementation_session_id FROM topics WHERE id=?").get(topicId);
+    const unstartedPlan = !topic?.plan_sha256 && !topic?.implementation_session_id &&
+      (["DRAFT", "CLAUDE_PLAN"].includes(String(topic?.state)) ||
+        (["USER_DECISION_REQUIRED", "FAILED"].includes(String(topic?.state)) && topic?.resume_state === "CLAUDE_PLAN"));
+    const version = unstartedPlan ? 2 : 1;
+    this.db.prepare("INSERT INTO planning_policies VALUES (?,?) ON CONFLICT(topic_id) DO NOTHING").run(topicId, version);
+  }
+  deliveredToSession(sessionId: string): PlanningFragment[] {
+    return this.db.prepare("SELECT record_json FROM planning_session_fragments WHERE session_id=?").all(sessionId)
+      .map(row => JSON.parse(String(row.record_json)) as PlanningFragment);
+  }
+  recordDelivery(sessionId: string, fragments: readonly PlanningFragment[]): void {
+    const insert = this.db.prepare("INSERT INTO planning_session_fragments VALUES (?,?,?) ON CONFLICT(session_id,id) DO NOTHING");
+    for (const fragment of fragments) insert.run(sessionId, fragment.id, JSON.stringify(fragment));
   }
   get(key: string): PlanningCheckpoint | null {
     const row = this.db.prepare("SELECT record_json FROM planning_checkpoints WHERE key=?").get(key);

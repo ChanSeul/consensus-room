@@ -112,7 +112,7 @@ export class DeliveryPipeline {
   async runImplementation(topicId: string, signal: AbortSignal): Promise<void> {
     let topic = this.core.dependencies.database.getTopic(topicId);
     const resuming = topic.state === "IMPLEMENTING";
-    const continuous = this.core.dependencies.database.planning.enabled(topicId);
+    const continuous = this.core.dependencies.database.planning.continuityEnabled(topicId);
     const planningSession = continuous ? this.core.dependencies.database.planning.boundSession(topic) : null;
     const savedSession = this.core.dependencies.database.getFlags(topicId).implementationSessionId;
     if (continuous && (!planningSession || (savedSession && savedSession !== planningSession.sessionId))) {
@@ -363,7 +363,7 @@ export class DeliveryPipeline {
       }
     }
     let sessionId = setup.work.sessionId;
-    if (db.planning.enabled(topicId) && !sessionId) throw new PlanningPaused("기존 Claude 세션이 없어 작업을 중단했습니다. 세션 복구가 필요합니다.");
+    if (db.planning.continuityEnabled(topicId) && !sessionId) throw new PlanningPaused("기존 Claude 세션이 없어 작업을 중단했습니다. 세션 복구가 필요합니다.");
     let work: WorkBinding = setup.work;
     let state: WorkState;
     // 멈춘(paused) 결과가 열린 요청만 빼면 완료였고 그 뒤 결정이 올라왔으면 쓰기 턴을 다시 사지 않는다 — 읽기 전용 확인 턴(요청 해소 여부)으로
@@ -399,7 +399,7 @@ export class DeliveryPipeline {
       const outcome = await this.core.executor.execute({
         role: "claude", topic, signal, purpose: "턴", inputSequence: setup.inputSequence, expected, write: true, writeGuards,
         session: sessionId
-          ? { mode: "resume", sessionId, ...(db.planning.enabled(topicId) ? {} : { fallbackFresh: { prompt: prompts.fresh, onSessionCreated: setup.persistSession } }) }
+          ? { mode: "resume", sessionId, ...(db.planning.continuityEnabled(topicId) ? {} : { fallbackFresh: { prompt: prompts.fresh, onSessionCreated: setup.persistSession } }) }
           : { mode: "create", onSessionCreated: setup.persistSession },
         prompt: sessionId ? prompts.resume : prompts.fresh, implementation: true, readablePaths: setup.readablePaths,
         settings: this.core.executionSettings(topicId, "claude", true),

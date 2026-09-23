@@ -20,8 +20,21 @@ it("requires authentication and an idempotency key to opt an idle topic into con
   const request = { method: "POST" as const, url, headers: { ...headers, "idempotency-key": "enable-once" } };
   const first = await app.inject(request);
   expect(first.statusCode).toBe(200);
+  expect(first.json().version).toBe(2);
   expect((await app.inject(request)).json()).toEqual(first.json());
   expect(database.planning.enabled("planning-topic")).toBe(true);
+  await app.close();
+});
+
+it("enabling planning after approval does not impose a new session contract", async () => {
+  const { app, database } = await makeApp();
+  draftTopic(database, "approved-topic");
+  database.updateTopic("approved-topic", { state: "AWAITING_USER_APPROVAL", planSHA256: "a".repeat(64) });
+  const response = await app.inject({ method: "POST", url: "/api/topics/approved-topic/planning-control",
+    headers: { "x-consensus-token": "launch-token-for-test", "idempotency-key": "late-enable" } });
+  expect(response.statusCode).toBe(200);
+  expect(response.json().version).toBe(1);
+  expect(database.planning.continuityEnabled("approved-topic")).toBe(false);
   await app.close();
 });
 

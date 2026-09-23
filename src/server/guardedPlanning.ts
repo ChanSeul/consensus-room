@@ -27,6 +27,7 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
       return resume ? { sessionId: (turn as SessionTurn).sessionId, result: await adapter.resumeTurn(turn as SessionTurn) }
         : adapter.createSession(turn);
     }
+    const keepSession = adapter.role === "codex" || database.planning.continuityEnabled(topic.id);
     const latest = database.planning.latest(topic.id);
     if (latest && !latest.finalized && latest.stage === topic.state && latest.role === adapter.role &&
         latest.scopeGeneration === topic.scopeGeneration && latest.planEpoch === topic.planEpoch && latest.planSHA256 === topic.planSHA256) {
@@ -54,7 +55,7 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
       scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch, planSHA256: topic.planSHA256, prompt: turn.prompt,
       inputSequence: database.getTimeline(topic.id).at(-1)?.sequence ?? 0,
       admissionId: turn.planningControl?.admissionId ?? randomUUID(), round: 0, stalled: 0,
-      sessionId: resume ? (turn as SessionTurn).sessionId : null,
+      sessionId: keepSession && resume ? (turn as SessionTurn).sessionId : null,
       step: { draft: "", facts: [], contradictions: [], questions: [topic.title], requests: [], complete: false },
       fragments: [], delivered: [], usage: zero(), updatedAt: new Date().toISOString(), stopped: null,
       finalized: false, finalAttempted: false, started: false, injectedBytes: 0,
@@ -123,6 +124,21 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
     record.stopped = null; save();
     docs.set("context:manifest", JSON.stringify(manifest));
     const reader = new PlanningReader(turn.cwd, tree, docs);
+    if (keepSession && record.sessionId) {
+      const valid: string[] = [];
+      for (const fragment of database.planning.deliveredToSession(record.sessionId)) {
+        if (fragment.kind === "image") {
+          if (imageHashes.has(fragment.hash)) valid.push(fragment.id);
+        } else {
+          try {
+            const current = await reader.read({ kind: fragment.kind, selector: fragment.selector, offset: fragment.offset, question: "Validate inherited evidence" });
+            if (current.id === fragment.id) valid.push(fragment.id);
+          } catch { /* A removed or changed source is not inherited. */ }
+        }
+      }
+      record.delivered = [...new Set([...record.delivered, ...valid])];
+      save();
+    }
     const group = database.workGroups.forTopic(topic.id);
     const accounts = [topic.id, ...(group ? [group.id] : [])];
     const startSequence = record.inputSequence;
@@ -187,7 +203,7 @@ ${finalizing ? "No more research is available. Return the final contracted resul
 Checkpoint must fit ${LIMIT.checkpointBytes} UTF-8 bytes. Final result must satisfy the task contract below.`;
         // The original task contract and mandatory instructions are never silently truncated.
         const contractHash = planningHash(turn.prompt);
-        const task = record.deliveredContractHash === contractHash ? "Continue the task already in this session." : turn.prompt;
+        const task = keepSession && record.deliveredContractHash === contractHash ? "Continue the task already in this session." : turn.prompt;
         const prompt = `${guidance}\n\n${task}\n\nSnapshot ${tree}; evidence ${state.digest}\n` +
           `Manifest: ${bytes(manifest) <= 4096 ? JSON.stringify(manifest) : "Read context:manifest in chunks."}\n` +
           `Checkpoint: ${JSON.stringify(record.step)}\nFragments: ${JSON.stringify(record.fragments)}`;
@@ -258,13 +274,13 @@ Checkpoint must fit ${LIMIT.checkpointBytes} UTF-8 bytes. Final result must sati
             save(); turn.onProcessSpawn?.(process);
           },
           onSessionCreated: id => {
-            if (record.sessionId && record.sessionId !== id) pause("The CLI changed the planning session identity; restore the existing session before retrying.");
+            if (keepSession && record.sessionId && record.sessionId !== id) pause("The CLI changed the planning session identity; restore the existing session before retrying.");
             record.sessionId = id; record.sessions = [...new Set([...(record.sessions ?? []), id])];
             save(); turn.onSessionCreated?.(id);
           } };
         let result: AgentResult;
         try {
-          if (record.sessionId) {
+          if (keepSession && record.sessionId) {
             result = await adapter.resumeTurn({ ...roundTurn, sessionId: record.sessionId });
           } else {
             const response = await adapter.createSession(roundTurn);
@@ -274,6 +290,7 @@ Checkpoint must fit ${LIMIT.checkpointBytes} UTF-8 bytes. Final result must sati
           if (!["inputTokens", "outputTokens", "durationMs"].every(k => observed.has(k)) && callStarted) record.usageIncomplete = true;
           save();
         }
+        if (keepSession && record.sessionId) database.planning.recordDelivery(record.sessionId, record.fragments);
         record.deliveredContractHash = contractHash;
         record.lastResponse = result; record.responseBytes = (record.responseBytes ?? 0) + bytes(result); save();
         await assertCurrent();
@@ -300,7 +317,7 @@ Checkpoint must fit ${LIMIT.checkpointBytes} UTF-8 bytes. Final result must sati
         const fragments: PlanningFragment[] = [];
         for (const request of step.requests) {
           if (request.kind === "image") {
-            if (record.delivered.includes(request.selector) && !request.rereadReason) continue;
+            if (keepSession && record.delivered.includes(request.selector) && !request.rereadReason) continue;
             if (record.imageHash || request.offset !== 0 || !imageHashes.has(request.selector)) pause("Only one pinned image per round is allowed.");
             const fragment: PlanningFragment = { id: request.selector, kind: "image", selector: request.selector, hash: request.selector,
               offset: 0, nextOffset: null, content: "Pinned design image attached to this round." };
@@ -312,7 +329,7 @@ Checkpoint must fit ${LIMIT.checkpointBytes} UTF-8 bytes. Final result must sati
           const fragment = database.planning.fragment(cacheKey) ?? await reader.read(request);
           database.planning.saveFragment(cacheKey, fragment);
           if (fragments.some(f => f.id === fragment.id)) continue;
-          if (record.delivered.includes(fragment.id) && !request.rereadReason) continue;
+          if (keepSession && record.delivered.includes(fragment.id) && !request.rereadReason) continue;
           if (bytes([...fragments, fragment]) > LIMIT.batchBytes) break;
           fragments.push(fragment);
         }

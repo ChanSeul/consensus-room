@@ -455,6 +455,11 @@ it("keeps the plan and revision session through approval, engine restart, implem
   expect(implementation.prompt).toContain("ONLY_NEW_KICKOFF");
   expect(implementation.prompt).not.toContain("UNIQUE_PLAN_BODY");
   expect(database.getFlags("topic").implementationSessionId).toBe("author-1");
+  await engine.amendTolerance("topic", { tolerance: { scopePaths: ["**", "form.swift"], rules: [] }, reason: "ALLOW_UPDATED_TOLERANCE" });
+  engine.retry("topic"); await settle();
+  expect(modelTurns.at(-1)?.prompt).toContain("ALLOW_UPDATED_TOLERANCE");
+  expect(modelTurns.at(-1)?.sessionId).toBe("author-1");
+  expect(modelTurns.at(-1)?.prompt).toContain('"form.swift"');
   unavailable = true;
   engine.retry("topic"); await settle();
   expect(database.getTopic("topic").state).toBe("USER_DECISION_REQUIRED");
@@ -477,4 +482,30 @@ it("allows an explicit bounded reread after compaction without treating it as ne
   await guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Plan" });
   expect(fake.calls[2].prompt).toContain("let step = 0");
   expect(database.planning.latest("topic")?.delivered).toHaveLength(1);
+});
+
+it("inherits current delivered evidence across plan and revision without retransmitting it", async () => {
+  const { repo, database, git } = setup();
+  let fragmentId = "";
+  const fake = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ requests: [{ kind: "file", selector: "form.swift", question: "Read", offset: 0 }] }));
+    if (n === 2) {
+      fragmentId = JSON.parse(turn.prompt.split("Fragments: ")[1])[0].id;
+      return answer(step({ facts: [{ statement: "Step exists", refs: [fragmentId] }], questions: [], complete: true }));
+    }
+    if (n === 3) return answer(step({ facts: [{ statement: "Step exists", refs: [fragmentId] }],
+      requests: [{ kind: "file", selector: "form.swift", question: "Read", offset: 0 }] }));
+    expect(turn.prompt).not.toContain("let step = 0");
+    return answer(step({ facts: [{ statement: "Step exists", refs: [fragmentId] }], questions: [], complete: true }));
+  });
+  const wrapped = guardedPlanning(fake.adapter, database, git);
+  const first = await wrapped.createSession({ cwd: repo, prompt: "Plan" });
+  database.updateTopic("topic", { state: "CLAUDE_REVISION", planSHA256: "a".repeat(64) });
+  await wrapped.resumeTurn({ cwd: repo, prompt: "Revise", sessionId: first.sessionId });
+  expect(fake.calls).toHaveLength(4);
+  expect(database.planning.latest("topic")?.delivered).toEqual([fragmentId]);
+  writeFileSync(join(repo, "form.swift"), "let renamed = 1\n");
+  database.updateTopic("topic", { planSHA256: "b".repeat(64) });
+  await expect(wrapped.resumeTurn({ cwd: repo, prompt: "Revalidate changed source", sessionId: first.sessionId }))
+    .rejects.toThrow("not delivered");
 });

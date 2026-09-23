@@ -107,7 +107,7 @@ export class PlanningPipeline {
       timeline: this.core.dependencies.database.getPromptTimeline(topicId, topic.scopeGeneration, known.inputSequence),
     }), signal, false, {
       // 읽기 전용 개정은 revision으로 집계한다. 서버 제어 계획에서는 작성 세션을 유지한다.
-      freshSession: !this.core.dependencies.database.planning.enabled(topic.id), planMode: true, planBase: carry.basePlan, planningWrite: "revision",
+      freshSession: !this.core.dependencies.database.planning.continuityEnabled(topic.id), planMode: true, planBase: carry.basePlan, planningWrite: "revision",
       // 교정 대기본(pending-contract-repair)은 이 진단의 이 적용 시도에만 결속한다 — 정정한 새 진단의 개정 턴이 앞 진단의 응답을 재사용해 새 진단 원문이
       // 러너에게 한 번도 전달되지 않았다(2026-09-15 감사 2차).
       repairContextKey: `diagnosis-plan-revision:${record.id}#${applyInfo(record)?.seq ?? 0}`,
@@ -402,7 +402,7 @@ export class PlanningPipeline {
       timeline: this.core.dependencies.database.getPromptTimeline(topicId, topic.scopeGeneration, known.inputSequence),
     }), signal, false, {
       readablePaths: known.readablePaths,
-      freshSession: !this.core.dependencies.database.planning.enabled(topic.id), planMode: audit.findings.length === 0, planBase: storedFirstPlan.markdown,
+      freshSession: !this.core.dependencies.database.planning.continuityEnabled(topic.id), planMode: audit.findings.length === 0, planBase: storedFirstPlan.markdown,
       normalize: this.core.carryForwardNormalizer(audit.findings, "Claude revision", { forReview: false }),
       check: (r) => {
         this.core.assertKind(r, "REVISION");
@@ -479,7 +479,7 @@ export class PlanningPipeline {
       source: "closeout",
     }), signal, false, {
       readablePaths: known.readablePaths,
-      freshSession: !this.core.dependencies.database.planning.enabled(topic.id), planMode: false, planBase: storedRevisedPlan.markdown,
+      freshSession: !this.core.dependencies.database.planning.continuityEnabled(topic.id), planMode: false, planBase: storedRevisedPlan.markdown,
       normalize: this.core.carryForwardNormalizer(source.findings, "Claude revision(2회차)", { forReview: false }),
       check: (r) => {
         this.core.assertKind(r, "REVISION");
@@ -643,7 +643,7 @@ export class PlanningPipeline {
 
   private async knownPlanningContext(topic: Topic) {
     const database = this.core.dependencies.database;
-    const binding = database.planning.enabled(topic.id) ? database.planning.boundSession(topic) : null;
+    const binding = database.planning.continuityEnabled(topic.id) ? database.planning.boundSession(topic) : null;
     if (!binding) return { knownPlan: undefined, inputSequence: 0, readablePaths: [] as string[] };
     const artifact = await this.core.requireCurrentPlanArtifact(topic.id);
     return { knownPlan: { sha256: topic.planSHA256!, path: artifact.path },
@@ -653,7 +653,7 @@ export class PlanningPipeline {
 
   private bindPlanningSession(topic: Topic, sha256: string): void {
     const database = this.core.dependencies.database;
-    if (!database.planning.enabled(topic.id)) return;
+    if (!database.planning.continuityEnabled(topic.id)) return;
     const current = database.getTopic(topic.id);
     const sessionId = current.participants.find(p => p.role === "claude")?.sessionId;
     if (!sessionId || sessionId.startsWith("pending:")) throw new Error("계획을 작성한 Claude 세션이 없습니다.");
