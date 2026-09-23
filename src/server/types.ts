@@ -72,8 +72,10 @@ export interface CommandRunner {
 export interface SessionTurn {
   // Bounded planning is tool-free but still receives mandatory project instructions.
   planningControl?: { admissionId: string; maxPromptBytes: number; image?: { path: string; bytes: number } };
-  // A host evidence cache supplied the external sources. Do not open a second direct Figma connection.
+  // Host-managed product evidence disables direct web reads; Figma implementation access is a separate opt-in.
   evidenceManaged?: boolean;
+  // Host opt-in only for implementation with registered Figma links; never planning or protocol turns.
+  figmaReadEnabled?: boolean;
   sessionId: string;
   prompt: string;
   cwd: string;

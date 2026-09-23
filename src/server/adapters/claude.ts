@@ -124,7 +124,8 @@ export class ClaudeAdapter implements AgentAdapter {
     try {
       const permissionMode = turn.implementation ? "dontAsk" : (turn.planMode ? "plan" : "dontAsk");
       const executionSettings = turn.settings ?? DEFAULT_AGENT_SETTINGS.claude;
-      const figmaMcpUrl = turn.evidenceManaged || turn.planningControl ? null : this.options.figmaMcpUrl ?? null;
+      const figmaMcpUrl = turn.implementation && turn.figmaReadEnabled && !turn.protocolOnly && !turn.planningControl
+        ? this.options.figmaMcpUrl ?? null : null;
       // 빈 객체 {}는 실 CLI가 "Invalid MCP configuration"으로 거부한다(실측). mcpServers 키는 항상 있어야 한다.
       const mcpConfig = {
         mcpServers: figmaMcpUrl ? { "figma-desktop": { type: "http", url: figmaMcpUrl } } : {},

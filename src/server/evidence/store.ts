@@ -274,6 +274,12 @@ export class EvidenceStore {
     }
     for (const source of state.sources) {
       rows.push(`${source.provider}: ${source.url} @ ${source.contentHash ?? "missing"} / 확인: ${source.checkedAt === null ? "없음" : new Date(source.checkedAt).toISOString()} / ${this.fresh(source) ? "확인됨" : "재확인 필요"}`);
+      // Figma is a locator, not an automatically injected design payload, in every phase.
+      if (source.provider === "figma") {
+        rows.push(JSON.stringify({ sourceId: source.id, fileKey: source.resource, nodeId: source.selector,
+          label: source.label, designAccess: "implementation-on-demand" }));
+        continue;
+      }
       const previous = sessionId ? this.db.prepare("SELECT unit_id,hash FROM evidence_receipts WHERE consumer=? AND source_id=?").all(consumer, source.id) : [];
       const old = new Map(previous.map(r => [String(r.unit_id), String(r.hash)]));
       const snapshot = this.snapshot(source.id);

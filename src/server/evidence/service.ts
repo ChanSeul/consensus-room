@@ -4,6 +4,7 @@ import type { EvidenceSource, EvidenceSnapshotInput, MediatorEvidenceResponse } 
 import type { ConsensusDatabase } from "../database.js";
 import type { AgentAdapter, SessionTurn } from "../types.js";
 import { EvidenceFetchError, type EvidenceConnector } from "./connectors.js";
+import { DESIGN_PLANNING_CONTRACT } from "../../shared/prompts.js";
 import { evidenceHash, type EvidenceStore } from "./store.js";
 
 export class EvidenceService {
@@ -115,11 +116,42 @@ export function withEvidence(adapter: AgentAdapter, database: ConsensusDatabase,
       if (evidenceHash(await readFile(path)) !== hash) throw new Error("디자인 파일 캐시가 변경됐습니다.");
       paths.push(path);
     }
+    // Materialize design data outside the prompt, only once implementation actually asks for a turn.
+    // Content-addressed files remain readable in resumed turns without re-sending their bodies or images.
+    const designPaths: string[] = [];
+    const designCache: Array<{ url: string; nodeId: string; contentHash: string; path: string }> = [];
+    const designSources = database.evidence.list(topic.id).filter(source => source.provider === "figma");
+    const designAccess = turn.implementation || ["CODEX_REVIEW", "CODEX_FINAL_REVIEW"].includes(topic.state);
+    if (designAccess) {
+      for (const source of designSources) {
+        // An old cache must never be presented as the current design. The link can still be queried directly.
+        if (!database.evidence.fresh(source)) continue;
+        const snapshot = database.evidence.snapshot(source.id, source.contentHash ?? undefined);
+        if (!snapshot) continue;
+        const images: string[] = [];
+        for (const hash of new Set(snapshot.units.flatMap(unit => unit.imageHash ? [unit.imageHash] : []))) {
+          images.push(await materializeImage(database.evidence, imageDirectory, hash));
+        }
+        const content = JSON.stringify({ ...snapshot, imagePaths: images }, null, 2);
+        const hash = evidenceHash(content);
+        await mkdir(imageDirectory, { recursive: true, mode: 0o700 });
+        const path = join(imageDirectory, `${hash}.design.json`);
+        try { await writeFile(path, content, { flag: "wx", mode: 0o600 }); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+        if (evidenceHash(await readFile(path)) !== hash) throw new Error("디자인 캐시가 변경됐습니다.");
+        designPaths.push(path, ...images);
+        designCache.push({ url: source.url, nodeId: source.selector, contentHash: snapshot.contentHash, path });
+      }
+    }
+    const designGuidance = !designSources.length ? "" : designAccess
+      ? `Inspect only the Figma screen currently being implemented or reviewed. Reuse already inspected data with the same contentHash; read the cache only when needed. Cached observations may be partial: use read-only Figma tools on the supplied link for missing design context, and screenshots only when visual verification is needed. Do not fetch the whole file. If the Figma tools or required node are unavailable, report the blocker instead of inventing design values.\nOptional design cache references (not yet read): ${JSON.stringify(designCache)}`
+      : DESIGN_PLANNING_CONTRACT;
+    const evidenceText = `${designGuidance}\n\n${packet.text}${paths.length ? `\n변경된 디자인 PNG (원격에서 다시 읽지 말고 이 파일을 확인):\n${paths.join("\n")}` : ""}`;
     database.evidence.measure(`runner:${topic.id}`, "modelCalls", 1);
-    database.evidence.measure(`runner:${topic.id}`, "deliveredBytes", Buffer.byteLength(packet.text));
-    const result = await invoke({ ...turn, evidenceManaged: true,
-      prompt: `${turn.prompt}\n\n${packet.text}${paths.length ? `\n변경된 디자인 PNG (원격에서 다시 읽지 말고 이 파일을 확인):\n${paths.join("\n")}` : ""}`,
-      readablePaths: [...turn.readablePaths ?? [], ...packet.availableImages.map(hash => join(imageDirectory, `${hash}.png`))] });
+    database.evidence.measure(`runner:${topic.id}`, "deliveredBytes", Buffer.byteLength(evidenceText));
+    const result = await invoke({ ...turn, evidenceManaged: true, figmaReadEnabled: Boolean(turn.implementation && designSources.length),
+      prompt: `${turn.prompt}\n\n${evidenceText}`,
+      readablePaths: [...turn.readablePaths ?? [], ...designPaths, ...packet.availableImages.map(hash => join(imageDirectory, `${hash}.png`))] });
     if (!turn.signal?.aborted && database.getTopic(topic.id).scopeGeneration === topic.scopeGeneration) {
       database.evidence.receipt(topic, adapter.role, session(result), packet.delivered);
     }

@@ -823,7 +823,7 @@ describe("에이전트별 권한 경계", () => {
     const runner = new RecordingRunner(successfulResult([planResult]));
     const adapter = new ClaudeAdapter(runner, undefined, { figmaMcpUrl: "http://127.0.0.1:3845/mcp" });
 
-    await adapter.createSession({ prompt: "계획을 작성해 주세요.", cwd: "/tmp" });
+    await adapter.createSession({ prompt: "Implement the linked screen.", cwd: "/tmp", implementation: true, evidenceManaged: true, figmaReadEnabled: true });
 
     const args = runner.calls[0].args;
     expect(args).toContain("--strict-mcp-config");
@@ -1574,3 +1574,14 @@ it("managed source evidence disables direct provider reads and permits only the 
     finally { if (old === undefined) delete process.env[key]; else process.env[key] = old; }
   }
 });
+
+it.each([{ implementation: false, figmaReadEnabled: true }, { implementation: true }, { implementation: true, protocolOnly: true, figmaReadEnabled: true },
+  { implementation: true, figmaReadEnabled: true, planningControl: { admissionId: "plan", maxPromptBytes: 65536 } }])(
+  "does not expose Figma during planning or protocol turns: %j", async mode => {
+    const runner = new RecordingRunner(successfulResult([planResult]));
+    await new ClaudeAdapter(runner, undefined, { figmaMcpUrl: "http://127.0.0.1:3845/mcp" }).createSession({
+      prompt: "Use links only", cwd: "/tmp", ...mode,
+    });
+    const args = runner.calls[0].args;
+    expect(JSON.parse(args[args.indexOf("--mcp-config") + 1])).toEqual({ mcpServers: {} });
+  });

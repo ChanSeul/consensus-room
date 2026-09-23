@@ -546,3 +546,21 @@ it("resumes migrated interrupted planning in the same epoch and session with bou
   expect(database.planning.latest("topic")).toMatchObject({ sessionId, started: true });
   expect(database.artifactsForScope("topic", "interrupted-output").map(a => a.sha256)).toContain(interrupted.sha256);
 });
+
+
+it.each(["claude", "codex"] as const)("%s planning sees Figma links but cannot retrieve the cached design body", async role => {
+  const { repo, database, git, topic } = setup(role);
+  const source = database.evidence.register(topic.id, { url: "https://www.figma.com/design/DesignFile?node-id=1-2", label: "Entry screen", mode: "connector", intervalSeconds: 900 });
+  const check = database.evidence.begin(source.id, true)!;
+  database.evidence.ingest(source.id, { checkId: check.checkId, revision: "r1",
+    units: [{ id: "1:2", kind: "design", content: "DO_NOT_SEND_NODE_TREE" }] });
+  const fake = scripted(async turn => {
+    expect(turn.prompt).toContain(source.url);
+    expect(turn.prompt).toContain("Design is implementation-time work");
+    expect(turn.prompt).not.toContain("DO_NOT_SEND_NODE_TREE");
+    return answer(step({ requests: [{ kind: "evidence", selector: `${source.id}::1:2`, offset: 0, question: "Try reading design early" }] }));
+  }, role);
+  await expect(guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Plan functional boundaries" })).rejects.toThrow();
+  expect(fake.calls).toHaveLength(1);
+  expect(database.planning.latest(topic.id)?.fragments).toEqual([]);
+});

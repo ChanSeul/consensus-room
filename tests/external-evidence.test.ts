@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -387,4 +387,53 @@ it("does not return old bytes when an external lease is still refreshing an over
   db.evidence.ingest(source.id, { checkId: lease.checkId, revision: "new", units: [unit("1", "new")] });
   expect((await service.prepareMediator(db, topic.id, "s")).changes[0].content).toBe("new");
   await service.stop();
+});
+
+
+it("keeps Figma detail out of planning and implementation prompts, exposing immutable caches only on implementation demand", async () => {
+  const { db, root, topic, ingest } = setup(); ingest([unit("1", "Confirmed product behavior")]);
+  const source = db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/DesignFile?node-id=1-2", label: "Entry screen" });
+  const update = (content: string) => db.evidence.ingest(source.id, { checkId: db.evidence.begin(source.id, true)!.checkId,
+    revision: content, units: [{ id: "1:2", kind: "design", content, imageBase64: png }] });
+  update("PRIVATE_LAYOUT_DETAILS");
+  const turns: any[] = [];
+  const adapter = withEvidence({ role: "claude", validateExistingSession: async () => true,
+    createSession: async () => { throw new Error("unused"); }, resumeTurn: async turn => {
+      turns.push(turn); return { kind: "PLAN", summary: "ok", findings: [], evidenceRefs: [] };
+    } }, db, join(root, "images"));
+  const turn = { sessionId: "same-session", cwd: root, prompt: "Task" };
+  await adapter.resumeTurn(turn);
+  expect(turns[0].prompt).toContain(source.url);
+  expect(turns[0].prompt).toContain("Confirmed product behavior");
+  expect(turns[0].prompt).not.toContain("PRIVATE_LAYOUT_DETAILS");
+  expect(turns[0].readablePaths).toEqual([]);
+  expect(turns[0].figmaReadEnabled).toBe(false);
+  await adapter.resumeTurn({ ...turn, implementation: true });
+  expect(turns[1].prompt).not.toContain("PRIVATE_LAYOUT_DETAILS");
+  expect(turns[1].figmaReadEnabled).toBe(true);
+  const cached = turns[1].readablePaths.find((p: string) => p.endsWith(".design.json"));
+  expect(readFileSync(cached, "utf8")).toContain("PRIVATE_LAYOUT_DETAILS");
+  const modified = statSync(cached).mtimeMs;
+  await adapter.resumeTurn({ ...turn, implementation: true });
+  expect(turns[2].readablePaths).toEqual(turns[1].readablePaths);
+  expect(statSync(cached).mtimeMs).toBe(modified);
+  update("UPDATED_LAYOUT_DETAILS");
+  await adapter.resumeTurn({ ...turn, implementation: true });
+  expect(turns[3].prompt).not.toContain("UPDATED_LAYOUT_DETAILS");
+  expect(turns[3].readablePaths).not.toContain(cached);
+  const next = turns[3].readablePaths.find((p: string) => p.endsWith(".design.json"));
+  expect(readFileSync(next, "utf8")).toContain("UPDATED_LAYOUT_DETAILS");
+  db.updateTopic(topic.id, { state: "CODEX_REVIEW" });
+  await adapter.resumeTurn(turn);
+  expect(turns[4].readablePaths).toContain(next);
+  expect(turns[4].prompt).not.toContain("UPDATED_LAYOUT_DETAILS");
+  const check = db.evidence.begin(source.id, true)!;
+  db.evidence.failed(source.id, check.checkId, "unavailable", 300);
+  await adapter.resumeTurn({ ...turn, implementation: true });
+  expect(turns[5].readablePaths).toEqual([]);
+  expect(turns[5].prompt).toContain(source.url);
+  db.evidence.detach(topic.id, source.id);
+  await adapter.resumeTurn({ ...turn, implementation: true });
+  expect(turns[6].figmaReadEnabled).toBe(false);
+  expect(turns[6].readablePaths).toEqual([]);
 });

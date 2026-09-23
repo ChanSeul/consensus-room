@@ -144,11 +144,14 @@ function outputLanguageContract(options: { planBody: boolean }): string {
   return lines.join("\n");
 }
 
+export const DESIGN_PLANNING_CONTRACT = "Design is implementation-time work. Planning and plan review retain screen-level Figma links and functional flows only. These links are locators, not evidence for visual claims or delivered fragment IDs. Do not fetch or reproduce layout, dimensions, spacing, typography, colors, node trees or screenshots in the plan. Resolve product behavior from confirmed requirements; missing visual detail is not a planning blocker. At implementation, inspect the linked screen on demand and stop for a product decision only if it changes the agreed behavior or scope.";
+
 function planContract(): string {
   return [
     "최종 plan.md에는 아래 제목이 모두 있어야 합니다.",
     ...REQUIRED_PLAN_HEADINGS.map((heading) => `- ## ${heading}`),
     "`## 허용 오차` 절에는 fenced 블록 ```tolerance {JSON} ``` 을 둡니다 — scopePaths(이 계획의 승인 경로 glob 목록)와 rules(각각 id `T-n`·title·paths(적용 영역 glob)·hunk(`insert-token`|`annotation-only`|`any`)·tokens·maxFiles·maxHunks·invariants). 규칙이 없으면 `\"rules\": []`. 설명은 의미가 충분히 전달되게 작성하세요. 기계 매칭에 쓰는 tokens는 각 80자 이하여야 합니다. 서버가 이 블록을 파싱해 구현 결과의 승인 범위 밖 변경을 git diff 로 기계 대조하므로, 술어는 diff 만으로 판정 가능해야 하고 상한은 숫자여야 합니다. 부류 예: 다른 단계 소유 파일의 격리 표기 한 줄(insert-token: nonisolated), 모듈 선언의 표기 변경(annotation-only: @Sendable). 동작 변경·우회 표기(`@unchecked Sendable`·`nonisolated(unsafe)`·`assumeIsolated`)는 규칙으로 허용하지 마세요.",
+    DESIGN_PLANNING_CONTRACT,
     "확정되지 않은 분석 이벤트, API 계약, SDK 동작을 추정해서 만들지 마세요.",
     "외부 증거가 없으면 EXTERNAL_EVIDENCE로 남기고 억지로 합의하지 마세요.",
   ].join("\n");
