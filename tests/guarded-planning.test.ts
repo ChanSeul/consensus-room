@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { ConsensusDatabase } from "../src/server/database";
 import { GitService } from "../src/server/git";
 import { SpawnCommandRunner } from "../src/server/processRunner";
@@ -16,8 +16,8 @@ import type { AgentAdapter, SessionTurn, TurnUsage } from "../src/server/types";
 import type { AgentResult } from "../src/shared/contracts";
 
 const cleanups: Array<() => void> = [];
-afterEach(() => { for (const clean of cleanups.splice(0).reverse()) clean(); });
-function setup(role: "claude" | "codex" = "claude", executionInput = 100000) {
+afterEach(() => { vi.restoreAllMocks(); for (const clean of cleanups.splice(0).reverse()) clean(); });
+function setup(role: "claude" | "codex" = "claude", executionInput = 100000, executionDuration = 100000) {
   const root = mkdtempSync(join(tmpdir(), "guarded-planning-"));
   const repo = join(root, "repo");
   execFileSync("git", ["init", "-q", repo]);
@@ -32,7 +32,7 @@ function setup(role: "claude" | "codex" = "claude", executionInput = 100000) {
     state: role === "claude" ? "CLAUDE_PLAN" : "CODEX_AUDIT", scopeGeneration: 1, planRevision: 0,
     planSHA256: null, approvedPlanSHA256: null, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), lastError: null });
   database.planning.enable(topic.id);
-  database.budgets.configure(topic.id, { execution: { inputTokens: executionInput, outputTokens: 10000, durationMs: 100000 },
+  database.budgets.configure(topic.id, { execution: { inputTokens: executionInput, outputTokens: 10000, durationMs: executionDuration },
     total: { inputTokens: 300000, outputTokens: 30000, durationMs: 300000 } }, "test");
   const git = new GitService(new SpawnCommandRunner());
   cleanups.push(() => rmSync(root, { recursive: true, force: true }), () => database.close());
@@ -354,4 +354,25 @@ it("delivers approved out-of-tree diagnosis artifacts in bounded pieces, rejecti
   await guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Plan diagnosis", readablePaths: [path] });
   const reader = new PlanningReader(repo, await git.writeWorkingTree(repo, "artifact-test"), new Map());
   await expect(reader.read({ kind: "artifact", selector: path, question: "Unlisted", offset: 0 })).rejects.toThrow("pinned manifest");
+});
+
+it("does not double count session discovery time or stop research before the real time threshold", async () => {
+  const { repo, database, git } = setup("codex", 100000, 15000);
+  const origin = Date.now(); let elapsed = 0, calls = 0;
+  vi.spyOn(Date, "now").mockImplementation(() => origin + elapsed);
+  const createSession: AgentAdapter["createSession"] = async turn => {
+    calls++;
+    turn.onProcessSpawn?.({ pid: 1, pgid: 1, executable: "fake", commandLine: "fake", startedAt: new Date().toISOString() });
+    if (calls === 1) { elapsed = 2000; turn.onSessionCreated?.("review-session"); elapsed = 10000; }
+    else elapsed = 10001;
+    turn.onUsage?.({ inputTokens: 100, outputTokens: 20, durationMs: calls === 1 ? 10000 : 1, recordKind: "final" });
+    return { sessionId: "review-session", result: answer(calls === 1 ? step({ requests: [
+      { kind: "file", selector: "form.swift", question: "Read", offset: 0 },
+    ] }) : step({ questions: [], complete: true })) };
+  };
+  const adapter: AgentAdapter = { role: "codex", createSession, resumeTurn: async t => (await createSession(t)).result,
+    validateExistingSession: async () => true };
+  await guardedPlanning(adapter, database, git).createSession({ cwd: repo, prompt: "Review" });
+  expect(calls).toBe(2);
+  expect(database.planning.latest("topic")?.usage.durationMs).toBe(10001);
 });

@@ -61,9 +61,10 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
     };
     const invocationStarted = Date.now(), priorDuration = record.usage.durationMs;
     const usedThisInvocation = zero();
+    let adapterDuration = 0;
     const invocationMetrics: PlanningMetrics = {};
     const save = () => {
-      usedThisInvocation.durationMs = Math.max(usedThisInvocation.durationMs, Date.now() - invocationStarted);
+      usedThisInvocation.durationMs = Math.max(usedThisInvocation.durationMs, Date.now() - invocationStarted, adapterDuration);
       record.usage.durationMs = priorDuration + usedThisInvocation.durationMs;
       record.updatedAt = new Date().toISOString(); database.planning.save(record);
     };
@@ -207,7 +208,11 @@ Checkpoint must fit ${LIMIT.checkpointBytes} UTF-8 bytes. Final result must sati
           for (const k of usageKeys) if (usage[k] !== undefined && Number.isFinite(usage[k]) && usage[k]! >= 0) {
             next[k] = Math.max(latest[k], usage[k]!); observed.add(k);
           }
-          for (const k of usageKeys) { record.usage[k] += next[k] - latest[k]; usedThisInvocation[k] += next[k] - latest[k]; }
+          for (const k of usageKeys) {
+            const delta = next[k] - latest[k];
+            if (k === "durationMs") adapterDuration += delta;
+            else { record.usage[k] += delta; usedThisInvocation[k] += delta; }
+          }
           for (const k of PLANNING_METRIC_KEYS) {
             const value = usage[k];
             if (value === undefined || !Number.isFinite(value) || value < 0) continue;
