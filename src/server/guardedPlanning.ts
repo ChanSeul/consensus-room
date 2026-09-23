@@ -136,6 +136,7 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
     record.stopped = null; save();
     docs.set("context:manifest", JSON.stringify(manifest));
     const reader = new PlanningReader(turn.cwd, tree, docs);
+    const unadoptedFragmentProgress = record.fragments.some(f => !record.delivered.includes(f.id));
     if (keepSession && record.sessionId) {
       const valid: string[] = [];
       for (const fragment of database.planning.deliveredToSession(record.sessionId)) {
@@ -191,7 +192,7 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
           account.used[k] + reserve < account.policy.total[k];
       });
     });
-    const acceptStep = async (result: AgentResult, finalizing: boolean): Promise<AgentResult | null> => {
+    const acceptStep = async (result: AgentResult, finalizing: boolean, replayProgress = false): Promise<AgentResult | null> => {
       const parsed = PlanningStepSchema.safeParse(result.planningStep);
       if (!parsed.success) pause("Invalid planning checkpoint; the response was preserved for mediation.");
       let step = parsed.data!;
@@ -205,7 +206,7 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
           questions: [...new Set([...step.questions, "Restate unverified facts using the returned fragment IDs."])] };
         if (bytes(step) > LIMIT.checkpointBytes) pause("Planning checkpoint exceeds its output limit; the response was preserved for mediation.");
       }
-      const progressed = record.fragments.some(f => !record.delivered.includes(f.id)) ||
+      const progressed = replayProgress || record.fragments.some(f => !record.delivered.includes(f.id)) ||
         step.facts.length > record.step.facts.length || step.questions.length < record.step.questions.length;
       record.stalled = progressed ? 0 : record.stalled + 1;
       record.delivered = [...known]; record.step = step; record.fragments = []; record.imageHash = undefined; save();
@@ -248,7 +249,7 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
         return { sessionId: record.sessionId!, result: record.finalResult };
       }
       if (replayResponse) {
-        const recovered = await acceptStep(replayResponse, false);
+        const recovered = await acceptStep(replayResponse, false, unadoptedFragmentProgress);
         if (recovered) return { sessionId: record.sessionId!, result: recovered };
       }
       while (true) {

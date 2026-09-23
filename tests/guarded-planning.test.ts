@@ -141,6 +141,31 @@ it("reuses a saved intermediate read request after a citation pause without anot
   expect(database.planning.latest("topic")!.round).toBe(2);
 });
 
+it("counts unadopted delivered fragments as progress when replaying a paused response", async () => {
+  const { repo, database, git } = setup();
+  const fake = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ requests: [{ kind: "file", selector: "form.swift", question: "First read", offset: 0 }] }));
+    if (n === 2) throw new Error("Simulate the former citation pause");
+    const fragments = JSON.parse(turn.prompt.split("Fragments: ").at(-1)!) as Array<{ id: string }>;
+    expect(fragments).toHaveLength(1);
+    return answer(step({ facts: [{ statement: "Verified", refs: [fragments[0].id] }], questions: [], complete: true }));
+  });
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("former citation pause");
+  const saved = database.planning.latest("topic")!;
+  expect(saved.stalled).toBe(1);
+  expect(saved.fragments).toHaveLength(1);
+  database.planning.recordDelivery(saved.sessionId!, saved.fragments);
+  saved.lastResponse = answer(step({ facts: [{ statement: "Unverified", refs: ["context:request"] }],
+    requests: [{ kind: "file", selector: "form.swift", question: "Continue read", offset: 100 }] }));
+  saved.stopped = "Checkpoint cites evidence that was not delivered.";
+  database.planning.save(saved);
+  const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+  expect(result.result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls).toHaveLength(3);
+  expect(database.planning.latest("topic")!.stalled).toBe(0);
+});
+
 it("does not replay an old read request after new user evidence changes the task", async () => {
   const { repo, database, git } = setup();
   const fake = scripted(async (turn, n) => {
