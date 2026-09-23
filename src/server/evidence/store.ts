@@ -29,6 +29,7 @@ export class EvidenceStore {
       CREATE TABLE IF NOT EXISTS evidence_mediator_acks(consumer TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY(consumer,id));
       CREATE TABLE IF NOT EXISTS evidence_mediator_batches(consumer TEXT PRIMARY KEY, id TEXT NOT NULL, manifest TEXT NOT NULL, packet TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS evidence_metrics(scope TEXT NOT NULL, name TEXT NOT NULL, value INTEGER NOT NULL, PRIMARY KEY(scope,name));
+      CREATE TABLE IF NOT EXISTS evidence_design_pending(binding TEXT NOT NULL, hash TEXT NOT NULL, record TEXT NOT NULL, PRIMARY KEY(binding,hash));
       CREATE TABLE IF NOT EXISTS evidence_design_observations(binding TEXT NOT NULL, hash TEXT NOT NULL, record TEXT NOT NULL, PRIMARY KEY(binding,hash));
       CREATE TABLE IF NOT EXISTS evidence_link_receipts(consumer TEXT NOT NULL, source_id TEXT NOT NULL, PRIMARY KEY(consumer,source_id));
       CREATE TABLE IF NOT EXISTS evidence_receipts(consumer TEXT NOT NULL, source_id TEXT NOT NULL, unit_id TEXT NOT NULL, hash TEXT NOT NULL, PRIMARY KEY(consumer,source_id,unit_id));
@@ -305,16 +306,26 @@ export class EvidenceStore {
     if (Buffer.byteLength(text) > 240_000) fail("전달할 근거가 너무 큽니다. 등록한 디자인 노드·이슈 범위를 나누세요.");
     return { text, images: [...new Set(images)], availableImages: [...new Set(availableImages)], delivered, links: state.sources.map(source => source.id) };
   }
-  // Design observations belong to the exact scope and plan, independently of product evidence readiness.
+  // A plan revision keeps the implementation session: retain its design observations within the same scope.
+  designRequest(topic: Binding, request: { tool: string; input: unknown }, completed = false): void {
+    const record = stableJSON(request); const hash = evidenceHash(record);
+    const key = stableJSON([topic.id, topic.scopeGeneration]);
+    if (completed) this.db.prepare("DELETE FROM evidence_design_pending WHERE binding=? AND hash=?").run(key, hash);
+    else this.db.prepare("INSERT OR IGNORE INTO evidence_design_pending(binding,hash,record) VALUES (?,?,?)").run(key, hash, record);
+  }
+  pendingDesignRequests(topic: Binding): unknown[] {
+    return this.db.prepare("SELECT record FROM evidence_design_pending WHERE binding=? ORDER BY hash")
+      .all(stableJSON([topic.id, topic.scopeGeneration])).map(row => JSON.parse(String(row.record)));
+  }
   designObservations(topic: Binding): Array<{ hash: string; record: string }> {
     return this.db.prepare("SELECT hash,record FROM evidence_design_observations WHERE binding=? ORDER BY rowid")
-      .all(stableJSON([topic.id, binding(topic), this.list(topic.id).filter(source => source.provider === "figma").map(source => source.id)])).map(row => ({ hash: String(row.hash), record: String(row.record) }));
+      .all(stableJSON([topic.id, topic.scopeGeneration])).map(row => ({ hash: String(row.hash), record: String(row.record) }));
   }
   observeDesign(topic: Binding, record: string): string {
     if (Buffer.byteLength(record) > 16 * 1024 * 1024) fail("Design observation exceeds the cache limit.");
     const hash = evidenceHash(record);
     this.db.prepare("INSERT OR IGNORE INTO evidence_design_observations(binding,hash,record) VALUES (?,?,?)")
-      .run(stableJSON([topic.id, binding(topic), this.list(topic.id).filter(source => source.provider === "figma").map(source => source.id)]), hash, record);
+      .run(stableJSON([topic.id, topic.scopeGeneration]), hash, record);
     return hash;
   }
   receipt(topic: Binding, role: string, sessionId: string, delivered: ReturnType<EvidenceStore["packet"]>["delivered"], links: string[] = []): void {

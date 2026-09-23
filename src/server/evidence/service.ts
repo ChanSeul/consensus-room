@@ -152,26 +152,32 @@ export function withEvidence(adapter: AgentAdapter, database: ConsensusDatabase,
       }
     }
     const designGuidance = !designSources.length ? "" : designAccess
-      ? `Inspect only the Figma screen currently being implemented or reviewed. Reuse already inspected data with the same contentHash; read the cache only when needed. The observed-design references are the exact native tool responses seen by implementation, not a claim that the remote file is still current. Use those same observations for review. Older source caches are baseline references only and must not override a newer observed response. Cached observations may be partial: use read-only Figma tools on the supplied link for missing design context, and screenshots only when visual verification is needed. Do not fetch the whole file. If the Figma tools or required node are unavailable, report the blocker instead of inventing design values.\nOptional design cache references (not yet read): ${JSON.stringify(designCache)}\nObserved design references for this exact scope and plan: ${JSON.stringify(observationReferences)}`
+      ? `Inspect only the Figma screen currently being implemented or reviewed. Reuse already inspected data with the same contentHash; read the cache only when needed. The observed-design references are the exact native tool responses seen by implementation, not a claim that the remote file is still current. Use those same observations for review. Older source caches are baseline references only and must not override a newer observed response. Cached observations may be partial: use read-only Figma tools on the supplied link for missing design context, and screenshots only when visual verification is needed. Do not fetch the whole file. If the Figma tools or required node are unavailable, report the blocker instead of inventing design values.\nOptional design cache references (not yet read): ${JSON.stringify(designCache)}\nObserved design references retained in this scope (including prior plan revisions; verify their relevance to the current plan): ${JSON.stringify(observationReferences)}`
       : DESIGN_PLANNING_CONTRACT;
     const evidenceText = `${designGuidance}\n\n${packet.text}${paths.length ? `\n변경된 디자인 PNG (원격에서 다시 읽지 말고 이 파일을 확인):\n${paths.join("\n")}` : ""}`;
     database.evidence.measure(`runner:${topic.id}`, "modelCalls", 1);
     database.evidence.measure(`runner:${topic.id}`, "deliveredBytes", Buffer.byteLength(evidenceText));
     const sourceDigest = database.evidence.topic(topic).digest;
-    const observations: Array<{ tool: string; input: unknown; content: unknown }> = [];
+    const pendingReads = database.evidence.pendingDesignRequests(topic);
+    const capture = (observation: { tool: string; input: unknown; content: unknown; isError?: boolean }) => {
+      if (!observation.isError) database.evidence.observeDesign(topic, JSON.stringify({ ...observation,
+        sources: designSources.map(source => ({ url: source.url, nodeId: source.selector })), sourceDigest,
+        observedUnderPlan: { epoch: topic.planEpoch, sha256: topic.planSHA256 } }));
+      database.evidence.designRequest(topic, { tool: observation.tool, input: observation.input }, true);
+    };
     const result = await invoke({ ...turn,
-      onFigmaResult: turn.implementation ? observation => { observations.push(observation); } : undefined, evidenceManaged: true, figmaReadEnabled: Boolean(turn.implementation && designSources.length),
-      prompt: `${turn.prompt}\n\n${evidenceText}`,
+      onFigmaRequest: turn.implementation ? request => database.evidence.designRequest(topic, request) : undefined,
+      onFigmaResult: turn.implementation ? capture : undefined, evidenceManaged: true, figmaReadEnabled: Boolean(turn.implementation && designSources.length),
+      prompt: `${turn.prompt}\n\n${evidenceText}${pendingReads.length && designAccess ? `\nUncaptured design reads from a prior attempt. Repeat these reads before completing: ${JSON.stringify(pendingReads)}` : ""}`,
       readablePaths: [...turn.readablePaths ?? [], ...designPaths, ...packet.availableImages.map(hash => join(imageDirectory, `${hash}.png`))] });
     const current = database.getTopic(topic.id);
     if (!turn.signal?.aborted && current.scopeGeneration === topic.scopeGeneration && current.planEpoch === topic.planEpoch && current.planSHA256 === topic.planSHA256) {
       const refs: string[] = [];
-      for (const observation of observations) {
-        const record = JSON.stringify({ ...observation, sources: designSources.map(source => ({ url: source.url, nodeId: source.selector })),
-          sourceDigest });
-        const hash = database.evidence.observeDesign(topic, record);
-        const files = await materializeObservation(imageDirectory, hash, record);
-        refs.push(`figma-observation:${hash} ${files[0]}`);
+      if (designAccess && database.evidence.pendingDesignRequests(topic).length) throw new Error("Design responses are missing from a previous attempt. Repeat the pending reads before completing.");
+      // Rebind retained observations even if this resumed turn needed no new Figma calls.
+      for (const observation of designAccess ? database.evidence.designObservations(topic) : []) {
+        const files = await materializeObservation(imageDirectory, observation.hash, observation.record);
+        refs.push(`figma-observation:${observation.hash} ${files[0]}`);
       }
       // Bind the accepted implementation artifact to the exact observed content, not an older REST snapshot.
       if (refs.length) {

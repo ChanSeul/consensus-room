@@ -208,17 +208,30 @@ export class ClaudeAdapter implements AgentAdapter {
       const startedAt = Date.now();
       const toolTime = createToolTimeMeter("claude");
       const metrics = new ExecutionMetrics("claude", Buffer.byteLength(stdin, "utf8"), executionSettings.model, executionSettings.effort, !newSession, startedAt);
-      const designCalls = new Map<string, { tool: string; input: unknown; content?: unknown; received: boolean; error: boolean }>();
+      const designCalls = new Map<string, { tool: string; input: unknown; content?: unknown; received: boolean; error: boolean; delivered: boolean }>();
+      let designCaptureError: unknown;
       const observeDesign = (value: unknown) => {
         const event = value as { type?: string; message?: { content?: Array<Record<string, unknown>> } } | null;
         if (!event || !Array.isArray(event.message?.content)) return;
         for (const block of event.message.content) {
           if (event.type === "assistant" && block.type === "tool_use" && typeof block.id === "string" &&
               typeof block.name === "string" && block.name.startsWith("mcp__figma-desktop__")) {
-            if (!designCalls.has(block.id)) designCalls.set(block.id, { tool: block.name, input: block.input, received: false, error: false });
+            if (!designCalls.has(block.id)) {
+              designCalls.set(block.id, { tool: block.name, input: block.input, received: false, error: false, delivered: false });
+              try { turn.onFigmaRequest?.({ tool: block.name, input: block.input }); } catch (error) { designCaptureError = error; }
+            }
           } else if (event.type === "user" && block.type === "tool_result" && typeof block.tool_use_id === "string") {
             const call = designCalls.get(block.tool_use_id);
-            if (call) { call.content = block.content; call.received = block.content !== undefined; call.error = block.is_error === true; }
+            if (call && !call.delivered) {
+              call.content = block.content; call.received = block.content !== undefined; call.error = block.is_error === true;
+              if (call.received) {
+                try {
+                  if (!turn.onFigmaResult) throw new Error("Figma observation sink is unavailable.");
+                  turn.onFigmaResult({ tool: call.tool, input: call.input, content: call.content, isError: call.error });
+                  call.delivered = true;
+                } catch (error) { designCaptureError = error; }
+              }
+            }
           }
         }
       };
@@ -257,12 +270,9 @@ export class ClaudeAdapter implements AgentAdapter {
       if (output.exitCode !== 0) {
         throw new Error(describeCommandFailure("Claude", output.exitCode, output.stderr, output.stdout));
       }
+      if (designCaptureError) throw designCaptureError;
       for (const call of designCalls.values()) {
         if (!call.received) throw new Error("Figma response was not captured; implementation cannot be accepted without shared design evidence.");
-        if (!call.error) {
-          if (!turn.onFigmaResult) throw new Error("Figma observation sink is unavailable.");
-          turn.onFigmaResult({ tool: call.tool, input: call.input, content: call.content });
-        }
       }
       return output;
       } finally {

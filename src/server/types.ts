@@ -77,7 +77,8 @@ export interface SessionTurn {
   // Host opt-in only for implementation with registered Figma links; never planning or protocol turns.
   figmaReadEnabled?: boolean;
   // Native tool transcript, captured by the host, never supplied by the model final answer.
-  onFigmaResult?: (observation: { tool: string; input: unknown; content: unknown }) => void;
+  onFigmaRequest?: (request: { tool: string; input: unknown }) => void;
+  onFigmaResult?: (observation: { tool: string; input: unknown; content: unknown; isError?: boolean }) => void;
   sessionId: string;
   prompt: string;
   cwd: string;

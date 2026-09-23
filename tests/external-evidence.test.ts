@@ -477,6 +477,7 @@ it("binds native observed design B to the result and reviewer even while the RES
   const implementation = withEvidence(native, db, join(root, "images"));
   const result = await implementation.createSession({ cwd: root, prompt: "Implement", implementation: true });
   expect(result.result.evidenceRefs).toHaveLength(1);
+  expect(db.evidence.designObservations(topic)).toHaveLength(1);
   const hash = db.evidence.designObservations(topic)[0].hash;
   expect(result.result.evidenceRefs[0]).toContain(`figma-observation:${hash}`);
   expect(db.evidence.designObservations(topic)).toHaveLength(1);
@@ -497,7 +498,7 @@ it("binds native observed design B to the result and reviewer even while the RES
   expect(db.evidence.designObservations(topic)).toHaveLength(1);
   expect(statSync(path).mtimeMs).toBe(mtime);
   db.updateTopic(topic.id, { planEpoch: topic.planEpoch + 1 });
-  expect(db.evidence.designObservations(db.getTopic(topic.id))).toEqual([]);
+  expect(db.evidence.designObservations(db.getTopic(topic.id))).toHaveLength(1);
 });
 
 it("remembers a link-only Figma delivery across database reopen and reports removal of the final link", async () => {
@@ -512,4 +513,63 @@ it("remembers a link-only Figma delivery across database reopen and reports remo
   expect(removed.text).toContain(`"removedSourceId":"${source.id}"`);
   reopened.evidence.receipt(topic, "claude", "s", removed.delivered, removed.links);
   expect(reopened.evidence.packet(topic, "claude", "s").text).toBe("");
+});
+
+it.each(["429", "cancelled", "invalid-result"])("retains native design evidence after %s and binds it on same-session resume after a plan revision", async failure => {
+  const { ClaudeAdapter } = await import("../src/server/adapters/claude");
+  const { db, root, topic, ingest } = setup(); ingest([unit("1", "Confirmed behavior")]);
+  db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc?node-id=1-2" });
+  const tool = { type: "assistant", message: { content: [{ type: "tool_use", id: "read", name: "mcp__figma-desktop__get_design_context", input: { nodeId: "1:2" } }] } };
+  const reply = { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "read", content: "design B before failure" }] } };
+  let attempt = 0; const prompts: string[] = [];
+  const native = new ClaudeAdapter({ run: async spec => {
+    prompts.push(spec.stdin!); attempt++;
+    if (attempt === 1) {
+      spec.onJSONLine?.(tool, Date.now()); spec.onJSONLine?.(reply, Date.now());
+      if (failure === "cancelled") throw new Error("Cancelled after reading Figma");
+      return { exitCode: failure === "429" ? 1 : 0, stdout: "", stderr: "rate limit", jsonLines: failure === "429" ? [] : [{ type: "result", num_turns: 1, structured_output: {} }] };
+    }
+    return { exitCode: 0, stdout: "", stderr: "", jsonLines: [{ type: "result", subtype: "success", num_turns: 1,
+      structured_output: { kind: "IMPLEMENTATION", summary: "resumed using remembered design", status: "completed", findings: [], evidenceRefs: [] } }] };
+  } }, undefined, { figmaMcpUrl: "http://127.0.0.1:3845/mcp" });
+  const adapter = withEvidence(native, db, join(root, "images"));
+  const turn = { cwd: root, sessionId: "same-session", prompt: "Implement", implementation: true };
+  await expect(adapter.resumeTurn(turn)).rejects.toThrow();
+  expect(db.evidence.designObservations(topic)).toHaveLength(1);
+  const hash = db.evidence.designObservations(topic)[0].hash;
+  expect(db.evidence.pendingDesignRequests(topic)).toEqual([]);
+  db.updateTopic(topic.id, { planEpoch: topic.planEpoch + 1, planSHA256: "b".repeat(64) });
+  const reopened = new ConsensusDatabase(join(root, "room.sqlite")); databases.push(reopened);
+  const resumed = await withEvidence(native, reopened, join(root, "images")).resumeTurn(turn);
+  expect(resumed.evidenceRefs).toHaveLength(1); expect(resumed.evidenceRefs[0]).toContain(hash);
+  expect(prompts[1]).toContain(hash); expect(prompts[1]).not.toContain("design B before failure");
+  let review: any;
+  db.updateTopic(topic.id, { state: "CODEX_REVIEW" });
+  await withEvidence({ role: "codex", validateExistingSession: async () => true, resumeTurn: async () => { throw Error("unused"); },
+    createSession: async turn => { review = turn; return { sessionId: "review", result: { kind: "REVIEW", summary: "ok", findings: [], evidenceRefs: [] } }; }
+  }, reopened, join(root, "images")).createSession({ cwd: root, prompt: "Review" });
+  const path = review.readablePaths.find((path: string) => path.endsWith(".observed-design.json"));
+  expect(resumed.evidenceRefs[0]).toContain(path); expect(readFileSync(path, "utf8")).toContain("design B before failure");
+  expect(review.prompt).toContain(hash);
+});
+
+it("requires recapture after a missing tool response, including on later no-tool resumes", async () => {
+  const { ClaudeAdapter } = await import("../src/server/adapters/claude");
+  const { db, root, topic, ingest } = setup(); ingest([unit("1", "Behavior")]);
+  db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc?node-id=1-2" });
+  let attempt = 0;
+  const native = new ClaudeAdapter({ run: async spec => {
+    attempt++;
+    if (attempt !== 2) spec.onJSONLine?.({ type: "assistant", message: { content: [{ type: "tool_use", id: `read-${attempt}`, name: "mcp__figma-desktop__get_metadata", input: { nodeId: "1:2" } }] } }, Date.now());
+    if (attempt === 3) spec.onJSONLine?.({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "read-3", content: "recaptured design" }] } }, Date.now());
+    return { exitCode: 0, stdout: "", stderr: "", jsonLines: [{ type: "result", subtype: "success", num_turns: 1,
+      structured_output: { kind: "IMPLEMENTATION", summary: "done", status: "completed", findings: [], evidenceRefs: [] } }] };
+  } }, undefined, { figmaMcpUrl: "http://127.0.0.1:3845/mcp" });
+  const adapter = withEvidence(native, db, join(root, "images"));
+  const turn = { cwd: root, sessionId: "s", prompt: "Implement", implementation: true };
+  await expect(adapter.resumeTurn(turn)).rejects.toThrow("not captured");
+  await expect(adapter.resumeTurn(turn)).rejects.toThrow("previous attempt");
+  expect(db.evidence.pendingDesignRequests(topic)).toHaveLength(1);
+  expect((await adapter.resumeTurn(turn)).evidenceRefs).toHaveLength(1);
+  expect(db.evidence.pendingDesignRequests(topic)).toEqual([]);
 });
