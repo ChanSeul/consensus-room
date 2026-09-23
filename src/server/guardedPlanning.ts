@@ -129,6 +129,8 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
     }
     record.tree = tree; record.evidenceDigest = state.digest; record.instructionHash = instructionHash; record.sourceHash = sourceHash;
     // A retry rechecks the same limits. It never grants budget or resets a round/session counter.
+    const recoverBudgetReads = !newInput && !sourceChanged && record.stopped === "Planning checkpoint saved; insufficient remaining budget for synthesis."
+      && record.fragments.length === 0 && record.step.requests.length > 0;
     const replayResponse = !newInput && !sourceChanged && record.stopped === "Checkpoint cites evidence that was not delivered."
       && record.lastResponse && PlanningStepSchema.safeParse(record.lastResponse.planningStep).success
       && record.lastResponse.planningStep?.complete === false && record.lastResponse.planningStep.requests.length
@@ -192,6 +194,28 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
           account.used[k] + reserve < account.policy.total[k];
       });
     });
+    const fulfillRequests = async (requests: PlanningCheckpoint["step"]["requests"]): Promise<void> => {
+      const fragments: PlanningFragment[] = [];
+      for (const request of requests) {
+        if (request.kind === "image") {
+          if (keepSession && record.delivered.includes(request.selector) && !request.rereadReason) continue;
+          if (record.imageHash || request.offset !== 0 || !imageHashes.has(request.selector)) pause("Only one pinned image per round is allowed.");
+          const fragment: PlanningFragment = { id: request.selector, kind: "image", selector: request.selector, hash: request.selector,
+            offset: 0, nextOffset: null, content: "Pinned design image attached to this round." };
+          if (bytes([...fragments, fragment]) > LIMIT.batchBytes) break;
+          record.imageHash = request.selector; fragments.push(fragment);
+          continue;
+        }
+        const cacheKey = planningHash(JSON.stringify([tree, sourceHash, request.kind, request.selector, request.offset]));
+        const fragment = database.planning.fragment(cacheKey) ?? await reader.read(request);
+        database.planning.saveFragment(cacheKey, fragment);
+        if (fragments.some(f => f.id === fragment.id)) continue;
+        if (keepSession && record.delivered.includes(fragment.id) && !request.rereadReason) continue;
+        if (bytes([...fragments, fragment]) > LIMIT.batchBytes) break;
+        fragments.push(fragment);
+      }
+      record.fragments = fragments; save();
+    };
     const acceptStep = async (result: AgentResult, finalizing: boolean, replayProgress = false): Promise<AgentResult | null> => {
       const parsed = PlanningStepSchema.safeParse(result.planningStep);
       if (!parsed.success) pause("Invalid planning checkpoint; the response was preserved for mediation.");
@@ -219,26 +243,7 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
       }
       if (finalizing) pause("Synthesis did not produce a complete plan; checkpoint retained.");
       if (softLimit() || record.round >= LIMIT.rounds) return null;
-      const fragments: PlanningFragment[] = [];
-      for (const request of step.requests) {
-        if (request.kind === "image") {
-          if (keepSession && record.delivered.includes(request.selector) && !request.rereadReason) continue;
-          if (record.imageHash || request.offset !== 0 || !imageHashes.has(request.selector)) pause("Only one pinned image per round is allowed.");
-          const fragment: PlanningFragment = { id: request.selector, kind: "image", selector: request.selector, hash: request.selector,
-            offset: 0, nextOffset: null, content: "Pinned design image attached to this round." };
-          if (bytes([...fragments, fragment]) > LIMIT.batchBytes) break;
-          record.imageHash = request.selector; fragments.push(fragment);
-          continue;
-        }
-        const cacheKey = planningHash(JSON.stringify([tree, sourceHash, request.kind, request.selector, request.offset]));
-        const fragment = database.planning.fragment(cacheKey) ?? await reader.read(request);
-        database.planning.saveFragment(cacheKey, fragment);
-        if (fragments.some(f => f.id === fragment.id)) continue;
-        if (keepSession && record.delivered.includes(fragment.id) && !request.rereadReason) continue;
-        if (bytes([...fragments, fragment]) > LIMIT.batchBytes) break;
-        fragments.push(fragment);
-      }
-      record.fragments = fragments; save();
+      await fulfillRequests(step.requests);
       return null;
     };
     try {
@@ -252,6 +257,7 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
         const recovered = await acceptStep(replayResponse, false, unadoptedFragmentProgress);
         if (recovered) return { sessionId: record.sessionId!, result: recovered };
       }
+      if (recoverBudgetReads && !softLimit() && record.round < LIMIT.rounds) await fulfillRequests(record.step.requests);
       while (true) {
         await assertCurrent();
         const finalizing = record.round >= LIMIT.rounds || softLimit();

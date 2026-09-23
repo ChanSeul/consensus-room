@@ -186,6 +186,47 @@ it("does not replay an old read request after new user evidence changes the task
   expect(fake.calls).toHaveLength(2);
 });
 
+it("fulfills accepted read requests after a budget increase without repeating the research call", async () => {
+  const { repo, database, git } = setup();
+  const fake = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ facts: [{ statement: "Unsupported", refs: ["context:request"] }],
+      questions: [], complete: true }));
+    const fragments = JSON.parse(turn.prompt.split("Fragments: ").at(-1)!) as Array<{ id: string }>;
+    expect(fragments).toHaveLength(1);
+    return answer(step({ facts: [{ statement: "Verified", refs: [fragments[0].id] }], questions: [], complete: true }));
+  });
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("not delivered");
+  const saved = database.planning.latest("topic")!;
+  saved.step = step({ requests: [{ kind: "file", selector: "form.swift", question: "Continue after budget", offset: 0 }] });
+  saved.stopped = "Planning checkpoint saved; insufficient remaining budget for synthesis.";
+  database.planning.save(saved);
+  const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+  expect(result.result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls).toHaveLength(2);
+  expect(database.planning.latest("topic")!.round).toBe(2);
+});
+
+it("does not recover budget-paused reads from a previous user contract", async () => {
+  const { repo, database, git } = setup();
+  const fake = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ facts: [{ statement: "Unsupported", refs: ["context:request"] }],
+      questions: [], complete: true }));
+    expect(turn.prompt).toContain("New scope evidence");
+    expect(JSON.parse(turn.prompt.split("Fragments: ").at(-1)!)).toEqual([]);
+    return answer(step({ questions: [], complete: true }));
+  });
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("not delivered");
+  const saved = database.planning.latest("topic")!;
+  saved.step = step({ requests: [{ kind: "file", selector: "form.swift", question: "Old read", offset: 0 }] });
+  saved.stopped = "Planning checkpoint saved; insufficient remaining budget for synthesis.";
+  database.planning.save(saved);
+  database.appendEvent({ topicId: "topic", actor: "user", kind: "evidence", state: "CLAUDE_PLAN", body: "New scope evidence" });
+  await adapter.createSession({ cwd: repo, prompt: "Plan" });
+  expect(fake.calls).toHaveLength(2);
+});
+
 it("persists interrupted progress and retries without refunding or double charging the previous attempt", async () => {
   const { repo, database, git } = setup();
   const fake = scripted(async (_turn, n) => {
