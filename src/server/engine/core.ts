@@ -93,7 +93,7 @@ function boundedError(message: string): string {
 }
 
 const DEFERRED_SOURCE_LABEL: Record<DeferredFinding["source"], string> = {
-  closeout: "종결 확인", "final-review": "최종 리뷰", implementation: "구현 to-do", fix: "수정 to-do",
+  closeout: "종결 확인", review: "첫 코드 리뷰", "final-review": "최종 리뷰", implementation: "구현 to-do", fix: "수정 to-do",
 };
 
 type TransitionInput = Parameters<WorkflowDependencies["database"]["applyTopicTransition"]>[0];
@@ -767,7 +767,7 @@ export class EngineCore {
     if (resolvedIDs.length === 0) return;
     const existing = await this.deferredFindingsOf(topic.id);
     const remaining = existing.filter((item) =>
-      !(resolvedIDs.includes(item.id) && (item.source === "implementation" || item.source === "fix")));
+      !(resolvedIDs.includes(item.id) && (item.source === "implementation" || item.source === "fix" || item.source === "review")));
     if (remaining.length === existing.length) return;
     const removed = existing.filter((item) => !remaining.includes(item));
     const revision = this.dependencies.database.timelineCount(topic.id) + 1;

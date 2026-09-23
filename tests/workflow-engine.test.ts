@@ -2280,11 +2280,11 @@ describe("최종 리뷰 신규 쟁점의 사용자 결정 소비", () => {
     findings: [newFinding], evidenceRefs: [],
   };
 
-  it("범위 밖으로 처분된 신규 쟁점은 후속 목록에 기록되고 전달을 막지 않는다", async () => {
+  it.each(["CODEX_REVIEW", "CODEX_FINAL_REVIEW"] as const)("%s: 범위 밖으로 처분된 신규 쟁점은 후속 목록에 기록되고 전달을 막지 않는다", async (resumeState) => {
     const deferredNew = finding("F-DEFER", "범위 밖 개선 제안", { disposition: "DEFERRED_OUT_OF_SCOPE" });
     const { database, engine, artifacts } = await makeReviewRecovery({
-      resumeState: "CODEX_FINAL_REVIEW", implementationFindings: [], originalReviewFindings: [],
-      codexResult: { kind: "FINAL_REVIEW", summary: "이연 1건", findings: [deferredNew], evidenceRefs: [] },
+      resumeState, implementationFindings: [], originalReviewFindings: [],
+      codexResult: { kind: resumeState === "CODEX_REVIEW" ? "REVIEW" : "FINAL_REVIEW", summary: "이연 1건", findings: [deferredNew], evidenceRefs: [] },
     });
     engine.retry("topic-1");
     await waitForActionCompletion(database, "topic-1");
@@ -2297,6 +2297,25 @@ describe("최종 리뷰 신규 쟁점의 사용자 결정 소비", () => {
     expect(notice?.body).toContain("처분 선택 자체는 현재 인도의 선행 조건이 아닙니다");
     expect(notice?.body).not.toContain("(커밋 전)");
     expect(database.getTimeline("topic-1").some((event) => event.body.includes("후속 목록에 기록") && event.body.includes("F-DEFER"))).toBe(true);
+    database.close();
+  });
+
+  it("첫 리뷰에서 이연한 항목을 뒤 리뷰가 해소하면 후속 목록에서도 제거한다", async () => {
+    const deferred = finding("F-DEFER", "이연", { disposition: "DEFERRED_OUT_OF_SCOPE" });
+    const { database, engine, artifacts } = await makeReviewRecovery({
+      resumeState: "CODEX_FINAL_REVIEW", implementationFindings: [deferred], originalReviewFindings: [deferred],
+      codexResult: { kind: "FINAL_REVIEW", summary: "기존 결정으로 불필요 확인", findings: [
+        { ...deferred, disposition: "AGREED_NO_ACTION" },
+      ], evidenceRefs: [] },
+    });
+    await artifacts.write("topic-1", "deferred-findings", 1, JSON.stringify({ findings: [{
+      id: deferred.id, title: deferred.title, severity: deferred.severity, rationale: deferred.rationale,
+      source: "review", topicId: "topic-1", recordedAt: "2026-09-23T00:00:00.000Z",
+    }] }));
+    engine.retry("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+    expect(database.getTopic("topic-1").state).toBe("READY_TO_DELIVER");
+    expect(JSON.parse((await artifacts.readLatest("topic-1", "deferred-findings"))!).findings).toEqual([]);
     database.close();
   });
 

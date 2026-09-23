@@ -1058,6 +1058,15 @@ export class DeliveryPipeline {
       }
       return;
     }
+    // 첫 리뷰에서 처음 이연한 항목도 인도 안내와 후속 계획이 읽는 산출물에 보존한다.
+    const existingDeferred = await this.core.deferredFindingsOf(topicId);
+    if (this.core.interruptForLatestTurnInput(topic)) return;
+    const deferredFirstReview = review.findings.filter((finding) =>
+      finding.disposition === "DEFERRED_OUT_OF_SCOPE" && !existingDeferred.some((item) => item.id === finding.id));
+    if (deferredFirstReview.length > 0) {
+      await this.core.recordDeferredFindings(topic, deferredFirstReview, "review", signal);
+      if (this.core.interruptForLatestTurnInput(topic)) return;
+    }
     if (!shouldRunFixPass(review.findings)) {
       await this.finishCodeReview(topic, reviewedSnapshot, "구현 리뷰에서 수정할 확정 결함이 없습니다.", verdicts, signal);
       return;

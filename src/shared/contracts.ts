@@ -301,7 +301,7 @@ export const DeferredFindingSchema = z.object({
   severity: FindingSchema.shape.severity,
   rationale: z.string(),
   // implementation/fix = 러너가 구현 중 범위 밖으로 판정해 to-do 로 남긴 것(DEFERRED_OUT_OF_SCOPE 처분, 2026-09-08).
-  source: z.enum(["closeout", "final-review", "implementation", "fix"]),
+  source: z.enum(["closeout", "review", "final-review", "implementation", "fix"]),
   topicId: z.string().min(1),
   recordedAt: z.string(),
 });
