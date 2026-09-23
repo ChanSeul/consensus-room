@@ -333,7 +333,13 @@ export class EvidenceStore {
     const record = stableJSON({ request, sourceIds: (exact.length ? exact : fileSources.length ? fileSources : sources).map(source => source.id) });
     const key = stableJSON([topic.id, topic.scopeGeneration]);
     if (completed) this.db.prepare("DELETE FROM evidence_design_pending WHERE binding=? AND hash=?").run(key, hash);
-    else this.db.prepare("INSERT OR IGNORE INTO evidence_design_pending(binding,hash,record) VALUES (?,?,?)").run(key, hash, record);
+    else this.db.prepare(`INSERT INTO evidence_design_pending(binding,hash,record) VALUES (?,?,?)
+      ON CONFLICT(binding,hash) DO UPDATE SET record=json_set(excluded.record,'$.sourceIds',json((
+        SELECT json_group_array(value) FROM (
+          SELECT value FROM json_each(evidence_design_pending.record,'$.sourceIds')
+          UNION SELECT value FROM json_each(excluded.record,'$.sourceIds')
+        )
+      )))`).run(key, hash, record);
   }
   pendingDesignRequests(topic: Binding): unknown[] {
     return this.db.prepare("SELECT record FROM evidence_design_pending WHERE binding=? ORDER BY hash")
