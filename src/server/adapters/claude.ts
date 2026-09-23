@@ -271,8 +271,11 @@ export class ClaudeAdapter implements AgentAdapter {
         throw new Error(describeCommandFailure("Claude", output.exitCode, output.stderr, output.stdout));
       }
       if (designCaptureError) throw designCaptureError;
-      for (const call of designCalls.values()) {
-        if (!call.received) throw new Error("Figma response was not captured; implementation cannot be accepted without shared design evidence.");
+      if ([...designCalls.values()].some(call => !call.received)) {
+        const result = parseAgentResult(output.jsonLines, output.stdout);
+        if (result.status !== "blocked" && result.status !== "in_progress") {
+          throw new Error("Figma response was not captured; implementation cannot be accepted without shared design evidence.");
+        }
       }
       return output;
       } finally {

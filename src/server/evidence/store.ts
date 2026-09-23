@@ -63,7 +63,12 @@ export class EvidenceStore {
     return this.db.prepare("SELECT DISTINCT s.record FROM evidence_sources s JOIN evidence_topics e ON e.source_id=s.id JOIN topics t ON t.id=e.topic_id WHERE t.state!='CLOSED' ORDER BY s.id")
       .all().map(row => JSON.parse(String(row.record)));
   }
-  detach(topicId: string, sourceId: string): void { this.db.prepare("DELETE FROM evidence_topics WHERE topic_id=? AND source_id=?").run(topicId, sourceId); }
+  detach(topicId: string, sourceId: string): void {
+    this.db.prepare("DELETE FROM evidence_topics WHERE topic_id=? AND source_id=?").run(topicId, sourceId);
+    // Explicit source removal disposes requests made under that source context, not unrelated requests.
+    this.db.prepare("DELETE FROM evidence_design_pending WHERE json_extract(binding,'$[0]')=? AND EXISTS (SELECT 1 FROM json_each(record,'$.sourceIds') WHERE value=?)")
+      .run(topicId, sourceId);
+  }
   linkedTopics(sourceId: string): string[] {
     return this.db.prepare("SELECT topic_id FROM evidence_topics WHERE source_id=?").all(sourceId).map(row => String(row.topic_id));
   }
@@ -308,14 +313,19 @@ export class EvidenceStore {
   }
   // A plan revision keeps the implementation session: retain its design observations within the same scope.
   designRequest(topic: Binding, request: { tool: string; input: unknown }, completed = false): void {
-    const record = stableJSON(request); const hash = evidenceHash(record);
+    const hash = evidenceHash(stableJSON(request));
+    const input = request.input as { fileKey?: string; nodeId?: string } | null;
+    const sources = this.list(topic.id).filter(source => source.provider === "figma");
+    const fileSources = input?.fileKey ? sources.filter(source => source.resource === input.fileKey) : sources;
+    const exact = fileSources.filter(source => source.selector === (typeof input?.nodeId === "string" ? input.nodeId.replace(/-/g, ":") : undefined));
+    const record = stableJSON({ request, sourceIds: (exact.length ? exact : fileSources.length ? fileSources : sources).map(source => source.id) });
     const key = stableJSON([topic.id, topic.scopeGeneration]);
     if (completed) this.db.prepare("DELETE FROM evidence_design_pending WHERE binding=? AND hash=?").run(key, hash);
     else this.db.prepare("INSERT OR IGNORE INTO evidence_design_pending(binding,hash,record) VALUES (?,?,?)").run(key, hash, record);
   }
   pendingDesignRequests(topic: Binding): unknown[] {
     return this.db.prepare("SELECT record FROM evidence_design_pending WHERE binding=? ORDER BY hash")
-      .all(stableJSON([topic.id, topic.scopeGeneration])).map(row => JSON.parse(String(row.record)));
+      .all(stableJSON([topic.id, topic.scopeGeneration])).map(row => JSON.parse(String(row.record)).request);
   }
   designObservations(topic: Binding): Array<{ hash: string; record: string }> {
     return this.db.prepare("SELECT hash,record FROM evidence_design_observations WHERE binding=? ORDER BY rowid")

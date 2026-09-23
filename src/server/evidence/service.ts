@@ -163,7 +163,7 @@ export function withEvidence(adapter: AgentAdapter, database: ConsensusDatabase,
       if (!observation.isError) database.evidence.observeDesign(topic, JSON.stringify({ ...observation,
         sources: designSources.map(source => ({ url: source.url, nodeId: source.selector })), sourceDigest,
         observedUnderPlan: { epoch: topic.planEpoch, sha256: topic.planSHA256 } }));
-      database.evidence.designRequest(topic, { tool: observation.tool, input: observation.input }, true);
+      if (!observation.isError) database.evidence.designRequest(topic, { tool: observation.tool, input: observation.input }, true);
     };
     const result = await invoke({ ...turn,
       onFigmaRequest: turn.implementation ? request => database.evidence.designRequest(topic, request) : undefined,
@@ -173,7 +173,10 @@ export function withEvidence(adapter: AgentAdapter, database: ConsensusDatabase,
     const current = database.getTopic(topic.id);
     if (!turn.signal?.aborted && current.scopeGeneration === topic.scopeGeneration && current.planEpoch === topic.planEpoch && current.planSHA256 === topic.planSHA256) {
       const refs: string[] = [];
-      if (designAccess && database.evidence.pendingDesignRequests(topic).length) throw new Error("Design responses are missing from a previous attempt. Repeat the pending reads before completing.");
+      const outcome = result as AgentResult | { result: AgentResult };
+      const agentResult = "result" in outcome ? outcome.result : outcome;
+      const unfinished = agentResult.status === "blocked" || agentResult.status === "in_progress";
+      if (designAccess && !unfinished && database.evidence.pendingDesignRequests(topic).length) throw new Error("Design responses are missing from a previous attempt. Repeat the pending reads before completing.");
       // Rebind retained observations even if this resumed turn needed no new Figma calls.
       for (const observation of designAccess ? database.evidence.designObservations(topic) : []) {
         const files = await materializeObservation(imageDirectory, observation.hash, observation.record);
@@ -181,8 +184,6 @@ export function withEvidence(adapter: AgentAdapter, database: ConsensusDatabase,
       }
       // Bind the accepted implementation artifact to the exact observed content, not an older REST snapshot.
       if (refs.length) {
-        const outcome = result as AgentResult | { result: AgentResult };
-        const agentResult = "result" in outcome ? outcome.result : outcome;
         agentResult.evidenceRefs = [...agentResult.evidenceRefs, ...new Set(refs)];
       }
       database.evidence.receipt(topic, adapter.role, session(result), packet.delivered, packet.links);

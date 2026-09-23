@@ -573,3 +573,52 @@ it("requires recapture after a missing tool response, including on later no-tool
   expect((await adapter.resumeTurn(turn)).evidenceRefs).toHaveLength(1);
   expect(db.evidence.pendingDesignRequests(topic)).toEqual([]);
 });
+
+it("does not clear an uncaptured design request when a retry returns a tool error", async () => {
+  const { db, root, topic, ingest } = setup(); ingest([unit("1", "Behavior")]);
+  db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc?node-id=1-2" });
+  const request = { tool: "mcp__figma-desktop__get_metadata", input: { nodeId: "1:2" } };
+  db.evidence.designRequest(topic, request);
+  const adapter = withEvidence({ role: "claude", validateExistingSession: async () => true, createSession: async () => { throw Error("unused"); },
+    resumeTurn: async turn => {
+      turn.onFigmaRequest?.(request);
+      turn.onFigmaResult?.({ ...request, content: "Access denied", isError: true });
+      return { kind: "IMPLEMENTATION", summary: "done", status: "completed", findings: [], evidenceRefs: [] };
+    } }, db, join(root, "images"));
+  await expect(adapter.resumeTurn({ cwd: root, sessionId: "s", prompt: "Retry", implementation: true })).rejects.toThrow("previous attempt");
+  expect(db.evidence.pendingDesignRequests(topic)).toEqual([request]);
+  expect(db.evidence.designObservations(topic)).toEqual([]);
+});
+
+it("explicit detach disposes only requests tied to that Figma source and permits the remaining product task", async () => {
+  const { db, root, topic, ingest } = setup(); ingest([unit("1", "Behavior")]);
+  const one = db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc?node-id=1-2" });
+  const two = db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc?node-id=3-4" });
+  const first = { tool: "mcp__figma-desktop__get_metadata", input: { nodeId: "1:2" } };
+  const second = { tool: "mcp__figma-desktop__get_metadata", input: { nodeId: "3:4" } };
+  db.evidence.designRequest(topic, first); db.evidence.designRequest(topic, second);
+  db.evidence.detach(topic.id, one.id);
+  expect(db.evidence.pendingDesignRequests(topic)).toEqual([second]);
+  db.evidence.detach(topic.id, two.id);
+  let delivered: any;
+  const adapter = withEvidence({ role: "claude", validateExistingSession: async () => true, createSession: async () => { throw Error("unused"); },
+    resumeTurn: async turn => { delivered = turn; return { kind: "IMPLEMENTATION", summary: "Product work", status: "completed", findings: [], evidenceRefs: [] }; }
+  }, db, join(root, "images"));
+  expect((await adapter.resumeTurn({ cwd: root, sessionId: "s", prompt: "Continue", implementation: true })).status).toBe("completed");
+  expect(delivered.figmaReadEnabled).toBe(false); expect(db.evidence.pendingDesignRequests(topic)).toEqual([]);
+});
+
+it.each(["blocked", "in_progress"] as const)("preserves a %s report with missing native design responses for the existing workflow", async status => {
+  const { ClaudeAdapter } = await import("../src/server/adapters/claude");
+  const { db, root, topic, ingest } = setup(); ingest([unit("1", "Behavior")]);
+  db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc?node-id=1-2" });
+  const native = new ClaudeAdapter({ run: async spec => {
+    spec.onJSONLine?.({ type: "assistant", message: { content: [{ type: "tool_use", id: "pending", name: "mcp__figma-desktop__get_metadata", input: { nodeId: "1:2" } }] } }, Date.now());
+    return { exitCode: 0, stdout: "", stderr: "", jsonLines: [{ type: "result", subtype: "success", num_turns: 1, structured_output: {
+      kind: "IMPLEMENTATION", summary: "Saved partial work", status, requestedUserDecision: "Reconnect Figma", findings: [], evidenceRefs: [],
+    } }] };
+  } }, undefined, { figmaMcpUrl: "http://127.0.0.1:3845/mcp" });
+  const result = await withEvidence(native, db, join(root, "images")).resumeTurn({ cwd: root, sessionId: "s", prompt: "Continue", implementation: true });
+  expect(result).toMatchObject({ status, requestedUserDecision: "Reconnect Figma", summary: "Saved partial work" });
+  expect(db.evidence.pendingDesignRequests(topic)).toHaveLength(1);
+});
