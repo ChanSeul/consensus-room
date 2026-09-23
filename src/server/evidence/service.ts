@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { EvidenceSource, EvidenceSnapshotInput, MediatorEvidenceResponse } from "../../shared/externalEvidence.js";
 import type { ConsensusDatabase } from "../database.js";
+import type { AgentResult } from "../../shared/contracts.js";
 import type { AgentAdapter, SessionTurn } from "../types.js";
 import { EvidenceFetchError, type EvidenceConnector } from "./connectors.js";
 import { DESIGN_PLANNING_CONTRACT } from "../../shared/prompts.js";
@@ -122,7 +123,14 @@ export function withEvidence(adapter: AgentAdapter, database: ConsensusDatabase,
     const designCache: Array<{ url: string; nodeId: string; contentHash: string; path: string }> = [];
     const designSources = database.evidence.list(topic.id).filter(source => source.provider === "figma");
     const designAccess = turn.implementation || ["CODEX_REVIEW", "CODEX_FINAL_REVIEW"].includes(topic.state);
+    const observed = designAccess ? database.evidence.designObservations(topic) : [];
+    const observationReferences: Array<{ hash: string; path: string }> = [];
     if (designAccess) {
+      for (const observation of observed) {
+        const files = await materializeObservation(imageDirectory, observation.hash, observation.record);
+        designPaths.push(...files);
+        observationReferences.push({ hash: observation.hash, path: files[0] });
+      }
       for (const source of designSources) {
         // An old cache must never be presented as the current design. The link can still be queried directly.
         if (!database.evidence.fresh(source)) continue;
@@ -144,16 +152,34 @@ export function withEvidence(adapter: AgentAdapter, database: ConsensusDatabase,
       }
     }
     const designGuidance = !designSources.length ? "" : designAccess
-      ? `Inspect only the Figma screen currently being implemented or reviewed. Reuse already inspected data with the same contentHash; read the cache only when needed. Cached observations may be partial: use read-only Figma tools on the supplied link for missing design context, and screenshots only when visual verification is needed. Do not fetch the whole file. If the Figma tools or required node are unavailable, report the blocker instead of inventing design values.\nOptional design cache references (not yet read): ${JSON.stringify(designCache)}`
+      ? `Inspect only the Figma screen currently being implemented or reviewed. Reuse already inspected data with the same contentHash; read the cache only when needed. The observed-design references are the exact native tool responses seen by implementation, not a claim that the remote file is still current. Use those same observations for review. Older source caches are baseline references only and must not override a newer observed response. Cached observations may be partial: use read-only Figma tools on the supplied link for missing design context, and screenshots only when visual verification is needed. Do not fetch the whole file. If the Figma tools or required node are unavailable, report the blocker instead of inventing design values.\nOptional design cache references (not yet read): ${JSON.stringify(designCache)}\nObserved design references for this exact scope and plan: ${JSON.stringify(observationReferences)}`
       : DESIGN_PLANNING_CONTRACT;
     const evidenceText = `${designGuidance}\n\n${packet.text}${paths.length ? `\n변경된 디자인 PNG (원격에서 다시 읽지 말고 이 파일을 확인):\n${paths.join("\n")}` : ""}`;
     database.evidence.measure(`runner:${topic.id}`, "modelCalls", 1);
     database.evidence.measure(`runner:${topic.id}`, "deliveredBytes", Buffer.byteLength(evidenceText));
-    const result = await invoke({ ...turn, evidenceManaged: true, figmaReadEnabled: Boolean(turn.implementation && designSources.length),
+    const sourceDigest = database.evidence.topic(topic).digest;
+    const observations: Array<{ tool: string; input: unknown; content: unknown }> = [];
+    const result = await invoke({ ...turn,
+      onFigmaResult: turn.implementation ? observation => { observations.push(observation); } : undefined, evidenceManaged: true, figmaReadEnabled: Boolean(turn.implementation && designSources.length),
       prompt: `${turn.prompt}\n\n${evidenceText}`,
       readablePaths: [...turn.readablePaths ?? [], ...designPaths, ...packet.availableImages.map(hash => join(imageDirectory, `${hash}.png`))] });
-    if (!turn.signal?.aborted && database.getTopic(topic.id).scopeGeneration === topic.scopeGeneration) {
-      database.evidence.receipt(topic, adapter.role, session(result), packet.delivered);
+    const current = database.getTopic(topic.id);
+    if (!turn.signal?.aborted && current.scopeGeneration === topic.scopeGeneration && current.planEpoch === topic.planEpoch && current.planSHA256 === topic.planSHA256) {
+      const refs: string[] = [];
+      for (const observation of observations) {
+        const record = JSON.stringify({ ...observation, sources: designSources.map(source => ({ url: source.url, nodeId: source.selector })),
+          sourceDigest });
+        const hash = database.evidence.observeDesign(topic, record);
+        const files = await materializeObservation(imageDirectory, hash, record);
+        refs.push(`figma-observation:${hash} ${files[0]}`);
+      }
+      // Bind the accepted implementation artifact to the exact observed content, not an older REST snapshot.
+      if (refs.length) {
+        const outcome = result as AgentResult | { result: AgentResult };
+        const agentResult = "result" in outcome ? outcome.result : outcome;
+        agentResult.evidenceRefs = [...agentResult.evidenceRefs, ...new Set(refs)];
+      }
+      database.evidence.receipt(topic, adapter.role, session(result), packet.delivered, packet.links);
     }
     return result;
   };
@@ -171,5 +197,36 @@ async function materializeImage(store: EvidenceStore, directory: string, hash: s
   try { await writeFile(path, store.image(hash), { flag: "wx", mode: 0o600 }); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
   if (evidenceHash(await readFile(path)) !== hash) throw new Error("디자인 캐시가 변경됐습니다.");
+  return path;
+}
+
+// Raw native responses are hashed and retained; the readable view externalizes images so JSON reads stay bounded.
+async function materializeObservation(directory: string, hash: string, record: string): Promise<string[]> {
+  if (evidenceHash(record) !== hash) throw new Error("Design observation cache changed.");
+  const paths: string[] = [];
+  const externalize = async (value: unknown): Promise<unknown> => {
+    if (Array.isArray(value)) return Promise.all(value.map(externalize));
+    if (!value || typeof value !== "object") return value;
+    const block = value as Record<string, unknown>;
+    const source = block.source as Record<string, unknown> | undefined;
+    const data = block.type === "image" ? (source?.data ?? block.data) : undefined;
+    const mime = source?.media_type ?? block.mimeType;
+    if (typeof data === "string" && typeof mime === "string" && ["image/png", "image/jpeg", "image/webp"].includes(mime)) {
+      const bytes = Buffer.from(data, "base64");
+      const path = await immutableFile(directory, bytes, mime === "image/jpeg" ? "jpg" : mime.split("/")[1]);
+      paths.push(path); return { type: "image", mimeType: mime, path, hash: evidenceHash(bytes) };
+    }
+    return Object.fromEntries(await Promise.all(Object.entries(block).map(async ([key, item]) => [key, await externalize(item)])));
+  };
+  const content = JSON.stringify({ observationHash: hash, observation: await externalize(JSON.parse(record)) }, null, 2);
+  const path = await immutableFile(directory, Buffer.from(content), "observed-design.json");
+  return [path, ...new Set(paths)];
+}
+async function immutableFile(directory: string, content: Buffer, extension: string): Promise<string> {
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const hash = evidenceHash(content); const path = join(directory, `${hash}.${extension}`);
+  try { await writeFile(path, content, { flag: "wx", mode: 0o600 }); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+  if (evidenceHash(await readFile(path)) !== hash) throw new Error("Design observation file changed.");
   return path;
 }

@@ -103,9 +103,9 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
     }));
     if (designs.length) docs.set("context:design-links", JSON.stringify(designs));
     for (const source of state.sources) {
-      if (source.provider === "figma") continue;
       const snapshot = database.evidence.snapshot(source.id, source.contentHash ?? undefined);
       for (const unit of snapshot?.units ?? []) {
+        if (source.provider === "figma" && (unit.kind === "design" || unit.kind === "render")) continue;
         docs.set(`evidence:${source.id}::${unit.id}`, JSON.stringify({ source: source.url, ...unit }));
         if (unit.imageHash) imageHashes.add(unit.imageHash);
       }

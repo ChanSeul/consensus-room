@@ -564,3 +564,19 @@ it.each(["claude", "codex"] as const)("%s planning sees Figma links but cannot r
   expect(fake.calls).toHaveLength(1);
   expect(database.planning.latest(topic.id)?.fragments).toEqual([]);
 });
+
+it("lets bounded planning request a Figma product comment while omitting the visual node", async () => {
+  const { repo, database, git, topic } = setup();
+  const source = database.evidence.register(topic.id, { url: "https://www.figma.com/design/abc?node-id=1-2", label: "Screen", mode: "connector", intervalSeconds: 900 });
+  database.evidence.ingest(source.id, { checkId: database.evidence.begin(source.id, true)!.checkId, revision: "r1", units: [
+    { id: "decision", kind: "comment", content: "Owner decision: save before exit" }, { id: "node", kind: "design", content: "VISUAL_SECRET" },
+  ] });
+  const fake = scripted(async (turn, call) => {
+    expect(turn.prompt).not.toContain("VISUAL_SECRET");
+    if (call === 1) return answer(step({ requests: [{ kind: "evidence", selector: `${source.id}::decision`, offset: 0, question: "Check exit policy" }] }));
+    expect(turn.prompt).toContain("save before exit");
+    return answer(step({ questions: [], complete: true }));
+  });
+  await guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Plan behavior" });
+  expect(fake.calls.length).toBeGreaterThan(1);
+});

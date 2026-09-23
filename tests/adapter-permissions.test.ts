@@ -2,7 +2,7 @@ import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpath
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { afterEach } from "vitest";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { buildIsolationSettings, ClaudeAdapter } from "../src/server/adapters/claude";
 import { CodexAdapter } from "../src/server/adapters/codex";
@@ -823,7 +823,7 @@ describe("에이전트별 권한 경계", () => {
     const runner = new RecordingRunner(successfulResult([planResult]));
     const adapter = new ClaudeAdapter(runner, undefined, { figmaMcpUrl: "http://127.0.0.1:3845/mcp" });
 
-    await adapter.createSession({ prompt: "Implement the linked screen.", cwd: "/tmp", implementation: true, evidenceManaged: true, figmaReadEnabled: true });
+    await adapter.createSession({ prompt: "Implement the linked screen.", cwd: "/tmp", implementation: true, evidenceManaged: true, figmaReadEnabled: true, onFigmaResult: () => undefined });
 
     const args = runner.calls[0].args;
     expect(args).toContain("--strict-mcp-config");
@@ -1585,3 +1585,14 @@ it.each([{ implementation: false, figmaReadEnabled: true }, { implementation: tr
     const args = runner.calls[0].args;
     expect(JSON.parse(args[args.indexOf("--mcp-config") + 1])).toEqual({ mcpServers: {} });
   });
+
+it("refuses to accept an implementation when its Figma tool response was not captured", async () => {
+  const runner = new RecordingRunner(successfulResult([
+    { type: "assistant", message: { content: [{ type: "tool_use", id: "missing", name: "mcp__figma-desktop__get_screenshot", input: { nodeId: "1:2" } }] } },
+    planResult,
+  ]));
+  const observed = vi.fn();
+  const adapter = new ClaudeAdapter(runner, undefined, { figmaMcpUrl: "http://127.0.0.1:3845/mcp" });
+  await expect(adapter.createSession({ cwd: "/tmp", prompt: "Implement", implementation: true, figmaReadEnabled: true, onFigmaResult: observed })).rejects.toThrow("not captured");
+  expect(observed).not.toHaveBeenCalled();
+});

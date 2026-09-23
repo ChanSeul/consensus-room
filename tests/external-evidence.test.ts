@@ -437,3 +437,79 @@ it("keeps Figma detail out of planning and implementation prompts, exposing immu
   expect(turns[6].figmaReadEnabled).toBe(false);
   expect(turns[6].readablePaths).toEqual([]);
 });
+
+it("delivers Figma product comments and link removal, without claiming design units were delivered", async () => {
+  const { db, topic, root, source: slack } = setup(); db.evidence.detach(topic.id, slack.id);
+  const source = db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc/Screen?node-id=1-2" });
+  db.evidence.ingest(source.id, { checkId: db.evidence.begin(source.id, true)!.checkId, revision: "r1", units: [
+    { id: "node", kind: "design", content: "PRIVATE_LAYOUT" }, { id: "decision", kind: "comment", content: "Owner: save draft on exit" },
+  ] });
+  const turns: any[] = [];
+  const adapter = withEvidence({ role: "claude", validateExistingSession: async () => true, createSession: async () => { throw Error("unused"); },
+    resumeTurn: async turn => { turns.push(turn); return { kind: "PLAN", summary: "ok", findings: [], evidenceRefs: [] }; } }, db, join(root, "images"));
+  const turn = { sessionId: "s", cwd: root, prompt: "Plan" };
+  await adapter.resumeTurn(turn);
+  expect(turns[0].prompt).toContain("save draft on exit"); expect(turns[0].prompt).not.toContain("PRIVATE_LAYOUT");
+  expect(db.evidence.packet(topic, "claude", "s").delivered.map(row => row.unitId)).toEqual(["decision"]);
+  await adapter.resumeTurn(turn); expect(turns[1].prompt).not.toContain("save draft on exit");
+  db.evidence.failed(source.id, db.evidence.begin(source.id, true)!.checkId, "offline");
+  expect(db.evidence.topic(topic).ready).toBe(false); // Known product comments still require fresh evidence.
+  db.evidence.detach(topic.id, source.id);
+  await adapter.resumeTurn(turn);
+  expect(turns[2].prompt).toContain(`"removedSourceId":"${source.id}"`);
+  await adapter.resumeTurn(turn); expect(turns[3].prompt).not.toContain("removedSourceId");
+});
+
+it("binds native observed design B to the result and reviewer even while the REST cache still contains A", async () => {
+  const { ClaudeAdapter } = await import("../src/server/adapters/claude");
+  const { db, root, topic, ingest } = setup(); ingest([unit("1", "Product contract")]);
+  const source = db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc/Screen?node-id=1-2" });
+  db.evidence.ingest(source.id, { checkId: db.evidence.begin(source.id, true)!.checkId, revision: "r1", units: [{ id: "node", kind: "design", content: "cache A" }] });
+  const lines = [
+    { type: "assistant", message: { content: [{ type: "tool_use", id: "read", name: "mcp__figma-desktop__get_design_context", input: { nodeId: "1:2" } }] } },
+    { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "read", content: [{ type: "text", text: "observed B" }, { type: "image", source: { type: "base64", media_type: "image/png", data: png } }] }] } },
+    { type: "result", subtype: "success", num_turns: 1, structured_output: { kind: "IMPLEMENTATION", summary: "done", status: "completed", findings: [], evidenceRefs: [] } },
+  ];
+  const native = new ClaudeAdapter({ run: async spec => {
+    for (const line of lines) spec.onJSONLine?.(line, Date.now());
+    return { exitCode: 0, stdout: "", stderr: "", jsonLines: lines };
+  } }, undefined, { figmaMcpUrl: "http://127.0.0.1:3845/mcp" });
+  const implementation = withEvidence(native, db, join(root, "images"));
+  const result = await implementation.createSession({ cwd: root, prompt: "Implement", implementation: true });
+  expect(result.result.evidenceRefs).toHaveLength(1);
+  const hash = db.evidence.designObservations(topic)[0].hash;
+  expect(result.result.evidenceRefs[0]).toContain(`figma-observation:${hash}`);
+  expect(db.evidence.designObservations(topic)).toHaveLength(1);
+  db.updateTopic(topic.id, { state: "CODEX_REVIEW" });
+  let review: any;
+  const reviewer = withEvidence({ role: "codex", validateExistingSession: async () => true, createSession: async turn => {
+    review = turn; return { sessionId: "review", result: { kind: "REVIEW", summary: "ok", findings: [], evidenceRefs: [] } };
+  }, resumeTurn: async () => { throw Error("unused"); } }, db, join(root, "images"));
+  await reviewer.createSession({ cwd: root, prompt: "Review" });
+  expect(review.prompt).toContain(hash); expect(review.prompt).not.toContain("observed B");
+  const path = review.readablePaths.find((p: string) => p.endsWith(".observed-design.json"));
+  expect(result.result.evidenceRefs[0]).toContain(path);
+  expect(readFileSync(path, "utf8")).toContain("observed B"); expect(readFileSync(path, "utf8")).not.toContain(png);
+  expect(review.readablePaths.some((p: string) => p.endsWith(".png"))).toBe(true);
+  const mtime = statSync(path).mtimeMs;
+  const resumed = await implementation.resumeTurn({ cwd: root, sessionId: result.sessionId, prompt: "Continue", implementation: true });
+  expect(resumed.evidenceRefs).toEqual(result.result.evidenceRefs);
+  expect(db.evidence.designObservations(topic)).toHaveLength(1);
+  expect(statSync(path).mtimeMs).toBe(mtime);
+  db.updateTopic(topic.id, { planEpoch: topic.planEpoch + 1 });
+  expect(db.evidence.designObservations(db.getTopic(topic.id))).toEqual([]);
+});
+
+it("remembers a link-only Figma delivery across database reopen and reports removal of the final link", async () => {
+  const { db, topic, root, source: slack } = setup(); db.evidence.detach(topic.id, slack.id);
+  const source = db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc?node-id=1-2" });
+  const packet = db.evidence.packet(topic, "claude", "s");
+  expect(packet.delivered).toEqual([]);
+  db.evidence.receipt(topic, "claude", "s", packet.delivered, packet.links);
+  const reopened = new ConsensusDatabase(join(root, "room.sqlite")); databases.push(reopened);
+  reopened.evidence.detach(topic.id, source.id);
+  const removed = reopened.evidence.packet(topic, "claude", "s");
+  expect(removed.text).toContain(`"removedSourceId":"${source.id}"`);
+  reopened.evidence.receipt(topic, "claude", "s", removed.delivered, removed.links);
+  expect(reopened.evidence.packet(topic, "claude", "s").text).toBe("");
+});

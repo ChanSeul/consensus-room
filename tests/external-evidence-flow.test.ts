@@ -200,3 +200,28 @@ it("uses mediator HTTP and CLI batches without model calls or implicit acknowled
     expect(f.adapter.createSession).not.toHaveBeenCalled(); expect(f.adapter.resumeTurn).not.toHaveBeenCalled();
   } finally { await app.close(); dbs.splice(dbs.indexOf(f.database), 1); }
 });
+
+it.each(["missing", "expired", "failed"])("admits planning and implementation with %s visual cache through the real executor", async status => {
+  const f = fixture();
+  const source = f.database.evidence.register(f.topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc/Screen?node-id=1-2" });
+  if (status !== "missing") {
+    f.database.evidence.ingest(source.id, { checkId: f.database.evidence.begin(source.id, true)!.checkId, revision: "r1", units: [{ id: "node", kind: "design", content: "layout" }] });
+    if (status === "expired") {
+      const now = Date.now(); vi.spyOn(Date, "now").mockReturnValue(now + 601000); f.ingest("initial");
+    } else f.database.evidence.failed(source.id, f.database.evidence.begin(source.id, true)!.checkId, "offline");
+  }
+  const core = new EngineCore(f.dependencies);
+  for (const implementation of [false, true]) {
+    const topic = f.database.updateTopic(f.topic.id, { state: implementation ? "IMPLEMENTING" : "CLAUDE_PLAN" });
+    f.database.evidence.review(topic, f.database.evidence.topic(topic).digest, "Product behavior checked; visual details deferred", topic);
+    let accepted = false;
+    core.startAction(topic.id, "design-test", async signal => {
+      await core.executor.execute({ role: "claude", topic, signal, purpose: "턴", inputSequence: 0, expected: core.expectationOf(topic), write: implementation,
+        session: { mode: "create" }, prompt: "Task", implementation, settings: { model: "opus", effort: "high" } });
+      accepted = true;
+    });
+    await core.active.get(topic.id)!.completion;
+    expect(accepted).toBe(true);
+  }
+  expect(f.adapter.createSession).toHaveBeenCalledTimes(2);
+});

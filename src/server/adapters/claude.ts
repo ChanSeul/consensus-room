@@ -124,7 +124,7 @@ export class ClaudeAdapter implements AgentAdapter {
     try {
       const permissionMode = turn.implementation ? "dontAsk" : (turn.planMode ? "plan" : "dontAsk");
       const executionSettings = turn.settings ?? DEFAULT_AGENT_SETTINGS.claude;
-      const figmaMcpUrl = turn.implementation && turn.figmaReadEnabled && !turn.protocolOnly && !turn.planningControl
+      const figmaMcpUrl = turn.implementation && turn.figmaReadEnabled && turn.onFigmaResult && !turn.protocolOnly && !turn.planningControl
         ? this.options.figmaMcpUrl ?? null : null;
       // 빈 객체 {}는 실 CLI가 "Invalid MCP configuration"으로 거부한다(실측). mcpServers 키는 항상 있어야 한다.
       const mcpConfig = {
@@ -208,6 +208,20 @@ export class ClaudeAdapter implements AgentAdapter {
       const startedAt = Date.now();
       const toolTime = createToolTimeMeter("claude");
       const metrics = new ExecutionMetrics("claude", Buffer.byteLength(stdin, "utf8"), executionSettings.model, executionSettings.effort, !newSession, startedAt);
+      const designCalls = new Map<string, { tool: string; input: unknown; content?: unknown; received: boolean; error: boolean }>();
+      const observeDesign = (value: unknown) => {
+        const event = value as { type?: string; message?: { content?: Array<Record<string, unknown>> } } | null;
+        if (!event || !Array.isArray(event.message?.content)) return;
+        for (const block of event.message.content) {
+          if (event.type === "assistant" && block.type === "tool_use" && typeof block.id === "string" &&
+              typeof block.name === "string" && block.name.startsWith("mcp__figma-desktop__")) {
+            if (!designCalls.has(block.id)) designCalls.set(block.id, { tool: block.name, input: block.input, received: false, error: false });
+          } else if (event.type === "user" && block.type === "tool_result" && typeof block.tool_use_id === "string") {
+            const call = designCalls.get(block.tool_use_id);
+            if (call) { call.content = block.content; call.received = block.content !== undefined; call.error = block.is_error === true; }
+          }
+        }
+      };
       let finalRecorded = false;
       const recordFinal = () => {
         if (finalRecorded) return;
@@ -227,7 +241,7 @@ export class ClaudeAdapter implements AgentAdapter {
         onInterruptedOutput: turn.onInterruptedOutput,
         command: "claude", args, cwd: workspace, stdin: transport,
         signal: turn.signal, onSpawn: turn.onProcessSpawn,
-        onJSONLine: (value, at) => { toolTime.observe(value, at); metrics.observe(value); },
+        onJSONLine: (value, at) => { toolTime.observe(value, at); metrics.observe(value); observeDesign(value); },
         // stream-json 의 마지막 줄은 {"type":"result"} 다. 그 뒤 2분 안에 프로세스가 안 끝나면 hang 으로 보고 정리한다.
         finalResultTimeoutMs: FINAL_RESULT_TIMEOUT_MS,
         isFinalResult: (value) => typeof value === "object" && value !== null && (value as { type?: unknown }).type === "result",
@@ -238,10 +252,17 @@ export class ClaudeAdapter implements AgentAdapter {
         }),
       });
       // 테스트용 runner가 onJSONLine을 생략해도 최종 버퍼를 한 번 관찰한다.
-      for (const value of output.jsonLines) metrics.observe(value);
+      for (const value of output.jsonLines) { metrics.observe(value); observeDesign(value); }
       recordFinal();
       if (output.exitCode !== 0) {
         throw new Error(describeCommandFailure("Claude", output.exitCode, output.stderr, output.stdout));
+      }
+      for (const call of designCalls.values()) {
+        if (!call.received) throw new Error("Figma response was not captured; implementation cannot be accepted without shared design evidence.");
+        if (!call.error) {
+          if (!turn.onFigmaResult) throw new Error("Figma observation sink is unavailable.");
+          turn.onFigmaResult({ tool: call.tool, input: call.input, content: call.content });
+        }
       }
       return output;
       } finally {
