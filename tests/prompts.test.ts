@@ -208,3 +208,27 @@ describe("구현 노트와 심각도 정책", () => {
     expect(closeout).toContain("BLOCKER·HIGH 뿐");
   });
 });
+
+// Public prompt boundaries: every implementation/review turn must receive the same decision policy.
+describe("중재 판단 정책 전달", () => {
+  for (const resumedSession of [false, true]) {
+    const inputs = { planMarkdown, planSHA256, timeline: [], resumedSession };
+    const prompts = [
+      ["구현", buildImplementationPrompt({ ...inputs, worktreePath: "/w", branchName: "b" })],
+      ["수정", buildClaudeFixPrompt({ ...inputs, reviewFindings: [] })],
+      ["첫 리뷰", buildCodexReviewPrompt({ ...inputs, implementation, finalPass: false })],
+      ["최종 리뷰", buildCodexReviewPrompt({ ...inputs, implementation, finalPass: true })],
+    ];
+    for (const [stage, prompt] of prompts) {
+      it(`${stage} ${resumedSession ? "재개" : "최초"}: 실행 판단과 승인 경계를 함께 전달한다`, () => {
+        expect(prompt.match(/작업 판단과 종료 기준:/g)).toHaveLength(1);
+        expect(prompt).toContain("실행 순서·동등한 방법은 기존 승인과 명시된 계획 조건 안에서 판단");
+        expect(prompt).toContain("기존 결함이라는 이유로 필수 검증 실패를 면제");
+        expect(prompt).toContain("위임 OFF·명시적 금지·승인 및 예산 한도는 그대로");
+        expect(prompt).toContain("기존 요청 ID 해소 절차");
+        expect(prompt).toContain("단계별 커밋 구조를 바꾸는 것은 동등한 실행 방법으로 간주하지");
+        expect(prompt).not.toContain("인도 전에 사용자가 처분(후속 토픽·다음 계획 포함·폐기)을 정합니다");
+      });
+    }
+  }
+});

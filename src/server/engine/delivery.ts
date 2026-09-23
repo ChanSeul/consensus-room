@@ -1977,7 +1977,7 @@ export class DeliveryPipeline {
     return true;
   }
 
-  // 인도 전 처분 요청: 이 토픽이 후속 목록에 올린 쟁점(러너 to-do·종결 확인·최종 리뷰 이연)을 한 번 띄운다.
+  // 인도 시 후속 목록 안내: 미처분 항목도 보존하며 처분 선택 자체는 인도를 막지 않는다.
   // 처분(후속 토픽 / 다음 단계 계획 포함 / 폐기)은 범위 결정이라 사용자 몫이고, "다음 계획 포함" 은 후속 토픽의
   // 첫 계획 프롬프트에 자동으로 실린다(deferredFindingsFor). 실패해도 인도를 막지 않는다.
   private async announceDeferredForDelivery(topicId: string): Promise<void> {
@@ -1986,7 +1986,7 @@ export class DeliveryPipeline {
       if (deferred.length === 0) return;
       const lines = deferred.map((item) => `- ${item.id} [${item.severity}] ${item.title} (${item.source})`).join("\n");
       this.core.event(topicId, "system", "system",
-        `인도 전 처분이 필요한 후속 목록 ${deferred.length}건 — 항목마다 후속 토픽 / 다음 단계 계획에 포함 / 폐기 중 하나를 사용자가 정합니다(커밋 전).\n${lines}`,
+        `현재 완료 조건과 별개로 보존한 후속 목록 ${deferred.length}건 — 후속 토픽 / 다음 단계 계획에 포함 / 폐기는 별도 범위 결정입니다. 처분 선택 자체는 현재 인도의 선행 조건이 아닙니다.\n${lines}`,
         { deferredForDelivery: deferred.map((item) => item.id) });
     } catch {
       // 부가 안내라 실패를 삼킨다.

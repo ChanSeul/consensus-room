@@ -2291,6 +2291,11 @@ describe("최종 리뷰 신규 쟁점의 사용자 결정 소비", () => {
 
     expect(database.getTopic("topic-1").state).toBe("READY_TO_DELIVER");
     expect(await artifacts.readLatest("topic-1", "deferred-findings")).toContain("F-DEFER");
+    const notice = database.getTimeline("topic-1").find((event) =>
+      Array.isArray(event.payload.deferredForDelivery));
+    expect(notice?.payload.deferredForDelivery).toContain("F-DEFER");
+    expect(notice?.body).toContain("처분 선택 자체는 현재 인도의 선행 조건이 아닙니다");
+    expect(notice?.body).not.toContain("(커밋 전)");
     expect(database.getTimeline("topic-1").some((event) => event.body.includes("후속 목록에 기록") && event.body.includes("F-DEFER"))).toBe(true);
     database.close();
   });

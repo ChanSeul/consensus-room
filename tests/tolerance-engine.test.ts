@@ -153,14 +153,14 @@ describe("허용 오차 — 엔진이 리뷰 전에 git diff 로 대조한다", 
 
     const topic = database.getTopic(topicId);
     expect(topic.state, topic.lastError ?? "").toBe("READY_TO_DELIVER");
-    await waitUntil(() => database.getTimeline(topicId).some((event) => event.body.startsWith("인도 전 처분이 필요한 후속 목록")));
+    await waitUntil(() => database.getTimeline(topicId).some((event) => Array.isArray(event.payload.deferredForDelivery)));
     const bodies = database.getTimeline(topicId).map((event) => event.body);
     expect(bodies.some((body) => body.startsWith("허용 오차 대조 통과 — 범위 밖 파일 1개 (T-1: 파일 1·hunk 1)"))).toBe(true);
-    // 러너 to-do 는 후속 목록에 출처 implementation 으로 오르고, 인도 전 처분 안내가 한 번 뜬다.
+    // 러너 to-do 는 후속 목록에 출처 implementation 으로 오르고, 인도를 막지 않는 후속 목록 안내가 뜬다.
     expect(bodies.some((body) => body.startsWith("후속 목록에 기록(이번 범위 밖, 구현 to-do): TODO-1"))).toBe(true);
     const deferred = JSON.parse((await artifacts.readLatest(topicId, "deferred-findings"))!);
     expect(deferred.findings).toMatchObject([{ id: "TODO-1", source: "implementation" }]);
-    expect(bodies.some((body) => body.includes("인도 전 처분이 필요한 후속 목록 1건") && body.includes("TODO-1"))).toBe(true);
+    expect(bodies.some((body) => body.includes("현재 완료 조건과 별개로 보존한 후속 목록 1건") && body.includes("TODO-1"))).toBe(true);
     expect(codex.prompts[0]).toContain("허용 오차 대조(서버가 git diff 로 판정한 결과");
     expect(codex.prompts[0]).toContain("T-1");
     expect(claude.prompts).toHaveLength(1);
@@ -252,7 +252,7 @@ describe("허용 오차 — 엔진이 리뷰 전에 git diff 로 대조한다", 
     expect(bodies.some((body) => body.startsWith("후속 목록에 기록(이번 범위 밖, 구현 to-do): TODO-1"))).toBe(true);
     expect(bodies.some((body) => body.startsWith("후속 목록에서 제외(뒤 단계에서 처분됨): TODO-1"))).toBe(true);
     expect(JSON.parse((await artifacts.readLatest(topicId, "deferred-findings"))!).findings).toEqual([]);
-    expect(bodies.some((body) => body.startsWith("인도 전 처분이 필요한 후속 목록"))).toBe(false);
+    expect(bodies.some((body) => body.startsWith("현재 완료 조건과 별개로 보존한 후속 목록"))).toBe(false);
     database.close();
   });
 
