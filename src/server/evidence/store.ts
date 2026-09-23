@@ -64,22 +64,9 @@ export class EvidenceStore {
       .all().map(row => JSON.parse(String(row.record)));
   }
   detach(topicId: string, sourceId: string): void {
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      // A child node may belong to several registered screen links. Keep its unresolved read
-      // while any candidate link remains; only the last explicit detach disposes it.
-      const pending = this.db.prepare("SELECT binding,hash,record FROM evidence_design_pending WHERE json_extract(binding,'$[0]')=? AND EXISTS (SELECT 1 FROM json_each(record,'$.sourceIds') WHERE value=?)")
-        .all(topicId, sourceId);
-      for (const row of pending) {
-        const record = JSON.parse(String(row.record)) as { request: unknown; sourceIds: string[] };
-        const remaining = record.sourceIds.filter(id => id !== sourceId);
-        if (remaining.length) this.db.prepare("UPDATE evidence_design_pending SET record=? WHERE binding=? AND hash=?")
-          .run(stableJSON({ ...record, sourceIds: remaining }), row.binding, row.hash);
-        else this.db.prepare("DELETE FROM evidence_design_pending WHERE binding=? AND hash=?").run(row.binding, row.hash);
-      }
-      this.db.prepare("DELETE FROM evidence_topics WHERE topic_id=? AND source_id=?").run(topicId, sourceId);
-      this.db.exec("COMMIT");
-    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    // Keep the unresolved read for a continued model session. It becomes inactive while
+    // its candidate links are detached, and active again if the same link is reattached.
+    this.db.prepare("DELETE FROM evidence_topics WHERE topic_id=? AND source_id=?").run(topicId, sourceId);
   }
   linkedTopics(sourceId: string): string[] {
     return this.db.prepare("SELECT topic_id FROM evidence_topics WHERE source_id=?").all(sourceId).map(row => String(row.topic_id));
@@ -330,20 +317,30 @@ export class EvidenceStore {
     const sources = this.list(topic.id).filter(source => source.provider === "figma");
     const fileSources = input?.fileKey ? sources.filter(source => source.resource === input.fileKey) : sources;
     const exact = fileSources.filter(source => source.selector === (typeof input?.nodeId === "string" ? input.nodeId.replace(/-/g, ":") : undefined));
-    const record = stableJSON({ request, sourceIds: (exact.length ? exact : fileSources.length ? fileSources : sources).map(source => source.id) });
+    const candidates = exact.length ? exact : fileSources.length ? fileSources : sources;
+    const record = stableJSON({ request, sourceIds: candidates.map(source => source.id), fileKeys: exact.length ? [] : [...new Set(candidates.map(source => source.resource))] });
     const key = stableJSON([topic.id, topic.scopeGeneration]);
     if (completed) this.db.prepare("DELETE FROM evidence_design_pending WHERE binding=? AND hash=?").run(key, hash);
     else this.db.prepare(`INSERT INTO evidence_design_pending(binding,hash,record) VALUES (?,?,?)
-      ON CONFLICT(binding,hash) DO UPDATE SET record=json_set(excluded.record,'$.sourceIds',json((
-        SELECT json_group_array(value) FROM (
+      ON CONFLICT(binding,hash) DO UPDATE SET record=json_set(excluded.record,
+        '$.sourceIds',json((SELECT json_group_array(value) FROM (
           SELECT value FROM json_each(evidence_design_pending.record,'$.sourceIds')
           UNION SELECT value FROM json_each(excluded.record,'$.sourceIds')
-        )
-      )))`).run(key, hash, record);
+        ))),
+        '$.fileKeys',json((SELECT json_group_array(value) FROM (
+          SELECT value FROM json_each(evidence_design_pending.record,'$.fileKeys')
+          UNION SELECT value FROM json_each(excluded.record,'$.fileKeys')
+        ))))`).run(key, hash, record);
   }
   pendingDesignRequests(topic: Binding): unknown[] {
+    const sources = this.list(topic.id).filter(source => source.provider === "figma");
+    const linked = new Set(sources.map(source => source.id));
+    const files = new Set(sources.map(source => source.resource));
     return this.db.prepare("SELECT record FROM evidence_design_pending WHERE binding=? ORDER BY hash")
-      .all(stableJSON([topic.id, topic.scopeGeneration])).map(row => JSON.parse(String(row.record)).request);
+      .all(stableJSON([topic.id, topic.scopeGeneration]))
+      .map(row => JSON.parse(String(row.record)) as { request: unknown; sourceIds: string[]; fileKeys?: string[] })
+      .filter(record => record.sourceIds.some(id => linked.has(id)) || record.fileKeys?.some(key => files.has(key)))
+      .map(record => record.request);
   }
   designObservations(topic: Binding): Array<{ hash: string; record: string }> {
     return this.db.prepare("SELECT hash,record FROM evidence_design_observations WHERE binding=? ORDER BY rowid")

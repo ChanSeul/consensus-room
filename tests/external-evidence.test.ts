@@ -663,3 +663,35 @@ it("restores candidate links when a child-node read is retried after a screen is
   reopened.evidence.detach(topic.id, screenB.id);
   expect(reopened.evidence.pendingDesignRequests(topic)).toEqual([]);
 });
+
+it("reactivates an unresolved read when its last screen is reattached before another tool call", async () => {
+  const { db, root, topic, ingest } = setup(); ingest([unit("1", "Product behavior")]);
+  const screenInput = { ...sourceInput, url: "https://www.figma.com/design/abc?node-id=1-2" };
+  const screen = db.evidence.register(topic.id, screenInput);
+  const request = { tool: "mcp__figma-desktop__get_design_context", input: { nodeId: "1:10" } };
+  db.evidence.designRequest(topic, request);
+  db.evidence.detach(topic.id, screen.id);
+  expect(db.evidence.pendingDesignRequests(topic)).toEqual([]);
+  db.evidence.register(topic.id, screenInput); // No native retry has happened yet.
+  const reopened = new ConsensusDatabase(join(root, "room.sqlite")); databases.push(reopened);
+  expect(reopened.evidence.pendingDesignRequests(topic)).toEqual([request]);
+  const adapter = withEvidence({ role: "claude", validateExistingSession: async () => true, createSession: async () => { throw Error("unused"); },
+    resumeTurn: async () => ({ kind: "IMPLEMENTATION", summary: "done", status: "completed", findings: [], evidenceRefs: [] })
+  }, reopened, join(root, "images"));
+  await expect(adapter.resumeTurn({ cwd: root, sessionId: "s", prompt: "Continue", implementation: true })).rejects.toThrow("previous attempt");
+});
+
+it("keeps an uncaptured read pending when a different screen in the same Figma file is linked", async () => {
+  const { db, root, topic, ingest } = setup(); ingest([unit("1", "Product behavior")]);
+  const first = db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc?node-id=1-2" });
+  const request = { tool: "mcp__figma-desktop__get_design_context", input: { nodeId: "1:10" } };
+  db.evidence.designRequest(topic, request);
+  db.evidence.detach(topic.id, first.id);
+  db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc?node-id=3-4" });
+  const reopened = new ConsensusDatabase(join(root, "room.sqlite")); databases.push(reopened);
+  expect(reopened.evidence.pendingDesignRequests(topic)).toEqual([request]);
+  const adapter = withEvidence({ role: "claude", validateExistingSession: async () => true, createSession: async () => { throw Error("unused"); },
+    resumeTurn: async () => ({ kind: "IMPLEMENTATION", summary: "done", status: "completed", findings: [], evidenceRefs: [] })
+  }, reopened, join(root, "images"));
+  await expect(adapter.resumeTurn({ cwd: root, sessionId: "s", prompt: "Continue", implementation: true })).rejects.toThrow("previous attempt");
+});
