@@ -318,7 +318,8 @@ export class EvidenceStore {
     const fileSources = input?.fileKey ? sources.filter(source => source.resource === input.fileKey) : sources;
     const exact = fileSources.filter(source => source.selector === (typeof input?.nodeId === "string" ? input.nodeId.replace(/-/g, ":") : undefined));
     const candidates = exact.length ? exact : fileSources.length ? fileSources : sources;
-    const record = stableJSON({ request, sourceIds: candidates.map(source => source.id), fileKeys: exact.length ? [] : [...new Set(candidates.map(source => source.resource))] });
+    // An exact node can still be inside another linked screen; node IDs do not prove disjoint subtrees.
+    const record = stableJSON({ request, sourceIds: candidates.map(source => source.id), fileKeys: [...new Set(candidates.map(source => source.resource))] });
     const key = stableJSON([topic.id, topic.scopeGeneration]);
     if (completed) this.db.prepare("DELETE FROM evidence_design_pending WHERE binding=? AND hash=?").run(key, hash);
     else this.db.prepare(`INSERT INTO evidence_design_pending(binding,hash,record) VALUES (?,?,?)

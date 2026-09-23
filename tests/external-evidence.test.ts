@@ -590,10 +590,10 @@ it("does not clear an uncaptured design request when a retry returns a tool erro
   expect(db.evidence.designObservations(topic)).toEqual([]);
 });
 
-it("explicit detach disposes only requests tied to that Figma source and permits the remaining product task", async () => {
+it("detaching an independent Figma file disposes only its requests and permits the remaining product task", async () => {
   const { db, root, topic, ingest } = setup(); ingest([unit("1", "Behavior")]);
   const one = db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc?node-id=1-2" });
-  const two = db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc?node-id=3-4" });
+  const two = db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/other?node-id=3-4" });
   const first = { tool: "mcp__figma-desktop__get_metadata", input: { nodeId: "1:2" } };
   const second = { tool: "mcp__figma-desktop__get_metadata", input: { nodeId: "3:4" } };
   db.evidence.designRequest(topic, first); db.evidence.designRequest(topic, second);
@@ -606,6 +606,24 @@ it("explicit detach disposes only requests tied to that Figma source and permits
   }, db, join(root, "images"));
   expect((await adapter.resumeTurn({ cwd: root, sessionId: "s", prompt: "Continue", implementation: true })).status).toBe("completed");
   expect(delivered.figmaReadEnabled).toBe(false); expect(db.evidence.pendingDesignRequests(topic)).toEqual([]);
+});
+
+it("keeps a child-node read pending while its parent screen remains linked", async () => {
+  const { db, root, topic, ingest } = setup(); ingest([unit("1", "Product behavior")]);
+  const parent = db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc?node-id=1-2" });
+  const child = db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc?node-id=1-3" });
+  const request = { tool: "mcp__figma-desktop__get_design_context", input: { nodeId: "1:3" } };
+  db.evidence.designRequest(topic, request);
+  const reopened = new ConsensusDatabase(join(root, "room.sqlite")); databases.push(reopened);
+  reopened.evidence.detach(topic.id, child.id);
+  expect(reopened.evidence.pendingDesignRequests(topic)).toEqual([request]);
+  const adapter = withEvidence({ role: "claude", validateExistingSession: async () => true, createSession: async () => { throw Error("unused"); },
+    resumeTurn: async () => ({ kind: "IMPLEMENTATION", summary: "done", status: "completed", findings: [], evidenceRefs: [] })
+  }, reopened, join(root, "images"));
+  await expect(adapter.resumeTurn({ cwd: root, sessionId: "s", prompt: "Continue", implementation: true })).rejects.toThrow("previous attempt");
+  reopened.evidence.detach(topic.id, parent.id);
+  expect(reopened.evidence.pendingDesignRequests(topic)).toEqual([]);
+  expect((await adapter.resumeTurn({ cwd: root, sessionId: "s", prompt: "Continue", implementation: true })).status).toBe("completed");
 });
 
 it.each(["blocked", "in_progress"] as const)("preserves a %s report with missing native design responses for the existing workflow", async status => {
