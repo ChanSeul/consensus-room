@@ -622,3 +622,22 @@ it.each(["blocked", "in_progress"] as const)("preserves a %s report with missing
   expect(result).toMatchObject({ status, requestedUserDecision: "Reconnect Figma", summary: "Saved partial work" });
   expect(db.evidence.pendingDesignRequests(topic)).toHaveLength(1);
 });
+
+it("keeps an unresolved child-node read when only another candidate screen is detached", async () => {
+  const { db, root, topic, source: slack, ingest } = setup(); ingest([unit("1", "Product behavior")]);
+  const screenA = db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc?node-id=1-2" });
+  const screenB = db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc?node-id=3-4" });
+  const request = { tool: "mcp__figma-desktop__get_design_context", input: { nodeId: "1:10" } };
+  db.evidence.designRequest(topic, request);
+  const reopened = new ConsensusDatabase(join(root, "room.sqlite")); databases.push(reopened);
+  reopened.evidence.detach(topic.id, screenB.id);
+  expect(reopened.evidence.pendingDesignRequests(topic)).toEqual([request]);
+  const adapter = withEvidence({ role: "claude", validateExistingSession: async () => true, createSession: async () => { throw Error("unused"); },
+    resumeTurn: async () => ({ kind: "IMPLEMENTATION", summary: "done", status: "completed", findings: [], evidenceRefs: [] })
+  }, reopened, join(root, "images"));
+  await expect(adapter.resumeTurn({ cwd: root, sessionId: "s", prompt: "Continue", implementation: true })).rejects.toThrow("previous attempt");
+  reopened.evidence.detach(topic.id, screenA.id);
+  expect(reopened.evidence.pendingDesignRequests(topic)).toEqual([]);
+  expect((await adapter.resumeTurn({ cwd: root, sessionId: "s", prompt: "Continue", implementation: true })).status).toBe("completed");
+  expect(reopened.evidence.get(slack.id)).toBeTruthy();
+});

@@ -64,10 +64,22 @@ export class EvidenceStore {
       .all().map(row => JSON.parse(String(row.record)));
   }
   detach(topicId: string, sourceId: string): void {
-    this.db.prepare("DELETE FROM evidence_topics WHERE topic_id=? AND source_id=?").run(topicId, sourceId);
-    // Explicit source removal disposes requests made under that source context, not unrelated requests.
-    this.db.prepare("DELETE FROM evidence_design_pending WHERE json_extract(binding,'$[0]')=? AND EXISTS (SELECT 1 FROM json_each(record,'$.sourceIds') WHERE value=?)")
-      .run(topicId, sourceId);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      // A child node may belong to several registered screen links. Keep its unresolved read
+      // while any candidate link remains; only the last explicit detach disposes it.
+      const pending = this.db.prepare("SELECT binding,hash,record FROM evidence_design_pending WHERE json_extract(binding,'$[0]')=? AND EXISTS (SELECT 1 FROM json_each(record,'$.sourceIds') WHERE value=?)")
+        .all(topicId, sourceId);
+      for (const row of pending) {
+        const record = JSON.parse(String(row.record)) as { request: unknown; sourceIds: string[] };
+        const remaining = record.sourceIds.filter(id => id !== sourceId);
+        if (remaining.length) this.db.prepare("UPDATE evidence_design_pending SET record=? WHERE binding=? AND hash=?")
+          .run(stableJSON({ ...record, sourceIds: remaining }), row.binding, row.hash);
+        else this.db.prepare("DELETE FROM evidence_design_pending WHERE binding=? AND hash=?").run(row.binding, row.hash);
+      }
+      this.db.prepare("DELETE FROM evidence_topics WHERE topic_id=? AND source_id=?").run(topicId, sourceId);
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
   }
   linkedTopics(sourceId: string): string[] {
     return this.db.prepare("SELECT topic_id FROM evidence_topics WHERE source_id=?").all(sourceId).map(row => String(row.topic_id));
