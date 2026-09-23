@@ -29,11 +29,13 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
     }
     const keepSession = adapter.role === "codex" || database.planning.continuityEnabled(topic.id);
     const latest = database.planning.latest(topic.id);
+    let newInput = false;
     if (latest && !latest.finalized && latest.stage === topic.state && latest.role === adapter.role &&
         latest.scopeGeneration === topic.scopeGeneration && latest.planEpoch === topic.planEpoch && latest.planSHA256 === topic.planSHA256) {
       const updates = database.getTimeline(topic.id).filter(e => e.sequence > latest.inputSequence &&
         e.actor === "user" && ["decision", "evidence"].includes(e.kind));
       if (updates.length) {
+        newInput = true;
         database.planning.archive(latest);
         const previousKey = latest.key;
         // The workflow supplies the refreshed task contract. Keep any user text it has not rendered in full.
@@ -116,8 +118,9 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
     }
     const manifest = [...docs].map(([id, text]) => ({ id, hash: planningHash(text), bytes: bytes(text) }));
     const sourceHash = planningHash(JSON.stringify(manifest));
-    if (record.tree && (record.tree !== tree || record.evidenceDigest !== state.digest ||
-        record.instructionHash !== instructionHash || record.sourceHash !== sourceHash)) {
+    const sourceChanged = Boolean(record.tree && (record.tree !== tree || record.evidenceDigest !== state.digest ||
+        record.instructionHash !== instructionHash || record.sourceHash !== sourceHash));
+    if (sourceChanged) {
       database.planning.archive(record);
       // Preserve the logical attempt, review session, counters and usage. Unverified old facts cannot approve a changed source.
       record.step = { draft: "", facts: [], contradictions: [], questions: ["Sources changed. Revalidate the plan against the pinned sources."], requests: [], complete: false };
@@ -126,6 +129,10 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
     }
     record.tree = tree; record.evidenceDigest = state.digest; record.instructionHash = instructionHash; record.sourceHash = sourceHash;
     // A retry rechecks the same limits. It never grants budget or resets a round/session counter.
+    const replayResponse = !newInput && !sourceChanged && record.stopped === "Checkpoint cites evidence that was not delivered."
+      && record.lastResponse && PlanningStepSchema.safeParse(record.lastResponse.planningStep).success
+      && record.lastResponse.planningStep?.complete === false && record.lastResponse.planningStep.requests.length
+      ? record.lastResponse : null;
     record.stopped = null; save();
     docs.set("context:manifest", JSON.stringify(manifest));
     const reader = new PlanningReader(turn.cwd, tree, docs);
@@ -184,12 +191,65 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
           account.used[k] + reserve < account.policy.total[k];
       });
     });
+    const acceptStep = async (result: AgentResult, finalizing: boolean): Promise<AgentResult | null> => {
+      const parsed = PlanningStepSchema.safeParse(result.planningStep);
+      if (!parsed.success) pause("Invalid planning checkpoint; the response was preserved for mediation.");
+      let step = parsed.data!;
+      if (bytes(step) > LIMIT.checkpointBytes) pause("Planning checkpoint exceeds its output limit; the response was preserved for mediation.");
+      const known = new Set([...record.delivered, ...record.fragments.map(f => f.id)]);
+      const supportedFacts = step.facts.filter(f => f.refs.every(ref => known.has(ref)));
+      if (supportedFacts.length !== step.facts.length) {
+        if (step.complete || result.requestedUserDecision || !step.requests.length) pause("Checkpoint cites evidence that was not delivered.");
+        // Intermediate reads are still useful; discard unverified claims before retaining the checkpoint.
+        step = { ...step, facts: supportedFacts,
+          questions: [...new Set([...step.questions, "Restate unverified facts using the returned fragment IDs."])] };
+        if (bytes(step) > LIMIT.checkpointBytes) pause("Planning checkpoint exceeds its output limit; the response was preserved for mediation.");
+      }
+      const progressed = record.fragments.some(f => !record.delivered.includes(f.id)) ||
+        step.facts.length > record.step.facts.length || step.questions.length < record.step.questions.length;
+      record.stalled = progressed ? 0 : record.stalled + 1;
+      record.delivered = [...known]; record.step = step; record.fragments = []; record.imageHash = undefined; save();
+      if (step.complete || result.requestedUserDecision) {
+        if (step.complete && (step.questions.length || step.requests.length)) pause("Incomplete planning cannot be submitted as a final plan.");
+        const { planningStep: _step, ...finalResult } = result;
+        record.finalized = true; record.finalResult = finalResult; save();
+        emitFinal();
+        return finalResult;
+      }
+      if (finalizing) pause("Synthesis did not produce a complete plan; checkpoint retained.");
+      if (softLimit() || record.round >= LIMIT.rounds) return null;
+      const fragments: PlanningFragment[] = [];
+      for (const request of step.requests) {
+        if (request.kind === "image") {
+          if (keepSession && record.delivered.includes(request.selector) && !request.rereadReason) continue;
+          if (record.imageHash || request.offset !== 0 || !imageHashes.has(request.selector)) pause("Only one pinned image per round is allowed.");
+          const fragment: PlanningFragment = { id: request.selector, kind: "image", selector: request.selector, hash: request.selector,
+            offset: 0, nextOffset: null, content: "Pinned design image attached to this round." };
+          if (bytes([...fragments, fragment]) > LIMIT.batchBytes) break;
+          record.imageHash = request.selector; fragments.push(fragment);
+          continue;
+        }
+        const cacheKey = planningHash(JSON.stringify([tree, sourceHash, request.kind, request.selector, request.offset]));
+        const fragment = database.planning.fragment(cacheKey) ?? await reader.read(request);
+        database.planning.saveFragment(cacheKey, fragment);
+        if (fragments.some(f => f.id === fragment.id)) continue;
+        if (keepSession && record.delivered.includes(fragment.id) && !request.rereadReason) continue;
+        if (bytes([...fragments, fragment]) > LIMIT.batchBytes) break;
+        fragments.push(fragment);
+      }
+      record.fragments = fragments; save();
+      return null;
+    };
     try {
       await assertCurrent();
       if (record.usageIncomplete) pause("Usage is incomplete; mediator reconciliation is required before resuming this attempt.");
       if (record.finalResult && record.finalized) {
         turn.onSessionCreated?.(record.sessionId!);
         return { sessionId: record.sessionId!, result: record.finalResult };
+      }
+      if (replayResponse) {
+        const recovered = await acceptStep(replayResponse, false);
+        if (recovered) return { sessionId: record.sessionId!, result: recovered };
       }
       while (true) {
         await assertCurrent();
@@ -302,45 +362,8 @@ Checkpoint must fit ${LIMIT.checkpointBytes} UTF-8 bytes. Final result must sati
         record.lastResponse = result; record.responseBytes = (record.responseBytes ?? 0) + bytes(result); save();
         await assertCurrent();
         if (record.usageIncomplete) pause("Usage is incomplete; checkpoint saved before another model call.");
-        const parsed = PlanningStepSchema.safeParse(result.planningStep);
-        if (!parsed.success) pause("Invalid planning checkpoint; the response was preserved for mediation.");
-        const step = parsed.data!;
-        if (bytes(step) > LIMIT.checkpointBytes) pause("Planning checkpoint exceeds its output limit; the response was preserved for mediation.");
-        const known = new Set([...record.delivered, ...record.fragments.map(f => f.id)]);
-        if (step.facts.some(f => f.refs.some(ref => !known.has(ref)))) pause("Checkpoint cites evidence that was not delivered.");
-        const progressed = record.fragments.some(f => !record.delivered.includes(f.id)) ||
-          step.facts.length > record.step.facts.length || step.questions.length < record.step.questions.length;
-        record.stalled = progressed ? 0 : record.stalled + 1;
-        record.delivered = [...known]; record.step = step; record.fragments = []; record.imageHash = undefined; save();
-        if (step.complete || result.requestedUserDecision) {
-          if (step.complete && (step.questions.length || step.requests.length)) pause("Incomplete planning cannot be submitted as a final plan.");
-          const { planningStep: _step, ...finalResult } = result;
-          record.finalized = true; record.finalResult = finalResult; save();
-          emitFinal();
-          return { sessionId: record.sessionId!, result: finalResult };
-        }
-        if (finalizing) pause("Synthesis did not produce a complete plan; checkpoint retained.");
-        if (softLimit() || record.round >= LIMIT.rounds) continue;
-        const fragments: PlanningFragment[] = [];
-        for (const request of step.requests) {
-          if (request.kind === "image") {
-            if (keepSession && record.delivered.includes(request.selector) && !request.rereadReason) continue;
-            if (record.imageHash || request.offset !== 0 || !imageHashes.has(request.selector)) pause("Only one pinned image per round is allowed.");
-            const fragment: PlanningFragment = { id: request.selector, kind: "image", selector: request.selector, hash: request.selector,
-              offset: 0, nextOffset: null, content: "Pinned design image attached to this round." };
-            if (bytes([...fragments, fragment]) > LIMIT.batchBytes) break;
-            record.imageHash = request.selector; fragments.push(fragment);
-            continue;
-          }
-          const cacheKey = planningHash(JSON.stringify([tree, sourceHash, request.kind, request.selector, request.offset]));
-          const fragment = database.planning.fragment(cacheKey) ?? await reader.read(request);
-          database.planning.saveFragment(cacheKey, fragment);
-          if (fragments.some(f => f.id === fragment.id)) continue;
-          if (keepSession && record.delivered.includes(fragment.id) && !request.rereadReason) continue;
-          if (bytes([...fragments, fragment]) > LIMIT.batchBytes) break;
-          fragments.push(fragment);
-        }
-        record.fragments = fragments; save();
+        const adopted = await acceptStep(result, finalizing);
+        if (adopted) return { sessionId: record.sessionId!, result: adopted };
       }
     } catch (error) {
       save();

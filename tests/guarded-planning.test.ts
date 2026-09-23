@@ -89,6 +89,78 @@ it("collects bounded snapshot evidence before returning one final plan and reser
   expect(fake.calls).toHaveLength(2);
 });
 
+it("fulfills intermediate reads without accepting facts that cite undelivered evidence", async () => {
+  const { repo, database, git } = setup();
+  const fake = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({
+      facts: [{ statement: "Unverified step behavior", refs: ["context:request"] }],
+      requests: [{ kind: "file", selector: "form.swift", question: "Verify step behavior", offset: 0 }],
+    }));
+    const fragments = JSON.parse(turn.prompt.split("Fragments: ").at(-1)!) as Array<{ id: string }>;
+    return answer(step({ facts: [{ statement: "Verified step behavior", refs: [fragments[0].id] }],
+      questions: [], complete: true }));
+  });
+  const result = await guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Plan" });
+  expect(result.result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls).toHaveLength(2);
+  expect(fake.calls[1].prompt).toContain("let step = 0");
+  expect(fake.calls[1].prompt).not.toContain('"statement":"Unverified step behavior"');
+  const checkpoint = database.planning.latest("topic")!;
+  expect(checkpoint.step.facts).toHaveLength(1);
+  expect(checkpoint.step.facts[0].statement).toBe("Verified step behavior");
+  expect(checkpoint.delivered).toContain(checkpoint.step.facts[0].refs[0]);
+});
+
+it("still rejects undelivered facts in a completed checkpoint", async () => {
+  const { repo, database, git } = setup();
+  const fake = scripted(async () => answer(step({ facts: [{ statement: "Unsupported", refs: ["context:request"] }],
+    questions: [], complete: true })));
+  await expect(guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Plan" }))
+    .rejects.toThrow("Checkpoint cites evidence that was not delivered.");
+  expect(database.planning.latest("topic")!.finalized).toBe(false);
+});
+
+it("reuses a saved intermediate read request after a citation pause without another research call", async () => {
+  const { repo, database, git } = setup();
+  const fake = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ facts: [{ statement: "Unverified", refs: ["context:request"] }],
+      questions: [], complete: true }));
+    const fragments = JSON.parse(turn.prompt.split("Fragments: ").at(-1)!) as Array<{ id: string }>;
+    expect(fragments).toHaveLength(1);
+    return answer(step({ facts: [{ statement: "Verified", refs: [fragments[0].id] }], questions: [], complete: true }));
+  });
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("not delivered");
+  const saved = database.planning.latest("topic")!;
+  saved.lastResponse = answer(step({ facts: [{ statement: "Unverified", refs: ["context:request"] }],
+    requests: [{ kind: "file", selector: "form.swift", question: "Verify", offset: 0 }] }));
+  database.planning.save(saved);
+  const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+  expect(result.result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls).toHaveLength(2);
+  expect(database.planning.latest("topic")!.round).toBe(2);
+});
+
+it("does not replay an old read request after new user evidence changes the task", async () => {
+  const { repo, database, git } = setup();
+  const fake = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ facts: [{ statement: "Unverified", refs: ["context:request"] }],
+      questions: [], complete: true }));
+    expect(turn.prompt).toContain("Updated requirement");
+    expect(JSON.parse(turn.prompt.split("Fragments: ").at(-1)!)).toEqual([]);
+    return answer(step({ questions: [], complete: true }));
+  });
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("not delivered");
+  const saved = database.planning.latest("topic")!;
+  saved.lastResponse = answer(step({ facts: [{ statement: "Unverified", refs: ["context:request"] }],
+    requests: [{ kind: "file", selector: "form.swift", question: "Old read", offset: 0 }] }));
+  database.planning.save(saved);
+  database.appendEvent({ topicId: "topic", actor: "user", kind: "evidence", state: "CLAUDE_PLAN", body: "Updated requirement" });
+  await adapter.createSession({ cwd: repo, prompt: "Plan" });
+  expect(fake.calls).toHaveLength(2);
+});
+
 it("persists interrupted progress and retries without refunding or double charging the previous attempt", async () => {
   const { repo, database, git } = setup();
   const fake = scripted(async (_turn, n) => {
