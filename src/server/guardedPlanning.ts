@@ -18,6 +18,7 @@ export const GUARDED_STAGES = new Set(["CLAUDE_PLAN", "CLAUDE_REVISION", "CODEX_
 const usageKeys = ["inputTokens", "cachedInputTokens", "outputTokens", "durationMs"] as const;
 const zero = (): PlanningUsage => ({ inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, durationMs: 0 });
 const bytes = (value: unknown) => Buffer.byteLength(typeof value === "string" ? value : JSON.stringify(value));
+const PENDING_READS = "Planning checkpoint accepted; deferred reads pending.";
 
 export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDatabase, git: GitService,
   memoryDirectory?: string, imageDirectory?: string): AgentAdapter {
@@ -129,7 +130,8 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
     }
     record.tree = tree; record.evidenceDigest = state.digest; record.instructionHash = instructionHash; record.sourceHash = sourceHash;
     // A retry rechecks the same limits. It never grants budget or resets a round/session counter.
-    const recoverBudgetReads = !newInput && !sourceChanged && record.stopped === "Planning checkpoint saved; insufficient remaining budget for synthesis."
+    const recoverBudgetReads = !newInput && !sourceChanged &&
+      ["Planning checkpoint saved; insufficient remaining budget for synthesis.", PENDING_READS].includes(record.stopped ?? "")
       && record.fragments.length === 0 && record.step.requests.length > 0;
     const replayResponse = !newInput && !sourceChanged && record.stopped === "Checkpoint cites evidence that was not delivered."
       && record.lastResponse && PlanningStepSchema.safeParse(record.lastResponse.planningStep).success
@@ -195,14 +197,15 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
     });
     const fulfillRequests = async (requests: PlanningCheckpoint["step"]["requests"]): Promise<void> => {
       const fragments: PlanningFragment[] = [];
+      let pendingImageHash: string | undefined;
       for (const request of requests) {
         if (request.kind === "image") {
           if (keepSession && record.delivered.includes(request.selector) && !request.rereadReason) continue;
-          if (record.imageHash || request.offset !== 0 || !imageHashes.has(request.selector)) pause("Only one pinned image per round is allowed.");
+          if (pendingImageHash || request.offset !== 0 || !imageHashes.has(request.selector)) pause("Only one pinned image per round is allowed.");
           const fragment: PlanningFragment = { id: request.selector, kind: "image", selector: request.selector, hash: request.selector,
             offset: 0, nextOffset: null, content: "Pinned design image attached to this round." };
           if (bytes([...fragments, fragment]) > LIMIT.batchBytes) break;
-          record.imageHash = request.selector; fragments.push(fragment);
+          pendingImageHash = request.selector; fragments.push(fragment);
           continue;
         }
         const cacheKey = planningHash(JSON.stringify([tree, sourceHash, request.kind, request.selector, request.offset]));
@@ -213,7 +216,7 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
         if (bytes([...fragments, fragment]) > LIMIT.batchBytes) break;
         fragments.push(fragment);
       }
-      record.fragments = fragments; save();
+      record.imageHash = pendingImageHash; record.fragments = fragments; save();
     };
     const acceptStep = async (result: AgentResult, finalizing: boolean, replayProgress = false): Promise<AgentResult | null> => {
       const parsed = PlanningStepSchema.safeParse(result.planningStep);
@@ -232,7 +235,9 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
       const progressed = replayProgress || record.fragments.some(f => !record.delivered.includes(f.id)) ||
         step.facts.length > record.step.facts.length || step.questions.length < record.step.questions.length;
       record.stalled = progressed ? 0 : record.stalled + 1;
-      record.delivered = [...known]; record.step = step; record.fragments = []; record.imageHash = undefined; save();
+      record.delivered = [...known]; record.step = step; record.fragments = []; record.imageHash = undefined;
+      record.stopped = !step.complete && !result.requestedUserDecision && step.requests.length ? PENDING_READS : null;
+      save();
       if (step.complete || result.requestedUserDecision) {
         if (step.complete && (step.questions.length || step.requests.length)) pause("Incomplete planning cannot be submitted as a final plan.");
         const { planningStep: _step, ...finalResult } = result;
@@ -243,6 +248,7 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
       if (finalizing) pause("Synthesis did not produce a complete plan; checkpoint retained.");
       if (softLimit() || record.round >= LIMIT.rounds) return null;
       await fulfillRequests(step.requests);
+      record.stopped = null; save();
       return null;
     };
     try {

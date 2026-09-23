@@ -141,6 +141,38 @@ it("reuses a saved intermediate read request after a citation pause without anot
   expect(database.planning.latest("topic")!.round).toBe(2);
 });
 
+it("does not replay an adopted citation response after a crash while saving its reads", async () => {
+  const { repo, database, git } = setup();
+  const fake = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ facts: [{ statement: "Unverified", refs: ["context:request"] }],
+      questions: [], complete: true }));
+    const fragments = JSON.parse(turn.prompt.split("Fragments: ").at(-1)!) as Array<{ id: string }>;
+    expect(fragments).toHaveLength(1);
+    return answer(step({ facts: [{ statement: "Verified", refs: [fragments[0].id] }], questions: [], complete: true }));
+  });
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("not delivered");
+  const saved = database.planning.latest("topic")!;
+  saved.lastResponse = answer(step({ facts: [{ statement: "Unverified", refs: ["context:request"] }],
+    requests: [{ kind: "file", selector: "form.swift", question: "Verify", offset: 0 }] }));
+  database.planning.save(saved);
+  const save = database.planning.save.bind(database.planning);
+  let interrupted = false;
+  const saving = vi.spyOn(database.planning, "save").mockImplementation(record => {
+    save(record);
+    if (!interrupted && record.fragments.length > 0 && record.stopped) {
+      interrupted = true;
+      throw new Error("Interrupted after fragment save");
+    }
+  });
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Interrupted after fragment save");
+  saving.mockRestore();
+  expect(database.planning.latest("topic")!.fragments).toHaveLength(1);
+  const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+  expect(result.result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls).toHaveLength(2);
+});
+
 it("counts unadopted delivered fragments as progress when replaying a paused response", async () => {
   const { repo, database, git } = setup();
   const fake = scripted(async (turn, n) => {
@@ -227,6 +259,41 @@ it("retains deferred reads when recovery is interrupted before fragments are sav
   expect(database.planning.latest("topic")!.stopped).toBe(saved.stopped);
   expect(fake.calls).toHaveLength(1);
   read.mockRestore();
+  const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+  expect(result.result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls).toHaveLength(2);
+});
+
+it("does not reserve an image when a later read in the same batch fails", async () => {
+  const { root, repo, database, git } = setup();
+  const source = database.evidence.register("topic", { url: "https://team.slack.com/archives/C123/p1789709010013729",
+    label: "Image evidence", mode: "connector", intervalSeconds: 900 });
+  const check = database.evidence.begin(source.id, true)!;
+  const imageBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lWQAAAAASUVORK5CYII=";
+  database.evidence.ingest(source.id, { checkId: check.checkId, revision: "r1", units: [
+    { id: "render", kind: "render", content: "Reference image", imageBase64 },
+  ] });
+  const imageHash = database.evidence.snapshot(source.id)!.units[0].imageHash!;
+  const fake = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ facts: [{ statement: "Unsupported", refs: ["context:request"] }],
+      questions: [], complete: true }));
+    expect(JSON.parse(turn.prompt.split("Fragments: ").at(-1)!)).toHaveLength(2);
+    expect(turn.planningControl?.image).toBeDefined();
+    return answer(step({ questions: [], complete: true }));
+  });
+  const adapter = guardedPlanning(fake.adapter, database, git, undefined, join(root, "images"));
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("not delivered");
+  const saved = database.planning.latest("topic")!;
+  saved.step = step({ requests: [
+    { kind: "image", selector: imageHash, question: "Inspect image", offset: 0 },
+    { kind: "file", selector: "form.swift", question: "Inspect form", offset: 0 },
+  ] });
+  saved.stopped = "Planning checkpoint saved; insufficient remaining budget for synthesis.";
+  database.planning.save(saved);
+  const read = vi.spyOn(PlanningReader.prototype, "read").mockRejectedValueOnce(new Error("Interrupted file read"));
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Interrupted file read");
+  read.mockRestore();
+  expect(database.planning.latest("topic")!.imageHash).toBeUndefined();
   const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
   expect(result.result.planMarkdown).toBe("Final navigation plan");
   expect(fake.calls).toHaveLength(2);
