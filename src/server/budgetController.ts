@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 import type { AgentAdapter, SessionTurn } from "./types.js";
 import { BudgetBlocked, type BudgetLedger } from "./budgetLedger.js";
 import type { ConsensusDatabase } from "./database.js";
-import { planningKey } from "./planningStore.js";
+import { planningKey, recoverableFinalizedFirstPlan } from "./planningStore.js";
 import { GUARDED_STAGES } from "./guardedPlanning.js";
 import { planningPacketLimit } from "../shared/planningControl.js";
 
@@ -37,7 +37,9 @@ export class BudgetController {
     const guarded = this.database?.planning.enabled(ctx.topicId) && GUARDED_STAGES.has(ctx.stage) && !turn.protocolOnly && !turn.implementation;
     const latest = guarded ? this.database!.planning.latest(ctx.topicId) : null;
     const topic = guarded ? this.database!.getTopic(ctx.topicId) : null;
-    const continued = latest && !latest.finalized && latest.stage === ctx.stage && latest.role === role &&
+    const finalizedFirstPlanRecovery = Boolean(topic && ctx.stage === "CLAUDE_PLAN" &&
+      recoverableFinalizedFirstPlan(latest, topic, this.database!.getTimeline(ctx.topicId)));
+    const continued = latest && (!latest.finalized || finalizedFirstPlanRecovery) && latest.stage === ctx.stage && latest.role === role &&
       latest.scopeGeneration === topic?.scopeGeneration && latest.planEpoch === topic.planEpoch && latest.planSHA256 === topic.planSHA256 ? latest : null;
     const saved = continued ?? (guarded ? this.database!.planning.get(planningKey(topic!, role, turn.prompt)) : null);
     const admissionId = saved?.admissionId ?? id;

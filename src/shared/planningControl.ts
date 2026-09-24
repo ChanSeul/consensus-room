@@ -76,6 +76,7 @@ export interface PlanningCheckpoint {
   metrics?: PlanningMetrics;
   sessions?: string[];
   lastResponse?: import("./contracts.js").AgentResult;
+  responsePending?: boolean;
   imageHash?: string;
   finalResult?: import("./contracts.js").AgentResult;
 }

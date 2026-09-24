@@ -134,11 +134,158 @@ it("reuses a saved intermediate read request after a citation pause without anot
   const saved = database.planning.latest("topic")!;
   saved.lastResponse = answer(step({ facts: [{ statement: "Unverified", refs: ["context:request"] }],
     requests: [{ kind: "file", selector: "form.swift", question: "Verify", offset: 0 }] }));
+  saved.responsePending = undefined; // Legacy checkpoint created before the explicit rejection marker.
   database.planning.save(saved);
   const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
   expect(result.result.planMarkdown).toBe("Final navigation plan");
   expect(fake.calls).toHaveLength(2);
   expect(database.planning.latest("topic")!.round).toBe(2);
+});
+
+it.each(["marked", "legacy"])("replays a %s saved response when freshness returns with the same digest", async mode => {
+  const { repo, database, git } = setup("codex");
+  const fake = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ requests: [
+      { kind: "file", selector: "form.swift", question: "Locate step ownership", offset: 0 },
+    ] }));
+    expect(turn.prompt).toContain("let step = 0");
+    return answer(step({ questions: [], complete: true }));
+  }, "codex");
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  const topicEvidence = database.evidence.topic.bind(database.evidence);
+  let expired = false;
+  const freshness = vi.spyOn(database.evidence, "topic").mockImplementation(topic => {
+    const state = topicEvidence(topic);
+    if (!expired && database.planning.latest("topic")?.lastResponse) {
+      expired = true;
+      return { ...state, ready: false };
+    }
+    return state;
+  });
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Planning binding changed");
+  freshness.mockRestore();
+  const saved = database.planning.latest("topic")!;
+  expect(saved.lastResponse?.planningStep?.requests).toHaveLength(1);
+  expect(saved.stopped).toBe("Planning binding changed; preserved checkpoint is not an approved plan.");
+  if (mode === "legacy") {
+    saved.responsePending = undefined;
+    database.planning.save(saved);
+  } else expect(saved.responsePending).toBe(true);
+  const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+  expect(result.result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls).toHaveLength(2);
+  expect(database.planning.latest("topic")!.round).toBe(2);
+  expect(database.planning.latest("topic")!.responsePending).toBe(false);
+});
+
+it("drops a saved pre-adoption response when the working tree changes before retry", async () => {
+  const { repo, database, git } = setup("codex");
+  const fake = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ requests: [
+      { kind: "file", selector: "form.swift", question: "Read previous source", offset: 0 },
+    ] }));
+    expect(JSON.parse(turn.prompt.split("Fragments: ").at(-1)!)).toEqual([]);
+    expect(database.planning.latest("topic")!.responsePending).toBe(false);
+    return answer(step({ questions: [], complete: true }));
+  }, "codex");
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  const topicEvidence = database.evidence.topic.bind(database.evidence);
+  let expired = false;
+  const freshness = vi.spyOn(database.evidence, "topic").mockImplementation(topic => {
+    const state = topicEvidence(topic);
+    if (!expired && database.planning.latest("topic")?.lastResponse) {
+      expired = true;
+      return { ...state, ready: false };
+    }
+    return state;
+  });
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Planning binding changed");
+  freshness.mockRestore();
+  writeFileSync(join(repo, "form.swift"), "let step = 1\n");
+  const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+  expect(result.result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls).toHaveLength(2);
+});
+
+it("replays a final response persisted immediately before an interrupted adoption", async () => {
+  const { repo, database, git } = setup("codex");
+  const fake = scripted(async () => answer(step({ questions: [], complete: true })), "codex");
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  const save = database.planning.save.bind(database.planning);
+  let interrupted = false;
+  const saving = vi.spyOn(database.planning, "save").mockImplementation(record => {
+    save(record);
+    if (!interrupted && record.responsePending) {
+      interrupted = true;
+      throw new Error("Interrupted before adopting the response");
+    }
+  });
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Interrupted before adopting");
+  saving.mockRestore();
+  const saved = database.planning.latest("topic")!;
+  expect(saved.responsePending).toBe(true);
+  expect(saved.stopped).toBeNull();
+  const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+  expect(result.result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls).toHaveLength(1);
+  expect(database.planning.latest("topic")!.responsePending).toBe(false);
+});
+
+it.each(["unsupported citation", "oversized checkpoint"])("requests a corrected response after rejecting an %s", async reason => {
+  const { repo, database, git } = setup("codex");
+  const fake = scripted(async (_turn, n) => {
+    if (n === 1 && reason === "unsupported citation") return answer(step({
+      facts: [{ statement: "Unsupported", refs: ["context:request"] }], questions: [], complete: true,
+    }));
+    if (n === 1) return answer(step({ draft: "x".repeat(PLANNING_LIMITS.checkpointBytes + 1) }));
+    return answer(step({ questions: [], complete: true }));
+  }, "codex");
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow(
+    reason === "unsupported citation" ? "not delivered" : "output limit");
+  expect(database.planning.latest("topic")!.responsePending).toBe(false);
+  const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+  expect(result.result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls).toHaveLength(2);
+});
+
+it("does not replay an explicitly rejected decision response with pending reads", async () => {
+  const { repo, database, git } = setup("codex");
+  const fake = scripted(async (_turn, n) => n === 1
+    ? { ...answer(step({ facts: [{ statement: "Unsupported", refs: ["context:request"] }], requests: [
+      { kind: "file", selector: "form.swift", question: "Read source", offset: 0 },
+    ] })), requestedUserDecision: "Confirm this fact" }
+    : answer(step({ questions: [], complete: true })), "codex");
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("not delivered");
+  expect(database.planning.latest("topic")!.responsePending).toBe(false);
+  const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+  expect(result.result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls).toHaveLength(2);
+});
+
+it("persists the final result atomically with clearing the replay marker", async () => {
+  const { repo, database, git } = setup("codex");
+  const fake = scripted(async () => answer(step({ questions: [], complete: true })), "codex");
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  const save = database.planning.save.bind(database.planning);
+  let interrupted = false;
+  const saving = vi.spyOn(database.planning, "save").mockImplementation(record => {
+    save(record);
+    if (!interrupted && record.step.complete) {
+      interrupted = true;
+      throw new Error("Interrupted after completed checkpoint save");
+    }
+  });
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Interrupted after completed checkpoint save");
+  saving.mockRestore();
+  const saved = database.planning.latest("topic")!;
+  expect(saved.finalized).toBe(true);
+  expect(saved.finalResult?.planMarkdown).toBe("Final navigation plan");
+  expect(saved.responsePending).toBe(false);
+  const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+  expect(result.result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls).toHaveLength(1);
 });
 
 it("does not replay an adopted citation response after a crash while saving its reads", async () => {
@@ -155,6 +302,7 @@ it("does not replay an adopted citation response after a crash while saving its 
   const saved = database.planning.latest("topic")!;
   saved.lastResponse = answer(step({ facts: [{ statement: "Unverified", refs: ["context:request"] }],
     requests: [{ kind: "file", selector: "form.swift", question: "Verify", offset: 0 }] }));
+  saved.responsePending = undefined;
   database.planning.save(saved);
   const save = database.planning.save.bind(database.planning);
   let interrupted = false;
@@ -187,6 +335,7 @@ it("keeps citation replay reads pending when the soft budget stops research", as
   const saved = database.planning.latest("topic")!;
   saved.lastResponse = answer(step({ facts: [{ statement: "Unverified", refs: ["context:request"] }],
     requests: [{ kind: "file", selector: "form.swift", question: "Verify", offset: 0 }] }));
+  saved.responsePending = undefined;
   database.planning.save(saved);
   const writeTree = git.writeWorkingTree.bind(git);
   let reads = 0;
@@ -221,6 +370,7 @@ it("counts unadopted delivered fragments as progress when replaying a paused res
   database.planning.recordDelivery(saved.sessionId!, saved.fragments);
   saved.lastResponse = answer(step({ facts: [{ statement: "Unverified", refs: ["context:request"] }],
     requests: [{ kind: "file", selector: "form.swift", question: "Continue read", offset: 100 }] }));
+  saved.responsePending = undefined;
   saved.stopped = "Checkpoint cites evidence that was not delivered.";
   database.planning.save(saved);
   const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
@@ -263,6 +413,7 @@ it("fulfills accepted read requests after a budget increase without repeating th
   const saved = database.planning.latest("topic")!;
   saved.step = step({ requests: [{ kind: "file", selector: "form.swift", question: "Continue after budget", offset: 0 }] });
   saved.stopped = "Planning checkpoint saved; insufficient remaining budget for synthesis.";
+  saved.responsePending = false;
   database.planning.save(saved);
   const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
   expect(result.result.planMarkdown).toBe("Final navigation plan");
@@ -284,6 +435,7 @@ it("retains deferred reads when recovery is interrupted before fragments are sav
   const saved = database.planning.latest("topic")!;
   saved.step = step({ requests: [{ kind: "file", selector: "form.swift", question: "Continue after budget", offset: 0 }] });
   saved.stopped = "Planning checkpoint saved; insufficient remaining budget for synthesis.";
+  saved.responsePending = false;
   database.planning.save(saved);
   const read = vi.spyOn(PlanningReader.prototype, "read").mockRejectedValueOnce(new Error("Interrupted read"));
   await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Interrupted read");
@@ -320,6 +472,7 @@ it("does not reserve an image when a later read in the same batch fails", async 
     { kind: "file", selector: "form.swift", question: "Inspect form", offset: 0 },
   ] });
   saved.stopped = "Planning checkpoint saved; insufficient remaining budget for synthesis.";
+  saved.responsePending = false;
   database.planning.save(saved);
   const read = vi.spyOn(PlanningReader.prototype, "read").mockRejectedValueOnce(new Error("Interrupted file read"));
   await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Interrupted file read");
@@ -605,6 +758,56 @@ it("public workflow retry preserves the epoch and blocks a malformed final resul
   expect(database.planning.latest("topic")?.sessions).toEqual(["claude-existing"]);
   expect(database.revisions.account("topic").used).toBe(0);
   expect(codex.calls).toHaveLength(0);
+  await engine.shutdown();
+});
+
+it.each([false, true])("public retry reuses a finalized first plan with prior-epoch artifact=%s", async hasPriorArtifact => {
+  const { root, repo, database, git } = setup();
+  database.updateTopic("topic", { state: "DRAFT" });
+  for (const role of ["claude", "codex"] as const) database.upsertParticipant("topic", {
+    role, sessionId: `${role}-existing`, mode: "attached", acknowledgedPlanSHA256: null,
+  });
+  const plan = REQUIRED_PLAN_HEADINGS.map(heading => `## ${heading}\n\nPlan${heading === "허용 오차" ? '\n```tolerance\n{"scopePaths":["**"],"rules":[]}\n```' : ""}`).join("\n\n");
+  const claude = scripted(async () => ({ ...answer(step({ questions: [], complete: true })), planMarkdown: plan }));
+  const codex = scripted(async () => { throw new Error("Stop after first plan recovery"); }, "codex");
+  const artifacts = new ArtifactStore(join(root, "artifacts"), database);
+  if (hasPriorArtifact) {
+    await artifacts.write("topic", "claude-plan", 1, "Prior epoch plan result");
+    database.updateTopic("topic", { planEpoch: 2 });
+  }
+  const previousArtifact = database.latestArtifact("topic", "claude-plan");
+  const write = artifacts.write.bind(artifacts);
+  let interrupted = false;
+  const writing = vi.spyOn(artifacts, "write").mockImplementation(async (...args) => {
+    if (args[1] === "claude-plan" && !interrupted) {
+      interrupted = true;
+      throw new Error("Interrupted before first plan artifact write");
+    }
+    return write(...args);
+  });
+  const engine = new WorkflowEngine({ database, git, artifacts,
+    claude: new BudgetController(database.budgets, () => ({ topicId: "topic", accounts: ["topic"],
+      stage: database.getTopic("topic").state }), async () => {}, database.revisions, true, database.reviews, database)
+      .wrap(guardedPlanning(claude.adapter, database, git)), codex: codex.adapter });
+  const settle = async () => {
+    const deadline = Date.now() + 5000;
+    while (database.runningAction("topic")) {
+      if (Date.now() > deadline) throw new Error("Workflow did not complete");
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+  };
+  engine.startPlan("topic"); await settle();
+  const epoch = database.getTopic("topic").planEpoch;
+  expect(database.getTopic("topic").state).toBe("FAILED");
+  expect(database.planning.latest("topic")!.finalized).toBe(true);
+  expect(database.latestArtifact("topic", "claude-plan")).toEqual(previousArtifact);
+  const usedBeforeRetry = database.revisions.account("topic").used;
+  writing.mockRestore();
+  engine.retry("topic"); await settle();
+  expect(database.getTopic("topic").planEpoch).toBe(epoch);
+  expect(claude.calls).toHaveLength(1);
+  expect(database.latestArtifact("topic", "claude-plan")!.revision).toBeGreaterThan(previousArtifact?.revision ?? 0);
+  expect(database.revisions.account("topic").used).toBe(usedBeforeRetry);
   await engine.shutdown();
 });
 

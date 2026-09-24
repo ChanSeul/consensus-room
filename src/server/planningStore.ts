@@ -1,11 +1,20 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import type { Topic } from "../shared/contracts.js";
+import type { TimelineEvent, Topic } from "../shared/contracts.js";
 import type { PlanningCheckpoint, PlanningFragment, PlanningMigration } from "../shared/planningControl.js";
 
 export const planningHash = (value: string) => createHash("sha256").update(value).digest("hex");
 export function planningKey(topic: Topic, role: string, prompt: string): string {
   return planningHash(JSON.stringify([topic.id, topic.scopeGeneration, topic.planEpoch, topic.planSHA256, topic.state, role, prompt]));
+}
+
+export function recoverableFinalizedFirstPlan(
+  record: PlanningCheckpoint | null, topic: Topic, timeline: readonly TimelineEvent[],
+): boolean {
+  return Boolean(record?.finalized && record.finalResult && record.stage === "CLAUDE_PLAN" && record.role === "claude" &&
+    !topic.planSHA256 && record.scopeGeneration === topic.scopeGeneration && record.planEpoch === topic.planEpoch &&
+    record.planSHA256 === topic.planSHA256 && !timeline.some(event => event.sequence > record.inputSequence &&
+      event.actor === "user" && ["decision", "evidence", "scope_change"].includes(event.kind)));
 }
 
 export class PlanningStore {

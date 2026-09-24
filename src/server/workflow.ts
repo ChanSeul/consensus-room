@@ -27,6 +27,7 @@ import { EngineCore, type MaintenanceLockOwner } from "./engine/core.js";
 import { PlanningPipeline } from "./engine/planning.js";
 import { DeliveryPipeline } from "./engine/delivery.js";
 import { UsageLimitRetryScheduler, type RetryClock } from "./engine/usageLimitRetry.js";
+import { recoverableFinalizedFirstPlan } from "./planningStore.js";
 
 // 호출 주체 — 브라우저 사용자(기본)와 중재 세션(x-consensus-actor: mediator, 위임 스위치 on 일 때만). 이벤트 payload 에 남긴다(D03).
 import type { DiagnosisInput, DiagnosisRecord } from "../shared/diagnoses.js";
@@ -305,7 +306,9 @@ export class WorkflowEngine {
       }, actionId);
     }
     const planningCheckpoint = this.core.dependencies.database.planning.latest(topicId);
-    if (resume === "CLAUDE_PLAN" && planningCheckpoint && !planningCheckpoint.finalized &&
+    if (resume === "CLAUDE_PLAN" && planningCheckpoint &&
+        (!planningCheckpoint.finalized || (topic.state === "FAILED" && recoverableFinalizedFirstPlan(
+          planningCheckpoint, topic, this.core.dependencies.database.getTimeline(topicId)))) &&
         planningCheckpoint.stage === resume && planningCheckpoint.scopeGeneration === topic.scopeGeneration &&
         planningCheckpoint.planEpoch === topic.planEpoch && planningCheckpoint.planSHA256 === topic.planSHA256) {
       return this.core.startAction(topicId, "retry", async signal => {

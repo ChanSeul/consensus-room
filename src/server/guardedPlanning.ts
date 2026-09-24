@@ -9,7 +9,7 @@ import { PLANNING_LIMITS as LIMIT, PLANNING_METRIC_KEYS, PlanningPaused, Plannin
 import type { ConsensusDatabase } from "./database.js";
 import type { GitService } from "./git.js";
 import type { AgentAdapter, SessionTurn, TurnUsage } from "./types.js";
-import { planningHash, planningKey } from "./planningStore.js";
+import { planningHash, planningKey, recoverableFinalizedFirstPlan } from "./planningStore.js";
 import { PlanningReader } from "./planningReader.js";
 import { ProjectMemoryReader } from "./projectMemory.js";
 import { readAppliedInstructions } from "./projectInstructions.js";
@@ -31,8 +31,10 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
     const keepSession = adapter.role === "codex" || database.planning.continuityEnabled(topic.id);
     const packetLimit = planningPacketLimit(topic.state);
     const latest = database.planning.latest(topic.id);
+    const finalizedFirstPlanRecovery = topic.state === "CLAUDE_PLAN" &&
+      recoverableFinalizedFirstPlan(latest, topic, database.getTimeline(topic.id));
     let newInput = false;
-    if (latest && !latest.finalized && latest.stage === topic.state && latest.role === adapter.role &&
+    if (latest && (!latest.finalized || finalizedFirstPlanRecovery) && latest.stage === topic.state && latest.role === adapter.role &&
         latest.scopeGeneration === topic.scopeGeneration && latest.planEpoch === topic.planEpoch && latest.planSHA256 === topic.planSHA256) {
       const updates = database.getTimeline(topic.id).filter(e => e.sequence > latest.inputSequence &&
         e.actor === "user" && ["decision", "evidence"].includes(e.kind));
@@ -120,20 +122,28 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
     }
     const manifest = [...docs].map(([id, text]) => ({ id, hash: planningHash(text), bytes: bytes(text) }));
     const sourceHash = planningHash(JSON.stringify(manifest));
-    const sourceChanged = Boolean(record.tree && (record.tree !== tree || record.evidenceDigest !== state.digest ||
+    const sourceChanged = Boolean(record.tree && (newInput || record.tree !== tree || record.evidenceDigest !== state.digest ||
         record.instructionHash !== instructionHash || record.sourceHash !== sourceHash));
     if (sourceChanged) {
       database.planning.archive(record);
       // Preserve the logical attempt, review session, counters and usage. Unverified old facts cannot approve a changed source.
       record.step = { draft: "", facts: [], contradictions: [], questions: ["Sources changed. Revalidate the plan against the pinned sources."], requests: [], complete: false };
       record.fragments = []; record.delivered = []; record.imageHash = undefined;
+      record.lastResponse = undefined; record.responsePending = false;
       record.finalized = false; record.finalResult = undefined;
     }
     record.tree = tree; record.evidenceDigest = state.digest; record.instructionHash = instructionHash; record.sourceHash = sourceHash;
     // A retry rechecks the same limits. It never grants budget or resets a round/session counter.
-    const replayResponse = !newInput && !sourceChanged && record.stopped === "Checkpoint cites evidence that was not delivered."
+    const pendingCitationReads = record.responsePending === undefined && record.stopped === "Checkpoint cites evidence that was not delivered."
+      && record.lastResponse?.planningStep?.complete === false && record.lastResponse.planningStep.requests.length;
+    const pausedBeforeAdoption = record.stopped === "Planning binding changed; preserved checkpoint is not an approved plan.";
+    // Older checkpoints predate responsePending. A changed request list identifies the known pre-adoption pause.
+    const legacyUnadoptedReads = record.responsePending === undefined && record.lastResponse?.planningStep?.complete === false
+      && record.lastResponse.planningStep.requests.length > 0
+      && JSON.stringify(record.lastResponse.planningStep.requests) !== JSON.stringify(record.step.requests);
+    const replayResponse = !newInput && !sourceChanged && (record.responsePending === true || pendingCitationReads ||
+      (pausedBeforeAdoption && legacyUnadoptedReads))
       && record.lastResponse && PlanningStepSchema.safeParse(record.lastResponse.planningStep).success
-      && record.lastResponse.planningStep?.complete === false && record.lastResponse.planningStep.requests.length
       ? record.lastResponse : null;
     docs.set("context:manifest", JSON.stringify(manifest));
     const reader = new PlanningReader(turn.cwd, tree, docs);
@@ -217,31 +227,35 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
       record.imageHash = pendingImageHash; record.fragments = fragments; save();
     };
     const acceptStep = async (result: AgentResult, finalizing: boolean, replayProgress = false): Promise<AgentResult | null> => {
+      const rejectResponse = (message: string): never => { record.responsePending = false; return pause(message); };
       const parsed = PlanningStepSchema.safeParse(result.planningStep);
-      if (!parsed.success) pause("Invalid planning checkpoint; the response was preserved for mediation.");
+      if (!parsed.success) rejectResponse("Invalid planning checkpoint; the response was preserved for mediation.");
       let step = parsed.data!;
-      if (bytes(step) > LIMIT.checkpointBytes) pause("Planning checkpoint exceeds its output limit; the response was preserved for mediation.");
+      if (bytes(step) > LIMIT.checkpointBytes) rejectResponse("Planning checkpoint exceeds its output limit; the response was preserved for mediation.");
       const known = new Set([...record.delivered, ...record.fragments.map(f => f.id)]);
       const supportedFacts = step.facts.filter(f => f.refs.every(ref => known.has(ref)));
       if (supportedFacts.length !== step.facts.length) {
-        if (step.complete || result.requestedUserDecision || !step.requests.length) pause("Checkpoint cites evidence that was not delivered.");
+        if (step.complete || result.requestedUserDecision || !step.requests.length) rejectResponse("Checkpoint cites evidence that was not delivered.");
         // Intermediate reads are still useful; discard unverified claims before retaining the checkpoint.
         step = { ...step, facts: supportedFacts,
           questions: [...new Set([...step.questions, "Restate unverified facts using the returned fragment IDs."])] };
-        if (bytes(step) > LIMIT.checkpointBytes) pause("Planning checkpoint exceeds its output limit; the response was preserved for mediation.");
+        if (bytes(step) > LIMIT.checkpointBytes) rejectResponse("Planning checkpoint exceeds its output limit; the response was preserved for mediation.");
       }
+      if (step.complete && (step.questions.length || step.requests.length)) rejectResponse("Incomplete planning cannot be submitted as a final plan.");
       const progressed = replayProgress || record.fragments.some(f => !record.delivered.includes(f.id)) ||
         step.facts.length > record.step.facts.length || step.questions.length < record.step.questions.length;
       record.stalled = progressed ? 0 : record.stalled + 1;
       record.delivered = [...known]; record.step = step; record.fragments = []; record.imageHash = undefined;
+      record.responsePending = false;
       record.stopped = !step.complete && !result.requestedUserDecision && step.requests.length ? PENDING_READS : null;
-      save();
       if (step.complete || result.requestedUserDecision) {
-        if (step.complete && (step.questions.length || step.requests.length)) pause("Incomplete planning cannot be submitted as a final plan.");
         const { planningStep: _step, ...finalResult } = result;
-        record.finalized = true; record.finalResult = finalResult; save();
+        record.finalized = true; record.finalResult = finalResult;
+      }
+      save();
+      if (record.finalResult && record.finalized) {
         emitFinal();
-        return finalResult;
+        return record.finalResult;
       }
       if (finalizing) pause("Synthesis did not produce a complete plan; checkpoint retained.");
       if (softLimit() || record.round >= LIMIT.rounds) return null;
@@ -375,7 +389,8 @@ Checkpoint must fit ${LIMIT.checkpointBytes} UTF-8 bytes. Final result must sati
         }
         if (keepSession && record.sessionId) database.planning.recordDelivery(record.sessionId, record.fragments);
         record.deliveredContractHash = contractHash;
-        record.lastResponse = result; record.responseBytes = (record.responseBytes ?? 0) + bytes(result); save();
+        record.lastResponse = result; record.responsePending = true;
+        record.responseBytes = (record.responseBytes ?? 0) + bytes(result); save();
         await assertCurrent();
         if (record.usageIncomplete) pause("Usage is incomplete; checkpoint saved before another model call.");
         const adopted = await acceptStep(result, finalizing);
