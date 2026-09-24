@@ -9,6 +9,8 @@ import { ConsensusDatabase } from "../src/server/database";
 import { GitService } from "../src/server/git";
 import type { AgentAdapter, CommandRunner, ProjectMemoryWriter } from "../src/server/types";
 import { EngineCore, FormatViolation, isFormatOnlyViolation } from "../src/server/engine/core";
+import { resumedPlanTimeline } from "../src/server/engine/planning";
+import { buildClaudePlanPrompt } from "../src/shared/prompts";
 import { WorkflowEngine } from "../src/server/workflow";
 import { parseTolerancePolicy, ToleranceFormatError } from "../src/shared/tolerance";
 import { REQUIRED_PLAN_HEADINGS, type AgentResult } from "../src/shared/contracts";
@@ -490,6 +492,39 @@ describe("완료 상태 주제 보호", () => {
 });
 
 describe("가짜 에이전트 전체 계획 왕복", () => {
+  it("같은 세션의 승인 대기 계획을 다시 세울 때 직전 계획과 새 결정만 보낸다", async () => {
+    const priorSHA = "a".repeat(64);
+    const { database, engine } = makeEngine("DRAFT", null);
+    database.planning.enable("topic-1");
+    database.updateTopic("topic-1", { state: "AWAITING_USER_APPROVAL", planSHA256: priorSHA });
+    database.planning.bindSession(database.getTopic("topic-1"), priorSHA, "claude-session", 0);
+    database.appendEvent({ topicId: "topic-1", actor: "user", kind: "decision", state: "DRAFT",
+      body: "OLD_TIMELINE_MARKER 첫 정책", payload: {} });
+    await engine.postMessage("topic-1", "decision", "NEW_TIMELINE_MARKER 로그인 때 다른 계정 초안을 지운다");
+    const topic = database.getTopic("topic-1");
+    database.appendEvent({ topicId: "topic-1", actor: "user", kind: "decision", state: "DRAFT",
+      body: "SECOND_NEW_DECISION 계정 삭제 직후 자동저장을 막는다",
+      payload: { invalidatedPlanSHA256: priorSHA, planEpoch: topic.planEpoch } });
+    const fullTimeline = database.getPromptTimeline("topic-1", topic.scopeGeneration);
+    expect(database.planning.continuesPriorPlan(topic, priorSHA)).toBe(true);
+    const selected = resumedPlanTimeline(fullTimeline, "PREVIOUS_PLAN",
+      database.planning.continuesPriorPlan(topic, priorSHA), topic.planEpoch);
+    const replanPrompt = buildClaudePlanPrompt({ title: topic.title, worktreePath: topic.worktreePath,
+      sourceRepositoryPath: topic.repositoryPath, baseRef: topic.baseRef, scopeGeneration: topic.scopeGeneration,
+      timeline: selected, previousPlanMarkdown: "PREVIOUS_PLAN" });
+    expect(replanPrompt).toContain("PREVIOUS_PLAN");
+    expect(replanPrompt).toContain("NEW_TIMELINE_MARKER");
+    expect(replanPrompt).toContain("SECOND_NEW_DECISION");
+    expect(replanPrompt).not.toContain("OLD_TIMELINE_MARKER");
+    database.upsertParticipant("topic-1", { role: "claude", sessionId: "replacement-session", mode: "attached",
+      acknowledgedPlanSHA256: null });
+    const replaced = database.getTopic("topic-1");
+    expect(database.planning.continuesPriorPlan(replaced, priorSHA)).toBe(false);
+    expect(resumedPlanTimeline(fullTimeline, "PREVIOUS_PLAN",
+      database.planning.continuesPriorPlan(replaced, priorSHA), replaced.planEpoch)).toEqual(fullTimeline);
+    database.close();
+  });
+
   // 메모리 쓰기 실패가 saveAgentOutput보다 앞에 있어서, 스냅샷 충돌 하나로 방금 끝난 계획·감사·구현 턴이
   // 통째로 사라졌다(2026-08-30 발견). 메모리는 부산물이므로 실패해도 턴 결과는 남아야 한다.
   it("메모리 쓰기가 실패해도 에이전트 턴 결과를 버리지 않고 사유를 남긴다", async () => {

@@ -108,6 +108,15 @@ export class PlanningStore {
       binding.planSHA256 === topic.planSHA256 && binding.sessionId === topic.participants.find(p => p.role === "claude")?.sessionId
       ? { sessionId: binding.sessionId, inputSequence: binding.inputSequence } : null;
   }
+  continuesPriorPlan(topic: Topic, previousPlanSHA256: string): boolean {
+    if (!this.continuityEnabled(topic.id)) return false;
+    const row = this.db.prepare("SELECT record_json FROM planning_sessions WHERE topic_id=?").get(topic.id);
+    if (!row) return false;
+    const binding = JSON.parse(String(row.record_json));
+    return binding.scopeGeneration === topic.scopeGeneration && binding.planEpoch === topic.planEpoch - 1 &&
+      binding.planSHA256 === previousPlanSHA256 &&
+      binding.sessionId === topic.participants.find(p => p.role === "claude")?.sessionId;
+  }
   fragment(key: string): PlanningFragment | null {
     const row = this.db.prepare("SELECT record_json FROM planning_fragments WHERE key=?").get(key);
     return row ? JSON.parse(String(row.record_json)) : null;

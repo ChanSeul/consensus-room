@@ -1,7 +1,7 @@
 import { normalizeToleranceBlocks } from "../../shared/tolerance.js";
 // 계획 수렴 파이프라인: CLAUDE_PLAN → CODEX_AUDIT → CLAUDE_REVISION → CODEX_CLOSEOUT → CONSENSUS_ACK.
 // 각 단계의 검증 순서(검증 → 메모리 반영 → pause → 저장)가 이 파일의 계약이다.
-import { type AgentResult, type Topic, AgentResultSchema, type Finding } from "../../shared/contracts.js";
+import { type AgentResult, type Topic, type TimelineEvent, AgentResultSchema, type Finding } from "../../shared/contracts.js";
 import {
   buildClaudePlanPrompt,
   buildClaudeRevisionPrompt,
@@ -31,6 +31,14 @@ import { preparePlanningContext } from "./planningContext.js";
 
 const IMPLEMENTATION_NOTE_PREFIX = "구현 노트로 승계(엔진 자동, 개정 생략): ";
 
+export function resumedPlanTimeline(timeline: readonly TimelineEvent[], previousPlanMarkdown: string | null,
+  continuousSession: boolean, planEpoch: number): readonly TimelineEvent[] {
+  if (!previousPlanMarkdown || !continuousSession) return timeline;
+  const invalidationIndex = timeline.findIndex(event =>
+    event.payload?.invalidatedPlanSHA256 && event.payload?.planEpoch === planEpoch);
+  return invalidationIndex >= 0 ? timeline.slice(invalidationIndex) : timeline;
+}
+
 export class PlanningPipeline {
   constructor(private readonly core: EngineCore) {}
 
@@ -41,11 +49,18 @@ export class PlanningPipeline {
     topic = this.core.transition(topicId, "CLAUDE_PLAN", "Claude가 첫 계획을 작성합니다.");
     // 재시작(closeout 신규 쟁점 → DRAFT)이면 직전 계획 전문을 프롬프트에 그대로 싣는다 — 새 세션은 타임라인만 받아 본문을 잃는다.
     const previousPlanMarkdown = await this.core.dependencies.artifacts.readLatest(topicId, "plan");
+    const fullTimeline = this.core.dependencies.database.getPromptTimeline(topicId, topic.scopeGeneration);
+    // 승인 대기 중 새 결정으로 계획만 무효화한 경우, 직전 계획 전문과 그 계획을 만든
+    // 이전 대화를 함께 다시 싣지 않는다. 무효화 결정 이후만 보내되 직전 계획은 보존한다.
+    const continuousSession = previousPlanMarkdown
+      ? this.core.dependencies.database.planning.continuesPriorPlan(topic, hashPlan(previousPlanMarkdown))
+      : false;
+    const timeline = resumedPlanTimeline(fullTimeline, previousPlanMarkdown, continuousSession, topic.planEpoch);
     const claudePlan = await this.core.turn("claude", topic, buildClaudePlanPrompt({
       title: topic.title, worktreePath: topic.worktreePath, sourceRepositoryPath: topic.repositoryPath,
       baseRef: topic.baseRef,
       scopeGeneration: topic.scopeGeneration,
-      timeline: this.core.dependencies.database.getPromptTimeline(topicId, topic.scopeGeneration),
+      timeline,
       previousPlanMarkdown,
       deferredFindings: await this.core.deferredFindingsFor(topicId),
     }), signal, false, {
