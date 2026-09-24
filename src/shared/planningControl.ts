@@ -17,12 +17,13 @@ export function planningPacketLimit(stage: string): number {
     ? PLANNING_LIMITS.reviewPromptBytes : PLANNING_LIMITS.promptBytes;
 }
 
+const RereadReasonSchema = z.string().trim().min(1).max(500);
 export const PlanningReadSchema = z.object({
   kind: z.enum(["file", "search", "evidence", "memory", "context", "artifact", "image"]),
   selector: z.string().min(1).max(1024),
   question: z.string().min(1).max(500),
   offset: z.number().int().nonnegative(),
-  rereadReason: z.string().trim().min(1).max(500).optional(),
+  rereadReason: RereadReasonSchema.nullish(),
 }).strict();
 export type PlanningRead = z.infer<typeof PlanningReadSchema>;
 export const PlanningStepSchema = z.object({
@@ -35,6 +36,10 @@ export const PlanningStepSchema = z.object({
 }).strict();
 export type PlanningStep = z.infer<typeof PlanningStepSchema>;
 export const PlanningStepJsonSchema = z.toJSONSchema(PlanningStepSchema);
+// Codex structured outputs require every object property. Null means the optional reread reason is absent.
+export const CodexPlanningStepJsonSchema = z.toJSONSchema(PlanningStepSchema.safeExtend({
+  requests: z.array(PlanningReadSchema.safeExtend({ rereadReason: RereadReasonSchema.nullable() })).max(PLANNING_LIMITS.requests),
+}));
 
 export interface PlanningFragment {
   id: string;

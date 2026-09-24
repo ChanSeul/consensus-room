@@ -2,7 +2,7 @@ import {ReviewAllowanceSchema,ReviewScopeSchema} from "./reviews.js";
 import { type BudgetAccount } from "./budgets.js";
 import { RevisionAllowanceSchema } from "./revisions.js";
 import { z } from "zod";
-import { PlanningStepSchema, PlanningStepJsonSchema } from "./planningControl.js";
+import { PlanningStepSchema, PlanningStepJsonSchema, CodexPlanningStepJsonSchema } from "./planningControl.js";
 import { ToleranceLedgerEntrySchema } from "./tolerance";
 
 // 확인 입력 분할과 응답 스키마가 같은 호출당 상한을 쓴다.
@@ -531,6 +531,11 @@ export const PlanningAgentResultJsonSchema = {
   ...AgentResultJsonSchema,
   required: [...AgentResultJsonSchema.required, "planningStep"],
   properties: { ...AgentResultJsonSchema.properties, planningStep: PlanningStepJsonSchema },
+} as const;
+
+export const CodexPlanningAgentResultJsonSchema = {
+  ...PlanningAgentResultJsonSchema,
+  properties: { ...PlanningAgentResultJsonSchema.properties, planningStep: CodexPlanningStepJsonSchema },
 } as const;
 
 export const REQUIRED_PLAN_HEADINGS = [

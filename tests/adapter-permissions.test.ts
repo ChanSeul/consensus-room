@@ -9,6 +9,7 @@ import { CodexAdapter } from "../src/server/adapters/codex";
 import type { CommandResult, CommandRunner, CommandSpec, TurnUsage } from "../src/server/types";
 import { agentEnvironment } from "../src/server/security";
 import { DEFAULT_AGENT_SETTINGS } from "../src/shared/contracts";
+import { PlanningStepSchema } from "../src/shared/planningControl";
 
 const planResult = {
   kind: "PLAN",
@@ -109,7 +110,25 @@ describe("에이전트별 권한 경계", () => {
     }
     expect(codex.calls[0].stdin).toContain("KEEP_CODEX_INSTRUCTIONS");
     expect(codex.calls[0].args).toContain(image);
-    expect(codex.calls[0].args[codex.calls[0].args.indexOf("--output-schema") + 1]).toContain(".planning.json");
+    const schemaPath = codex.calls[0].args[codex.calls[0].args.indexOf("--output-schema") + 1];
+    expect(schemaPath).toContain(".planning.json");
+    const schema = JSON.parse(readFileSync(schemaPath, "utf8"));
+    const assertStrictObjects = (value: unknown): void => {
+      if (!value || typeof value !== "object") return;
+      const object = value as Record<string, unknown>;
+      if (object.properties) {
+        expect(object.additionalProperties).toBe(false);
+        expect(new Set(object.required as string[])).toEqual(new Set(Object.keys(object.properties as object)));
+      }
+      for (const child of Object.values(object)) assertStrictObjects(child);
+    };
+    assertStrictObjects(schema);
+    const request = schema.properties.planningStep.properties.requests.items;
+    expect(request.required).toContain("rereadReason");
+    expect(request.properties.rereadReason.anyOf).toContainEqual({ type: "null" });
+    expect(PlanningStepSchema.safeParse({ draft: "", facts: [], contradictions: [], questions: [],
+      requests: [{ kind: "file", selector: "form.swift", question: "Check", offset: 0, rereadReason: null }],
+      complete: false }).success).toBe(true);
   });
 
   it("rejects the final composed planning input including instructions before spawning either CLI", async () => {

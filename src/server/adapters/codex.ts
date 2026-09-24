@@ -7,7 +7,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
   AgentResultJsonSchema,
-  PlanningAgentResultJsonSchema,
+  CodexPlanningAgentResultJsonSchema,
   DEFAULT_AGENT_SETTINGS,
   type AgentResult,
 } from "../../shared/contracts.js";
@@ -200,7 +200,7 @@ export class CodexAdapter implements AgentAdapter {
     // Separate immutable contents prevent parallel normal/controlled topics from replacing each other's schema.
     const schemaPath = turn.planningControl ? `${this.schemaPath}.planning.json` : this.schemaPath;
     const schemaTemp = `${schemaPath}.${randomUUID()}.tmp`;
-    await writeFile(schemaTemp, JSON.stringify(turn.planningControl ? PlanningAgentResultJsonSchema : AgentResultJsonSchema, null, 2), { mode: 0o600 });
+    await writeFile(schemaTemp, JSON.stringify(turn.planningControl ? CodexPlanningAgentResultJsonSchema : AgentResultJsonSchema, null, 2), { mode: 0o600 });
     await rename(schemaTemp, schemaPath);
     commandArgs = commandArgs.map(arg => arg === this.schemaPath ? schemaPath : arg);
     if (turn.planningControl?.image) commandArgs.splice(commandArgs.length - 1, 0, "--image", turn.planningControl.image.path);
