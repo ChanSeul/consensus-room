@@ -313,8 +313,10 @@ Checkpoint must fit ${LIMIT.checkpointBytes} UTF-8 bytes. Final result must sati
         let packetBytes = bytes([EXECUTION_POLICY_NOTE, ...instructionBlocks, prompt].join("\n\n"));
         if (adapter.role === "codex" && record.sessionId) {
           const context = database.planning.sessionContext(record.sessionId);
+          // Closeout must carry the revised plan into the same review session after the initial audit.
+          const historyLimit = topic.state === "CODEX_CLOSEOUT" ? LIMIT.closeoutHistoryBytes : LIMIT.reviewHistoryBytes;
           if (!context.known) pause("Reviewer context is unknown or exceeds the host history limit; the review session and its findings were preserved for mediation.");
-          if (context.bytes + packetBytes > LIMIT.reviewHistoryBytes && instructionsInSession &&
+          if (context.bytes + packetBytes > historyLimit && instructionsInSession &&
               task !== turn.prompt && record.lastResponse && !record.responsePending && !record.finalAttempted &&
               JSON.stringify(record.step) === JSON.stringify(record.lastResponse.planningStep)) {
             if (!canFinalize()) pause("Planning checkpoint saved; insufficient remaining budget for synthesis.");
@@ -326,7 +328,7 @@ Checkpoint must fit ${LIMIT.checkpointBytes} UTF-8 bytes. Final result must sati
               `Snapshot ${tree}; evidence ${state.digest}\nFragments: ${JSON.stringify(record.fragments)}`;
             packetBytes = bytes([EXECUTION_POLICY_NOTE, ...instructionBlocks, prompt].join("\n\n"));
           }
-          if (context.bytes + packetBytes > LIMIT.reviewHistoryBytes) {
+          if (context.bytes + packetBytes > historyLimit) {
             pause("Reviewer context is unknown or exceeds the host history limit; the review session and its findings were preserved for mediation.");
           }
         }

@@ -315,6 +315,26 @@ it("does not omit a contract repair question from a compact final review", async
   expect(database.planning.latest("topic")!.finalAttempted).toBe(false);
 });
 
+it("carries a revised closeout into the existing reviewer session after the audit history cap", async () => {
+  const { repo, database, git } = setup("codex");
+  writeFileSync(join(repo, "AGENTS.md"), "Mandatory project rule.\n".repeat(700));
+  const fake = scripted(async () => answer(step({ questions: [], complete: true })), "codex");
+  const wrapped = guardedPlanning(fake.adapter, database, git);
+  await wrapped.createSession({ cwd: repo, prompt: "Audit the first plan" });
+  const audit = database.planning.latest("topic")!;
+  audit.injectedBytes = PLANNING_LIMITS.reviewHistoryBytes + 12_000;
+  database.planning.save(audit);
+  database.updateTopic("topic", { state: "CODEX_CLOSEOUT" });
+  const revisedPlan = "Revised plan: " + "scope and validation. ".repeat(1450);
+  const result = await wrapped.resumeTurn({ cwd: repo, prompt: revisedPlan, sessionId: "session-1" });
+  expect(result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls).toHaveLength(2);
+  expect(fake.calls[1]).toMatchObject({ sessionId: "session-1" });
+  expect(fake.calls[1].planningControl?.instructionsInSession).toBe(false);
+  expect(fake.calls[1].prompt).toContain(revisedPlan);
+  expect(database.planning.latest("topic")!.finalized).toBe(true);
+});
+
 it.each(["unsupported citation", "oversized checkpoint"])("requests a corrected response after rejecting an %s", async reason => {
   const { repo, database, git } = setup("codex");
   const fake = scripted(async (_turn, n) => {

@@ -8,6 +8,7 @@ export type PlanningMigration = z.infer<typeof PlanningMigrationSchema>;
 
 export const PLANNING_LIMITS = {
   promptBytes: 64 * 1024, reviewPromptBytes: 96 * 1024, reviewHistoryBytes: 256 * 1024,
+  closeoutHistoryBytes: 384 * 1024,
   fragmentBytes: 8 * 1024, batchBytes: 24 * 1024,
   checkpointBytes: 12 * 1024, requests: 4, rounds: 8, stalledRounds: 2,
 } as const;
