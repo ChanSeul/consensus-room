@@ -9,6 +9,7 @@ import { BudgetBlocked, type BudgetLedger } from "./budgetLedger.js";
 import type { ConsensusDatabase } from "./database.js";
 import { planningKey } from "./planningStore.js";
 import { GUARDED_STAGES } from "./guardedPlanning.js";
+import { planningPacketLimit } from "../shared/planningControl.js";
 
 interface Context { topicId: string; accounts: string[]; stage: string; }
 // All model methods pass through this boundary, including direct delivery/correction calls.
@@ -40,7 +41,7 @@ export class BudgetController {
       latest.scopeGeneration === topic?.scopeGeneration && latest.planEpoch === topic.planEpoch && latest.planSHA256 === topic.planSHA256 ? latest : null;
     const saved = continued ?? (guarded ? this.database!.planning.get(planningKey(topic!, role, turn.prompt)) : null);
     const admissionId = saved?.admissionId ?? id;
-    const preparedTurn = guarded ? { ...turn, planningControl: { admissionId, maxPromptBytes: 64 * 1024 } } : turn;
+    const preparedTurn = guarded ? { ...turn, planningControl: { admissionId, maxPromptBytes: planningPacketLimit(ctx.stage) } } : turn;
     if(!this.budgetsEnabled) {
       if(review)this.reviews?.admit(ctx.topicId,admissionId,review);
       if(kind)this.revisions?.admit(ctx.topicId,admissionId,kind);

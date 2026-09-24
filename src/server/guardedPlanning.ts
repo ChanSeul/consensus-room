@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { DESIGN_PLANNING_CONTRACT, EXECUTION_POLICY_NOTE } from "../shared/prompts.js";
 import type { AgentResult } from "../shared/contracts.js";
-import { PLANNING_LIMITS as LIMIT, PLANNING_METRIC_KEYS, PlanningPaused, PlanningStepSchema,
+import { PLANNING_LIMITS as LIMIT, PLANNING_METRIC_KEYS, PlanningPaused, PlanningStepSchema, planningPacketLimit,
   type PlanningCheckpoint, type PlanningFragment, type PlanningUsage, type PlanningMetrics } from "../shared/planningControl.js";
 import type { ConsensusDatabase } from "./database.js";
 import type { GitService } from "./git.js";
@@ -29,6 +29,7 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
         : adapter.createSession(turn);
     }
     const keepSession = adapter.role === "codex" || database.planning.continuityEnabled(topic.id);
+    const packetLimit = planningPacketLimit(topic.state);
     const latest = database.planning.latest(topic.id);
     let newInput = false;
     if (latest && !latest.finalized && latest.stage === topic.state && latest.role === adapter.role &&
@@ -289,12 +290,12 @@ Checkpoint must fit ${LIMIT.checkpointBytes} UTF-8 bytes. Final result must sati
           `Manifest: ${bytes(manifest) <= 4096 ? JSON.stringify(manifest) : "Read context:manifest in chunks."}\n` +
           `Checkpoint: ${JSON.stringify(record.step)}\nFragments: ${JSON.stringify(record.fragments)}`;
         const packetBytes = bytes([EXECUTION_POLICY_NOTE, ...instructions.blocks, prompt].join("\n\n"));
-        if (packetBytes > LIMIT.promptBytes) {
+        if (packetBytes > packetLimit) {
           pause("Mandatory task, instructions and checkpoint exceed the planning packet limit; mediator must narrow the contract.");
         }
         if (adapter.role === "codex" && record.sessionId) {
           const context = database.planning.sessionContext(record.sessionId);
-          if (!context.known || context.bytes + packetBytes > LIMIT.promptBytes) {
+          if (!context.known || context.bytes + packetBytes > LIMIT.reviewHistoryBytes) {
             pause("Reviewer context is unknown or exceeds the host history limit; the review session and its findings were preserved for mediation.");
           }
         }
@@ -345,7 +346,7 @@ Checkpoint must fit ${LIMIT.checkpointBytes} UTF-8 bytes. Final result must sati
         }
         const { sessionId: _previousSession, ...roundBase } = turn as SessionTurn;
         const roundTurn: Omit<SessionTurn, "sessionId"> = { ...roundBase, prompt, planMode: false,
-          planningControl: { admissionId: record.admissionId, maxPromptBytes: LIMIT.promptBytes, image }, evidenceManaged: true,
+          planningControl: { admissionId: record.admissionId, maxPromptBytes: packetLimit, image }, evidenceManaged: true,
           readablePaths: image ? [image.path] : [],
           onUsage, onProcessSpawn: process => {
             record.stopped = null;

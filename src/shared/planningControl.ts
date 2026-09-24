@@ -7,9 +7,15 @@ export const PlanningMigrationSchema = z.object({
 export type PlanningMigration = z.infer<typeof PlanningMigrationSchema>;
 
 export const PLANNING_LIMITS = {
-  promptBytes: 64 * 1024, fragmentBytes: 8 * 1024, batchBytes: 24 * 1024,
+  promptBytes: 64 * 1024, reviewPromptBytes: 96 * 1024, reviewHistoryBytes: 256 * 1024,
+  fragmentBytes: 8 * 1024, batchBytes: 24 * 1024,
   checkpointBytes: 12 * 1024, requests: 4, rounds: 8, stalledRounds: 2,
 } as const;
+
+export function planningPacketLimit(stage: string): number {
+  return stage === "CODEX_AUDIT" || stage === "CODEX_CLOSEOUT"
+    ? PLANNING_LIMITS.reviewPromptBytes : PLANNING_LIMITS.promptBytes;
+}
 
 export const PlanningReadSchema = z.object({
   kind: z.enum(["file", "search", "evidence", "memory", "context", "artifact", "image"]),

@@ -379,6 +379,35 @@ it("rejects an oversized mandatory prompt before any model call and preserves a 
   expect(database.planning.latest("topic")!.finalized).toBe(false);
 });
 
+it("admits a complete large Codex audit contract with mandatory instructions and reuses its session", async () => {
+  const { repo, database, git } = setup("codex");
+  writeFileSync(join(repo, "AGENTS.md"), "Keep this mandatory rule.\n".repeat(800));
+  execFileSync("git", ["-C", repo, "add", "AGENTS.md"]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "instructions"]);
+  const contract = "AUDIT_CONTRACT_START" + "x".repeat(44_000) + "AUDIT_CONTRACT_END";
+  const fake = scripted(async (_turn, n) => answer(n === 1 ? step({ requests: [
+    { kind: "file", selector: "form.swift", question: "Check navigation", offset: 0 },
+  ] }) : step({ questions: [], complete: true })), "codex");
+  const wrapped = new BudgetController(database.budgets, () => ({ topicId: "topic", accounts: ["topic"], stage: "CODEX_AUDIT" }),
+    async () => {}, database.revisions, true, database.reviews, database).wrap(guardedPlanning(fake.adapter, database, git));
+  await wrapped.createSession({ cwd: repo, prompt: contract });
+  expect(fake.calls).toHaveLength(2);
+  expect(fake.calls[0].prompt).toContain(contract);
+  expect(fake.calls[0].planningControl?.maxPromptBytes).toBe(PLANNING_LIMITS.reviewPromptBytes);
+  expect(fake.calls[1]).toMatchObject({ sessionId: "session-1" });
+  expect(fake.calls[1].prompt).not.toContain(contract);
+  expect(database.planning.latest("topic")?.finalized).toBe(true);
+});
+
+it("still rejects a Codex audit packet above its larger review limit before a model call", async () => {
+  const { repo, database, git } = setup("codex");
+  const fake = scripted(async () => answer(step({ questions: [], complete: true })), "codex");
+  await expect(guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo,
+    prompt: "x".repeat(PLANNING_LIMITS.reviewPromptBytes + 1) })).rejects.toThrow("packet limit");
+  expect(fake.calls).toHaveLength(0);
+  expect(database.planning.latest("topic")?.finalized).toBe(false);
+});
+
 it("does not promote a completed claim with unanswered questions", async () => {
   const { repo, database, git } = setup();
   const fake = scripted(async () => answer(step({ complete: true })));
