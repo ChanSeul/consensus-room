@@ -175,7 +175,7 @@ export class ClaudeAdapter implements AgentAdapter {
       ];
       // 프로토콜 확인 턴은 판단에 필요한 값을 프롬프트가 다 담고 있어 지시문(CLAUDE.md)도 싣지 않는다
       // (2026-09-07 Codex 자기 최적화 제안 ②: ACK 턴마다 전역·프로젝트 지시문 블록을 재전송하던 낭비).
-      const { blocks: instructions } = turn.protocolOnly
+      const { blocks: instructions } = turn.protocolOnly || (!newSession && turn.planningControl?.instructionsInSession)
         ? { blocks: [] as string[] }
         : await readAppliedInstructions({
           strict: Boolean(turn.planningControl),

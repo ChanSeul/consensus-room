@@ -67,6 +67,7 @@ export interface PlanningCheckpoint {
   started: boolean; injectedBytes: number;
   sourceHash?: string;
   deliveredContractHash?: string;
+  deliveredInstructionHash?: string;
   peakStep?: PlanningUsage;
   lastRequestInputTokens?: number;
   peakRequestInputTokens?: number;

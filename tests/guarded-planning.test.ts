@@ -231,6 +231,90 @@ it("replays a final response persisted immediately before an interrupted adoptio
   expect(database.planning.latest("topic")!.responsePending).toBe(false);
 });
 
+it("uses a compact final review turn before same-session history reaches its cap", async () => {
+  const { repo, database, git } = setup("codex");
+  const fake = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ draft: "x".repeat(2000), requests: [
+      { kind: "file", selector: "form.swift", question: "Check navigation", offset: 0 },
+    ] }));
+    expect(turn.prompt).toContain("No further reads fit the host history limit");
+    expect(turn.prompt).toContain("let step = 0");
+    expect(turn.prompt).not.toContain('Checkpoint: {"draft"');
+    expect(turn.planningControl?.instructionsInSession).toBe(true);
+    return answer(step({ questions: [], complete: true }));
+  }, "codex");
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  const save = database.planning.save.bind(database.planning);
+  let interrupted = false;
+  const saving = vi.spyOn(database.planning, "save").mockImplementation(record => {
+    save(record);
+    if (!interrupted && record.responsePending) {
+      interrupted = true;
+      throw new Error("Interrupted before first read");
+    }
+  });
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Interrupted before first read");
+  saving.mockRestore();
+  const saved = database.planning.latest("topic")!;
+  saved.injectedBytes = PLANNING_LIMITS.reviewHistoryBytes - (saved.responseBytes ?? 0) - 9000;
+  database.planning.save(saved);
+  const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+  expect(result.result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls).toHaveLength(2);
+  expect(fake.calls[1]).toMatchObject({ sessionId: "session-1" });
+});
+
+it("resends changed instructions when a resumed call stopped before delivering them", async () => {
+  const { repo, database, git } = setup("codex");
+  writeFileSync(join(repo, "AGENTS.md"), "Original rule\n");
+  const fake = scripted(async (_turn, n) => n === 1 ? answer(step({
+    facts: [{ statement: "Unsupported", refs: ["context:request"] }], questions: [], complete: true,
+  })) : answer(step({ questions: [], complete: true })), "codex");
+  let stopBeforeSpawn = false;
+  const adapter: AgentAdapter = { ...fake.adapter, resumeTurn: async turn => {
+    if (stopBeforeSpawn) { stopBeforeSpawn = false; throw new Error("Stopped before spawn"); }
+    return fake.adapter.resumeTurn(turn);
+  } };
+  const wrapped = guardedPlanning(adapter, database, git);
+  await expect(wrapped.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("not delivered");
+  const originalHash = database.planning.latest("topic")!.deliveredInstructionHash;
+  writeFileSync(join(repo, "AGENTS.md"), "Updated rule\n");
+  stopBeforeSpawn = true;
+  await expect(wrapped.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Stopped before spawn");
+  expect(database.planning.latest("topic")!.deliveredInstructionHash).toBe(originalHash);
+  await wrapped.createSession({ cwd: repo, prompt: "Plan" });
+  expect(fake.calls).toHaveLength(2);
+  expect(fake.calls[1].planningControl?.instructionsInSession).toBe(false);
+  expect(database.planning.latest("topic")!.deliveredInstructionHash).not.toBe(originalHash);
+});
+
+it("does not omit a contract repair question from a compact final review", async () => {
+  const { repo, database, git } = setup("codex");
+  const fake = scripted(async () => answer(step({ requests: [
+    { kind: "file", selector: "form.swift", question: "Check navigation", offset: 0 },
+  ] })), "codex");
+  const wrapped = guardedPlanning(fake.adapter, database, git);
+  const save = database.planning.save.bind(database.planning);
+  let interrupted = false;
+  const saving = vi.spyOn(database.planning, "save").mockImplementation(record => {
+    save(record);
+    if (!interrupted && record.responsePending) {
+      interrupted = true;
+      throw new Error("Interrupted before adoption");
+    }
+  });
+  await expect(wrapped.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Interrupted before adoption");
+  saving.mockRestore();
+  const saved = database.planning.latest("topic")!;
+  saved.responsePending = false;
+  saved.step.questions = ["Repair the final task contract: include the missing section"];
+  saved.injectedBytes = PLANNING_LIMITS.reviewHistoryBytes - (saved.responseBytes ?? 0) - 1000;
+  database.planning.save(saved);
+  await expect(wrapped.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("host history limit");
+  expect(fake.calls).toHaveLength(1);
+  expect(database.planning.latest("topic")!.finalAttempted).toBe(false);
+});
+
 it.each(["unsupported citation", "oversized checkpoint"])("requests a corrected response after rejecting an %s", async reason => {
   const { repo, database, git } = setup("codex");
   const fake = scripted(async (_turn, n) => {

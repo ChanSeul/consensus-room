@@ -94,13 +94,21 @@ describe("에이전트별 권한 경계", () => {
     writeFileSync(image, png);
     const planningControl = { admissionId: "attempt", maxPromptBytes: 64 * 1024, image: { path: image, bytes: png.length } };
     const claude = new RecordingRunner(successfulResult([planResult]));
-    await new ClaudeAdapter(claude).createSession({ cwd: root, prompt: "Bounded planning", planningControl });
+    const claudeAdapter = new ClaudeAdapter(claude);
+    const claudeSession = await claudeAdapter.createSession({ cwd: root, prompt: "Bounded planning", planningControl });
     const call = claude.calls[0];
     expect(call.args[call.args.indexOf("--tools") + 1]).toBe("");
     expect(call.args[call.args.indexOf("--input-format") + 1]).toBe("stream-json");
     const message = JSON.parse(call.stdin!);
     expect(message.message.content[0].text).toContain("KEEP_CLAUDE_INSTRUCTIONS");
     expect(message.message.content[1].source.data).toBe(png.toString("base64"));
+    await claudeAdapter.resumeTurn({ cwd: root, prompt: "Continue plan", sessionId: claudeSession.sessionId,
+      planningControl: { admissionId: "attempt", maxPromptBytes: 64 * 1024, instructionsInSession: true } });
+    expect(claude.calls[1].stdin).not.toContain("KEEP_CLAUDE_INSTRUCTIONS");
+    await claudeAdapter.createSession({ cwd: root, prompt: "Fresh plan", planningControl: {
+      admissionId: "fresh-attempt", maxPromptBytes: 64 * 1024, instructionsInSession: true,
+    } });
+    expect(claude.calls[2].stdin).toContain("KEEP_CLAUDE_INSTRUCTIONS");
     const codex = new RecordingRunner(successfulResult([{ type: "thread.started", thread_id: "bounded-thread" }, planResult]));
     const { adapter } = codexAdapter(codex);
     await adapter.createSession({ cwd: root, prompt: "Bounded review", planningControl });
@@ -109,6 +117,13 @@ describe("에이전트별 권한 경계", () => {
       expect(config).toContain(`${name} = false`);
     }
     expect(codex.calls[0].stdin).toContain("KEEP_CODEX_INSTRUCTIONS");
+    await adapter.resumeTurn({ cwd: root, prompt: "Continue review", sessionId: "bounded-thread",
+      planningControl: { admissionId: "attempt", maxPromptBytes: 64 * 1024, instructionsInSession: true } });
+    expect(codex.calls[1].stdin).not.toContain("KEEP_CODEX_INSTRUCTIONS");
+    await adapter.createSession({ cwd: root, prompt: "Fresh review", planningControl: {
+      admissionId: "fresh-attempt", maxPromptBytes: 64 * 1024, instructionsInSession: true,
+    } });
+    expect(codex.calls[2].stdin).toContain("KEEP_CODEX_INSTRUCTIONS");
     expect(codex.calls[0].args).toContain(image);
     const schemaPath = codex.calls[0].args[codex.calls[0].args.indexOf("--output-schema") + 1];
     expect(schemaPath).toContain(".planning.json");
