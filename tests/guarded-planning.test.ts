@@ -120,6 +120,138 @@ it("still rejects undelivered facts in a completed checkpoint", async () => {
   expect(database.planning.latest("topic")!.finalized).toBe(false);
 });
 
+it("repairs an undelivered final citation once in the same planning session after the round cap", async () => {
+  const { repo, database, git } = setup();
+  const fake = scripted(async (_turn, n) => answer(step({
+    facts: n === 1 ? [{ statement: "Unsupported", refs: ["not-delivered"] }] : [],
+    questions: [], complete: true,
+  })));
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("not delivered");
+  const saved = database.planning.latest("topic")!;
+  saved.round = PLANNING_LIMITS.rounds;
+  saved.finalAttempted = true;
+  database.planning.save(saved);
+
+  const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+  expect(result.sessionId).toBe("session-1");
+  expect(result.result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls).toHaveLength(2);
+  expect(fake.calls[1].prompt).toContain("Citation repair, final attempt");
+  expect(fake.calls[1].prompt).toContain("not-delivered");
+  expect(database.planning.latest("topic")!.citationRepairAttempted).toBe(true);
+});
+
+it("does not buy another correction when the final citation repair is still unsupported", async () => {
+  const { repo, database, git } = setup();
+  const fake = scripted(async () => answer(step({
+    facts: [{ statement: "Unsupported", refs: ["not-delivered"] }], questions: [], complete: true,
+  })));
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("not delivered");
+  const saved = database.planning.latest("topic")!;
+  saved.round = PLANNING_LIMITS.rounds;
+  saved.finalAttempted = true;
+  database.planning.save(saved);
+
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("not delivered");
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Citation repair already attempted");
+  expect(fake.calls).toHaveLength(2);
+});
+
+it("keeps citation repair final even when a later budget grant removes the soft limit", async () => {
+  const { repo, database, git } = setup();
+  const fake = scripted(async (_turn, n) => n === 1
+    ? answer(step({ facts: [{ statement: "Unsupported", refs: ["not-delivered"] }], questions: [], complete: true }))
+    : answer(step({ requests: [{ kind: "file", selector: "form.swift", question: "Read more", offset: 0 }] })));
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("not delivered");
+  const saved = database.planning.latest("topic")!;
+  saved.finalAttempted = true;
+  database.planning.save(saved);
+
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Synthesis did not produce a complete plan");
+  expect(fake.calls).toHaveLength(2);
+  expect(database.planning.latest("topic")!.fragments).toHaveLength(0);
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Citation repair already attempted");
+  expect(fake.calls).toHaveLength(2);
+  expect(database.planning.latest("topic")!.fragments).toHaveLength(0);
+});
+
+it("does not replay old pending reads before correcting a final citation", async () => {
+  const { repo, database, git } = setup();
+  const fake = scripted(async (_turn, n) => answer(step({
+    facts: n === 1 ? [{ statement: "Unsupported", refs: ["not-delivered"] }] : [],
+    questions: [], complete: true,
+  })));
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("not delivered");
+  const saved = database.planning.latest("topic")!;
+  saved.finalAttempted = true;
+  saved.step.requests = [{ kind: "file", selector: "missing.swift", question: "Old research", offset: 0 }];
+  saved.stopped = "Planning checkpoint saved; insufficient remaining budget for synthesis.";
+  database.planning.save(saved);
+
+  const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+  expect(result.result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls).toHaveLength(2);
+  expect(fake.calls[1].prompt).toContain("Citation repair, final attempt");
+  expect(fake.calls[1].prompt).toContain("Fragments: []");
+});
+
+it("compresses a final citation repair before the Codex review history cap", async () => {
+  const { repo, database, git } = setup("codex");
+  const fake = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ facts: [{ statement: "Unsupported", refs: ["not-delivered"] }],
+      questions: [], complete: true }));
+    expect(turn.prompt).toContain("preceding final response was rejected");
+    expect(turn.prompt).toContain("not-delivered");
+    expect(turn.prompt).not.toContain('Checkpoint: {"draft"');
+    return answer(step({ questions: [], complete: true }));
+  }, "codex");
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("not delivered");
+  const saved = database.planning.latest("topic")!;
+  saved.finalAttempted = true;
+  saved.step.draft = "x".repeat(9000);
+  saved.injectedBytes = PLANNING_LIMITS.reviewHistoryBytes - (saved.responseBytes ?? 0) - 4000;
+  database.planning.save(saved);
+
+  const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+  expect(result.result.planMarkdown).toBe("Final navigation plan");
+  expect(result.sessionId).toBe("session-1");
+  expect(fake.calls).toHaveLength(2);
+});
+
+it("replays a saved final citation correction after interruption without another model call", async () => {
+  const { repo, database, git } = setup();
+  const fake = scripted(async (_turn, n) => answer(step({
+    facts: n === 1 ? [{ statement: "Unsupported", refs: ["not-delivered"] }] : [],
+    questions: [], complete: true,
+  })));
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("not delivered");
+  const saved = database.planning.latest("topic")!;
+  saved.finalAttempted = true;
+  saved.round = PLANNING_LIMITS.rounds;
+  database.planning.save(saved);
+  const save = database.planning.save.bind(database.planning);
+  let interrupted = false;
+  const saving = vi.spyOn(database.planning, "save").mockImplementation(record => {
+    save(record);
+    if (!interrupted && record.citationRepairAttempted && record.responsePending) {
+      interrupted = true;
+      throw new Error("Interrupted before adopting correction");
+    }
+  });
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Interrupted before adopting correction");
+  saving.mockRestore();
+
+  const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+  expect(result.result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls).toHaveLength(2);
+});
+
 it("reuses a saved intermediate read request after a citation pause without another research call", async () => {
   const { repo, database, git } = setup();
   const fake = scripted(async (turn, n) => {

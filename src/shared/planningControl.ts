@@ -65,6 +65,7 @@ export interface PlanningCheckpoint {
   step: PlanningStep; fragments: PlanningFragment[]; delivered: string[];
   usage: PlanningUsage; updatedAt: string; stopped: string | null;
   finalized: boolean; finalAttempted: boolean;
+  citationRepairAttempted?: boolean;
   started: boolean; injectedBytes: number;
   sourceHash?: string;
   deliveredContractHash?: string;
