@@ -396,6 +396,51 @@ it("uses a compact final review turn before same-session history reaches its cap
   expect(fake.calls[1]).toMatchObject({ sessionId: "session-1" });
 });
 
+it("keeps every requested body and citation when compacting a nearly full review session", async () => {
+  const { repo, database, git } = setup("codex");
+  writeFileSync(join(repo, "tiny.swift"), "let account = 1\n");
+  execFileSync("git", ["-C", repo, "add", "tiny.swift"]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "tiny fixture"]);
+  const requests = [0, 7000, 14000].map(offset => ({
+    kind: "file" as const, selector: "form.swift", question: "Review this form section", offset,
+  }));
+  requests.push({ kind: "file", selector: "tiny.swift", question: "Review account state", offset: 0 });
+  const fake = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ requests }));
+    const fragments = JSON.parse(turn.prompt.split("Fragments: ").at(-1)!) as Array<{
+      id: string; content: string; nextOffset: number | null;
+    }>;
+    expect(fragments).toHaveLength(4);
+    expect(fragments.every(fragment => fragment.id.length === 64 && fragment.content.length > 0)).toBe(true);
+    expect(fragments.slice(0, 3).every(fragment => fragment.nextOffset !== null)).toBe(true);
+    expect(fragments[3].nextOffset).toBeNull();
+    expect(fragments[3].content).toContain("let account = 1");
+    expect(turn.prompt).not.toContain('"selector":"form.swift"');
+    return answer(step({ facts: [{ statement: "Reviewed account state", refs: [fragments[3].id] }],
+      questions: [], complete: true }));
+  }, "codex");
+  const wrapped = guardedPlanning(fake.adapter, database, git);
+  const save = database.planning.save.bind(database.planning);
+  let interrupted = false;
+  const saving = vi.spyOn(database.planning, "save").mockImplementation(record => {
+    save(record);
+    if (!interrupted && record.fragments.length === 4 && !record.responsePending) {
+      interrupted = true;
+      throw new Error("Interrupted after bounded reads");
+    }
+  });
+  await expect(wrapped.createSession({ cwd: repo, prompt: "Review local draft flow" }))
+    .rejects.toThrow("Interrupted after bounded reads");
+  saving.mockRestore();
+  const saved = database.planning.latest("topic")!;
+  expect(saved.fragments).toHaveLength(4);
+  saved.injectedBytes = PLANNING_LIMITS.reviewHistoryBytes - (saved.responseBytes ?? 0) - 23_000;
+  database.planning.save(saved);
+  const result = await wrapped.createSession({ cwd: repo, prompt: "Review local draft flow" });
+  expect(result.result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls[1]).toMatchObject({ sessionId: "session-1" });
+});
+
 it("resends changed instructions when a resumed call stopped before delivering them", async () => {
   const { repo, database, git } = setup("codex");
   writeFileSync(join(repo, "AGENTS.md"), "Original rule\n");

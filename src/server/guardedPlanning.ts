@@ -336,14 +336,17 @@ Checkpoint must fit ${LIMIT.checkpointBytes} UTF-8 bytes. Final result must sati
                 JSON.stringify(record.step) === JSON.stringify(record.lastResponse.planningStep)))) {
             if (!canFinalize()) pause("Planning checkpoint saved; insufficient remaining budget for synthesis.");
             finalizing = true;
-            prompt = `Continue this same planning review. The task, instructions and preceding checkpoint remain in this session unchanged. ` +
-              (citationRepair
-                ? `The preceding final response was rejected for undelivered citations: ${JSON.stringify(unsupportedCitations)}. ` +
-                  `Correct the citations from previously delivered evidence or remove unsupported claims. `
-                : `Use previously delivered evidence and the new fragments below. No further reads fit the host history limit. `) +
-              `Return the final contracted result with planningStep complete=true and no questions or requests, or requestedUserDecision ` +
-              `for unresolved decisions. Preserve contradictions and cite only delivered fragment IDs. Do not invent unseen content.\n` +
-              `Snapshot ${tree}; evidence ${state.digest}\nFragments: ${JSON.stringify(record.fragments)}`;
+            // The session already has each request's kind, selector and starting offset. Keep the
+            // citation, full body and read result's EOF marker while dropping repeated metadata.
+            const compactFragments = record.fragments.map(fragment => ({
+              id: fragment.id, content: fragment.content, nextOffset: fragment.nextOffset,
+            }));
+            prompt = (citationRepair
+              ? `Continue this same planning review. The preceding final response was rejected for undelivered citations: ` +
+                `${JSON.stringify(unsupportedCitations)}. Correct citations from delivered evidence or remove unsupported claims. `
+              : `Continue same review. Prior task, instructions and checkpoint apply. No further reads fit the host history limit. `) +
+              `Return the final contracted result, or requestedUserDecision if unresolved. No requests; cite delivered IDs only.\n` +
+              `Fragments: ${JSON.stringify(compactFragments)}`;
             packetBytes = bytes([EXECUTION_POLICY_NOTE, ...instructionBlocks, prompt].join("\n\n"));
           }
           if (context.bytes + packetBytes > historyLimit) {
