@@ -305,6 +305,8 @@ export class EngineCore {
       session?: { id: string | null; persist: (sessionId: string) => void };
       // 이 턴에 추가로 읽기를 허용할 경로(주제 plan.md 등).
       readablePaths?: readonly string[];
+      // prompt 가 이어 쓰는 세션 기준의 변경분일 때, 과제가 다른 세션으로 가면 쓸 전체 문맥 판(SessionTurn.freshSessionPrompt).
+      freshSessionPrompt?: string;
       normalize?: ResultNormalizer;
       planBase?: string;
       repairContextKey?: string;
@@ -345,7 +347,7 @@ export class EngineCore {
             this.dependencies.database.upsertParticipant(topic.id,{...participant,sessionId:id,acknowledgedPlanSHA256:null});
           }
         } },
-        prompt, implementation, planMode, planningWrite, readablePaths: options.readablePaths,
+        prompt, freshSessionPrompt: options.freshSessionPrompt, implementation, planMode, planningWrite, readablePaths: options.readablePaths,
         settings: this.executionSettings(topic.id, role, implementation), onUsage,
         // 결과 교정·새 입력 처리(채택 검사) 전에 저장해야 재시도가 같은 세션을 이어 쓸 수 있다.
         onResponse: (outcome) => {
@@ -374,7 +376,7 @@ export class EngineCore {
             this.dependencies.database.upsertParticipant(topic.id, { ...participant, sessionId: id, acknowledgedPlanSHA256: null });
           }
         } },
-        prompt, implementation, planMode,
+        prompt, freshSessionPrompt: options.freshSessionPrompt, implementation, planMode,
         planningWrite: options.planningWrite ?? (role==="claude" && topic.state==="CLAUDE_PLAN"?"plan":role==="claude"&&topic.state==="CLAUDE_REVISION"?"revision":undefined),
         readablePaths: options.readablePaths, settings: this.executionSettings(topic.id, role, implementation), onUsage,
       });

@@ -5,7 +5,9 @@ Never reads connector credentials, invokes a model, writes external services, or
 """
 import argparse
 import json
+import os
 from pathlib import Path
+import re
 import sys
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, quote, urlsplit
@@ -25,6 +27,20 @@ def connection(path):
     return f"http://127.0.0.1:{value.port}", tokens[0]
 
 
+def mediator_identity():
+    """Assignment identity the mediator session was given (CONSENSUS_MEDIATOR=<participant>@<version>), same contract as cr_api.sh.
+
+    Pinned by the session, never refreshed from the server: a replaced mediator's late requests must stay distinguishable (engine rework E1).
+    """
+    value = os.environ.get("CONSENSUS_MEDIATOR", "")
+    if not value:
+        return {}
+    match = re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9._:-]*)@([0-9]+)", value)
+    if not match:
+        raise ValueError("CONSENSUS_MEDIATOR must be <participant>@<version>")
+    return {"x-consensus-mediator": match.group(1), "x-consensus-mediator-version": match.group(2)}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--launch-file", type=Path, default=Path.home() / "Library/Application Support/ConsensusRoom/consensus-room.url")
@@ -34,6 +50,7 @@ def main():
     parser.add_argument("--session", help="실제 중재자 세션 ID; batch/ack에 필수")
     parser.add_argument("--batch", help="읽기를 마친 batchId; ack에 필수")
     args = parser.parse_args()
+    identity = mediator_identity()
     base, token = connection(args.launch_file)
     if args.command not in {"due", "connections"} and not args.id:
         parser.error("--id is required")
@@ -63,7 +80,7 @@ def main():
                 parser.error("input exceeds the source limit")
             data = json.dumps(json.loads(args.input.read_text()), ensure_ascii=False).encode()
     request = Request(base + route, data=data, method="GET" if data is None else "POST", headers={
-        "x-consensus-token": token, "x-consensus-actor": "mediator", "content-type": "application/json",
+        "x-consensus-token": token, "x-consensus-actor": "mediator", "content-type": "application/json", **identity,
     })
     try:
         with build_opener(NoRedirect).open(request, timeout=200) as response:

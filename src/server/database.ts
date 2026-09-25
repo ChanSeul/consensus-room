@@ -1,4 +1,5 @@
 import { ReviewLedger } from "./reviewLedger.js";
+import { RoleRegistry } from "./roleAssignments.js";
 import { PlanningStore } from "./planningStore.js";
 import { RevisionLedger } from "./revisionLedger.js";
 import { WorkGroups } from "./workGroups.js";
@@ -61,6 +62,7 @@ export class ConsensusDatabase {
   readonly fixContracts: FixContractStore;
   readonly evidence: EvidenceStore;
   readonly planning: PlanningStore;
+  readonly roles: RoleRegistry;
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true });
@@ -75,6 +77,7 @@ export class ConsensusDatabase {
     this.workGroups = new WorkGroups(this.db);
     this.revisions = new RevisionLedger(this.db);
     this.reviews = new ReviewLedger(this.db);
+    this.roles = new RoleRegistry(this.db);
   }
 
   close(): void {

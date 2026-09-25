@@ -42,6 +42,8 @@ export async function preparePlanningContext(core: EngineCore, topic: Topic, mar
   return {
     text, mode, inputSequence: sequence, readablePaths: [...new Set(readablePaths)],
     timeline: database.getPromptTimeline(topic.id, topic.scopeGeneration, since),
+    // 변경분은 계산한 세션(sessionId)에서만 유효하다 — 과제가 다른 세션(교체·새 세션)으로 가면 이 전체 문맥으로 다시 만든다(host-review a7a9ce86 F-001).
+    full: mode === "delta" ? { text: markdown, timeline: database.getPromptTimeline(topic.id, topic.scopeGeneration, 0) } : null,
     async accept(signal: AbortSignal, prompt: string) {
       core.assertCurrent(topic.id, signal, topic.scopeGeneration, topic.state);
       const now = database.getTopic(topic.id);

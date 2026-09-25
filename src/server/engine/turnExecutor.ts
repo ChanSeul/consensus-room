@@ -46,6 +46,8 @@ export interface TurnRequest {
     | { mode: "resume"; sessionId: string; onSessionCreated?: (sessionId: string) => void; fallbackFresh?: { prompt: string; onSessionCreated?: (sessionId: string) => void; onFallback?: (sessionId: string) => void } }
     | { mode: "create"; onSessionCreated?: (sessionId: string) => void };
   prompt: string;
+  // prompt 가 이어 쓰는 세션 기준의 변경분일 때의 전체 문맥 판 — SessionTurn.freshSessionPrompt 로 그대로 넘긴다.
+  freshSessionPrompt?: string;
   implementation: boolean;
   planMode?: boolean;
   protocolOnly?: boolean;
@@ -146,7 +148,7 @@ export class TurnExecutor {
     await admit.async();
     const adapter = this.adapter(request.role);
     const base = {
-      prompt: request.prompt, cwd: request.topic.worktreePath, signal: request.signal, implementation: request.implementation,
+      prompt: request.prompt, freshSessionPrompt: request.freshSessionPrompt, cwd: request.topic.worktreePath, signal: request.signal, implementation: request.implementation,
       planMode: request.planMode, protocolOnly: request.protocolOnly, planningWrite: request.planningWrite, readablePaths: request.readablePaths,
       settings: request.settings, beforeSpawn: admit.async, admitSync: admit.sync,
       onProcessSpawn: ((observe) => (process: Parameters<NonNullable<SessionTurn["onProcessSpawn"]>>[0]) => { observe(process); request.onSpawn?.(); })(this.core.processObserver(request.topic.id)),

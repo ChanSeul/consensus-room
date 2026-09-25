@@ -21,13 +21,13 @@ import {
   hashPlan,
   isMinorFinding,
   isSettledFinding,
-  newFindingIDs,
   normalizePlan,
   redactSecrets, replanDirective,
   salvageResultFields,
 } from "../../shared/workflow.js";
 import type { EngineCore } from "./core.js";
 import { preparePlanningContext } from "./planningContext.js";
+import { classifyCloseoutAdditions, judgeCloseout } from "./findingJudgment.js";
 
 const IMPLEMENTATION_NOTE_PREFIX = "구현 노트로 승계(엔진 자동, 개정 생략): ";
 
@@ -314,16 +314,20 @@ export class PlanningPipeline {
     const context = await preparePlanningContext(this.core, topic, storedFirstPlan.markdown, storedFirstPlan.sha256);
     // 진단 계획 개정 뒤의 감사면 진단 원문·이전 승인 계획·이미 바뀐 파일을 함께 싣는다(구현 도중의 개정).
     const revisionContext = await this.core.diagnoses.revisionAuditContext(topicId);
-    const prompt = buildCodexAuditPrompt({
-      title: topic.title, planMarkdown: context.text, planSHA256: storedFirstPlan.sha256,
+    const deferredFindings = await this.core.deferredFindingsFor(topicId);
+    const auditPrompt = (text: string, timeline: typeof context.timeline, planningContextMode: typeof context.mode) => buildCodexAuditPrompt({
+      title: topic.title, planMarkdown: text, planSHA256: storedFirstPlan.sha256,
       scopeGeneration: topic.scopeGeneration,
-      timeline: context.timeline,
-      planningContextMode: context.mode,
+      timeline,
+      planningContextMode,
       claudePlan,
-      deferredFindings: await this.core.deferredFindingsFor(topicId),
+      deferredFindings,
       diagnosisRevision: revisionContext?.context,
     });
+    const prompt = auditPrompt(context.text, context.timeline, context.mode);
     const audit = await this.core.turn("codex", topic, prompt, signal, false, {
+      // 변경분은 커서를 기록한 세션에서만 유효하다 — 계획 제어가 새 감사 세션으로 바꾸면 전체 문맥 판을 쓴다(host-review a7a9ce86 F-001).
+      freshSessionPrompt: context.full ? auditPrompt(context.full.text, context.full.timeline, "full") : undefined,
       readablePaths: [...context.readablePaths, ...(revisionContext?.paths ?? [])],
       normalize: this.core.carryForwardNormalizer(claudePlan.findings, "Codex audit", { forReview: true }),
       check: (r) => {
@@ -391,15 +395,26 @@ export class PlanningPipeline {
     await this.runPlanningFromRevision(topicId, audit, stored, signal);
   }
 
-  // 이 바퀴에서 Claude 가 처분한 쟁점 전부 — 개정 1회차(감사 답변) + 개정 2회차(종결 새 쟁점 답변).
-  // 종결 확인이 "새 쟁점" 을 판정하는 기준 집합이다. 개정 2회차를 열지 않았으면 최신 개정 하나뿐이다.
-  private async roundKnownFindings(topicId: string): Promise<Finding[]> {
-    const flags = this.core.dependencies.database.getFlags(topicId);
+  // 이 바퀴에서 Claude 가 처분한 쟁점 전부 — 최신 감사 뒤의 개정 전부(1회차 감사 답변 + 2회차·추가 개정의 종결 새 쟁점 답변).
+  // 종결 확인이 "새 쟁점"·"처분 되돌림" 을 판정하는 기준 집합이다. 개정 2회차를 열지 않았으면 최신 개정 하나뿐이다.
+  // 결정 뒤 추가 개정(3회차 이상)이 이어질 수 있어 최근 두 개만 읽으면 1회차 합의가 빠진다 — 재개한 종결이 그 합의를 내려도
+  // 되돌림 가드가 보지 못했다(host-review 1b40ea64 F-005). 연속 실행의 누적(runPlanningFromRevision2)과 같은 순서로 합친다(나중 개정이 같은 id 를 덮는다).
+  // 산출물 revision 은 저장 시점의 타임라인 순번이라 종류를 넘어 순서를 비교한다(pausedResultReusable 과 같은 규칙).
+  // 재개 정보(resume)의 종결 판정도 이 집합을 쓴다 — 부작용 없음.
+  async roundKnownFindings(topicId: string): Promise<Finding[]> {
+    const { database, artifacts } = this.core.dependencies;
     const latest = await this.core.latestResult(topicId, "claude-revision");
-    if (!flags.closeoutRevisionUsed) return latest.findings;
-    const previousRaw = await this.core.dependencies.artifacts.readPrevious(topicId, "claude-revision");
-    const previous = previousRaw ? AgentResultSchema.parse(JSON.parse(previousRaw)) : null;
-    return uniqueFindings([...(previous?.findings ?? []), ...latest.findings]);
+    if (!database.getFlags(topicId).closeoutRevisionUsed) return latest.findings;
+    const audit = database.latestArtifact(topicId, "audit");
+    const round = database.artifactsForScope(topicId, "claude-revision")
+      .filter((artifact) => !audit || artifact.revision > audit.revision)
+      .reverse();
+    const results = await Promise.all(round.map(async (artifact) => {
+      const stored = await artifacts.verifiedByRevision(topicId, "claude-revision", artifact.revision);
+      if (!stored) throw new Error(`개정 산출물 #${artifact.revision} 을 읽을 수 없습니다.`);
+      return AgentResultSchema.parse(JSON.parse(stored.content));
+    }));
+    return uniqueFindings(results.flatMap((result) => result.findings));
   }
 
   private async runPlanningFromRevision(
@@ -447,8 +462,9 @@ export class PlanningPipeline {
     if (this.closeoutRegressionAdjudicated(topicId)) {
       const stored = this.core.dependencies.database.latestArtifact(topicId, "closeout");
       const closeout = stored ? await this.core.latestResult(topicId, "closeout") : null;
+      // 저장된 종결의 재판정 — resume(재개 정보)과 같은 함수·같은 입력(되돌림 판정 끝)이다.
       if (closeout && closeout.planSHA256 === sha256 && classifyCloseout(closeout).state === "CONSENSUS_ACK"
-        && classifyCloseoutAdditions(known, closeout).essential.length === 0) {
+        && judgeCloseout(known, closeout, { regressionAdjudicated: true }).essential.length === 0) {
         this.core.event(topicId, "system", "system",
           `결정이 처분 되돌림 쟁점(${dispositionRegressions(known, closeout.findings).join(", ")})을 확정했습니다 — 저장된 종결 확인(#${stored?.revision ?? "?"})으로 합의를 마칩니다(종결 턴 재구매 없음).`);
         await this.runConsensusFinalization(topicId, closeout.findings, sha256, signal);
@@ -525,16 +541,19 @@ export class PlanningPipeline {
       ? "Codex가 개정 2회차 결과로 의견 수렴을 종료할 수 있는지 확인합니다."
       : "Codex가 의견 수렴을 종료할 수 있는지 확인합니다.");
     const context = await preparePlanningContext(this.core, topic, storedRevisedPlan.markdown, storedRevisedPlan.sha256);
-    const prompt = buildCodexCloseoutPrompt({
-      revisedPlan: context.text,
+    const implementationNotes = await this.core.implementationNotesOf(topicId);
+    const closeoutPrompt = (text: string, timeline: typeof context.timeline, planningContextMode: typeof context.mode) => buildCodexCloseoutPrompt({
+      revisedPlan: text,
       revisedPlanSHA256: storedRevisedPlan.sha256,
       claudeRevision: revision,
-      timeline: context.timeline,
-      planningContextMode: context.mode,
+      timeline,
+      planningContextMode,
       secondRound,
-      implementationNotes: await this.core.implementationNotesOf(topicId),
+      implementationNotes,
     });
+    const prompt = closeoutPrompt(context.text, context.timeline, context.mode);
     const closeout = await this.core.turn("codex", topic, prompt, signal, false, {
+      freshSessionPrompt: context.full ? closeoutPrompt(context.full.text, context.full.timeline, "full") : undefined,
       readablePaths: context.readablePaths,
       normalize: this.core.carryForwardNormalizer(revision.findings, "Codex closeout", { forReview: true }),
       check: (r) => {
@@ -549,7 +568,9 @@ export class PlanningPipeline {
     // 새 쟁점은 발견 시점이 아니라 Codex 의 처분으로 분류한다(2026-09-07 Codex 피드백): 범위 밖(DEFERRED_OUT_OF_SCOPE·
     // AGREED_NO_ACTION)은 후속 목록에 기록만 하고 진행, 필수 쟁점은 개정 2회차(바퀴당 1회) → 그 뒤에도 남으면 최신 계획을
     // 보존한 채 사용자 결정 뒤 그 쟁점만 추가 개정. 처음부터 다시 도는 것은 결정에 REPLAN 을 적은 경우뿐이다.
-    const { deferred, essential, minor } = classifyCloseoutAdditions(knownFindings, closeout);
+    // 종결 판정은 resume(재개 정보)과 같은 함수로 한다(findingJudgment.ts).
+    const closeoutJudgment = judgeCloseout(knownFindings, closeout);
+    const { deferred, essential, minor } = closeoutJudgment;
     if (deferred.length > 0) await this.core.recordDeferredFindings(topic, deferred, "closeout", signal);
     if (minor.length > 0) await this.core.recordImplementationNotes(topic, minor, "closeout", signal);
     if (essential.length > 0) {
@@ -568,7 +589,7 @@ export class PlanningPipeline {
       );
       return;
     }
-    const downgradedAtCloseout = dispositionRegressions(knownFindings, closeout.findings);
+    const downgradedAtCloseout = closeoutJudgment.regressed;
     if (downgradedAtCloseout.length > 0) {
       // 재개 지점은 CODEX_CLOSEOUT이다 — 되돌린 주체가 closeout이므로 종결 판정만 다시 하면 된다.
       // CLAUDE_PLAN으로 두면 retry가 전체 재계획으로 떨어져 그때까지의 개정 전부를 버린다
@@ -699,19 +720,6 @@ export class PlanningPipeline {
     this.bindPlanningSession(topic, artifact.sha256);
     return { markdown: normalized, sha256: artifact.sha256 };
   }
-}
-
-// 종결 확인이 낸 새 쟁점을 Codex 의 처분으로 나눈다: 범위 밖(기록만) vs 필수(개정으로 반영).
-// 2026-09-13 사용자 규칙: 경미(MEDIUM 이하) 새 쟁점은 개정을 열지 않고 구현 노트로 러너에게 넘긴다. 필수(essential)는 BLOCKER/HIGH 뿐.
-function classifyCloseoutAdditions(known: readonly Finding[], closeout: AgentResult): { deferred: Finding[]; essential: Finding[]; minor: Finding[] } {
-  const added = new Set(newFindingIDs(known, closeout.findings, "Codex closeout"));
-  const additions = closeout.findings.filter((finding) => added.has(finding.id));
-  const deferred = additions.filter((finding) =>
-    finding.disposition === "DEFERRED_OUT_OF_SCOPE" || finding.disposition === "AGREED_NO_ACTION");
-  const actionable = additions.filter((finding) => !deferred.includes(finding));
-  const minor = actionable.filter((finding) => isMinorFinding(finding) && !finding.requiresUserDecision && finding.disposition !== "EXTERNAL_EVIDENCE");
-  const essential = actionable.filter((finding) => !minor.includes(finding));
-  return { deferred, essential, minor };
 }
 
 function uniqueFindings(findings: readonly Finding[]): Finding[] {

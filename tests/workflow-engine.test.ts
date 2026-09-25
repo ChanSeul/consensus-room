@@ -3029,6 +3029,61 @@ describe("종결 확인의 새 쟁점 → 개정 2회차", () => {
     database.close();
   });
 
+  // host-review 1b40ea64 F-005: 재개는 바퀴 합의를 저장된 개정에서 다시 만든다(roundKnownFindings). 최근 두 개정만 읽으면 추가 개정이
+  // 두 번 이어진 뒤 1회차(감사 답변) 합의가 빠져, 종결이 그 합의를 내려도 새 쟁점(범위 밖 기록)으로 넘어가 합의로 닫혔다.
+  it("추가 개정이 두 번 이어진 뒤 종결이 1회차 합의를 내리면 처분 되돌림 가드로 멈춘다 — 바퀴 합의는 최신 감사 뒤의 개정 전부다", async () => {
+    const fourth = validPlan("추가 개정 계획");
+    const fourthSHA = hashPlan(`${fourth.trim()}\n`);
+    const fifth = validPlan("두 번째 추가 개정 계획");
+    const fifthSHA = hashPlan(`${fifth.trim()}\n`);
+    const closeoutNew3 = finding("C-NEW-3", "3회차 종결에서 또 나온 필수 쟁점", { severity: "HIGH", disposition: "AGREED_ACTION" });
+    const auditRegressed = finding("A-1", "감사 지적", { severity: "HIGH", disposition: "AGREED_NO_ACTION" });
+    const { database, engine, claude } = exhaustedRound(
+      [
+        { kind: "REVISION", summary: "추가 개정", planMarkdown: fourth, findings: [closeoutNew2], evidenceRefs: [] },
+        { kind: "REVISION", summary: "두 번째 추가 개정", planMarkdown: fifth, findings: [closeoutNew3], evidenceRefs: [] },
+      ],
+      [
+        { kind: "CLOSEOUT", summary: "종결 3회차 — 또 필수 쟁점", planSHA256: fourthSHA, findings: [closeoutNew2, closeoutNew3], evidenceRefs: [] },
+        // 1회차(감사 답변)에서 합의한 A-1 을 조치 없음으로 내린다.
+        { kind: "CLOSEOUT", summary: "종결 4회차 — 1회차 합의 되돌림", planSHA256: fifthSHA, findings: [auditRegressed, closeoutNew3], evidenceRefs: [] },
+      ],
+    );
+    engine.startPlan("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+    expect(database.getTopic("topic-1").lastError).toContain("필수 쟁점이 남았습니다(C-NEW-2)");
+
+    await engine.postMessage("topic-1", "decision", "C-NEW-2 는 범위에 넣는다. 최신 계획 위에 반영하라.");
+    engine.retry("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+    expect(engine.reviewPaused("topic-1")).toBe("planning");
+    database.reviews.grant("topic-1", "planning", "extra-closeout-3", database.reviews.account("topic-1", "planning").version);
+    engine.retry("topic-1"); await waitForActionCompletion(database, "topic-1");
+    expect(database.getTopic("topic-1").lastError).toContain("필수 쟁점이 남았습니다(C-NEW-3)");
+
+    await engine.postMessage("topic-1", "decision", "C-NEW-3 도 범위에 넣는다. 최신 계획 위에 반영하라.");
+    engine.retry("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+    // 네 번째 개정은 계획 재작성 한도에서 먼저 멈춘다 — 한 번 더 승인하면 개정 턴이 돌고, 종결 4회차는 리뷰 한도에서 멈춘다.
+    expect(database.getTopic("topic-1").lastError).toContain("계획 재작성 한도");
+    database.revisions.grant("topic-1", "extra-revision-4", database.revisions.account("topic-1").version);
+    engine.retry("topic-1"); await waitForActionCompletion(database, "topic-1");
+    expect(engine.reviewPaused("topic-1")).toBe("planning");
+    database.reviews.grant("topic-1", "planning", "extra-closeout-4", database.reviews.account("topic-1", "planning").version);
+    engine.retry("topic-1"); await waitForActionCompletion(database, "topic-1");
+
+    // 두 번째 추가 개정(개정 4회차)까지 돌았고, 종결 4회차가 1회차 합의 A-1 을 내린 것을 되돌림 가드가 잡았다(합의로 닫혀 ACK 턴으로 가지 않는다).
+    const topic = database.getTopic("topic-1");
+    expect(topic.lastError ?? "").toContain("처분을 되돌렸습니다(A-1)");
+    expect(topic.state).toBe("USER_DECISION_REQUIRED");
+    expect(claude.calls).toHaveLength(5);
+    expect(claude.calls[4]).toContain("C-NEW-3");
+    expect(database.getFlags("topic-1").resumeState).toBe("CODEX_CLOSEOUT");
+    const guard = database.getTimeline("topic-1").filter((event) => Array.isArray(event.payload?.closeoutRegressedFindingIDs)).at(-1);
+    expect(guard?.payload?.closeoutRegressedFindingIDs).toEqual(["A-1"]);
+    database.close();
+  });
+
   it("결정에 REPLAN 을 적으면 그때만 처음부터 다시 돌고 옛 계획을 재사용하지 않는다", async () => {
     const { database, engine, claude } = exhaustedRound(
       [{ kind: "PLAN", summary: "재시작 계획", planMarkdown: validPlan("재시작 계획"), findings: [], evidenceRefs: [] }],
@@ -3349,13 +3404,19 @@ describe("계획 전송 기록", () => {
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(codex.calls[0]).toContain(plan.trim());
     expect(codex.calls[0]).toContain("OLD-EVIDENCE-MARKER");
+    // 변경분 턴은 다른 세션으로 갈 때 쓸 전체 문맥 판(전문·커서 이전 증거)을 함께 넘긴다(host-review a7a9ce86 F-001). 전문 턴에는 없다.
+    expect(codex.turns[0].freshSessionPrompt).toBeUndefined();
     if (longPlan) {
       expect(codex.calls[1]).toContain("(계획 변경 없음)");
       expect(codex.calls[1]).not.toContain("PLAN-CONTENT");
       expect(codex.calls[1]).not.toContain("OLD-EVIDENCE-MARKER");
+      expect(codex.turns[1].freshSessionPrompt).toContain(plan.trim());
+      expect(codex.turns[1].freshSessionPrompt).toContain("OLD-EVIDENCE-MARKER");
+      expect(codex.turns[1].freshSessionPrompt).not.toContain("(계획 변경 없음)");
     } else {
       expect(codex.calls[1]).toContain(plan.trim());
       expect(codex.calls[1]).toContain("OLD-EVIDENCE-MARKER");
+      expect(codex.turns[1].freshSessionPrompt).toBeUndefined();
     }
     const cursor = JSON.parse((await artifacts.readLatest("topic-1", "codex-planning-cursor"))!);
     expect(cursor).toMatchObject({ sessionId: "codex-session", scopeGeneration: 1, planSHA256: sha });

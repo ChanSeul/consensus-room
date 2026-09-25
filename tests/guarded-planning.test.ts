@@ -396,6 +396,50 @@ it("uses a compact final review turn before same-session history reaches its cap
   expect(fake.calls[1]).toMatchObject({ sessionId: "session-1" });
 });
 
+it("starts a new reviewer session when a new plan cannot fit the old audit history", async () => {
+  const { repo, database, git } = setup("codex");
+  const fake = scripted(async (_turn, n) => answer(step({ draft: n === 1 ? "Previous audit" : "New audit",
+    questions: [], complete: true })), "codex");
+  const wrapped = guardedPlanning(fake.adapter, database, git);
+  await wrapped.createSession({ cwd: repo, prompt: "Audit the previous plan" });
+  const old = database.planning.latest("topic")!;
+  old.injectedBytes = PLANNING_LIMITS.reviewHistoryBytes - (old.responseBytes ?? 0) - 1000;
+  database.planning.save(old);
+  database.updateTopic("topic", { planEpoch: 1, planSHA256: "a".repeat(64) });
+
+  const result = await wrapped.resumeTurn({ cwd: repo, prompt: "Audit the complete revised plan and prior findings",
+    sessionId: "session-1" });
+  expect(result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls).toHaveLength(2);
+  expect(fake.calls[1].prompt).toContain("Audit the complete revised plan and prior findings");
+  expect("sessionId" in fake.calls[1]).toBe(false);
+  expect(fake.calls[1].planningControl?.instructionsInSession).toBe(false);
+  expect(database.planning.latest("topic")!.sessionId).toBe("session-2");
+});
+
+// host-review a7a9ce86 F-001 — 진단 개정(planEpoch 유지) 뒤 감사는 기존 세션 기준 변경분일 수 있다. 세션을 교체하면 변경분이 아니라 전체 문맥 판을 보낸다.
+it.each([
+  { rotated: true, sent: "FULL-CONTEXT audit: complete plan and every decision", withheld: "DELTA audit: changed lines since the cursor" },
+  { rotated: false, sent: "DELTA audit: changed lines since the cursor", withheld: "FULL-CONTEXT audit: complete plan and every decision" },
+])("sends the full-context task only to a session other than the delta's (rotated=$rotated)", async ({ rotated, sent, withheld }) => {
+  const { repo, database, git } = setup("codex");
+  const fake = scripted(async (_turn, n) => answer(step({ draft: n === 1 ? "Previous audit" : "New audit",
+    questions: [], complete: true })), "codex");
+  const wrapped = guardedPlanning(fake.adapter, database, git);
+  await wrapped.createSession({ cwd: repo, prompt: "Audit the previous plan" });
+  const old = database.planning.latest("topic")!;
+  if (rotated) old.injectedBytes = PLANNING_LIMITS.reviewHistoryBytes - (old.responseBytes ?? 0) - 1000;
+  database.planning.save(old);
+  database.updateTopic("topic", { planSHA256: "b".repeat(64) });
+
+  await wrapped.resumeTurn({ cwd: repo, prompt: "DELTA audit: changed lines since the cursor",
+    freshSessionPrompt: "FULL-CONTEXT audit: complete plan and every decision", sessionId: "session-1" });
+  expect(fake.calls).toHaveLength(2);
+  expect(fake.calls[1].prompt).toContain(sent);
+  expect(fake.calls[1].prompt).not.toContain(withheld);
+  expect("sessionId" in fake.calls[1]).toBe(!rotated);
+});
+
 it("keeps every requested body and citation when compacting a nearly full review session", async () => {
   const { repo, database, git } = setup("codex");
   writeFileSync(join(repo, "tiny.swift"), "let account = 1\n");

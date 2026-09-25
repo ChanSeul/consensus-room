@@ -34,6 +34,7 @@ import {
   assertTransition,
 } from "../../shared/workflow.js";
 import { normalizeCommitPaths } from "../git.js";
+import { judgeFixAcceptance, judgeReview, settleClosedDiagnoses, type FixAcceptanceJudgment, type ReviewJudgment } from "./findingJudgment.js";
 import { redactAgentResult } from "../security.js";
 import {
   carryForwardLedger, evaluateTolerance, parseTolerancePolicy, parseUnifiedDiff, renderToleranceSummary, type ChangedFile,
@@ -869,11 +870,7 @@ export class DeliveryPipeline {
     const expected = finalPass ? "CODEX_FINAL_REVIEW" : "CODEX_REVIEW";
     this.core.requireState(topicId, expected);
     const { content: plan, path: planPath } = await this.core.requireCurrentPlanArtifact(topicId);
-    // 최종 리뷰의 대조 기준은 수정 작업 계약에서 읽는다 — 보고는 수락된 결과만(반환·정지로 저장된 수정 결과는 아니다), 그 뒤 수정 없이 닫힌 계약의
-    // 원본(최종 리뷰 정지 쟁점)도 커버리지·되돌림 검사에 싣는다(2026-09-15 감사 2차).
-    const base = finalPass ? await this.core.fixContracts.finalReviewBase(topicId) : null;
-    const implementation = base ? base.report : await this.core.latestResult(topicId, "implementation-result");
-    const originalReview = finalPass ? await this.core.latestResult(topicId, "codex-review") : null;
+    const { base, implementation, originalReview } = await this.reviewBaseline(topicId, finalPass);
     const reviewedSnapshot = await this.core.dependencies.git.snapshot(topic.worktreePath);
     // 리뷰 시점 작업 트리를 객체로 남긴다 — 최종 리뷰가 '직전 리뷰 이후 변경분' 만 다시 보게 하는 근거(Codex 피드백 ①).
     const previousFlags = this.core.dependencies.database.getFlags(topicId);
@@ -995,28 +992,17 @@ export class DeliveryPipeline {
       // 최종 리뷰에서 처음 등장한 쟁점은 Claude가 고칠 기회가 없었다. RESOLVED_BY_FIX로 표시해도
       // 실제 수정이 없었으므로, closeout의 신규 쟁점 규칙과 똑같이 처분과 무관하게 사용자 판단으로 보낸다.
       // 이월 쟁점은 fix와 첫 리뷰 양쪽에 같은 ID로 있으므로 합집합을 ID로 접어야 newFindingIDs의 중복 검사에 걸리지 않는다.
-      const knownFindings = [...new Map(
-        [...implementation.findings, ...(originalReview?.findings ?? []), ...(base?.sources ?? [])].map((finding) => [finding.id, finding]),
-      ).values()];
+      // 판정(신규 쟁점·판정 끝난 id·합의 원본·OVERRULE·되돌림·수정 대상)은 resume(재개 정보)과 같은 함수로 한다(findingJudgment.judgeReview).
       // 사용자 결정이 이미 소비한 신규 쟁점은 다시 사용자에게 보내지 않는다. 인터럽트 이벤트에 실린
       // ID 목록과 그 뒤에 도착한 사용자 결정의 짝으로만 판정하므로, 결정 없는 재실행(인프라 재시도)은
       // 여전히 인터럽트된다 — 조용한 종결은 불가능하다(2026-09-01 S1.1 R4 무변경 fix 패스 루프의 프로그램적 방지).
-      const adjudicated = this.core.fixContracts.adjudicatedFinalReviewIDs(topic);
-      const addedIDs = new Set(newFindingIDs(knownFindings, review.findings, "Codex final review").filter((id) => !adjudicated.has(id)));
-      const added = review.findings.filter((finding) => addedIDs.has(finding.id));
-      // 새 쟁점은 발견 시점이 아니라 처분으로 분류한다(2026-09-07 Codex 피드백 ④): 범위 밖은 후속 목록에 기록만,
-      // 확정 결함(AGREED_ACTION)은 남은 수정 회차에서 바로 수정, 결정이 필요하거나 처분이 없거나 수정 없이 닫힌
-      // (RESOLVED_BY_FIX — 고칠 기회가 없었다) 쟁점만 사용자에게 보낸다.
-      const deferredNew = added.filter((finding) =>
-        finding.disposition === "DEFERRED_OUT_OF_SCOPE" || finding.disposition === "AGREED_NO_ACTION");
+      const judgment = this.judgeStoredReview(topic, review, true, { base, implementation, originalReview });
+      const { deferredNew, askUser } = judgment;
       if (deferredNew.length > 0) {
         await this.core.recordDeferredFindings(topic, deferredNew, "final-review", signal);
         // 기록하는 await 동안 도착한 결정·증거는 이 판정에 반영되지 않았다 — 인도 대기 전이 전에 다시 본다(CF-01, 감사 5차 #6).
         if (this.core.interruptForLatestTurnInput(topic)) return;
       }
-      const askUser = added.filter((finding) =>
-        finding.requiresUserDecision || !finding.disposition || finding.disposition === "EXTERNAL_EVIDENCE"
-        || finding.disposition === "RESOLVED_BY_FIX");
       if (askUser.length > 0) {
         const ids = askUser.map((finding) => finding.id);
         this.core.interrupt(
@@ -1028,14 +1014,9 @@ export class DeliveryPipeline {
         );
         return;
       }
-      // 수정을 마친 쟁점의 정상 종결은 RESOLVED_BY_FIX다. 다른 처분으로 내리면 아무도 고치지 않은 요구를 닫는 것이므로 멈춘다.
-      // 되돌림 검사의 원본 = 첫 리뷰 쟁점 ∪ 수정 작업 계약의 원본(최종 리뷰 정지 쟁점 등). 면제 = 사용자 결정 ∪ 계약의 판정 id ∪ 닫힌 진단.
-      const overruled = originalReview ? this.userOverruledFindings(topic, "codex-review", originalReview.findings) : new Set<string>();
-      for (const id of base?.overruled ?? []) overruled.add(id);
-      // 진단 전용 계약의 원본(정지 쟁점)이 같은 id 의 첫 리뷰·보고 처분보다 최신 판정이다 — 앞에 둔다(감사 3차: 옛 settled 처분에 가려졌다).
-      const agreed = mergeAgreedSources(base?.sources, originalReview?.findings);
-      this.noteOverruled(topicId, overruled, agreed, review.findings);
-      const withdrawn = [...new Set(dispositionRegressions(agreed, review.findings, overruled))];
+      // 수정을 마친 쟁점의 정상 종결은 RESOLVED_BY_FIX다. 다른 처분으로 내리면 아무도 고치지 않은 요구를 닫는 것이므로 멈춘다(judgment.withdrawn).
+      this.noteOverruled(topicId, judgment.overruled, judgment.agreed, review.findings);
+      const withdrawn = judgment.withdrawn;
       if (withdrawn.length > 0) {
         this.core.interrupt(
           topicId,
@@ -1049,8 +1030,7 @@ export class DeliveryPipeline {
       if (shouldRunFixPass(review.findings)) {
         if (this.refuseFixAfterCommit(topicId, review, expected)) return;
         const flags = this.core.dependencies.database.getFlags(topicId);
-        const remaining = review.findings
-          .filter((finding) => finding.disposition === "AGREED_ACTION").map((finding) => finding.id);
+        const remaining = judgment.remaining;
         // 남은 수정 회차 안에서는 결정 없이 바로 고친다(2026-09-07 Codex 피드백 ④ — 종전엔 2차도 사용자 결정 뒤에만 열렸다).
         // 회차를 다 썼으면 최신 코드와 남은 필수 쟁점을 보존한 채 한 번 결정받고, 그 결정이 추가 회차 1회를 연다(runFix 의 해제 규칙).
         if (!flags.secondFixPassUsed || this.userDecisionAfterLastFixInterrupt(topic)) {
@@ -1101,6 +1081,43 @@ export class DeliveryPipeline {
       contracts: [...this.core.fixContracts.abandonOpen(topicId), contract], payload: { fixContract: contract.contractId },
     });
     await this.runContractFix(topicId, signal, contract);
+  }
+
+  // 리뷰 판정의 입력 — 최종 리뷰의 대조 기준은 수정 작업 계약에서 읽는다: 보고는 수락된 결과만(반환·정지로 저장된 수정 결과는 아니다), 그 뒤 수정 없이
+  // 닫힌 계약의 원본(최종 리뷰 정지 쟁점)도 커버리지·되돌림 검사에 싣는다(2026-09-15 감사 2차). runReview 와 재개 정보가 같이 쓴다.
+  private async reviewBaseline(topicId: string, finalPass: boolean) {
+    const base = finalPass ? await this.core.fixContracts.finalReviewBase(topicId) : null;
+    const implementation = base ? base.report : await this.core.latestResult(topicId, "implementation-result");
+    const originalReview = finalPass ? await this.core.latestResult(topicId, "codex-review") : null;
+    return { base, implementation, originalReview };
+  }
+
+  // 리뷰 판정 — 판정 끝난 최종 리뷰 신규 id 와 원본 리뷰 이후의 OVERRULE 지시를 모아 공용 판정 함수에 넘긴다(부작용 없음).
+  private judgeStoredReview(topic: Topic, review: AgentResult, finalPass: boolean,
+    baseline: Awaited<ReturnType<DeliveryPipeline["reviewBaseline"]>>): ReviewJudgment {
+    return judgeReview({
+      review, finalPass, implementation: baseline.implementation, originalReview: baseline.originalReview, base: baseline.base,
+      adjudicated: finalPass ? this.core.fixContracts.adjudicatedFinalReviewIDs(topic) : new Set<string>(),
+      userOverruled: finalPass && baseline.originalReview
+        ? this.userOverruledFindings(topic, "codex-review", baseline.originalReview.findings) : new Set<string>(),
+    });
+  }
+
+  // 재개 정보(resume)용 — 열린 수정 작업 계약의 원본·면제로 수정 결과를 contractAcceptance 와 같은 판정으로 다시 판정한다. 열린 계약이 없으면 null.
+  // 상태·원장·이벤트를 바꾸지 않는다(noteOverruled 같은 기록은 수락 경로만 한다).
+  fixAcceptanceJudgment(topicId: string, fixFindings: readonly Finding[]): FixAcceptanceJudgment | null {
+    const contract = this.core.fixContracts.open(topicId);
+    if (!contract) return null;
+    const source = this.core.fixContracts.source(topicId, contract);
+    return judgeFixAcceptance(source, fixFindings, this.core.fixContracts.overruled(this.core.dependencies.database.getTopic(topicId), contract, source));
+  }
+
+  // 재개 정보(resume)용 — 저장된 리뷰를 runReview 와 같은 입력·같은 판정으로 다시 판정한다. 상태·원장·이벤트를 바꾸지 않는다.
+  async storedReviewJudgment(topicId: string, kind: "codex-review" | "codex-final-review"): Promise<{ review: AgentResult; judgment: ReviewJudgment }> {
+    const finalPass = kind === "codex-final-review";
+    const baseline = await this.reviewBaseline(topicId, finalPass);
+    const review = await this.core.latestResult(topicId, kind);
+    return { review, judgment: this.judgeStoredReview(this.core.dependencies.database.getTopic(topicId), review, finalPass, baseline) };
   }
 
   // 사용자 결정이 뒤집은 쟁점: 원본 리뷰(그 finding 을 낸 codex 산출물, revision = 타임라인 sequence)보다 뒤에 올라온 사용자 decision 이 줄 머리
@@ -1594,7 +1611,8 @@ export class DeliveryPipeline {
         const source = this.core.fixContracts.source(topicId, contract);
         const overruled = this.core.fixContracts.overruled(topic, contract, source);
         this.noteOverruled(topicId, overruled, source, fixResult.findings);
-        const downgraded = dispositionRegressions(source, fixResult.findings, overruled);
+        // 되돌림 판정은 resume(재개 정보)과 같은 함수로 한다(findingJudgment.judgeFixAcceptance).
+        const downgraded = judgeFixAcceptance(source, fixResult.findings, overruled).downgraded;
         if (downgraded.length > 0) {
           this.core.interrupt(topicId, "USER_DECISION_REQUIRED",
             `수정 단계가 고치기로 합의한 쟁점의 처분을 되돌렸습니다(${downgraded.join(", ")}). 최종 리뷰로 넘기지 않았습니다 — ${OVERRULE_GUIDANCE} `
@@ -2246,19 +2264,4 @@ function resolvedIDs(result: AgentResult): string[] {
   return result.findings
     .filter((finding) => finding.disposition && finding.disposition !== "DEFERRED_OUT_OF_SCOPE" && finding.disposition !== "EXTERNAL_EVIDENCE")
     .map((finding) => finding.id);
-}
-
-// 정정·해결로 닫힌 진단의 쟁점 중 판단이 끝나지 않은 처분(증거·결정 요청, 미반영)을 판단이 끝난 처분으로 바꾼다 — 닫힌 진단은 중재자가 처리했으므로
-// 완료 판정·계속 진행이 그 처분을 기다리지 않는다. 쟁점 자체(보고 기록)는 지우지 않는다.
-function settleClosedDiagnoses(result: AgentResult, closed: ReadonlySet<string>): AgentResult {
-  if (closed.size === 0) return result;
-  let changed = false;
-  const findings = result.findings.map((finding) => {
-    if (!closed.has(finding.id)) return finding;
-    const open = finding.disposition === undefined || finding.disposition === "AGREED_ACTION" || finding.disposition === "EXTERNAL_EVIDENCE" || finding.requiresUserDecision;
-    if (!open) return finding;
-    changed = true;
-    return { ...finding, disposition: "AGREED_NO_ACTION" as const, requiresUserDecision: false, rationale: `정정·해결로 닫힌 중재자 진단(서버 정리): ${finding.rationale}` };
-  });
-  return changed ? { ...result, findings } : result;
 }

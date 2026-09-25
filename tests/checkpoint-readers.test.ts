@@ -17,6 +17,7 @@ const ALLOWED: Record<string, number> = {
   "src/server/engine/delivery.ts": 5,     // 계획 변경 첫 전달 판정 · runWork 복구 · 직전 작업 checkpoint · 저장 수정 결과 재사용 판정 · 진단 0건 계약 종결
   "src/server/engine/diagnoses.ts": 2,    // 등록·적용 결속(captureBinding) · 계획 변경 승계(captureCarry)
   "src/server/engine/fixContracts.ts": 3, // 최종 리뷰 대조 보고(수락 계약·옛 수락) · 옛 토픽 이관(ensureOpen)
+  "src/server/workflow.ts": 1,            // 재개 정보의 작업 체크포인트 층(resumeFindings) — 손상은 findings.errors 로 보고, 다른 오류는 다시 던진다(host-review a7a9ce86 F-004)
 };
 
 function sources(directory: string): string[] {

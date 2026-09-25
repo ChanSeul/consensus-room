@@ -9,6 +9,7 @@ import { basename, dirname, join } from "node:path";
 import {
   type ResumeImplementationInput,
   type AgentExecutionSettings,
+  type Finding,
   type Participant,
   type Topic,
   type WorkflowState,
@@ -26,12 +27,39 @@ import type { AgentAdapter, ExecutionLimits, ParticipantRole, ProjectMemoryWrite
 import { EngineCore, type MaintenanceLockOwner } from "./engine/core.js";
 import { PlanningPipeline } from "./engine/planning.js";
 import { DeliveryPipeline } from "./engine/delivery.js";
+import { CheckpointCorrupt, checkpointOpenRequests, WORK_CHECKPOINT_KIND } from "./engine/checkpoint.js";
+import { pendingReviewRequests } from "./engine/reviewRequests.js";
+import { closeoutOpenFindings, fixOpenFindings, judgeCloseout, reviewOpenFindings, settleClosedDiagnoses, unsettledFindings, type OpenFinding } from "./engine/findingJudgment.js";
 import { UsageLimitRetryScheduler, type RetryClock } from "./engine/usageLimitRetry.js";
 import { recoverableFinalizedFirstPlan } from "./planningStore.js";
 
 // 호출 주체 — 브라우저 사용자(기본)와 중재 세션(x-consensus-actor: mediator, 위임 스위치 on 일 때만). 이벤트 payload 에 남긴다(D03).
-import type { DiagnosisInput, DiagnosisRecord } from "../shared/diagnoses.js";
-export interface CallOrigin { actor: "mediator"; delegationSetAt: string | null }
+import { CLOSED_DIAGNOSIS_STATUSES, MEDIATOR_PENDING_STATUSES, type DiagnosisInput, type DiagnosisRecord } from "../shared/diagnoses.js";
+import type { MediatorIdentity } from "../shared/roles.js";
+// 재개 정보의 다음 허용 작업 — blocker 는 실제 액션의 사전 검사가 던지는 문구, deferredChecks 는 실행 때만 할 수 있는 검사(엔진 개편 E1).
+export interface ResumeAction {
+  action: string;
+  blocker: string | null;
+  input?: Record<string, unknown>;
+  deferredChecks?: string[];
+}
+const INTERRUPTED_STATES: ReadonlySet<WorkflowState> = new Set(["FAILED", "USER_DECISION_REQUIRED", "BLOCKED_ON_EVIDENCE"]);
+// 재개 정보의 미해결 지적 — 판정 지점이 될 수 있는 결과 산출물(계획 단계·인도 단계)과 인도 작업 체크포인트(host-review a7a9ce86 F-004).
+// 러너 보고(구현·수정·체크포인트)의 RESOLVED_BY_FIX 는 리뷰가 확인할 주장이다.
+const PLANNING_STAGES: ReadonlySet<string> = new Set(["DRAFT", "CLAUDE_PLAN", "CODEX_AUDIT", "CLAUDE_REVISION", "CODEX_CLOSEOUT", "CONSENSUS_ACK", "AWAITING_USER_APPROVAL"]);
+const PLANNING_RESULT_KINDS = ["claude-plan", "diagnosis-plan-revision", "audit", "claude-revision", "closeout"] as const;
+const DELIVERY_RESULT_KINDS = ["implementation-result", "codex-review", "claude-fix", "codex-final-review"] as const;
+const RUNNER_REPORT_KINDS: ReadonlySet<string> = new Set(["implementation-result", "claude-fix"]);
+const PAUSE_KEYS = ["planningPause", "budgetPause", "revisionPause", "reviewPause", "admissionRefused"] as const;
+
+// mediator: 배정이 있는 작업에서 수락된 중재자의 배정 신원(참여자·버전·scope) — 배정이 없으면 null(엔진 개편 E1).
+// policyVersion: 호출 시점의 공통 중재 정책 버전(sha256) — 작업에 적용한 설정 버전을 기록한다(plan §2.2).
+export interface CallOrigin {
+  actor: "mediator";
+  delegationSetAt: string | null;
+  mediator?: MediatorIdentity | null;
+  policyVersion?: string | null;
+}
 
 export interface WorkflowDependencies {
   database: ConsensusDatabase;
@@ -216,10 +244,7 @@ export class WorkflowEngine {
   }
 
   startImplementation(topicId: string, actionId?: string, kickoffDecision?: string): string {
-    this.core.assertNotShuttingDown();
-    this.core.diagnoses.assertResumable(topicId, "구현 시작(implement)");
-    assertImplementationGate(this.core.dependencies.database.getTopic(topicId));
-    this.core.dependencies.database.evidence.assertReady(this.core.dependencies.database.getTopic(topicId));
+    this.implementPreconditions(topicId);
     if (kickoffDecision !== undefined) {
       // 재계획 트리거 단어는 결정 본문에 쓸 수 없다 — retry 사다리가 그 단어로 DRAFT 리셋을 판단한다(2026-09-07 사고).
       if (replanDirective(kickoffDecision)) throw new Error("시작 결정문에는 재계획 트리거 지시(줄 머리 또는 본문 끝의 REPLAN)를 쓸 수 없습니다.");
@@ -260,13 +285,14 @@ export class WorkflowEngine {
     action.controller.abort(new Error("사용자가 실행을 중단했습니다."));
   }
 
-  retry(topicId: string, actionId?: string): string {
+  // retry 의 부작용 전 검사 전부 — retry 와 재개 정보(resumeInfo 의 다음 허용 작업)가 같은 함수를 쓴다(엔진 개편 E1).
+  private retryPreconditions(topicId: string) {
     this.core.assertNotShuttingDown();
     this.core.assertBudgetAvailable(topicId);
     // 상태를 바꾸기 전에 다른 작업(실행·범위 변경·인도)이 없는지 본다 — 아래 사다리 일부는 startAction 전에 전이하므로,
     // 잠금을 startAction 에서 뒤늦게 만나면 상태만 바뀐 채 고착된다(Codex 후속 지적 2).
     this.core.assertNoActiveWork(topicId);
-    let topic = this.core.dependencies.database.getTopic(topicId);
+    const topic = this.core.dependencies.database.getTopic(topicId);
     const flags = this.core.dependencies.database.getFlags(topicId);
     const resume = flags.resumeState;
     // 공통 진단 상태 검사: 중재자가 처리할 진단(적용 대기·재확인·반박·추가 증거)이 있으면 재개하지 않는다 — 자동 재시도도 이 경로다.
@@ -281,6 +307,13 @@ export class WorkflowEngine {
     // 재작성 한도 정지도 **그 계획 단계를 재개할 때만** 막는다 — 정정이 재개 단계를 구현으로 되돌렸으면 쓰지 않을 재작성 승인을 요구하지 않는다(2026-09-15 감사 2차).
     if(interruption?.payload?.revisionPause===true && topic.state==="USER_DECISION_REQUIRED" && interruption.payload.resumeState===resume)
       this.core.dependencies.database.revisions.assertAvailable(topicId,resume==="CLAUDE_PLAN"?"plan":"revision");
+    return { topic, resume, interruption };
+  }
+
+  retry(topicId: string, actionId?: string): string {
+    const preconditions = this.retryPreconditions(topicId);
+    let topic = preconditions.topic;
+    const { resume, interruption } = preconditions;
     // 실행 환경 때문에 멈춘 정지(예산·한도·spawn 직전 허용 거부: 유지보수 잠금·계획 변경·기준 불일치)는 사람의 제품 결정이 아니다 — 저장된 같은 단계로
     // 재개하고 계획을 다시 만들지 않는다(CF-07: 유지보수 거부 뒤 retry 가 계획부터 다시 만들었다).
     if (topic.state === "USER_DECISION_REQUIRED" && (interruption?.payload?.planningPause === true || interruption?.payload?.budgetPause === true || interruption?.payload?.revisionPause === true || Boolean(interruption?.payload?.reviewPause)
@@ -427,21 +460,238 @@ export class WorkflowEngine {
     return stage==="CLAUDE_REVISION";
   }
 
-  approve(topicId: string, planSHA256: string): Topic {
+  // 구현 시작의 부작용 전 검사(startAction 의 실행 중 작업 검사 포함) — startImplementation 과 재개 정보가 같은 함수를 쓴다(엔진 개편 E1).
+  private implementPreconditions(topicId: string): void {
+    this.core.assertNotShuttingDown();
+    this.core.diagnoses.assertResumable(topicId, "구현 시작(implement)");
+    assertImplementationGate(this.core.dependencies.database.getTopic(topicId));
+    this.core.dependencies.database.evidence.assertReady(this.core.dependencies.database.getTopic(topicId));
+  }
+
+  // 승인의 검사 — approve 와 재개 정보가 같은 함수를 쓴다(엔진 개편 E1).
+  private approvePreconditions(topicId: string, planSHA256: string | null): void {
     const topic = this.core.dependencies.database.getTopic(topicId);
     this.core.dependencies.database.evidence.assertReady(topic);
-    if (topic.state !== "AWAITING_USER_APPROVAL" || topic.planSHA256 !== planSHA256) {
+    if (topic.state !== "AWAITING_USER_APPROVAL" || !planSHA256 || topic.planSHA256 !== planSHA256) {
       throw new Error("현재 승인을 기다리는 계획 해시와 일치하지 않습니다.");
     }
     if (!bothAgentsAcknowledged(topic.participants, planSHA256)) {
       throw new Error("두 에이전트가 같은 계획 해시를 ACK하지 않았습니다.");
     }
+  }
+
+  // 중재자 인계용 재개 정보(엔진 개편 E1, plan §2.5 "재개 정보 조회") — 어느 중재자가 읽어도 같은 사실과 같은 다음 작업을 돌려준다.
+  // 다음 허용 작업은 실제 액션의 사전 검사 함수를 부작용 없이 호출해 판정한다(규칙표를 따로 두면 액션과 어긋난다).
+  async resumeInfo(topicId: string) {
+    const db = this.core.dependencies.database;
+    const topic = db.getTopic(topicId);
+    const flags = db.getFlags(topicId);
+    const running = db.runningAction(topicId);
+    const timeline = db.getTimeline(topicId).filter(event => event.scopeGeneration === topic.scopeGeneration);
+    // 정지의 정본은 topic.lastError·resume_state 다(interrupt·실패 기록이 함께 쓴다). resumeState 이벤트는 그것이 **지금** 정지를 만든 기록일 때만
+    // 싣는다 — USER_DECISION_REQUIRED·BLOCKED_ON_EVIDENCE 이고, 같은 재개 단계이며, 그 뒤 상태 전이가 없을 때. FAILED 의 원인은 실패 기록(lastError·
+    // 실패 action)이지 옛 정지 요청이 아니다(host-review a7a9ce86 F-007).
+    const lastTransition = timeline.filter(event => event.actor === "system" && event.payload?.to !== undefined).at(-1)?.sequence ?? 0;
+    const lastPause = timeline.filter(event => event.actor === "system" && event.payload?.resumeState).at(-1) ?? null;
+    const interruption = (topic.state === "USER_DECISION_REQUIRED" || topic.state === "BLOCKED_ON_EVIDENCE")
+      && lastPause && lastPause.sequence > lastTransition && lastPause.payload?.resumeState === flags.resumeState ? lastPause : null;
+    const inputsSinceInterruption = interruption
+      ? timeline.filter(event => event.sequence > interruption.sequence && event.actor === "user" && (event.kind === "decision" || event.kind === "evidence")).length
+      : null;
+    const lastAction = db.latestAction(topicId);
+    const stop = INTERRUPTED_STATES.has(topic.state) ? {
+      state: topic.state, reason: topic.lastError, resumeState: flags.resumeState ?? null,
+      failedAction: topic.state === "FAILED" && lastAction && (lastAction.status === "failed" || lastAction.status === "cancelled")
+        ? { id: lastAction.id, kind: lastAction.kind, status: lastAction.status, error: lastAction.error, finishedAt: lastAction.finishedAt } : null,
+    } : null;
+    const diagnoses = this.listDiagnoses(topicId).filter(record => !CLOSED_DIAGNOSIS_STATUSES.has(record.status))
+      .map(record => ({ id: record.id, kind: record.input.kind, status: record.status, mediatorAction: MEDIATOR_PENDING_STATUSES.has(record.status) }));
+    // 열린 리뷰 요청은 정본 원장(pendingReviewRequests — 수정 작업 계약과 같은 함수)에서 읽는다(F-006).
+    const reviewRequests = pendingReviewRequests(db.getTimeline(topicId), topic.scopeGeneration)
+      .map(request => ({ id: request.id, question: request.question, askedAtSequence: request.sequence, answerDecisionSequence: request.answerDecisionSequence ?? null }));
+    const findings = await this.resumeFindings(topic, flags.resumeState ?? null);
+    const planArtifact = db.latestArtifact(topicId, "plan");
+    return {
+      topicId: topic.id, title: topic.title, state: topic.state, resumeState: flags.resumeState ?? null,
+      scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch, planRevision: topic.planRevision,
+      plan: {
+        planSHA256: topic.planSHA256, approvedPlanSHA256: topic.approvedPlanSHA256,
+        acknowledged: Object.fromEntries(topic.participants.map(participant => [participant.role, participant.acknowledgedPlanSHA256])),
+        path: planArtifact?.path ?? null,
+      },
+      delivery: { branchName: topic.branchName, committedOID: flags.committedOID ?? null, pushedOID: flags.pushedOID ?? null, orphanCommitOID: flags.orphanCommitOID ?? null },
+      runningAction: running ? { id: running.id, kind: running.kind } : null,
+      autoRetryAt: this.scheduledRetryAt(topicId),
+      stop,
+      openRequests: {
+        interruption: interruption ? { sequence: interruption.sequence, body: interruption.body, resumeState: interruption.payload?.resumeState ?? null,
+          pause: PAUSE_KEYS.filter(key => Boolean(interruption.payload?.[key])) } : null,
+        userInputsSinceInterruption: inputsSinceInterruption,
+        reviewRequests,
+        workRequests: findings.workRequests,
+        diagnoses,
+      },
+      findings: { basis: findings.basis, open: findings.open, errors: findings.errors },
+      limits: {
+        budget: db.budgets.account(topicId),
+        revision: db.revisions.account(topicId), revisionPaused: this.revisionPaused(topicId),
+        reviews: [db.reviews.account(topicId, "planning"), db.reviews.account(topicId, "implementation")], reviewPaused: this.reviewPaused(topicId),
+      },
+      nextActions: this.nextActions(topicId),
+      locations: { worktreePath: topic.worktreePath, repositoryPath: topic.repositoryPath, planPath: planArtifact?.path ?? null },
+    };
+  }
+
+  // 미해결 지적 — 현재 단계(정지면 재개 단계)의 **최신 판정 지점**(그 단계의 가장 최근 결과 산출물 또는 현재 작업 체크포인트)을 골라, 파이프라인이 그
+  // 지점에서 쓰는 판정 함수(engine/findingJudgment.ts)를 같은 입력으로 다시 부른다 — 종결은 바퀴 합의(planning.roundKnownFindings), 리뷰는 runReview 의
+  // 입력(대조 보고·첫 리뷰·계약 원본·원본 이후 OVERRULE·판정 끝난 신규 id). resume 이 판정을 따로 구현하면 엔진과 어긋난다(host-review dd71c649).
+  // 계획 판정 지점은 이 범위 세대의 가장 최근 계획 단계 산출물이다 — 엔진이 멈춘 계획·개정을 재사용할 때 쓰는 기준과 같다(planning.pausedResultReusable:
+  // 최초 계획은 결정을 묻고 멈추면 계획 저장 전이라 planSHA256 이 아직 없다). DRAFT 는 판정할 것이 없다. 인도 판정은 현재 계획 산출물 이후의 것만 본다
+  // (옛 계획의 리뷰를 지금 판정으로 쓰지 않는다).
+  // 판정 지점을 읽거나 판정을 다시 계산하지 못하면 "지적 없음" 으로 바꾸지 않고 오류로 돌려준다.
+  private async resumeFindings(topic: Topic, resumeState: string | null) {
+    const db = this.core.dependencies.database;
+    const stage = INTERRUPTED_STATES.has(topic.state) ? resumeState ?? topic.state : topic.state;
+    // 재개 단계를 모르는 정지(재개 단계 없는 FAILED 등)는 두 단계의 판정 지점을 모두 후보로 본다.
+    const unknownStage = (INTERRUPTED_STATES as ReadonlySet<string>).has(stage);
+    const planningKinds = PLANNING_STAGES.has(stage) || unknownStage;
+    const deliveryKinds = !PLANNING_STAGES.has(stage) || unknownStage;
+    const planArtifact = db.latestArtifact(topic.id, "plan");
+    type Basis = { kind: string; revision: number; path: string; createdAt: string };
+    const candidates: Basis[] = [];
+    if (planningKinds && stage !== "DRAFT") {
+      for (const kind of PLANNING_RESULT_KINDS) {
+        const artifact = db.latestArtifact(topic.id, kind);
+        if (artifact) candidates.push({ kind, revision: artifact.revision, path: artifact.path, createdAt: artifact.createdAt });
+      }
+    }
+    const errors: string[] = [];
+    let workRequests: Array<{ id: string; text: string; askedAfterSequence: number }> = [];
+    let workFindings: Finding[] = [];
+    let workIsFix = false;
+    if (deliveryKinds) {
+      const current = (createdAt: string) => !planArtifact || createdAt >= planArtifact.createdAt;
+      for (const kind of DELIVERY_RESULT_KINDS) {
+        const artifact = db.latestArtifact(topic.id, kind);
+        if (artifact && current(artifact.createdAt)) candidates.push({ kind, revision: artifact.revision, path: artifact.path, createdAt: artifact.createdAt });
+      }
+      // 진행 중인 인도 작업(현재 세대·현재 계획)의 누적 결과와 열린 요청 — 결과 산출물을 저장하기 전에 멈춘 구현·수정의 지적·질문이 여기 있다.
+      const artifact = db.latestArtifact(topic.id, WORK_CHECKPOINT_KIND);
+      if (artifact) {
+        try {
+          const checkpoint = await this.core.checkpoints.latest(topic.id);
+          if (checkpoint && checkpoint.work.scopeGeneration === topic.scopeGeneration && checkpoint.work.planSHA256 === topic.planSHA256) {
+            candidates.push({ kind: WORK_CHECKPOINT_KIND, revision: artifact.revision, path: artifact.path, createdAt: artifact.createdAt });
+            workFindings = settleClosedDiagnoses(checkpoint.accumulated, this.core.diagnoses.mediatorClosedIds(topic.id)).findings;
+            workIsFix = checkpoint.work.kind === "FIX";
+            workRequests = checkpointOpenRequests(checkpoint).map(request => ({ id: request.id, text: request.text, askedAfterSequence: request.askedAfterSequence }));
+          }
+        } catch (error) {
+          // 손상은 "열린 요청·지적 없음" 으로 바꾸지 않고 손상으로 돌려준다(엔진의 다른 읽는 곳과 같은 규칙). 그 밖의 오류는 재개 조회 실패로 올린다.
+          if (!(error instanceof CheckpointCorrupt)) throw error;
+          errors.push(`작업 체크포인트 #${error.revision} 이 손상돼 열린 요청·지적을 확인할 수 없습니다: ${error.message}`);
+        }
+      }
+    }
+    const basis = candidates.sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.revision - a.revision)[0] ?? null;
+    let open: OpenFinding[] = [];
+    if (basis) {
+      try {
+        if (basis.kind === "closeout") {
+          const closeout = await this.core.latestResult(topic.id, "closeout");
+          open = closeoutOpenFindings(closeout, judgeCloseout(await this.planning.roundKnownFindings(topic.id), closeout,
+            { regressionAdjudicated: this.planning.closeoutRegressionAdjudicated(topic.id) }));
+        } else if (basis.kind === "codex-review" || basis.kind === "codex-final-review") {
+          const { review, judgment } = await this.delivery.storedReviewJudgment(topic.id, basis.kind);
+          open = reviewOpenFindings(review, judgment);
+        } else if (basis.kind === "claude-fix" || (basis.kind === WORK_CHECKPOINT_KIND && workIsFix)) {
+          // 수정 결과는 수락 가드(contractAcceptance)와 같은 판정 — 열린 수정 작업 계약의 원본 합의를 내린 되돌림을 미해결로 싣는다.
+          const findings = basis.kind === "claude-fix" ? await this.runnerFindings(topic.id, "claude-fix") : workFindings;
+          const judgment = this.delivery.fixAcceptanceJudgment(topic.id, findings);
+          open = judgment ? fixOpenFindings(findings, judgment) : unsettledFindings(findings, { runnerReport: true });
+        } else if (basis.kind === WORK_CHECKPOINT_KIND) {
+          open = unsettledFindings(workFindings, { runnerReport: true });
+        } else if (RUNNER_REPORT_KINDS.has(basis.kind)) {
+          open = unsettledFindings(await this.runnerFindings(topic.id, basis.kind), { runnerReport: true });
+        } else {
+          open = unsettledFindings((await this.core.latestResult(topic.id, basis.kind)).findings);
+        }
+      } catch (error) {
+        errors.push(`${basis.kind} 판정을 다시 계산하지 못했습니다: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    return {
+      basis: basis ? { kind: basis.kind, revision: basis.revision, path: basis.path } : null,
+      open: open.map(({ finding, reason }) => ({ id: finding.id, severity: finding.severity, title: finding.title,
+        disposition: finding.disposition ?? null, requiresUserDecision: finding.requiresUserDecision, reason })),
+      errors, workRequests,
+    };
+  }
+
+  // 러너 보고(구현·수정 결과)의 처분 — 인도 작업 재개와 같이 정정·해결로 닫힌 진단의 옛 처분을 정리한 뒤 판정한다.
+  private async runnerFindings(topicId: string, kind: string): Promise<Finding[]> {
+    return settleClosedDiagnoses(await this.core.latestResult(topicId, kind), this.core.diagnoses.mediatorClosedIds(topicId)).findings;
+  }
+
+  private blocker(check: () => void): string | null {
+    try { check(); return null; } catch (error) { return error instanceof Error ? error.message : String(error); }
+  }
+
+  nextActions(topicId: string): ResumeAction[] {
+    const db = this.core.dependencies.database;
+    const topic = db.getTopic(topicId);
+    const flags = db.getFlags(topicId);
+    if (db.runningAction(topicId) || this.core.active.has(topicId)) return [{ action: "stop", blocker: null }];
+    const actions: ResumeAction[] = [];
+    if (topic.state === "DRAFT") {
+      actions.push({ action: "plan", blocker: this.blocker(() => {
+        this.core.assertNotShuttingDown(); this.core.assertNoActiveWork(topicId); this.core.requireState(topicId, "DRAFT");
+      }) });
+    } else if (INTERRUPTED_STATES.has(topic.state)) {
+      if (topic.state === "USER_DECISION_REQUIRED") actions.push({ action: "message:decision", blocker: null });
+      if (topic.state === "BLOCKED_ON_EVIDENCE") actions.push({ action: "message:evidence", blocker: null });
+      actions.push({ action: "retry", blocker: this.blocker(() => {
+        const { resume } = this.retryPreconditions(topicId);
+        if (!resume && !this.core.diagnoses.pendingPlanRevision(topicId)) throw new Error("재시도할 단계가 기록되어 있지 않습니다.");
+      }) });
+      if (this.scheduledRetryAt(topicId)) actions.push({ action: "stop", blocker: null });
+    } else if (topic.state === "AWAITING_USER_APPROVAL") {
+      if (topic.approvedPlanSHA256 !== topic.planSHA256) {
+        actions.push({ action: "approve", input: { planSHA256: topic.planSHA256 }, blocker: this.blocker(() => this.approvePreconditions(topicId, topic.planSHA256)) });
+      } else {
+        actions.push({ action: "implement", blocker: this.blocker(() => { this.implementPreconditions(topicId); this.core.assertNoActiveWork(topicId); }) });
+      }
+    } else if (topic.state === "READY_TO_DELIVER") {
+      // 리뷰 질문 답변·작업 트리 스냅샷·전달 잠금은 인도 실행이 검사한다(DeliveryPipeline 내부) — 여기서는 호출할 수 있는 검사만 판정하고 나머지를 밝힌다.
+      const deliverable = (entry: string) => this.blocker(() => {
+        db.evidence.assertReady(topic); this.core.diagnoses.assertDeliverable(topicId, entry);
+        if (!topic.branchName) throw new Error("커밋할 작업 브랜치가 없습니다.");
+        if (!flags.reviewedHead || !flags.reviewedDiffSHA256) throw new Error("최종 리뷰가 확인한 변경 스냅샷이 없습니다.");
+      });
+      const deferredChecks = ["리뷰 질문 답변 확인", "작업 트리가 최종 리뷰 스냅샷과 같은지", "전달 잠금"];
+      actions.push({ action: "commit", input: { message: null, paths: null }, blocker: deliverable("커밋(commit)"), deferredChecks });
+      if (flags.committedOID && flags.pushedOID !== flags.committedOID) actions.push({ action: "push", blocker: deliverable("푸시(push)"), deferredChecks });
+      actions.push({ action: "close", blocker: this.blocker(() => this.closePreconditions(topicId)) });
+    } else if (topic.state === "CLOSED") {
+      actions.push({ action: "archive", blocker: this.blocker(() => { this.core.assertNotShuttingDown(); this.core.assertNoActiveWork(topicId); }) });
+    }
+    return actions;
+  }
+
+  approve(topicId: string, planSHA256: string): Topic {
+    this.approvePreconditions(topicId, planSHA256);
     const updated = this.core.dependencies.database.updateTopic(topicId, { approvedPlanSHA256: planSHA256 });
     this.core.event(topicId, "user", "decision", "현재 계획 버전의 구현을 승인했습니다.", { planSHA256 });
     return updated;
   }
 
   close(topicId: string): Topic {
+    this.closePreconditions(topicId);
+    return this.core.transition(topicId, "CLOSED", "주제를 닫았습니다.");
+  }
+
+  // close 의 부작용 전 검사 전부 — close 와 재개 정보가 같은 함수를 쓴다(엔진 개편 E1).
+  private closePreconditions(topicId: string): void {
     this.core.dependencies.database.evidence.assertReady(this.core.dependencies.database.getTopic(topicId));
     if (this.core.active.has(topicId) || this.core.deliveryActive.has(topicId) || this.core.scopeChangeActive.has(topicId)) {
       throw new Error("다른 작업이 끝난 뒤 주제를 닫아 주세요.");
@@ -458,7 +708,6 @@ export class WorkflowEngine {
       const flags=this.core.dependencies.database.getFlags(topicId);
       if(!flags.pushedOID || flags.pushedOID!==flags.committedOID)throw new Error("다음 단계로 넘어가려면 먼저 커밋과 푸시를 완료하세요.");
     }
-    return this.core.transition(topicId, "CLOSED", "주제를 닫았습니다.");
   }
 
   // 전달(commit/push/처분) API는 DeliveryPipeline에 위임한다.

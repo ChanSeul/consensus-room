@@ -317,7 +317,12 @@ ${finalizing ? "No more research is available. Return the final contracted resul
 Checkpoint must fit ${LIMIT.checkpointBytes} UTF-8 bytes. Final result must satisfy the task contract below.`;
         // The original task contract and mandatory instructions are never silently truncated.
         const contractHash = planningHash(turn.prompt);
-        const task = keepSession && record.deliveredContractHash === contractHash ? "Continue the task already in this session." : turn.prompt;
+        const continuing = keepSession && record.deliveredContractHash === contractHash;
+        // A delta prompt is only valid in the session it was computed for. Any other session (rotated or new)
+        // receives the workflow's full-context version, so decisions before the delta cursor are not lost.
+        const deltaSession = resume ? (turn as SessionTurn).sessionId : null;
+        const task = continuing ? "Continue the task already in this session."
+          : turn.freshSessionPrompt && record.sessionId !== deltaSession ? turn.freshSessionPrompt : turn.prompt;
         const instructionsInSession = Boolean(keepSession && record.sessionId && record.started &&
           record.deliveredInstructionHash === instructionHash);
         const instructionBlocks = instructionsInSession ? [] : instructions.blocks;
@@ -330,8 +335,21 @@ Checkpoint must fit ${LIMIT.checkpointBytes} UTF-8 bytes. Final result must sati
           // Closeout must carry the revised plan into the same review session after the initial audit.
           const historyLimit = topic.state === "CODEX_CLOSEOUT" ? LIMIT.closeoutHistoryBytes : LIMIT.reviewHistoryBytes;
           if (!context.known) pause("Reviewer context is unknown or exceeds the host history limit; the review session and its findings were preserved for mediation.");
+          // A new plan epoch can reuse the reviewer participant's old session. If that session
+          // cannot hold the first audit packet, start this audit in a fresh reviewer session.
+          // The fresh session gets the full-context task (freshSessionPrompt) when the workflow sent a delta.
+          if (topic.state === "CODEX_AUDIT" && context.bytes + packetBytes > historyLimit &&
+              record.round === 0 && !record.started && !record.lastResponse && record.fragments.length === 0) {
+            record.sessions = [...new Set([...(record.sessions ?? []), record.sessionId])];
+            record.sessionId = null;
+            record.delivered = [];
+            record.deliveredContractHash = undefined;
+            record.deliveredInstructionHash = undefined;
+            save();
+            continue;
+          }
           if (context.bytes + packetBytes > historyLimit && instructionsInSession &&
-              task !== turn.prompt && record.lastResponse && !record.responsePending &&
+              continuing && record.lastResponse && !record.responsePending &&
               (citationRepair || (!record.finalAttempted &&
                 JSON.stringify(record.step) === JSON.stringify(record.lastResponse.planningStep)))) {
             if (!canFinalize()) pause("Planning checkpoint saved; insufficient remaining budget for synthesis.");

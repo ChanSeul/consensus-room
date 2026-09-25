@@ -82,6 +82,9 @@ export interface SessionTurn {
   onFigmaResult?: (observation: { tool: string; input: unknown; content: unknown; isError?: boolean }) => void;
   sessionId: string;
   prompt: string;
+  // prompt 가 sessionId 세션이 이미 받은 내용 위의 변경분일 때만 둔다 — 과제를 다른 세션(교체·새 세션)에 전달하는 쪽은 prompt 대신 이
+  // 전체 문맥 판을 쓴다. 변경분은 계산한 세션에서만 유효하다(host-review a7a9ce86 F-001).
+  freshSessionPrompt?: string;
   cwd: string;
   signal?: AbortSignal;
   // spawn 직전 실행 허용 검사(CommandSpec.beforeSpawn/admitSync 로 그대로 전달). 어댑터의 내부 재시도·슬롯 대기·세션 폴백도 매번 부른다.

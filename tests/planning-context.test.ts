@@ -50,6 +50,9 @@ describe("검증된 계획 정본으로 만드는 변경분", () => {
     expect(context.text).not.toContain("line 100: original");
     expect(context.readablePaths).toHaveLength(2);
     expect(context.timeline.map((event) => event.body)).toEqual(["NEW"]);
+    // 변경분은 커서 세션에서만 유효하다 — 다른 세션으로 갈 때 쓸 전체 문맥(전문·커서 이전 결정 포함)을 함께 준다(host-review a7a9ce86 F-001).
+    expect(context.full?.text).toBe(f.current);
+    expect(context.full?.timeline.map((event) => event.body)).toEqual(["OLD", "NEW"]);
     const before = await f.artifacts.readLatest("topic", "codex-planning-cursor");
     await expect(context.accept(AbortSignal.abort(), "prompt")).rejects.toThrow();
     expect(await f.artifacts.readLatest("topic", "codex-planning-cursor")).toBe(before);
@@ -65,6 +68,7 @@ describe("검증된 계획 정본으로 만드는 변경분", () => {
     if (reason === "oversized-diff") f.core.dependencies.git.diffPlanFiles = async () => "diff".repeat(10000);
     const context = await f.prepare();
     expect(context.mode).toBe("full");
+    expect(context.full).toBeNull();
     expect(context.text).toBe(f.current);
     expect(context.timeline.map((event) => event.body)).toEqual(["OLD", "NEW"]);
   });
