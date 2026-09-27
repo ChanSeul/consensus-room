@@ -12,6 +12,9 @@ import type { CommandResult, CommandRunner, CommandSpec, TurnUsage } from "../sr
 import { agentEnvironment } from "../src/server/security";
 import { DEFAULT_AGENT_SETTINGS } from "../src/shared/contracts";
 import { PlanningStepSchema } from "../src/shared/planningControl";
+import { DatabaseSync } from "node:sqlite";
+import { BudgetLedger } from "../src/server/budgetLedger";
+import { BudgetController } from "../src/server/budgetController";
 
 vi.mock("node:fs/promises", async importOriginal => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
@@ -71,6 +74,43 @@ function memoryDocument(name: string, body: string): string {
 }
 
 describe("에이전트별 권한 경계", () => {
+  it.each(["shared", "topic"])("charges only the resumed Codex turn from the %s session home", async location => {
+    // resumeTurn -> onUsage -> guarded planning/BudgetController. The provider's request records
+    // independently identify this turn; its CLI completion reports the whole previous session too.
+    const seen: TurnUsage[] = [];
+    let home = "";
+    const runner: CommandRunner = { run: async spec => {
+      const at = new Date().toISOString(), session = "thread-scoped-usage", turn = "turn-new";
+      const usage = { input_tokens: 120, cached_input_tokens: 90, output_tokens: 7 };
+      const total = { input_tokens: 1120, cached_input_tokens: 890, output_tokens: 107 };
+      const events = [
+        { type: "session_meta", payload: { id: session } },
+        { type: "event_msg", timestamp: at, payload: { type: "task_started", turn_id: turn } },
+        { type: "token_usage_record", timestamp: at, payload: { thread_id: session, turn_id: turn,
+          response_id: "r-new", usage, turn_token_usage: usage, thread_token_usage: total } },
+        { type: "event_msg", timestamp: at, payload: { type: "task_complete", turn_id: turn } },
+      ];
+      const sessions = join(location === "shared" ? home : String(spec.environment?.CODEX_HOME), "sessions/2026/09/27");
+      mkdirSync(sessions, { recursive: true });
+      writeFileSync(join(sessions, `${session}.jsonl`), events.map(e => JSON.stringify(e)).join("\n"));
+      return successfulResult([{ type: "thread.started", thread_id: session }, planResult,
+        { type: "turn.completed", usage: total }]);
+    } };
+    const created = codexAdapter(runner); home = created.codexHome;
+    const sql = new DatabaseSync(":memory:"), ledger = new BudgetLedger(sql);
+    ledger.configure("topic", { execution: { inputTokens: 500, outputTokens: 50, durationMs: 10_000 },
+      total: { inputTokens: 5000, outputTokens: 500, durationMs: 100_000 } }, "user-explicit");
+    const budgeted = new BudgetController(ledger, () => ({ topicId: "topic", accounts: ["topic"], stage: "CODEX_AUDIT" }), async () => {}).wrap(created.adapter);
+    try {
+      await budgeted.resumeTurn({ sessionId: "thread-scoped-usage", cwd: "/tmp", prompt: "Continue",
+        protocolOnly: true, onUsage: usage => seen.push(usage) });
+      expect(ledger.account("topic")).toMatchObject({ pause: null, used: { inputTokens: 120, outputTokens: 7 } });
+    } finally { sql.close(); }
+    expect(seen.at(-1)).toMatchObject({ inputTokens: 120, cachedInputTokens: 90, outputTokens: 7,
+      source: "codex-home", completeness: "complete", sourceUsage: {
+        cli: { inputTokens: 1120, outputTokens: 107 }, codexHome: { inputTokens: 120, outputTokens: 7 },
+      } });
+  });
   it("resumes the planning session for Opus implementation with ultracode and write tools", async () => {
     const root = mkdtempSync(join(tmpdir(), "planning-to-implementation-"));
     temporaryDirectories.push(root);

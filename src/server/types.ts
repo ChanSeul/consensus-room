@@ -185,7 +185,16 @@ export interface TurnUsage {
   modelTurns?: number;
   internalRequests?: number;
   // Codex CLI 최종값과 관리형 홈 원본을 합산하지 않고 나란히 보관한다.
-  sourceUsage?: { cli?: Partial<TurnUsage>; claudeStream?: Partial<TurnUsage>; codexHome?: Partial<TurnUsage>; status: "matched" | "mismatch" | "unavailable" };
+  sourceUsage?: UsageSourceComparison & { turns?: Array<{
+    executionId?: string; sessionId: string | null; round: number; sourceUsage: UsageSourceComparison;
+  }> };
+}
+
+export interface UsageSourceComparison {
+  cli?: Partial<TurnUsage>;
+  claudeStream?: Partial<TurnUsage>;
+  codexHome?: Partial<TurnUsage>;
+  status: "matched" | "mismatch" | "unavailable";
 }
 
 export interface ExecutionLimits {

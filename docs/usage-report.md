@@ -41,6 +41,7 @@ mapping에서 정확한 파일의 역할을 먼저 지정한다. 원본 메시�
   다른 형식만 남은 기록은 실행별 보고값으로 보존하며 원본 요청 합계에 추정해 넣지 않는다.
 - `executionObservations`는 원장에 남은 별도 관측이다. 원본 요청 합계에 더하지 않는다.
   CLI·원본 대조의 불일치와 필드 누락은 `coverage`에 남긴다. 미제공 수치를 0으로 단정하지 않는다.
+
 - `reportedCostUSD`는 실행 원장이 보고한 금액만의 합이다. 요금제 사용량이나 청구서를 뜻하지 않는다.
   토큰에 임의 단가를 곱하거나 사전 감사의 입력 환산 토큰을 달러로 합산하지 않는다.
 - 실행시간 합계는 병렬 실행을 각각 포함한다. union은 기록된 실행 구간의 중복을 제거한다.
@@ -52,3 +53,17 @@ JSON에는 출처 경로·SHA-256·요청 위치·실행별 관측·미배정 �
 **실제 보고서와 mapping은 비공개 로컬 산출물이다.** 공개 저장소에는 도구·문서·익명화된 테스트만 넣는다.
 
 검증: `python3 -m unittest discover -s tests/host-review -p test_usage_report.py -v`.
+
+## 재개한 Codex 호출의 예산 집계
+
+Codex CLI가 `turn.completed`에 세션 전체 누적량을 보고하는 경우가 있다. 엔진은 관리형 홈의 `token_usage_record`,
+해당 턴의 시작·완료, 세션·턴·요청 ID와 턴별 합계를 대조한다. 범위가 확인되면 그 호출에서 새로 발생한 요청 합계를
+예산에 반영한다. CLI 원문은 `sourceUsage.cli`에 보존하고 검증한 요청 합계를 `sourceUsage.codexHome`에 함께 남긴다.
+계획 제어가 여러 내부 호출을 묶는 경우에는 `sourceUsage.turns`에 호출별 실행·세션·회차와 비교값을 보존한다.
+원문이 불완전하거나 서로 모순되면 작은 값으로 추정해서 정정하지 않는다.
+
+이미 누적량을 반복 합산한 기록은 `scripts/reconcile-codex-usage.ts`로 검증할 수 있다. 완료된 실행과 현재 예산 대기
+체크포인트가 원문의 누적값 합계와 정확히 일치해야 한다. 먼저 `--database PATH --home CODEX_HOME --transcript JSONL
+--execution ID`로 읽기 전용 preview를 확인하고, 운영 백업을 보존한 뒤 같은 명령에 `--apply HASH`를 추가한다.
+preview 이후 자료가 바뀌거나 실행 중 action·불확실한 실행이 있으면 적용하지 않는다. 원본 행·원문 해시·정정 전후 값은
+`codex_usage_reconciliations`에 남고 재적용은 멱등이다. 시간 사용량, 정책 상한, grant, 세션, 읽기 영수증과 논리 리뷰 예산은 유지한다.

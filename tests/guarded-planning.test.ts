@@ -4305,3 +4305,25 @@ it("cancels a blocked preparation read before model spawn and closes the same bu
   expect(database.planning.latest("topic")?.finalized).toBe(false);
   expect(() => database.budgets.assertAvailable(["topic"])).not.toThrow();
 });
+
+
+it("preserves each internal Codex comparison through guarded planning into execution_usage", async () => {
+  const { repo, database, git } = setup("codex");
+  const fake = scripted(async (turn, n) => {
+    const comparison = { status: "mismatch" as const, cli: { inputTokens: 1000 + n, outputTokens: 200 + n },
+      codexHome: { inputTokens: 100, outputTokens: 20 } };
+    // Repeated final observation for one call must replace its source record, not append another.
+    for (let i = 0; i < 2; i++) turn.onUsage?.({ executionId: `inner-${n}`, inputTokens: 100, outputTokens: 20,
+      recordKind: "final", sourceUsage: comparison });
+    return n === 1 ? answer(step({ requests: [{ kind: "file", selector: "form.swift", question: "Read", offset: 0 }] }))
+      : answer(step({ questions: [], complete: true }));
+  }, "codex");
+  await guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Plan",
+    onUsage: usage => database.saveExecutionUsage("topic", 1, "codex", "turn", { ...usage, executionId: "outer" }) });
+  const saved = database.getExecutionUsage("topic")[0].usage;
+  expect(saved).toMatchObject({ recordKind: "final", inputTokens: 200, outputTokens: 40, sourceUsage: { status: "mismatch",
+    turns: [
+      { executionId: "inner-1", sessionId: "session-1", sourceUsage: { cli: { inputTokens: 1001, outputTokens: 201 }, codexHome: { inputTokens: 100, outputTokens: 20 } } },
+      { executionId: "inner-2", sessionId: "session-1", sourceUsage: { cli: { inputTokens: 1002, outputTokens: 202 }, codexHome: { inputTokens: 100, outputTokens: 20 } } },
+    ] } });
+});

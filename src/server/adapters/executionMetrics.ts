@@ -2,6 +2,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ExecutionLimits, TurnUsage } from "../types.js";
+import { codexUsageEvidence, sameTokenCounts, type CodexUsageEvidence } from "./codexUsageEvidence.js";
+
+type CodexHomeUsage = Partial<TurnUsage> & { turnEvidence?: CodexUsageEvidence };
 
 type RecordValue = Record<string, unknown>;
 
@@ -64,6 +67,7 @@ export class ExecutionMetrics {
   private finalUsageComplete = false;
   private claudeAssistantRequests = 0;
   private reconciliation: TurnUsage["sourceUsage"];
+  private reconciledCodexTurn = false;
 
   constructor(
     private readonly kind: "claude" | "codex",
@@ -197,10 +201,18 @@ export class ExecutionMetrics {
 
   hasFinalSource(): boolean { return this.finalSourceSeen; }
 
-  setCodexHomeUsage(homeUsage: Partial<TurnUsage> | null): void {
+  setCodexHomeUsage(homeUsage: CodexHomeUsage | null): void {
     const cli = { ...this.totals, internalRequests: this.internalRequests };
     const same = homeUsage && cli.inputTokens === homeUsage.inputTokens && cli.outputTokens === homeUsage.outputTokens;
     this.reconciliation = { cli, ...(homeUsage ? { codexHome: homeUsage } : {}), status: homeUsage ? (same ? "matched" : "mismatch") : "unavailable" };
+    const proof = homeUsage?.turnEvidence;
+    // Keep the provider's original cumulative report above; only verified completed request/turn
+    // records may replace the counters consumed by planning and the budget ledger.
+    if (this.kind === "codex" && proof && proof.turnCount === this.internalRequests &&
+      (sameTokenCounts(cli, proof.reported) || sameTokenCounts(cli, proof.usage))) {
+      this.totals = { ...proof.usage };
+      this.reconciledCodexTurn = true;
+    }
   }
 
   snapshot(tool: { toolDurationMs: number; toolCalls: number }, recordKind: "progress" | "final"): TurnUsage {
@@ -213,7 +225,7 @@ export class ExecutionMetrics {
       inputBytes: this.inputBytes,
       recordKind,
       completeness: observed ? "complete" : "partial",
-      source: "cli-stream",
+      source: this.reconciledCodexTurn ? "codex-home" : "cli-stream",
       internalRequests: this.internalRequests,
       lastRequestInputTokens: this.lastRequestInputTokens,
       peakRequestInputTokens: this.peakRequestInputTokens,
@@ -229,24 +241,27 @@ export class ExecutionMetrics {
 
 // 관리형 CODEX_HOME은 CLI 버전별로 세션 파일 배치가 달라질 수 있으므로, 해당 홈 아래 JSONL만 제한적으로
 // 읽고 같은 완료 이벤트의 마지막 관측값을 따로 보관한다. 찾지 못한 것은 0이 아니라 unavailable이다.
-export async function codexHomeUsage(home: string, sessionId: string | undefined, startedAt: number, endedAt = Date.now()): Promise<Partial<TurnUsage> | null> {
+export async function codexHomeUsage(home: string | readonly string[], sessionId: string | undefined, startedAt: number, endedAt = Date.now()): Promise<CodexHomeUsage | null> {
   if (!sessionId) return null;
-  const files: string[] = [];
+  const files = new Set<string>();
   const visit = async (directory: string, depth: number): Promise<void> => {
-    if (depth > 4 || files.length >= 200) return;
+    if (depth > 4 || files.size >= 200) return;
     for (const entry of await readdir(directory, { withFileTypes: true }).catch(() => [])) {
       const path = join(directory, entry.name);
       if (entry.isSymbolicLink()) continue;
       if (entry.isDirectory()) await visit(path, depth + 1);
-      else if (entry.isFile() && entry.name.endsWith(".jsonl") && entry.name.includes(sessionId)) files.push(path);
+      else if (entry.isFile() && entry.name.endsWith(".jsonl") && entry.name.includes(sessionId)) files.add(path);
     }
   };
-  await visit(home, 0);
+  for (const root of new Set(typeof home === "string" ? [home] : home)) await visit(root, 0);
   let total: Partial<TurnUsage> = {};
   let found = false;
   const seen = new Set<string>();
+  const proofs: CodexUsageEvidence[] = [];
   for (const path of files) {
     const text = await readFile(path, "utf8").catch(() => "");
+    const proof = codexUsageEvidence(text, sessionId, startedAt, endedAt);
+    if (proof) proofs.push(proof);
     for (const line of text.split(/\r?\n/)) {
       try {
         const event = record(JSON.parse(line));
@@ -270,7 +285,9 @@ export async function codexHomeUsage(home: string, sessionId: string | undefined
       } catch { /* non JSON lines are not source records */ }
     }
   }
-  return found ? total : null;
+  // More than one matching transcript is ambiguous; do not select whichever counter is smaller.
+  return found ? { ...total, ...(files.size === 1 && proofs.length === 1 && sameTokenCounts(total, proofs[0].usage)
+    ? { turnEvidence: proofs[0] } : {}) } : null;
 }
 
 export function exceededLimits(usage: TurnUsage, limits: ExecutionLimits): Array<{ key: keyof ExecutionLimits; value: number; limit: number; timing: "live" | "completion" }> {

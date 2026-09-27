@@ -229,13 +229,19 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
     const usedThisInvocation = zero();
     let adapterDuration = 0;
     const invocationMetrics: PlanningMetrics = {};
+    const sourceTurns: NonNullable<NonNullable<TurnUsage["sourceUsage"]>["turns"]> = [];
+    const sourceComparison = (): TurnUsage["sourceUsage"] => sourceTurns.length ? {
+      status: sourceTurns.some(t => t.sourceUsage.status === "mismatch") ? "mismatch"
+        : sourceTurns.some(t => t.sourceUsage.status === "unavailable") ? "unavailable" : "matched",
+      turns: structuredClone(sourceTurns),
+    } : undefined;
     const save = (persist = () => database.planning.save(record)) => {
       usedThisInvocation.durationMs = Math.max(usedThisInvocation.durationMs, Date.now() - invocationStarted, adapterDuration);
       record.usage.durationMs = priorDuration + usedThisInvocation.durationMs;
       record.updatedAt = new Date().toISOString(); persist();
     };
     const emitFinal = () => turn.onUsage?.({ ...usedThisInvocation, ...invocationMetrics,
-      recordKind: "final", completeness: "partial", sourceUsage: undefined,
+      recordKind: "final", completeness: "partial", sourceUsage: sourceComparison(),
       model: turn.settings?.model, effort: turn.settings?.effort });
     const pause = (message: string): never => { record.stopped = message; save(); throw new PlanningPaused(message); };
     // ---- 복구 계보(E3-3a) — 좌석(job 역할)별 계보에서 자동 복구 1회를 센다. 계보의 경계는 엔진이 이 좌석의 결과를 채택한 산출물이다
@@ -919,7 +925,14 @@ Checkpoint must fit ${LIMIT.checkpointBytes} UTF-8 bytes. Final result must sati
         const stepMetrics: PlanningMetrics = {};
         let callStarted = false;
         const observed = new Set<string>();
+        let sourceIndex: number | undefined;
+        const sourceRound = record.round + 1;
         const onUsage = (usage: TurnUsage) => {
+          if (usage.sourceUsage) {
+            sourceIndex ??= sourceTurns.length;
+            sourceTurns[sourceIndex] = { executionId: usage.executionId, sessionId: record.sessionId,
+              round: sourceRound, sourceUsage: structuredClone(usage.sourceUsage) };
+          }
           const next = { ...latest };
           for (const k of usageKeys) if (usage[k] !== undefined && Number.isFinite(usage[k]) && usage[k]! >= 0) {
             next[k] = Math.max(latest[k], usage[k]!); observed.add(k);
@@ -943,7 +956,7 @@ Checkpoint must fit ${LIMIT.checkpointBytes} UTF-8 bytes. Final result must sati
           if (usage.lastRequestInputTokens !== undefined) record.lastRequestInputTokens = usage.lastRequestInputTokens;
           if (usage.peakRequestInputTokens !== undefined) record.peakRequestInputTokens = Math.max(record.peakRequestInputTokens ?? 0, usage.peakRequestInputTokens);
           save();
-          turn.onUsage?.({ ...usage, ...usedThisInvocation, ...invocationMetrics, sourceUsage: undefined, recordKind: "progress" });
+          turn.onUsage?.({ ...usage, ...usedThisInvocation, ...invocationMetrics, sourceUsage: sourceComparison(), recordKind: "progress" });
         };
         let image: { path: string; bytes: number } | undefined;
         if (record.imageHash) {

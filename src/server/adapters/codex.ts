@@ -418,7 +418,7 @@ export class CodexAdapter implements AgentAdapter {
       ? output.jsonLines.find((value) => typeof value === "object" && value !== null && (value as { type?: unknown }).type === "thread.started" && typeof (value as { thread_id?: unknown }).thread_id === "string") as { thread_id?: string } | undefined
       : undefined;
     const resumedSessionId = "sessionId" in turn ? turn.sessionId : undefined;
-    metrics.setCodexHomeUsage(await codexHomeUsage(usageHome, resumedSessionId ?? sessionId?.thread_id, startedAt));
+    metrics.setCodexHomeUsage(await codexHomeUsage([usageHome, topicHome], resumedSessionId ?? sessionId?.thread_id, startedAt));
     recordFinal();
     if (foreignThreads.length > 0) {
       throw new SessionIdentityMismatch("codex", requestedSessionId!, returnedThread!,
