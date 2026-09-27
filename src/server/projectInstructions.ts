@@ -1,4 +1,4 @@
-import { readFile, realpath } from "node:fs/promises";
+import { readInstructionFiles } from "./userFileReader.js";
 import { join } from "node:path";
 import { PROJECT_INSTRUCTION_PRECEDENCE_NOTE } from "../shared/prompts.js";
 import { redactSecrets } from "../shared/workflow.js";
@@ -11,6 +11,9 @@ export const INSTRUCTION_FILE_LIMIT_BYTES = 32_000;
 // 조항(요청 없이 빌드 금지·시뮬 실행·훅 ack·홈 경로 참조)이 있으므로 주입 뒤에 우선순위 규칙을 붙인다.
 export interface AppliedInstructionInput {
   strict?: boolean;
+  // Guarded planning delivers the complete text through its required input queue when needed.
+  chunkedDelivery?: boolean;
+  signal?: AbortSignal;
   workspace: string;
   fileName: string;
   // 원본 저장소. worktree 에 파일이 없을 때만 쓴다.
@@ -28,39 +31,26 @@ export interface AppliedInstructions {
 }
 
 export async function readAppliedInstructions(input: AppliedInstructionInput): Promise<AppliedInstructions> {
+  const files = await readInstructionFiles({ workspacePath: join(input.workspace, input.fileName),
+    repositoryPath: input.repositoryPath ? join(input.repositoryPath, input.fileName) : undefined,
+    globalPath: input.globalPath ?? undefined, injectWorkspaceFile: input.injectWorkspaceFile }, { signal: input.signal });
   const blocks: string[] = [];
-  if (input.globalPath) {
-    const block = await readInstructionBlock(`사용자 전역 ${input.fileName}`, input.globalPath, input.strict);
-    if (block) blocks.push(block);
-  }
-  const workspacePath = join(input.workspace, input.fileName);
-  const workspaceHasFile = Boolean(await realpath(workspacePath).catch(() => null));
-  let projectSource: AppliedInstructions["projectSource"] = null;
-  let projectBlock: string | null = null;
-  if (workspaceHasFile) {
-    if (input.injectWorkspaceFile) {
-      projectBlock = await readInstructionBlock(`작업 저장소 ${input.fileName}`, workspacePath, input.strict);
-      if (projectBlock) projectSource = "workspace";
-    }
-  } else if (input.repositoryPath) {
-    projectBlock = await readInstructionBlock(
-      `작업 저장소 ${input.fileName} (원본 저장소 사본 — worktree 에는 gitignored 라 없음)`,
-      join(input.repositoryPath, input.fileName),
-      input.strict,
-    );
-    if (projectBlock) projectSource = "repository";
-  }
+  const globalBlock = instructionBlock(`사용자 전역 ${input.fileName}`, files.global, input.strict, input.chunkedDelivery);
+  if (globalBlock) blocks.push(globalBlock);
+  const projectSource = files.source;
+  const label = projectSource === "repository"
+    ? `작업 저장소 ${input.fileName} (원본 저장소 사본 — worktree 에는 gitignored 라 없음)` : `작업 저장소 ${input.fileName}`;
+  const projectBlock = instructionBlock(label, files.project, input.strict, input.chunkedDelivery);
   if (projectBlock) blocks.push(projectBlock, PROJECT_INSTRUCTION_PRECEDENCE_NOTE);
   return { blocks, projectSource };
 }
 
-async function readInstructionBlock(label: string, path: string, strict = false): Promise<string | null> {
-  const raw = await readFile(path, "utf8").catch(() => null);
+function instructionBlock(label: string, raw: string | null, strict = false, chunked = false): string | null {
   if (!raw) return null;
-  if (strict && Buffer.byteLength(raw) > INSTRUCTION_FILE_LIMIT_BYTES) {
+  if (!chunked && strict && Buffer.byteLength(raw) > INSTRUCTION_FILE_LIMIT_BYTES) {
     throw new Error("Mandatory instruction file exceeds the planning limit; it must not be silently truncated.");
   }
-  const bounded = Buffer.byteLength(raw, "utf8") > INSTRUCTION_FILE_LIMIT_BYTES
+  const bounded = !chunked && Buffer.byteLength(raw, "utf8") > INSTRUCTION_FILE_LIMIT_BYTES
     ? `${raw.slice(0, INSTRUCTION_FILE_LIMIT_BYTES)}\n[이하 생략: 지시문이 32KB를 넘었습니다.]`
     : raw;
   return [`적용되는 지시문 시작: ${label}`, redactSecrets(bounded).trim(), `적용되는 지시문 끝: ${label}`].join("\n");

@@ -127,13 +127,15 @@ async function makeApp(runner?: CommandRunner, validateSession: () => Promise<bo
     run: async () => { throw new Error("이 테스트에서는 명령을 실행하지 않습니다."); },
   };
   const adapterCalls:string[]=[];
+  let resolveAdapterCall!: (role: string) => void;
+  const adapterCalled = new Promise<string>(resolve => { resolveAdapterCall = resolve; });
   // 가짜는 프로세스를 띄운 뒤 실패한 호출을 흉내 낸다(onProcessSpawn) — 띄우지 않은 호출은 예약이 해제되므로 집계 테스트의 전제가 달라진다(PLAN §2 검증 조건 1).
   const fakeSpawn = (turn: { onProcessSpawn?: (process: { pid: number; pgid: number; executable: string; commandLine: string; startedAt: string }) => void }) =>
     turn.onProcessSpawn?.({ pid: 1, pgid: 1, executable: "fake", commandLine: "fake", startedAt: new Date().toISOString() });
   const adapter = (role: "claude" | "codex"): AgentAdapter => ({
     role,
-    createSession: async (turn) => { adapterCalls.push(role); fakeSpawn(turn); throw new Error("이 테스트에서는 CLI를 실행하지 않습니다."); },
-    resumeTurn: async (turn) => { adapterCalls.push(role); fakeSpawn(turn); throw new Error("이 테스트에서는 CLI를 실행하지 않습니다."); },
+    createSession: async (turn) => { adapterCalls.push(role); resolveAdapterCall(role); fakeSpawn(turn); throw new Error("이 테스트에서는 CLI를 실행하지 않습니다."); },
+    resumeTurn: async (turn) => { adapterCalls.push(role); resolveAdapterCall(role); fakeSpawn(turn); throw new Error("이 테스트에서는 CLI를 실행하지 않습니다."); },
     validateExistingSession: validateSession,
   });
   const database = new ConsensusDatabase(join(root, "room.sqlite"));
@@ -164,7 +166,7 @@ async function makeApp(runner?: CommandRunner, validateSession: () => Promise<bo
     claude: adapter("claude"),
     codex: adapter("codex"),
   });
-  return { app, database, root, adapterCalls };
+  return { app, database, root, adapterCalls, adapterCalled };
 }
 
 // 실제 git 에 위임하면서 worktree 생성 명령만 센다 — 작업 묶음 새 단계 토픽은 계획 제어 v2 라(E4 2차 보완 F012) 계획 턴이 실제 작업 트리 스냅숏을 만든다.
@@ -600,7 +602,7 @@ it("activity API는 현재 세대의 역할별 최신 관측과 시각을 반환
 it("작업 묶음 API는 단계 생성 중복을 막고 계약 변경 때 승인을 무효화한다",async()=>{
  // 새 단계 토픽은 계획 제어 v2 다(E4 2차 보완 F012) — 예산 재개 뒤 계획 턴이 실제 작업 트리 스냅숏을 거쳐 에이전트에 닿도록 실제 git 저장소를 쓴다.
  const {runner,worktreeAdds}=countingRealGitRunner();let failWorktree=false;
- const {app,database,adapterCalls}=await makeApp({run:spec=>{if(failWorktree&&spec.args[0]==="worktree")throw new Error("worktree failure");return runner.run(spec);}},undefined,{gitRepository:true});
+ const {app,database,adapterCalls,adapterCalled}=await makeApp({run:spec=>{if(failWorktree&&spec.args[0]==="worktree")throw new Error("worktree failure");return runner.run(spec);}},undefined,{gitRepository:true});
  const budget={execution:{inputTokens:100,outputTokens:100,durationMs:100000},total:{inputTokens:1000,outputTokens:1000,durationMs:1000000}};
  const input={title:"단계 작업",goal:"목표",contracts:"기존 계약",stages:[
   {id:"one",kind:"work",title:"구현",goal:"구현",acceptance:"테스트",dependsOn:[],budget},
@@ -638,7 +640,8 @@ it("작업 묶음 API는 단계 생성 중복을 막고 계약 변경 때 승인
   const groupPolicy=database.budgets.account(group.id)!.policy;
   const granted=await post(`/api/work-groups/${group.id}/budget`,{version:1,policy:{...groupPolicy,execution:{...groupPolicy.execution,inputTokens:200}}},"grant");
   expect(granted.statusCode).toBe(200);
-  await vi.waitFor(()=>expect(adapterCalls).toEqual(["claude"]));
+  expect(await adapterCalled).toBe("claude");
+  expect(adapterCalls).toEqual(["claude"]);
   await vi.waitFor(()=>expect(database.runningAction(topic.id)).toBeNull());
   expect(database.budgets.account(group.id)?.used.inputTokens).toBe(100);
 

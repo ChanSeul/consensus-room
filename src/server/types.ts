@@ -81,7 +81,7 @@ export interface SessionTurn {
   binding?: SessionBinding;
   // Bounded planning is tool-free but still receives mandatory project instructions.
   planningControl?: { admissionId: string; maxPromptBytes: number; image?: { path: string; bytes: number };
-    instructionsInSession?: boolean };
+    instructionsInSession?: boolean; instructionsProvided?: boolean };
   // 코드 리뷰 원장 ID(E3-4c) — 실행기가 경로(TurnRoute.reviewLedger)에서 옮겨 싣는다. 예산 래퍼(BudgetController)가 리뷰 좌석의 읽기·최종 판정 호출을
   // 호출마다 새 ID 대신 이 ID 로 예약하고, 원장의 첫 spawn 뒤에는 spawn 전 실패에도 예약을 되돌리지 않는다. 어댑터는 읽지 않는다.
   reviewLedger?: string;

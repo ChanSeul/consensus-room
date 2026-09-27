@@ -5,6 +5,25 @@ import { BudgetLedger } from "../src/server/budgetLedger";
 import type { AgentAdapter, SessionTurn } from "../src/server/types";
 const policy={execution:{inputTokens:10,outputTokens:10,durationMs:100000},total:{inputTokens:50,outputTokens:50,durationMs:300000}};
 afterEach(()=>vi.useRealTimers());
+it("records dispatch before the process can start while preserving the caller's admission guard", async () => {
+ const db=new DatabaseSync(":memory:"),ledger=new BudgetLedger(db);ledger.configure("t",policy,"test");
+ const current=()=>ledger.execution(String(db.prepare("SELECT id FROM budget_executions").get()!.id));
+ const order:string[]=[];
+ const result={kind:"ACK" as const,summary:"done",findings:[],evidenceRefs:[]};
+ const invoke=async(t:Omit<SessionTurn,"sessionId">)=>{
+  expect(current().dispatchStarted).toBe(false);
+  t.admitSync?.();
+  // A crash here must not be mistaken for preparation, even before onProcessSpawn is delivered.
+  expect(current().dispatchStarted).toBe(true);order.push("dispatch");
+  t.onProcessSpawn?.({pid:123,pgid:123,executable:"fake",commandLine:"fake",startedAt:"now"});
+  return {sessionId:"s",result};
+ };
+ const adapter:AgentAdapter={role:"claude",validateExistingSession:async()=>true,createSession:invoke,
+  resumeTurn:async t=>(await invoke(t)).result};
+ const wrapped=new BudgetController(ledger,()=>({topicId:"t",accounts:["t"],stage:"ACK"}),async()=>{}).wrap(adapter);
+ await wrapped.createSession({cwd:"/tmp",prompt:"test",admitSync:()=>{expect(current().dispatchStarted).toBe(false);order.push("guard");}});
+ expect(order).toEqual(["guard","dispatch"]);expect(current().finished).toBe(true);db.close();
+});
 it("응답을 기다리는 60초 동안 다음 호출을 막고 중단 출력을 보존한다",async()=>{
  vi.useFakeTimers();vi.setSystemTime(0);
  const db=new DatabaseSync(":memory:"), ledger=new BudgetLedger(db); ledger.configure("t",policy,"test");

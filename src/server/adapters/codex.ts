@@ -319,14 +319,14 @@ export class CodexAdapter implements AgentAdapter {
     // 않았다 — 엔진이 그 세션의 첫 일반 resume 에 memoryBodies 를 실으면 그 resume 에 한 번 싣는다(매니페스트 없이).
     const injectMemory = Boolean(this.memory) && !protocolOnly && !turn.planningControl && (newSession || turn.memoryBodies === true);
     const enriched = injectMemory
-      ? await this.memory!.buildPrompt(turn.prompt, this.role)
+      ? await this.memory!.buildPrompt(turn.prompt, this.role, turn.signal)
       : turn.planningControl ? turn.prompt : await this.withMemoryManifest(turn, protocolOnly);
     // 프로토콜 확인 턴은 판단에 필요한 값을 프롬프트가 다 담고 있어 프로젝트 지시문(AGENTS.md)도 싣지 않는다
     // (2026-09-07 Codex 자기 최적화 제안 ②: ACK 턴마다 지시문 블록을 재전송하던 낭비).
-    const { blocks: instructions } = protocolOnly || (!newSession && turn.planningControl?.instructionsInSession)
+    const { blocks: instructions } = protocolOnly || turn.planningControl?.instructionsProvided || (!newSession && turn.planningControl?.instructionsInSession)
       ? { blocks: [] as string[] }
       : await readAppliedInstructions({
-        strict: Boolean(turn.planningControl),
+        strict: Boolean(turn.planningControl), signal: turn.signal,
         workspace: turn.cwd, fileName: "AGENTS.md", repositoryPath: this.options.repositoryPath ?? null,
         globalPath: turn.planningControl ? join(homedir(), ".codex", "AGENTS.md") : null,
         injectWorkspaceFile: Boolean(turn.planningControl),
@@ -441,7 +441,7 @@ export class CodexAdapter implements AgentAdapter {
     protocolOnly: boolean,
   ): Promise<string> {
     if (!this.memory || protocolOnly) return turn.prompt;
-    const manifest = await this.memory.buildManifest(turn.prompt, this.role);
+    const manifest = await this.memory.buildManifest(turn.prompt, this.role, turn.signal);
     return manifest ? `${turn.prompt}\n\n${manifest}` : turn.prompt;
   }
 

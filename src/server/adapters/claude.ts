@@ -210,10 +210,10 @@ export class ClaudeAdapter implements AgentAdapter {
       ];
       // 프로토콜 확인 턴은 판단에 필요한 값을 프롬프트가 다 담고 있어 지시문(CLAUDE.md)도 싣지 않는다
       // (2026-09-07 Codex 자기 최적화 제안 ②: ACK 턴마다 전역·프로젝트 지시문 블록을 재전송하던 낭비).
-      const { blocks: instructions } = protocolOnly || (!newSession && turn.planningControl?.instructionsInSession)
+      const { blocks: instructions } = protocolOnly || turn.planningControl?.instructionsProvided || (!newSession && turn.planningControl?.instructionsInSession)
         ? { blocks: [] as string[] }
         : await readAppliedInstructions({
-          strict: Boolean(turn.planningControl),
+          strict: Boolean(turn.planningControl), signal: turn.signal,
           workspace, fileName: "CLAUDE.md", repositoryPath: this.options.repositoryPath ?? null,
           globalPath: join(homedir(), ".claude", "CLAUDE.md"), injectWorkspaceFile: true,
         });
@@ -225,7 +225,7 @@ export class ClaudeAdapter implements AgentAdapter {
       // 한 번 싣는다(매니페스트 없이). 그 뒤 resume 은 다시 매니페스트만이다.
       const injectMemory = Boolean(this.memory) && !protocolOnly && !turn.planningControl && (newSession || turn.memoryBodies === true);
       const enriched = injectMemory
-        ? await this.memory!.buildPrompt(turn.prompt, this.role)
+        ? await this.memory!.buildPrompt(turn.prompt, this.role, turn.signal)
         : turn.planningControl ? turn.prompt : await this.withMemoryManifest(turn, protocolOnly);
       const stdin = [EXECUTION_POLICY_NOTE, ...instructions, enriched].join("\n\n");
       if (turn.planningControl && Buffer.byteLength(stdin) > turn.planningControl.maxPromptBytes) {
@@ -331,7 +331,7 @@ export class ClaudeAdapter implements AgentAdapter {
     protocolOnly: boolean,
   ): Promise<string> {
     if (!this.memory || protocolOnly) return turn.prompt;
-    const manifest = await this.memory.buildManifest(turn.prompt, this.role);
+    const manifest = await this.memory.buildManifest(turn.prompt, this.role, turn.signal);
     return manifest ? `${turn.prompt}\n\n${manifest}` : turn.prompt;
   }
 

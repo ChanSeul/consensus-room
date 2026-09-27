@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { lstat, readFile, realpath } from "node:fs/promises";
-import { dirname, isAbsolute, normalize, relative, resolve, sep } from "node:path";
+import { readMemoryFile, readMemoryFiles, resolveUserPath } from "./userFileReader.js";
+import { isAbsolute, normalize, relative, resolve, sep } from "node:path";
 
 import { redactSecrets } from "../shared/workflow.js";
 import type { ParticipantRole } from "./types.js";
@@ -43,8 +43,8 @@ export class ProjectMemoryReader {
   // 본문 없이 현재 SHA-256만 다시 알려 준다. 문서 본문은 세션 생성 턴에 한 번만 싣지만(턴당 ~20K자 중복),
   // 해시는 그 사이 바뀔 수 있어 그대로 두면 에이전트가 낡은 expectedSHA256으로 쓰기를 제안하고 거부당한다.
   // 매니페스트는 수백 바이트라 매 턴 실어도 비용이 없다.
-  async buildManifest(prompt: string, role: ParticipantRole): Promise<string> {
-    const snapshots = await this.select(prompt, role);
+  async buildManifest(prompt: string, role: ParticipantRole, signal?: AbortSignal): Promise<string> {
+    const snapshots = await this.select(prompt, role, signal);
     if (snapshots.length === 0) return "";
     const rows = (await Promise.all(snapshots.map(async (snapshot) => {
       const notice = await wikiEvidenceNotice(snapshot.content, this.options);
@@ -60,8 +60,8 @@ export class ProjectMemoryReader {
     ].join("\n");
   }
 
-  async buildPrompt(prompt: string, role: ParticipantRole): Promise<string> {
-    const snapshots = await this.select(prompt, role);
+  async buildPrompt(prompt: string, role: ParticipantRole, signal?: AbortSignal): Promise<string> {
+    const snapshots = await this.select(prompt, role, signal);
     if (snapshots.length === 0) return `${prompt}\n\n${memoryUsageRules(role, this.memoryDirectory, [])}`;
     const rendered = (await Promise.all(snapshots.map(async (snapshot) => [
       await wikiEvidenceNotice(snapshot.content, this.options) ?? "",
@@ -73,20 +73,21 @@ export class ProjectMemoryReader {
     return `${prompt}\n\n${memoryUsageRules(role, this.memoryDirectory, snapshots)}\n\n${rendered}`;
   }
 
-  async select(prompt: string, role: ParticipantRole): Promise<MemoryDocumentSnapshot[]> {
-    return (await this.selectWithDiagnostics(prompt, role)).snapshots;
+  async select(prompt: string, role: ParticipantRole, signal?: AbortSignal): Promise<MemoryDocumentSnapshot[]> {
+    return (await this.selectWithDiagnostics(prompt, role, signal)).snapshots;
   }
 
-  async selectWithDiagnostics(prompt: string, role: ParticipantRole): Promise<MemorySelection> {
+  async selectWithDiagnostics(prompt: string, role: ParticipantRole, signal?: AbortSignal): Promise<MemorySelection> {
     const empty = (): MemorySelection => ({ snapshots: [], decisions: [], bytes: 0 });
-    const targets = await this.linkTargets(role);
+    const targets = await this.linkTargets(role, signal);
     if (!targets) return empty();
     const { root, router, contexts } = targets;
     const decisions: MemorySelection["decisions"] = [];
     const candidates: Array<{ snapshot: MemoryDocumentSnapshot; score: number; decision: MemorySelection["decisions"][number] }> = [];
+    const current = await this.readSnapshots(root, [...contexts.keys()], role, signal);
     for (const [path, labels] of contexts) {
       if (!isReadableMemoryPath(path, role)) continue;
-      const snapshot = await this.readSnapshot(root, path, role);
+      const snapshot = current.get(path);
       if (!snapshot) { decisions.push({ path, score: 0, reason: "unreadable", selected: false }); continue; }
       const relevance = memoryRelevance(prompt, path, labels.join("\n"), snapshot.content);
       const decision = { path, score: relevance.score, reason: relevance.reason as string, selected: false };
@@ -110,12 +111,13 @@ export class ProjectMemoryReader {
   // 허용 색인(E3-5) — 선택과 같은 링크 대상(라우터·MEMORY.md 의 `.md` 링크, 두 문서 자신 제외) 가운데 이 역할이 읽을 수 있는 문서 전부의 스냅숏이다.
   // 관련도 점수·문서 수·전체 바이트 한도는 적용하지 않는다(선택이 고르지 않은 문서를 찾는 목록이다). 역할 폴더·심볼릭 링크·문서당 80KB·가림은 선택과
   // 같은 readSnapshot 규칙이라, 읽을 수 없는 문서는 목록에 오르지 않는다. 순서는 링크가 처음 나온 순서(라우터 다음 MEMORY.md)다.
-  async index(role: ParticipantRole): Promise<MemoryIndexEntry[]> {
-    const targets = await this.linkTargets(role);
+  async index(role: ParticipantRole, signal?: AbortSignal): Promise<MemoryIndexEntry[]> {
+    const targets = await this.linkTargets(role, signal);
     if (!targets) return [];
     const entries: MemoryIndexEntry[] = [];
+    const current = await this.readSnapshots(targets.root, [...targets.contexts.keys()], role, signal);
     for (const [path, contexts] of targets.contexts) {
-      const snapshot = await this.readSnapshot(targets.root, path, role);
+      const snapshot = current.get(path);
       if (!snapshot) continue;
       entries.push({ path, version: createHash("sha256").update(snapshot.content, "utf8").digest("hex"),
         bytes: Buffer.byteLength(snapshot.content, "utf8"), contexts, content: snapshot.content, redacted: snapshot.redacted });
@@ -124,12 +126,12 @@ export class ProjectMemoryReader {
   }
 
   // 라우터와 MEMORY.md 의 링크 대상과 링크 문맥 — 선택(selectWithDiagnostics)과 허용 색인(index)이 같은 목록을 쓴다. 라우터가 없으면 둘 다 비어 있다.
-  private async linkTargets(role: ParticipantRole): Promise<{ root: string; router: MemoryDocumentSnapshot; contexts: Map<string, string[]> } | null> {
-    const root = await realpath(this.memoryDirectory).catch(() => null);
+  private async linkTargets(role: ParticipantRole, signal?: AbortSignal): Promise<{ root: string; router: MemoryDocumentSnapshot; contexts: Map<string, string[]> } | null> {
+    const root = await resolveUserPath(this.memoryDirectory, { signal });
     if (!root) return null;
-    const router = await this.readSnapshot(root, ROUTER_FILE, role);
+    const router = await this.readSnapshot(root, ROUTER_FILE, role, signal);
     if (!router) return null;
-    const index = await this.readSnapshot(root, "MEMORY.md", role);
+    const index = await this.readSnapshot(root, "MEMORY.md", role, signal);
     const contexts = new Map<string, string[]>();
     for (const source of [router.content, index?.content ?? ""]) {
       for (const candidate of extractMarkdownLinks(source)) {
@@ -140,31 +142,32 @@ export class ProjectMemoryReader {
     return { root, router, contexts };
   }
 
+  private async readSnapshots(root: string, paths: string[], role: ParticipantRole, signal?: AbortSignal): Promise<Map<string, MemoryDocumentSnapshot>> {
+    const allowed = paths.filter(path => isReadableMemoryPath(path, role) && isInside(root, resolve(root, path)));
+    const contents = await readMemoryFiles(allowed.map(path => resolve(root, path)), MAX_DOCUMENT_BYTES, { signal });
+    return new Map(allowed.flatMap((path, index) => {
+      const raw = contents[index];
+      return raw === null ? [] : [[path, this.snapshot(path, raw)]];
+    }));
+  }
+
+  private snapshot(path: string, rawContent: string): MemoryDocumentSnapshot {
+    const content = redactSecrets(rawContent);
+    return { path, sha256: createHash("sha256").update(rawContent, "utf8").digest("hex"), content, redacted: content !== rawContent };
+  }
+
   private async readSnapshot(
     root: string,
     relativePath: string,
     role: ParticipantRole,
+    signal?: AbortSignal,
   ): Promise<MemoryDocumentSnapshot | null> {
     if (!isReadableMemoryPath(relativePath, role)) return null;
     const target = resolve(root, relativePath);
     if (!isInside(root, target)) return null;
-    try {
-      const parent = await realpath(dirname(target));
-      if (parent !== dirname(target)) return null;
-      const stat = await lstat(target);
-      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_DOCUMENT_BYTES) return null;
-      const rawContent = await readFile(target, "utf8");
-      if (Buffer.byteLength(rawContent, "utf8") > MAX_DOCUMENT_BYTES) return null;
-      const content = redactSecrets(rawContent);
-      return {
-        path: relativePath,
-        sha256: createHash("sha256").update(rawContent, "utf8").digest("hex"),
-        content,
-        redacted: content !== rawContent,
-      };
-    } catch {
-      return null;
-    }
+    const rawContent = await readMemoryFile(target, MAX_DOCUMENT_BYTES, { signal });
+    if (rawContent === null) return null;
+    return this.snapshot(relativePath, rawContent);
   }
 }
 

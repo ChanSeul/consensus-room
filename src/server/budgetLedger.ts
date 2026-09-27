@@ -7,6 +7,8 @@ export class BudgetBlocked extends Error {
 interface Execution {
   id: string; accounts: string[]; limit: BudgetVector; accountLimits: Record<string,BudgetVector>; used: BudgetVector;
   startedAt: number; stage: string; role: string; model: string; effort: string; finished: boolean;
+  // Absent in legacy rows: unknown, never evidence that a paid process did not start.
+  dispatchStarted?: boolean;
 }
 export class BudgetLedger {
   constructor(private readonly db: DatabaseSync) {
@@ -64,6 +66,12 @@ export class BudgetLedger {
     if (!row) throw new Error("예산 실행 기록이 없습니다.");
     return JSON.parse(String(row.record_json));
   }
+  markDispatching(id: string): void {
+    const execution = this.execution(id);
+    if (execution.dispatchStarted) return;
+    execution.dispatchStarted = true;
+    this.db.prepare("UPDATE budget_executions SET record_json=? WHERE id=?").run(JSON.stringify(execution), id);
+  }
   observe(id: string, usage: Partial<BudgetVector>, now = Date.now(), finished = false): BudgetAccount[] {
     return this.transaction(() => {
       const execution = this.execution(id);
@@ -89,6 +97,17 @@ export class BudgetLedger {
       this.db.prepare("UPDATE budget_executions SET record_json=? WHERE id=?").run(JSON.stringify(execution), id);
       return accounts;
     });
+  }
+  // Startup only, after the previous server's actions/processes have been interrupted.
+  // Only a durable pre-dispatch record with no token usage proves no paid call could be lost.
+  // Started/legacy-unknown executions remain unfinished until usage is reconciled or explicitly granted.
+  recoverInterruptedExecutions(): void {
+    for (const row of this.db.prepare("SELECT record_json FROM budget_executions").all()) {
+      const execution = JSON.parse(String(row.record_json)) as Execution;
+      if (execution.finished || execution.dispatchStarted !== false || execution.used.inputTokens !== 0 || execution.used.outputTokens !== 0) continue;
+      execution.finished = true;
+      this.db.prepare("UPDATE budget_executions SET record_json=? WHERE id=?").run(JSON.stringify(execution), execution.id);
+    }
   }
   grant(id: string, requestId: string, policy: BudgetPolicy, expectedVersion: number): BudgetAccount {
     policy = BudgetPolicySchema.parse(policy);

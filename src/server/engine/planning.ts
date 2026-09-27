@@ -29,7 +29,7 @@ import {
 import type { ConsensusDatabase } from "../database.js";
 import type { PlanningCheckpoint, TimelineDeliveryPlan } from "../../shared/planningControl.js";
 import { turnFlags } from "../../shared/roles.js";
-import { timelineReferencesApply, unreadRequiredTimeline } from "../guardedPlanning.js";
+import { timelineReferencesApply, unreadRequiredTimeline, unreadRequiredInputs } from "../guardedPlanning.js";
 import { bindingOf, legacyBinding, resolveRoute, sameBinding, UnsupportedRoute, type SessionBinding, type TurnRoute } from "../turnRouting.js";
 import type { StoredArtifact } from "../types.js";
 import type { EngineCore } from "./core.js";
@@ -353,7 +353,8 @@ export class PlanningPipeline {
     if (!checkpoint || checkpoint.finalized || checkpoint.stage !== stage || !checkpoint.awaitingDecision) return false;
     if (checkpoint.scopeGeneration !== topic.scopeGeneration || checkpoint.planEpoch !== topic.planEpoch ||
         checkpoint.planSHA256 !== topic.planSHA256) return false;
-    if (!checkpoint.deferredReads?.length && !checkpoint.synthesisIncomplete && !unreadRequiredTimeline(database, checkpoint).length) return false;
+    if (!checkpoint.deferredReads?.length && !checkpoint.synthesisIncomplete && !unreadRequiredTimeline(database, checkpoint).length &&
+        !unreadRequiredInputs(database, checkpoint).length) return false;
     let route: TurnRoute;
     try { route = resolveRoute(database, topic, RESUMING_JOB[stage]); }
     catch (error) { if (error instanceof UnsupportedRoute) return true; throw error; }

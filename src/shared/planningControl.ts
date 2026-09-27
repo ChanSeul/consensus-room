@@ -75,6 +75,10 @@ export interface PlanningCheckpoint {
   started: boolean; injectedBytes: number;
   sourceHash?: string;
   deliveredContractHash?: string;
+  // The task body is a required context document when its inline packet would overflow.
+  // Reading is tracked in the existing per-session byte-range receipts, not another attempt.
+  taskReference?: Pick<TimelineReference, "selector" | "hash" | "bytes" | "unit" | "version">;
+  instructionReference?: Pick<TimelineReference, "selector" | "hash" | "bytes" | "unit" | "version">;
   deliveredInstructionHash?: string;
   peakStep?: PlanningUsage;
   lastRequestInputTokens?: number;

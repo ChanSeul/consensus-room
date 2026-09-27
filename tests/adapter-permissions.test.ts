@@ -116,6 +116,12 @@ describe("에이전트별 권한 경계", () => {
       admissionId: "fresh-attempt", maxPromptBytes: 64 * 1024, instructionsInSession: true,
     } });
     expect(claude.calls[2].stdin).toContain("KEEP_CLAUDE_INSTRUCTIONS");
+    await claudeAdapter.createSession({ cwd: root, prompt: "HOST_QUEUED_INSTRUCTION_FRAGMENT", planningControl: {
+      admissionId: "queued-instructions", maxPromptBytes: 64 * 1024, instructionsProvided: true,
+    } });
+    expect(claude.calls[3].stdin).toContain("HOST_QUEUED_INSTRUCTION_FRAGMENT");
+    expect(claude.calls[3].stdin).not.toContain("KEEP_CLAUDE_INSTRUCTIONS");
+    expect(claude.calls[3].args[claude.calls[3].args.indexOf("--tools") + 1]).toBe("");
     const codex = new RecordingRunner(successfulResult([{ type: "thread.started", thread_id: "bounded-thread" }, planResult]));
     const { adapter } = codexAdapter(codex);
     await adapter.createSession({ cwd: root, prompt: "Bounded review", planningControl });
@@ -131,6 +137,11 @@ describe("에이전트별 권한 경계", () => {
       admissionId: "fresh-attempt", maxPromptBytes: 64 * 1024, instructionsInSession: true,
     } });
     expect(codex.calls[2].stdin).toContain("KEEP_CODEX_INSTRUCTIONS");
+    await adapter.createSession({ cwd: root, prompt: "HOST_QUEUED_INSTRUCTION_FRAGMENT", planningControl: {
+      admissionId: "queued-instructions", maxPromptBytes: 64 * 1024, instructionsProvided: true,
+    } });
+    expect(codex.calls[3].stdin).toContain("HOST_QUEUED_INSTRUCTION_FRAGMENT");
+    expect(codex.calls[3].stdin).not.toContain("KEEP_CODEX_INSTRUCTIONS");
     expect(codex.calls[0].args).toContain(image);
     const schemaPath = codex.calls[0].args[codex.calls[0].args.indexOf("--output-schema") + 1];
     expect(schemaPath).toContain(".planning.json");

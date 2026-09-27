@@ -28,6 +28,10 @@ import type { CommandResult, CommandRunner, CommandSpec } from "../src/server/ty
 import { legacyBinding } from "../src/server/turnRouting";
 import { DiagnosisInputSchema } from "../src/shared/diagnoses";
 
+// Each scenario may run many model turns and source revalidations. Await their completion;
+// individual reader cancellation/deadlines are asserted separately in user-file-reader.test.ts.
+vi.setConfig({ testTimeout: 30_000 });
+
 vi.mock("node:fs/promises", async importOriginal => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
   return { ...actual, readdir: vi.fn(actual.readdir) };
@@ -885,11 +889,14 @@ it("persists interrupted progress and retries without refunding or double chargi
   expect(database.revisions.account("topic").used).toBe(0);
 });
 
-it("rejects an oversized mandatory prompt before any model call and preserves a checkpoint", async () => {
-  const { repo, database, git } = setup();
+it("preserves the legacy non-continuous planner's mandatory instruction limit before any model call", async () => {
+  const { repo, database, git } = setup("claude", 100000, 100000, false);
+  database.updateTopic("topic", { state: "CLAUDE_REVISION" });
+  database.planning.enable("topic");
+  writeFileSync(join(repo, "CLAUDE.md"), "x".repeat(32_001));
   const fake = scripted(async () => answer(step({ questions: [], complete: true })));
   await expect(guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo,
-    prompt: "x".repeat(PLANNING_LIMITS.promptBytes + 1) })).rejects.toThrow("packet limit");
+    prompt: "Plan" })).rejects.toThrow("Mandatory instruction file exceeds");
   expect(fake.calls).toHaveLength(0);
   expect(database.planning.latest("topic")!.finalized).toBe(false);
 });
@@ -914,14 +921,35 @@ it("admits a complete large Codex audit contract with mandatory instructions and
   expect(database.planning.latest("topic")?.finalized).toBe(true);
 });
 
-it("still rejects a Codex audit packet above its larger review limit before a model call", async () => {
+it.each(["task", "instructions", "combined"])("streams oversized %s through required context without accepting an unread complete claim", async kind => {
   const { repo, database, git } = setup("codex");
-  const fake = scripted(async () => answer(step({ questions: [], complete: true })), "codex");
-  await expect(guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo,
-    prompt: "x".repeat(PLANNING_LIMITS.reviewPromptBytes + 1) })).rejects.toThrow("packet limit");
-  expect(fake.calls).toHaveLength(0);
-  expect(database.planning.latest("topic")?.finalized).toBe(false);
-});
+  const contract = kind === "instructions" ? "Audit" : "TASK_BEGIN\n" + "한글 contract 내용.\n".repeat(4000) + "TASK_END";
+  const rules = kind === "task" ? null : "MANDATORY_BEGIN\n" + "이 규칙을 지킨다.\n".repeat(4000) + "MANDATORY_END";
+  if (rules) writeFileSync(join(repo, "AGENTS.md"), rules);
+  const received: PlanningFragment[] = [];
+  const fake = scripted(async (turn, n) => {
+    const match = /Fragments: (.*)$/.exec(turn.prompt);
+    received.push(...JSON.parse(match![1]));
+    if (n === 1) {
+      if (kind !== "instructions") expect(turn.prompt).not.toContain(contract);
+      expect(turn.prompt).toContain("selector=request");
+      if (rules) expect(turn.prompt).toContain("selector=mandatory-instructions");
+      expect(turn.planningControl?.instructionsProvided).toBe(true);
+    } else expect(turn).toMatchObject({ sessionId: "session-1" });
+    // Deliberately claim complete before reading. The host must deliver every required byte first.
+    return answer(step({ questions: [], complete: true }));
+  }, "codex");
+  const wrapped = new BudgetController(database.budgets, () => ({ topicId: "topic", accounts: ["topic"], stage: "CODEX_AUDIT" }),
+    async () => {}, database.revisions, true, database.reviews, database).wrap(guardedPlanning(fake.adapter, database, git));
+  await wrapped.createSession({ cwd: repo, prompt: contract });
+  expect(received.filter(f => f.selector === "request").map(f => f.content).join("")).toBe(contract);
+  if (rules) expect(received.filter(f => f.selector === "mandatory-instructions").map(f => f.content).join("")).toContain(rules);
+  expect(fake.calls.length).toBeGreaterThan(2);
+  expect(fake.calls.every(t => Buffer.byteLength(t.prompt) < PLANNING_LIMITS.reviewPromptBytes)).toBe(true);
+  expect(database.planning.latest("topic")).toMatchObject({ finalized: true, sessionId: "session-1" });
+  expect(database.planning.latest("topic")?.priorAttempt).toBeUndefined();
+  expect(() => database.budgets.assertAvailable(["topic"])).not.toThrow();
+}, 30000);
 
 it("does not promote a completed claim with unanswered questions", async () => {
   const { repo, database, git } = setup();
@@ -959,13 +987,20 @@ it("reads dirty snapshot content, rejects symlinks/credential paths and paginate
   expect(() => utf8Slice("한", 1, 100)).toThrow("UTF-8");
 });
 
-it("checkpoints oversized mandatory instructions before dispatch without truncating them", async () => {
+it("streams oversized planner instructions before accepting completion without truncating them", async () => {
   const { repo, database, git } = setup();
-  writeFileSync(join(repo, "CLAUDE.md"), "필수 규칙".repeat(10000));
-  const fake = scripted(async () => answer(step({ questions: [], complete: true })));
-  await expect(guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("silently truncated");
-  expect(fake.calls).toHaveLength(0);
-  expect(database.planning.latest("topic")?.stopped).toContain("instruction");
+  const rules = "필수 규칙".repeat(10000);
+  writeFileSync(join(repo, "CLAUDE.md"), rules);
+  const received: PlanningFragment[] = [];
+  const fake = scripted(async turn => {
+    received.push(...JSON.parse(/Fragments: (.*)$/.exec(turn.prompt)![1]));
+    return answer(step({ questions: [], complete: true }));
+  });
+  await guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Plan" });
+  expect(received.filter(f => f.selector === "mandatory-instructions").map(f => f.content).join("")).toContain(rules);
+  expect(fake.calls.length).toBeGreaterThan(2);
+  expect(fake.calls.every(turn => Buffer.byteLength(turn.prompt) < PLANNING_LIMITS.promptBytes)).toBe(true);
+  expect(database.planning.latest("topic")).toMatchObject({ finalized: true, sessionId: "session-1" });
 });
 
 // E3-4a(r3 B 뒤집기): 회차 수만으로 최종 정리를 강제하지 않는다. 예전 고정 회차(8)를 넘어 조사가 이어지고, 여덟째 회차가 청한 읽기도 다음 호출에 실린다.
@@ -4039,6 +4074,41 @@ describe("E3 후속 리뷰 F008 계약 위반으로 무효화한 결정 응답",
     firstPlanUsed: database.revisions.account("topic").firstPlanUsed, reviews: database.reviews.account("topic", "planning").used });
   const stopAudit = () => scripted(async () => { throw new Error("F008_AUDIT_STOP"); }, "codex");
 
+  it.each(["task", "instructions"])("public retry resumes unread oversized %s after a user decision on the same audit attempt", async source => {
+    const { repo, database, git, artifacts, settle } = engineTopic("pending:input-queue-audit");
+    const body = "Required audit content. ".repeat(5000) + "END_OF_REQUIRED_INPUT";
+    if (source === "instructions") writeFileSync(join(repo, "AGENTS.md"), body);
+    const plan = contractPlan("INPUT_QUEUE") + (source === "task" ? `\n${body}` : "");
+    const claude = scripted(async (_turn, n) => {
+      if (n === 1) return { ...answer(step({ questions: [], complete: true })), planMarkdown: plan };
+      throw new Error("INPUT_QUEUE_REVISION_STOP");
+    });
+    const received: PlanningFragment[] = [];
+    const codex = scripted(async (turn, n) => {
+      received.push(...fragmentsIn(turn));
+      return { kind: "AUDIT", summary: "Audit", findings: [], evidenceRefs: [],
+        ...(n === 1 ? { requestedUserDecision: "Confirm the audit scope" } : {}),
+        planningStep: step({ questions: n === 1 ? ["Confirm scope"] : [], requests: [], complete: n !== 1 }) };
+    }, "codex");
+    const engine = new WorkflowEngine({ database, git, artifacts, claude: guardedPlanning(claude.adapter, database, git),
+      codex: guardedPlanning(codex.adapter, database, git) });
+    try {
+      engine.startPlan("topic"); await settle();
+      const open = database.planning.latest("topic", "codex")!;
+      expect(open).toMatchObject({ stage: "CODEX_AUDIT", finalized: false, awaitingDecision: true });
+      const before = reservations(database);
+      await engine.postMessage("topic", "decision", "Keep the current audit scope and read the remaining original text");
+      engine.retry("topic"); await settle();
+      expect(codex.calls.length).toBeGreaterThan(1);
+      expect(received.filter(fragment => source === "task" ? ["request", "request-fresh"].includes(fragment.selector)
+        : fragment.selector === "mandatory-instructions").map(fragment => fragment.content).join("").includes(body)).toBe(true);
+      expect(database.planning.latest("topic", "codex")).toMatchObject({ id: open.id, admissionId: open.admissionId,
+        sessionId: open.sessionId, finalized: true });
+      expect(database.reviews.account("topic", "planning").used).toBe(before.reviews);
+      expect(database.latestArtifact("topic", "audit")).not.toBeNull();
+    } finally { await engine.shutdown(); }
+  });
+
   it("CLAUDE_PLAN: a public retry without new input reaches the repair call for a wrong-kind decision response and adopts it on the same checkpoint and admission", async () => {
     const { database, git, artifacts, settle } = engineTopic();
     const plan = contractPlan("F008_PLAN");
@@ -4220,4 +4290,18 @@ describe("E5 budget-forced synthesis that only asks a user decision", () => {
     expect(ordinary.database.planning.latest("topic")!.awaitingDecision).toBeUndefined();
     expect(ordinary.database.planning.latest("topic")!.synthesisIncomplete).toBeUndefined();
   });
+});
+
+it("cancels a blocked preparation read before model spawn and closes the same budget execution", async () => {
+  const { repo, database, git } = setup("codex");
+  execFileSync("mkfifo", [join(repo, "AGENTS.md")]);
+  const fake = scripted(async () => answer(step({ questions: [], complete: true })), "codex");
+  const wrapped = new BudgetController(database.budgets, () => ({ topicId: "topic", accounts: ["topic"], stage: "CODEX_AUDIT" }),
+    async () => {}, database.revisions, true, database.reviews, database).wrap(guardedPlanning(fake.adapter, database, git));
+  await expect(wrapped.createSession({ cwd: repo, prompt: "Resume audit", signal: AbortSignal.timeout(300) }))
+    .rejects.toMatchObject({ name: "TimeoutError" });
+  expect(fake.calls).toHaveLength(0);
+  expect(database.planning.latest("topic")?.started).toBe(false);
+  expect(database.planning.latest("topic")?.finalized).toBe(false);
+  expect(() => database.budgets.assertAvailable(["topic"])).not.toThrow();
 });

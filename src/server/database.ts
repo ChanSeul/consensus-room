@@ -431,7 +431,6 @@ export class ConsensusDatabase {
       FROM actions JOIN topics ON topics.id = actions.topic_id
       WHERE actions.status = 'running'
     `).all() as Array<Record<string, unknown>>;
-    if (interrupted.length === 0) return;
     const timestamp = now();
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -448,6 +447,7 @@ export class ConsensusDatabase {
             last_error = ?, updated_at = ? WHERE id = ?
         `).run("서버 재시작으로 실행이 중단되었습니다.", timestamp, row.topic_id as SqlValue);
       }
+      this.budgets.recoverInterruptedExecutions();
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");

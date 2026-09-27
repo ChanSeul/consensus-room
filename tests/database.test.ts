@@ -918,3 +918,35 @@ it("final 관측과 원장 기록 중 실패하면 함께 롤백되어 재시도
   expect(database.getTimeline("topic-1")).toHaveLength(1);
   raw.close(); database.close();
 });
+
+// Public startup recovery -> persisted ledger -> next admission. Recovery is not a grant/refund.
+it("startup only closes proven pre-spawn executions and retains incomplete or unknown usage blocks", () => {
+  const { database, path } = openDatabase();
+  const policy = { execution: { inputTokens: 100, outputTokens: 100, durationMs: 1000 },
+    total: { inputTokens: 500, outputTokens: 500, durationMs: 5000 } };
+  const ids = ["prepared", "exhausted", "unknown", "partial", "unobserved"];
+  for (const id of ids) {
+    database.budgets.configure(id, policy, "test");
+    database.budgets.start({ id: `${id}-run`, accounts: [id], stage: "CODEX_AUDIT", role: "codex",
+      model: "test", effort: "high", startedAt: 0,
+      ...(["prepared", "exhausted"].includes(id) ? { dispatchStarted: false } : id === "unknown" ? {} : { dispatchStarted: true }) });
+    database.budgets.observe(`${id}-run`, { inputTokens: id === "partial" ? 20 : 0,
+      durationMs: id === "exhausted" ? 1000 : 40 }, 40);
+  }
+  const before = ids.map(id => database.budgets.account(id));
+  database.close();
+  const reopened = new ConsensusDatabase(path);
+  reopened.recoverInterruptedActions(); // also handles a crash after action completion, before budget finally
+  expect(ids.map(id => reopened.budgets.account(id))).toEqual(before);
+  expect(reopened.budgets.execution("prepared-run").finished).toBe(true);
+  expect(reopened.budgets.execution("exhausted-run").finished).toBe(true);
+  expect(() => reopened.budgets.assertAvailable(["prepared"])).not.toThrow();
+  expect(() => reopened.budgets.assertAvailable(["exhausted"])).toThrow();
+  for (const id of ["unknown", "partial", "unobserved"]) {
+    expect(reopened.budgets.execution(`${id}-run`).finished).toBe(false);
+    expect(() => reopened.budgets.assertAvailable([id])).toThrow("집계가 끝나지 않은 실행");
+  }
+  reopened.recoverInterruptedActions();
+  expect(ids.map(id => reopened.budgets.account(id))).toEqual(before);
+  reopened.close();
+});
