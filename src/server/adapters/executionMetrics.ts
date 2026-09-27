@@ -209,7 +209,8 @@ export class ExecutionMetrics {
     // Keep the provider's original cumulative report above; only verified completed request/turn
     // records may replace the counters consumed by planning and the budget ledger.
     if (this.kind === "codex" && proof && proof.turnCount === this.internalRequests &&
-      (sameTokenCounts(cli, proof.reported) || sameTokenCounts(cli, proof.usage))) {
+      (sameTokenCounts(cli, proof.reported) || sameTokenCounts(cli, proof.usage) ||
+        (proof.cliReported && sameTokenCounts(cli, proof.cliReported)))) {
       this.totals = { ...proof.usage };
       this.reconciledCodexTurn = true;
     }

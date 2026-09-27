@@ -74,7 +74,7 @@ function memoryDocument(name: string, body: string): string {
 }
 
 describe("에이전트별 권한 경계", () => {
-  it.each(["shared", "topic"])("charges only the resumed Codex turn from the %s session home", async location => {
+  it.each(["shared", "topic"].flatMap(location => ["normal", "compaction", "after-compaction"].map(scope => ({ location, scope }))))("charges all requests from the $location home with $scope CLI counters", async ({ location, scope }) => {
     // resumeTurn -> onUsage -> guarded planning/BudgetController. The provider's request records
     // independently identify this turn; its CLI completion reports the whole previous session too.
     const seen: TurnUsage[] = [];
@@ -83,13 +83,27 @@ describe("에이전트별 권한 경계", () => {
       const at = new Date().toISOString(), session = "thread-scoped-usage", turn = "turn-new";
       const usage = { input_tokens: 120, cached_input_tokens: 90, output_tokens: 7 };
       const total = { input_tokens: 1120, cached_input_tokens: 890, output_tokens: 107 };
+      const compacting = scope === "compaction", divergent = scope !== "normal";
+      const charged = compacting ? { input_tokens: 170, cached_input_tokens: 90, output_tokens: 12 } : usage;
+      const thread = divergent ? { input_tokens: 1170, cached_input_tokens: 890, output_tokens: 112 } : total;
       const events = [
         { type: "session_meta", payload: { id: session } },
+        { type: "event_msg", timestamp: new Date(0).toISOString(), payload: { type: "token_count", info: {
+          total_token_usage: { input_tokens: 1000, cached_input_tokens: 800, output_tokens: 100 },
+          last_token_usage: { input_tokens: 100, cached_input_tokens: 80, output_tokens: 10 },
+        } } },
         { type: "event_msg", timestamp: at, payload: { type: "task_started", turn_id: turn } },
         { type: "token_usage_record", timestamp: at, payload: { thread_id: session, turn_id: turn,
-          response_id: "r-new", usage, turn_token_usage: usage, thread_token_usage: total } },
+          response_id: "r-new", usage, turn_token_usage: charged, thread_token_usage: thread } },
+        { type: "event_msg", timestamp: at, payload: { type: "token_count", info: { total_token_usage: total, last_token_usage: usage } } },
         { type: "event_msg", timestamp: at, payload: { type: "task_complete", turn_id: turn } },
       ];
+      if (compacting) events.splice(3, 0, { type: "token_usage_record", timestamp: at, payload: {
+        thread_id: session, turn_id: turn, response_id: "r-compaction",
+        usage: { input_tokens: 50, cached_input_tokens: 0, output_tokens: 5 },
+        turn_token_usage: { input_tokens: 50, cached_input_tokens: 0, output_tokens: 5 },
+        thread_token_usage: { input_tokens: 1050, cached_input_tokens: 800, output_tokens: 105 },
+      } }, { type: "compacted", timestamp: at, payload: {} } as never);
       const sessions = join(location === "shared" ? home : String(spec.environment?.CODEX_HOME), "sessions/2026/09/27");
       mkdirSync(sessions, { recursive: true });
       writeFileSync(join(sessions, `${session}.jsonl`), events.map(e => JSON.stringify(e)).join("\n"));
@@ -104,11 +118,11 @@ describe("에이전트별 권한 경계", () => {
     try {
       await budgeted.resumeTurn({ sessionId: "thread-scoped-usage", cwd: "/tmp", prompt: "Continue",
         protocolOnly: true, onUsage: usage => seen.push(usage) });
-      expect(ledger.account("topic")).toMatchObject({ pause: null, used: { inputTokens: 120, outputTokens: 7 } });
+      expect(ledger.account("topic")).toMatchObject({ pause: null, used: { inputTokens: scope === "compaction" ? 170 : 120, outputTokens: scope === "compaction" ? 12 : 7 } });
     } finally { sql.close(); }
-    expect(seen.at(-1)).toMatchObject({ inputTokens: 120, cachedInputTokens: 90, outputTokens: 7,
+    expect(seen.at(-1)).toMatchObject({ inputTokens: scope === "compaction" ? 170 : 120, cachedInputTokens: 90, outputTokens: scope === "compaction" ? 12 : 7,
       source: "codex-home", completeness: "complete", sourceUsage: {
-        cli: { inputTokens: 1120, outputTokens: 107 }, codexHome: { inputTokens: 120, outputTokens: 7 },
+        cli: { inputTokens: 1120, outputTokens: 107 }, codexHome: { inputTokens: scope === "compaction" ? 170 : 120, outputTokens: scope === "compaction" ? 12 : 7 },
       } });
   });
   it("resumes the planning session for Opus implementation with ultracode and write tools", async () => {

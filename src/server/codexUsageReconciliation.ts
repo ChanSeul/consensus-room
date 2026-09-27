@@ -2,12 +2,39 @@ import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { basename, join, relative, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { codexUsageEvidence, sameTokenCounts } from "./adapters/codexUsageEvidence.js";
+import { codexUsageEvidence, sameTokenCounts, type CodexUsageEvidence, type TokenCounts } from "./adapters/codexUsageEvidence.js";
 
 const digest = (value: string) => createHash("sha256").update(value).digest("hex");
 const tokenKeys = ["inputTokens", "cachedInputTokens", "outputTokens"] as const;
 type Input = { databasePath: string; codexHome: string; transcriptPath: string; executionId: string; expectedHash?: string };
 function requireProof(ok: unknown, message: string): asserts ok { if (!ok) throw new Error(`Usage reconciliation refused: ${message}`); }
+
+// The previous normalizer handled some turns before compaction made CLI and thread counters diverge.
+// Reconstruct that exact former charge from independently verified, ordered request sets.
+// Never assume that an arbitrary stored total is another cumulative-counter defect.
+function provedCharge(observed: { sourceUsage?: { turns?: unknown[] } }, proof: CodexUsageEvidence, sessionId: string, round: number): TokenCounts {
+  const sources = observed.sourceUsage?.turns;
+  requireProof(Array.isArray(sources) && sources.length === proof.turnCount, "per-turn source evidence missing");
+  const charge = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
+  const executionIds = new Set<string>();
+  for (const [i, entry] of sources.entries()) {
+    const source = entry as { executionId?: string; sessionId?: string; round?: number;
+      sourceUsage?: { cli?: Partial<TokenCounts> & { internalRequests?: number }; codexHome?: Partial<TokenCounts> & { turnEvidence?: CodexUsageEvidence } } };
+    const cli = source?.sourceUsage?.cli, home = source?.sourceUsage?.codexHome, saved = home?.turnEvidence, turn = proof.turns[i];
+    requireProof(source?.sessionId === sessionId && source.round === round - sources.length + i + 1 &&
+      typeof source.executionId === "string" && !executionIds.has(source.executionId), "per-turn identity or order mismatch");
+    executionIds.add(source.executionId);
+    requireProof(cli?.internalRequests === 1 && home && saved?.turnCount === 1 && sameTokenCounts(home, turn.usage) &&
+      sameTokenCounts(saved.usage, turn.usage) && sameTokenCounts(saved.reported, turn.reported) && sameTokenCounts(saved.lastThread, turn.reported) &&
+      JSON.stringify(saved.requestIds) === JSON.stringify(turn.requestIds), "per-turn request evidence changed");
+    const wasNormalized = sameTokenCounts(cli, turn.reported) || sameTokenCounts(cli, turn.usage);
+    requireProof(wasNormalized || (turn.cliReported && sameTokenCounts(cli, turn.cliReported)), "CLI counter is not proved by the transcript");
+    const used = wasNormalized ? turn.usage : turn.cliReported!;
+    for (const key of tokenKeys) charge[key] += used[key];
+  }
+  requireProof(tokenKeys.every(k => Number.isSafeInteger(charge[k])), "charge overflow");
+  return charge;
+}
 
 // Explicit operator repair, never startup migration: prove one completed planning invocation from
 // provider request/turn records, preview its exact before/after rows, then apply that hash atomically.
@@ -52,11 +79,12 @@ export function reconcileCodexPlanningUsage(input: Input) {
     const end = execution.startedAt + execution.used.durationMs;
     const proof = codexUsageEvidence(text, checkpoint.sessionId, execution.startedAt, end);
     requireProof(proof, "incomplete or contradictory provider request evidence");
-    requireProof(sameTokenCounts(observed, proof.reported) && sameTokenCounts(checkpoint.usage, proof.reported) &&
-      execution.used.inputTokens === proof.reported.inputTokens && execution.used.outputTokens === proof.reported.outputTokens &&
+    const charged = sameTokenCounts(observed, proof.reported) ? proof.reported : provedCharge(observed, proof, checkpoint.sessionId, checkpoint.round);
+    requireProof(sameTokenCounts(observed, charged) && sameTokenCounts(checkpoint.usage, charged) &&
+      execution.used.inputTokens === charged.inputTokens && execution.used.outputTokens === charged.outputTokens &&
       checkpoint.metrics?.internalRequests === proof.turnCount && observed.internalRequests === proof.turnCount,
     "stored counters are not exactly the proved cumulative-count defect");
-    requireProof(tokenKeys.some(k => proof.reported[k] > proof.usage[k]) && tokenKeys.every(k => proof.reported[k] >= proof.usage[k]), "not a cumulative overcount");
+    requireProof(tokenKeys.some(k => charged[k] > proof.usage[k]) && tokenKeys.every(k => charged[k] >= proof.usage[k]), "not a cumulative overcount");
     requireProof(Array.isArray(execution.accounts) && execution.accounts.includes(usageRow.topic_id), "execution ownership mismatch");
     for (const row of db.prepare("SELECT record_json FROM budget_executions").all()) {
       const other = JSON.parse(String(row.record_json));
@@ -66,18 +94,18 @@ export function reconcileCodexPlanningUsage(input: Input) {
       const row = db.prepare("SELECT record_json FROM budget_accounts WHERE id=?").get(id);
       requireProof(row, "account missing");
       const before = JSON.parse(String(row.record_json));
-      requireProof(before.pause === null && before.used.inputTokens >= proof.reported.inputTokens && before.used.outputTokens >= proof.reported.outputTokens,
+      requireProof(before.pause === null && before.used.inputTokens >= charged.inputTokens && before.used.outputTokens >= charged.outputTokens,
         "account is paused or counters cannot cover this execution");
       return { id, before, after: { ...before, used: { ...before.used,
-        inputTokens: before.used.inputTokens - proof.reported.inputTokens + proof.usage.inputTokens,
-        outputTokens: before.used.outputTokens - proof.reported.outputTokens + proof.usage.outputTokens } } };
+        inputTokens: before.used.inputTokens - charged.inputTokens + proof.usage.inputTokens,
+        outputTokens: before.used.outputTokens - charged.outputTokens + proof.usage.outputTokens } } };
     });
     const correctedExecution = { ...execution, used: { ...execution.used, inputTokens: proof.usage.inputTokens, outputTokens: proof.usage.outputTokens } };
-    const correctedUsage = { ...observed, ...proof.usage, source: "codex-home", sourceUsage: { status: "mismatch",
-      cli: proof.reported, codexHome: { ...proof.usage, source: "codex-home" } } };
+    const correctedUsage = { ...observed, ...proof.usage, source: "codex-home", sourceUsage: { ...observed.sourceUsage, status: "mismatch",
+      cli: charged, codexHome: { ...proof.usage, source: "codex-home" } } };
     const correctedCheckpoint = { ...checkpoint, usage: { ...checkpoint.usage, ...proof.usage }, peakStep: { ...checkpoint.peakStep, ...proof.peak } };
-    const report = { version: 1, executionId: input.executionId, topicId: usageRow.topic_id, checkpointKey: rows[0].key,
-      sessionId: checkpoint.sessionId, sourceSHA256, startedAt: execution.startedAt, endedAt: end, proof,
+    const report = { version: 2, executionId: input.executionId, topicId: usageRow.topic_id, checkpointKey: rows[0].key,
+      sessionId: checkpoint.sessionId, sourceSHA256, startedAt: execution.startedAt, endedAt: end, proof, charged,
       before: { execution, usage: observed, checkpoint, accounts: accounts.map((a: { before: unknown }) => a.before) },
       after: { execution: correctedExecution, usage: correctedUsage, checkpoint: correctedCheckpoint, accounts: accounts.map((a: { after: unknown }) => a.after) } };
     const hash = digest(JSON.stringify(report));
