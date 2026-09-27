@@ -1,6 +1,6 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { EvidenceSource, EvidenceSnapshotInput, MediatorEvidenceResponse } from "../../shared/externalEvidence.js";
+import type { EvidenceSource, EvidenceSnapshotInput, MediatorEvidenceBatch, MediatorEvidenceResponse } from "../../shared/externalEvidence.js";
 import type { ConsensusDatabase } from "../database.js";
 import type { AgentResult } from "../../shared/contracts.js";
 import type { AgentAdapter, SessionTurn } from "../types.js";
@@ -31,7 +31,7 @@ export class EvidenceService {
   connection(source: EvidenceSource): { configured: boolean; error: string | null } {
     return { configured: this.connector.configured?.(source) ?? false, error: source.error };
   }
-  async prepareMediator(database: ConsensusDatabase, topicId: string, sessionId: string): Promise<MediatorEvidenceResponse> {
+  async prepareMediator(database: ConsensusDatabase, topicId: string, sessionId: string, pageBytes?: number): Promise<MediatorEvidenceResponse> {
     const start = database.getTopic(topicId);
     if (start.state === "CLOSED") throw new Error("닫힌 주제는 수집하지 않습니다.");
     const deadline = Date.now() + 90_000;
@@ -47,16 +47,21 @@ export class EvidenceService {
     if (this.store.list(topicId).some(source => source.mode !== "rest" || source.nextCheckAt <= Date.now() || !this.store.fresh(source))) {
       throw new Error("원문 수집이 진행 중이거나 실패했습니다. 완료 후 다시 확인하세요.");
     }
-    const packet = this.store.mediatorBatch(topic, sessionId);
+    // 쪽 크기는 이 서비스가 돌려주는 응답 본문(HTTP 가 그대로 JSON 으로 보낸다)으로 잰다(E3-1). 만들 때는 superseded=false(가장 긴 값)로 재므로
+    // 나중에 원문이 앞서 superseded 가 true 가 되어도 본문은 길어지지 않는다. currentDigest 는 길이가 같은 해시다.
+    const imagePath = (hash: string) => this.imageDirectory ? join(this.imageDirectory, `${hash}.png`) : "";
+    const respond = (batch: MediatorEvidenceBatch, currentDigest: string): MediatorEvidenceResponse =>
+      ({ ...batch, images: batch.images.map(({ hash }) => ({ hash, path: imagePath(hash) })), currentDigest, superseded: batch.digest !== currentDigest });
+    const packet = this.store.mediatorBatch(topic, sessionId, { pageBytes, render: batch => JSON.stringify(respond(batch, batch.digest)) });
     const hashes = packet.images.map(image => image.hash);
     if (hashes.length && !this.imageDirectory) throw new Error("디자인 캐시 경로가 설정되지 않았습니다.");
-    const images = [];
-    for (const hash of hashes) images.push({ hash, path: await materializeImage(this.store, this.imageDirectory!, hash) });
+    for (const hash of hashes) {
+      if (await materializeImage(this.store, this.imageDirectory!, hash) !== imagePath(hash)) throw new Error("디자인 캐시 경로가 바뀌었습니다.");
+    }
     const current = database.getTopic(topicId);
     if (current.scopeGeneration !== topic.scopeGeneration || current.state === "CLOSED") throw new Error("자료 준비 중 작업 범위가 바뀌었습니다.");
     this.store.assertReady(current, false);
-    const currentDigest = this.store.topic(current).digest;
-    const response = { ...packet, images, currentDigest, superseded: packet.digest !== currentDigest };
+    const response = respond(packet, this.store.topic(current).digest);
     this.store.measure(`mediator:${topicId}`, "deliveredBytes", Buffer.byteLength(JSON.stringify(response)));
     return response;
   }
@@ -105,17 +110,19 @@ export function withEvidence(adapter: AgentAdapter, database: ConsensusDatabase,
   const run = async <T>(turn: Omit<SessionTurn, "sessionId"> | SessionTurn, invoke: (enriched: typeof turn) => Promise<T>, session: (result: T) => string): Promise<T> => {
     const topic = database.listTopics().find(topic => topic.worktreePath === turn.cwd);
     if (!topic || turn.protocolOnly || turn.planningControl) return invoke(turn);
-    const packet = database.evidence.packet(topic, adapter.role, "sessionId" in turn ? turn.sessionId : undefined);
-    if (!packet.text) return invoke(turn);
-    const paths: string[] = [];
+    // 한 턴에 근거 한 쪽을 싣는다(E3-1). 쪽 크기는 바뀐 PNG 경로 줄까지 포함한 근거 블록의 바이트다. 새로 전달할 항목이 없으면 블록은 비어 있지만,
+    // 원문이 연결된 주제의 턴은 계속 근거 관리 턴이다(웹 조회 차단·로컬 PNG 읽기·Figma 안내). 원문도 삭제 알림도 없을 때만 그대로 부른다.
+    const imagePath = (hash: string) => join(imageDirectory, `${hash}.png`);
+    const packet = database.evidence.packet(topic, adapter.role, "sessionId" in turn ? turn.sessionId : undefined, {
+      decorate: (text, images) => `${text}${images.length ? `\n변경된 디자인 PNG (원격에서 다시 읽지 말고 이 파일을 확인):\n${images.map(imagePath).join("\n")}` : ""}` });
+    if (!packet.text && !packet.links.length) return invoke(turn);
     if (packet.images.length) await mkdir(imageDirectory, { recursive: true, mode: 0o700 });
     for (const hash of packet.images) {
-      const path = join(imageDirectory, `${hash}.png`);
+      const path = imagePath(hash);
       const bytes = database.evidence.image(hash);
       try { await writeFile(path, bytes, { flag: "wx", mode: 0o600 }); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
       if (evidenceHash(await readFile(path)) !== hash) throw new Error("디자인 파일 캐시가 변경됐습니다.");
-      paths.push(path);
     }
     // Materialize design data outside the prompt, only once implementation actually asks for a turn.
     // Content-addressed files remain readable in resumed turns without re-sending their bodies or images.
@@ -154,9 +161,11 @@ export function withEvidence(adapter: AgentAdapter, database: ConsensusDatabase,
     const designGuidance = !designSources.length ? "" : designAccess
       ? `Inspect only the Figma screen currently being implemented or reviewed. Reuse already inspected data with the same contentHash; read the cache only when needed. The observed-design references are the exact native tool responses seen by implementation, not a claim that the remote file is still current. Use those same observations for review. Older source caches are baseline references only and must not override a newer observed response. Cached observations may be partial: use read-only Figma tools on the supplied link for missing design context, and screenshots only when visual verification is needed. Do not fetch the whole file. If the Figma tools or required node are unavailable, report the blocker instead of inventing design values.\nOptional design cache references (not yet read): ${JSON.stringify(designCache)}\nObserved design references retained in this scope (including prior plan revisions; verify their relevance to the current plan): ${JSON.stringify(observationReferences)}`
       : DESIGN_PLANNING_CONTRACT;
-    const evidenceText = `${designGuidance}\n\n${packet.text}${paths.length ? `\n변경된 디자인 PNG (원격에서 다시 읽지 말고 이 파일을 확인):\n${paths.join("\n")}` : ""}`;
-    database.evidence.measure(`runner:${topic.id}`, "modelCalls", 1);
-    database.evidence.measure(`runner:${topic.id}`, "deliveredBytes", Buffer.byteLength(evidenceText));
+    const evidenceText = [designGuidance, packet.text].filter(Boolean).join("\n\n");
+    if (evidenceText) {
+      database.evidence.measure(`runner:${topic.id}`, "modelCalls", 1);
+      database.evidence.measure(`runner:${topic.id}`, "deliveredBytes", Buffer.byteLength(evidenceText));
+    }
     const sourceDigest = database.evidence.topic(topic).digest;
     const pendingReads = database.evidence.pendingDesignRequests(topic);
     const capture = (observation: { tool: string; input: unknown; content: unknown; isError?: boolean }) => {
@@ -168,7 +177,7 @@ export function withEvidence(adapter: AgentAdapter, database: ConsensusDatabase,
     const result = await invoke({ ...turn,
       onFigmaRequest: turn.implementation ? request => database.evidence.designRequest(topic, request) : undefined,
       onFigmaResult: turn.implementation ? capture : undefined, evidenceManaged: true, figmaReadEnabled: Boolean(turn.implementation && designSources.length),
-      prompt: `${turn.prompt}\n\n${evidenceText}${pendingReads.length && designAccess ? `\nUncaptured design reads from a prior attempt. Repeat these reads before completing: ${JSON.stringify(pendingReads)}` : ""}`,
+      prompt: `${turn.prompt}${evidenceText ? `\n\n${evidenceText}` : ""}${pendingReads.length && designAccess ? `\nUncaptured design reads from a prior attempt. Repeat these reads before completing: ${JSON.stringify(pendingReads)}` : ""}`,
       readablePaths: [...turn.readablePaths ?? [], ...designPaths, ...packet.availableImages.map(hash => join(imageDirectory, `${hash}.png`))] });
     const current = database.getTopic(topic.id);
     if (!turn.signal?.aborted && current.scopeGeneration === topic.scopeGeneration && current.planEpoch === topic.planEpoch && current.planSHA256 === topic.planSHA256) {
@@ -186,12 +195,13 @@ export function withEvidence(adapter: AgentAdapter, database: ConsensusDatabase,
       if (refs.length) {
         agentResult.evidenceRefs = [...agentResult.evidenceRefs, ...new Set(refs)];
       }
-      database.evidence.receipt(topic, adapter.role, session(result), packet.delivered, packet.links);
+      database.evidence.receipt(topic, adapter.role, session(result), packet);
     }
     return result;
   };
   return {
     role: adapter.role, validateExistingSession: id => adapter.validateExistingSession(id),
+    ...(adapter.isSessionMissing ? { isSessionMissing: (id: string) => adapter.isSessionMissing!(id) } : {}),
     createSession: turn => run(turn, enriched => adapter.createSession(enriched), result => result.sessionId),
     resumeTurn: turn => run(turn, enriched => adapter.resumeTurn(enriched as SessionTurn), () => turn.sessionId),
     ...(adapter.resumePlanRepair ? { resumePlanRepair: (turn: SessionTurn) => adapter.resumePlanRepair!(turn) } : {}),

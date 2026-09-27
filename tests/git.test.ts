@@ -327,3 +327,126 @@ describe("리뷰 시점 트리 스냅샷", () => {
     expect(git(repository, ["diff", "--cached", "--name-only"])).toBe("");
   });
 });
+
+// 엔진 개편 E4 보완(F001) — 합류 병합은 엔진이 준비하고(작업 트리에 커밋 없이), 인도 때 엔진이 리뷰 트리·승인된 부모로 병합 커밋을 만든다.
+describe("합류 병합 준비와 병합 커밋", () => {
+  // develop(기준) 에서 갈라진 두 결과 A(owned.txt 수정·a.txt 추가)와 B(unrelated.txt 삭제·b.txt 추가, conflict 이면 owned.txt 도 수정).
+  function divergedResults(conflict: boolean) {
+    const repository = makeRepository();
+    const base = git(repository, ["rev-parse", "HEAD"]);
+    git(repository, ["switch", "-c", "result-a"]);
+    writeFileSync(join(repository, "owned.txt"), "A 결과\n");
+    writeFileSync(join(repository, "a.txt"), "A\n");
+    git(repository, ["add", "-A"]);
+    git(repository, ["commit", "-m", "A"]);
+    const a = git(repository, ["rev-parse", "HEAD"]);
+    git(repository, ["switch", "--detach", base]);
+    git(repository, ["switch", "-c", "result-b"]);
+    if (conflict) writeFileSync(join(repository, "owned.txt"), "B 결과\n");
+    writeFileSync(join(repository, "b.txt"), "B\n");
+    git(repository, ["rm", "-q", "unrelated.txt"]);
+    git(repository, ["add", "-A"]);
+    git(repository, ["commit", "-m", "B"]);
+    const b = git(repository, ["rev-parse", "HEAD"]);
+    git(repository, ["switch", "--detach", a]);
+    return { repository, base, a, b };
+  }
+
+  it("충돌 없는 합류를 작업 트리에 커밋 없이 적용하고 HEAD·index 는 그대로 둔다 — 다시 불러도 같은 트리로 멈춘다", async () => {
+    const { repository, a, b } = divergedResults(false);
+    const service = new GitService(new SpawnCommandRunner());
+    const prepared = await service.prepareMerge(repository, a, [b]);
+    expect(prepared.conflicts).toEqual([]);
+    expect(git(repository, ["rev-parse", "HEAD"])).toBe(a);
+    expect(git(repository, ["diff", "--cached", "--name-only"])).toBe("");
+    expect(readFileSync(join(repository, "b.txt"), "utf8")).toBe("B\n");
+    expect(git(repository, ["ls-files", "--deleted"])).toBe("unrelated.txt");
+    expect(git(repository, ["ls-files", "--others", "--exclude-standard"])).toBe("b.txt");
+    expect(await service.workingTreeOID(repository)).toBe(prepared.tree);
+    // 멱등: 이미 준비된 작업 트리는 바꾸지 않는다.
+    expect(await service.prepareMerge(repository, a, [b])).toEqual(prepared);
+  });
+
+  it("충돌은 표식을 담은 채 적용하고 파일 이름을 돌려준다 — 기준에서 바뀐 작업 트리·다른 HEAD 에서는 준비하지 않는다", async () => {
+    const { repository, a, b } = divergedResults(true);
+    const service = new GitService(new SpawnCommandRunner());
+    writeFileSync(join(repository, "stray.txt"), "러너가 먼저 쓴 파일\n");
+    await expect(service.prepareMerge(repository, a, [b])).rejects.toThrow("작업 트리가 단계 기준 커밋에서 바뀌어");
+    rmSync(join(repository, "stray.txt"));
+    await expect(service.prepareMerge(repository, b, [a])).rejects.toThrow("단계 기준 커밋이 아니어서");
+    const prepared = await service.prepareMerge(repository, a, [b]);
+    expect(prepared.conflicts).toEqual(["owned.txt"]);
+    expect(readFileSync(join(repository, "owned.txt"), "utf8")).toMatch(/^<<<<<<< [\s\S]*A 결과[\s\S]*=======[\s\S]*B 결과[\s\S]*>>>>>>> /);
+    expect(git(repository, ["rev-parse", "HEAD"])).toBe(a);
+  });
+
+  it("여러 합류 대상을 차례로 병합하고, 리뷰한 트리·승인된 부모로 병합 커밋을 만든다 — 첫 부모 대비 경로를 돌려준다", async () => {
+    const { repository, base, a, b } = divergedResults(false);
+    git(repository, ["switch", "--detach", base]);
+    git(repository, ["switch", "-c", "result-c"]);
+    writeFileSync(join(repository, "c.txt"), "C\n");
+    git(repository, ["add", "-A"]);
+    git(repository, ["commit", "-m", "C"]);
+    const c = git(repository, ["rev-parse", "HEAD"]);
+    git(repository, ["switch", "--detach", a]);
+    git(repository, ["switch", "-c", "stage"]);
+    const service = new GitService(new SpawnCommandRunner());
+    const prepared = await service.prepareMerge(repository, a, [b, c]);
+    expect(prepared.conflicts).toEqual([]);
+    writeFileSync(join(repository, "stage.txt"), "이 단계 변경\n");
+    const reviewed = await service.workingTreeOID(repository);
+    await expect(service.writeMergeCommit(repository, reviewed, [a], "합류")).rejects.toThrow("합류 대상이 하나 이상");
+    const merge = await service.writeMergeCommit(repository, reviewed, [a, b, c], "합류 병합");
+    // 커밋 객체만 만들었다 — 브랜치·index 는 그대로다(호출자가 OID 를 기록한 뒤 옮긴다).
+    expect(git(repository, ["rev-parse", "HEAD"])).toBe(a);
+    await expect(service.moveBranch(repository, "stage", merge, b)).rejects.toThrow();
+    await service.moveBranch(repository, "stage", merge, a);
+    // 브랜치만 옮겼다 — index 는 옛 HEAD 라 정렬 전에는 변경이 보인다.
+    expect(git(repository, ["status", "--porcelain"])).not.toBe("");
+    await service.resyncIndex(repository, "stage");
+    expect(await service.commitParents(repository, merge)).toEqual([a, b, c]);
+    expect(git(repository, ["rev-parse", "HEAD^{tree}"])).toBe(reviewed);
+    expect(git(repository, ["status", "--porcelain"])).toBe("");
+    expect(await service.commitChangedPaths(repository, merge)).toEqual(["b.txt", "c.txt", "stage.txt", "unrelated.txt"]);
+    // 일반 커밋은 기존과 같다.
+    expect(await service.commitChangedPaths(repository, b)).toEqual(["b.txt", "unrelated.txt"]);
+  });
+
+  it("병합 커밋은 기대한 HEAD 에서만 브랜치를 옮기고 stage 된 변경이 있으면 옮기지 않는다", async () => {
+    const { repository, a, b } = divergedResults(false);
+    git(repository, ["switch", "-c", "stage"]);
+    const service = new GitService(new SpawnCommandRunner());
+    const prepared = await service.prepareMerge(repository, a, [b]);
+    const merge = await service.writeMergeCommit(repository, prepared.tree, [a, b], "합류");
+    git(repository, ["add", "b.txt"]);
+    await expect(service.moveBranch(repository, "stage", merge, a)).rejects.toThrow("이미 stage된 변경");
+    git(repository, ["restore", "--staged", "b.txt"]);
+    await expect(service.moveBranch(repository, "stage", merge, b)).rejects.toThrow();
+    expect(git(repository, ["rev-parse", "HEAD"])).toBe(a);
+  });
+
+  // E4 2차 보완 F015 — 준비 트리는 DB 의 OID 만으로는 GC 에서 살아남지 않는다. ref 로 잡고, ref 가 지워져 사라졌으면 같은 기준·대상으로 다시 만든다.
+  it("준비 트리를 ref 로 보존해 GC 뒤에도 읽고, ref 가 지워져 사라진 트리는 다시 계산해 같은 트리일 때만 되살린다", async () => {
+    const { repository, a, b } = divergedResults(true);
+    const service = new GitService(new SpawnCommandRunner());
+    const prepared = await service.prepareMerge(repository, a, [b]);
+    const ref = `refs/consensus/prepared/${prepared.tree}`;
+    expect(git(repository, ["rev-parse", ref])).toBe(prepared.tree);
+    const collect = () => { git(repository, ["reflog", "expire", "--expire=now", "--all"]); git(repository, ["gc", "--prune=now", "--quiet"]); };
+    const present = () => { try { git(repository, ["cat-file", "-e", `${prepared.tree}^{tree}`]); return true; } catch { return false; } };
+    collect();
+    expect(present()).toBe(true);
+    // ref 를 지우고 GC 하면 준비 트리가 사라진다(작업 트리·index 는 이 트리를 가리키지 않는다).
+    git(repository, ["update-ref", "-d", ref]);
+    collect();
+    expect(present()).toBe(false);
+    await service.ensurePreparedTree(repository, a, [b], prepared.tree);
+    expect(present()).toBe(true);
+    expect(git(repository, ["rev-parse", ref])).toBe(prepared.tree);
+    // 되살린 트리 대비로 변경 파일을 수집한다(허용 오차 대조의 계산) — 사라진 트리였다면 이 diff 가 git 오류로 끊겼다.
+    writeFileSync(join(repository, "resolved.txt"), "해소\n");
+    expect((await service.diffTrees(repository, prepared.tree, await service.workingTreeOID(repository))).files).toEqual(["resolved.txt"]);
+    // 다른 트리를 준비 트리로 주장하면(재계산과 다르면) 되살리지 않는다.
+    await expect(service.ensurePreparedTree(repository, a, [b], "0".repeat(40))).rejects.toThrow("병합 준비를 재현할 수 없습니다");
+  });
+});

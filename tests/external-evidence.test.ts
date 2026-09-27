@@ -1,9 +1,11 @@
 import { mkdtempSync, rmSync, readFileSync, statSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ConsensusDatabase } from "../src/server/database";
-import { parseEvidenceSource, type EvidenceSourceInput, type EvidenceUnitInput } from "../src/shared/externalEvidence";
+import { EVIDENCE_PAGE_BYTES, parseEvidenceSource, type EvidenceRange, type EvidenceSourceInput, type EvidenceUnitInput,
+  type MediatorEvidenceBatch } from "../src/shared/externalEvidence";
 import { EvidenceService, withEvidence } from "../src/server/evidence/service";
 import { RestEvidenceConnector } from "../src/server/evidence/connectors";
 import type { AgentAdapter } from "../src/server/types";
@@ -44,7 +46,7 @@ describe("source identity and persistent content cache", () => {
   it("timestamps and revision bumps alone do not resend content; deletion does", () => {
     const { db, topic, source, ingest } = setup();
     const first = ingest([{ ...unit("1", "Decision"), changedAt: "old" }, unit("2", "Question")]);
-    const packet = db.evidence.packet(topic, "claude"); db.evidence.receipt(topic, "claude", "s1", packet.delivered);
+    const packet = db.evidence.packet(topic, "claude"); db.evidence.receipt(topic, "claude", "s1", packet);
     const second = ingest([unit("2", "Question"), { ...unit("1", "Decision"), changedAt: "new" }], "r2");
     expect(second.contentHash).toBe(first.contentHash);
     expect(db.evidence.packet(topic, "claude", "s1").text).not.toContain('"content":"Decision"');
@@ -52,7 +54,7 @@ describe("source identity and persistent content cache", () => {
     const changed = db.evidence.packet(topic, "claude", "s1");
     expect(changed.text).toContain('"content":"Changed"'); expect(changed.text).toContain('"removedUnitId":"2"');
     expect(db.evidence.snapshot(source.id, first.contentHash!)?.units).toHaveLength(2);
-    db.evidence.receipt(topic, "claude", "s1", changed.delivered);
+    db.evidence.receipt(topic, "claude", "s1", changed);
     expect(db.evidence.packet(topic, "claude", "s1").text).not.toContain("removedUnitId");
     expect(db.evidence.packet(topic, "codex", "s1").text).toContain('"content":"Changed"');
   });
@@ -94,7 +96,7 @@ describe("source identity and persistent content cache", () => {
   });
   it("persists receipts and snapshots across database reopening", () => {
     const { db, root, topic, source, ingest } = setup(); ingest([unit("1", "Kept")]);
-    db.evidence.receipt(topic, "claude", "session", db.evidence.packet(topic, "claude").delivered);
+    db.evidence.receipt(topic, "claude", "session", db.evidence.packet(topic, "claude"));
     const reopened = new ConsensusDatabase(join(root, "room.sqlite")); databases.push(reopened);
     expect(reopened.evidence.packet(topic, "claude", "session").text).not.toContain('"content":"Kept"');
     expect(reopened.evidence.snapshot(source.id)?.units[0].content).toBe("Kept");
@@ -225,7 +227,7 @@ it("reuses the selected Figma subtree and PNG when only another screen changed",
   const service = new EvidenceService(db.evidence, new RestEvidenceConnector({ figmaToken: "secret" }, request as typeof fetch));
   await service.refresh(source.id, true);
   const first = db.evidence.get(source.id); expect(first.error).toBeNull();
-  db.evidence.receipt(topic, "claude", "session", db.evidence.packet(topic, "claude").delivered);
+  db.evidence.receipt(topic, "claude", "session", db.evidence.packet(topic, "claude"));
   version = "v2"; await service.refresh(source.id, true);
   expect(db.evidence.get(source.id)).toMatchObject({ error: null, revision: "v2", contentHash: first.contentHash });
   expect(urls.filter(url => url.includes("/images/"))).toHaveLength(1);
@@ -450,7 +452,9 @@ it("delivers Figma product comments and link removal, without claiming design un
   const turn = { sessionId: "s", cwd: root, prompt: "Plan" };
   await adapter.resumeTurn(turn);
   expect(turns[0].prompt).toContain("save draft on exit"); expect(turns[0].prompt).not.toContain("PRIVATE_LAYOUT");
-  expect(db.evidence.packet(topic, "claude", "s").delivered.map(row => row.unitId)).toEqual(["decision"]);
+  // delivered 는 이 쪽에 실린 단위만이다(E3-1) — 이미 받은 세션은 비어 있고, 새 세션의 첫 쪽에도 디자인 단위는 없다.
+  expect(db.evidence.packet(topic, "claude", "s").delivered).toEqual([]);
+  expect(db.evidence.packet(topic, "claude", "fresh").delivered.map(row => row.unitId)).toEqual(["decision"]);
   await adapter.resumeTurn(turn); expect(turns[1].prompt).not.toContain("save draft on exit");
   db.evidence.failed(source.id, db.evidence.begin(source.id, true)!.checkId, "offline");
   expect(db.evidence.topic(topic).ready).toBe(false); // Known product comments still require fresh evidence.
@@ -506,12 +510,12 @@ it("remembers a link-only Figma delivery across database reopen and reports remo
   const source = db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc?node-id=1-2" });
   const packet = db.evidence.packet(topic, "claude", "s");
   expect(packet.delivered).toEqual([]);
-  db.evidence.receipt(topic, "claude", "s", packet.delivered, packet.links);
+  db.evidence.receipt(topic, "claude", "s", packet);
   const reopened = new ConsensusDatabase(join(root, "room.sqlite")); databases.push(reopened);
   reopened.evidence.detach(topic.id, source.id);
   const removed = reopened.evidence.packet(topic, "claude", "s");
   expect(removed.text).toContain(`"removedSourceId":"${source.id}"`);
-  reopened.evidence.receipt(topic, "claude", "s", removed.delivered, removed.links);
+  reopened.evidence.receipt(topic, "claude", "s", removed);
   expect(reopened.evidence.packet(topic, "claude", "s").text).toBe("");
 });
 
@@ -712,4 +716,345 @@ it("keeps an uncaptured read pending when a different screen in the same Figma f
     resumeTurn: async () => ({ kind: "IMPLEMENTATION", summary: "done", status: "completed", findings: [], evidenceRefs: [] })
   }, reopened, join(root, "images"));
   await expect(adapter.resumeTurn({ cwd: root, sessionId: "s", prompt: "Continue", implementation: true })).rejects.toThrow("previous attempt");
+});
+
+// E3-1 쪽·구간 전달: 두 소비처(중재자 batch·러너 턴)가 한 쪽 구성 규칙을 쓴다. 공개 경계는 store 의 batch·ack·packet·receipt, 서비스 응답,
+// 실제 어댑터 래퍼(withEvidence)다. 영수증·진행 위치는 같은 sqlite 파일을 따로 열어 확인한다(ack 전 완료 기록이 없다는 계약).
+describe("E3-1 근거 쪽·구간 전달", () => {
+  // 단위 본문 최대 길이는 JS 문자열 길이(UTF-16 코드 단위) 160,000 이다 — 이모지만으로는 80,000 코드 포인트가 최대다.
+  const MAX_CONTENT = 160_000;
+  const fill = (alphabet: string[]) => {
+    let content = "";
+    for (let index = 0; content.length + alphabet[index % alphabet.length].length <= MAX_CONTENT; index++) content += alphabet[index % alphabet.length];
+    return content;
+  };
+  const korean = fill(Array.from({ length: 64 }, (_, index) => String.fromCodePoint(0xAC00 + index * 7)));
+  const emoji = fill(Array.from({ length: 80 }, (_, index) => String.fromCodePoint(0x1F600 + index)));
+  const escapes = fill(['"', "\\", "\n", "\u0001", "\u001f", "\t", "a"]);
+  const splitsSurrogate = (text: string) => /^[\uDC00-\uDFFF]/.test(text) || /[\uD800-\uDBFF]$/.test(text);
+  type Delivered = { unitId: string; content: string; range?: EvidenceRange };
+  // 구간을 받은 순서대로 잇는다. 구간은 앞 구간의 끝에서 시작해야 하고, 서로게이트를 가르지 않아야 한다.
+  function reassemble(delivered: Delivered[]): Map<string, string> {
+    const joined = new Map<string, { text: string; end: number }>();
+    for (const item of delivered) {
+      expect(splitsSurrogate(item.content), item.unitId).toBe(false);
+      if (!item.range) { expect(joined.has(item.unitId), item.unitId).toBe(false); joined.set(item.unitId, { text: item.content, end: -1 }); continue; }
+      const previous = joined.get(item.unitId) ?? { text: "", end: 0 };
+      expect(item.range.offset, item.unitId).toBe(previous.end);
+      expect(Array.from(item.content).length, item.unitId).toBe(item.range.end - item.range.offset);
+      joined.set(item.unitId, { text: previous.text + item.content, end: item.range.end });
+    }
+    return new Map([...joined].map(([id, value]) => [id, value.text]));
+  }
+  function drainMediator(db: ConsensusDatabase, topic: Parameters<ConsensusDatabase["evidence"]["mediatorBatch"]>[0], session: string, pageBytes?: number) {
+    const pages: MediatorEvidenceBatch[] = [];
+    for (let round = 0; round < 200; round++) {
+      const page = db.evidence.mediatorBatch(topic, session, { pageBytes });
+      if (page.batchId === null) return pages;
+      expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(pageBytes ?? EVIDENCE_PAGE_BYTES);
+      pages.push(page); db.evidence.acknowledgeMediator(topic, session, page.batchId);
+    }
+    throw new Error("mediator pages did not drain");
+  }
+  const runnerRows = (prompt: string) => prompt.split("\n").filter(line => line.startsWith('{"sourceId"') && line.includes('"content"'))
+    .map(line => JSON.parse(line) as Delivered);
+  const recorder = (prompts: string[], fail = () => false): AgentAdapter => ({ role: "claude", validateExistingSession: async () => true,
+    createSession: async () => { throw new Error("unused"); },
+    resumeTurn: async turn => { prompts.push(turn.prompt); if (fail()) throw new Error("model failure"); return {} as any; } });
+  const rows = (root: string, sql: string, ...values: string[]) => {
+    const raw = new DatabaseSync(join(root, "room.sqlite"));
+    try { return raw.prepare(sql).all(...values); } finally { raw.close(); }
+  };
+
+  it("최대 길이 단위 세 종류(한국어·이모지·JSON escape)를 두 소비처 모두 코드 포인트 구간으로 나눠 싣고, 이으면 원문과 같다", async () => {
+    const { db, root, topic, ingest } = setup();
+    ingest([unit("escape", escapes), unit("emoji", emoji), unit("korean", korean)]);
+    expect(Array.from(emoji).length).toBe(80_000);
+    const originals = new Map([["escape", escapes], ["emoji", emoji], ["korean", korean]]);
+    const pages = drainMediator(db, topic, "mediator");
+    expect(pages.length).toBeGreaterThan(3);
+    const mediatorItems = pages.flatMap(page => page.changes.map(change => ({ unitId: change.id, content: change.content, range: change.range })));
+    expect(reassemble(mediatorItems)).toEqual(originals);
+    expect(mediatorItems.every(item => item.range?.total === Array.from(originals.get(item.unitId)!).length)).toBe(true);
+    const prompts: string[] = [];
+    const adapter = withEvidence(recorder(prompts), db, join(root, "images"));
+    for (let round = 0; round < 20 && prompts.at(-1) !== "Task"; round++) await adapter.resumeTurn({ sessionId: "runner", cwd: root, prompt: "Task" });
+    expect(prompts.at(-1)).toBe("Task");
+    for (const prompt of prompts) expect(Buffer.byteLength(prompt.slice("Task\n\n".length))).toBeLessThanOrEqual(EVIDENCE_PAGE_BYTES);
+    expect(reassemble(prompts.flatMap(runnerRows))).toEqual(originals);
+  });
+
+  it("끝 구간을 확인하기 전에는 그 단위의 완료 영수증이 없고, 실패한 턴은 진행 위치를 옮기지 않으며, 새 세션은 처음부터 받는다", async () => {
+    const { db, root, topic, source, ingest } = setup();
+    ingest([unit("big", korean)]);
+    const prompts: string[] = []; let failing = false;
+    const adapter = withEvidence(recorder(prompts, () => failing), db, join(root, "images"));
+    const turn = { sessionId: "runner", cwd: root, prompt: "Task" };
+    await adapter.resumeTurn(turn);
+    const [first] = runnerRows(prompts[0]);
+    expect(first.range).toMatchObject({ offset: 0, total: Array.from(korean).length });
+    const receipts = () => rows(root, "SELECT unit_id FROM evidence_receipts WHERE unit_id='big'");
+    const progress = () => rows(root, "SELECT next_offset FROM evidence_receipt_progress WHERE unit_id='big'");
+    expect(receipts()).toEqual([]); expect(progress()).toEqual([{ next_offset: first.range!.end }]);
+    failing = true; await expect(adapter.resumeTurn(turn)).rejects.toThrow("model failure"); failing = false;
+    expect(progress()).toEqual([{ next_offset: first.range!.end }]);
+    expect(runnerRows(db.evidence.packet(topic, "claude", "other").text)[0].range?.offset).toBe(0);
+    for (let round = 0; round < 5 && prompts.at(-1) !== "Task"; round++) await adapter.resumeTurn(turn);
+    expect(receipts()).toEqual([{ unit_id: "big" }]); expect(progress()).toEqual([]);
+    // 중재자도 같다: 끝 구간 ack 전에는 완료 영수증 없이 진행 위치만 있다.
+    const page = db.evidence.mediatorBatch(topic, "mediator");
+    expect(page.changes[0].range).toMatchObject({ offset: 0 });
+    db.evidence.acknowledgeMediator(topic, "mediator", page.batchId!);
+    expect(rows(root, "SELECT unit_id FROM evidence_mediator_unit_receipts WHERE source_id=?", source.id)).toEqual([]);
+    expect(rows(root, "SELECT next_offset FROM evidence_mediator_progress WHERE source_id=?", source.id)).toEqual([{ next_offset: page.changes[0].range!.end }]);
+  });
+
+  it("구간 전달 중 단위가 바뀌면 진행 위치를 버리고 새 해시로 처음부터 싣는다(두 소비처)", async () => {
+    const { db, root, topic, ingest } = setup();
+    ingest([unit("big", korean)]);
+    const page = db.evidence.mediatorBatch(topic, "mediator");
+    db.evidence.acknowledgeMediator(topic, "mediator", page.batchId!);
+    const prompts: string[] = [];
+    const adapter = withEvidence(recorder(prompts), db, join(root, "images"));
+    await adapter.resumeTurn({ sessionId: "runner", cwd: root, prompt: "Task" });
+    const changed = `변경 ${korean}`.slice(0, MAX_CONTENT);
+    ingest([unit("big", changed)], "r2");
+    const hash = db.evidence.snapshot(db.evidence.list(topic.id)[0].id)!.units[0].contentHash;
+    const next = db.evidence.mediatorBatch(topic, "mediator");
+    expect(next.changes[0]).toMatchObject({ contentHash: hash, range: { offset: 0 } });
+    expect(next.changes[0].content.startsWith("변경 ")).toBe(true);
+    await adapter.resumeTurn({ sessionId: "runner", cwd: root, prompt: "Task" });
+    const [row] = runnerRows(prompts[1]);
+    expect(row).toMatchObject({ hash, range: { offset: 0 } }); expect(row.content.startsWith("변경 ")).toBe(true);
+  });
+
+  it("모두 확인한 뒤 한 단위만 바뀌면 다음 쪽에는 그 단위만 싣는다 — 바뀌지 않은 단위를 다시 보내지 않는다(두 소비처)", async () => {
+    const { db, root, topic, ingest } = setup();
+    const units = ["a", "b", "c", "d"].map(id => unit(id, `stable ${id}`));
+    ingest(units);
+    drainMediator(db, topic, "mediator");
+    const prompts: string[] = [];
+    const adapter = withEvidence(recorder(prompts), db, join(root, "images"));
+    await adapter.resumeTurn({ sessionId: "runner", cwd: root, prompt: "Task" });
+    await adapter.resumeTurn({ sessionId: "runner", cwd: root, prompt: "Task" });
+    expect(prompts[1]).toBe("Task");
+    ingest([...units.slice(0, 2), unit("c", "changed c"), units[3]], "r2");
+    const next = db.evidence.mediatorBatch(topic, "mediator");
+    expect(next.changes.map(change => change.id)).toEqual(["c"]); expect(next.remaining).toBe(0);
+    await adapter.resumeTurn({ sessionId: "runner", cwd: root, prompt: "Task" });
+    expect(runnerRows(prompts[2]).map(row => row.unitId)).toEqual(["c"]);
+  });
+
+  it("pageBytes 는 요청자가 고르는 최대 쪽 크기다 — 작은 요청은 작은 쪽, 대기 쪽보다 작으면 새 쪽으로 바꾸고 옛 batchId 는 거부, 담을 수 없으면 최소 바이트와 함께 409", () => {
+    const { db, topic, ingest } = setup();
+    ingest(Array.from({ length: 20 }, (_, index) => unit(`u${String(index).padStart(2, "0")}`, "x".repeat(1_000))));
+    const large = db.evidence.mediatorBatch(topic, "s");
+    expect(large).toMatchObject({ remaining: 0, nextCursor: null }); expect(large.changes).toHaveLength(20);
+    expect(db.evidence.mediatorBatch(topic, "s", { pageBytes: EVIDENCE_PAGE_BYTES }).batchId).toBe(large.batchId);
+    const small = db.evidence.mediatorBatch(topic, "s", { pageBytes: 5_000 });
+    expect(small.batchId).not.toBe(large.batchId);
+    expect(Buffer.byteLength(JSON.stringify(small))).toBeLessThanOrEqual(5_000);
+    expect(small.changes.length).toBeLessThan(20); expect(small.remaining).toBe(20 - small.changes.length);
+    expect(() => db.evidence.acknowledgeMediator(topic, "s", large.batchId!)).toThrow("미확인 배치가 아닙니다");
+    expect(db.evidence.mediatorBatch(topic, "s", { pageBytes: EVIDENCE_PAGE_BYTES }).batchId).toBe(small.batchId);
+    expect(() => db.evidence.mediatorBatch(topic, "tiny", { pageBytes: 50 })).toThrow(/최소 \d+B/);
+    for (const pageBytes of [0, 1.5, EVIDENCE_PAGE_BYTES + 1]) {
+      expect(() => db.evidence.mediatorBatch(topic, "invalid", { pageBytes })).toThrow(expect.objectContaining({ statusCode: 400 }));
+    }
+    const pages = drainMediator(db, topic, "s", 5_000);
+    expect(pages.length).toBeGreaterThan(1);
+  });
+
+  it("서비스 응답 본문(이미지 경로·currentDigest·superseded 포함)으로 쪽 크기를 재고, ack 전 원문 갱신은 옛 쪽을 superseded 로 돌려준 뒤 새 해시로 다시 싣는다", async () => {
+    const { db, root, topic, source } = setup(); db.evidence.useRest(source.id);
+    const first = [unit("a-big", korean), { id: "b-render", kind: "render" as const, content: "design", imageBase64: png }];
+    const fetch = vi.fn(async () => ({ revision: "r1", units: first }));
+    const service = new EvidenceService(db.evidence, { fetch }, undefined, join(root, "images"));
+    const responses = [];
+    for (let round = 0; round < 60; round++) {
+      const response = await service.prepareMediator(db, topic.id, "s", 30_000);
+      if (response.batchId === null) break;
+      expect(Buffer.byteLength(JSON.stringify(response))).toBeLessThanOrEqual(30_000);
+      responses.push(response); db.evidence.acknowledgeMediator(topic, "s", response.batchId);
+    }
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(reassemble(responses.flatMap(page => page.changes.map(change => ({ unitId: change.id, content: change.content, range: change.range })))))
+      .toEqual(new Map([["a-big", korean], ["b-render", "design"]]));
+    expect(responses.flatMap(page => page.images)).toEqual([{ hash: expect.any(String), path: expect.stringContaining(join(root, "images")) }]);
+    const again = [unit("a-big", "short"), first[1]];
+    const pending = await service.prepareMediator(db, topic.id, "fresh");
+    db.evidence.ingest(source.id, { checkId: db.evidence.begin(source.id, true)!.checkId, revision: "r2", units: again });
+    const stale = await service.prepareMediator(db, topic.id, "fresh");
+    expect(stale).toMatchObject({ batchId: pending.batchId, superseded: true });
+    db.evidence.acknowledgeMediator(topic, "fresh", pending.batchId!);
+    const next = await service.prepareMediator(db, topic.id, "fresh");
+    expect(next.changes.map(change => [change.id, change.content])).toEqual([["a-big", "short"], ["b-render", "design"]]);
+    await service.stop();
+  });
+
+  // host-review 530cd5fe F001: 마지막 항목을 넣으면 nextCursor 가 null 이 되고 러너 잔여 안내가 사라져 쪽이 오히려 작아진다.
+  it("모든 항목을 실은 쪽이 한 항목만 실은 쪽보다 작아도 그 크기의 요청을 받아들이고, 409 의 최소 바이트는 가장 작은 쪽이다(두 소비처)", async () => {
+    const { db, root, topic, ingest } = setup();
+    ingest([unit("u1", "first"), unit("u2", "second")]);
+    for (const session of ["probe", "real"]) drainMediator(db, topic, session);
+    const prompts: string[] = [];
+    const adapter = withEvidence(recorder(prompts), db, join(root, "images"));
+    for (const session of ["probe", "real"]) await adapter.resumeTurn({ sessionId: session, cwd: root, prompt: "Task" });
+    ingest([], "r2");
+    const probe = db.evidence.mediatorBatch(topic, "probe");
+    expect(probe.removedUnits.map(item => item.unitId)).toEqual(["u1", "u2"]);
+    const full = Buffer.byteLength(JSON.stringify(probe));
+    const error = (() => { try { db.evidence.mediatorBatch(topic, "real", { pageBytes: full - 1 }); } catch (caught) { return String(caught); } return ""; })();
+    expect(error).toContain(`최소 ${full}B`);
+    const page = db.evidence.mediatorBatch(topic, "real", { pageBytes: full });
+    expect(page.removedUnits.map(item => item.unitId)).toEqual(["u1", "u2"]);
+    expect(page).toMatchObject({ remaining: 0, nextCursor: null });
+    const text = db.evidence.packet(topic, "claude", "probe").text;
+    const runner = db.evidence.packet(topic, "claude", "real", { pageBytes: Buffer.byteLength(text) });
+    expect(runner.entries.map(entry => entry.type)).toEqual(["removedUnit", "removedUnit"]);
+    expect(runner.text).toBe(text);
+  });
+
+  // host-review 530cd5fe F002: 완료한 버전 A 로 되돌아와도, 소비처가 마지막으로 받은 것은 다른 버전 B 의 일부다 — 현재 버전을 다시 싣는다.
+  it("다른 버전의 구간을 받은 뒤 원문이 이전에 완료한 버전으로 되돌아오면 현재 버전을 처음부터 다시 싣는다(두 소비처)", async () => {
+    const { db, root, topic, ingest } = setup();
+    ingest([unit("big", "A")]);
+    drainMediator(db, topic, "mediator");
+    const prompts: string[] = [];
+    const adapter = withEvidence(recorder(prompts), db, join(root, "images"));
+    await adapter.resumeTurn({ sessionId: "runner", cwd: root, prompt: "Task" });
+    ingest([unit("big", korean)], "r2");
+    const partial = db.evidence.mediatorBatch(topic, "mediator");
+    expect(partial.changes[0].range).toMatchObject({ offset: 0 });
+    db.evidence.acknowledgeMediator(topic, "mediator", partial.batchId!);
+    await adapter.resumeTurn({ sessionId: "runner", cwd: root, prompt: "Task" });
+    expect(runnerRows(prompts[1])[0].range).toMatchObject({ offset: 0 });
+    const restored = ingest([unit("big", "A")], "r3");
+    const hash = db.evidence.snapshot(restored.id)!.units[0].contentHash;
+    const back = db.evidence.mediatorBatch(topic, "mediator");
+    expect(back.changes.map(change => [change.id, change.content, change.contentHash, change.range])).toEqual([["big", "A", hash, undefined]]);
+    await adapter.resumeTurn({ sessionId: "runner", cwd: root, prompt: "Task" });
+    expect(runnerRows(prompts[2]).map(row => [row.unitId, row.content, row.range])).toEqual([["big", "A", undefined]]);
+    db.evidence.acknowledgeMediator(topic, "mediator", back.batchId!);
+    expect(db.evidence.mediatorBatch(topic, "mediator").batchId).toBeNull();
+    await adapter.resumeTurn({ sessionId: "runner", cwd: root, prompt: "Task" });
+    expect(prompts[3]).toBe("Task");
+  });
+
+  // eef75b21 F002: 복원 버전도 여러 쪽이면 첫 구간 확인 뒤 같은 해시의 옛 완료 기록보다 진행 위치가 우선해야 한다.
+  it("여러 쪽인 A 완료 후 B 일부를 받고 A로 복원하면 두 소비처가 A의 마지막 구간까지 다시 받는다", async () => {
+    const { db, root, topic, ingest } = setup();
+    ingest([unit("big", korean)]);
+    drainMediator(db, topic, "mediator");
+    const prompts: string[] = [];
+    const adapter = withEvidence(recorder(prompts), db, join(root, "images"));
+    const turn = { sessionId: "runner", cwd: root, prompt: "Task" };
+    const drainRunner = async () => {
+      const start = prompts.length;
+      for (let round = 0; round < 20; round++) {
+        await adapter.resumeTurn(turn);
+        if (prompts.at(-1) === "Task") return prompts.slice(start).flatMap(runnerRows);
+      }
+      throw new Error("runner pages did not drain");
+    };
+    expect(reassemble(await drainRunner())).toEqual(new Map([["big", korean]]));
+    ingest([unit("big", escapes)], "r2");
+    const partial = db.evidence.mediatorBatch(topic, "mediator");
+    expect(partial.changes[0].range).toMatchObject({ offset: 0 });
+    db.evidence.acknowledgeMediator(topic, "mediator", partial.batchId!);
+    await adapter.resumeTurn(turn);
+    expect(runnerRows(prompts.at(-1)!)[0].range).toMatchObject({ offset: 0 });
+    ingest([unit("big", korean)], "r3");
+    const restored = drainMediator(db, topic, "mediator");
+    const received = await drainRunner();
+    expect(restored.length).toBeGreaterThan(1);
+    expect(received.length).toBeGreaterThan(1);
+    expect(reassemble(restored.flatMap(page => page.changes.map(change => ({ unitId: change.id, content: change.content, range: change.range })))))
+      .toEqual(new Map([["big", korean]]));
+    expect(reassemble(received)).toEqual(new Map([["big", korean]]));
+    expect(restored.at(-1)).toMatchObject({ remaining: 0, nextCursor: null });
+    expect(received.at(-1)?.range?.end).toBe(Array.from(korean).length);
+    expect(db.evidence.mediatorBatch(topic, "mediator").batchId).toBeNull();
+    await adapter.resumeTurn(turn);
+    expect(prompts.at(-1)).toBe("Task");
+  });
+
+  // eef75b21 F004: 부분 구간의 range 포장보다 짧은 단위 전체가 작을 수 있다. 실제 성공 응답의 크기로 최소 안내를 대조한다.
+  it.each(["hi", "한글", "😀😃", '"\n'])("짧은 첫 단위 %j 전체의 응답 크기를 최소 크기 안내에서 빠뜨리지 않는다", async content => {
+    const { db, root, topic, source } = setup(); db.evidence.useRest(source.id);
+    const fetch = vi.fn(async () => ({ revision: "r1", units: [unit("first", content), unit("second", "z".repeat(10_000))] }));
+    const service = new EvidenceService(db.evidence, { fetch }, undefined, join(root, "images"));
+    try {
+      const probe = await service.prepareMediator(db, topic.id, "probe", 2_000);
+      expect(probe.changes.map(change => [change.id, change.content, change.range])).toEqual([["first", content, undefined]]);
+      const minimum = Buffer.byteLength(JSON.stringify(probe));
+      await expect(service.prepareMediator(db, topic.id, "real", minimum - 1)).rejects.toThrow(`최소 ${minimum}B`);
+      const exact = await service.prepareMediator(db, topic.id, "real", minimum);
+      expect(Buffer.byteLength(JSON.stringify(exact))).toBe(minimum);
+      expect(exact.changes.map(change => change.content)).toEqual([content]);
+      const runnerProbe = db.evidence.packet(topic, "claude", "probe", { pageBytes: 2_000 });
+      expect(runnerRows(runnerProbe.text).map(row => [row.unitId, row.content, row.range])).toEqual([["first", content, undefined]]);
+      const runnerMinimum = Buffer.byteLength(runnerProbe.text);
+      expect(() => db.evidence.packet(topic, "claude", "real", { pageBytes: runnerMinimum - 1 })).toThrow(`최소 ${runnerMinimum}B`);
+      expect(db.evidence.packet(topic, "claude", "real", { pageBytes: runnerMinimum }).text).toBe(runnerProbe.text);
+      expect(fetch).toHaveBeenCalledTimes(1);
+    } finally { await service.stop(); }
+  });
+
+  // host-review 530cd5fe F003: 대기 쪽은 저장 때 잰 바이트가 아니라 지금 돌려줄 포장으로 다시 잰다(데이터 폴더를 옮겨 이미지 경로가 길어진 재시작).
+  it("재시작 뒤 이미지 경로가 길어져 대기 쪽이 요청 크기를 넘으면 그대로 돌려주지 않고 요청 크기 안의 새 쪽으로 바꾼다", async () => {
+    const { db, root, topic, source } = setup(); db.evidence.useRest(source.id);
+    const fetch = vi.fn(async () => ({ revision: "r1", units: [{ id: "render", kind: "render" as const, content: "design", imageBase64: png }, unit("z", "zeta")] }));
+    const before = new EvidenceService(db.evidence, { fetch }, undefined, join(root, "i"));
+    const first = await before.prepareMediator(db, topic.id, "s");
+    const size = Buffer.byteLength(JSON.stringify(first));
+    await before.stop();
+    const after = new EvidenceService(db.evidence, { fetch }, undefined, join(root, "moved-data-directory-with-a-much-longer-name", "images"));
+    const replayed = await after.prepareMediator(db, topic.id, "s", size);
+    expect(Buffer.byteLength(JSON.stringify(replayed))).toBeLessThanOrEqual(size);
+    expect(replayed.batchId).not.toBe(first.batchId);
+    expect(() => db.evidence.acknowledgeMediator(topic, "s", first.batchId!)).toThrow("미확인 배치가 아닙니다");
+    expect(fetch).toHaveBeenCalledTimes(1);
+    await after.stop();
+  });
+
+  describe("E3-1 이전 중재자 기록(소스별 스냅샷 manifest) 호환", () => {
+    // 옛 서버가 남긴 기록: 소비처(주제·범위 세대·세션)별로 확인한 [sourceId, snapshotHash] 목록.
+    function legacy(root: string, session: string, manifest: Array<[string, string]>) {
+      const raw = new DatabaseSync(join(root, "room.sqlite"));
+      try { raw.prepare("INSERT INTO evidence_mediator_consumers(consumer,manifest,ack_id) VALUES (?,?,?)").run(JSON.stringify(["topic", 1, session]), JSON.stringify(manifest), "old"); }
+      finally { raw.close(); }
+    }
+    it("정확한 스냅샷이 있으면 그 버전 단위만 확인한 것으로 보고, 이후 버전의 새·변경 단위는 싣는다", () => {
+      const { db, root, topic, source, ingest } = setup();
+      const acknowledged = ingest([unit("1", "A"), unit("2", "B")]).contentHash!;
+      ingest([unit("1", "A"), unit("2", "B changed"), unit("3", "C")], "r2");
+      legacy(root, "legacy", [[source.id, acknowledged]]);
+      expect(db.evidence.mediatorBatch(topic, "legacy").changes.map(change => change.id)).toEqual(["2", "3"]);
+    });
+    it("스냅샷이 없거나 단위 레코드가 빠져 불완전하면 옮기지 않고 모두 다시 싣는다", () => {
+      const { db, root, topic, source, ingest } = setup();
+      const acknowledged = ingest([unit("1", "A"), unit("old", "only in the old version")]).contentHash!;
+      const oldUnit = db.evidence.snapshot(source.id)!.units.find(item => item.id === "old")!.contentHash;
+      ingest([unit("1", "A"), unit("2", "B")], "r2");
+      legacy(root, "missing", [[source.id, "f".repeat(64)]]);
+      expect(db.evidence.mediatorBatch(topic, "missing").changes.map(change => change.id)).toEqual(["1", "2"]);
+      const raw = new DatabaseSync(join(root, "room.sqlite"));
+      try { raw.prepare("DELETE FROM evidence_units WHERE hash=?").run(oldUnit); } finally { raw.close(); }
+      legacy(root, "incomplete", [[source.id, acknowledged]]);
+      expect(db.evidence.mediatorBatch(topic, "incomplete").changes.map(change => change.id)).toEqual(["1", "2"]);
+    });
+    it("옮기기는 소비처마다 한 번이다 — 확인한 삭제를 옛 기록이 되살리지 않는다", () => {
+      const { db, root, topic, source, ingest } = setup();
+      const acknowledged = ingest([unit("1", "A"), unit("2", "B")]).contentHash!;
+      legacy(root, "legacy", [[source.id, acknowledged]]);
+      expect(db.evidence.mediatorBatch(topic, "legacy").batchId).toBeNull();
+      ingest([unit("2", "B")], "r2");
+      const removal = db.evidence.mediatorBatch(topic, "legacy");
+      expect(removal.removedUnits).toEqual([{ sourceId: source.id, unitId: "1" }]);
+      db.evidence.acknowledgeMediator(topic, "legacy", removal.batchId!);
+      const reopened = new ConsensusDatabase(join(root, "room.sqlite")); databases.push(reopened);
+      expect(reopened.evidence.mediatorBatch(topic, "legacy").batchId).toBeNull();
+    });
+  });
 });

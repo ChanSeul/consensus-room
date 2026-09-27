@@ -16,7 +16,7 @@ import sqlite3
 import sys
 
 FIELDS = ('inputTokens', 'cachedInputTokens', 'cacheCreationInputTokens', 'outputTokens')
-ROLES = ('runner', 'mediator', 'pre-audit', 'host-review', 'work-admission')
+ROLES = ('runner', 'mediator', 'pre-audit', 'host-review', 'work-admission', 'repair')
 
 
 def timestamp(value):
@@ -266,8 +266,14 @@ class Report:
                 'reportedUsage': usage, 'status': row['status']})
         admission = self.args.room_home / 'work-admission'
         for task in sorted((admission / 'tasks').glob('*')):
-            self.read_source({'path': str(task / 'codex-home/sessions'), 'provider': 'codex', 'role': 'work-admission',
-                              'topic': self.mapping.get('admissionTasks', {}).get(task.name)})
+            legacy = task / 'codex-home/sessions'
+            sessions = ([legacy] if legacy.exists() else []) + sorted(
+                (task / 'runtime/codex-home/isolated').glob('*/sessions'))
+            # Keep old records and discover the E2e runtime homes too. Existing file/request identity
+            # rules deduplicate copies; runtime usage receipts remain separate execution observations.
+            for path in sessions or [legacy]:
+                self.read_source({'path': str(path), 'provider': 'codex', 'role': 'work-admission',
+                                  'topic': self.mapping.get('admissionTasks', {}).get(task.name)})
         for row in self.database(admission / 'admission.sqlite', 'SELECT * FROM attempts ORDER BY rowid'):
             path = admission / 'tasks' / row['task'] / 'workspace' / row['id'] / 'usage.json'
             duration = count(row.get('seconds'))
@@ -276,6 +282,28 @@ class Report:
                 'topic': self.mapping.get('admissionTasks', {}).get(row['task']), 'startedAt': start,
                 'endedAt': start + duration if start is not None and duration is not None else None,
                 'durationSeconds': duration, 'final': row['status'] != 'running', 'costUSD': None,
+                'reportedUsage': self.read_json(path) if path.exists() else None})
+        # Codex repair attempts (engine rework E2e-3). Native sessions are request observations; the repair job is the
+        # host-review job, so topics come from reviewJobs. Every attempt is a new session in its own runtime home.
+        for attempt in sorted((admission / 'repairs').glob('*/*')):
+            legacy = attempt / 'codex-home/sessions'
+            sessions = ([legacy] if legacy.exists() else []) + sorted((attempt / 'runtime/codex-home/isolated').glob('*/sessions'))
+            for path in sessions:
+                self.read_source({'path': str(path), 'provider': 'codex', 'role': 'repair',
+                                  'topic': self.mapping.get('reviewJobs', {}).get(attempt.parent.name)})
+        # The attempt ledger is an execution observation: its raw usage receipt never adds to request totals, and a
+        # ledger written before the table existed is simply absent (not zero).
+        rounds = self.database(admission / 'admission.sqlite',
+                               "SELECT name FROM sqlite_master WHERE type='table' AND name='repair_rounds'")
+        for row in (self.database(admission / 'admission.sqlite', 'SELECT * FROM repair_rounds ORDER BY job, round') if rounds else []):
+            path = Path(row['directory']) / 'usage.json'
+            duration = count(row.get('seconds'))
+            start = count(row.get('started'))
+            self.execution({'id': '%s/%s' % (row['job'], row['round']), 'job': row['job'], 'role': 'repair',
+                'provider': row.get('provider'), 'topic': self.mapping.get('reviewJobs', {}).get(row['job']),
+                'startedAt': start, 'endedAt': start + duration if start is not None and duration is not None else None,
+                'durationSeconds': duration, 'final': row['status'] != 'running', 'costUSD': None,
+                'modelCall': row.get('spawned') is not None,
                 'reportedUsage': self.read_json(path) if path.exists() else None})
 
     def result(self):

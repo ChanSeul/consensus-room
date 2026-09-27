@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { MediatorEvidenceInputSchema, MediatorEvidenceAckSchema, EvidenceDependencySchema, EvidenceReviewInputSchema, EvidenceSnapshotInputSchema, EvidenceSourceInputSchema } from "../../shared/externalEvidence.js";
+import { MediatorEvidenceBatchInputSchema, MediatorEvidenceAckSchema, EvidenceDependencySchema, EvidenceReviewInputSchema, EvidenceSnapshotInputSchema, EvidenceSourceInputSchema } from "../../shared/externalEvidence.js";
 import type { ConsensusDatabase } from "../database.js";
 import type { WorkflowEngine } from "../workflow.js";
 import type { EvidenceService } from "./service.js";
@@ -25,8 +25,8 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
   });
   app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/mediator/batch", async request => {
     mediator(request.headers);
-    const input = MediatorEvidenceInputSchema.parse(request.body);
-    return service.prepareMediator(db, request.params.id, input.sessionId);
+    const input = MediatorEvidenceBatchInputSchema.parse(request.body);
+    return service.prepareMediator(db, request.params.id, input.sessionId, input.pageBytes);
   });
   app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/mediator/ack", async request => {
     mediator(request.headers);

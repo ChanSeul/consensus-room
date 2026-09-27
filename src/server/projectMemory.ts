@@ -25,6 +25,18 @@ export interface MemorySelection {
   bytes: number;
 }
 
+// 허용 색인의 한 항목(E3-5) — 라우터·MEMORY.md 링크 대상 가운데 이 역할이 읽을 수 있는 문서 하나. 버전은 **가린 본문**의 SHA-256 이다(원문 해시
+// `MemoryDocumentSnapshot.sha256` 은 memoryUpdates 의 expectedSHA256 용이라 따로 둔다). 계획 제어는 가린 본문을 조각으로 싣고 조각 hash 도
+// 가린 본문 해시라, 이 버전과 조각 hash 가 같은 값이 된다.
+export interface MemoryIndexEntry {
+  path: string;
+  version: string;
+  bytes: number;
+  contexts: string[];
+  content: string;
+  redacted: boolean;
+}
+
 export class ProjectMemoryReader {
   constructor(private readonly memoryDirectory: string, private readonly options: MemoryReaderOptions = {}) {}
 
@@ -67,18 +79,9 @@ export class ProjectMemoryReader {
 
   async selectWithDiagnostics(prompt: string, role: ParticipantRole): Promise<MemorySelection> {
     const empty = (): MemorySelection => ({ snapshots: [], decisions: [], bytes: 0 });
-    const root = await realpath(this.memoryDirectory).catch(() => null);
-    if (!root) return empty();
-    const router = await this.readSnapshot(root, ROUTER_FILE, role);
-    if (!router) return empty();
-    const index = await this.readSnapshot(root, "MEMORY.md", role);
-    const contexts = new Map<string, string[]>();
-    for (const source of [router.content, index?.content ?? ""]) {
-      for (const candidate of extractMarkdownLinks(source)) {
-        if (candidate.path === ROUTER_FILE || candidate.path === "MEMORY.md") continue;
-        contexts.set(candidate.path, [...contexts.get(candidate.path) ?? [], candidate.context]);
-      }
-    }
+    const targets = await this.linkTargets(role);
+    if (!targets) return empty();
+    const { root, router, contexts } = targets;
     const decisions: MemorySelection["decisions"] = [];
     const candidates: Array<{ snapshot: MemoryDocumentSnapshot; score: number; decision: MemorySelection["decisions"][number] }> = [];
     for (const [path, labels] of contexts) {
@@ -102,6 +105,39 @@ export class ProjectMemoryReader {
       bytes += size;
     }
     return { snapshots, decisions, bytes };
+  }
+
+  // 허용 색인(E3-5) — 선택과 같은 링크 대상(라우터·MEMORY.md 의 `.md` 링크, 두 문서 자신 제외) 가운데 이 역할이 읽을 수 있는 문서 전부의 스냅숏이다.
+  // 관련도 점수·문서 수·전체 바이트 한도는 적용하지 않는다(선택이 고르지 않은 문서를 찾는 목록이다). 역할 폴더·심볼릭 링크·문서당 80KB·가림은 선택과
+  // 같은 readSnapshot 규칙이라, 읽을 수 없는 문서는 목록에 오르지 않는다. 순서는 링크가 처음 나온 순서(라우터 다음 MEMORY.md)다.
+  async index(role: ParticipantRole): Promise<MemoryIndexEntry[]> {
+    const targets = await this.linkTargets(role);
+    if (!targets) return [];
+    const entries: MemoryIndexEntry[] = [];
+    for (const [path, contexts] of targets.contexts) {
+      const snapshot = await this.readSnapshot(targets.root, path, role);
+      if (!snapshot) continue;
+      entries.push({ path, version: createHash("sha256").update(snapshot.content, "utf8").digest("hex"),
+        bytes: Buffer.byteLength(snapshot.content, "utf8"), contexts, content: snapshot.content, redacted: snapshot.redacted });
+    }
+    return entries;
+  }
+
+  // 라우터와 MEMORY.md 의 링크 대상과 링크 문맥 — 선택(selectWithDiagnostics)과 허용 색인(index)이 같은 목록을 쓴다. 라우터가 없으면 둘 다 비어 있다.
+  private async linkTargets(role: ParticipantRole): Promise<{ root: string; router: MemoryDocumentSnapshot; contexts: Map<string, string[]> } | null> {
+    const root = await realpath(this.memoryDirectory).catch(() => null);
+    if (!root) return null;
+    const router = await this.readSnapshot(root, ROUTER_FILE, role);
+    if (!router) return null;
+    const index = await this.readSnapshot(root, "MEMORY.md", role);
+    const contexts = new Map<string, string[]>();
+    for (const source of [router.content, index?.content ?? ""]) {
+      for (const candidate of extractMarkdownLinks(source)) {
+        if (candidate.path === ROUTER_FILE || candidate.path === "MEMORY.md") continue;
+        contexts.set(candidate.path, [...contexts.get(candidate.path) ?? [], candidate.context]);
+      }
+    }
+    return { root, router, contexts };
   }
 
   private async readSnapshot(

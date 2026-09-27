@@ -1,5 +1,9 @@
-import { PlanningPaused } from "../../shared/planningControl.js";
-import { createHash } from "node:crypto";
+import { PlanningPaused, TIMELINE_REQUIRED_KINDS, type RecoveryBoundary, type RecoveryContract, type RecoveryError,
+  type TimelineReference } from "../../shared/planningControl.js";
+import { AgentRunError, SessionIdentityMismatch } from "../adapters/resultParser.js";
+import { PROVIDER_COMPACTION } from "../adapters/turnPolicy.js";
+import type { RecoverySeat, ReviewLedgerRecord } from "../planningStore.js";
+import { createHash, randomUUID } from "node:crypto";
 import { reviewAnswerCandidate } from "./reviewRequests.js";
 // 구현·리뷰·전달 파이프라인: IMPLEMENTING → CODEX_REVIEW → (CLAUDE_FIX → CODEX_FINAL_REVIEW) →
 // READY_TO_DELIVER → commit/push. git 사후 검증(고아 커밋 처분 포함)이 이 파일의 계약이다.
@@ -10,10 +14,11 @@ import { digestToolTrees, type ToolTreeDigest } from "../toolTree.js";
 import { redactUnverifiedResult } from "../security.js";
 import {
   buildContinuationPrompt, buildReviewAnswerConfirmationPrompt,
-  buildStatusConfirmationPrompt,
+  buildStatusConfirmationDelivery,
   buildClaudeFixPrompt,
-  buildCodexReviewPrompt,
-  buildImplementationPrompt, buildToleranceCorrectionPrompt, type PlanRevisionNotice,
+  buildCodexReviewPrompt, buildReviewReadPrompt,
+  buildImplementationPrompt, buildPlanAckPrompt, buildToleranceCorrectionPrompt, type PlanRevisionNotice,
+  planTimelineDelivery, timelineEventText, timelineReference, type TimelinePage, type TimelinePush,
 } from "../../shared/prompts.js";
 import {
   assertImplementationGate,
@@ -41,13 +46,16 @@ import {
   type ToleranceLedgerEntry,
 } from "../../shared/tolerance.js";
 import { HandledWorkflowInterruption, type ResultNormalizer, type EngineCore } from "./core.js";
-import type { TurnExpectation, WriteGuards } from "./turnExecutor.js";
+import { AdmissionRefused, invocationFailure, type InvocationFailure, type TurnExpectation, type WriteGuards } from "./turnExecutor.js";
 import {
   accumulate, checkpointOpenRequests, requestId, workId, workEvidenceDigest, EMPTY_EVIDENCE_DIGEST, CheckpointCorrupt, type Accumulation, type RecoveredWork, type WorkBinding, type WorkCheckpoint, type WorkKind,
 } from "./checkpoint.js";
 import { acceptResult, completionVerdict, decisionRequestTexts, renderOpenRequests, type AcceptedResult, type CompletionVerdict, type OpenRequest } from "./completion.js";
 import type { DiagnosisRecord } from "../../shared/diagnoses.js";
 import type { FixContract } from "../../shared/fixContract.js";
+import type { TurnJob } from "../../shared/roles.js";
+import type { PreparedMerge, WorkGroup } from "../../shared/workGroups.js";
+import { bindingOf, describeBinding, legacyBinding, sameBinding, type SessionBinding, type TurnRoute } from "../turnRouting.js";
 
 // 논리 작업 실행기의 입력(구현·수정 공통).
 interface WorkSetup {
@@ -55,7 +63,11 @@ interface WorkSetup {
   baselineHead: string; toolTreesBefore: ToolTreeDigest; inputSequence: number;
   check: (result: AgentResult) => void; carry: ResultNormalizer;
   progressKind: string; resultKind: string; deferredSource: "implementation" | "fix"; pauseFallbackMessage?: string;
-  prompts: (openRequests: readonly OpenRequest[]) => { fresh: string; resume: string };
+  // 두 판의 타임라인(E3-2-2b) — fresh 는 새 세션용 전체, resume 은 이 작업 세션의 전달 커서 뒤. 부를 때마다 커서를 다시 읽는다(완료 게이트가 턴 뒤에 쓴다).
+  timeline: () => { fresh: TimelineEvent[]; resume: TimelineEvent[] };
+  prompts: (openRequests: readonly OpenRequest[], timeline: { fresh: WorkTimeline; resume: WorkTimeline }) => { fresh: string; resume: string };
+  // 이 작업의 경로(E2b) — 작업 세션(sessionId)은 이 경로의 바인딩(공급자·참여자)과 같다고 호출자가 확인했다. 새 세션은 이 바인딩으로 저장한다.
+  route: TurnRoute;
   sessionId: string | null; persistSession: (sessionId: string) => void;
   // false 면 모델 턴 없이 완료 판정 루프만 돈다(저장 결과 재사용·확인).
   initialTurn: boolean;
@@ -75,6 +87,62 @@ interface WorkSetup {
   };
 }
 
+// 한 판의 타임라인과 그 참조·쪽(E3-2-2b) — 빌더에 그대로 넘긴다.
+interface WorkTimeline { events: readonly TimelineEvent[]; push: TimelinePush }
+
+// 한 호출 판의 타임라인 전달(E3-2-2b) — 프롬프트에 싣는 것(push)과 조회 파일에 쓸 참조 원문. 인정·세션 목록은 이 판을 실제로 보낸 호출이 반환한 세션에만 쓴다.
+interface TimelineSend {
+  events: readonly TimelineEvent[];
+  push: TimelinePush;
+  documents: Array<{ reference: TimelineReference; text: string }>;
+}
+
+// 타임라인 쪽 예산(E3-2-2b) — "타임라인 쪽" 절 자료의 임시 예산이다. 지시문·계획·메타데이터를 포함한 전체 프롬프트 한도가 아니다(J4, 실측 패킷은 E3.md).
+// 구현·수정은 호출당이고 남은 필수 구간은 필수 읽기 턴(횟수 상한 없음, 진척 게이트 — E3-4b)으로 잇는다. 리뷰도 호출당이다 — 넘치는 앞부분은 판정 전 리뷰
+// 읽기 호출(같은 원장·진척 게이트)로 나눠 싣고, 남은 구간이 한 호출에 들면 마지막 호출이 그 쪽과 함께 판정한다(E3-4c).
+const TIMELINE_PAGE_BYTES = { work: 48 * 1024, review: 96 * 1024 } as const;
+
+// 이미 복구 판정을 끝낸 실패(E3-3b) — 안쪽 작업(리뷰가 연 수정 작업 등)이 판정한 실패가 바깥 작업·리뷰의 복구 판정에서 다시 세지지 않게 한다.
+const handledRecoveries = new WeakSet<object>();
+// 검증 계열 checkpoint — 계약·허용 오차 검사를 통과한 누적본(verified)과 그 누적본으로 연 수락(accepting·accepted). 원본(turn-result·before-*)은 요청
+// 해소의 근거가 아니다. paused 는 넣지 않는다: 허용 오차 교정 뒤에도 위반이 남은 정지(absorbTurn)는 검증을 통과하지 못한 누적본을 paused 로 남기고, 검증된
+// 정지(pauseWork)는 같은 누적본의 verified 가 그 앞에 있다 — phase 만으로 둘을 가를 수 없어 앞선 verified 에서 읽는다(host-review 9c4d786 F005).
+const VERIFIED_PHASES: ReadonlySet<WorkCheckpoint["phase"]> = new Set(["verified", "accepting", "accepted"]);
+// 게이트를 통과한 전이 이벤트에 싣는 계보 경계 표식(E3-3b, planningStore.RECOVERY_ANCHORS 가 읽는다).
+const boundary = (value: RecoveryBoundary) => ({ recoveryBoundary: value });
+
+// 필수 참조의 미인정 구간(인정 구간 합집합의 공백)을 앞에서부터 쪽 예산만큼 고른다. 쪽 끝은 UTF-8 코드 포인트 경계로 내린다(PlanningReader.utf8Slice 와
+// 같은 규칙). 공백의 시작·끝은 0·전체 길이이거나 인정 구간의 경계라 이미 코드 포인트 경계다 — 아니면(손상) 겹치는 쪽으로 넓혀 자료를 건너뛰지 않는다.
+// 예산을 넘는 나머지는 remainingBytes 로 알린다 — 조용히 버리지 않는다.
+function selectTimelinePages(
+  documents: ReadonlyArray<{ reference: TimelineReference; bytes: Buffer; gaps: ReadonlyArray<{ offset: number; end: number }> }>, budget: number,
+): { pages: TimelinePage[]; remainingBytes: number } {
+  const pages: TimelinePage[] = [];
+  const continuation = (bytes: Buffer, at: number) => at > 0 && at < bytes.length && (bytes[at] & 0xc0) === 0x80;
+  let left = budget;
+  let remainingBytes = 0;
+  for (const { reference, bytes, gaps } of documents) {
+    for (const gap of gaps) {
+      let offset = gap.offset;
+      while (continuation(bytes, offset)) offset--;
+      let gapEnd = gap.end;
+      while (continuation(bytes, gapEnd)) gapEnd++;
+      let end = Math.min(gapEnd, offset + left);
+      while (end > offset && continuation(bytes, end)) end--;
+      if (end > offset) {
+        pages.push({ seq: reference.seq, selector: reference.selector, offset, end, total: reference.bytes, text: bytes.subarray(offset, end).toString("utf8") });
+        left -= end - offset;
+      }
+      remainingBytes += gapEnd - end;
+    }
+  }
+  return { pages, remainingBytes };
+}
+
+function withReferences(paths: readonly string[], referencesPath: string | null): readonly string[] {
+  return referencesPath ? [...paths, referencesPath] : paths;
+}
+
 // 수락된 결과가 실은 진단의 반영 보고(fix_reported) 항목 — 수락 전이와 한 transaction 으로 쓴다.
 type FixReported = ReturnType<EngineCore["diagnoses"]["acceptedEntries"]>;
 
@@ -83,6 +151,11 @@ function reportedExtras(reported: FixReported, state: WorkflowState) {
   return reported
     ? { diagnosisEntries: reported.entries, events: [{ actor: "system" as const, kind: "system" as const, state, body: reported.body, payload: reported.payload }] }
     : {};
+}
+
+// 구현·수정 본 턴의 job(엔진 개편 E2a) — 본 턴과 그 결과의 계약 검사가 같은 job 을 쓴다.
+function workTurnJob(kind: WorkKind): TurnJob {
+  return { role: "implementer", operation: kind === "FIX" ? "fix" : "implement" };
 }
 
 // 복구 직후(턴 전)의 바탕 — 결과가 없을 수 있다.
@@ -101,6 +174,7 @@ function renderReport(result: AgentResult): string {
 }
 
 // status=in_progress 로 멈춘 러너를 같은 액션 안에서 다시 여는 상한. 그 뒤엔 USER_DECISION_REQUIRED(resume IMPLEMENTING)로 넘겨 retry 로 잇는다.
+// 완료 보고 뒤 남은 필수 타임라인 구간을 싣는 필수 읽기 턴은 이 상한을 쓰지 않는다 — 진척 게이트가 끊는다(E3-4b).
 const CONTINUATION_LIMIT = 4;
 
 function isWithinSelectedPaths(path: string, selectedPaths: readonly string[]): boolean {
@@ -113,14 +187,26 @@ export class DeliveryPipeline {
   async runImplementation(topicId: string, signal: AbortSignal): Promise<void> {
     let topic = this.core.dependencies.database.getTopic(topicId);
     const resuming = topic.state === "IMPLEMENTING";
+    assertImplementationGate(resuming ? { ...topic, state: "AWAITING_USER_APPROVAL" } : topic);
+    // 승인 계획의 구현 시작은 구현 좌석 계보의 경계다(E3-3b Q3a) — 게이트(assertImplementationGate)를 통과한 전이에만 표식을 싣는다.
+    if (!resuming) topic = this.core.transitionWith(topicId, "IMPLEMENTING", "Claude가 승인된 계획을 구현합니다.", { payload: boundary({ seat: "implementer",
+      kind: "approval", ref: { planSHA256: topic.approvedPlanSHA256, planEpoch: topic.planEpoch, scopeGeneration: topic.scopeGeneration } }) });
+    // 실행 전 거부(계획 연속성·경로·세션 바인딩)는 IMPLEMENTING 전이 뒤, 브랜치·세션 저장 전에 한다. 승인 대기(AWAITING_USER_APPROVAL)에서는 결정 대기로
+    // 멈출 수 없어(상태 전이표) 거부가 인터럽트되지 못하고 주제가 기록 없이 승인 대기에 남았다(E2b 검증에서 발견 — 연속성 정지도 같았다). 전이 뒤의 거부는
+    // 재개 상태 IMPLEMENTING 으로 멈추고, 재시도가 같은 판정을 다시 한다.
+    const workRoute = this.core.route(topic, workTurnJob("IMPLEMENTATION"));
     const continuous = this.core.dependencies.database.planning.continuityEnabled(topicId);
     const planningSession = continuous ? this.core.dependencies.database.planning.boundSession(topic) : null;
     const savedSession = this.core.dependencies.database.getFlags(topicId).implementationSessionId;
     if (continuous && (!planningSession || (savedSession && savedSession !== planningSession.sessionId))) {
       throw new PlanningPaused("승인 계획과 연결된 Claude 세션을 확인할 수 없습니다. 새 세션을 만들지 않고 중재를 기다립니다.");
     }
-    assertImplementationGate(resuming ? { ...topic, state: "AWAITING_USER_APPROVAL" } : topic);
-    if (!resuming) topic = this.core.transition(topicId, "IMPLEMENTING", "Claude가 승인된 계획을 구현합니다.");
+    // 계획 세션(작성자 좌석)을 구현에 넘기는 것은 바인딩이 같을 때만이다 — 다른 공급자·참여자의 구현자에게 계획 세션 id 를 보내지 않는다(E2b).
+    const authorBinding = this.core.dependencies.database.participantBinding(topicId, "claude") ?? legacyBinding("claude");
+    if (planningSession && !sameBinding(authorBinding, workRoute)) {
+      this.refuseSessionBinding(topicId, "계획", planningSession.sessionId, authorBinding, workRoute);
+    }
+    const savedImplementationSession = this.implementationSessionFor(topicId, workRoute);
     if (!topic.branchName) {
       const branchName = resolveBranchName(topic);
       await this.core.dependencies.git.createBranch(topic.worktreePath, branchName);
@@ -136,10 +222,12 @@ export class DeliveryPipeline {
     const baselineHead = await this.requirePinnedBaseline(topicId, topic.worktreePath);
     const inputSequence = this.core.latestSequence(topicId);
     const sessionFlags = this.core.dependencies.database.getFlags(topicId);
-    const existingImplementationSession = sessionFlags.implementationSessionId ?? planningSession?.sessionId ?? null;
+    // 저장된 구현 세션은 바인딩이 같을 때만 잇는다(다르면 위에서 새 세션으로 돌렸다). 연속성 정책이면 계획 세션을 넘겨받는다.
+    const existingImplementationSession = savedImplementationSession ?? (sessionFlags.implementationSessionId ? null : planningSession?.sessionId ?? null);
     const planningHandoff = Boolean(planningSession && sessionFlags.implementationPromptSequence == null);
     if (planningSession && !sessionFlags.implementationSessionId) {
-      this.core.dependencies.database.setImplementationSession(topicId, planningSession.sessionId);
+      // 넘겨받은 세션의 바인딩은 그 세션을 만든 작성자 좌석의 것이다(같은 공급자·참여자임을 위에서 확인했다).
+      this.core.dependencies.database.setImplementationSession(topicId, planningSession.sessionId, authorBinding);
     }
     // 개정 없이 넘어온 경미 지적(구현 노트)은 첫 프롬프트에 실리고, 러너 결과가 id 별 처분을 빠뜨리면 커버리지 계약이 재제출을 요구한다.
     const implementationNotes = await this.core.implementationNotesOf(topicId);
@@ -212,29 +300,36 @@ export class DeliveryPipeline {
       progressKind: "implementation-progress", resultKind: "implementation-result", deferredSource: "implementation",
       // 이어지는 턴은 계획 본문과 이미 받은 이벤트를 다시 싣지 않는다(2026-09-08 Codex 제안 ⑥). 세션 유실로 새 세션이 되면 실행기가 전문 프롬프트로
       // 폴백한다. '전달한 sequence' 는 턴이 실제로 돌아온 뒤에만 적는다 — 429 로 끊긴 턴이 못 본 이벤트를 다음 retry 가 다시 싣게 하기 위해서다.
-      prompts: (openRequests) => ({
-        fresh: buildImplementationPrompt({
-          ...promptBase, openRequests, timeline: this.core.dependencies.database.getPromptTimeline(topicId, scopedTopic.scopeGeneration),
-        }),
+      // 타임라인은 참조 경로 조회('all')다 — 조용한 절단·제외 없이 인라인·참조·쪽으로 나눈다(E3-2-2b). 커서는 부를 때마다 다시 읽는다.
+      timeline: () => ({
+        fresh: this.core.dependencies.database.getPromptTimeline(topicId, scopedTopic.scopeGeneration, 0, "all"),
+        resume: this.core.dependencies.database.getPromptTimeline(topicId, scopedTopic.scopeGeneration,
+          this.core.dependencies.database.getFlags(topicId).implementationPromptSequence ?? planningSession?.inputSequence ?? 0, "all"),
+      }),
+      prompts: (openRequests, timeline) => ({
+        fresh: buildImplementationPrompt({ ...promptBase, openRequests, timeline: timeline.fresh.events, timelinePush: timeline.fresh.push }),
         resume: buildImplementationPrompt({
           ...promptBase, openRequests, resumedSession: true, planningHandoff, planAlreadyKnown: Boolean(planningSession),
-          timeline: this.core.dependencies.database.getPromptTimeline(topicId, scopedTopic.scopeGeneration, sessionFlags.implementationPromptSequence ?? planningSession?.inputSequence ?? 0),
+          timeline: timeline.resume.events, timelinePush: timeline.resume.push,
         }),
       }),
+      route: workRoute,
       sessionId: existingImplementationSession,
       diagnoses,
       carriedSeed,
       // 세션 저장이 검증보다 먼저다 — 검증이 턴을 거부해도 세션이 남아야 재시도가 재구현 없이 resume된다
       // (2026-09-01 S1.1: 저장 전에 거부돼 수동 DB 복구가 필요했던 사건의 프로그램적 방지).
-      persistSession: (sessionId) => this.core.dependencies.database.setImplementationSession(topicId, sessionId),
+      persistSession: (sessionId) => this.core.dependencies.database.setImplementationSession(topicId, sessionId, bindingOf(workRoute)),
       initialTurn: true,
       legacyBase: async () => ({
         base: await this.legacyPendingOriginal(topicId, scopedTopic, "IMPLEMENTING"), ledger: await this.legacyAcceptedLedger(topicId),
       }),
       accept: {
         persist: async (accepted) => { await this.core.writeArtifact(scopedTopic, "implementation", 1, renderReport(accepted), signal); },
-        transition: (_accepted, _acceptId, reported) => {
-          this.core.transitionWith(topicId, "CODEX_REVIEW", "Codex가 구현 결과를 읽기 전용으로 검토합니다.", reportedExtras(reported, "CODEX_REVIEW"));
+        transition: (_accepted, acceptId, reported) => {
+          // 구현 수락 전이 — 수락 절차 id(acceptId)와 짝지은 계보 경계 표식(E3-3b)을 같은 transaction 에 싣는다.
+          this.core.transitionWith(topicId, "CODEX_REVIEW", "Codex가 구현 결과를 읽기 전용으로 검토합니다.", {
+            ...reportedExtras(reported, "CODEX_REVIEW"), payload: boundary({ seat: "implementer", kind: "implementation", ref: { acceptId } }) });
           return true;
         },
         continue: async () => { await this.runReview(topicId, signal, false); },
@@ -243,7 +338,263 @@ export class DeliveryPipeline {
   }
 
   // ---- 논리 작업 실행기(구현·수정 공통, PLAN §2): 복구 → 턴 → 흡수(계약·허용 오차·누적 checkpoint) → 완료 판정 루프(계속 진행·확인·정지·수락) ----
+  // 작업 세션의 자동 복구(E3-3b)가 이 실행을 감싼다: 대기 중인 복구를 먼저 잇고, 작업 세션 턴이 관측된 세션 유실·문맥 초과로 끝나면 계보가 허가할 때만
+  // 같은 route 새 세션(연속성 v2 는 확인을 마친 복구 세션)으로 같은 논리 작업을 처음부터 다시 연다(checkpoint 는 논리 작업에 속한다).
   private async runWork(setup: WorkSetup, signal: AbortSignal): Promise<void> {
+    const prepared = await this.resumePendingWorkRecovery(setup, signal);
+    if (!prepared) return;
+    // 이 실행이 지금 쓰는 작업 세션 — 시작 세션이거나 이 실행 안에서 만들어 저장한 세션이다. 복구 판정은 실패 시점의 이 세션과 대조한다(시작 세션만
+    // 보면 첫 실행·복구 뒤 새 세션이 같은 실행의 계속 진행·확인 턴에서 유실될 때 판정 없이 원형 실패로 끝나, 재시도가 잃은 세션을 다시 불렀다).
+    let current = prepared.work.sessionId;
+    const tracked: WorkSetup = { ...prepared, persistSession: (id) => { prepared.persistSession(id); current = id; } };
+    try {
+      await this.runWorkOnce(tracked, signal);
+    } catch (error) {
+      const next = await this.recoverWorkSession({ ...prepared, sessionId: current, work: { ...prepared.work, sessionId: current } }, error, signal);
+      if (!next) return;
+      await this.runWork(next, signal);
+    }
+  }
+
+  // ---- 작업·리뷰 좌석의 자동 복구(E3-3b) ----
+  private recoveryContract(topicId: string, route: TurnRoute): RecoveryContract {
+    const topic = this.core.dependencies.database.getTopic(topicId);
+    return { stage: topic.state, scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch, planSHA256: topic.planSHA256, binding: bindingOf(route) };
+  }
+
+  // 같은 논리 작업(workId)의 최신 검증 계열 checkpoint 가 가진 열린 요청 id(Root Q1). 최신 checkpoint 가 다른 작업이거나 손상이면 null — 해소를 진척으로
+  // 세지 않는 쪽으로 틀린다. 결정·증거 추가나 해소 이벤트가 아니라, 엔진 누적(accumulate)이 닫고 검증된 누적본에 남은 목록만 본다.
+  private async verifiedOpenRequests(topicId: string, work: WorkBinding): Promise<{ workId: string; open: string[] } | null> {
+    try {
+      let checkpoint = await this.core.checkpoints.latest(topicId);
+      while (checkpoint && workId(checkpoint.work) === workId(work)) {
+        if (VERIFIED_PHASES.has(checkpoint.phase)) return { workId: workId(work), open: checkpointOpenRequests(checkpoint).map((request) => request.id) };
+        checkpoint = checkpoint.previous === null ? null : await this.core.checkpoints.byRevision(topicId, checkpoint.previous);
+      }
+    } catch (error) {
+      if (!(error instanceof CheckpointCorrupt)) throw error;
+    }
+    return null;
+  }
+
+  // 계보가 자동 복구를 허가하는가 — 허가하면 복구 기록(기준선 포함)을 남기고 null, 아니면 차단 기록을 남기고 사유 문자열. 판정 순서:
+  //   (1) 실패한 그 호출의 사용량이 완전해야 한다(Root Q4). 예외는 모델 턴 없음을 관측한 세션 유실(session-missing 분류의 필요조건)뿐이다.
+  //   (2) 계보에 이미 자동 복구가 있으면 유효 진척이 있어야 한다: 계보 세션 전체의 참조 전달 인정 합집합이 기준선보다 늘었거나(i), 작업 좌석은 기준선에서
+  //       열려 있던 요청이 같은 작업의 검증 계열 checkpoint 에서 닫혔다(iii). 새 계보(채택 전이)는 새 1회다(ii).
+  private async authorizeRecovery(input: {
+    seat: RecoverySeat; topicId: string; route: TurnRoute; error: AgentRunError; observed: InvocationFailure; fromSession: string; work?: WorkBinding;
+  }): Promise<string | null> {
+    const planning = this.core.dependencies.database.planning;
+    const lineage = planning.currentRecoveryLineage(input.topicId, input.seat);
+    const contract = this.recoveryContract(input.topicId, input.route);
+    const error: RecoveryError = { provider: input.error.provider, code: input.error.code, message: input.error.message, raw: input.error.raw };
+    const sessions = [...new Set([...lineage.sessions, input.fromSession])];
+    const current = planning.lineageProgress(input.topicId, sessions);
+    const requests = input.work ? await this.verifiedOpenRequests(input.topicId, input.work) : null;
+    const block = (message: string, extra: Partial<NonNullable<typeof lineage.blocked>>): string => {
+      lineage.sessions = sessions;
+      lineage.blocked = { at: new Date().toISOString(), reason: input.error.code, error, contract, ...extra };
+      planning.saveRecoveryLineage(input.topicId, input.seat, lineage);
+      return message;
+    };
+    if (input.error.code !== "session-missing" && input.observed.usage !== "complete") {
+      return block(`작업 세션 ${input.fromSession} 이(가) ${input.error.code} 로 끝났지만 그 호출의 사용량 관측이 ${input.observed.usage === "unknown" ? "없어" : "불완전해"} `
+        + `복구 호출을 사지 않고 멈춥니다(사용량 누락 정책). 원형 오류를 보존했습니다: ${input.error.message}`, { usage: input.observed.usage });
+    }
+    const last = lineage.recoveries.at(-1);
+    if (last) {
+      const evidence = Object.entries(current).some(([key, covered]) => covered > (last.baseline[key] ?? 0));
+      const open = requests && last.requests && requests.workId === last.requests.workId ? requests.open : null;
+      const resolved = open ? last.requests!.open.filter((id) => !open.includes(id)) : [];
+      if (!evidence && resolved.length === 0) {
+        return block(`작업 세션이 ${input.error.code} 로 다시 끝났지만 ${last.at} 의 자동 복구(${last.reason}, ${last.fromSession ?? "없음"} → ${last.toSession ?? "없음"}) 뒤 `
+          + `새 근거 구간도, 엔진이 확인한 요청 해소도 없습니다 — 계보마다 실패당 자동 복구는 1회입니다. 원형 오류를 보존했습니다: ${input.error.message}`,
+        { baseline: last.baseline, current, ...(last.requests ? { requests: { baseline: last.requests.open, open } } : {}) });
+      }
+    }
+    lineage.sessions = sessions;
+    lineage.blocked = null;
+    lineage.recoveries.push({ at: new Date().toISOString(), reason: input.error.code as "session-missing" | "context-exceeded",
+      fromSession: input.fromSession, toSession: null, compaction: PROVIDER_COMPACTION[input.route.provider] === "automatic-only" ? "automatic-only" : "unsupported",
+      contract, baseline: current, error, usage: input.observed.usage, ...(requests ? { requests } : {}) });
+    planning.saveRecoveryLineage(input.topicId, input.seat, lineage);
+    return null;
+  }
+
+  // 복구가 연 새 세션을 계보의 대기 중 기록(요청 세션 → 새 세션)에 잇는다.
+  private noteRecoveredSession(seat: RecoverySeat, topicId: string, fromSession: string | null, toSession: string): void {
+    const planning = this.core.dependencies.database.planning;
+    const lineage = planning.currentRecoveryLineage(topicId, seat);
+    const last = lineage.recoveries.at(-1);
+    if (!last || last.toSession !== null || last.fromSession !== fromSession) return;
+    last.toSession = toSession;
+    lineage.sessions = [...new Set([...lineage.sessions, toSession])];
+    planning.saveRecoveryLineage(topicId, seat, lineage);
+  }
+
+  // 대기 중인 자동 복구 — 허가됐지만 새 세션이 아직 이어지지 않은 기록(요청 세션이 이 세션). 다시 허가받지 않고 그 복구를 잇는다(새 복구 소비 없음).
+  private pendingRecovery(seat: RecoverySeat, topicId: string, sessionId: string | null) {
+    if (!sessionId) return null;
+    const last = this.core.dependencies.database.planning.currentRecoveryLineage(topicId, seat).recoveries.at(-1);
+    return last && last.fromSession === sessionId && (last.toSession === null || last.verification?.phase === "pending") ? last : null;
+  }
+
+  // 어댑터가 반환 신원을 대조해 거부한 응답(Codex 재개 스트림의 다른 thread)을 좌석 계보에 남긴다(자동 복구 사유가 아니다).
+  private recordSeatIdentityMismatch(seat: RecoverySeat, topicId: string, route: TurnRoute, error: SessionIdentityMismatch): void {
+    const planning = this.core.dependencies.database.planning;
+    const lineage = planning.currentRecoveryLineage(topicId, seat);
+    lineage.blocked = { at: new Date().toISOString(), reason: "identity-mismatch", error: { provider: error.provider, code: "identity-mismatch", message: error.message },
+      contract: this.recoveryContract(topicId, route), sessions: { requested: error.requested, returned: error.returned } };
+    planning.saveRecoveryLineage(topicId, seat, lineage);
+  }
+
+  private withRecoveredSession(setup: WorkSetup, sessionId: string | null, fromSession: string | null): WorkSetup {
+    return { ...setup, sessionId, work: { ...setup.work, sessionId },
+      persistSession: (id) => { setup.persistSession(id); this.noteRecoveredSession("implementer", setup.topicId, fromSession, id); } };
+  }
+
+  private freshHandoffPending(topicId: string, sessionId: string): boolean {
+    const last = this.core.dependencies.database.planning.storedRecoveryLineage(topicId, "implementer")?.recoveries.at(-1);
+    return Boolean(last && last.toSession === sessionId && last.verification?.phase === "verified" && last.verification.handoff === "fresh-pending");
+  }
+
+  private completeFreshHandoff(topicId: string, sessionId: string): void {
+    const planning = this.core.dependencies.database.planning;
+    const lineage = planning.storedRecoveryLineage(topicId, "implementer");
+    const last = lineage?.recoveries.at(-1);
+    if (!lineage || !last?.verification || last.toSession !== sessionId || last.verification.handoff !== "fresh-pending") return;
+    last.verification.handoff = "done";
+    planning.saveRecoveryLineage(topicId, "implementer", lineage);
+  }
+
+  // 작업을 열기 전에 대기 중인 복구를 잇는다 — 허가된 뒤 새 세션이 생기기 전(또는 v2 확인이 끝나기 전)에 끊겼으면, 잃은 세션을 다시 부르지 않고(문맥 초과면
+  // 다시 비용을 치른다) 그 복구를 마저 한다. 새 복구를 소비하지 않는다.
+  private async resumePendingWorkRecovery(setup: WorkSetup, signal: AbortSignal): Promise<WorkSetup | null> {
+    const pending = this.pendingRecovery("implementer", setup.topicId, setup.work.sessionId);
+    if (!pending) return setup;
+    this.core.event(setup.topicId, "system", "system",
+      `작업 세션 ${pending.fromSession} 의 자동 복구(${pending.reason}, ${pending.at})가 끝나기 전에 멈췄습니다 — 새 복구를 쓰지 않고 그 복구를 이어갑니다.`,
+      { workSessionRecoveryResumed: { from: pending.fromSession, to: pending.toSession } });
+    return this.core.dependencies.database.planning.continuityEnabled(setup.topicId)
+      ? this.verifyRecoveredAuthor(setup, signal)
+      : this.withRecoveredSession(setup, null, pending.fromSession);
+  }
+
+  // 작업 세션 턴의 실패 — 관측된 세션 유실·문맥 초과이고 이 작업 세션에 보낸 호출이며 계보가 허가하면, 같은 route 새 세션(연속성 v2 는 확인을 마친 복구
+  // 세션)으로 다시 열 작업 입력을 돌려준다. 아니면 기존과 같이 멈춘다(v2 세션 유실은 PlanningPaused, 그 밖은 원래 오류).
+  private async recoverWorkSession(setup: WorkSetup, error: unknown, signal: AbortSignal): Promise<WorkSetup | null> {
+    const session = setup.work.sessionId;
+    if (typeof error !== "object" || error === null || handledRecoveries.has(error)) throw error;
+    if (error instanceof SessionIdentityMismatch && session && error.requested === session) {
+      handledRecoveries.add(error);
+      this.recordSeatIdentityMismatch("implementer", setup.topicId, setup.route, error);
+      throw error;
+    }
+    const observed = invocationFailure(error);
+    if (!(error instanceof AgentRunError) || error.code === "unknown" || !observed || !session || observed.sessionId !== session || signal.aborted) throw error;
+    handledRecoveries.add(error);
+    const continuity = this.core.dependencies.database.planning.continuityEnabled(setup.topicId);
+    const refusal = await this.authorizeRecovery({ seat: "implementer", topicId: setup.topicId, route: setup.route, error, observed, fromSession: session, work: setup.work });
+    if (refusal) {
+      this.core.event(setup.topicId, "system", "system", refusal, { workSessionRecoveryRefused: { session, code: error.code, usage: observed.usage } });
+      if (continuity && error.code === "session-missing") throw new PlanningPaused(refusal);
+      throw error;
+    }
+    this.core.event(setup.topicId, "system", "system",
+      `${setup.kind === "FIX" ? "수정" : "구현"} 작업 세션 ${session} 이(가) ${error.code} 로 끝나 같은 경로의 새 세션으로 이 작업을 한 번 다시 엽니다`
+      + `${continuity ? " — 새 세션이 승인 계획을 먼저 읽기 전용으로 확인한 뒤에만 쓰기를 재개합니다" : ""}(누적 checkpoint·열린 요청·사용량은 논리 작업에 그대로 남습니다).`,
+      { workSessionRecovery: { from: session, code: error.code, usage: observed.usage, continuity } });
+    return continuity ? this.verifyRecoveredAuthor(setup, signal) : this.withRecoveredSession(setup, null, session);
+  }
+
+  // 연속성 v2 작성자 좌석의 복구 세션 확인(E3-3b, Root Q5 A) — 같은 작업 route(공급자·참여자·모델·설정·options 그대로, job planner/ack → 도구 없는
+  // protocol 턴)로 복구 세션 S1 을 만들며(대기 중이면 그 S1 을 이어) 기존 ACK 프롬프트를 보낸다. 실행기가 취소·상태·세대·근거·계획 epoch·sha·새 입력을
+  // 대조하고, 여기서 응답 종류·승인 sha·바인딩·세션 충돌을 본다. 통과하면 참여자(ACK = S1 이 답한 값)·승인 바인딩(검증 기록)·구현 세션·계보를 한
+  // transaction 으로 S1 에 옮긴다. 기존 ACK 를 복사하거나 사용자 승인을 만들지 않고, 계획자 checkpoint 도 건드리지 않는다. 대조가 어긋나면 옮기지 않고 멈춘다.
+  private async verifyRecoveredAuthor(setup: WorkSetup, signal: AbortSignal): Promise<WorkSetup | null> {
+    const { topicId } = setup;
+    const database = this.core.dependencies.database;
+    const topic = database.getTopic(topicId);
+    const lineage = database.planning.currentRecoveryLineage(topicId, "implementer");
+    const record = lineage.recoveries.at(-1);
+    if (!record) throw new Error("복구 세션 확인에 대응하는 자동 복구 기록이 없습니다.");
+    const refuse = (message: string): never => {
+      lineage.blocked = { at: new Date().toISOString(), reason: record.reason, error: record.error, contract: this.recoveryContract(topicId, setup.route), verification: message };
+      database.planning.saveRecoveryLineage(topicId, "implementer", lineage);
+      this.core.event(topicId, "system", "system", message, { recoveredAuthorRefused: { from: record.fromSession, session: record.verification?.session ?? null } });
+      throw new PlanningPaused(message);
+    };
+    const sha = topic.approvedPlanSHA256;
+    if (!sha || sha !== topic.planSHA256) refuse("승인된 현재 계획이 없어 복구 세션이 확인할 계획이 없습니다 — 작업 세션을 옮기지 않고 멈춥니다.");
+    const route = this.workRoute(setup, { role: "planner", operation: "ack" });
+    const authorBinding = database.participantBinding(topicId, "claude") ?? legacyBinding("claude");
+    if (!sameBinding(authorBinding, route)) {
+      refuse(`작성자 좌석(${describeBinding(authorBinding)})과 작업 경로(${describeBinding(route)})가 달라 복구 세션을 작성자 좌석으로 옮길 수 없습니다.`);
+    }
+    record.verification ??= { phase: "pending", session: null, planSHA256: sha!, scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch,
+      evidenceDigest: workEvidenceDigest(setup.work), binding: bindingOf(route) };
+    const verification = record.verification;
+    if (verification.planSHA256 !== sha || verification.scopeGeneration !== topic.scopeGeneration || verification.planEpoch !== topic.planEpoch
+        || verification.evidenceDigest !== workEvidenceDigest(setup.work)) {
+      refuse("복구 세션 확인을 시작한 뒤 승인 계획·범위·근거가 바뀌었습니다 — 옛 확인을 새 계획에 쓰지 않고 멈춥니다.");
+    }
+    database.planning.saveRecoveryLineage(topicId, "implementer", lineage);
+    const expected = { state: setup.work.resumeState, scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch, planSHA256: topic.planSHA256,
+      evidenceDigest: workEvidenceDigest(setup.work) };
+    const pendingSession = verification.session;
+    let outcome;
+    try {
+      outcome = await this.core.executor.execute({
+        route, topic, signal, purpose: "복구 세션 계획 확인", inputSequence: setup.inputSequence, expected, recoverable: true,
+        session: pendingSession ? { mode: "resume", sessionId: pendingSession } : { mode: "create", onSessionCreated: (id) => {
+          verification.session = id; record.toSession = id;
+          lineage.sessions = [...new Set([...lineage.sessions, id])];
+          database.planning.saveRecoveryLineage(topicId, "implementer", lineage);
+        } },
+        prompt: buildPlanAckPrompt(sha!, setup.plan), readablePaths: [], settings: route.settings,
+      });
+    } catch (error) {
+      // 복구 세션 자체가 유실·문맥 초과로 끝났다 — 새 실패로 보고 같은 계보 규칙(진척 없으면 정지)을 적용한다.
+      const observed = invocationFailure(error);
+      const lost = verification.session;
+      if (!lost || !(error instanceof AgentRunError) || error.code === "unknown" || !observed || observed.sessionId !== lost || signal.aborted
+          || handledRecoveries.has(error)) throw error;
+      handledRecoveries.add(error);
+      const refusal = await this.authorizeRecovery({ seat: "implementer", topicId, route: setup.route, error, observed, fromSession: lost, work: setup.work });
+      if (refusal) throw new PlanningPaused(refusal);
+      return this.verifyRecoveredAuthor(setup, signal);
+    }
+    const result = outcome.result;
+    const recovered = outcome.sessionId;
+    // 새 세션 id 는 어댑터가 프로세스 전에 알리는 것이 보통이다(대기 중 기록). 알림 없이 정상 반환했으면 반환 세션을 지금 기록한다.
+    if (verification.session === null) {
+      verification.session = recovered; record.toSession = recovered;
+    } else if (recovered !== verification.session) {
+      refuse(`복구 세션 확인이 기록된 세션(${verification.session})이 아닌 ${recovered} 에서 돌아왔습니다.`);
+    }
+    if (result.kind !== "ACK") refuse(`복구 세션 ${recovered} 이(가) 계획 확인(ACK) 대신 ${result.kind} 를 돌려주었습니다 — 옮기지 않고 멈춥니다.`);
+    if (this.core.pauseForResult(topicId, result, setup.work.resumeState, "복구 세션이 승인 계획을 확인하지 못했습니다.")) return null;
+    if (result.planSHA256 !== sha) {
+      refuse(`복구 세션 ${recovered} 이(가) 확인한 계획 해시(${(result.planSHA256 ?? "없음").slice(0, 12)})가 승인 계획(${sha!.slice(0, 12)})과 다릅니다 — 옮기지 않고 멈춥니다.`);
+    }
+    if (database.participantSessionInUse(topicId, route.provider, recovered)) refuse(`복구 세션 ${recovered} 은(는) 다른 주제에서 이미 사용 중입니다.`);
+    if (this.core.interruptForNewUserInput(database.getTopic(topicId), setup.inputSequence)) return null;
+    verification.phase = "verified";
+    verification.at = new Date().toISOString();
+    verification.handoff = "fresh-pending";
+    verification.acknowledged = { kind: result.kind, planSHA256: result.planSHA256 ?? null, summary: result.summary.slice(0, 500) };
+    record.toSession = recovered;
+    lineage.sessions = [...new Set([...lineage.sessions, recovered])];
+    lineage.blocked = null;
+    database.switchRecoveredAuthorSession({ topicId, sessionId: recovered, planSHA256: sha!, binding: authorBinding, inputSequence: setup.inputSequence,
+      recovery: { fromSession: record.fromSession, verification }, lineage: { jobRole: "implementer", value: lineage },
+      event: { actor: "system", kind: "system", state: database.getTopic(topicId).state,
+        body: `복구 세션 ${recovered} 이(가) 승인 계획(${sha!.slice(0, 12)})을 읽기 전용으로 확인했습니다 — 작성자 좌석·계획 확인·승인 바인딩·구현 세션을 이 세션으로 옮기고, 첫 쓰기 턴은 전문 판으로 보냅니다(잃은 세션 ${record.fromSession ?? "없음"}).`,
+        payload: { recoveredAuthorSession: { from: record.fromSession, to: recovered, planSHA256: sha, scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch } } } });
+    return this.withRecoveredSession(setup, recovered, record.fromSession);
+  }
+
+  private async runWorkOnce(setup: WorkSetup, signal: AbortSignal): Promise<void> {
     const { topicId, topic } = setup;
     const db = this.core.dependencies.database;
     const expected = { state: setup.work.resumeState, scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch, planSHA256: topic.planSHA256, evidenceDigest: workEvidenceDigest(setup.work) };
@@ -365,11 +716,14 @@ export class DeliveryPipeline {
     }
     let sessionId = setup.work.sessionId;
     if (db.planning.continuityEnabled(topicId) && !sessionId) throw new PlanningPaused("기존 Claude 세션이 없어 작업을 중단했습니다. 세션 복구가 필요합니다.");
+    // 확인을 마친 복구 세션의 첫 쓰기 턴(E3-3b, 연속성 v2) — 그 세션은 승인 계획 확인만 받았으므로 저장 결과 확인·재대조 지름길을 쓰지 않고 전문 판을 보낸다.
+    const freshHandoff = sessionId !== null && this.freshHandoffPending(topicId, sessionId);
     let work: WorkBinding = setup.work;
     let state: WorkState;
     // 멈춘(paused) 결과가 열린 요청만 빼면 완료였고 그 뒤 결정이 올라왔으면 쓰기 턴을 다시 사지 않는다 — 읽기 전용 확인 턴(요청 해소 여부)으로
     // 간다. 결정이 REFIX 를 지시하면 저장 결과는 낡은 것이므로 쓰기 턴을 다시 연다. 미완료(in_progress·blocked)면 쓰기 턴이 남은 단계를 한다.
-    if (recovered && recovered.checkpoint.phase === "paused" && seed.base && initialTurn && !diagnosisPending) {
+    // 세션이 없으면(배정이 바뀌어 새 세션으로 돌린 작업, E2b) 확인 턴을 열 대화가 없다 — 아래 규칙대로 쓰기 턴이다.
+    if (recovered && sessionId && recovered.checkpoint.phase === "paused" && seed.base && initialTurn && !diagnosisPending) {
       const decisions = db.getTimeline(topicId, recovered.checkpoint.inputSequence)
         .filter((event) => event.scopeGeneration === topic.scopeGeneration && event.actor === "user" && event.kind === "decision");
       const completeApartFromRequests = completionVerdict(seed.base, {
@@ -390,27 +744,50 @@ export class DeliveryPipeline {
       this.core.event(topicId, "system", "system",
         `적용된 중재자 진단 ${ids.join(", ")} 을(를) 전달하는 쓰기 턴을 엽니다 — 수락 이어가기·완료 확인 턴·저장 결과 재사용으로 건너뛰지 않습니다.`, { diagnosisTurn: ids });
     }
+    // 세션 없이 복구된 작업(배정이 바뀌어 새 세션으로 돌린 작업, E2b)은 이전 대화를 전제하는 복구 지름길(완료 확인 턴·저장 결과 재대조와 그 교정)을 쓸 수
+    // 없다 — 새 세션의 첫 턴은 전문 프롬프트의 쓰기 턴이다. 누적 checkpoint 는 세션이 아니라 논리 작업에 속하므로 그대로 이어받는다.
+    // 모든 복구 지름길 판정 뒤에 둔다 — 어느 지름길이 쓰기 턴을 건너뛰기로 했어도 세션이 없으면 여기서 되돌린다(사전 검증 a2df64d: paused 지름길이 이 검사
+    // 뒤에서 initialTurn 을 내려 세션 없이 완료 판정 루프로 들어가 FAILED 가 반복됐다).
+    if ((!sessionId || freshHandoff) && !initialTurn) {
+      initialTurn = true;
+      this.core.event(topicId, "system", "system",
+        `이 작업의 세션이 없어(새 세션) 저장된 결과의 확인·재대조 대신 새 세션에서 ${setup.kind === "FIX" ? "수정" : "구현"} 턴을 엽니다.`, { freshSessionTurn: true });
+    }
     // 2) 턴 — 실행기가 adapter 호출 전·spawn 직전에 허용 검사를 하고, 응답 수신 시 채택 검사를 한다.
     if (initialTurn) {
-      const prompts = setup.prompts(seed.openRequests);
+      // 두 판의 타임라인 쪽(E3-2-2b): fresh 는 새 세션용이라 인정·이월 없이 처음부터, resume 은 이 세션의 인정 구간·세션 참조 목록에서 고른다.
+      const timeline = setup.timeline();
+      const fresh = this.timelineSend(topic, timeline.fresh, null, TIMELINE_PAGE_BYTES.work);
+      const resume = sessionId && !freshHandoff ? this.timelineSend(topic, timeline.resume, sessionId, TIMELINE_PAGE_BYTES.work) : null;
+      const referencesPath = await this.writeTimelineReferences(topic, resume ? [fresh, resume] : [fresh], signal);
+      const view = (send: TimelineSend): WorkTimeline => ({ events: send.events, push: { ...send.push, referencesPath } });
+      const prompts = setup.prompts(seed.openRequests, { fresh: view(fresh), resume: view(resume ?? fresh) });
+      // 실제로 보낸 판 — create 와 복구 세션의 첫 쓰기 턴은 fresh, resume 은 resume 이다. created 로 판을 추정하지 않는다(resume 중 CLI 가 세션 id 를
+      // 바꿔도 created=true 지만 보낸 것은 resume 판이다). 세션 유실은 이 호출 안에서 새 세션으로 바꾸지 않는다 — 계보가 허가한 복구가 논리 작업을 다시 연다.
+      const sent: TimelineSend = resume ?? fresh;
       // 진단 전달 기록 — 프로세스가 뜨는 순간(spawn). 프로세스를 띄우지 않는 어댑터를 위해 정상 반환 뒤에도 한 번(멱등). spawn 전 거부는 전달이 아니다.
       const deliverDiagnoses = (moment: "spawn" | "return") => {
         if (setup.diagnoses?.length) this.core.diagnoses.markDelivered(topicId, setup.diagnoses, { moment, workId: workId(setup.work) });
       };
+      const route = this.workRoute(setup);
       const outcome = await this.core.executor.execute({
-        role: "claude", topic, signal, purpose: "턴", inputSequence: setup.inputSequence, expected, write: true, writeGuards,
-        session: sessionId
-          ? { mode: "resume", sessionId, ...(db.planning.continuityEnabled(topicId) ? {} : { fallbackFresh: { prompt: prompts.fresh, onSessionCreated: setup.persistSession } }) }
-          : { mode: "create", onSessionCreated: setup.persistSession },
-        prompt: sessionId ? prompts.resume : prompts.fresh, implementation: true, readablePaths: setup.readablePaths,
-        settings: this.core.executionSettings(topicId, "claude", true),
+        route, topic, signal, purpose: "턴", inputSequence: setup.inputSequence, expected, writeGuards,
+        session: sessionId ? { mode: "resume", sessionId } : { mode: "create", onSessionCreated: setup.persistSession },
+        prompt: sessionId && !freshHandoff ? prompts.resume : prompts.fresh, recoverable: true, readablePaths: withReferences(setup.readablePaths, referencesPath),
+        settings: route.settings,
         onSpawn: () => deliverDiagnoses("spawn"),
         // 세션 저장이 검증·채택 검사보다 먼저다 — 검증이 턴을 거부해도 세션이 남아야 재시도가 재구현 없이 resume 된다(2026-09-01 S1.1).
         onResponse: (outcome) => {
           if (outcome.created || outcome.sessionId !== sessionId) setup.persistSession(outcome.sessionId);
+          // 보낸 판의 필수 참조 의무를 커서보다 **먼저** 반환 세션의 목록에 남긴다 — 두 쓰기 사이에서 끊기거나 의무 기록이 실패하면 커서가 전진하지
+          // 않아 다음 턴이 같은 이벤트를 다시 싣는다(거꾸로면 커서만 전진해 남은 필수 원문이 사라졌다, host-review 55f3795 F001). 채택 검사가 응답을
+          // 보존만 하고 멈춰도 다음 턴이 이어 싣는다.
+          this.rememberTimeline(topic, outcome.sessionId, sent);
           db.updateTopic(topicId, { implementationPromptSequence: setup.inputSequence });
+          if (freshHandoff) this.completeFreshHandoff(topicId, outcome.sessionId);
         },
       });
+      this.acknowledgeTimeline(topic, signal, setup.work.resumeState, outcome.sessionId, sent);
       deliverDiagnoses("return");
       sessionId = outcome.sessionId;
       work = { ...setup.work, sessionId };
@@ -424,9 +801,46 @@ export class DeliveryPipeline {
       state = { ...seed, base: seed.base };
     }
     if (!sessionId) throw new Error("세션 없이 완료 판정 루프에 들어왔습니다.");
+    const workSession = sessionId;
     if (initialTurn) freshlyVerified = true;
     // 3) 완료 판정 루프
+    // 계수는 둘이다(E3-4b): 러너 in_progress 의 계속 진행(상한 CONTINUATION_LIMIT)과 완료 게이트의 필수 읽기 턴(상한 없음 — 진척 게이트).
     let continuations = 0;
+    let readingTurns = 0;
+    // 같은 세션의 계속 진행 턴 — 러너의 in_progress 와 필수 타임라인 완독 게이트(recheck)가 같은 경로를 쓴다. 쪽은 이 세션이 아직 받지 않은 필수
+    // 구간(커서 뒤 필수 이벤트 전부 + 세션 참조 목록)에서 고르고, 반환 뒤에만 반환 세션에 인정한다(E3-2-2b).
+    const continueWork = async (remainingSteps: readonly string[], send: TimelineSend, recheck: boolean): Promise<WorkState | null> => {
+      const round = recheck ? ++readingTurns : ++continuations;
+      // 호출을 열기 전에 누적본을 보존한다(옛 progress 산출물은 사람·옛 소비처 호환).
+      await this.core.saveAgentOutput(topic, setup.route, state.base, setup.progressKind, signal);
+      await this.core.checkpoints.record(topic, {
+        work, phase: "before-continuation", accumulated: state.base, verifiedLedger: state.verifiedLedger, inputSequence: setup.inputSequence,
+        openRequests: state.openRequests, confirmations: state.confirmations,
+      }, signal);
+      if (recheck) {
+        this.core.event(topicId, "system", "system",
+          `러너가 완료를 보고했지만 이 세션이 아직 받지 않은 필수 타임라인 구간이 남았습니다(필수 참조 ${send.push.required.length}개) — 최종 채택·검증 전에 같은 세션에서 남은 쪽을 싣고 결과를 재대조합니다(필수 읽기 ${round}회차).`,
+          { readingTurn: round, timelineRecheck: send.push.required.map((reference) => reference.selector) });
+      } else {
+        this.core.event(topicId, "system", "system",
+          `러너가 진행 중(status=in_progress)으로 멈췄습니다 — 남은 단계 ${remainingSteps.length}개. 같은 세션에서 계속 진행합니다(${round}/${CONTINUATION_LIMIT}).`,
+          { continuation: round, remainingSteps });
+      }
+      const referencesPath = await this.writeTimelineReferences(topic, [send], signal);
+      const continueRoute = this.workRoute(setup, { role: "implementer", operation: "continue" });
+      const continued = await this.core.executor.execute({
+        route: continueRoute, topic, signal, purpose: "계속 진행 턴", inputSequence: setup.inputSequence, expected, writeGuards,
+        session: { mode: "resume", sessionId: workSession }, recoverable: true,
+        prompt: buildContinuationPrompt(remainingSteps, round, CONTINUATION_LIMIT, setup.kind, state.openRequests,
+          send.push.required.length ? { ...send.push, referencesPath, recheck } : undefined),
+        readablePaths: withReferences(setup.readablePaths, referencesPath), settings: continueRoute.settings,
+        onResponse: (outcome) => this.rememberTimeline(topic, outcome.sessionId, send),
+      });
+      this.acknowledgeTimeline(topic, signal, setup.work.resumeState, continued.sessionId, send);
+      await this.assertBaselineIntact(topic, setup.baselineHead, "계속 진행 중");
+      this.assertToolTreesIntact(topic, setup.toolTreesBefore, "계속 진행 중");
+      return this.absorbTurn(setup, work, state, continued.result, workSession, expected, writeGuards, signal);
+    };
     for (;;) {
       // 루프에 들어오는 모든 누적본(첫 턴·복구·재대조·계속 진행·확인 턴)에서 먼저 본다 — 러너가 이 작업에 실린 진단을 반박하거나 증거를 요구했으면
       // 결과를 보존한 채 중재자에게 돌려보낸다. 판정·수락보다 앞이라, 재대조가 연 허용 오차 교정 턴의 반박도 수락으로 새지 않는다(host-review R3·2026-09-14 감사).
@@ -435,6 +849,27 @@ export class DeliveryPipeline {
         openRequests: state.openRequests, decisionAfterRequest: this.decisionAfter(topic, state.openRequests), unresolvedDiagnoses: this.unresolvedDiagnoses(setup, state.base),
       });
       if (verdict.kind === "completed") {
+        // 필수 타임라인 완독 게이트(E3-2-2b J2) — 이 세션이 아직 받지 않은 필수 참조(세션 참조 목록 + 작업 턴이 아직 싣지 않은 커서 뒤의 필수 이벤트 전부,
+        // 크기 무관)가 있으면 완료 보고를 채택·검증하지 않고 필수 읽기 턴으로 잇는다. 횟수 상한은 없고 진척 게이트가 끊는다(E3-4b): 턴 직전의 필수 참조 집합과
+        // 작업 세션의 미인정 바이트를 고정하고, 턴 뒤 같은 집합·같은 세션으로 다시 잰다. 호스트 인정(정상 반환 + 현재성 재대조 뒤 acknowledgeTimeline)만
+        // 줄인다 — 러너 보고·파일 읽기, 다른 세션(CLI 가 바꾼 세션 id)에 인정된 쪽은 작업 세션의 공백을 줄이지 않는다. 새로 생긴 참조는 다음 비교의 집합에만 든다.
+        const unread = this.timelineSend(topic, setup.timeline().resume, workSession, TIMELINE_PAGE_BYTES.work, true);
+        if (unread.push.required.length > 0) {
+          const pinned = unread.push.required;
+          const before = this.unacknowledgedBytes(topic, workSession, pinned);
+          const absorbed = await continueWork(["남은 필수 타임라인 구간을 읽고 이미 만든 결과를 그 결정과 재대조·보완"], unread, true);
+          if (!absorbed) return;
+          state = absorbed;
+          freshlyVerified = true;
+          const after = this.unacknowledgedBytes(topic, workSession, pinned);
+          if (after >= before) {
+            await this.pauseWork(setup, work, state, "USER_DECISION_REQUIRED",
+              `필수 읽기 턴(${readingTurns}회차) 뒤에도 이 작업 세션(${workSession})의 필수 타임라인 미인정 구간이 줄지 않았습니다 — 필수 참조 ${pinned.length}개(${pinned.map((reference) => reference.selector).join(", ")}), 미인정 ${after} bytes. 응답이 다른 세션으로 돌아왔거나 쪽이 인정되지 않았습니다. 결과·인정 구간·세션 참조 목록을 보존했고 완료로 채택하지 않았습니다. 재시도(retry)하면 같은 세션에서 남은 쪽을 이어 싣습니다.`,
+              { readingStalled: true, timelineUnread: { references: pinned.map((reference) => reference.selector), bytes: after } }, signal);
+            return;
+          }
+          continue;
+        }
         if (!freshlyVerified) {
           // 재대조는 새 턴과 같은 흡수 경로(absorbTurn)를 지난다 — 재대조가 연 허용 오차 교정과 그 안의 계약 교정도 같은 checkpoint·누적 계약을 받고,
           // 교정 응답(요청·증거·원장·상태)은 누적된 뒤 **다시 판정**된다(CF-02·CF-04 잔여).
@@ -459,25 +894,8 @@ export class DeliveryPipeline {
             { continuationExhausted: true, remainingSteps: verdict.remainingSteps }, signal);
           return;
         }
-        continuations += 1;
-        // 호출을 열기 전에 누적본을 보존한다(옛 progress 산출물은 사람·옛 소비처 호환).
-        await this.core.saveAgentOutput(topic, "claude", state.base, setup.progressKind, signal);
-        await this.core.checkpoints.record(topic, {
-          work, phase: "before-continuation", accumulated: state.base, verifiedLedger: state.verifiedLedger, inputSequence: setup.inputSequence,
-          openRequests: state.openRequests, confirmations: state.confirmations,
-        }, signal);
-        this.core.event(topicId, "system", "system",
-          `러너가 진행 중(status=in_progress)으로 멈췄습니다 — 남은 단계 ${verdict.remainingSteps.length}개. 같은 세션에서 계속 진행합니다(${continuations}/${CONTINUATION_LIMIT}).`,
-          { continuation: continuations, remainingSteps: verdict.remainingSteps });
-        const continued = await this.core.executor.execute({
-          role: "claude", topic, signal, purpose: "계속 진행 턴", inputSequence: setup.inputSequence, expected, write: true, writeGuards,
-          session: { mode: "resume", sessionId },
-          prompt: buildContinuationPrompt(verdict.remainingSteps, continuations, CONTINUATION_LIMIT, setup.kind, state.openRequests),
-          implementation: true, readablePaths: setup.readablePaths, settings: this.core.executionSettings(topicId, "claude", true),
-        });
-        await this.assertBaselineIntact(topic, setup.baselineHead, "계속 진행 중");
-        this.assertToolTreesIntact(topic, setup.toolTreesBefore, "계속 진행 중");
-        const absorbed = await this.absorbTurn(setup, work, state, continued.result, sessionId, expected, writeGuards, signal);
+        const absorbed = await continueWork(verdict.remainingSteps,
+          this.timelineSend(topic, setup.timeline().resume, workSession, TIMELINE_PAGE_BYTES.work, true), false);
         if (!absorbed) return;
         state = absorbed;
         freshlyVerified = true;
@@ -510,11 +928,16 @@ export class DeliveryPipeline {
         this.core.event(topicId, "system", "system", `완료 상태 확인 턴 실행(${moment === "spawn" ? "프로세스 시작" : "응답 수신"}, checkpoint #${reservation.revision}).`,
           { confirmationExecuted: reservation.revision, moment });
       };
+      // 구현 모델 + 추론 low, 쓰기 없음·프로토콜 전용 — completion-confirmation job 이 그렇게 유도한다.
+      const confirmationRoute = this.workRoute(setup, { role: "implementer", operation: "completion-confirmation" });
+      const confirmationPrompt = buildStatusConfirmationDelivery({
+        kind: setup.kind, reason: verdict.message, accumulated: state.base, planPath: setup.planPath, openRequests: state.openRequests, decisionsSince,
+      });
       const confirmed = await this.core.executor.execute({
-        role: "claude", topic, signal, purpose: "완료 확인", inputSequence: setup.inputSequence, expected, write: false,
-        session: { mode: "resume", sessionId }, implementation: false, protocolOnly: true, readablePaths: setup.readablePaths,
-        prompt: buildStatusConfirmationPrompt({ kind: setup.kind, reason: verdict.message, accumulated: state.base, planPath: setup.planPath, openRequests: state.openRequests, decisionsSince }),
-        settings: { ...this.core.executionSettings(topicId, "claude", true), effort: "low" },
+        route: confirmationRoute, topic, signal, purpose: "완료 확인", inputSequence: setup.inputSequence, expected,
+        session: { mode: "resume", sessionId }, recoverable: true, readablePaths: setup.readablePaths,
+        prompt: confirmationPrompt.prompt,
+        settings: { ...confirmationRoute.settings, effort: "low" },
         onSpawn: () => recordExecution("spawn"),
       });
       recordExecution("return");
@@ -523,6 +946,11 @@ export class DeliveryPipeline {
         this.core.event(topicId, "system", "system", "확인 턴 응답이 계약을 어겨 상태를 확정하지 못했습니다(보존).", { confirmationInvalid: true });
         continue; // confirmations=1 → 다음 반복에서 보존한 채 멈춘다
       }
+      // 확인 턴이 실제로 온전히 실은 필수 이벤트(렌더 선택 결과 그대로)만 반환 세션에 전달로 인정한다 — 정상 확인 응답과 현재성 검사 뒤다. 앞부분 절단·
+      // 이벤트당 20,000자 제한에 걸린 필수 이벤트는 인정하지 않아 완료 게이트가 쪽으로 싣는다(host-review 55f3795 F002). 확인 턴은 쪽을 싣지 않는다.
+      const whole = new Set(confirmationPrompt.whole);
+      this.acknowledgeWholeEvents(topic, signal, setup.work.resumeState, confirmed.sessionId,
+        decisionsSince.filter((event) => whole.has(event.sequence) && TIMELINE_REQUIRED_KINDS.has(event.kind)));
       // 확인 턴은 저장된 원본 위에 허용된 필드(상태·남은 단계·해소 표식·blocked 요청)만 바꾸는 연산이다 — 쟁점·증거·요약·메모리 갱신·원장은
       // 원본 그대로(CF-06: 재구성하면 memoryUpdates 가 사라졌다). 원본의 requestedUserDecision 은 열린 요청 렌더링이라 다시 요청으로 넣지 않는다.
       const { requestedUserDecision: _rendered, status: _status, remainingSteps: _remaining, ...original } = state.base;
@@ -580,6 +1008,70 @@ export class DeliveryPipeline {
     return workId(latest.work) === workId(work) ? null : latest;
   }
 
+  // ---- 세션 바인딩(E2b) — 세션은 그 세션을 만든 바인딩(공급자·참여자)으로만 이어 쓴다. 다른 공급자 CLI 에 옛 resume id 를 보내지 않는다 ----
+
+  // 작업 안 한 턴의 경로. 작업 세션을 이어 쓰는 턴(본 턴·계속 진행·완료 확인·허용 오차 교정·결과 교정)은 모두 작업 job 의 배정을 따르고 job 만 바꾼다 —
+  // 세션은 그 배정의 공급자에 속한다(부속 job 에 따로 배정이 있어도 세션 도중 공급자를 바꾸지 않는다). 턴마다 최신 주제로 다시 정해 설정 변경을 반영하고
+  // (E2b 이전에도 턴마다 주제 설정을 다시 읽었다), 작업을 시작한 바인딩과 달라졌으면(작업 도중 배정 변경) 모델 실행 전에 멈춘다 — 재시도가 작업 시작의
+  // 바인딩 규칙(새 세션 또는 연속성 정지)으로 다시 판단한다.
+  private workRoute(setup: WorkSetup, job: TurnJob = workTurnJob(setup.kind)): TurnRoute {
+    const current = this.core.route(this.core.dependencies.database.getTopic(setup.topicId), workTurnJob(setup.kind));
+    if (!sameBinding(current, setup.route)) {
+      const message = `작업 도중 ${setup.kind === "FIX" ? "수정" : "구현"} 배정이 ${describeBinding(setup.route)} 에서 ${describeBinding(current)} 로 바뀌어 `
+        + "이 작업의 세션을 이어 쓰지 않고 멈춥니다 — 재시도하면 바뀐 배정으로 다시 판단합니다.";
+      this.core.event(setup.topicId, "system", "system", message,
+        { admissionRefused: "session-binding", previous: bindingOf(setup.route), next: bindingOf(current) });
+      throw new AdmissionRefused("session-binding", message);
+    }
+    return { ...current, job };
+  }
+
+  // 저장된 구현 세션을 이 작업 경로로 이어 쓸 수 있는가(바인딩이 없는 옛 세션은 Claude 기본 배정으로 읽는다).
+  private implementationBindingMatches(topicId: string, route: TurnRoute): boolean {
+    return sameBinding(this.core.dependencies.database.implementationSessionBinding(topicId) ?? legacyBinding("claude"), route);
+  }
+
+  // 저장된 구현 세션을 이 작업 경로로 이어 쓸 수 있으면 그 id, 없거나 바인딩이 다르면 null(새 세션). 바인딩이 다르면 계획 연속성 정책(계획→구현이 한 세션)
+  // 에서는 새 세션으로 끊지 않고 모델 실행 전에 멈추고, 아니면 이전 세션(id·바인딩)을 이벤트로 남긴 채 새 세션으로 간다 — 세션 기록·승인·사용량은 지우지 않고
+  // 새 세션이 만들어질 때 새 바인딩으로 덮는다.
+  private implementationSessionFor(topicId: string, route: TurnRoute): string | null {
+    const database = this.core.dependencies.database;
+    const sessionId = database.getFlags(topicId).implementationSessionId;
+    if (!sessionId || this.implementationBindingMatches(topicId, route)) return sessionId;
+    const stored = database.implementationSessionBinding(topicId) ?? legacyBinding("claude");
+    if (database.planning.continuityEnabled(topicId)) this.refuseSessionBinding(topicId, "구현", sessionId, stored, route);
+    this.core.event(topicId, "system", "system",
+      `구현 세션 ${sessionId}(${describeBinding(stored)})은 이 작업의 경로 ${describeBinding(route)} 와 공급자·참여자가 달라 이어 쓰지 않습니다 — `
+      + "새 세션에서 전문 프롬프트로 시작합니다(이전 세션 기록은 이 이벤트에 남깁니다).",
+      { sessionRebound: { seat: "implementation", previous: { sessionId, binding: stored }, next: bindingOf(route) } });
+    return null;
+  }
+
+  // 계획 연속성 정책의 세션을 다른 바인딩의 경로로 넘기지 않는다 — 새 세션으로 바꾸지도 않고 멈춘다(core.reboundSeatSession 의 작성자 좌석 규칙과 같다).
+  private refuseSessionBinding(topicId: string, label: string, sessionId: string, stored: SessionBinding, route: TurnRoute): never {
+    const message = `${label} 세션 ${sessionId}(${describeBinding(stored)})은 이 턴의 경로 ${describeBinding(route)} 와 공급자·참여자가 달라 이어 쓸 수 없습니다. `
+      + "계획 연속성 정책은 계획 세션을 구현까지 이어 써야 해서 새 세션을 열지 않고 멈춥니다 — 배정을 되돌리거나 연속성 정책을 끈 뒤 재개하세요.";
+    this.core.event(topicId, "system", "system", message,
+      { admissionRefused: "session-binding", seat: route.seat, previous: { sessionId, binding: stored }, next: bindingOf(route) });
+    throw new AdmissionRefused("session-binding", message);
+  }
+
+  // 코드 리뷰 세션을 이 리뷰 경로로 이어 쓸 수 있으면 그 id. 바인딩이 다르면 이전 세션을 이벤트로 남기고 null(새 세션) — 검토자 세션에는 연속성 정책이 없다.
+  private reviewSessionFor(topicId: string, route: TurnRoute): string | null {
+    const database = this.core.dependencies.database;
+    const sessionId = database.getCodexReviewSession(topicId);
+    if (!sessionId) return null;
+    const stored = database.codexReviewSessionBinding(topicId) ?? legacyBinding("codex");
+    // 잃은 세션(대기 중 자동 복구, E3-3b) — 다시 부르지 않고 새 리뷰 세션을 연다. 새 세션이 저장되면 복구 기록이 그 세션으로 이어진다.
+    if (sameBinding(stored, route) && this.pendingRecovery("code-review", topicId, sessionId)) return null;
+    if (sameBinding(stored, route)) return sessionId;
+    this.core.event(topicId, "system", "system",
+      `코드 리뷰 세션 ${sessionId}(${describeBinding(stored)})은 이 리뷰의 경로 ${describeBinding(route)} 와 공급자·참여자가 달라 이어 쓰지 않고 새 세션을 엽니다`
+      + "(이전 세션 기록은 이 이벤트에 남깁니다).",
+      { sessionRebound: { seat: "code-review", previous: { sessionId, binding: stored }, next: bindingOf(route) } });
+    return null;
+  }
+
   // 턴 응답 하나를 누적본에 흡수한다: turn-result checkpoint(raw) → 계약(교정 전 checkpoint) → 허용 오차(교정 전 checkpoint) → verified checkpoint.
   // 반환 null = 허용 오차 위반이 남아 정지했다(인터럽트·보존 완료).
   private async absorbTurn(
@@ -608,9 +1100,10 @@ export class DeliveryPipeline {
     };
     normalize.carried = () => setup.carry.carried?.() ?? [];
     normalize.label = setup.carry.label;
-    const contracted = await this.core.enforceResultContract("claude", topic, raw, sessionId, {
+    // 흡수하는 결과(본 턴·계속 진행·저장 결과 재대조)는 모두 이 작업의 구현자 결과다 — 교정 재제출의 job 은 역할에서 정해진다.
+    const contracted = await this.core.enforceResultContract(this.workRoute(setup), topic, raw, sessionId, {
       evidenceDigest: workEvidenceDigest(work),
-      signal, implementation: true, planMode: false, startedAfter: setup.inputSequence, check: setup.check, readablePaths: setup.readablePaths,
+      signal, planMode: false, startedAfter: setup.inputSequence, check: setup.check, readablePaths: setup.readablePaths,
       normalize, writeGuards,
       beforeCorrection: async (rejected) => {
         const acc = salvaged(rejected);
@@ -628,6 +1121,7 @@ export class DeliveryPipeline {
       // 교정 프롬프트의 열린 요청은 **최신** 누적본 기준이다 — 턴 시작 시점 목록이면 이번 턴이 새로 연 질문의 서버 id 가 빠져, 교정이 원인을 되돌려도
       // 그 요청을 resolvedRequestIds 로 닫을 수 없어 사용자 입력 대기로 멈춘다(host-review R03; checkpoint 기록과 같은 latestRequests()).
       readablePaths: setup.readablePaths, normalize, previousLedger: state.verifiedLedger, expected, writeGuards, openRequests: latestRequests(),
+      routeFor: (job) => this.workRoute(setup, job),
       beforeCorrection: async (original) => {
         await this.core.checkpoints.record(topic, {
           work, phase: "before-tolerance-correction", raw: original, accumulated: original, verifiedLedger: state.verifiedLedger,
@@ -696,7 +1190,7 @@ export class DeliveryPipeline {
   ): Promise<void> {
     const { topic, topicId } = setup;
     await this.core.recordDeferredFindings(topic, state.base.findings.filter((finding) => finding.disposition === "DEFERRED_OUT_OF_SCOPE"), setup.deferredSource, signal);
-    await this.core.saveAgentOutput(topic, "claude", state.base, setup.resultKind, signal);
+    await this.core.saveAgentOutput(topic, setup.route, state.base, setup.resultKind, signal);
     await this.core.checkpoints.record(topic, {
       work, phase: "paused", accumulated: state.base, verifiedLedger: state.verifiedLedger, inputSequence: setup.inputSequence,
       openRequests: state.openRequests, confirmations: state.confirmations,
@@ -717,7 +1211,7 @@ export class DeliveryPipeline {
       openRequests: state.openRequests, confirmations: state.confirmations, worktree,
     }, signal);
     this.assertWorkEvidence(setup);
-    await this.core.saveAgentOutput(topic, "claude", base, setup.resultKind, signal, { acceptId: accepting.revision });
+    await this.core.saveAgentOutput(topic, setup.route, base, setup.resultKind, signal, { acceptId: accepting.revision });
     this.assertWorkEvidence(setup);
     await this.core.checkpoints.record(topic, {
       work, phase: "accepted", accumulated: base, verifiedLedger: state.verifiedLedger, inputSequence: setup.inputSequence,
@@ -774,7 +1268,7 @@ export class DeliveryPipeline {
       { acceptResumed: acceptId, phase: checkpoint.phase, outputRecorded });
     if (checkpoint.phase === "accepting") {
       // 산출물·메모리·이벤트는 한 묶음(saveAgentOutput) — 이벤트가 없으면 다시 돈다. 메모리 갱신은 expectedSHA256 으로 두 번 적용되지 않는다.
-      if (!outputRecorded) await this.core.saveAgentOutput(topic, "claude", base, setup.resultKind, signal, { acceptId });
+      if (!outputRecorded) await this.core.saveAgentOutput(topic, setup.route, base, setup.resultKind, signal, { acceptId });
       // 검증된 워킹트리 스냅샷은 복구 저장에도 그대로 남긴다 — 빠지면 다음 재개가 "트리 변경" 으로 보고 같은 결과를 새 acceptId 로 다시 수락한다(CF-01 회귀).
       await this.core.checkpoints.record(topic, {
         work: checkpoint.work, phase: "accepted", accumulated: base, verifiedLedger: checkpoint.verifiedLedger, inputSequence: checkpoint.inputSequence,
@@ -821,7 +1315,7 @@ export class DeliveryPipeline {
     // reviewKind 로 불러 결정별 판정을 받는다(열린 질문·미판정 결정이 없으면 호출하지 않는다). 리뷰 도중(결과 저장 뒤 입력 검사에서) 도착한 결정처럼 재확인 표식 없이 재개되는
     // 경우도 같은 길이다. 판정이 없거나 true 면 재사용 경로가 모두 false 를 돌려주고 정상 리뷰가 읽는다.
     if (state === "CODEX_REVIEW") {
-      await this.confirmReviewAnswers(topicId, signal, { reviewKind: "codex-review" });
+      if (await this.confirmAnswersOrRecover(topicId, signal, false, { reviewKind: "codex-review" })) return this.runReview(topicId, signal, false);
       if (await this.finalizePassedReview(topicId, false)) return;
       if (await this.openFixFromStoredReview(topicId, false, signal)) return;
       return this.runReview(topicId, signal, false);
@@ -853,7 +1347,7 @@ export class DeliveryPipeline {
       return this.runContractFix(topicId, signal, contract);
     }
     if (state === "CODEX_FINAL_REVIEW") {
-      await this.confirmReviewAnswers(topicId, signal, { reviewKind: "codex-final-review" });
+      if (await this.confirmAnswersOrRecover(topicId, signal, true, { reviewKind: "codex-final-review" })) return this.runReview(topicId, signal, true);
       if (await this.finalizePassedReview(topicId, true)) return;
       // 가드로 멈춘 최종 리뷰가 그 뒤의 사용자 결정으로 통과 조건을 만족하면 Codex 턴을 다시 사지 않는다.
       if (await this.finalizeStoredFinalReview(topicId)) return;
@@ -864,11 +1358,68 @@ export class DeliveryPipeline {
     throw new Error(`지원하지 않는 재개 단계입니다: ${state}`);
   }
 
+  // 코드 리뷰 세션의 자동 복구(E3-3b) — 저장 리뷰 세션에 보낸 호출(리뷰 턴·답변 확인)이 관측된 세션 유실·문맥 초과로 끝나고 code-review 계보가 허가하면,
+  // 그 세션을 대기 중 복구로 두고 리뷰를 처음부터 다시 연다. reviewSessionFor 가 새 세션(전문 판·fresh 쪽·옛 인정 비상속)을 고른다.
   private async runReview(topicId: string, signal: AbortSignal, finalPass: boolean): Promise<void> {
+    try {
+      await this.runReviewOnce(topicId, signal, finalPass);
+    } catch (error) {
+      await this.recoverReviewFailure(topicId, error, signal, finalPass);
+      await this.runReview(topicId, signal, finalPass);
+    }
+  }
+
+  // 저장 리뷰 세션에 보낸 호출의 실패 판정 — 관측된 세션 유실·문맥 초과이고 code-review 계보가 허가하면 그 세션을 대기 중 복구로 두고 정상 반환한다(호출자가
+  // 새 리뷰 세션으로 리뷰를 다시 연다). 그 밖에는 기록할 것을 기록하고 원래 오류를 다시 던진다. runReview 와 재개 경로의 직접 답변 확인이 이 한 판정을
+  // 지난다(host-review 9c4d786 F002).
+  private async recoverReviewFailure(topicId: string, error: unknown, signal: AbortSignal, finalPass: boolean): Promise<void> {
+    const database = this.core.dependencies.database;
+    const session = database.getCodexReviewSession(topicId);
+    if (typeof error !== "object" || error === null || handledRecoveries.has(error) || !session) throw error;
+    const route = this.core.route(database.getTopic(topicId), { role: "reviewer", operation: finalPass ? "final-review" : "review" });
+    if (error instanceof SessionIdentityMismatch && error.requested === session) {
+      handledRecoveries.add(error);
+      this.recordSeatIdentityMismatch("code-review", topicId, route, error);
+      throw error;
+    }
+    const observed = invocationFailure(error);
+    if (!(error instanceof AgentRunError) || error.code === "unknown" || !observed || observed.sessionId !== session || signal.aborted) throw error;
+    handledRecoveries.add(error);
+    // 이미 떠난 세션(대기 중 복구)에서 또 실패가 왔다 — 새 세션을 고르는 경로가 어긋난 것이므로 되풀이하지 않고 멈춘다.
+    if (this.pendingRecovery("code-review", topicId, session)) throw error;
+    const refusal = await this.authorizeRecovery({ seat: "code-review", topicId, route, error, observed, fromSession: session });
+    if (refusal) {
+      this.core.event(topicId, "system", "system", refusal, { reviewSessionRecoveryRefused: { session, code: error.code, usage: observed.usage } });
+      throw error;
+    }
+    this.core.event(topicId, "system", "system",
+      `코드 리뷰 세션 ${session} 이(가) ${error.code} 로 끝나 같은 경로의 새 리뷰 세션으로 이 리뷰를 한 번 다시 엽니다(전문 판, 타임라인 쪽은 처음부터).`,
+      { reviewSessionRecovery: { from: session, code: error.code, usage: observed.usage } });
+  }
+
+  // 재개 경로가 리뷰 세션에 직접 보내는 답변 확인(CODEX_REVIEW·CODEX_FINAL_REVIEW·인도 대기 재확인) — runReview 밖이라 여기서 같은 복구 판정을 지나게 한다
+  // (host-review 9c4d786 F002: 저장 리뷰 세션 유실이 계보 기록 없이 FAILED 로 끝났다). 복구가 허가됐거나 이미 대기 중이면 true — 호출자는 저장 리뷰 재사용·
+  // 저장 리뷰로 수정 열기로 가지 않고 새 리뷰 세션(runReview)으로 간다. 잃은 세션이 판정한 저장 리뷰는 답변 판정 없이 재사용하거나 수정으로 보낼 수 없다
+  // (openFixFromStoredReview 는 canReuseReview 를 거치지 않는다).
+  private async confirmAnswersOrRecover(topicId: string, signal: AbortSignal, finalPass: boolean,
+    options: { reviewKind: "codex-review" | "codex-final-review" }): Promise<boolean> {
+    if (this.pendingRecovery("code-review", topicId, this.core.dependencies.database.getCodexReviewSession(topicId))) return true;
+    try {
+      await this.confirmReviewAnswers(topicId, signal, options);
+      return false;
+    } catch (error) {
+      await this.recoverReviewFailure(topicId, error, signal, finalPass);
+      return true;
+    }
+  }
+
+  private async runReviewOnce(topicId: string, signal: AbortSignal, finalPass: boolean): Promise<void> {
     await this.confirmReviewAnswers(topicId, signal);
     let topic = this.core.dependencies.database.getTopic(topicId);
     const expected = finalPass ? "CODEX_FINAL_REVIEW" : "CODEX_REVIEW";
     this.core.requireState(topicId, expected);
+    // 경로(E2b)는 리뷰 준비(작업 트리 객체·세션 대조)보다 먼저 정한다 — 지원하지 않는 배정이면 부수효과 없이 멈춘다.
+    const reviewRoute = this.core.route(topic, { role: "reviewer", operation: finalPass ? "final-review" : "review" });
     const { content: plan, path: planPath } = await this.core.requireCurrentPlanArtifact(topicId);
     const { base, implementation, originalReview } = await this.reviewBaseline(topicId, finalPass);
     const reviewedSnapshot = await this.core.dependencies.git.snapshot(topic.worktreePath);
@@ -876,25 +1427,31 @@ export class DeliveryPipeline {
     const previousFlags = this.core.dependencies.database.getFlags(topicId);
     const reviewedTree = await this.core.dependencies.git.writeWorkingTree(topic.worktreePath, `${topicId.slice(0, 8)}-${finalPass ? "final" : "first"}`)
       .catch(() => null);
-    const reviewSessionId = this.core.dependencies.database.getCodexReviewSession(topicId);
-    const resumedSession = reviewSessionId !== null;
+    const storedReviewSession = this.core.dependencies.database.getCodexReviewSession(topicId);
+    let reviewSessionId = this.reviewSessionFor(topicId, reviewRoute);
+    // 코드 리뷰 원장(E3-4c) — 논리 리뷰 한 번(검토 tree·계약·리뷰 종류)을 호스트 소유 ID 하나로 묶는다. 판정 전 읽기 호출과 최종 판정 호출이 그 ID 로 리뷰
+    // 1회를 예약하고(ReviewLedger 예약은 ID 마다 멱등, 경로 → 실행기 → SessionTurn → 예산 래퍼), 판정이 돌아오면 닫혀 다음 리뷰는 새 ID·새 예약이다. 판정 전이면
+    // 재시작·DB 다시 열기·재시도·세션 복구 뒤에도 같은 원장·같은 예약으로 잇는다(실제 호출의 토큰·시간·실패는 호출마다 실행 예산에 쌓인다).
+    const planning = this.core.dependencies.database.planning;
+    const repairContextKey = reviewedTree ?? JSON.stringify(reviewedSnapshot);
+    const ledgerRecord = planning.openReviewLedger({ topicId, kind: finalPass ? "codex-final-review" : "codex-review", scopeGeneration: topic.scopeGeneration,
+      planEpoch: topic.planEpoch, planSHA256: topic.planSHA256, reviewedTree: repairContextKey,
+      reportRevision: base ? base.reportRevision : this.core.dependencies.database.latestArtifact(topicId, "implementation-result")?.revision ?? 0 });
+    const ledgerRoute: TurnRoute = { ...reviewRoute, reviewLedger: ledgerRecord.id };
+    // 리뷰 세션을 새로 만든 호출(읽기 호출의 create·판정 호출의 create·CLI 가 바꾼 id)의 기록 — 저장·복구 계보 연결·이벤트.
+    const persistReviewSession = (sessionId: string) => {
+      this.core.dependencies.database.setCodexReviewSession(topicId, sessionId, bindingOf(reviewRoute));
+      this.noteRecoveredSession("code-review", topicId, storedReviewSession, sessionId);
+      this.core.event(topicId, "system", "system", "계획 이력을 넘기지 않는 Codex 코드 리뷰 세션을 만들었습니다.", {
+        role: "codex", sessionId, planSHA256: topic.planSHA256,
+      });
+    };
     const previousReviewArtifact = ["codex-review", "codex-final-review"]
       .map((kind) => this.core.dependencies.database.latestArtifact(topicId, kind, topic.scopeGeneration))
       .filter((artifact) => artifact !== null).sort((a, b) => b.revision - a.revision)[0];
     const previousReview = previousReviewArtifact ? await this.core.latestResult(topicId, previousReviewArtifact.kind) : null;
     const previousReviewCompleted = previousReview !== null && this.reviewWorkCompleted(previousReview);
     const remainingReviewSteps = previousReview && !previousReviewCompleted ? previousReview.remainingSteps ?? [] : undefined;
-    // 미완료 판정은 변경되지 않은 코드의 검토를 보장하지 않는다. 완료한 리뷰가 있을 때만 변경분으로 좁힌다.
-    const deltaSinceLastReview = finalPass && resumedSession && previousReviewCompleted && previousFlags.reviewedTreeOID && reviewedTree
-      ? previousFlags.reviewedTreeOID === reviewedTree
-        ? { files: [], patch: "" }
-        : await this.core.dependencies.git.diffTrees(topic.worktreePath, previousFlags.reviewedTreeOID, reviewedTree).catch(() => null)
-      : null;
-    // 재개 세션에는 직전 리뷰 턴 이후의 결정·증거만 싣는다(2026-09-08 Codex 제안 ⑥). 값은 턴이 돌아온 뒤에 적는다.
-    const reviewInputSequence = this.core.latestSequence(topicId);
-    const reviewSince = resumedSession ? (this.core.dependencies.database.getCodexReviewPromptSequence(topicId) ?? 0) : 0;
-    const closeout = !resumedSession && this.core.dependencies.database.latestArtifact(topicId, "closeout")
-      ? await this.core.latestResult(topicId, "closeout") : null;
     // 리뷰 프롬프트용 허용 오차 요약. 강제 대조는 구현·수정 단계(enforceTolerance)가 이미 했으므로 여기서의 git 실패는
     // 리뷰를 죽이지 않고 그 사실을 프롬프트에 적는다(Codex 가 diff 로 직접 본다).
     const tolerancePolicy = parseTolerancePolicy(plan);
@@ -920,24 +1477,62 @@ export class DeliveryPipeline {
     const reviewLabel = finalPass ? "Codex final review" : "Codex review";
     const reviewNormalizer = this.core.carryForwardNormalizer(
       mergeFindingSources(base?.sources, implementation.findings, originalReview?.findings), reviewLabel, { forReview: true });
-    let review = await this.core.turn("codex", topic, buildCodexReviewPrompt({
+    // 타임라인 쪽(E3-2-2b J3·E3-4c) — 리뷰 세션이 아직 받지 않은 필수 구간(이 판의 필수 참조 + 세션 참조 목록의 미완독)을 호출당 쪽 예산으로 싣는다. 한 호출에
+    // 다 들지 않으면 판정 전에 리뷰 읽기 호출(같은 원장·도구 없음·ACK)로 앞부분을 나눠 싣고, 남은 구간이 한 호출에 들면 마지막 판정 호출이 그 쪽과 함께 판정한다.
+    // 재개 판(계획 SHA·직전 커서 뒤)은 저장된 리뷰 세션이 리뷰 전문 판을 이미 받았을 때만이다. 판정 기준은 원장이 아니라 세션별 수신 기록이다(host-review
+    // 39d21df9 F003 — 원장 생성 목록으로 가리면 트리가 바뀌어 새 원장이 열릴 때 읽기 호출만 받은 세션이 재개 판으로 가 계획 전문·계획 검토 근거를 받지 못했다).
+    //   - 기록 있음(프로토콜 턴 — 리뷰 읽기 등 — 이 만든 세션): 전문 판 판정 호출이 응답을 받아 적은 reviewContext 로 판정한다. 어느 원장이 만들었든 같다.
+    //   - 기록 없음(일반 턴이 만든 세션·배포 전 세션): 종전 의미 — 이 원장의 읽기 호출이 만든 세션만 전문 판(수신 기록 도입 전 진행 중 원장 대비), 나머지는 재개 판.
+    // 입력 순번은 판을 고르기 직전에 적는다 — 판에는 그 순번까지의 결정·증거가 실리고, 그 뒤 입력은 실행기가 호출 전에 막는다.
+    const reviewSendFor = (sessionId: string | null) => {
+      const receipt = sessionId === null ? null : planning.sessionReceipt(sessionId);
+      const resumed = sessionId !== null && (receipt ? receipt.reviewContext : !planning.reviewLedger(ledgerRecord.id)!.createdSessions.includes(sessionId));
+      const since = resumed ? (this.core.dependencies.database.getCodexReviewPromptSequence(topicId) ?? 0) : 0;
+      const inputSequence = this.core.latestSequence(topicId);
+      return { resumed, inputSequence, send: this.timelineSend(topic, this.reviewTimeline(topicId, topic.scopeGeneration, since), sessionId, TIMELINE_PAGE_BYTES.review) };
+    };
+    let prepared = reviewSendFor(reviewSessionId);
+    while (prepared.send.push.remainingBytes > 0) {
+      const next = await this.readReviewPages({ topic, signal, expected, route: ledgerRoute, ledger: ledgerRecord, sessionId: reviewSessionId, finalPass,
+        send: prepared.send, inputSequence: prepared.inputSequence, persist: persistReviewSession });
+      if (next === null) return;
+      reviewSessionId = next;
+      prepared = reviewSendFor(reviewSessionId);
+    }
+    const { resumed: resumedSession, send: reviewSend, inputSequence: reviewInputSequence } = prepared;
+    // 미완료 판정은 변경되지 않은 코드의 검토를 보장하지 않는다. 완료한 리뷰가 있을 때만 변경분으로 좁힌다.
+    const deltaSinceLastReview = finalPass && resumedSession && previousReviewCompleted && previousFlags.reviewedTreeOID && reviewedTree
+      ? previousFlags.reviewedTreeOID === reviewedTree
+        ? { files: [], patch: "" }
+        : await this.core.dependencies.git.diffTrees(topic.worktreePath, previousFlags.reviewedTreeOID, reviewedTree).catch(() => null)
+      : null;
+    const closeout = !resumedSession && this.core.dependencies.database.latestArtifact(topicId, "closeout")
+      ? await this.core.latestResult(topicId, "closeout") : null;
+    const reviewReferencesPath = await this.writeTimelineReferences(topic, [reviewSend], signal);
+    // 저장된 교정 대기본을 core.turn 이 이어 쓰는가 — 그러면 이번 프롬프트(와 쪽)는 보내지 않는다. core.turn(core.ts:353 `reuse`)의 조건 전체를 같은 입력으로
+    // 대조한다: 같은 대기본 조회(pendingRepair, 주제 상태), 좌석, 바인딩(sameBinding), 교정 문맥 키(위 한 변수를 core.turn 옵션에도 넘긴다), 요청 세션 id.
+    // core.turn 의 재사용 조건을 바꾸면 여기도 함께 바꾼다(host-review 55f3795 F003 — 좌석만 보던 추정이 트리가 바뀌어 실제로 전달된 쪽을 인정하지 않았다).
+    const pendingRepair = reviewSend.push.required.length ? await this.core.pendingRepair(topicId, topic.state) : null;
+    const reusesPendingRepair = Boolean(pendingRepair && pendingRepair.role === reviewRoute.seat && sameBinding(pendingRepair.binding, reviewRoute)
+      && pendingRepair.contextKey === repairContextKey && reviewSessionId === pendingRepair.sessionId);
+    // 이번 프롬프트를 받은 세션 — 새 세션·CLI 가 바꾼 id 는 persist 로 알린다(그 밖에는 요청한 리뷰 세션).
+    let reviewedSession = reviewSessionId;
+    let review = await this.core.turn(ledgerRoute, topic, buildCodexReviewPrompt({
       planMarkdown: plan, planSHA256: topic.planSHA256!, implementation, finalPass, resumedSession, tolerance, planPath,
-      timeline: this.reviewTimeline(topicId, topic.scopeGeneration, reviewSince),
+      timeline: reviewSend.events, timelinePush: { ...reviewSend.push, referencesPath: reviewReferencesPath },
       planningFindings: closeout?.planSHA256 === topic.planSHA256 ? closeout.findings : undefined,
       planningEvidenceRefs: closeout?.planSHA256 === topic.planSHA256 ? closeout.evidenceRefs : undefined,
       originalReviewFindings: originalReview?.findings,
       deltaSinceLastReview, remainingReviewSteps, verificationReceipts: receipts?.text, diagnoses: reviewDiagnoses.prompts, fixSourceFindings: base?.sources,
-    }), signal, false, {
-      readablePaths: [planPath, ...(receipts?.readablePaths ?? []), ...reviewDiagnoses.paths],
-      repairContextKey: reviewedTree ?? JSON.stringify(reviewedSnapshot),
+    }), signal, {
+      readablePaths: withReferences([planPath, ...(receipts?.readablePaths ?? []), ...reviewDiagnoses.paths], reviewReferencesPath),
+      repairContextKey,
       normalize: reviewNormalizer,
       session: {
         id: reviewSessionId,
         persist: (sessionId) => {
-          this.core.dependencies.database.setCodexReviewSession(topicId, sessionId);
-          this.core.event(topicId, "system", "system", "계획 이력을 넘기지 않는 Codex 코드 리뷰 세션을 만들었습니다.", {
-            role: "codex", sessionId, planSHA256: topic.planSHA256,
-          });
+          reviewedSession = sessionId;
+          persistReviewSession(sessionId);
         },
       },
       check: (r) => {
@@ -947,7 +1542,28 @@ export class DeliveryPipeline {
         if (base?.sources.length) assertFindingCoverage(base.sources, r.findings, "Codex final review(수정 작업 원본)");
       },
     });
-    this.core.dependencies.database.setCodexReviewPromptSequence(topicId, reviewInputSequence);
+    // 판정이 돌아왔다 — 이 원장은 여기서 닫힌다(E3-4c). 완료든 미완료(미인정 구간·트리 변경·in_progress·blocked·남은 검토)든 같은 ID 로 판정을 다시 사지 않고,
+    // 다음 리뷰는 새 원장·새 예약이다. 반환 직후·저장 전에 닫아 저장 도중 끊겨도 재시도가 같은 예약으로 판정을 한 번 더 사지 않는다.
+    planning.judgeReviewLedger(ledgerRecord.id);
+    // 전문 판을 받은 세션이 판정을 돌려줬다 — 그 세션의 다음 리뷰는 재개 판이다(F003). 응답을 받기 전(실패·취소)이면 적지 않아 다음 판정이 전문 판을 다시 싣는다.
+    // 교정 대기본을 이어 써 이번 프롬프트를 보내지 않았어도, 대기본을 만든 같은 세션의 앞 호출이 전문 판을 보냈다 — 수신 기록은 없음 → 받음 한 방향으로만
+    // 바뀌므로 지금 전문 판이면 그때도 전문 판이었다.
+    if (!resumedSession && reviewedSession) planning.noteReviewContext(reviewedSession);
+    // 반환 뒤에만 이번 쪽을 실제로 받은 세션에 인정한다. 그래도 필수 구간이 남으면(교정 대기본 재사용이라 이번 쪽을 보내지 않았거나 CLI 가 세션 id 를
+    // 바꿔 앞 세션의 인정이 없는 경우) 이 리뷰를 최종으로 저장하지 않고 커서도 전진하지 않은 채 멈춘다 — 재시도가 새 호출로 남은 쪽을 싣는다.
+    if (reviewSend.push.required.length) {
+      const session = reviewedSession;
+      if (!session) throw new Error("코드 리뷰 세션을 확인하지 못했습니다.");
+      this.rememberTimeline(topic, session, reviewSend);
+      if (!reusesPendingRepair) this.acknowledgeTimeline(topic, signal, expected, session, reviewSend);
+      const unread = reviewSend.push.required.filter((reference) => !planning.referenceComplete(session, topic, reference));
+      if (unread.length) {
+        this.core.interrupt(topicId, "USER_DECISION_REQUIRED",
+          `코드 리뷰가 돌아왔지만 리뷰 세션 ${session} 에 인정된 필수 타임라인 구간이 끝까지 닿지 않았습니다(${unread.map((reference) => reference.selector).join(", ")}) — ${reusesPendingRepair ? "저장된 교정 대기본을 이어 써 이번 쪽을 보내지 않았습니다" : "세션이 바뀌어 앞 세션의 인정을 이어받지 않았습니다"}. 이 리뷰를 최종으로 저장하지 않습니다. 재시도하면 새 호출로 남은 쪽을 싣습니다.`,
+          expected, { timelineReviewUnread: unread.map((reference) => reference.selector), reviewSession: session });
+        return;
+      }
+    }
     // 중재자 소유 경로(gitignore 된 도구 트리)의 확정 결함은 러너 수정 회차를 열지 않는다 — EXTERNAL_EVIDENCE 로 바꿔 아래
     // BLOCKED_ON_EVIDENCE 분기로 보낸다. 중재자가 고치고 evidence + retry 하면 같은 리뷰 단계가 다시 돌아 재검증한다
     // (2026-09-14 사용자 지시 "러너는 앱 코드만"; S10H 도구 결함 수정 4회 루프의 처방).
@@ -963,6 +1579,14 @@ export class DeliveryPipeline {
       this.core.interrupt(topicId, "USER_DECISION_REQUIRED", "코드 검토 중 worktree가 바뀌었습니다. 변경 원인을 확인한 뒤 다시 검토하세요.", expected);
       return;
     }
+    // 완료 판정(E3-4c) — 완료 리뷰(status·남은 검토) + 원장 전 구간 인정(위 미인정 검사) + 같은 검토 tree(위 스냅숏 대조)일 때만 리뷰 커서를 전진하고 원장을
+    // 완료로 닫는다. 미완료 리뷰도 원문·질문은 기존 agent_output 계약(아래 저장)으로 보존하지만, 커서·재사용(canReuseReview)·저장 리뷰로 수정 열기
+    // (openFixFromStoredReview)의 근거가 되지 않는다. 커서를 그대로 두므로 같은 세션의 다음 리뷰는 마지막 완료 리뷰 이후의 결정·증거를 다시 받는다 — 미완료
+    // 판정은 그 입력의 판정을 끝내지 않았다(이미 인정된 필수 쪽은 다시 싣지 않는다).
+    if (this.reviewWorkCompleted(review)) {
+      this.core.dependencies.database.setCodexReviewPromptSequence(topicId, reviewInputSequence);
+      planning.completeReviewLedger(ledgerRecord.id);
+    }
     // 리뷰가 본 스냅샷은 가드 결과와 무관하게 기록한다 — 가드로 멈춘 뒤 사용자 결정으로 재개할 때(finalizeStoredFinalReview)
     // 저장된 리뷰가 지금 worktree 를 본 것인지 대조하는 근거다. 커밋은 여전히 READY_TO_DELIVER 상태를 요구한다.
     this.core.dependencies.database.updateTopic(topicId, {
@@ -971,7 +1595,7 @@ export class DeliveryPipeline {
     // 리뷰가 to-do 를 다른 처분(해결·불필요·반박·수정 합의)으로 닫았으면 후속 목록에서 뺀다(2026-09-08 Codex 지적 9).
     await this.core.pruneDeferredFindings(topic, resolvedIDs(review), signal);
     await this.core.writeArtifact(topic, "codexReview", finalPass ? 2 : 1, renderReport(review), signal);
-    await this.core.saveAgentOutput(topic, "codex", review, finalPass ? "codex-final-review" : "codex-review", signal, { reviewInputSequence });
+    await this.core.saveAgentOutput(topic, reviewRoute, review, finalPass ? "codex-final-review" : "codex-review", signal, { reviewInputSequence });
     // 통과 판정에 쓸 진단 확인 처분은 입력 검사 전에 읽는다 — 검사와 인도 대기 전이 사이에 await 가 끼면 그 사이 도착한 결정·증거를 건너뛰고 READY 로 갔다
     // (CF-01, 2026-09-15 감사 5차 #6). 이 뒤로는 전이까지 await 가 없거나, 있으면 전이 전에 입력을 다시 본다.
     const verdicts = await this.core.fixContracts.reviewVerdicts(topicId, review.findings);
@@ -1071,6 +1695,67 @@ export class DeliveryPipeline {
     await this.openReviewFix(topicId, signal, "codex-review", review, "Claude가 합의된 결함을 한 번 수정합니다.");
   }
 
+  // 리뷰 읽기 호출 하나(E3-4c, job reviewer/review-read) — 판정 전에 이 세션에 남은 필수 구간의 앞부분 쪽(≤ 한 리뷰 호출 예산)을 싣는다. 리뷰 경로의 모델·추론
+  // 설정을 그대로 쓰고(확인 턴처럼 낮추지 않는다) 도구는 닫힌다(프로토콜 턴). 원장 ID 로 예약하므로 리뷰 횟수를 새로 쓰지 않는다.
+  //   - 인정: 정상 반환 + 동기 현재성 재대조 뒤 이 호출이 실제로 보낸 쪽만 반환 세션에 적는다(2b·4b 와 같은 규칙 — 응답 내용은 전달 근거가 아니다).
+  //   - 진척 게이트(4b 와 같다): 호출 직전 필수 참조 집합과 요청 세션(새 세션이면 만든 세션)의 미인정 바이트를 고정하고, 호출 뒤 같은 집합·같은 세션으로 다시
+  //     잰다. 줄지 않으면(CLI 가 다른 세션 id 로 답해 그쪽에만 인정됐거나 쪽이 인정되지 않음) 인정 구간·세션 참조 목록·원장(예약 유지)을 보존하고 멈춘다.
+  //   - 응답이 ACK 가 아니면(판정·질문을 적음) 판정으로 쓰지 않고 멈춘다 — 판정은 마지막 판정 호출에서만 한다. ACK 는 agent_output 으로 저장하지 않는다
+  //     (리뷰 요청·재확인 해제가 codex agent_output 을 리뷰 산출물로 센다).
+  // 반환: 다음 호출이 이어 쓸 리뷰 세션 id. 멈췄으면 null(인터럽트 완료).
+  private async readReviewPages(input: {
+    topic: Topic; signal: AbortSignal; expected: WorkflowState; route: TurnRoute; ledger: ReviewLedgerRecord; sessionId: string | null; finalPass: boolean;
+    send: TimelineSend; inputSequence: number; persist: (sessionId: string) => void;
+  }): Promise<string | null> {
+    const { topic, signal, expected, ledger, sessionId, send } = input;
+    const planning = this.core.dependencies.database.planning;
+    const round = (planning.reviewLedger(ledger.id)?.reads ?? 0) + 1;
+    const pinned = send.push.required;
+    const before = this.unacknowledgedBytes(topic, sessionId, pinned);
+    this.core.event(topic.id, "system", "system",
+      `코드 리뷰에 필요한 필수 타임라인 구간 ${before} bytes(필수 참조 ${pinned.length}개)가 한 리뷰 호출의 쪽 예산(${TIMELINE_PAGE_BYTES.review} bytes)을 넘어 판정 전에 리뷰 읽기 호출로 앞부분을 싣습니다(리뷰 읽기 ${round}회차, 원장 ${ledger.id} — 리뷰 횟수를 새로 쓰지 않습니다).`,
+      { reviewReadingTurn: round, reviewLedger: ledger.id, timelineReviewRead: pinned.map((reference) => reference.selector) });
+    const readRoute: TurnRoute = { ...input.route, job: { role: "reviewer", operation: "review-read" } };
+    let persisted = false;
+    const persist = (id: string) => {
+      if (persisted) return;
+      persisted = true;
+      planning.noteReviewLedgerSession(ledger.id, id);
+      input.persist(id);
+    };
+    const outcome = await this.core.executor.execute({
+      route: readRoute, topic, signal, purpose: "리뷰 읽기", inputSequence: input.inputSequence, expected: this.core.expectationOf(topic),
+      // 새 세션은 만든 즉시 저장한다(재시도가 같은 세션을 잇는다). 이어 쓰는 세션의 CLI 가 다른 id 로 답하면 저장하지 않는다 — 진척 게이트가 멈추고 재시도는
+      // 원래 세션에서 남은 쪽을 잇는다(4b 와 같다).
+      session: sessionId ? { mode: "resume", sessionId } : { mode: "create", onSessionCreated: persist },
+      prompt: buildReviewReadPrompt({ round, finalPass: input.finalPass, pages: { ...send.push, referencesPath: null } }),
+      readablePaths: [], settings: readRoute.settings,
+      onResponse: (outcome) => {
+        if (!sessionId) persist(outcome.sessionId);
+        this.rememberTimeline(topic, outcome.sessionId, send);
+      },
+    });
+    this.acknowledgeTimeline(topic, signal, expected, outcome.sessionId, send);
+    planning.noteReviewLedgerRead(ledger.id, outcome.sessionId);
+    const measured = sessionId ?? outcome.sessionId;
+    const after = this.unacknowledgedBytes(topic, measured, pinned);
+    const parsed = AgentResultSchema.safeParse(outcome.result);
+    if (!parsed.success || parsed.data.kind !== "ACK" || parsed.data.findings.length > 0 || parsed.data.requestedUserDecision) {
+      this.core.interrupt(topic.id, "USER_DECISION_REQUIRED",
+        `리뷰 읽기 호출(${round}회차)의 응답이 ACK 계약(판정·질문 없이 kind=ACK)을 어겨 판정으로 쓰지 않고 멈춥니다(응답 kind ${parsed.success ? parsed.data.kind : "해석 불가"}). 실은 쪽의 전달 인정과 원장(${ledger.id}, 예약 유지)은 보존했습니다 — 재시도(retry)하면 같은 원장에서 남은 쪽부터 잇습니다.`,
+        expected, { reviewReadInvalid: { round, kind: parsed.success ? parsed.data.kind : null }, reviewLedger: ledger.id, reviewSession: measured });
+      return null;
+    }
+    if (after >= before) {
+      this.core.interrupt(topic.id, "USER_DECISION_REQUIRED",
+        `리뷰 읽기 호출(${round}회차) 뒤에도 리뷰 세션(${measured})의 필수 타임라인 미인정 구간이 줄지 않았습니다 — 필수 참조 ${pinned.length}개(${pinned.map((reference) => reference.selector).join(", ")}), 미인정 ${after} bytes. 응답이 다른 세션으로 돌아왔거나 쪽이 인정되지 않았습니다. 인정 구간·세션 참조 목록·리뷰 원장(${ledger.id}, 예약 유지)을 보존했고 판정 호출을 열지 않았습니다. 재시도(retry)하면 같은 원장·같은 세션에서 남은 쪽을 이어 싣습니다.`,
+        expected, { readingStalled: true, reviewLedger: ledger.id, reviewSession: measured,
+          timelineUnread: { references: pinned.map((reference) => reference.selector), bytes: after } });
+      return null;
+    }
+    return measured;
+  }
+
   // 리뷰가 연 수정 작업 — 계약(원본 = 방금 저장한 이 리뷰 산출물의 쟁점, 소비할 회차)을 CLAUDE_FIX 전이와 **한 transaction** 으로 기록하고 그 계약으로 수정한다.
   private async openReviewFix(topicId: string, signal: AbortSignal, kind: "codex-review" | "codex-final-review", review: AgentResult, message: string): Promise<void> {
     const database = this.core.dependencies.database;
@@ -1078,7 +1763,8 @@ export class DeliveryPipeline {
     if (!artifact) throw new Error(`수정 작업의 원본 리뷰(${kind})가 저장되지 않았습니다.`);
     const contract = this.core.fixContracts.forReview(database.getTopic(topicId), { kind, revision: artifact.revision, findings: review.findings });
     this.core.transitionWith(topicId, "CLAUDE_FIX", message, {
-      contracts: [...this.core.fixContracts.abandonOpen(topicId), contract], payload: { fixContract: contract.contractId },
+      contracts: [...this.core.fixContracts.abandonOpen(topicId), contract],
+      payload: { fixContract: contract.contractId, ...boundary({ seat: "code-review", kind: "review", ref: { artifact: { kind, revision: artifact.revision } } }) },
     });
     await this.runContractFix(topicId, signal, contract);
   }
@@ -1165,6 +1851,9 @@ export class DeliveryPipeline {
       .some((event) => event.scopeGeneration === topic.scopeGeneration && event.actor === "user" && event.kind === "decision");
     if (!decided) return false;
     const review = await this.core.latestResult(topicId, reviewKind);
+    // 미완료 리뷰(in_progress·blocked·남은 검토)의 쟁점은 일부 검토의 결과다 — 그대로 수정으로 보내면 남은 검토 없이 수정·최종 리뷰로 넘어간다(E3-4c: 완료
+    // 리뷰만 커서·재사용·수정 재사용의 근거). 결정으로 멈춘 완료 리뷰의 확정 결함은 지금처럼 결정 뒤 바로 수정한다.
+    if (!this.reviewWorkCompleted(review)) return false;
     if (!shouldRunFixPass(review.findings)) return false;
     if (!finalPass && flags.fixPassUsed) return false;
     if (finalPass && flags.fixPassUsed && flags.secondFixPassUsed && !this.userDecisionAfterLastFixInterrupt(topic)) return false;
@@ -1241,12 +1930,31 @@ export class DeliveryPipeline {
     if (!latest) return;
     // 실패·부분 답변을 받은 질문은 같은 결정으로 재호출하지 않는다. 한도 때문에 아직 보내지 않은 질문은 이어갈 수 있다.
     // 구버전의 상한 초과 묶음은 유효한 확인 자체가 불가능했으므로 새 묶음 계약으로 복구한다(사용한 예산은 그대로).
-    const attemptedQuestions = new Set(events.filter((event) => event.actor === "system"
+    // 프로세스 시작 뒤 세션 유실이 판정되면 시도 기록은 이미 있다. 실패한 그 호출만, 같은 세션의 복구가 실제로 허가된 경우에 한해
+    // 억제 대상에서 뺀다. 실패 기록을 복구 판단 전에 남겨 재시작에도 이어지게 하며, 부분 답변·일반 오류·구버전 시도는 계속 억제한다.
+    const recoveries = database.planning.storedRecoveryLineage(topicId, "code-review")?.recoveries ?? [];
+    const recoveredAttempts = new Set(events.flatMap(event => {
+      const value = event.actor === "system" ? event.payload?.reviewAnswerFailedAttempt : null;
+      if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+      const failed = value as Record<string, unknown>;
+      return typeof failed.id === "string" && recoveries.some(recovery => recovery.fromSession === failed.sessionId
+        && recovery.reason === failed.code && recovery.contract.scopeGeneration === topic.scopeGeneration) ? [failed.id] : [];
+    }));
+    const attempts = events.filter(event => typeof event.payload?.reviewAnswerAttemptId !== "string"
+      || !recoveredAttempts.has(event.payload.reviewAnswerAttemptId));
+    const attemptedQuestions = new Set(attempts.filter((event) => event.actor === "system"
       && event.payload?.reviewAnswerQuestionsAttempt === latest.sequence && Array.isArray(event.payload.requestIds)
       && event.payload.requestIds.length <= REVIEW_ANSWER_BATCH_LIMIT).flatMap((event) => event.payload!.requestIds as string[]));
     if (requests.some((request) => attemptedQuestions.has(request.id))) return;
     const sessionId = database.getCodexReviewSession(topicId);
     if (!sessionId) return; // 대화가 없으면 임의 새 세션으로 확인하지 않는다. 다음 정상 리뷰가 세션을 만든다.
+    // 잃은 리뷰 세션(대기 중 자동 복구, E3-3b)에서는 확인하지 않는다 — 다음 리뷰의 새 세션이 결정 전부를 전문 판으로 받는다.
+    if (this.pendingRecovery("code-review", topicId, sessionId)) return;
+    // 답변 확인은 기존 리뷰 대화를 잇는 턴이다 — 그 리뷰 단계의 배정을 따르고 job 만 바꾼다(작업 세션의 부속 턴과 같은 규칙, E2b). 세션의 바인딩이 그 배정과
+    // 다르면(배정 변경) 다른 공급자 CLI 에 옛 id 를 보내지 않고 확인하지 않는다 — 세션이 없을 때와 같다(다음 정상 리뷰가 새 세션에서 결정을 읽는다).
+    const reviewRoute = this.core.route(topic, { role: "reviewer", operation: topic.state === "CODEX_FINAL_REVIEW" ? "final-review" : "review" });
+    if (!sameBinding(database.codexReviewSessionBinding(topicId) ?? legacyBinding("codex"), reviewRoute)) return;
+    const answerRoute: TurnRoute = { ...reviewRoute, job: { role: "reviewer", operation: "answer-confirmation" } };
     const assessed = this.decisionAssessmentFlags(topic);
     // 과거 답변은 근거로만 유지한다. 현재 리뷰가 이미 읽었거나 확인자가 판정한 결정을 다시 출력하게 하지 않는다.
     const pending = decisions.filter((event) => (input === null || event.sequence > input) && !assessed.has(event.sequence));
@@ -1267,23 +1975,31 @@ export class DeliveryPipeline {
       const answerEvidence = decisions.filter((decision) => !wanted.has(decision.sequence));
       const batchKey = createHash("sha256").update(JSON.stringify({ version: 2, latest: latest.sequence,
         decisions: [...wanted], requests: batchRequests.map((request) => request.id) })).digest("hex");
-      if (events.some((event) => event.actor === "system" && event.payload?.reviewAnswerBatchKey === batchKey)) return;
+      if (attempts.some((event) => event.actor === "system" && event.payload?.reviewAnswerBatchKey === batchKey)) return;
+      const attemptId = randomUUID();
       let recorded = false;
       const recordAttempt = () => {
         if (recorded) return;
         recorded = true;
         this.core.event(topicId, "system", "system", "사용자 답변을 기존 Codex 세션에서 요청별로 확인합니다.",
-          { reviewAnswerAttempt: latest.sequence, reviewAnswerBatchKey: batchKey,
+          { reviewAnswerAttempt: latest.sequence, reviewAnswerBatchKey: batchKey, reviewAnswerAttemptId: attemptId,
             ...(batchRequests.length > 0 ? { reviewAnswerQuestionsAttempt: latest.sequence } : {}),
             requestIds: batchRequests.map((request) => request.id) });
       };
       const outcome = await this.core.executor.execute({
-        role: "codex", topic, signal, purpose: "프로토콜 확인", inputSequence, expected: this.core.expectationOf(topic),
-        write: false, implementation: false, protocolOnly: true, session: { mode: "resume", sessionId }, readablePaths: [],
-        settings: this.core.executionSettings(topicId, "codex", false), onSpawn: recordAttempt,
+        route: answerRoute, topic, signal, purpose: "프로토콜 확인", inputSequence, expected: this.core.expectationOf(topic),
+        session: { mode: "resume", sessionId }, readablePaths: [],
+        settings: answerRoute.settings, onSpawn: recordAttempt,
         prompt: buildReviewAnswerConfirmationPrompt({ requests: batchRequests,
           decisions: batch.map(({ sequence, body }) => ({ sequence, body })),
           answerEvidence: answerEvidence.map(({ sequence, body }) => ({ sequence, body })) }),
+      }).catch(error => {
+        if (recorded && error instanceof AgentRunError && error.code !== "unknown"
+          && invocationFailure(error)?.sessionId === sessionId && !signal.aborted) {
+          this.core.event(topicId, "system", "system", "답변 확인 호출이 세션 오류로 끝났습니다. 복구가 허가된 경우에만 새 세션에서 다시 확인합니다.",
+            { reviewAnswerFailedAttempt: { id: attemptId, sessionId, code: error.code } });
+        }
+        throw error;
       });
       recordAttempt();
       const parsed = AgentResultSchema.safeParse(outcome.result);
@@ -1292,7 +2008,7 @@ export class DeliveryPipeline {
         this.core.event(topicId, "system", "system", "답변 확인 결과가 유효하지 않아 열린 요청을 보존합니다.");
         return;
       }
-      await this.core.saveAgentOutput(topic, "codex", parsed.data, "review-answer-confirmation", signal, { reviewAnswerConfirmation: true });
+      await this.core.saveAgentOutput(topic, answerRoute, parsed.data, "review-answer-confirmation", signal, { reviewAnswerConfirmation: true });
       if (this.core.interruptForNewUserInput(topic, inputSequence)) throw new HandledWorkflowInterruption();
       const answers = parsed.data.reviewDecisionAnswers ?? [];
       const ids = new Set<string>();
@@ -1332,7 +2048,8 @@ export class DeliveryPipeline {
     const flags = database.getFlags(topicId);
     const inputSequence = this.core.latestSequence(topicId);
     const kind = topic.state === "CODEX_FINAL_REVIEW" ? "codex-final-review" : "codex-review";
-    await this.confirmReviewAnswers(topicId, signal, { reviewKind: kind });
+    // 리뷰 세션 복구가 허가됐거나 대기 중이면 저장 판정을 재사용하지 않고 호출자(resumeDelivery)가 새 리뷰 세션으로 정상 리뷰한다(F002).
+    if (await this.confirmAnswersOrRecover(topicId, signal, topic.state === "CODEX_FINAL_REVIEW", { reviewKind: kind })) return false;
     const stored = database.latestArtifact(topicId, kind, topic.scopeGeneration);
     const review = stored ? await this.core.latestResult(topicId, kind) : null;
     const passed = stored && database.getScopedTimeline(topicId, topic.scopeGeneration).findLast((event) =>
@@ -1502,6 +2219,99 @@ export class DeliveryPipeline {
       ["scope_change", "evidence", "decision"].includes(event.kind) || (event.actor === "user" && event.kind === "note"));
   }
 
+  // ---- 타임라인 쪽(E3-2-2b) — 구현·수정·계속 진행·코드 리뷰 턴. 선택·descriptor·인정 기록은 2a 것(planTimelineDelivery·timeline:<seq>@<sha256>·
+  // planning_reference_reads)을 쓰고, 러너의 파일 읽기는 관측할 수 없으므로 필수 참조는 호스트가 프롬프트에 쪽으로 싣고 반환 뒤에만 인정한다. ----
+
+  // 한 판의 전달: 이벤트를 2a 선택으로 인라인·참조로 나누고, 필수 참조(이 판의 참조 + 이 세션의 참조 목록에 남은 미완독)의 미인정 구간을 예산만큼 쪽으로 싣는다.
+  // sessionId 가 없으면 새 세션 판이라 인정·이월이 없다(옛 세션의 인정을 상속하지 않는다).
+  // undelivered: 이 이벤트들을 작업 턴 프롬프트가 실어 보낸 적이 없다(작업 커서 뒤 — 완료 게이트·계속 진행). 그러면 필수 이벤트는 크기와 무관하게 모두
+  // 쪽 의무다. 인라인으로 분류된다는 사실은 전달이 아니다 — 저장 결과 확인 경로의 확인 턴은 기존 렌더(앞부분 절단)로만 보여 짧은 결정도 잘릴 수 있다
+  // (host-review 55f3795 F002).
+  private timelineSend(topic: Topic, events: readonly TimelineEvent[], sessionId: string | null, budget: number, undelivered = false): TimelineSend {
+    const planning = this.core.dependencies.database.planning;
+    const delivery = planTimelineDelivery(events);
+    const own = undelivered
+      ? events.filter((event) => TIMELINE_REQUIRED_KINDS.has(event.kind)).map(timelineReference)
+      : delivery.references.filter((reference) => reference.required);
+    const ownSelectors = new Set(own.map((reference) => reference.selector));
+    const carried = sessionId
+      ? planning.unreadSessionReferences(sessionId, topic).filter((reference) => reference.required && !ownSelectors.has(reference.selector)) : [];
+    const sources = new Map(events.map((event) => [event.sequence, event]));
+    if (carried.some((reference) => !sources.has(reference.seq))) {
+      for (const event of this.core.dependencies.database.getScopedTimeline(topic.id, topic.scopeGeneration)) {
+        if (!sources.has(event.sequence)) sources.set(event.sequence, event);
+      }
+    }
+    // 참조 원문은 불변 행에서 다시 만들어 해시를 대조한다 — 다르면 descriptor 가 가리키는 원문이 아니므로 싣지 않고 멈춘다.
+    const documents = [...new Map([...delivery.references, ...own, ...carried].map((reference) => [reference.selector, reference])).values()]
+      .sort((left, right) => left.seq - right.seq).map((reference) => {
+        const event = sources.get(reference.seq);
+        if (!event || timelineReference(event).hash !== reference.hash) {
+          throw new Error(`타임라인 참조 ${reference.selector} 의 원문을 찾지 못했거나 원문이 바뀌었습니다 — 싣지 않고 멈춥니다.`);
+        }
+        return { reference, text: timelineEventText(event) };
+      });
+    const texts = new Map(documents.map((document) => [document.reference.selector, document.text]));
+    const required = [...own, ...carried].filter((reference) => !sessionId || !planning.referenceComplete(sessionId, topic, reference))
+      .sort((left, right) => left.seq - right.seq);
+    const selected = selectTimelinePages(required.map((reference) => ({
+      reference, bytes: Buffer.from(texts.get(reference.selector)!), gaps: planning.referenceGaps(sessionId, topic, reference),
+    })), budget);
+    return { events, push: { delivery, pages: selected.pages, required, remainingBytes: selected.remainingBytes, referencesPath: null }, documents };
+  }
+
+  // 참조 원문을 조회용 산출물 한 건으로 쓴다(sha 이름 blob, 읽기 허용). 러너가 참고 참조를 찾아 읽는 경로일 뿐 전달·완독 근거가 아니다(J1) — 내용이 같으면 새 판 없음.
+  private async writeTimelineReferences(topic: Topic, sends: readonly TimelineSend[], signal: AbortSignal): Promise<string | null> {
+    const documents = [...new Map(sends.flatMap((send) => send.documents).map((document) => [document.reference.selector, document])).values()]
+      .sort((left, right) => left.reference.seq - right.reference.seq);
+    if (documents.length === 0) return null;
+    const body = [
+      "# 타임라인 참조 원문(서버 보존, 조회용 — 전달·완독 근거가 아닙니다)", "",
+      ...documents.map(({ reference, text }) =>
+        `## ${reference.selector} · ${reference.bytes} bytes(${reference.unit} v${reference.version})${reference.required ? " · 필수" : ""}\n\n${text}\n`),
+    ].join("\n");
+    const artifacts = this.core.dependencies.artifacts;
+    if (await artifacts.readLatest(topic.id, "timeline-references") !== body) {
+      const revision = (this.core.dependencies.database.latestArtifact(topic.id, "timeline-references")?.revision ?? 0) + 1;
+      await this.core.writeArtifact(topic, "timeline-references", revision, body, signal);
+    }
+    return artifacts.verifiedPath(topic.id, "timeline-references");
+  }
+
+  // 한 세션에서 필수 참조 집합에 남은 미인정 바이트(참조별 공백 합) — 필수 읽기·리뷰 읽기 진척 게이트의 측정값(E3-4b·E3-4c). 같은 selector·hash·unit·version 의
+  // 인정만 센다. 세션이 없으면(새 세션 판) 전체가 공백이다.
+  private unacknowledgedBytes(topic: Topic, sessionId: string | null, references: readonly TimelineReference[]): number {
+    const planning = this.core.dependencies.database.planning;
+    return references.reduce((sum, reference) =>
+      sum + planning.referenceGaps(sessionId, topic, reference).reduce((own, gap) => own + gap.end - gap.offset, 0), 0);
+  }
+
+  // 보낸 판의 필수 참조를 반환 세션의 참조 목록에 남긴다 — 의무 기록이라 응답 수신(커서 전진) 때 쓴다. 완독하면 목록 조회에서 빠진다.
+  private rememberTimeline(topic: Topic, sessionId: string, sent: TimelineSend): void {
+    if (sent.push.required.length) this.core.dependencies.database.planning.rememberSessionReferences(sessionId, topic, sent.push.required);
+  }
+
+  // 이벤트 원문 전체가 온전히 실린 호출(읽기 전용 확인 턴)의 전달 인정 — 그 이벤트의 참조 구간 [0, 전체) 를 반환 세션에 적는다. 정상 반환·동기 현재성
+  // 재대조 뒤에만 부른다.
+  private acknowledgeWholeEvents(topic: Topic, signal: AbortSignal, state: WorkflowState, sessionId: string, events: readonly TimelineEvent[]): void {
+    if (!events.length) return;
+    this.core.assertCurrent(topic.id, signal, topic.scopeGeneration, state);
+    this.core.dependencies.database.planning.acknowledgeReferencePages(sessionId, topic, events.map(timelineReference).map((reference) => ({
+      selector: reference.selector, hash: reference.hash, offset: 0, end: reference.bytes, total: reference.bytes,
+    })));
+  }
+
+  // 보낸 판의 쪽을 반환 세션에 인정한다 — 호출이 정상 반환한 뒤에만, 동기 현재성 재대조(취소·주제 세대·상태)를 통과한 경우에만 부른다. 실패·취소·늦은
+  // 응답은 여기에 오지 않아 다음 호출이 같은 구간을 다시 싣는다.
+  private acknowledgeTimeline(topic: Topic, signal: AbortSignal, state: WorkflowState, sessionId: string, sent: TimelineSend): void {
+    if (!sent.push.pages.length) return;
+    this.core.assertCurrent(topic.id, signal, topic.scopeGeneration, state);
+    const hashes = new Map(sent.push.required.map((reference) => [reference.selector, reference.hash]));
+    this.core.dependencies.database.planning.acknowledgeReferencePages(sessionId, topic, sent.push.pages.map((page) => ({
+      selector: page.selector, hash: hashes.get(page.selector)!, offset: page.offset, end: page.end, total: page.total,
+    })));
+  }
+
   // 수정 작업(계약) 실행 — 리뷰 수정·진단 전용 수정 공통(2026-09-15 "작업 계약을 기록으로"). 원본 쟁점·실은 진단·회차·수락 가드는 모두 계약에서 읽는다 —
   // 두 경로가 원본을 따로 추정하던 것(리뷰 수정: 회차 플래그와 최신 리뷰, 진단 전용 수정: 진단 사슬과 최신 최종 리뷰)이 조합마다 어긋났다(감사 2차).
   // 리뷰 수정은 자동 수정 회차(fixPassUsed·secondFixPassUsed)를 완주(최종 리뷰로 전이) 시점에 소비하고, 진단 전용 수정은 소비하지도 초기화하지도 않는다.
@@ -1536,11 +2346,15 @@ export class DeliveryPipeline {
       }
       this.core.transitionWith(topicId, "CODEX_FINAL_REVIEW",
         `진단 전용 수정 작업 ${contract.contractId} 의 진단이 모두 정정으로 닫혀 수정 없이 끝났습니다 — 지금 작업 트리를 최종 리뷰합니다.`, {
-          contracts: [this.core.fixContracts.closed(contract, this.core.latestSequence(topicId))], payload: { fixContract: contract.contractId, fixContractClosed: true },
+          contracts: [this.core.fixContracts.closed(contract, this.core.latestSequence(topicId))], payload: { fixContract: contract.contractId, fixContractClosed: true,
+            ...boundary({ seat: "implementer", kind: "fix-closed", ref: { contractId: contract.contractId } }) },
         });
       await this.runReview(topicId, signal, true);
       return;
     }
+    // 경로와 구현 세션 대조(E2b)는 수정 준비(결정 요약·도구 트리 기준 기록)보다 먼저 한다 — 수정은 구현 세션을 이어 쓰는 작업이라 같은 바인딩 규칙을 따른다.
+    const fixRoute = this.core.route(topic, workTurnJob("FIX"));
+    const fixSession = this.implementationSessionFor(topicId, fixRoute);
     const { content: plan, path: planPath } = await this.core.requireCurrentPlanArtifact(topicId);
     if (!topic.branchName) throw new Error("수정할 작업 브랜치가 없습니다.");
     await this.core.dependencies.git.assertCurrentBranch(topic.worktreePath, topic.branchName);
@@ -1573,21 +2387,24 @@ export class DeliveryPipeline {
       ...(diagnosisRoute ? { heading: "승인된 계획 범위 안에서 중재자 진단(수정 지시)을 반영하세요. 수정 결과는 최종 리뷰를 다시 거쳐야 인도할 수 있습니다." } : {}),
     };
     await this.runWork({
-      topicId, topic, kind: "FIX", work: this.core.checkpoints.binding(topic, "FIX", flags.implementationSessionId, contract.contractId),
+      topicId, topic, kind: "FIX", work: this.core.checkpoints.binding(topic, "FIX", fixSession, contract.contractId),
       plan, planPath, readablePaths, baselineHead, toolTreesBefore, inputSequence, check,
       // 판단이 끝난 원본 쟁점은 서버가 승계한다 — 러너가 되돌려 담지 않아도 재제출을 사지 않는다(2026-09-13).
       carry: this.core.carryForwardNormalizer(primary, label),
       progressKind: "fix-progress", resultKind: "claude-fix", deferredSource: "fix",
       pauseFallbackMessage: diagnosisRoute ? "진단 수정에 사용자 결정이 필요합니다." : "수정 범위를 넓히려면 사용자 결정이 필요합니다.",
-      prompts: (openRequests) => ({
-        fresh: buildClaudeFixPrompt({ ...fixBase, openRequests, timeline: database.getPromptTimeline(topicId, topic.scopeGeneration) }),
-        resume: buildClaudeFixPrompt({
-          ...fixBase, openRequests, resumedSession: true,
-          timeline: database.getPromptTimeline(topicId, topic.scopeGeneration, flags.implementationPromptSequence ?? 0),
-        }),
+      // 수정 턴도 참조 경로 조회다(E3-2-2b) — 같은 구현 세션이면 그 세션의 인정 구간에서 이어 싣고, 새 세션이면 처음부터다.
+      timeline: () => ({
+        fresh: database.getPromptTimeline(topicId, topic.scopeGeneration, 0, "all"),
+        resume: database.getPromptTimeline(topicId, topic.scopeGeneration, database.getFlags(topicId).implementationPromptSequence ?? 0, "all"),
       }),
-      sessionId: flags.implementationSessionId,
-      persistSession: (sessionId) => database.setImplementationSession(topicId, sessionId),
+      prompts: (openRequests, timeline) => ({
+        fresh: buildClaudeFixPrompt({ ...fixBase, openRequests, timeline: timeline.fresh.events, timelinePush: timeline.fresh.push }),
+        resume: buildClaudeFixPrompt({ ...fixBase, openRequests, resumedSession: true, timeline: timeline.resume.events, timelinePush: timeline.resume.push }),
+      }),
+      route: fixRoute,
+      sessionId: fixSession,
+      persistSession: (sessionId) => database.setImplementationSession(topicId, sessionId, bindingOf(fixRoute)),
       initialTurn: true,
       // 진단 전용 수정은 새 논리 작업이다 — 결과는 이 진단 보고부터 쌓고, 허용 오차 원장은 마지막으로 수락된 원장에서 승계해 전체 diff 로 다시 대조한다.
       legacyBase: diagnosisRoute
@@ -1623,7 +2440,8 @@ export class DeliveryPipeline {
           contract.route === "diagnosis" ? `Codex가 중재자 진단(${contract.diagnosisIds.join(", ")}) 수정 결과를 최종 검토합니다.` : "Codex가 수정 결과를 마지막으로 검토합니다.", {
             changes: contract.pass === "first" ? { fixPassUsed: true } : contract.pass === "second" ? { secondFixPassUsed: true } : {},
             contracts: [this.core.fixContracts.accepted(contract, acceptId, this.core.latestSequence(topicId))],
-            payload: { fixContract: contract.contractId, ...(contract.pass === "none" ? { diagnosisFix: contract.diagnosisIds } : { fixPassConsumed: contract.pass === "second" ? 2 : 1 }) },
+            payload: { fixContract: contract.contractId, ...(contract.pass === "none" ? { diagnosisFix: contract.diagnosisIds } : { fixPassConsumed: contract.pass === "second" ? 2 : 1 }),
+              ...boundary({ seat: "implementer", kind: "fix", ref: { acceptId, contractId: contract.contractId } }) },
             ...reportedExtras(reported, "CODEX_FINAL_REVIEW"),
           });
         return true;
@@ -1649,6 +2467,9 @@ export class DeliveryPipeline {
     const decisions = database.getTimeline(topicId, storedFix.revision)
       .filter((event) => event.scopeGeneration === topic.scopeGeneration && event.actor === "user" && event.kind === "decision");
     if (decisions.length === 0 || !flags.implementationSessionId) return false;
+    // 저장 결과의 확인은 구현 세션을 잇는 턴이다 — 세션 바인딩이 지금 수정 배정과 다르면(E2b) 재사용하지 않고 수정 작업(runContractFix)이 새 세션 규칙으로 판단한다.
+    const fixRoute = this.core.route(topic, workTurnJob("FIX"));
+    if (!this.implementationBindingMatches(topicId, fixRoute)) return false;
     const work = this.core.checkpoints.binding(topic, "FIX", flags.implementationSessionId, contract.contractId);
     const previous = await this.previousWorkCheckpoint(topic, work);
     // 원문을 추적한 결과는 checkpoint의 원문 해시가 맞아야 재사용한다. 이 옛 산출물 경로에는 그 보장이 없으므로
@@ -1704,8 +2525,14 @@ export class DeliveryPipeline {
       carry: this.core.carryForwardNormalizer(source, "Claude fix"),
       progressKind: "fix-progress", resultKind: "claude-fix", deferredSource: "fix",
       pauseFallbackMessage: "수정 범위를 넓히려면 사용자 결정이 필요합니다.",
+      // 쓰기 턴은 열지 않지만 완료 게이트(E3-2-2b)가 이 세션이 아직 받지 않은 필수 참조를 본다 — 수정 턴과 같은 커서 뒤 조회다.
+      timeline: () => ({
+        fresh: [],
+        resume: this.core.dependencies.database.getPromptTimeline(topicId, topic.scopeGeneration,
+          this.core.dependencies.database.getFlags(topicId).implementationPromptSequence ?? 0, "all"),
+      }),
       prompts: () => ({ fresh: "", resume: "" }),
-      sessionId: flags.implementationSessionId, persistSession: () => undefined, initialTurn: false,
+      route: fixRoute, sessionId: flags.implementationSessionId, persistSession: () => undefined, initialTurn: false,
       legacyBase: async () => ({ base: fixResult, ledger: [...(fixResult.toleranceLedger ?? [])] }),
       accept: this.contractAcceptance(topicId, topic, contract.contractId, signal),
     }, signal);
@@ -1722,6 +2549,26 @@ export class DeliveryPipeline {
     const git = this.core.dependencies.git;
     const base = this.core.dependencies.database.getFlags(topic.id).implementationBaseOID;
     if (!base) throw new Error("구현 기준 커밋이 없어 허용 오차를 대조할 수 없습니다.");
+    // 합류 병합을 준비한 단계는 준비 트리 대비 변경만 센다(E4 보완 F001) — 병합으로 들어온 내용은 이미 리뷰된 선행 결과이고 이 단계 러너의 변경이 아니다.
+    // 충돌 해소·이 단계 작업은 준비 트리와 달라진 파일로 잡힌다. 준비 트리에 없던 파일은 새 파일(untracked)로 본다.
+    const prepared = this.stagePreparedMerge(topic.id);
+    if (prepared) {
+      // 준비 트리가 GC 로 사라졌으면 같은 기준·대상으로 다시 만들어 ref 로 잡는다(E4 2차 보완 F015).
+      await git.ensurePreparedTree(topic.worktreePath, prepared.baseOID, prepared.merge.targets.map((target) => target.commitOID), prepared.merge.tree);
+      const current = await git.workingTreeOID(topic.worktreePath);
+      const files = (await git.diffTrees(topic.worktreePath, prepared.merge.tree, current)).files;
+      const changed: ChangedFile[] = [];
+      for (const file of files) {
+        const before = await git.fileAtCommit(topic.worktreePath, prepared.merge.tree, file);
+        if (before === null) { changed.push({ file, untracked: true, hunks: [] }); continue; }
+        const parsed = parseUnifiedDiff(await git.treeFileDiff(topic.worktreePath, prepared.merge.tree, current, file));
+        changed.push({
+          file, untracked: false, hunks: parsed.hunks, binary: parsed.binary, modeChanged: parsed.modeChanged,
+          baseLines: parsed.binary ? null : before.split("\n"),
+        });
+      }
+      return changed;
+    }
     const paths = await git.changedPaths(topic.worktreePath);
     const tracked = new Set(await git.trackedPaths(topic.worktreePath, paths));
     const changed: ChangedFile[] = [];
@@ -1749,6 +2596,8 @@ export class DeliveryPipeline {
     previousLedger: readonly ToleranceLedgerEntry[];
     expected: EvidenceBoundExpectation; writeGuards: WriteGuards;
     openRequests?: readonly OpenRequest[];
+    // 교정 턴의 경로 — 작업 세션을 이어 쓰므로 작업의 배정을 따르고 job 만 바꾼다(E2b, workRoute).
+    routeFor: (job: TurnJob) => TurnRoute;
     beforeCorrection?: (original: AgentResult) => Promise<void>;
     // 허용 오차 교정 응답이 계약을 어겨 다시 교정할 때(중첩), 그 호출 직전에 부른다.
     beforeNestedCorrection?: (rejected: AgentResult, violation: string) => Promise<void>;
@@ -1785,11 +2634,12 @@ export class DeliveryPipeline {
         `${renderToleranceSummary(evaluation)}\n같은 세션에 돌려보내 1회 교정합니다(되돌리기 또는 원장 보완).`,
         { toleranceViolations: evaluation.violations });
       // 실행 허용(새 입력·계획 변경·취소·유지보수·예산·쓰기 기준)은 실행기가 spawn 직전에 본다.
+      const toleranceRoute = input.routeFor({ role: "implementer", operation: "tolerance-correction" });
       const { result: corrected } = await this.core.executor.execute({
-        role: "claude", topic: input.topic, signal: input.signal, purpose: "허용 오차 교정", inputSequence: input.inputSequence,
-        expected: input.expected, write: true, writeGuards: input.writeGuards, session: { mode: "resume", sessionId: input.sessionId },
+        route: toleranceRoute, topic: input.topic, signal: input.signal, purpose: "허용 오차 교정", inputSequence: input.inputSequence,
+        expected: input.expected, writeGuards: input.writeGuards, session: { mode: "resume", sessionId: input.sessionId }, recoverable: true,
         prompt: buildToleranceCorrectionPrompt(evaluation.violations, policy, input.resumeState === "CLAUDE_FIX" ? "FIX" : "IMPLEMENTATION", input.openRequests),
-        implementation: true, readablePaths: input.readablePaths, settings: this.core.executionSettings(input.topicId, "claude", true),
+        readablePaths: input.readablePaths, settings: toleranceRoute.settings,
       });
       // 교정 턴도 커밋을 만들 수 있다 — 범위 밖 변경을 커밋해 버리면 작업 트리 대조에서 사라진다(2026-09-08 Codex 지적 2).
       await this.assertBaselineIntact(input.topic, input.baselineHead, "허용 오차 교정 중");
@@ -1801,9 +2651,9 @@ export class DeliveryPipeline {
         preservedParts = merged.preserved;
         return input.normalize ? input.normalize(merged.result) : merged.result;
       };
-      const contracted = await this.core.enforceResultContract("claude", input.topic, corrected, input.sessionId, {
+      const contracted = await this.core.enforceResultContract(toleranceRoute, input.topic, corrected, input.sessionId, {
         evidenceDigest: input.expected.evidenceDigest,
-        signal: input.signal, implementation: true, planMode: false, startedAfter: input.inputSequence, check: input.check,
+        signal: input.signal, planMode: false, startedAfter: input.inputSequence, check: input.check,
         readablePaths: input.readablePaths, normalize: mergeNormalizer, writeGuards: input.writeGuards, beforeCorrection: input.beforeNestedCorrection,
       });
       if (preservedParts.length > 0) {
@@ -1998,7 +2848,9 @@ export class DeliveryPipeline {
       committedOID: flags.committedOID && flags.committedOID === snapshot.head ? flags.committedOID : null,
       pushedOID: flags.pushedOID && flags.pushedOID === snapshot.head ? flags.pushedOID : null,
     });
-    this.core.transition(topicId, "READY_TO_DELIVER", message);
+    // 리뷰 통과로 인도 대기 — 리뷰 좌석 계보의 경계 표식(E3-3b)을 전이와 한 transaction 에 싣는다.
+    this.core.transitionWith(topicId, "READY_TO_DELIVER", message, { payload: boundary({ seat: "code-review", kind: "review-passed",
+      ref: { head: snapshot.head, diffSHA256: snapshot.diffSHA256 } }) });
     // 반영 보고된 중재자 진단 중 통과한 리뷰가 반영을 확인한 것만 해결이다(나머지는 열린 채 커밋을 막는다).
     this.core.diagnoses.resolveReported(topicId, snapshot, verdicts);
     void this.announceDeferredForDelivery(topicId);
@@ -2043,6 +2895,11 @@ export class DeliveryPipeline {
       // **마지막 확정 커밋**(없으면 리뷰 HEAD)이고, 내용 불변은 **리뷰 HEAD 기준** diff 해시로 본다 — 커밋은 파일을 바꾸지 않으므로 리뷰가 본
       // 변경 집합(작업 트리 vs 리뷰 HEAD)은 사슬 내내 같다. 이전엔 기준이 리뷰 HEAD 로 고정돼 두 번째 커밋부터 "worktree 가 바뀌었다" 로 거부됐다.
       const deliveryBase = flags.committedOID ?? flags.reviewedHead;
+      // 합류 병합을 준비한 작업 묶음 단계의 첫 인도 커밋은 엔진이 만드는 병합 커밋이다(E4 보완 F001).
+      const preparedMerge = flags.committedOID ? null : this.stagePreparedMerge(topicId);
+      if (preparedMerge) return this.commitStageMerge(topic, flags, preparedMerge, message, paths, idempotencyKey);
+      // 경로 없는 커밋은 파일 차이가 없는 합류 병합 커밋에만 있다(E4 2차 보완 F001) — 일반 커밋은 고른 경로가 있어야 한다.
+      if (paths.length === 0) throw new Error("커밋할 경로를 하나 이상 고르세요.");
       // stage와 사후 검증이 같은 정규화 결과를 봐야 한다. 다르면 커밋은 남고 기록은 없는 고아 커밋이 생긴다.
       const selectedPaths = normalizeCommitPaths(topic.worktreePath, paths);
       const current = await this.core.dependencies.git.snapshot(topic.worktreePath, flags.reviewedHead);
@@ -2075,7 +2932,151 @@ export class DeliveryPipeline {
     });
   }
 
+  // 작업 묶음 단계 링크의 합류 병합 준비(없으면 null). 단계 토픽이 아니면 null.
+  private stagePreparedMerge(topicId: string): StagePreparedMerge | null {
+    const group = this.core.dependencies.database.workGroups.forTopic(topicId);
+    const stageId = group && Object.entries(group.links).find(([, link]) => link.topicId === topicId)?.[0];
+    const link = stageId ? group.links[stageId] : undefined;
+    return group && stageId && link?.preparedMerge
+      ? { stageId, merge: link.preparedMerge, mergeTargets: link.mergeTargets ?? [], baseOID: link.baseOID, results: group.results ?? {} } : null;
+  }
+
+  // 합류 병합 커밋(E4 보완 F001) — 에이전트가 커밋하거나 병합하지 않는다(기준 HEAD 고정 가드 유지). 엔진이 확인하는 것:
+  //  ① 승인된 합류 대상: 링크에 준비한 대상 = 링크의 합류 대상이고, 각 커밋이 지금 동결된 그 단계 결과 커밋이다.
+  //  ② 부모: [인도 기준(리뷰 HEAD), …합류 대상 커밋] — 브랜치는 update-ref 세 인자로 기대 HEAD 에서만 옮긴다.
+  //  ③ 리뷰 트리: 작업 트리 전체의 트리 == 최종 리뷰가 기록한 트리. 병합 커밋은 리뷰한 작업 트리 전체를 담으므로 바뀐 경로가 모두 선택 범위 안이어야 한다
+  //     (일부만 담으면 합류 대상을 부모로 삼으면서 그 내용을 되돌리는 커밋이 된다). 같은 변경을 서로 다른 커밋으로 만든 결과를 잇는 병합처럼 파일 차이가
+  //     없는 계보 병합도 부모·트리가 확인되면 정상 결과다(E4 2차 보완 F001) — 선택 경로는 비어 있을 수 있다.
+  // 순서(E4 2차 보완 F014): 커밋 객체 생성 → 그 OID·부모·트리·경로를 타임라인(과 요청 좌표)에 기록 → 브랜치 이동 → index 정렬 → 사후 검증·확정. ref 를
+  // 옮긴 뒤 어디서 멈춰도(index.lock 등 정렬 실패, 서버 종료) 기록한 OID 가 남는다. 그 OID 가 HEAD 인 동안 commit 재요청(또는 서버 종료 뒤
+  // reconcile-delivery 성공 확인)이 index 를 맞추고 같은 검증으로 확정한다 — 바뀐 HEAD 를 그대로 인정하지 않고 기록한 커밋일 때만 잇는다.
+  // 요청 좌표(E4 3차 보완): 최초 요청과 재요청 모두 확정 **전에** 자기 요청에 {parent: 인도 기준, mergeCommit: 병합 OID} 를 남긴다. 확정 기록 뒤 요청
+  // 완료 전에 서버가 멈추면 복구는 이 좌표로 "이 요청의 병합 커밋" 을 가려 이미 확정된 경우에도 같은 검증으로 성공을 확인한다.
+  // 사후 검증(부모·트리·첫 부모 대비 경로·작업 트리 스냅샷)이 어긋나면 일반 커밋과 같은 고아 처분 규칙을 쓴다.
+  private async commitStageMerge(
+    topic: Topic, flags: ReturnType<EngineCore["dependencies"]["database"]["getFlags"]>,
+    prepared: StagePreparedMerge,
+    message: string, paths: string[], idempotencyKey?: string,
+  ): Promise<string> {
+    const git = this.core.dependencies.git;
+    const database = this.core.dependencies.database;
+    const deliveryBase = flags.reviewedHead!;
+    const approved = this.approvedMergeParents(prepared, deliveryBase);
+    if (!flags.reviewedTreeOID) throw new Error("최종 리뷰가 기록한 작업 트리가 없어 합류 병합 커밋을 만들 수 없습니다.");
+    const head = await git.head(topic.worktreePath);
+    if (head !== deliveryBase) {
+      // 브랜치를 옮긴 뒤 확정 전에 멈춘 병합 커밋 — 이 범위 세대에 마지막으로 기록한 병합 커밋이 같은 인도 기준에서 만든 것이고 지금 HEAD 일 때만 이어서
+      // 끝낸다(요청의 메시지·경로는 기록한 것을 쓴다). 확정 기록이 없는 상태에서만 이 경로에 온다(commit 이 확정 커밋이 있으면 병합 경로를 타지 않는다).
+      const pending = this.recordedStageMerge(topic.id);
+      if (!pending || pending.parent !== deliveryBase || pending.oid !== head) {
+        throw new Error("최종 리뷰 뒤 worktree가 바뀌었습니다. 다시 리뷰해야 커밋할 수 있습니다.");
+      }
+      if (idempotencyKey) database.annotateActionRequest(topic.id, "commit", idempotencyKey, { parent: pending.parent, mergeCommit: pending.oid });
+      return this.finishStageMerge(topic, flags, approved, pending, "retry");
+    }
+    const selectedPaths = paths.length ? normalizeCommitPaths(topic.worktreePath, paths) : [];
+    const current = await git.snapshot(topic.worktreePath, flags.reviewedHead!);
+    if (current.head !== deliveryBase || current.diffSHA256 !== flags.reviewedDiffSHA256) {
+      throw new Error("최종 리뷰 뒤 worktree가 바뀌었습니다. 다시 리뷰해야 커밋할 수 있습니다.");
+    }
+    const changed = await git.changedPaths(topic.worktreePath);
+    const unselected = changed.filter((path) => !isWithinSelectedPaths(path, selectedPaths));
+    if (unselected.length > 0) {
+      throw new Error(`합류 병합 커밋은 리뷰한 작업 트리 전체를 담습니다 — 바뀐 경로를 모두 선택하세요: ${unselected.join(", ")}`);
+    }
+    const tree = await git.workingTreeOID(topic.worktreePath);
+    if (tree !== flags.reviewedTreeOID) throw new Error("작업 트리가 최종 리뷰한 트리와 달라 합류 병합 커밋을 만들지 않았습니다. 다시 리뷰하세요.");
+    database.evidence.assertReady(database.getTopic(topic.id));
+    const oid = await git.writeMergeCommit(topic.worktreePath, tree, approved, message);
+    const pending: PendingStageMerge = { oid, parent: deliveryBase, parents: approved, tree, paths: selectedPaths, message };
+    if (idempotencyKey) database.annotateActionRequest(topic.id, "commit", idempotencyKey, { parent: deliveryBase, mergeCommit: oid });
+    this.core.event(topic.id, "system", "system",
+      `합류 병합 커밋 ${oid} 을 만들었습니다 — 브랜치를 옮기고 index 를 맞춘 뒤 확정합니다(부모 ${approved.join(", ")}).`, { mergeCommitPending: pending });
+    await git.moveBranch(topic.worktreePath, topic.branchName!, oid, deliveryBase);
+    return this.finishStageMerge(topic, flags, approved, pending, "commit");
+  }
+
+  // 승인된 병합 부모 — [인도 기준, …준비한 합류 대상 커밋]. 준비 대상 = 링크 합류 대상이고 각 커밋이 지금 동결된 그 단계 결과여야 한다.
+  private approvedMergeParents(prepared: StagePreparedMerge, deliveryBase: string): string[] {
+    const mergeTargets = prepared.mergeTargets;
+    const targetIds = prepared.merge.targets.map((target) => target.stageId);
+    if (targetIds.length === 0 || [...targetIds].sort().join("\0") !== [...mergeTargets].sort().join("\0")) {
+      throw new Error("준비한 합류 대상이 단계의 합류 대상과 다릅니다.");
+    }
+    for (const target of prepared.merge.targets) {
+      if (prepared.results[target.stageId]?.commitOID !== target.commitOID) {
+        throw new Error(`합류 대상 ${target.stageId} 의 커밋이 동결된 단계 결과와 다릅니다.`);
+      }
+    }
+    return [deliveryBase, ...prepared.merge.targets.map((target) => target.commitOID)];
+  }
+
+  // 이 범위 세대에서 마지막으로 기록한 합류 병합 커밋(없으면 null) — 확정 여부와 무관하다. 호출자가 인도 기준·HEAD·요청 좌표로 결속한다: commit 재요청은
+  // 확정 전에만, 결과 확인은 그 요청이 좌표로 남긴 병합 OID 일 때만 쓴다(E4 3차 보완). 다른 세대의 기록은 보지 않는다(범위 변경은 새 작업 트리다).
+  private recordedStageMerge(topicId: string): PendingStageMerge | null {
+    const database = this.core.dependencies.database;
+    const topic = database.getTopic(topicId);
+    return (database.getScopedTimeline(topicId, topic.scopeGeneration)
+      .filter((event) => event.payload?.mergeCommitPending).at(-1)?.payload?.mergeCommitPending as PendingStageMerge | undefined) ?? null;
+  }
+
+  // 브랜치를 옮긴 병합 커밋의 index 정렬·사후 검증·확정(커밋·재요청 공용). index 정렬이 실패하면(index.lock 등) 그 상태를 기록하고 멈춘다 — HEAD 는 기록한
+  // 커밋이고 확정하지 않았으며, 원인을 푼 뒤 commit 재요청이 여기서 이어 끝낸다.
+  private async finishStageMerge(
+    topic: Topic, flags: ReturnType<EngineCore["dependencies"]["database"]["getFlags"]>, approved: string[], pending: PendingStageMerge,
+    via: "commit" | "retry",
+  ): Promise<string> {
+    const git = this.core.dependencies.git;
+    try {
+      await git.resyncIndex(topic.worktreePath, topic.branchName!);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      this.core.event(topic.id, "system", "system",
+        `합류 병합 커밋 ${pending.oid} 로 브랜치를 옮겼지만 index 를 맞추지 못했습니다(${reason.split("\n")[0]}). HEAD 는 이 커밋이고 아직 확정하지 않았습니다 — `
+          + "index 잠금 등 원인을 푼 뒤 commit 을 다시 요청하면 index 를 맞추고 같은 검증으로 확정합니다.",
+        { mergeCommitIndexPending: pending.oid });
+      throw Object.assign(new Error(`합류 병합 커밋 ${pending.oid} 의 index 정렬에 실패해 확정하지 못했습니다(${reason.split("\n")[0]}). 원인을 푼 뒤 commit 을 다시 요청하세요.`),
+        { statusCode: 409 });
+    }
+    this.assertDeliverySnapshot(topic);
+    const problem = await this.stageMergeProblem(topic, flags, approved, pending);
+    if (problem) this.rejectOrphanCommit(topic.id, pending.oid, problem);
+    this.core.dependencies.database.updateTopic(topic.id, { committedOID: pending.oid, pushedOID: null, orphanCommitOID: null });
+    this.core.event(topic.id, "user", "decision", via === "retry"
+      ? "브랜치를 옮긴 뒤 멈췄던 합류 병합 커밋의 index 를 맞추고 확정했습니다(엔진 병합 커밋)."
+      : "합류 대상을 병합한 선택 변경을 커밋했습니다(엔진 병합 커밋).", {
+      oid: pending.oid, paths: pending.paths, deliveryAction: "commit", parent: pending.parent,
+      merge: { parents: pending.parents, tree: pending.tree, via },
+    });
+    return pending.oid;
+  }
+
+  // 병합 커밋 사후 검증 — 어긋난 이유(없으면 null). 부모 = 기록한 부모 = 승인된 부모, 커밋 트리 == 리뷰 트리, 작업 트리 내용 == 리뷰 스냅샷, 첫 부모 대비
+  // 경로 ⊆ 선택 경로(파일 차이 없는 계보 병합은 빈 경로).
+  private async stageMergeProblem(
+    topic: Topic, flags: ReturnType<EngineCore["dependencies"]["database"]["getFlags"]>, approved: string[], pending: PendingStageMerge,
+  ): Promise<string | null> {
+    const git = this.core.dependencies.git;
+    const parents = await git.commitParents(topic.worktreePath, pending.oid);
+    if (parents.join("\0") !== approved.join("\0") || pending.parents.join("\0") !== approved.join("\0")) {
+      return "생성된 병합 커밋의 부모가 인도 기준·합류 대상과 다릅니다.";
+    }
+    if (!flags.reviewedTreeOID || (await git.diffTrees(topic.worktreePath, pending.oid, flags.reviewedTreeOID)).files.length > 0) {
+      return "생성된 병합 커밋의 트리가 최종 리뷰한 트리와 다릅니다.";
+    }
+    if ((await git.snapshot(topic.worktreePath, flags.reviewedHead!)).diffSHA256 !== flags.reviewedDiffSHA256) {
+      return "커밋 도중 파일 내용이 최종 리뷰 결과와 달라졌습니다.";
+    }
+    const committedPaths = await git.commitChangedPaths(topic.worktreePath, pending.oid);
+    if (committedPaths.some((path) => !isWithinSelectedPaths(path, pending.paths))) {
+      return "생성된 커밋에 사용자가 고른 범위 밖 파일이 들어 있습니다.";
+    }
+    return null;
+  }
+
   async push(topicId: string): Promise<string> {
+    // 닫힌 작업 묶음 단계는 동결 결과를 전달한다(E4 보완 F002) — 단계 종료(로컬 커밋 승계)와 원격 전달은 독립이다.
+    if (this.core.dependencies.database.getTopic(topicId).state === "CLOSED") return this.pushClosedStage(topicId);
     return this.withDeliveryLock(topicId, async (topic) => {
       this.assertReviewAnswersForDelivery(topic);
       this.core.diagnoses.assertDeliverable(topicId, "push");
@@ -2094,6 +3095,54 @@ export class DeliveryPipeline {
     });
   }
 
+  // 닫힌 단계의 push 가 받아들여지는 조건(부작용 전 검사 전부) — push 와 재개 정보가 같은 함수를 쓴다. 동결 결과가 이 토픽의 것이고 확정 커밋이 그 결과
+  // 커밋이며, 결과가 불명확한 전달 요청이 없을 때만. 상태는 CLOSED 그대로다(다시 열지 않는다).
+  closedStagePushPreconditions(topicId: string): { topic: Topic; commitOID: string } {
+    const database = this.core.dependencies.database;
+    const topic = database.getTopic(topicId);
+    if (topic.state !== "CLOSED") throw new Error("닫힌 단계가 아닙니다.");
+    const group = database.workGroups.forTopic(topicId);
+    const stageId = group && Object.entries(group.links).find(([, link]) => link.topicId === topicId)?.[0];
+    const result = stageId ? group.results?.[stageId] : undefined;
+    if (!group || !stageId || !result || result.topicId !== topicId) throw new Error("동결된 단계 결과가 있는 닫힌 작업 묶음 단계만 push 할 수 있습니다.");
+    const flags = database.getFlags(topicId);
+    if (!flags.committedOID || flags.committedOID !== result.commitOID) throw new Error("확정 커밋이 동결된 단계 결과 커밋과 다릅니다.");
+    if (flags.pushedOID === flags.committedOID) throw new Error("동결된 단계 결과는 이미 push 했습니다.");
+    if (database.unknownDeliveryAction(topicId)) {
+      throw new Error("결과가 불명확한 push 가 있습니다. reconcile-delivery 로 원격 결과를 먼저 확인하세요.");
+    }
+    if (!topic.branchName) throw new Error("push할 작업 브랜치가 없습니다.");
+    this.core.assertNoActiveWork(topicId);
+    this.assertReviewAnswersForDelivery(topic);
+    this.core.diagnoses.assertDeliverable(topicId, "push");
+    database.evidence.assertReady(topic);
+    return { topic, commitOID: flags.committedOID };
+  }
+
+  private async pushClosedStage(topicId: string): Promise<string> {
+    const { topic, commitOID } = this.closedStagePushPreconditions(topicId);
+    this.core.deliveryActive.add(topicId);
+    try {
+      await this.core.dependencies.git.assertCurrentBranch(topic.worktreePath, topic.branchName!);
+      if (await this.core.dependencies.git.head(topic.worktreePath) !== commitOID) {
+        throw new Error("닫힌 단계의 작업 트리 HEAD 가 동결된 결과 커밋과 달라 push 를 중단했습니다.");
+      }
+      const oid = await this.core.dependencies.git.push(topic.worktreePath, topic.branchName!);
+      const current = this.core.dependencies.database.getTopic(topicId);
+      if (current.state !== "CLOSED" || current.branchName !== topic.branchName || current.worktreePath !== topic.worktreePath) {
+        throw new Error("전달 작업 중 주제 상태나 worktree가 바뀌었습니다.");
+      }
+      if (oid !== commitOID) throw new Error("push 한 커밋이 동결된 단계 결과 커밋과 다릅니다.");
+      this.core.dependencies.database.updateTopic(topicId, { pushedOID: oid });
+      this.core.event(topicId, "user", "decision", "닫힌 단계의 동결 결과를 원격 저장소에 push했습니다.", {
+        oid, branchName: topic.branchName, deliveryAction: "push", closedStage: true,
+      });
+      return oid;
+    } finally {
+      this.core.deliveryActive.delete(topicId);
+    }
+  }
+
   // 사후 검증으로 거부한 커밋은 이 경로에서만, 되돌려도 안전하다는 것을 전부 확인한 뒤에 되돌린다.
   async discardOrphanCommit(topicId: string): Promise<Topic> {
     return this.withDeliveryLock(topicId, async (topic) => {
@@ -2105,7 +3154,11 @@ export class DeliveryPipeline {
       // 정작 거부된 커밋만 영구히 처분할 수 없게 된다.
       const head = await this.core.dependencies.git.head(topic.worktreePath);
       const parents = await this.core.dependencies.git.commitParents(topic.worktreePath, flags.orphanCommitOID);
-      if (parents.length !== 1) {
+      // 엔진이 만든 합류 병합 커밋(부모 = [기준, …준비한 합류 대상])은 첫 부모로 되돌린다 — 작업 트리는 그대로라 잃는 것이 없다(E4 보완 F001).
+      const prepared = this.stagePreparedMerge(topicId);
+      const engineMerge = prepared !== null && parents.length >= 2
+        && parents.slice(1).join("\0") === prepared.merge.targets.map((target) => target.commitOID).join("\0");
+      if (parents.length !== 1 && !engineMerge) {
         throw new Error(`부모가 하나인 커밋만 되돌립니다. 이 커밋의 부모는 ${parents.length}개입니다.`);
       }
       const restoredHead = parents[0];
@@ -2143,6 +3196,7 @@ export class DeliveryPipeline {
   ): Promise<Topic> {
     const topic = this.core.dependencies.database.getTopic(topicId);
     const flags = this.core.dependencies.database.getFlags(topicId);
+    if (topic.state === "CLOSED") return this.reconcileClosedStagePush(topic, input);
     if (topic.state !== "USER_DECISION_REQUIRED" || flags.resumeState !== "READY_TO_DELIVER") {
       throw new Error("확인이 필요한 전달 작업이 없습니다.");
     }
@@ -2165,6 +3219,8 @@ export class DeliveryPipeline {
         throw new Error("전달 결과를 확인하는 동안 주제 상태가 바뀌었습니다. 다시 확인해 주세요.");
       }
     };
+    // 성공 확인이 남길 확정 기록 — 아래 마감 transaction 에 요청 마감·전이와 함께 싣는다(E4 F016).
+    let confirmedChanges: { committedOID?: string; pushedOID?: string | null } = {};
     if (input.outcome === "succeeded") {
       if (!input.oid) throw new Error("성공 확인에는 Git OID가 필요합니다.");
       await this.core.dependencies.git.assertCurrentBranch(topic.worktreePath, topic.branchName);
@@ -2182,6 +3238,47 @@ export class DeliveryPipeline {
         const annotated = recovery.annotation?.parent;
         const expectedParent = typeof annotated === "string" && annotated ? annotated : (flags.committedOID ?? flags.reviewedHead);
         if (head === expectedParent) throw new Error("현재 HEAD는 커밋 전 리뷰 기준과 같아 커밋 성공이 아닙니다.");
+        // 합류 병합 요청(E4 2·3차 보완 F014·F001) — 요청이 확정 전에 남긴 좌표의 병합 OID(mergeCommit)로 가린다. 확정 기록(committedOID)이 이미 이 병합
+        // 커밋이어도 같은 경로다: 확정 뒤 요청 완료 전에 멈춘 경우 일반 커밋 판정(첫 부모 대비 경로가 있어야 함)은 파일 차이 없는 계보 병합을 거부했고,
+        // 좌표 없는 재요청은 기준이 확정 커밋으로 잡혀 거부됐다. 좌표가 없어도 확정 기록이 없는 준비 단계면 이 경로다 — 그 단계의 첫 인도 커밋은 엔진 병합
+        // 커밋뿐이라, 엔진이 기록하지 않은 커밋(좌표를 남기기 전에 멈춘 요청 뒤 손으로 만든 병합 등)을 일반 커밋 규칙으로 성공 처리하지 않는다. 확정 뒤의
+        // 좌표 없는 요청(일반 후속 커밋)은 병합 요청이 아니다 — 과거 병합을 그 요청의 성공으로 보지 않는다.
+        const recordedMerge = typeof recovery.annotation?.mergeCommit === "string" && recovery.annotation.mergeCommit
+          ? recovery.annotation.mergeCommit : null;
+        const prepared = this.stagePreparedMerge(topicId);
+        if (recordedMerge || (prepared && !flags.committedOID)) {
+          if (!prepared) throw new Error("합류 병합 준비가 없는 단계에 병합 요청 기록이 있어 성공으로 확인하지 않았습니다.");
+          // 이 요청이 기록한 병합 OID = 현재 HEAD = 이 세대에 마지막으로 기록한 병합 커밋이고, 그 기록이 이 요청의 인도 기준에서 만든 것이어야 한다.
+          const pending = this.recordedStageMerge(topicId);
+          if ((recordedMerge && recordedMerge !== head) || !pending || pending.oid !== head || pending.parent !== expectedParent) {
+            throw new Error("현재 HEAD 가 이 요청에서 엔진이 기록한 합류 병합 커밋이 아니어서 성공으로 확인하지 않았습니다.");
+          }
+          // 확정 기록이 있으면 그것이 이 병합 커밋이어야 한다(다른 확정 커밋 위의 HEAD 를 이 요청의 성공으로 보지 않는다).
+          const alreadyCommitted = flags.committedOID === head;
+          if (flags.committedOID && !alreadyCommitted) {
+            throw new Error("확정 커밋이 이 요청의 합류 병합 커밋과 달라 성공으로 확인하지 않았습니다.");
+          }
+          const approved = this.approvedMergeParents(prepared, pending.parent);
+          await this.core.dependencies.git.resyncIndex(topic.worktreePath, topic.branchName);
+          const problem = await this.stageMergeProblem(topic, flags, approved, pending);
+          if (problem) throw new Error(problem);
+          assertStillReconciling();
+          // 확정 기록·확정 이벤트·요청 마감·전이를 한 transaction 으로 저장하고 알림은 COMMIT 뒤에 낸다(E4 F016) — 사이에서 멈춰도 요청이 사라진 채 복구
+          // 대기에 남지 않는다(모두 이전 상태면 재기동 뒤 같은 확인을 다시 한다). 확정 기록과 확정 이벤트는 커밋 경로에서 따로 쓰이므로 그 사이에서 멈췄으면
+          // 이벤트가 없다 — 없을 때만 넣어 이 병합 커밋의 확정 이벤트가 정확히 하나가 되게 한다.
+          const confirmed = this.core.dependencies.database.getScopedTimeline(topicId, topic.scopeGeneration)
+            .some((event) => event.payload?.deliveryAction === "commit" && event.payload?.oid === head);
+          return this.core.transitionWith(topicId, "READY_TO_DELIVER", alreadyCommitted
+            ? `확정 기록 뒤 요청 완료 전에 멈췄던 ${action}(합류 병합 커밋 ${head}) 결과를 사용자가 성공으로 확인했습니다.`
+            : `중단됐던 ${action} 결과를 사용자가 성공으로 확인했습니다.`, {
+            changes: alreadyCommitted ? {} : { committedOID: head, pushedOID: null, orphanCommitOID: null },
+            events: confirmed ? [] : [{ actor: "user", kind: "decision", state: "READY_TO_DELIVER",
+              body: "중단됐던 합류 병합 커밋의 index 를 맞추고 확정했습니다(엔진 병합 커밋, 전달 결과 확인).",
+              payload: { oid: head, paths: pending.paths, deliveryAction: "commit", parent: pending.parent,
+                merge: { parents: pending.parents, tree: pending.tree, via: "reconcile" } } }],
+            deliveryResolution: { action, idempotencyKey: recovery.idempotencyKey, outcome: input.outcome },
+          });
+        }
         if (await this.core.dependencies.git.commitParent(topic.worktreePath, head) !== expectedParent) {
           throw new Error("현재 커밋의 부모가 리뷰 기준 HEAD와 다릅니다.");
         }
@@ -2195,7 +3292,7 @@ export class DeliveryPipeline {
           throw new Error("복구한 커밋에 사용자가 고른 범위 밖 파일이 들어 있습니다.");
         }
         assertStillReconciling();
-        this.core.dependencies.database.updateTopic(topicId, { committedOID: head, pushedOID: null });
+        confirmedChanges = { committedOID: head, pushedOID: null };
       } else {
         if (flags.committedOID !== head) {
           throw new Error("확정된 커밋과 현재 HEAD가 달라 push 성공으로 기록할 수 없습니다.");
@@ -2204,15 +3301,52 @@ export class DeliveryPipeline {
           throw new Error("원격 브랜치가 현재 커밋을 가리키지 않아 push 성공이 아닙니다.");
         }
         assertStillReconciling();
-        this.core.dependencies.database.updateTopic(topicId, { pushedOID: head });
+        confirmedChanges = { pushedOID: head };
       }
     }
     assertStillReconciling();
-    this.core.dependencies.database.resolveUnknownDeliveryAction(
-      topicId, action, recovery.idempotencyKey, input.outcome,
-    );
-    this.core.transition(topicId, "READY_TO_DELIVER", `중단됐던 ${action} 결과를 사용자가 ${input.outcome === "succeeded" ? "성공" : "실패"}으로 확인했습니다.`);
-    return this.core.dependencies.database.getTopic(topicId);
+    // 확정 기록(성공 확인의 committedOID·pushedOID)·요청 마감·전이를 한 transaction 으로 저장하고 알림은 COMMIT 뒤에 낸다(E4 F016).
+    return this.core.transitionWith(topicId, "READY_TO_DELIVER",
+      `중단됐던 ${action} 결과를 사용자가 ${input.outcome === "succeeded" ? "성공" : "실패"}으로 확인했습니다.`, {
+        changes: confirmedChanges,
+        deliveryResolution: { action, idempotencyKey: recovery.idempotencyKey, outcome: input.outcome },
+      });
+  }
+
+  // 닫힌 단계 push 의 결과 불명확 요청 확인(E4 보완 F002) — 서버 재시작 복구는 CLOSED 토픽을 다시 열지 않고 요청만 unknown 으로 남긴다. 성공 확인은
+  // 원격 브랜치가 동결 결과 커밋(=확정 커밋=HEAD)을 가리킬 때만, 실패 확인은 기록만 닫아 다시 push 할 수 있게 한다. 상태는 CLOSED 그대로다.
+  private async reconcileClosedStagePush(
+    topic: Topic, input: { idempotencyKey: string; outcome: "succeeded" | "failed"; oid?: string },
+  ): Promise<Topic> {
+    const database = this.core.dependencies.database;
+    const recovery = database.unknownDeliveryAction(topic.id);
+    if (!recovery || recovery.action !== "push") throw new Error("확인이 필요한 전달 작업이 없습니다.");
+    if (recovery.idempotencyKey !== input.idempotencyKey) throw new Error("확인하려는 전달 요청이 현재 복구 대상과 다릅니다.");
+    if (!topic.branchName) throw new Error("확인할 작업 브랜치가 없습니다.");
+    if (this.core.deliveryActive.has(topic.id)) throw new Error("다른 전달 작업이 끝난 뒤 확인하세요.");
+    this.core.deliveryActive.add(topic.id);
+    try {
+      if (input.outcome === "succeeded") {
+        const flags = database.getFlags(topic.id);
+        if (!input.oid) throw new Error("성공 확인에는 Git OID가 필요합니다.");
+        await this.core.dependencies.git.assertCurrentBranch(topic.worktreePath, topic.branchName);
+        const head = await this.core.dependencies.git.head(topic.worktreePath);
+        if (input.oid !== head || flags.committedOID !== head) throw new Error("확정된 커밋과 현재 HEAD가 달라 push 성공으로 기록할 수 없습니다.");
+        if (await this.core.dependencies.git.remoteBranchOID(topic.worktreePath, topic.branchName) !== head) {
+          throw new Error("원격 브랜치가 현재 커밋을 가리키지 않아 push 성공이 아닙니다.");
+        }
+        if (database.getTopic(topic.id).state !== "CLOSED" || database.unknownDeliveryAction(topic.id)?.idempotencyKey !== input.idempotencyKey) {
+          throw new Error("전달 결과를 확인하는 동안 주제 상태가 바뀌었습니다. 다시 확인해 주세요.");
+        }
+        database.updateTopic(topic.id, { pushedOID: head });
+      }
+      database.resolveUnknownDeliveryAction(topic.id, "push", recovery.idempotencyKey, input.outcome);
+      this.core.event(topic.id, "system", "system", `중단됐던 닫힌 단계 push 결과를 사용자가 ${input.outcome === "succeeded" ? "성공" : "실패"}으로 확인했습니다.`,
+        { closedStagePushReconciled: input.outcome });
+      return database.getTopic(topic.id);
+    } finally {
+      this.core.deliveryActive.delete(topic.id);
+    }
   }
 
   private assertReviewAnswersForDelivery(topic: Topic): void {
@@ -2257,6 +3391,24 @@ export class DeliveryPipeline {
 }
 
 export { isMissingSessionError } from "./turnExecutor.js";
+
+// 작업 묶음 단계 링크의 합류 병합 준비(E4 보완 F001).
+interface StagePreparedMerge {
+  stageId: string;
+  merge: PreparedMerge;
+  mergeTargets: string[];
+  baseOID: string;
+  results: NonNullable<WorkGroup["results"]>;
+}
+// 만들어 기록했지만 아직 확정하지 않은 합류 병합 커밋(E4 2차 보완 F014) — 타임라인 system 이벤트 payload.mergeCommitPending.
+interface PendingStageMerge {
+  oid: string;
+  parent: string;
+  parents: string[];
+  tree: string;
+  paths: string[];
+  message: string;
+}
 
 
 // 후속 목록에서 빼야 할 쟁점 id — 뒤 단계가 DEFERRED_OUT_OF_SCOPE 가 아닌 처분(해결·불필요·반박·수정 합의)을 붙인 것.

@@ -3,7 +3,7 @@ import {reviewScope,type ReviewScope} from "../shared/reviews.js";
 import { assertToleranceWidening, normalizeToleranceBlocks, parseTolerancePolicy, replaceToleranceBlock, TolerancePolicySchema } from "../shared/tolerance.js";
 import { hashPlan, normalizePlan } from "../shared/workflow.js";
 import { RevisionBlocked } from "./revisionLedger.js";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { describePrune, pruneBuildTrees } from "./buildTrees.js";
 import { basename, dirname, join } from "node:path";
 import {
@@ -32,10 +32,14 @@ import { pendingReviewRequests } from "./engine/reviewRequests.js";
 import { closeoutOpenFindings, fixOpenFindings, judgeCloseout, reviewOpenFindings, settleClosedDiagnoses, unsettledFindings, type OpenFinding } from "./engine/findingJudgment.js";
 import { UsageLimitRetryScheduler, type RetryClock } from "./engine/usageLimitRetry.js";
 import { recoverableFinalizedFirstPlan } from "./planningStore.js";
+import { bindingOf, describeBinding, legacyBinding, resolveRoute, sameBinding, UnsupportedRoute, type SessionBinding, type TurnRoute } from "./turnRouting.js";
 
 // 호출 주체 — 브라우저 사용자(기본)와 중재 세션(x-consensus-actor: mediator, 위임 스위치 on 일 때만). 이벤트 payload 에 남긴다(D03).
 import { CLOSED_DIAGNOSIS_STATUSES, MEDIATOR_PENDING_STATUSES, type DiagnosisInput, type DiagnosisRecord } from "../shared/diagnoses.js";
-import type { MediatorIdentity } from "../shared/roles.js";
+import type { MediatorIdentity, TurnJob } from "../shared/roles.js";
+import type { StageDecision, StageResult } from "../shared/workGroups.js";
+import { resolvePriorResults } from "./workGroupService.js";
+import type { TimelineEvent } from "../shared/contracts.js";
 // 재개 정보의 다음 허용 작업 — blocker 는 실제 액션의 사전 검사가 던지는 문구, deferredChecks 는 실행 때만 할 수 있는 검사(엔진 개편 E1).
 export interface ResumeAction {
   action: string;
@@ -51,6 +55,12 @@ const PLANNING_RESULT_KINDS = ["claude-plan", "diagnosis-plan-revision", "audit"
 const DELIVERY_RESULT_KINDS = ["implementation-result", "codex-review", "claude-fix", "codex-final-review"] as const;
 const RUNNER_REPORT_KINDS: ReadonlySet<string> = new Set(["implementation-result", "claude-fix"]);
 const PAUSE_KEYS = ["planningPause", "budgetPause", "revisionPause", "reviewPause", "admissionRefused"] as const;
+// 좌석의 대표 job(E2b) — 좌석 세션을 연결할 때 그 세션이 어느 공급자의 것이어야 하는지 정하는 기준. 'claude' 좌석은 이 세션을 처음 이어 쓰는
+// 계획 턴(계획자), 'codex' 좌석은 감사 턴(검토자)이다. 배정이 없으면 좌석 이름과 같은 공급자다(turnRouting.ts 기본 배정).
+const SEAT_JOB: Readonly<Record<ParticipantRole, TurnJob>> = {
+  claude: { role: "planner", operation: "plan" },
+  codex: { role: "reviewer", operation: "audit" },
+};
 
 // mediator: 배정이 있는 작업에서 수락된 중재자의 배정 신원(참여자·버전·scope) — 배정이 없으면 null(엔진 개편 E1).
 // policyVersion: 호출 시점의 공통 중재 정책 버전(sha256) — 작업에 적용한 설정 버전을 기록한다(plan §2.2).
@@ -104,6 +114,8 @@ export class WorkflowEngine {
   private readonly planning: PlanningPipeline;
   private readonly delivery: DeliveryPipeline;
   private readonly usageLimitRetry: UsageLimitRetryScheduler;
+  // 결과 확인(git) 중인 묶음 단계 닫기 — 같은 단계를 두 번 동시에 닫지 않는다.
+  private readonly stageClosing = new Set<string>();
 
   constructor(dependencies: WorkflowDependencies) {
     this.core = new EngineCore(dependencies);
@@ -132,22 +144,34 @@ export class WorkflowEngine {
     const topic = this.core.dependencies.database.getTopic(topicId);
     if (topic.state !== "DRAFT") throw new Error("세션 연결은 계획 실행 전에만 바꿀 수 있습니다.");
     const generation = topic.scopeGeneration;
-    const adapter = this.core.adapter(role);
     let participant: Participant;
+    let binding: SessionBinding | undefined;
     if (input.mode === "attach") {
-      if (!await adapter.validateExistingSession(input.sessionId)) throw new Error(`${role} 세션을 확인할 수 없습니다.`);
+      // 기존 세션은 좌석이 라우팅되는 공급자의 CLI 세션이다 — 그 공급자의 어댑터로 확인하고 그 공급자의 세션 이름공간에서 중복을 본 뒤 바인딩과 함께 저장한다
+      // (E2b — 다른 공급자 CLI 에 이 id 를 보내지 않게). 기본 배정에서는 좌석 이름과 같은 공급자라 E2b 이전과 같은 어댑터·검사다.
+      const route = this.seatRoute(topic, SEAT_JOB[role]);
+      if (!await this.core.adapter(route.provider).validateExistingSession(input.sessionId)) {
+        throw new Error(`${role} 세션을 확인할 수 없습니다${route.provider === role ? "" : `(${describeBinding(route)} 세션으로 확인)`}.`);
+      }
       const current = this.core.dependencies.database.getTopic(topicId);
       if (current.state !== "DRAFT" || current.scopeGeneration !== generation) {
         throw new Error("세션을 확인하는 동안 합의가 시작되었거나 범위가 바뀌었습니다.");
       }
-      if (this.core.dependencies.database.participantSessionInUse(topicId, role, input.sessionId)) {
+      if (this.core.dependencies.database.participantSessionInUse(topicId, route.provider, input.sessionId)) {
         throw new Error("이 에이전트 세션은 다른 주제에서 이미 사용 중입니다.");
       }
+      // 같은 공급자가 두 좌석을 맡아도 좌석 세션은 역할마다 따로다(E2b) — 다른 좌석이 쓰는 같은 공급자의 세션을 이 좌석에 붙이지 않는다.
+      // 공급자가 다르면 세션 이름공간이 달라 겹쳐도 같은 대화가 아니다(E2b 이전과 같다).
+      const shared = current.participants.find((item) => item.role !== role && item.sessionId === input.sessionId
+        && (this.core.dependencies.database.participantBinding(topicId, item.role) ?? legacyBinding(item.role)).provider === route.provider);
+      if (shared) throw new Error(`이 ${route.provider} 세션은 이 주제의 ${shared.role} 좌석이 쓰고 있습니다 — 역할마다 다른 세션을 연결하세요.`);
       participant = { role, sessionId: input.sessionId, mode: "attached", acknowledgedPlanSHA256: null };
+      binding = bindingOf(route);
     } else {
+      // pending 새 세션은 바인딩 없이 둔다 — 첫 턴이 세션을 만들 때 그 경로의 바인딩을 함께 저장한다(core.turn).
       participant = { role, sessionId: `pending:${randomUUID()}`, mode: "created", acknowledgedPlanSHA256: null };
     }
-    this.core.dependencies.database.upsertParticipant(topicId, participant);
+    this.core.dependencies.database.upsertParticipant(topicId, participant, binding);
     this.core.event(topicId, "system", "system", `${role} ${input.mode === "new" ? "새" : "기존"} 세션을 연결했습니다.`, {
       role, mode: input.mode,
       ...(requestKey ? { requestKey, requestAction: `participant:${role}` } : {}),
@@ -203,6 +227,7 @@ export class WorkflowEngine {
       this.core.assertNoActiveWork(topicId);
       const topic = db.getTopic(topicId);
       db.planning.assertMigration(topic, input);
+      this.assertClaudePlanningMigration(topic, input.sessionId);
       if (db.participantSessionInUse(topicId, "claude", input.sessionId)) throw new Error("Session belongs to another topic.");
       return JSON.stringify([topic, db.getFlags(topicId), db.getTimeline(topicId).at(-1)?.sequence]);
     };
@@ -233,6 +258,33 @@ export class WorkflowEngine {
     return { version: db.planning.policyVersion(topicId), validated: true, applied: input.apply, ...input };
   }
 
+  // 옛 Claude 계획 이관은 Claude 전용 복구 경로다 — 중단 출력의 Claude init 행으로 세션·worktree 를 확인하고 Claude 어댑터로 세션을 검증한다(E2b).
+  // 계획자가 다른 공급자로 배정됐으면 이 세션을 Claude 로 이어 갈 수 없고, 좌석 세션의 바인딩이 계획자 경로와 다르면 이관 뒤 계획 턴이
+  // 연속성 정책으로 그 세션을 이어 쓰지 못하고 멈춘다(core.reboundSeatSession) — 둘 다 이관 전에 구체적 사유로 거부한다.
+  private assertClaudePlanningMigration(topic: Topic, sessionId: string): void {
+    const route = this.seatRoute(topic, SEAT_JOB.claude);
+    if (route.provider !== "claude") {
+      throw Object.assign(new Error(`중단된 첫 계획 이관은 Claude 전용 복구 경로입니다 — 계획자(planner/plan)가 ${describeBinding(route)} 로 배정돼 있어 `
+        + "Claude 세션으로 이어 갈 수 없습니다. 배정을 Claude 로 되돌린 뒤 이관하세요."), { statusCode: 409 });
+    }
+    const seat = this.core.dependencies.database.participantBinding(topic.id, "claude") ?? legacyBinding("claude");
+    if (!sameBinding(seat, route)) {
+      throw Object.assign(new Error(`계획자 좌석 세션 ${sessionId}(${describeBinding(seat)})은 현재 계획자 경로 ${describeBinding(route)} 와 공급자·참여자가 달라 `
+        + "이관해도 계획 턴이 이어 쓸 수 없습니다. 배정을 그 세션의 것으로 되돌린 뒤 이관하세요."), { statusCode: 409 });
+    }
+  }
+
+  // 좌석 세션을 확인할 공급자(E2b) — 좌석 대표 job 의 배정을 따른다. 배정이 실행할 수 없으면(프로필 없음·설정 오류) 어느 공급자의 세션인지 정할 수 없어
+  // 409 로 거부한다(추측해 다른 공급자로 확인하지 않는다).
+  private seatRoute(topic: Topic, job: TurnJob): TurnRoute {
+    try {
+      return resolveRoute(this.core.dependencies.database, topic, job);
+    } catch (error) {
+      if (!(error instanceof UnsupportedRoute)) throw error;
+      throw Object.assign(new Error(`${error.message} 좌석 세션을 어느 공급자로 확인할지 정할 수 없습니다 — 배정을 고친 뒤 다시 시도하세요.`), { statusCode: 409 });
+    }
+  }
+
   assertBudgetEditable(topicId: string): void { this.core.assertNoActiveWork(topicId); }
 
   startPlan(topicId: string, actionId?: string): string {
@@ -240,7 +292,28 @@ export class WorkflowEngine {
     this.core.assertNotShuttingDown();
     this.core.assertNoActiveWork(topicId);
     this.core.requireState(topicId, "DRAFT");
+    this.assertStageContextCurrent(topicId);
+    this.ensureInheritedDecisions(topicId);
     return this.core.startAction(topicId, "plan", (signal) => this.planning.runPlanningLoop(topicId, signal), actionId);
+  }
+
+  // 작업 묶음 단계가 이어받는 결정(선행 단계 동결 결과의 사용자 결정 원문)을 현재 범위 세대 타임라인에 싣는다(E4 보완 F012·F013). 계획 시작 경계(DRAFT,
+  // 턴 전)에서 이 세대에 아직 없는 것만 멱등으로 적재한다 — 생성 직후 첫 계획과 범위 변경(새 세대) 뒤 첫 계획이 같은 한 경로를 지나고, 적재가 중간에
+  // 끊겨도 다음 경계가 빠진 것만 채운다. 원문은 기존 프롬프트 타임라인(현재 세대)·결정 원문 산출물·참조 페이지 경로가 그대로 전달한다.
+  private ensureInheritedDecisions(topicId: string): void {
+    const db = this.core.dependencies.database;
+    const group = db.workGroups.forTopic(topicId);
+    if (!group) return;
+    const stageId = Object.entries(group.links).find(([, link]) => link.topicId === topicId)![0];
+    const topic = db.getTopic(topicId);
+    const present = new Set(db.getScopedTimeline(topicId, topic.scopeGeneration).flatMap(event => {
+      const inherited = event.payload?.inheritedDecision as { topicId?: unknown; sequence?: unknown } | undefined;
+      return inherited && typeof inherited.topicId === "string" && typeof inherited.sequence === "number" ? [`${inherited.topicId}\0${inherited.sequence}`] : [];
+    }));
+    for (const entry of db.workGroups.inheritedDecisions(group, stageId)) {
+      if (present.has(`${entry.decision.topicId}\0${entry.decision.sequence}`)) continue;
+      db.appendEvent({ topicId, state: topic.state, ...db.workGroups.inheritedDecisionEvent(group.id, entry) });
+    }
   }
 
   startImplementation(topicId: string, actionId?: string, kickoffDecision?: string): string {
@@ -292,6 +365,7 @@ export class WorkflowEngine {
     // 상태를 바꾸기 전에 다른 작업(실행·범위 변경·인도)이 없는지 본다 — 아래 사다리 일부는 startAction 전에 전이하므로,
     // 잠금을 startAction 에서 뒤늦게 만나면 상태만 바뀐 채 고착된다(Codex 후속 지적 2).
     this.core.assertNoActiveWork(topicId);
+    this.assertStageContextCurrent(topicId);
     const topic = this.core.dependencies.database.getTopic(topicId);
     const flags = this.core.dependencies.database.getFlags(topicId);
     const resume = flags.resumeState;
@@ -321,6 +395,16 @@ export class WorkflowEngine {
       && interruption?.payload?.resumeState === resume) {
       // Budget pauses resume the exact infrastructure stage, without consuming a product decision or resetting the plan.
       topic = this.core.dependencies.database.updateTopic(topicId, {state:"FAILED"});
+    }
+    // 감사·종결이 결정을 청하며 읽기 의무(결정 뒤로 미룬 이연 읽기·필수 미완독)를 남기고 열어 둔 계획 제어 체크포인트면 같은 단계로 재개한다(host-review
+    // 39d21df9 F007). 전이표는 USER_DECISION_REQUIRED → 감사·종결을 막아 아래 사다리가 개정으로 내려갔는데, 개정은 planningStep 을 뺀 저장 결과를 소비하고
+    // 계획 제어 체크포인트는 같은 단계에서만 이어져 요청한 자료가 끝내 전달되지 않았다. 예산 정지와 같은 FAILED 경유로 사다리가 그 단계 재개
+    // (resumePlanningAtAudit·resumePlanningAtCloseout)를 고르게 한다 — 재개된 턴은 guardedPlanning 이 같은 체크포인트(같은 admission·세션·epoch)를 이어,
+    // 결정이 왔으면 대기 읽기를 싣고 그 단계 결과를 채택한 뒤 다음 단계로 가고, 결정이 없으면 저장된 질문을 돌려줘 다시 멈춘다(모델 호출 없음).
+    // 판정은 planning.openReadObligation 하나(계획·개정의 재사용 판정과 공유)다 — 의무가 없는 일반 결정 멈춤은 종전대로 개정이 결정을 소비한다.
+    if (topic.state === "USER_DECISION_REQUIRED" && (resume === "CODEX_AUDIT" || resume === "CODEX_CLOSEOUT") &&
+        this.planning.openReadObligation(topicId, resume)) {
+      topic = this.core.dependencies.database.updateTopic(topicId, { state: "FAILED" });
     }
     // 계획 변경 진단(적용됨·개정 저장 전)은 멈춘 단계와 무관하게 진단 계획 개정 턴으로 간다 — 옛 승인 계획으로의 구현 재개나 전체 재계획
     // (restartPlanning)으로 새지 않는다. 한도 정지(재작성·리뷰·예산) 검사는 위에서 이미 거쳤다(한도는 초기화·추가 승인하지 않는다).
@@ -466,6 +550,7 @@ export class WorkflowEngine {
     this.core.diagnoses.assertResumable(topicId, "구현 시작(implement)");
     assertImplementationGate(this.core.dependencies.database.getTopic(topicId));
     this.core.dependencies.database.evidence.assertReady(this.core.dependencies.database.getTopic(topicId));
+    this.assertStageContextCurrent(topicId);
   }
 
   // 승인의 검사 — approve 와 재개 정보가 같은 함수를 쓴다(엔진 개편 E1).
@@ -478,6 +563,7 @@ export class WorkflowEngine {
     if (!bothAgentsAcknowledged(topic.participants, planSHA256)) {
       throw new Error("두 에이전트가 같은 계획 해시를 ACK하지 않았습니다.");
     }
+    this.assertStageContextCurrent(topicId);
   }
 
   // 중재자 인계용 재개 정보(엔진 개편 E1, plan §2.5 "재개 정보 조회") — 어느 중재자가 읽어도 같은 사실과 같은 다음 작업을 돌려준다.
@@ -537,7 +623,7 @@ export class WorkflowEngine {
         revision: db.revisions.account(topicId), revisionPaused: this.revisionPaused(topicId),
         reviews: [db.reviews.account(topicId, "planning"), db.reviews.account(topicId, "implementation")], reviewPaused: this.reviewPaused(topicId),
       },
-      nextActions: this.nextActions(topicId),
+      nextActions: await this.nextActions(topicId),
       locations: { worktreePath: topic.worktreePath, repositoryPath: topic.repositoryPath, planPath: planArtifact?.path ?? null },
     };
   }
@@ -637,7 +723,11 @@ export class WorkflowEngine {
     try { check(); return null; } catch (error) { return error instanceof Error ? error.message : String(error); }
   }
 
-  nextActions(topicId: string): ResumeAction[] {
+  private async asyncBlocker(check: () => Promise<unknown>): Promise<string | null> {
+    try { await check(); return null; } catch (error) { return error instanceof Error ? error.message : String(error); }
+  }
+
+  async nextActions(topicId: string): Promise<ResumeAction[]> {
     const db = this.core.dependencies.database;
     const topic = db.getTopic(topicId);
     const flags = db.getFlags(topicId);
@@ -646,6 +736,7 @@ export class WorkflowEngine {
     if (topic.state === "DRAFT") {
       actions.push({ action: "plan", blocker: this.blocker(() => {
         this.core.assertNotShuttingDown(); this.core.assertNoActiveWork(topicId); this.core.requireState(topicId, "DRAFT");
+        this.assertStageContextCurrent(topicId);
       }) });
     } else if (INTERRUPTED_STATES.has(topic.state)) {
       if (topic.state === "USER_DECISION_REQUIRED") actions.push({ action: "message:decision", blocker: null });
@@ -671,8 +762,15 @@ export class WorkflowEngine {
       const deferredChecks = ["리뷰 질문 답변 확인", "작업 트리가 최종 리뷰 스냅샷과 같은지", "전달 잠금"];
       actions.push({ action: "commit", input: { message: null, paths: null }, blocker: deliverable("커밋(commit)"), deferredChecks });
       if (flags.committedOID && flags.pushedOID !== flags.committedOID) actions.push({ action: "push", blocker: deliverable("푸시(push)"), deferredChecks });
-      actions.push({ action: "close", blocker: this.blocker(() => this.closePreconditions(topicId)) });
+      // 묶음 단계는 closeStage 의 결과 확인(git)까지 같은 함수로 판정한다.
+      actions.push({ action: "close", blocker: db.workGroups.forTopic(topicId)
+        ? await this.asyncBlocker(async () => { this.closePreconditions(topicId); await this.stageCloseResult(topicId, { freeze: false }); })
+        : this.blocker(() => this.closePreconditions(topicId)) });
     } else if (topic.state === "CLOSED") {
+      // 닫힌 작업 묶음 단계의 동결 결과 전달(E4 보완 F002) — 확정 커밋이 아직 push 되지 않았거나 결과 불명확 push 가 남았으면 push 를 싣는다.
+      if (db.workGroups.forTopic(topicId) && ((flags.committedOID && flags.pushedOID !== flags.committedOID) || db.unknownDeliveryAction(topicId))) {
+        actions.push({ action: "push", blocker: this.blocker(() => { this.core.assertNotShuttingDown(); this.delivery.closedStagePushPreconditions(topicId); }) });
+      }
       actions.push({ action: "archive", blocker: this.blocker(() => { this.core.assertNotShuttingDown(); this.core.assertNoActiveWork(topicId); }) });
     }
     return actions;
@@ -685,9 +783,133 @@ export class WorkflowEngine {
     return updated;
   }
 
+  // 작업 묶음에 연결되지 않은 주제의 닫기. 묶음 단계는 결과 커밋 검증(git)과 결과 동결이 필요해 closeStage 로만 닫는다 — 동기 경로로 닫으면
+  // 동결 기록 없이 CLOSED 가 되어 다음 단계가 이 결과를 승계할 수 없다(엔진 개편 E4, plan §3.3).
   close(topicId: string): Topic {
     this.closePreconditions(topicId);
+    if (this.core.dependencies.database.workGroups.forTopic(topicId)) {
+      throw new Error("작업 묶음 단계는 결과 커밋을 확인하고 결과를 동결해야 닫을 수 있습니다(closeStage).");
+    }
     return this.core.transition(topicId, "CLOSED", "주제를 닫았습니다.");
+  }
+
+  // 닫기(API 경로) — 묶음 단계면 검증된 로컬 커밋(HEAD==committedOID·clean·커밋 트리==리뷰 트리·기준의 후손)과 합류 대상·통합의 조상 관계를 확인하고
+  // 결과를 동결한 뒤 닫는다. push 는 요구하지 않는다: 원격 전달은 단계 착수와 분리된 상태이고, 닫힌 단계의 동결 결과는 따로 push 한다(plan §3.3, E4 보완
+  // F002). git 경계 뒤 사전 검사를 다시 하고, 그 사이 커밋이 바뀌었으면 거부한다. 동결은 전이보다 먼저 쓰고(전이 실패 뒤 재시도는 닫히기 전이라 교체), 닫힌
+  // 뒤에는 바뀌지 않는다. 변경 없이 검증한 통합은 리뷰한 기준 커밋을 확정 커밋으로 CLOSED 전이와 한 transaction 에 기록한다 — 전달 계약(push)이 이
+  // 커밋을 싣는다(F003).
+  async closeStage(topicId: string): Promise<Topic> {
+    const db = this.core.dependencies.database;
+    this.closePreconditions(topicId);
+    const group = db.workGroups.forTopic(topicId);
+    if (!group) return this.core.transition(topicId, "CLOSED", "주제를 닫았습니다.");
+    if (this.stageClosing.has(topicId)) throw new Error("이미 단계를 닫고 있습니다.");
+    this.stageClosing.add(topicId);
+    try {
+      const record = await this.stageCloseResult(topicId, { freeze: true });
+      this.closePreconditions(topicId);
+      const flags = db.getFlags(topicId);
+      if ((flags.committedOID ?? null) !== record.committedOID) throw new Error("단계를 확인하는 동안 결과 커밋이 바뀌었습니다. 다시 닫아 주세요.");
+      db.workGroups.freezeResult(record.groupId, record.result, { replaceUnclosed: true });
+      return this.core.transitionWith(topicId, "CLOSED", "주제를 닫았습니다.", record.committedOID === null
+        ? { changes: { committedOID: record.result.commitOID }, payload: { verifiedBaseResult: record.result.commitOID } } : {});
+    } finally {
+      this.stageClosing.delete(topicId);
+    }
+  }
+
+  // 묶음 단계 닫기의 결과 확인과 동결 기록. freeze:false(재개 정보의 close 판정)는 DB 를 쓰지 않는다 — E4 전 닫힌 선행 단계도 검증만 한다.
+  // freeze:true(closeStage)는 선행 결과 해석(resolvePriorResults)이 안전한 legacy 결과를 동결한다(F005: 이미 열린 legacy 통합도 새 next 없이 닫힌다).
+  private async stageCloseResult(topicId: string, options: { freeze: boolean }): Promise<{ groupId: string; committedOID: string | null; result: StageResult }> {
+    const { database: db, git } = this.core.dependencies;
+    const group = db.workGroups.forTopic(topicId);
+    const stage = group?.stages.find(candidate => group.links[candidate.id]?.topicId === topicId);
+    if (!group || !stage) throw new Error("작업 묶음 단계를 찾을 수 없습니다.");
+    const link = group.links[stage.id];
+    const topic = db.getTopic(topicId), flags = db.getFlags(topicId);
+    const integration = stage.kind === "integration";
+    const head = await git.head(topic.worktreePath);
+    if ((await git.changedPaths(topic.worktreePath)).length) throw new Error("작업 트리에 커밋하지 않은 변경이 있어 단계를 닫을 수 없습니다.");
+    let commitOID: string;
+    if (flags.committedOID) {
+      if (head !== flags.committedOID) throw new Error("작업 트리 HEAD 가 단계 결과 커밋과 다릅니다 — 검증된 로컬 커밋에서만 닫습니다.");
+      if (!flags.reviewedTreeOID) throw new Error("리뷰한 트리 기록이 없어 단계 결과를 승계할 수 없습니다.");
+      if ((await git.diffTrees(topic.worktreePath, flags.committedOID, flags.reviewedTreeOID)).files.length) {
+        throw new Error("단계 결과 커밋의 트리가 리뷰한 트리와 다릅니다.");
+      }
+      commitOID = flags.committedOID;
+    } else if (integration && !link.preparedMerge && head === link.baseOID) {
+      // 변경 없이 검증만 한 통합 단계 — 기준 커밋이 곧 결과다. 다만 "변경 없음" 도 리뷰가 확인한 사실이어야 한다(F004): 리뷰 HEAD 가 기준 커밋이고 리뷰한
+      // 작업 트리가 기준 커밋 트리와 같을 때만. 리뷰한 수정을 커밋하지 않고 되돌린 작업 트리는 리뷰한 결과가 아니다.
+      if (!flags.reviewedTreeOID || flags.reviewedHead !== head) {
+        throw new Error("변경 없는 통합 결과를 리뷰한 기록(리뷰 HEAD·리뷰 트리)이 없어 단계를 닫을 수 없습니다.");
+      }
+      if ((await git.diffTrees(topic.worktreePath, head, flags.reviewedTreeOID)).files.length) {
+        throw new Error("리뷰한 작업 트리에 변경이 있었습니다 — 리뷰한 변경을 커밋해야 통합 결과로 닫을 수 있습니다(되돌린 기준 커밋은 리뷰한 결과가 아닙니다).");
+      }
+      commitOID = head;
+    } else {
+      throw new Error("다음 단계로 넘어가려면 먼저 검증된 결과를 커밋하세요.");
+    }
+    if (!await git.isAncestor(topic.worktreePath, link.baseOID, commitOID)) throw new Error("단계 결과 커밋이 단계 기준 커밋의 후손이 아닙니다.");
+    // 합류 대상(기준에 모이지 않은 선행 결과)과 통합(다른 모든 단계 결과)은 결과 커밋의 조상이어야 한다 — 필요한 선행 결과가 실제로 포함됐는지 확인한다.
+    // 선행 결과는 어댑터와 같은 해석 함수로 얻는다: 동결 결과는 승계 검사, E4 전 닫힌 단계는 이전 계약 증거(F005·F009 같은 계약).
+    const resolution = await resolvePriorResults(db, git, group.id, stage.id, { freeze: options.freeze });
+    const proofs = new Map([...resolution.proof, ...resolution.unfrozen].map(proof => [proof.stageId, proof]));
+    const required = integration ? group.stages.filter(other => other.id !== stage.id).map(other => other.id) : link.mergeTargets ?? [];
+    for (const id of required) {
+      const prior = proofs.get(id);
+      if (!prior) throw new Error(`단계 ${id} 의 결과를 확인할 수 없어 ${integration ? "통합" : "합류"}을 확인할 수 없습니다.`);
+      if (!await git.isAncestor(topic.worktreePath, prior.commit, commitOID)) {
+        throw new Error(`단계 ${id} 의 결과 커밋이 이 단계 결과에 포함되지 않았습니다(${integration ? "통합" : "합류"} 대상).`);
+      }
+    }
+    if (!topic.approvedPlanSHA256) throw new Error("승인된 계획이 없어 단계 결과를 동결할 수 없습니다.");
+    const timeline = db.getTimeline(topicId);
+    // 이 단계에서 실제로 쓴 위키 문서(경로별 마지막 기록 버전) — 통합 단계가 기록 버전과 당시 버전을 대조한다.
+    const memory = new Map<string, string>();
+    for (const event of timeline) {
+      const changes = event.payload?.memoryChanges;
+      if (!Array.isArray(changes)) continue;
+      for (const change of changes as Array<{ path?: unknown; sha256?: unknown; status?: unknown }>) {
+        if (change.status === "written" && typeof change.path === "string" && typeof change.sha256 === "string") memory.set(change.path, change.sha256);
+      }
+    }
+    const result: StageResult = {
+      stageId: stage.id, topicId, baseOID: link.baseOID, commitOID,
+      reviewedTreeOID: flags.reviewedTreeOID ?? "", planSHA256: topic.approvedPlanSHA256,
+      evidenceDigest: db.evidence.topic(topic).digest ?? null,
+      verifications: (db.verificationRecords(topicId) as Array<{ id?: unknown; status?: unknown }>)
+        .filter(record => typeof record.id === "string" && typeof record.status === "string")
+        .map(record => ({ id: record.id as string, status: record.status as string })),
+      memoryChanges: [...memory].map(([path, sha256]) => ({ path, sha256 })).sort((a, b) => a.path.localeCompare(b.path)),
+      openQuestions: (group.questions ?? []).filter(question => !question.resolution && (question.stageId === stage.id || question.stageId === null))
+        .map(question => `${question.id}: ${question.text}`),
+      // 실제 보류 원장(deferred-findings 산출물) — 재개 판정의 열린 지적(resumeFindings.open)은 DEFERRED_OUT_OF_SCOPE 를 빼므로 쓰지 않는다(F007).
+      deferredFindings: await this.core.deferredFindingsOf(topicId),
+      // 현재 범위 세대의 사용자 결정 원문 전부(F012·F013) — 개수·길이로 자르지 않고, 과거 세대 결정과 절차 기록은 넣지 않는다.
+      decisions: stageDecisions(db.getScopedTimeline(topicId, topic.scopeGeneration), topicId),
+      closedAt: new Date().toISOString(),
+    };
+    return { groupId: group.id, committedOID: flags.committedOID ?? null, result };
+  }
+
+  // 작업 묶음 단계가 외부 결정(사용자 결정·외부 근거)에 막혔는가 — 막힌 단계 옆에서 독립 준비 단계를 고를 수 있는 조건(plan §3.1, E4-6).
+  // 자원 정지(예산·재작성·리뷰·계획 제어·착수 거부)는 막힘이 아니다 — 재개 정보의 정지 분류(PAUSE_KEYS)와 같은 판정을 쓴다.
+  stageBlockedExternally(topicId: string): boolean {
+    const db = this.core.dependencies.database;
+    const topic = db.getTopic(topicId);
+    if (topic.state !== "USER_DECISION_REQUIRED" && topic.state !== "BLOCKED_ON_EVIDENCE") return false;
+    if (db.runningAction(topicId) || this.core.active.has(topicId)) return false;
+    const interruption = db.getTimeline(topicId).filter(event =>
+      event.scopeGeneration === topic.scopeGeneration && event.actor === "system" && event.payload?.resumeState).at(-1);
+    return !PAUSE_KEYS.some(key => Boolean(interruption?.payload?.[key]));
+  }
+
+  // 작업 묶음 단계의 문맥 결속(E4 — D2 재계획 대기·문맥 해시). 연결 단계가 아니면 통과한다. 상태를 전진시키는 동작(계획·구현 시작·승인·재시도·
+  // 구현 재개·닫기)이 모두 이 판정 하나를 쓴다.
+  private assertStageContextCurrent(topicId: string): void {
+    this.core.dependencies.database.workGroups.assertStageContextCurrent(topicId);
   }
 
   // close 의 부작용 전 검사 전부 — close 와 재개 정보가 같은 함수를 쓴다(엔진 개편 E1).
@@ -703,11 +925,8 @@ export class WorkflowEngine {
     const topic = this.core.dependencies.database.getTopic(topicId);
     if (topic.state !== "READY_TO_DELIVER") throw new Error("전달 준비가 끝난 주제만 닫을 수 있습니다.");
     this.core.diagnoses.assertDeliverable(topicId, "주제 닫기(close)");
-    const group=this.core.dependencies.database.workGroups.forTopic(topicId);
-    if(group && group.links[group.stages.at(-1)!.id]?.topicId!==topicId) {
-      const flags=this.core.dependencies.database.getFlags(topicId);
-      if(!flags.pushedOID || flags.pushedOID!==flags.committedOID)throw new Error("다음 단계로 넘어가려면 먼저 커밋과 푸시를 완료하세요.");
-    }
+    // 묶음 단계: 재계획 대기·문맥 변경 중에는 닫지 않는다(닫기는 결과를 동결해 다음 단계로 승계하는 길이다). 결과 커밋 검증은 closeStage 가 한다.
+    this.assertStageContextCurrent(topicId);
   }
 
   // 전달(commit/push/처분) API는 DeliveryPipeline에 위임한다.
@@ -811,6 +1030,7 @@ export class WorkflowEngine {
   // 구현 계속 재개 — 리뷰 한도·실패로 멈춘 토픽의 resume 을 IMPLEMENTING 으로 되돌린다(같은 세션·같은 계획, 리뷰 소비량 불변). 그 뒤 retry.
   resumeImplementation(topicId: string, input: ResumeImplementationInput, origin?: CallOrigin): Topic {
     this.core.assertNoActiveWork(topicId);
+    this.assertStageContextCurrent(topicId);
     this.core.diagnoses.assertResumable(topicId, "구현 재개(resume-implementation)");
     this.core.diagnoses.assertNoPlanRevision(topicId, "구현 재개(resume-implementation)");
     const db = this.core.dependencies.database;
@@ -941,7 +1161,8 @@ export class WorkflowEngine {
     return this.core.dependencies.database.getTopic(topicId);
   }
 
-  async handleScopeChange(topicId: string, body: string, requestKey?: string, origin?: CallOrigin): Promise<Topic> {
+  // 범위 변경의 부작용 전 검사 — handleScopeChange 와 작업 묶음 개정의 사전 검사(저장 전, E4 D2 ①)가 같은 함수를 쓴다.
+  assertScopeChangeAllowed(topicId: string): Topic {
     if (this.core.deliveryActive.has(topicId)) throw new Error("커밋 또는 push가 끝난 뒤 범위를 바꿔 주세요.");
     if (this.core.dependencies.database.unknownDeliveryAction(topicId)) {
       // 미확정 commit/push 확인은 git await 사이에 낀다. 그 사이 세대가 올라가면 이전 세대의 OID가
@@ -957,6 +1178,11 @@ export class WorkflowEngine {
     if (!SCOPE_CHANGE_ALLOWED_STATES[topic.state]) {
       throw new Error(`${topic.state} 상태에서는 범위를 바꿀 수 없습니다.`);
     }
+    return topic;
+  }
+
+  async handleScopeChange(topicId: string, body: string, requestKey?: string, origin?: CallOrigin): Promise<Topic> {
+    const topic = this.assertScopeChangeAllowed(topicId);
     this.core.scopeChangeActive.add(topicId);
     // 범위 변경은 새 사건이다 — 예약된 자동 재시도와 그 지속 상태를 지운다(잠금 중 발화하면 fire 가 건너뛴다).
     this.usageLimitRetry.reset(topicId);
@@ -970,6 +1196,15 @@ export class WorkflowEngine {
         const stem = basename(topic.worktreePath).replace(/-g\d+(?:-[a-f0-9]+)?$/, "");
         worktreePath = join(dirname(topic.worktreePath), `${stem}-g${nextGeneration}-${randomUUID().slice(0, 6)}`);
         await this.core.dependencies.git.createDetachedWorktree(topic.repositoryPath, worktreePath, topic.baseRef);
+        // 합류 병합을 준비한 작업 묶음 단계는 새 작업 트리에도 같은 준비를 다시 적용한다(E4 보완 F001) — 기준에서 새로 만든 트리에는 병합 내용이 없어,
+        // 그대로 두면 인도 병합 커밋이 합류 대상을 부모로 삼으면서 그 내용을 빠뜨린다. 같은 기준·대상이면 같은 트리가 나와야 한다.
+        const stageGroup = this.core.dependencies.database.workGroups.forTopic(topicId);
+        const stageLink = stageGroup ? Object.values(stageGroup.links).find(link => link.topicId === topicId) : undefined;
+        if (stageLink?.preparedMerge) {
+          const prepared = await this.core.dependencies.git.prepareMerge(worktreePath, stageLink.baseOID,
+            stageLink.preparedMerge.targets.map(target => target.commitOID));
+          if (prepared.tree !== stageLink.preparedMerge.tree) throw new Error("새 작업 트리의 합류 병합 준비가 단계에 기록된 병합 트리와 다릅니다. 새로 만든 worktree는 보존했습니다.");
+        }
         const current = this.core.dependencies.database.getTopic(topicId);
         if (current.scopeGeneration !== topic.scopeGeneration || current.state !== topic.state) {
           throw new Error("범위를 바꾸는 동안 주제 상태가 달라졌습니다. 새로 만든 worktree는 보존했습니다.");
@@ -980,8 +1215,13 @@ export class WorkflowEngine {
       // 강한 격리: 범위가 실제로 바뀌면 두 에이전트 세션도 새로 만든다. --resume으로 이어지는 세션 기억이
       // 이전 범위의 대화를 그대로 갖고 있기 때문이다. 계획만 무효화하는 note/evidence 경로는 세션을 유지한다.
       const previousSessions: Record<string, string> = {};
+      // 좌석 세션을 만든 공급자·근거도 남긴다(E2b) — 참여자 초기화(pending 세션)와 구현 세션 비우기 때 DB 가 바인딩도 함께 비우므로 이 이벤트가 남는 기록이다.
+      // pending 세션은 아직 공급자가 정해지지 않았으므로 null.
+      const previousBindings: Record<string, SessionBinding | null> = {};
       const resetParticipants = topic.participants.map((participant) => {
         previousSessions[participant.role] = participant.sessionId;
+        previousBindings[participant.role] = participant.sessionId.startsWith("pending:") ? null
+          : this.core.dependencies.database.participantBinding(topicId, participant.role);
         return {
           role: participant.role,
           sessionId: `pending:${randomUUID()}`,
@@ -1034,6 +1274,7 @@ export class WorkflowEngine {
               previousPushedOID: previous.pushedOID,
               previousOrphanCommitOID: previous.orphanCommitOID,
               previousSessions,
+              previousBindings,
               ...(origin ? { origin } : {}),
               ...(requestKey ? { requestKey, requestAction: "message:scope_change" } : {}),
             }),
@@ -1051,4 +1292,15 @@ export class WorkflowEngine {
       this.core.scopeChangeActive.delete(topicId);
     }
   }
+}
+
+// 단계 결과에 넘길 사용자 결정(E4 보완 F012·F013) — 한 범위 세대의 사용자 결정 이벤트 원문 전부. 엔진 절차 기록(인도 동작·허용 오차 개정·구현 재개·승계 결정
+// 사본·승인 기록)은 뺀다. 승인 기록은 planSHA256 만 싣는다(승인 대기 중 메시지의 계획 무효화는 invalidatedPlanSHA256 을 함께 싣는 사용자 결정이다).
+const PROCEDURAL_DECISION_KEYS = ["deliveryAction", "toleranceAmendment", "implementationResume", "inheritedDecision"] as const;
+function stageDecisions(events: readonly TimelineEvent[], topicId: string): StageDecision[] {
+  return events.filter(event => event.actor === "user" && event.kind === "decision"
+    && !PROCEDURAL_DECISION_KEYS.some(key => event.payload?.[key] !== undefined)
+    && !(event.payload?.planSHA256 !== undefined && event.payload?.invalidatedPlanSHA256 === undefined))
+    .map(event => ({ topicId, sequence: event.sequence, scopeGeneration: event.scopeGeneration,
+      sha256: createHash("sha256").update(event.body, "utf8").digest("hex"), body: event.body }));
 }

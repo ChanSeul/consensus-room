@@ -5,7 +5,7 @@ import { RevisionBlocked } from "../revisionLedger.js";
 import type { RewriteKind } from "../../shared/revisions.js";
 import { wrapWorkGroupAdapter } from "../workGroupAdapter.js";
 import { BudgetController } from "../budgetController.js";
-import { PlanningPaused } from "../../shared/planningControl.js";
+import { PlanningPaused, type TimelineDelivery } from "../../shared/planningControl.js";
 import { BudgetBlocked } from "../budgetLedger.js";
 import { applyPlanLineEdits, applyPlanRepair, planRepairPrompt, repairablePlan } from "../../shared/planPatches.js";
 // WorkflowEngine 분해(2026-08-31): 상태 전환·세션·산출물·메모리·전달이 한 클래스(1,504줄)에 있어
@@ -30,6 +30,10 @@ import {
   ImplementationNotesSchema,
 } from "../../shared/contracts.js";
 import { appliedExecutionSettings } from "../../shared/execution.js";
+import { turnFlags, type TurnJob } from "../../shared/roles.js";
+import { planningControlApplies } from "../guardedPlanning.js";
+import { bindingOf, describeBinding, designReadRequested, legacyBinding, resolveRoute, routeSupport, sameBinding, UnsupportedRoute,
+  type SessionBinding, type TurnRoute } from "../turnRouting.js";
 import {
   applyPlanEdits,
   assertFixDispositionAllowed,
@@ -89,6 +93,17 @@ export function conflict(message: string): Error & { statusCode: number } {
 }
 
 // 실패 진단이 프롬프트 크기만큼 원장에 들어가는 것을 막는다(감사 최적화 지적: 4~16KB 상한).
+// 재작성 집계 종류 — 계획자 job 의 계획 단계 턴이다(E2b: 공급자 이름이 아니라 job 역할로 판정 — 계획자가 다른 공급자로 가도 한도가 빠지지 않는다).
+function planningWriteOf(job: TurnJob, state: WorkflowState): RewriteKind | undefined {
+  if (job.role !== "planner") return undefined;
+  return state === "CLAUDE_PLAN" ? "plan" : state === "CLAUDE_REVISION" ? "revision" : undefined;
+}
+
+// 경로의 기록용 요약(E2b) — 이벤트 payload·사용량 기록에 싣는다. 이벤트 actor·산출물 kind·execution_usage.role 은 좌석 이름 그대로 둔다(과거 기록과 같은 키).
+function routeRecord(route: TurnRoute) {
+  return { provider: route.provider, participant: route.participant, profileId: route.profileId, basis: route.basis, job: route.job };
+}
+
 function boundedError(message: string): string {
   return message.length <= 16_000 ? message : `${message.slice(0, 16_000)}\n[이하 생략]`;
 }
@@ -96,6 +111,8 @@ function boundedError(message: string): string {
 const DEFERRED_SOURCE_LABEL: Record<DeferredFinding["source"], string> = {
   closeout: "종결 확인", review: "첫 코드 리뷰", "final-review": "최종 리뷰", implementation: "구현 to-do", fix: "수정 to-do",
 };
+// 계획·감사 턴의 이연 쟁점 원문 산출물 종류 — 토픽 자기 원장(deferred-findings)과 다른 종류다(원장은 이 토픽이 이연한 것만, 이것은 턴에 실은 전체).
+export const DEFERRED_FINDINGS_DIGEST = "deferred-findings-digest";
 
 type TransitionInput = Parameters<WorkflowDependencies["database"]["applyTopicTransition"]>[0];
 
@@ -164,9 +181,21 @@ export class EngineCore {
     if (checkpoint?.started && !checkpoint.finalized && checkpoint.stage === stage &&
         checkpoint.scopeGeneration === topic.scopeGeneration && checkpoint.planEpoch === topic.planEpoch && checkpoint.planSHA256 === topic.planSHA256) return;
     const review=reviewScope(stage??"");
-    if(review)this.dependencies.database.reviews.assertAvailable(topicId,review);
+    if(review && !this.heldReviewLedger(stage, topic))this.dependencies.database.reviews.assertAvailable(topicId,review);
     if(stage==="CLAUDE_PLAN" || stage==="CLAUDE_REVISION")
       this.dependencies.database.revisions.assertAvailable(topicId,stage==="CLAUDE_PLAN"?"plan":"revision");
+  }
+
+  // 재시도가 이어 쓸 코드 리뷰 원장(E3-4c)이 이미 리뷰 1회를 예약해 두었는가 — 가장 최근 원장이 판정 전(open)이고 그 호출이 spawn 해 예약이 원장에 묶였으며
+  // (spawn 뒤에는 spawn 전 실패로도 되돌리지 않는다), 리뷰 종류가 재개 단계와 같고 범위 세대·계획 epoch·계획 SHA 가 지금 주제와 같을 때만 참이다. 그러면
+  // 재시도의 읽기·판정 호출은 같은 원장 ID 로 멱등 예약해 새 1회를 쓰지 않으므로 가용 횟수 사전 검사를 건너뛴다. 여기서는 검토 tree·보고판을 보지 않는다 —
+  // 실행 경로가 원장 신원을 대조해(openReviewLedger) 달라졌으면 새 원장 ID 로 예약하고, 한도에 닿았으면 ReviewLedger.reserve 가 spawn 전에 막는다. 답변
+  // 확인·계약 교정처럼 원장 밖에서 호출마다 예약하는 턴과 예산 검사도 그대로 막힌다. 예산 강제가 꺼진 구성은 spawn 을 기록하지 않아 이 예외가 적용되지 않는다.
+  private heldReviewLedger(stage: string | null | undefined, topic: Topic): boolean {
+    const kind = stage === "CODEX_FINAL_REVIEW" ? "codex-final-review" : stage === "CODEX_REVIEW" ? "codex-review" : null;
+    const ledger = kind ? this.dependencies.database.planning.latestReviewLedger(topic.id) : null;
+    return Boolean(ledger && ledger.status === "open" && ledger.spawned && ledger.kind === kind &&
+      ledger.scopeGeneration === topic.scopeGeneration && ledger.planEpoch === topic.planEpoch && ledger.planSHA256 === topic.planSHA256);
   }
 
   // 서버 종료: 새 실행을 막고, 실행 중인 action 을 전부 중단(프로세스 그룹 SIGTERM→SIGKILL 은 runner 몫)한 뒤
@@ -291,12 +320,12 @@ export class EngineCore {
   // 개정본까지 매 턴 재전송된다 — 2026-08-31 실측: 개정 11 시점에 턴당 재전송 834,290토큰, 그중
   // StructuredOutput(과거 개정 계획 전문 누적) 695KB. 개정 턴이 15분→45분으로 늘고 429를 두 번 맞았다.
   // 만들어진 세션 ID는 participant에 저장하지 않는다 — 저장하면 다음 단계가 이 세션을 이어받는다.
+  // route 는 이 논리 턴의 경로(엔진 개편 E2b) — 좌석(세션 저장 키)·job(역할 정책)·실제 공급자·설정·선택 근거. core.route 로 만든다.
   async turn(
-    role: ParticipantRole,
+    route: TurnRoute,
     topic: Topic,
     prompt: string,
     signal: AbortSignal,
-    implementation: boolean,
     options: {
       freshSession?: boolean;
       planMode?: boolean;
@@ -307,6 +336,8 @@ export class EngineCore {
       readablePaths?: readonly string[];
       // prompt 가 이어 쓰는 세션 기준의 변경분일 때, 과제가 다른 세션으로 가면 쓸 전체 문맥 판(SessionTurn.freshSessionPrompt).
       freshSessionPrompt?: string;
+      // 두 판(prompt·freshSessionPrompt)의 타임라인 참조 descriptor(E3-2-2a) — 과제 문자열과 짝을 맞춰 턴에 싣는다.
+      timelineDelivery?: TimelineDelivery;
       normalize?: ResultNormalizer;
       planBase?: string;
       repairContextKey?: string;
@@ -317,46 +348,56 @@ export class EngineCore {
     } = {},
   ): Promise<AgentResult> {
     const { freshSession = false, planMode = false, check } = options;
+    const role = route.seat;
     const startedAfter = this.latestSequence(topic.id);
     this.turnInputSequence.set(topic.id, startedAfter);
     const participant = this.participant(topic, role);
-    const resumeSessionId = options.session ? options.session.id : participant.sessionId;
+    // 좌석 세션은 바인딩(공급자·참여자)이 이 경로와 같을 때만 이어 쓴다 — 다른 공급자 CLI 에 옛 resume id 를 보내지 않는다(E2b).
+    // 코드 리뷰처럼 호출자가 세션을 관리하면(options.session) 호출자가 같은 대조를 끝낸 id 를 넘긴다.
+    const seatSession = options.session ? null : this.reboundSeatSession(topic, route, participant);
+    const resumeSessionId = options.session ? options.session.id : seatSession;
     let executionId: string | undefined;
-    const observeUsage = this.usageObserver(topic.id, role, "턴");
+    const observeUsage = this.usageObserver(topic.id, route, "턴");
     const onUsage = (usage: TurnUsage) => { executionId = usage.executionId; observeUsage(usage); };
     let result: AgentResult;
     let sessionId: string;
     const evidenceDigest = this.dependencies.database.evidence.topic(topic).digest;
     const pending=await this.pendingRepair(topic.id,topic.state);
-    const reuse=pending && pending.role===role && pending.contextKey===(options.repairContextKey??null)
+    // 교정 대기본은 그 응답을 만든 공급자·참여자의 세션으로만 이어 쓴다(E2b — 배정이 바뀌었으면 다시 실행한다).
+    const reuse=pending && pending.role===role && sameBinding(pending.binding, route) && pending.contextKey===(options.repairContextKey??null)
       && (!options.session || options.session.id===pending.sessionId);
     if(reuse) {
       result=pending.raw;sessionId=pending.sessionId;
       this.event(topic.id,"system","system","저장된 응답의 교정을 같은 세션에서 재개합니다.");
     } else if (freshSession || !resumeSessionId || resumeSessionId.startsWith("pending:")) {
-      const planningWrite = options.planningWrite ?? (role==="claude" && topic.state==="CLAUDE_PLAN"?"plan":role==="claude"&&topic.state==="CLAUDE_REVISION"?"revision":undefined);
+      const planningWrite = options.planningWrite ?? planningWriteOf(route.job, topic.state);
       const created = await this.executor.execute({
         evidenceDigest,
-        role, topic, signal, purpose: "턴", inputSequence: startedAfter, expected: this.expectationOf(topic), write: implementation,
+        route, topic, signal, purpose: "턴", inputSequence: startedAfter, expected: this.expectationOf(topic),
         writeGuards: options.writeGuards,
         session: { mode: "create", onSessionCreated: id => {
           this.assertCurrent(topic.id,signal,topic.scopeGeneration,topic.state);
           if (options.session) options.session.persist(id);
           else if (!freshSession) {
-            if (this.dependencies.database.participantSessionInUse(topic.id,role,id)) throw new Error("세션 충돌");
-            this.dependencies.database.upsertParticipant(topic.id,{...participant,sessionId:id,acknowledgedPlanSHA256:null});
+            if (this.dependencies.database.participantSessionInUse(topic.id,route.provider,id)) throw new Error("세션 충돌");
+            this.dependencies.database.upsertParticipant(topic.id,{...participant,sessionId:id,acknowledgedPlanSHA256:null},bindingOf(route));
           }
         } },
-        prompt, freshSessionPrompt: options.freshSessionPrompt, implementation, planMode, planningWrite, readablePaths: options.readablePaths,
-        settings: this.executionSettings(topic.id, role, implementation), onUsage,
+        // 새 세션에는 전체 문맥 판을 보낸다 — 변경분(prompt)은 그것을 계산한 좌석 세션에서만 유효한데, 배정이 바뀌어 새 세션으로 돌리면(reboundSeatSession)
+        // 그 세션을 잇지 않는다(E2b, host-review 2fa1309 F-002: 새 검토자가 커서 이전의 결정·계획 문맥 없이 종결을 판단했다).
+        prompt: options.freshSessionPrompt ?? prompt, freshSessionPrompt: options.freshSessionPrompt, planMode, planningWrite, readablePaths: options.readablePaths,
+        // 새 세션에는 전체 판을 보내므로 descriptor 도 전체 판의 것을 과제 판으로 짝짓는다.
+        timelineDelivery: options.timelineDelivery && options.freshSessionPrompt !== undefined
+          ? { prompt: options.timelineDelivery.fresh, fresh: options.timelineDelivery.fresh } : options.timelineDelivery,
+        settings: route.settings, onUsage,
         // 결과 교정·새 입력 처리(채택 검사) 전에 저장해야 재시도가 같은 세션을 이어 쓸 수 있다.
         onResponse: (outcome) => {
           if (options.session) options.session.persist(outcome.sessionId);
           else if (!freshSession) {
-            if (this.dependencies.database.participantSessionInUse(topic.id, role, outcome.sessionId)) {
+            if (this.dependencies.database.participantSessionInUse(topic.id, route.provider, outcome.sessionId)) {
               throw new Error("새 에이전트 세션이 다른 주제 세션과 충돌했습니다.");
             }
-            this.dependencies.database.upsertParticipant(topic.id, { ...participant, sessionId: outcome.sessionId, acknowledgedPlanSHA256: null });
+            this.dependencies.database.upsertParticipant(topic.id, { ...participant, sessionId: outcome.sessionId, acknowledgedPlanSHA256: null }, bindingOf(route));
           }
         },
       });
@@ -366,19 +407,19 @@ export class EngineCore {
     } else {
       const resumed = await this.executor.execute({
         evidenceDigest,
-        role, topic, signal, purpose: "턴", inputSequence: startedAfter, expected: this.expectationOf(topic), write: implementation,
+        route, topic, signal, purpose: "턴", inputSequence: startedAfter, expected: this.expectationOf(topic),
         writeGuards: options.writeGuards,
         session: { mode: "resume", sessionId: resumeSessionId, onSessionCreated: id => {
           this.assertCurrent(topic.id, signal, topic.scopeGeneration, topic.state);
           if (options.session) options.session.persist(id);
           else {
-            if (this.dependencies.database.participantSessionInUse(topic.id, role, id)) throw new Error("세션 충돌");
-            this.dependencies.database.upsertParticipant(topic.id, { ...participant, sessionId: id, acknowledgedPlanSHA256: null });
+            if (this.dependencies.database.participantSessionInUse(topic.id, route.provider, id)) throw new Error("세션 충돌");
+            this.dependencies.database.upsertParticipant(topic.id, { ...participant, sessionId: id, acknowledgedPlanSHA256: null }, bindingOf(route));
           }
         } },
-        prompt, freshSessionPrompt: options.freshSessionPrompt, implementation, planMode,
-        planningWrite: options.planningWrite ?? (role==="claude" && topic.state==="CLAUDE_PLAN"?"plan":role==="claude"&&topic.state==="CLAUDE_REVISION"?"revision":undefined),
-        readablePaths: options.readablePaths, settings: this.executionSettings(topic.id, role, implementation), onUsage,
+        prompt, freshSessionPrompt: options.freshSessionPrompt, timelineDelivery: options.timelineDelivery, planMode,
+        planningWrite: options.planningWrite ?? planningWriteOf(route.job, topic.state),
+        readablePaths: options.readablePaths, settings: route.settings, onUsage,
       });
       result = resumed.result;
       sessionId = resumed.sessionId;
@@ -387,9 +428,9 @@ export class EngineCore {
     if (await this.interruptPreservingResult(topic, role, result, startedAfter, signal)) throw new HandledWorkflowInterruption();
     let accepted = false;
     try {
-      const checked = await this.enforceResultContract(role, topic, result, sessionId, {
+      const checked = await this.enforceResultContract(route, topic, result, sessionId, {
         evidenceDigest,
-        signal, implementation, planMode, startedAfter, check, readablePaths: options.readablePaths, normalize: options.normalize, planBase: options.planBase,
+        signal, planMode, startedAfter, check, readablePaths: options.readablePaths, normalize: options.normalize, planBase: options.planBase,
         writeGuards: options.writeGuards,
       });
       accepted = true;
@@ -398,7 +439,7 @@ export class EngineCore {
     } catch(error) {
       if(error instanceof RevisionBlocked || error instanceof ReviewBlocked || error instanceof BudgetBlocked) {
         await this.writeArtifact(topic,"pending-contract-repair",this.latestSequence(topic.id)+1,JSON.stringify({
-          role,stage:topic.state,scopeGeneration:topic.scopeGeneration,planEpoch:topic.planEpoch,planSHA256:topic.planSHA256,
+          role,binding:bindingOf(route),stage:topic.state,scopeGeneration:topic.scopeGeneration,planEpoch:topic.planEpoch,planSHA256:topic.planSHA256,
           participantSessionId:this.participant(this.dependencies.database.getTopic(topic.id),role).sessionId,
           sessionId,raw:redactAgentResult(result),contextKey:options.repairContextKey??null,startedAfter,evidenceDigest,
         }),signal);
@@ -415,7 +456,7 @@ export class EngineCore {
   }
 
   async pendingRepair(topicId:string,stage:string):Promise<{
-    role:ParticipantRole;stage:string;scopeGeneration:number;planEpoch:number;planSHA256:string|null;
+    role:ParticipantRole;binding:SessionBinding;stage:string;scopeGeneration:number;planEpoch:number;planSHA256:string|null;
     participantSessionId:string|null;sessionId:string;raw:AgentResult;contextKey:string|null;startedAfter:number;evidenceDigest:string;
   }|null> {
     const stored=await this.dependencies.artifacts.readLatest(topicId,"pending-contract-repair");
@@ -431,20 +472,21 @@ export class EngineCore {
     if(pending.role!=="claude" && pending.role!=="codex")throw new Error("교정 재개 기록의 역할이 올바르지 않습니다.");
     if(this.participant(topic,pending.role).sessionId!==pending.participantSessionId)return null;
     if(typeof pending.sessionId!=="string" || !pending.raw || !Number.isInteger(pending.startedAfter))throw new Error("교정 재개 기록이 올바르지 않습니다.");
-    return pending;
+    // 바인딩이 없는 옛 기록은 좌석의 기본 공급자가 만든 응답이다(E2b 이전).
+    return {...pending,binding:pending.binding ?? legacyBinding(pending.role)};
   }
 
   // 기계 계약 위반은 작업 실패가 아니라 표기 실패다. 턴을 버리면 그때까지의 작업 비용 전체가 소각되므로
   // (2026-09-01 S1.1: RESOLVED_BY_FIX 금지 하나로 1시간 구현 턴 폐기), 같은 세션에 거부 사유를 돌려주고
   // 한 번만 재제출받는다. 두 번째 위반은 그대로 던져 FAILED 경로로 보낸다 — 무한 교정은 다른 종류의 소각이다.
+  // route: 원 턴의 경로 — 교정 재제출·계획 교정은 원 턴의 세션을 이어 쓰므로 같은 공급자·설정으로 가고, job 만 교정 작업으로 바꾼다(E2b).
   async enforceResultContract(
-    role: ParticipantRole,
+    route: TurnRoute,
     topic: Topic,
     raw: AgentResult,
     sessionId: string,
     context: {
       signal: AbortSignal;
-      implementation: boolean;
       planMode: boolean;
       startedAfter: number;
       evidenceDigest: string;
@@ -459,6 +501,7 @@ export class EngineCore {
       beforeCorrection?: (raw: AgentResult, violation: string) => Promise<void>;
     },
   ): Promise<AgentResult> {
+    const role = route.seat;
     const evidence = this.dependencies.database.evidence.topic(this.dependencies.database.getTopic(topic.id));
     const evidenceDigest = context.evidenceDigest;
     if (!evidence.ready || evidence.digest !== evidenceDigest) {
@@ -483,9 +526,14 @@ export class EngineCore {
     if (this.dependencies.database.planning.enabled(topic.id) &&
         ["CLAUDE_PLAN", "CLAUDE_REVISION", "CODEX_AUDIT", "CODEX_CLOSEOUT"].includes(topic.state)) {
       const checkpoint = this.dependencies.database.planning.latest(topic.id);
-      if (checkpoint && checkpoint.stage === topic.state && checkpoint.role === role &&
+      if (checkpoint && checkpoint.stage === topic.state && checkpoint.role === route.provider &&
           checkpoint.scopeGeneration === topic.scopeGeneration && checkpoint.planEpoch === topic.planEpoch) {
         checkpoint.finalized = false; checkpoint.finalResult = undefined;
+        // 무효화한 응답은 결정 질문이어도 재생할 질문이 아니다 — 결정 대기 표식(awaitingDecision)을 함께 내려 이 체크포인트를 교정 대기로만 둔다
+        // (E3 후속 리뷰 F008). 남겨 두면 새 입력 없는 retry 가 guardedPlanning 의 질문 재생 분기에서 거절된 응답을 그대로 돌려줘 같은 거절을 끝없이
+        // 되풀이하고 교정 호출에 닿지 못한다. 무효화 상태는 여기 한 곳이 정하고 재생 분기에 예외를 두지 않는다. 같은 체크포인트(같은 admission·세션)를
+        // 이어 가므로 교정 호출은 새 시도·새 예약이 아니고, 결정 뒤로 미룬 읽기(deferredReads)는 지우지 않아 교정 호출에 다시 대조해 실린다.
+        checkpoint.awaitingDecision = undefined;
         checkpoint.step.complete = false;
         checkpoint.step.questions = [`Repair the final task contract: ${violation}`, ...checkpoint.step.questions];
         checkpoint.stopped = "Final result failed the task contract; checkpoint and response retained.";
@@ -495,8 +543,12 @@ export class EngineCore {
       // A generic repair call would bypass the bounded research protocol and buy a second logical attempt.
       throw new PlanningPaused("Final result failed the task contract; resume the saved planning attempt after mediation.");
     }
-    if (repairPlan && this.executor.supportsPlanRepair(role)) {
-      const usageObserver = this.usageObserver(topic.id, role, "계약 교정 재제출");
+    // 계획 교정(plan-repair)은 계획자·검토자에게만 있다 — 구현자 원본에는 열지 않는다. 지금도 구현 턴에서는 열리지 않는다: 구현 결과는
+    // kind 검사를 통과하면 PLAN·REVISION 이 아니어서 repairablePlan 이 null 이다(planBase 도 넘기지 않는다).
+    const repairJob: TurnJob | null = route.job.role === "implementer" ? null : { role: route.job.role, operation: "plan-repair" };
+    if (repairPlan && repairJob && this.executor.supportsPlanRepair(route.provider)) {
+      const repairRoute: TurnRoute = { ...route, job: repairJob };
+      const usageObserver = this.usageObserver(topic.id, repairRoute, "계약 교정 재제출");
       let executionId: string | undefined;
       let repaired: AgentResult | undefined;
       let responseBytes: number | undefined;
@@ -507,9 +559,9 @@ export class EngineCore {
         // 실행 허용(새 입력·계획 변경·취소…)은 실행기가 spawn 직전에 본다(R3-03 → PLAN §2 공통 실행기).
         const patch = await this.executor.executePlanRepair({
           evidenceDigest,
-          role, topic, signal: context.signal, purpose: "계획 교정", inputSequence: context.startedAfter, expected: this.expectationOf(topic), write: false,
-          session: { mode: "resume", sessionId }, prompt: planRepairPrompt(repairPlan, violation), implementation: false, protocolOnly: true,
-          settings: { ...this.executionSettings(topic.id, role, false), effort: "low" },
+          route: repairRoute, topic, signal: context.signal, purpose: "계획 교정", inputSequence: context.startedAfter, expected: this.expectationOf(topic),
+          session: { mode: "resume", sessionId }, prompt: planRepairPrompt(repairPlan, violation),
+          settings: { ...route.settings, effort: "low" },
           onUsage: (usage) => { executionId = usage.executionId; usageObserver(usage); },
         });
         responseBytes = Buffer.byteLength(JSON.stringify(patch), "utf8");
@@ -541,14 +593,15 @@ export class EngineCore {
     await context.beforeCorrection?.(raw, violation);
     this.event(topic.id, "system", "system",
       `기계 계약 위반을 같은 세션에 돌려보내 1회 교정합니다${formatOnly ? "(표기 교정 — 추론 low)" : ""}: ${violation}`);
-    const settings = this.executionSettings(topic.id, role, context.implementation);
+    const correctionRoute: TurnRoute = { ...route, job: { role: route.job.role, operation: "contract-correction" } };
+    const settings = route.settings;
     // 실행 허용(새 입력·계획 변경·취소·유지보수·예산·쓰기 기준)은 실행기가 adapter 호출 전과 spawn 직전에 본다(R3-03 → PLAN §2).
     const { result: corrected } = await this.executor.execute({
       evidenceDigest,
-      role, topic, signal: context.signal, purpose: "계약 교정 재제출", inputSequence: context.startedAfter,
+      route: correctionRoute, topic, signal: context.signal, purpose: "계약 교정 재제출", inputSequence: context.startedAfter,
       expected: { ...this.expectationOf(topic), state: this.dependencies.database.getTopic(topic.id).state },
-      write: context.implementation, writeGuards: context.writeGuards,
-      session: { mode: "resume", sessionId }, prompt: buildContractCorrectionPrompt(violation), implementation: context.implementation,
+      writeGuards: context.writeGuards,
+      session: { mode: "resume", sessionId }, prompt: buildContractCorrectionPrompt(violation),
       planMode: context.planMode, planningWrite: "repair", readablePaths: context.readablePaths,
       settings: formatOnly ? { ...settings, effort: "low" } : settings,
     });
@@ -597,7 +650,7 @@ export class EngineCore {
   // 합의 세션과 무관한 일회용 세션에서 실행한다. 만들어진 세션 ID는 participant에 저장하지 않는다 —
   // 저장하면 다음 단계가 그 빈 세션을 이어받아 합의 대화를 잃는다.
   async isolatedTurn(
-    role: ParticipantRole,
+    route: TurnRoute,
     topic: Topic,
     prompt: string,
     signal: AbortSignal,
@@ -605,25 +658,61 @@ export class EngineCore {
     const startedAfter = this.latestSequence(topic.id);
     this.turnInputSequence.set(topic.id, startedAfter);
     const created = await this.executor.execute({
-      role, topic, signal, purpose: "프로토콜 확인", inputSequence: startedAfter, expected: this.expectationOf(topic), write: false,
-      session: { mode: "create" }, prompt, implementation: false, protocolOnly: true,
-      // 모델은 주제 설정을 따르되 추론 강도는 low로 내린다. 프로토콜 확인에 xhigh/max 추론은
+      route, topic, signal, purpose: "프로토콜 확인", inputSequence: startedAfter, expected: this.expectationOf(topic),
+      session: { mode: "create" }, prompt,
+      // 모델은 경로의 설정을 따르되 추론 강도는 low로 내린다. 프로토콜 확인에 xhigh/max 추론은
       // thinking 토큰 낭비다(2026-08-29 ACK 실측: output 19,975 중 상당분이 탐색·추론).
-      settings: { ...this.executionSettings(topic.id, role), effort: "low" },
+      settings: { ...route.settings, effort: "low" },
     });
     this.assertCurrent(topic.id, signal, topic.scopeGeneration, topic.state);
     if (this.interruptForNewUserInput(topic, startedAfter)) throw new HandledWorkflowInterruption();
     return redactAgentResult(AgentResultSchema.parse(created.result));
   }
 
-  // implementation=true인 턴은 구현 전용 모델(있으면)을 쓴다 — adversarial 계획 왕복은 fable,
-  // 구현은 opus라는 사용자 관행의 실행 지점(2026-08-31). 반환값에서 implementation 필드는 벗긴다.
-  executionSettings(topicId: string, role: ParticipantRole, implementation = false): AgentExecutionSettings {
-    return appliedExecutionSettings(this.dependencies.database.getTopic(topicId).agentSettings[role], implementation);
+  // 논리 턴의 경로(엔진 개편 E2b) — 역할 배정·프로필로 실제 공급자와 설정을 정하고(turnRouting.ts), 세션 저장·원장·모델 실행 같은 부수효과 전에
+  // 지원 여부를 판정한다. 지원하지 않는 조합(Claude 읽기 턴 팬아웃·Codex Figma 관측)과 프로필 없는·잘못된 배정은 구체적 사유로 멈춘다(재시도해도 같으므로
+  // FAILED 가 아니라 결정 대기). 설정: 기본 배정은 주제의 공급자 설정(구현자 job 이면 구현 전용 모델 — adversarial 계획 왕복은 fable, 구현은 opus 라는
+  // 사용자 관행의 실행 지점, 2026-08-31), 배정은 프로필의 모델·강도.
+  route(topic: Topic, job: TurnJob): TurnRoute {
+    try {
+      const route = resolveRoute(this.dependencies.database, topic, job);
+      const flags = turnFlags(job);
+      // withEvidence가 구현 턴에 붙이는 Figma 요구를 브랜치·세션 생성 전에도 판정한다(실행기의 마지막 판정과 같은 식 — designReadRequested).
+      const reason = routeSupport(route, planningControlApplies(this.dependencies.database, topic.id, topic.state, flags),
+        designReadRequested(this.dependencies.database, topic.id, job));
+      if (reason) {
+        throw new UnsupportedRoute(`${reason} — ${job.role}/${job.operation} 이(가) ${describeBinding(route)} 로 배정돼 있습니다. 배정을 바꾸거나 지원되는 공급자로 되돌린 뒤 재개하세요.`,
+          { job, provider: route.provider, basis: route.basis });
+      }
+      return route;
+    } catch (error) {
+      if (!(error instanceof UnsupportedRoute)) throw error;
+      this.event(topic.id, "system", "system", error.message,
+        { admissionRefused: "unsupported-route", job, provider: error.detail.provider ?? null, basis: error.detail.basis ?? null });
+      throw new AdmissionRefused("unsupported-route", error.message);
+    }
   }
 
-  adapter(role: ParticipantRole): AgentAdapter {
-    return role === "claude" ? this.dependencies.claude : this.dependencies.codex;
+  // 좌석 세션을 이 경로로 이어 쓸 수 있으면 그 id, 아니면 null(새 세션). 바인딩이 다르면 이전 세션(id·공급자·근거)을 이벤트로 남기고 새 세션을 연다 —
+  // 행·승인 이력·사용량은 지우지 않는다. 작성자 좌석의 계획 연속성 정책(계획→개정→구현이 한 세션)에서는 새 세션으로 끊지 않고 모델 실행 전에 멈춘다.
+  reboundSeatSession(topic: Topic, route: TurnRoute, participant: Participant): string | null {
+    const sessionId = participant.sessionId;
+    if (!sessionId || sessionId.startsWith("pending:")) return sessionId;
+    const stored = this.dependencies.database.participantBinding(topic.id, route.seat) ?? legacyBinding(route.seat);
+    if (sameBinding(stored, route)) return sessionId;
+    const message = `${route.seat} 좌석의 세션 ${sessionId}(${describeBinding(stored)})은 이 턴의 경로 ${describeBinding(route)} 와 공급자·참여자가 달라 이어 쓰지 않습니다.`;
+    if (route.seat === "claude" && this.dependencies.database.planning.continuityEnabled(topic.id)) {
+      this.event(topic.id, "system", "system", `${message} 계획 연속성 정책은 한 세션을 이어 써야 해서 새 세션을 열지 않고 멈춥니다 — 배정을 되돌리거나 연속성 정책을 끈 뒤 재개하세요.`,
+        { admissionRefused: "session-binding", seat: route.seat, previous: { sessionId, binding: stored }, next: bindingOf(route) });
+      throw new AdmissionRefused("session-binding", `${message} 계획 연속성 정책에서는 새 세션으로 바꾸지 않습니다.`);
+    }
+    this.event(topic.id, "system", "system", `${message} 새 세션을 엽니다(이전 세션 기록은 이 이벤트에 남깁니다).`,
+      { sessionRebound: { seat: route.seat, previous: { sessionId, binding: stored }, next: bindingOf(route) } });
+    return null;
+  }
+
+  adapter(provider: ParticipantRole): AgentAdapter {
+    return provider === "claude" ? this.dependencies.claude : this.dependencies.codex;
   }
 
   participant(topic: Topic, role: ParticipantRole): Participant {
@@ -657,13 +746,13 @@ export class EngineCore {
   // 반영 보고)가 중간에 끊겨 갈라지지 않게(2026-09-15 감사 2차). 이벤트의 비밀값 가림은 DB 저장 경계가 한다.
   transitionWith(topicId: string, to: WorkflowState, message: string, extras: {
     changes?: TransitionInput["changes"]; contracts?: TransitionInput["contracts"]; diagnosisEntries?: TransitionInput["diagnosisEntries"];
-    payload?: Record<string, unknown>; events?: TransitionInput["events"];
+    payload?: Record<string, unknown>; events?: TransitionInput["events"]; deliveryResolution?: TransitionInput["deliveryResolution"];
   } = {}): Topic {
     const topic = this.dependencies.database.getTopic(topicId);
     assertTransition(topic.state, to);
     return this.dependencies.database.applyTopicTransition({
       topicId, changes: { state: to, lastError: null, resumeState: null, ...(extras.changes ?? {}) },
-      contracts: extras.contracts, diagnosisEntries: extras.diagnosisEntries,
+      contracts: extras.contracts, diagnosisEntries: extras.diagnosisEntries, deliveryResolution: extras.deliveryResolution,
       events: [{ actor: "system", kind: "system", state: to, body: message, payload: { from: topic.state, to, ...(extras.payload ?? {}) } }, ...(extras.events ?? [])],
     });
   }
@@ -709,6 +798,8 @@ export class EngineCore {
     if (!active || active.controller.signal !== signal || topic.scopeGeneration !== scopeGeneration || topic.state !== expectedState) {
       throw new Error("이전 실행의 늦은 응답을 버렸습니다.");
     }
+    // 작업 묶음 단계의 문맥 결속(E4) — 실행기가 spawn 직전과 응답 처리 때 이 함수로 대조한다. 재계획 대기·문맥 변경이면 새 턴을 열지 않는다.
+    this.dependencies.database.workGroups.assertStageContextCurrent(topicId);
   }
 
   isCurrentAction(topicId: string, actionId: string, scopeGeneration: number): boolean {
@@ -733,12 +824,15 @@ export class EngineCore {
   // 턴이 쓴 토큰·시간을 타임라인에 남긴다(2026-09-07 Codex 자기 최적화 제안 ④). 이벤트의 state 열이 단계를
   // 가리키므로 단계별 집계는 SQL 로 한다. payload.usage 가 있는 이벤트는 getPromptTimeline 이 걸러 프롬프트에
   // 들어가지 않는다 — 사용량 줄이 에이전트에게 되돌아가면 그 자체가 새 입력 비용이다.
-  usageObserver(topicId: string, role: ParticipantRole, phase: TurnPurpose) {
+  // by: 경로(좌석 + 실제 공급자·근거) 또는 좌석. role 열은 좌석, 실제 공급자·근거는 사용량 기록의 route 로 남는다(E2b).
+  usageObserver(topicId: string, by: TurnRoute | ParticipantRole, phase: TurnPurpose) {
+    const role = typeof by === "string" ? by : by.seat;
+    const route = typeof by === "string" ? undefined : routeRecord(by);
     const generation = this.dependencies.database.getTopic(topicId).scopeGeneration;
     const fallbackExecutionId = randomUUID();
     return (observation: TurnUsage) => {
       const usage = { ...observation, executionId: observation.executionId ?? fallbackExecutionId,
-        recordKind: observation.recordKind ?? "final" as const, phase };
+        recordKind: observation.recordKind ?? "final" as const, phase, ...(route ? { route } : {}) };
       const tokens = (count: number | undefined) => count === undefined ? "관측 안 됨" : count.toLocaleString("en-US");
       const seconds = (ms: number | undefined) => Math.round((ms ?? 0) / 1000);
       const cost = usage.costUSD === undefined ? "" : ` · $${usage.costUSD.toFixed(2)}`;
@@ -844,14 +938,44 @@ export class EngineCore {
     return parsed.success ? parsed.data.findings : [];
   }
 
-  // 계획·감사 프롬프트에 실을 이연 목록: 이 토픽이 이연한 것(재시작 바퀴) + 선행 토픽(predecessorTopicId)이 이연한 것.
+  // 계획·감사 프롬프트에 실을 이연 목록: 이 토픽이 이연한 것(재시작 바퀴) + 선행 토픽(predecessorTopicId)이 이연한 것 + 작업 묶음 단계면 이어받는
+  // 선행 단계 동결 결과의 보류 원장(E4 보완 F007 — 단계 토픽은 predecessorTopicId 가 없고, 결과가 동결한 deferred-findings 원장이 승계 근거다).
+  // 같은 토픽의 같은 id 는 한 번만 싣는다.
   async deferredFindingsFor(topicId: string): Promise<DeferredFinding[]> {
     const topic = this.dependencies.database.getTopic(topicId);
     const own = await this.deferredFindingsOf(topicId);
     const inherited = topic.predecessorTopicId
       ? await this.deferredFindingsOf(topic.predecessorTopicId).catch(() => [])
       : [];
-    return [...inherited, ...own];
+    const group = this.dependencies.database.workGroups.forTopic(topicId);
+    const stageId = group ? Object.entries(group.links).find(([, link]) => link.topicId === topicId)?.[0] : undefined;
+    const stageInherited = group && stageId ? this.dependencies.database.workGroups.inheritedDeferredFindings(group, stageId) : [];
+    const seen = new Set<string>();
+    return [...stageInherited, ...inherited, ...own].filter((finding) => {
+      const key = `${finding.topicId}\0${finding.id}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  // 계획·감사 턴에 실을 이연 쟁점 전체(deferredFindingsFor 결과)를 근거 전문 그대로 읽기 전용 산출물로 쓴다(E4 2차 보완 F012). 프롬프트의 이연 목록은
+  // 인라인 예산을 넘으면 색인과 이 산출물의 참조만 싣는다 — 근거를 잘라 싣지 않는다. 결정 원문 산출물과 같은 방식으로 내용이 같으면 새 판을 만들지 않고,
+  // 쓰기는 writeArtifact 의 채택 경계(범위 세대·작업 묶음 문맥)를 지난다. 없으면 쓰지 않고 null. 반환: 원장 sha 로 검증한 정본 경로(계획 제어는 그 턴의
+  // readablePaths 로 받아 kind=artifact selector=<경로> 문서로 싣는다).
+  async writeDeferredFindingsDigest(topic: Topic, findings: readonly DeferredFinding[], signal: AbortSignal): Promise<string | null> {
+    if (!findings.length) return null;
+    const body = [
+      "# 이연 쟁점 원문(서버 보존, 읽기 전용)", "",
+      `주제 ${topic.id} · 범위 세대 ${topic.scopeGeneration} · ${findings.length}건. 계획·감사 프롬프트의 이연 쟁점 목록이 가리키는 근거 전문이다.`, "",
+      ...findings.map((finding) => `## ${finding.id} [${finding.severity}] ${finding.title}\n\n출처 ${finding.source} · 토픽 ${finding.topicId} · 기록 ${finding.recordedAt}\n\n${finding.rationale}\n`),
+    ].join("\n");
+    const latest = await this.dependencies.artifacts.readLatest(topic.id, DEFERRED_FINDINGS_DIGEST);
+    if (latest !== body) {
+      const revision = (this.dependencies.database.latestArtifact(topic.id, DEFERRED_FINDINGS_DIGEST)?.revision ?? 0) + 1;
+      await this.writeArtifact(topic, DEFERRED_FINDINGS_DIGEST, revision, body, signal);
+    }
+    return this.dependencies.artifacts.verifiedPath(topic.id, DEFERRED_FINDINGS_DIGEST);
   }
 
   async writeArtifact(
@@ -868,8 +992,11 @@ export class EngineCore {
         if (signal.aborted) return false;
         const active = this.active.get(topic.id);
         const current = this.dependencies.database.getTopic(topic.id);
+        // 작업 묶음 단계면 재계획 대기·문맥 변경 중에는 이미 돌던 옛 응답을 채택하지 않는다(엔진 개편 E4 — D2). 대기 표식은 범위 세대를 올린 뒤에만
+        // 지워지므로, 대기 중에는 이 표식이, 해제 뒤에는 위 세대 대조가 막는다.
         return active?.controller.signal === signal &&
-          current.scopeGeneration === topic.scopeGeneration && current.state === topic.state && (accept?.() ?? true);
+          current.scopeGeneration === topic.scopeGeneration && current.state === topic.state &&
+          this.dependencies.database.workGroups.isStageContextCurrent(topic.id) && (accept?.() ?? true);
       },
     });
   }
@@ -964,14 +1091,18 @@ export class EngineCore {
     return this.interruptForNewUserInput(topic, this.turnInputSequence.get(topic.id) ?? this.latestSequence(topic.id));
   }
 
+  // by: 이 결과를 만든 턴의 경로(또는 좌석). 이벤트 actor 는 좌석, 메모리 쓰기 검증은 실제 공급자다 — 좌석 이름으로 검증하면 다른 공급자가 실행한 턴이
+  // 남의 플랫폼 메모리(claude-only/codex-only)에 쓴다(E2b). 경로는 이벤트 payload 에 남는다.
   async saveAgentOutput(
     topic: Topic,
-    role: ParticipantRole,
+    by: TurnRoute | ParticipantRole,
     result: AgentResult,
     kind: string,
     signal: AbortSignal,
     extraPayload: Record<string, unknown> = {},
   ): Promise<void> {
+    const role = typeof by === "string" ? by : by.seat;
+    const provider = typeof by === "string" ? by : by.provider;
     const safeResult = redactAgentResult(result);
     const requestedMemoryUpdates = safeResult.memoryUpdates ?? [];
     if (requestedMemoryUpdates.length > 0 && !this.dependencies.memory) {
@@ -983,7 +1114,7 @@ export class EngineCore {
     await this.writeArtifact(topic, kind, revision, JSON.stringify(safeResult, null, 2), signal);
     // 메모리 쓰기는 턴의 부산물이다. 실패해도 방금 확정한 턴 결과를 버리지 않는다(2026-08-30).
     const memoryChanges = requestedMemoryUpdates.length > 0 && !signal.aborted
-      ? await this.applyMemoryUpdates(role, requestedMemoryUpdates)
+      ? await this.applyMemoryUpdates(provider, requestedMemoryUpdates)
       : requestedMemoryUpdates.map((update) => ({
           path: update.path, previousSHA256: update.expectedSHA256, sha256: "",
           reason: update.reason, status: "rejected" as const, error: "실행이 취소되어 반영하지 않았습니다.",
@@ -991,7 +1122,7 @@ export class EngineCore {
     this.event(topic.id, role, "agent_output", safeResult.summary, {
       resultKind: safeResult.kind, findings: safeResult.findings, evidenceRefs: safeResult.evidenceRefs,
       requestedUserDecision: safeResult.requestedUserDecision, status: safeResult.status, remainingSteps: safeResult.remainingSteps,
-      memoryChanges, ...extraPayload, artifactRevision: revision,
+      memoryChanges, ...(typeof by === "string" ? {} : { route: routeRecord(by) }), ...extraPayload, artifactRevision: revision,
     });
   }
 

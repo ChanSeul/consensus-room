@@ -2,6 +2,7 @@ import {
   PlanRepairSchema, type PlanRepair, AgentResultSchema, RESPONSE_LEDGER_LIMIT, RESPONSE_RESOLVED_IDS_LIMIT, type AgentResult,
 } from "../../shared/contracts.js";
 import { redactSecrets } from "../../shared/workflow.js";
+import type { AgentRunErrorCode } from "../../shared/planningControl.js";
 
 // AgentResultJsonSchema는 선택 필드를 "required + null 허용"으로 표현한다 — OpenAI 구조화 출력이
 // required에 properties의 전 키를 요구하기 때문이다(그 주석 참조). 모델은 값이 없으면 null을 보내는데
@@ -87,6 +88,59 @@ export function describeCommandFailure(
   return `${label} 실행 실패(${exitCode}): ${redactSecrets(details) || "stderr와 stdout 모두 비어 있습니다."}`;
 }
 
+// 공급자 CLI 비정상 종료(E3-3a) — 메시지는 기존 describeCommandFailure 문자열 그대로이고(기존 문구 판정 호환), 관측된 실패 형태만 code 로 올린다.
+// 래퍼·엔진은 message 가 아니라 code 로만 가른다. raw 는 판정에 쓴 출력 꼬리를 보존한다(원형 보존 정지·복구 기록용).
+export class AgentRunError extends Error {
+  constructor(readonly code: AgentRunErrorCode, readonly provider: "claude" | "codex", message: string,
+    readonly raw: { exitCode: number | null; stderr: string; stdout: string }) {
+    super(message);
+    this.name = "AgentRunError";
+  }
+}
+
+// 재개한 세션이 요청과 다른 신원으로 응답했다(E3-3a) — 응답을 채택하지 않는 기존 차단은 그대로이고, 요청·반환 id 를 구조로 실어 호출자가 복구 상태에
+// 남기게 한다. 자동 복구 사유가 아니다(메시지는 기존 문자열 그대로).
+export class SessionIdentityMismatch extends Error {
+  constructor(readonly provider: "claude" | "codex", readonly requested: string, readonly returned: string, message: string) {
+    super(message);
+    this.name = "SessionIdentityMismatch";
+  }
+}
+
+export function agentRunError(provider: "claude" | "codex", exitCode: number | null, stderr: string, stdout: string): AgentRunError {
+  return new AgentRunError(classifyRunFailure(provider, stderr, stdout), provider,
+    describeCommandFailure(provider === "claude" ? "Claude" : "Codex", exitCode, stderr, stdout),
+    { exitCode, stderr: redactSecrets(tailForDiagnosis(stderr, 6, 4_000)), stdout: redactSecrets(tailForDiagnosis(stdout)) });
+}
+
+// 관측된 형태만 판정한다 — 비슷한 문구·일반 실패·사용 한도(429)는 unknown 이다. 새 형태는 실제 관측을 근거로만 더한다.
+// - Claude 세션 유실(운영 기록 2026-09-08, 주제 5154fc57 seq 63): stderr "No conversation found with session ID: <id>" 와 마지막 result 이벤트
+//   is_error=true·num_turns=0(모델 호출 없음).
+// - Codex 세션 유실(격리 실측 2026-09-26, codex-cli 0.155.0-alpha.9, 빈 CODEX_HOME 에서 없는 thread 로 exec resume): stdout 비어 있음,
+//   stderr "Error: thread/resume: thread/resume failed: no rollout found for thread id <id> (code -32600)".
+// - Codex 문맥 초과(운영 기록 2026-09-06, 주제 e13f53ae seq 43, CODEX_CLOSEOUT): 마지막 오류 이벤트 message
+//   "Codex ran out of room in the model's context window. …".
+export function classifyRunFailure(provider: "claude" | "codex", stderr: string, stdout: string): AgentRunErrorCode {
+  const events = stdout.trim().split(/\r?\n/).flatMap((line) => {
+    try {
+      const value = JSON.parse(line) as unknown;
+      return value && typeof value === "object" && !Array.isArray(value) ? [value as Record<string, unknown>] : [];
+    } catch { return []; }
+  });
+  if (provider === "claude") {
+    const result = [...events].reverse().find((event) => event.type === "result");
+    if (/^No conversation found with session ID: \S+/m.test(stderr) && result?.is_error === true && result.num_turns === 0) return "session-missing";
+    return "unknown";
+  }
+  if (stdout.trim() === "" && /^Error: thread\/resume: thread\/resume failed: no rollout found for thread id \S+ \(code -32600\)$/m.test(stderr)) {
+    return "session-missing";
+  }
+  const messages = events.flatMap((event) => [event.message, (event.error as { message?: unknown } | undefined)?.message])
+    .filter((value): value is string => typeof value === "string");
+  if (messages.some((message) => message.startsWith("Codex ran out of room in the model's context window."))) return "context-exceeded";
+  return "unknown";
+}
+
 // 두 CLI 다 마지막 이벤트에 사람이 읽을 사유를 담는다(claude는 result.result, codex는 error.message).
 // 그걸 뽑아내면 4KB짜리 JSON 꼬리 대신 "월 지출 한도" 같은 한 줄이 원장에 남는다.
 // 마지막 result 이벤트의 요약. stream-json: {"type":"result","subtype":"success|error_max_turns|error_during_execution|…",
@@ -167,6 +221,21 @@ function parseJsonText(text: string): AgentResult | null {
   return null;
 }
 
+
+// 소비처 schema 의 결과(엔진 개편 E2e) — 계약 형태를 여기서 알 수 없으므로 "들어맞는 JSON 객체"를 찾아 앞 메시지까지 훑지 않는다. 마지막 최종 응답
+// 하나만 읽는다(Codex: 마지막 agent_message, Claude: result 이벤트의 structured_output). 그 응답이 JSON 객체가 아니면 실패다. 의미 검증은 소비처 몫이다.
+export function parseStructuredResult(candidates: readonly unknown[], stdout: string): Record<string, unknown> {
+  const isRecord = (value: unknown): value is Record<string, unknown> => Boolean(value) && typeof value === "object" && !Array.isArray(value);
+  const final = [...candidates].reverse().filter(isRecord)
+    .find(event => event.type === "result" || (event.type === "item.completed" && isRecord(event.item) && event.item.type === "agent_message"));
+  let value: unknown;
+  if (final?.type === "result") value = final.structured_output;
+  else if (final && isRecord(final.item) && typeof final.item.text === "string") {
+    try { value = JSON.parse(final.item.text.trim()); } catch { value = undefined; }
+  }
+  if (isRecord(value)) return value;
+  throw new Error(`에이전트의 마지막 응답이 JSON 객체가 아닙니다.${describeTerminalResult(candidates, stdout)}`);
+}
 
 // Repair responses cannot be interpreted as a full AgentResult (or accidentally reuse one from stdout).
 export function parsePlanRepair(candidates: unknown[], stdout: string): PlanRepair {

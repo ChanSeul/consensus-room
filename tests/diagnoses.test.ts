@@ -16,6 +16,7 @@ import type { AgentAdapter, SessionTurn } from "../src/server/types";
 import { REQUIRED_PLAN_HEADINGS, type AgentResult, type Finding } from "../src/shared/contracts";
 import { hashPlan } from "../src/shared/workflow";
 import { pendingReviewRequests } from "../src/server/engine/reviewRequests";
+import { AgentRunError, agentRunError } from "../src/server/adapters/resultParser";
 
 const temporaryDirectories: string[] = [];
 afterEach(() => {
@@ -2054,8 +2055,10 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
       () => { throw new Error("구현 턴 프로세스 비정상 종료"); },
       // 진단 계획 개정 턴(일회용 세션) — 프로세스가 죽는다(FAILED, 재개 CLAUDE_PLAN). 개정 계획은 아직 저장 전이다.
       () => { throw new Error("개정 턴 프로세스 비정상 종료"); },
-      // 정정 뒤 retry 의 구현 턴 — 직전 턴이 시작 직후 죽어 CLI 가 구현 세션을 찾지 못한다. 실행기가 전문 프롬프트의 새 세션으로 폴백한다.
-      () => { throw new Error("No conversation found with session ID impl-session"); },
+      // 정정 뒤 retry 의 구현 턴 — 직전 턴이 시작 직후 죽어 CLI 가 구현 세션을 찾지 못한다(관측된 세션 유실). 구현 계보의 자동 복구가 전문 프롬프트의
+      // 새 세션으로 작업을 다시 연다(E3-3b).
+      () => { throw agentRunError("claude", 1, "No conversation found with session ID: impl-session\n",
+        JSON.stringify({ type: "result", subtype: "error_during_execution", is_error: true, num_turns: 0, session_id: "impl-session" })); },
       () => { writeFileSync(join(r.worktree, "feature.txt"), "승인 계획 구현\n"); return result("IMPLEMENTATION", "승인 계획대로 구현했습니다.", { status: "completed" }); },
     );
     const approvedSHA = r.database.getTopic(r.topicId).planSHA256!;
@@ -2095,7 +2098,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(after.planSHA256).toBe(approvedSHA);
     expect(after.approvedPlanSHA256).toBe(approvedSHA);
     expect(r.claude.turns.map((turn) => turn.mode)).toEqual(["create", "create", "resume", "create"]);
-    expect(r.database.getTimeline(r.topicId).some((event) => event.payload?.missingSessionId === "impl-session")).toBe(true);
+    expect(r.database.getTimeline(r.topicId).some((event) => (event.payload?.workSessionRecovery as { from?: string } | undefined)?.from === "impl-session")).toBe(true);
     const [, , resumed, implementation] = r.claude.turns;
     for (const turn of [resumed, implementation]) {
       expect(turn.protocolOnly).toBe(false);
@@ -7380,6 +7383,144 @@ describe("R1~R8 committed delivery recheck", () => {
     expect(pendingReviewRequests(r.database.getTimeline(r.topicId), 1).map((item) => item.id)).not.toContain(first.id);
     r.database.close();
   }, 30_000);
+});
+
+// host-review 9c4d786 F002: 재개 경로가 리뷰 세션에 직접 보내는 답변 확인(CODEX_REVIEW·CODEX_FINAL_REVIEW·인도 대기 재확인)도 runReview 와 같은 코드 리뷰
+// 세션 복구를 지난다. 저장 리뷰 세션이 유실되면 code-review 계보로 새 리뷰 세션을 한 번 열고, 저장 리뷰 재사용이나 저장 리뷰로 수정 열기로 빠지지 않는다.
+// 공개 경계: messages(결정) → actions/retry. 가짜 Codex 만 통제한다(세션 유실은 관측된 Codex 형태, 새 세션 id 는 codex-recovered-N).
+describe("E3-3b 리뷰 재개 경로의 답변 확인 세션 복구(host-review 9c4d786 F002)", () => {
+  type Room = Awaited<ReturnType<typeof room>>;
+  const codexSessionMissing = (id: string) => agentRunError("codex", 1,
+    `Error: thread/resume: thread/resume failed: no rollout found for thread id ${id} (code -32600)\n`, "");
+  const REVIEW_QUESTION = "배포 창을 사용자에게 확인해야 합니다.";
+  // 첫 코드 리뷰만 질문과 함께 고칠 쟁점(AGREED_ACTION)을 남긴다 — 저장 리뷰로 수정을 열 수 있는 상태를 만든다. 그 뒤 리뷰는 쟁점 없이 통과한다.
+  class ActionQuestionReviewCodex extends EchoCodex {
+    private reviews = 0;
+    override async resumeTurn(turn: SessionTurn): Promise<AgentResult> {
+      const review = await super.resumeTurn(turn);
+      if (review.kind !== "REVIEW" || ++this.reviews > 1) return review;
+      return { ...review, requestedUserDecision: REVIEW_QUESTION, findings: [{ id: "F-9", title: "입력 검증 누락", severity: "MEDIUM", disposition: "AGREED_ACTION",
+        rationale: "입력 검증을 추가해야 합니다.", evidenceRefs: [], requiresUserDecision: false }] };
+    }
+  }
+  // 저장 리뷰 세션을 잃게 하는 한 겹(room 의 답변 확인 대역 위) — 잃은 세션으로 가는 호출은 관측된 유실로 실패하고, 새 리뷰 세션은 다른 id 를 받는다.
+  const loseReviewSession = (r: Room) => {
+    const lost = new Set<string>();
+    let created = 0;
+    const inner = r.codex.resumeTurn.bind(r.codex);
+    r.codex.resumeTurn = async (turn) => {
+      if (lost.has(turn.sessionId)) {
+        // 실제 Codex는 프로세스가 시작된 뒤 기존 대화 파일의 유실을 판정한다.
+        turn.onProcessSpawn?.({ pid: 1, pgid: 1, executable: "fake", commandLine: "fake", startedAt: "now" });
+        throw codexSessionMissing(turn.sessionId);
+      }
+      return inner(turn);
+    };
+    r.codex.createSession = async (turn) => {
+      const sessionId = `codex-recovered-${++created}`;
+      return { sessionId, result: await r.codex.resumeTurn({ ...turn, sessionId } as SessionTurn) };
+    };
+    return lost;
+  };
+  const decide = async (r: Room, body: string) =>
+    expect((await r.call("POST", `/api/topics/${r.topicId}/messages`, { kind: "decision", body })).status).toBe(200);
+  const retry = async (r: Room) => expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(200);
+  const implemented = (r: Room) => r.claude["steps"].push(() => {
+    writeFileSync(join(r.worktree, "feature.txt"), "구현 완료\n");
+    return result("IMPLEMENTATION", "구현을 마쳤습니다.", { status: "completed" });
+  });
+  // 복구 뒤 공통 판정: 인도 대기에 이르고, code-review 계보에 잃은 세션 → 새 리뷰 세션 1회가 남으며(차단 없음), 답변 확인은 새 세션에서만 했다.
+  const expectRecovered = async (r: Room, lostSession: string, label: string) => {
+    expect(await g6aSettleWithGrants(r, label)).toBe("READY_TO_DELIVER");
+    const lineage = r.database.planning.storedRecoveryLineage(r.topicId, "code-review")!;
+    expect(lineage.recoveries.map((record) => [record.reason, record.fromSession, record.toSession])).toEqual([["session-missing", lostSession, "codex-recovered-1"]]);
+    expect(lineage.blocked ?? null).toBeNull();
+    expect(r.codex.answerConfirmations.filter((turn) => turn.sessionId === lostSession)).toEqual([]);
+  };
+
+  it("F002 복구 거부: 사용량 없는 문맥 초과 시도는 retry해도 답변 확인을 다시 사지 않는다", async () => {
+    const { r } = await r10FinalQuestionStop("f002-refused-answer");
+    const inner = r.codex.resumeTurn.bind(r.codex);
+    let attempts = 0;
+    r.codex.resumeTurn = async turn => {
+      if (!turn.prompt.includes("REVIEW_ANSWER_INPUT\n")) return inner(turn);
+      attempts += 1;
+      turn.onProcessSpawn?.({ pid: 1, pgid: 1, executable: "fake", commandLine: "fake", startedAt: "now" });
+      throw new AgentRunError("context-exceeded", "codex", "context exhausted", { exitCode: 1, stderr: "context exhausted", stdout: "" });
+    };
+    await decide(r, "배포는 금요일입니다.");
+    await retry(r);
+    expect(await settledState(r, "f002-refused")).toBe("FAILED");
+    expect(r.database.planning.storedRecoveryLineage(r.topicId, "code-review")!.recoveries).toHaveLength(0);
+    expect(r.database.getTimeline(r.topicId).filter(event => event.payload?.reviewAnswerFailedAttempt)).toHaveLength(1);
+    await retry(r);
+    expect(await g6aSettleWithGrants(r, "f002-refused-retry")).toBe("USER_DECISION_REQUIRED");
+    expect(attempts).toBe(1);
+    expect(pendingReviewRequests(r.database.getTimeline(r.topicId), 1).length).toBeGreaterThan(0);
+    r.database.close();
+  });
+
+  it("F002 복구 후 부분 답변: 실패 시도만 제외하고 새 세션의 미답 확인은 다시 사지 않는다", async () => {
+    const { r } = await r10FinalQuestionStop("f002-partial-recovered-answer");
+    loseReviewSession(r).add(r.database.getCodexReviewSession(r.topicId)!);
+    r.codex.answerHandlers.push(() => []);
+    await decide(r, "아직 확정하지 않았습니다.");
+    await retry(r);
+    expect(await g6aSettleWithGrants(r, "f002-recovered-partial")).toBe("USER_DECISION_REQUIRED");
+    expect(r.codex.answerConfirmations).toHaveLength(1);
+    expect(r.codex.answerConfirmations[0].sessionId).toBe("codex-recovered-1");
+    await retry(r);
+    expect(await g6aSettleWithGrants(r, "f002-recovered-no-repeat")).toBe("USER_DECISION_REQUIRED");
+    expect(r.codex.answerConfirmations).toHaveLength(1);
+    expect(pendingReviewRequests(r.database.getTimeline(r.topicId), 1).length).toBeGreaterThan(0);
+    r.database.close();
+  });
+
+  it("CODEX_REVIEW: 질문에 답한 뒤 저장 리뷰 세션이 유실되면 새 리뷰 세션으로 다시 리뷰하고, 저장 리뷰의 AGREED_ACTION 으로 수정을 열지 않는다", { timeout: 60_000 }, async () => {
+    const r = await room("f002-review-answer", [], { codexInstance: new ActionQuestionReviewCodex() });
+    implemented(r);
+    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/implement`)).status).toBe(200);
+    await r.idle("USER_DECISION_REQUIRED");
+    expect([r.database.getFlags(r.topicId).resumeState, r.database.getTopic(r.topicId).lastError]).toEqual(["CODEX_REVIEW", expect.stringContaining(REVIEW_QUESTION)]);
+    const stored = r.database.getCodexReviewSession(r.topicId)!;
+    loseReviewSession(r).add(stored);
+    await decide(r, "배포 창은 금요일 오후입니다.");
+    await retry(r);
+    await expectRecovered(r, stored, "f002-review-answer");
+    expect(r.claude.turns).toHaveLength(1);
+    r.database.close();
+  });
+
+  it("CODEX_FINAL_REVIEW: 최종 리뷰 질문에 답한 뒤 저장 리뷰 세션이 유실되면 새 리뷰 세션으로 최종 리뷰를 다시 한다", { timeout: 60_000 }, async () => {
+    const { r } = await r10FinalQuestionStop("f002-final-answer");
+    const stored = r.database.getCodexReviewSession(r.topicId)!;
+    const turnsBefore = r.claude.turns.length;
+    loseReviewSession(r).add(stored);
+    await decide(r, "배포 창은 오늘 저녁으로 확정합니다.");
+    await retry(r);
+    await expectRecovered(r, stored, "f002-final-answer");
+    expect(r.claude.turns).toHaveLength(turnsBefore);
+    r.database.close();
+  });
+
+  it("인도 대기 재확인: 결정으로 재확인 정지한 뒤 저장 리뷰 세션이 유실되면 저장 판정을 재사용하지 않고 새 리뷰 세션으로 정상 리뷰한다", { timeout: 60_000 }, async () => {
+    const r = await room("f002-delivery-recheck", []);
+    implemented(r);
+    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/implement`)).status).toBe(200);
+    await r.idle("READY_TO_DELIVER");
+    await decide(r, "로그 레벨은 info 로 유지합니다.");
+    expect(r.database.getTopic(r.topicId).state).toBe("USER_DECISION_REQUIRED");
+    expect(r.database.getTimeline(r.topicId).at(-1)?.payload?.reviewDeliveryRecheck).toBe(true);
+    const stored = r.database.getCodexReviewSession(r.topicId)!;
+    const reviewsBefore = r.codex.prompts.length;
+    loseReviewSession(r).add(stored);
+    await retry(r);
+    await expectRecovered(r, stored, "f002-delivery-recheck");
+    // 저장 판정 재사용("기존 코드 판정과 커밋을 보존하고 답변을 재확인했습니다")이 아니라 새 세션의 정상 리뷰가 결정을 읽었다.
+    expect(r.database.getTimeline(r.topicId).some((event) => event.body.includes("기존 코드 판정과 커밋을 보존하고 답변을 재확인했습니다."))).toBe(false);
+    expect(r.codex.prompts.length).toBeGreaterThan(reviewsBefore);
+    r.database.close();
+  });
 });
 
 });

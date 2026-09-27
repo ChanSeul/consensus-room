@@ -30,6 +30,8 @@ import {
   type WorkflowState,
 } from "../shared/contracts.js";
 import type { ActionRecord, TurnUsage, AutoRetryState, InternalTopicFlags, ParticipantRole, StoredArtifact } from "./types.js";
+import { legacyBinding, parseBinding, sameBinding, type SessionBinding } from "./turnRouting.js";
+import type { PlanningCheckpoint } from "../shared/planningControl.js";
 
 type SqlValue = string | number | bigint | null | Uint8Array;
 
@@ -312,6 +314,14 @@ export class ConsensusDatabase {
     // 이어지는 턴에 새 이벤트만 싣기 위한 '마지막으로 전달한 sequence'(2026-09-08 Codex 제안 ⑥). null = 전부 싣는다.
     this.ensureColumn("topics", "implementation_prompt_sequence", "INTEGER");
     this.ensureColumn("codex_review_sessions", "prompt_sequence", "INTEGER");
+    // 세션 바인딩(엔진 개편 E2b) — 세션을 만든 실제 공급자와 선택 근거(turnRouting.ts SessionBinding). NULL 은 E2b 이전 기록이며
+    // 그 저장소의 기본 좌석·공급자로 읽는다(참여자: 좌석 이름, 구현 세션: claude, 코드 리뷰 세션: codex).
+    this.ensureColumn("participants", "provider", "TEXT");
+    this.ensureColumn("participants", "binding_json", "TEXT");
+    this.ensureColumn("topics", "implementation_session_provider", "TEXT");
+    this.ensureColumn("topics", "implementation_session_binding_json", "TEXT");
+    this.ensureColumn("codex_review_sessions", "provider", "TEXT");
+    this.ensureColumn("codex_review_sessions", "binding_json", "TEXT");
     // 사용 한도 자동 재시도의 지속 상태(시도 수·마지막 발화·예약 시각·사용자 취소) — 재시작이 상한과 취소를 지우지 않게(Codex 후속 지적 4·5).
     this.ensureColumn("topics", "auto_retry_json", "TEXT");
     // 계획 좌표(annotation)를 요청 본문과 분리 저장한다. request_json에 합쳐 넣으면 같은 키 재전송의
@@ -567,6 +577,8 @@ export class ConsensusDatabase {
     const entries = Object.entries(changes);
     if (entries.length === 0) return this.getTopic(id);
     const assignments = entries.map(([key]) => `${columns[key]} = ?`);
+    // 구현 세션 id 를 바꾸면 그 세션의 바인딩도 무효다 — setImplementationSession 이 새 바인딩을 곧바로 쓴다(E2b).
+    if ("implementationSessionId" in changes) assignments.push("implementation_session_provider = NULL", "implementation_session_binding_json = NULL");
     const values = entries.map(([key, value]) => key === "fixPassUsed" ? (value ? 1 : 0) : value) as SqlValue[];
     this.db.prepare(`UPDATE topics SET ${assignments.join(", ")}, updated_at = ? WHERE id = ?`)
       .run(...values, now(), id);
@@ -591,40 +603,73 @@ export class ConsensusDatabase {
         });
   }
 
-  upsertParticipant(topicId: string, participant: Participant): void {
+  // binding: 이 세션을 만든 공급자·근거(E2b). 주지 않으면 같은 세션 id 의 갱신(모드·ACK)은 기존 바인딩을 유지하고, 세션 id 가 바뀌면 비운다
+  // (pending 연결 등 — 바인딩 없는 세션은 좌석의 기본 공급자로 읽는다). 바인딩을 잃으면 다른 공급자 세션을 기본 공급자로 오판하므로 조건 없이 지우지 않는다.
+  upsertParticipant(topicId: string, participant: Participant, binding?: SessionBinding): void {
     this.db.prepare(`
-      INSERT INTO participants(topic_id, role, session_id, mode, acknowledged_plan_sha256)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT INTO participants(topic_id, role, session_id, mode, acknowledged_plan_sha256, provider, binding_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(topic_id, role) DO UPDATE SET
+        provider = CASE WHEN excluded.provider IS NOT NULL THEN excluded.provider
+          WHEN participants.session_id = excluded.session_id THEN participants.provider ELSE NULL END,
+        binding_json = CASE WHEN excluded.binding_json IS NOT NULL THEN excluded.binding_json
+          WHEN participants.session_id = excluded.session_id THEN participants.binding_json ELSE NULL END,
         session_id = excluded.session_id,
         mode = excluded.mode,
         acknowledged_plan_sha256 = excluded.acknowledged_plan_sha256
-    `).run(topicId, participant.role, participant.sessionId, participant.mode, participant.acknowledgedPlanSHA256);
+    `).run(topicId, participant.role, participant.sessionId, participant.mode, participant.acknowledgedPlanSHA256,
+      binding?.provider ?? null, binding ? JSON.stringify(binding) : null);
     this.updateTopic(topicId, {});
   }
 
-  participantSessionInUse(topicId: string, role: ParticipantRole, sessionId: string): boolean {
-    const row = this.db.prepare(`
-      SELECT 1 FROM participants WHERE role = ? AND session_id = ? AND topic_id <> ? LIMIT 1
-    `).get(role, sessionId, topicId);
-    if (row) return true;
-    if (role === "codex") return Boolean(this.db.prepare(`
-      SELECT 1 FROM codex_review_sessions WHERE session_id = ? AND topic_id <> ? LIMIT 1
-    `).get(sessionId, topicId));
-    return Boolean(this.db.prepare(`
-      SELECT 1 FROM topics WHERE implementation_session_id = ? AND id <> ? LIMIT 1
-    `).get(sessionId, topicId));
+  // 좌석 세션의 바인딩(E2b). 좌석이 연결되지 않았으면 null.
+  participantBinding(topicId: string, seat: ParticipantRole): SessionBinding | null {
+    const row = this.db.prepare("SELECT provider, binding_json FROM participants WHERE topic_id = ? AND role = ?").get(topicId, seat) as
+      { provider: string | null; binding_json: string | null } | undefined;
+    return row ? parseBinding(row.binding_json, seat, row.provider) : null;
   }
 
-  setImplementationSession(topicId: string, sessionId: string): void {
-    if (this.participantSessionInUse(topicId, "claude", sessionId)) {
-      throw new Error("이 Claude 구현 세션은 다른 주제에서 이미 사용 중입니다.");
+  // 세션 id 의 이름공간은 공급자 CLI 단위다 — 같은 공급자의 세션 저장소 전부(참여자 좌석·코드 리뷰·구현)에서 다른 주제가 쓰는지 본다(E2b).
+  // 바인딩이 없는 옛 행은 저장소의 기본 공급자로 읽는다(참여자는 좌석 이름, 코드 리뷰는 codex, 구현은 claude) — 기본 배정에서는 E2b 이전과 같은 결과다.
+  participantSessionInUse(topicId: string, provider: SessionBinding["provider"], sessionId: string): boolean {
+    return Boolean(this.db.prepare(`
+      SELECT 1 FROM participants WHERE COALESCE(provider, role) = ? AND session_id = ? AND topic_id <> ?
+      UNION ALL SELECT 1 FROM codex_review_sessions WHERE COALESCE(provider, 'codex') = ? AND session_id = ? AND topic_id <> ?
+      UNION ALL SELECT 1 FROM topics WHERE COALESCE(implementation_session_provider, 'claude') = ? AND implementation_session_id = ? AND id <> ?
+      LIMIT 1
+    `).get(provider, sessionId, topicId, provider, sessionId, topicId, provider, sessionId, topicId));
+  }
+
+  setImplementationSession(topicId: string, sessionId: string, binding: SessionBinding = legacyBinding("claude")): void {
+    if (this.participantSessionInUse(topicId, binding.provider, sessionId)) {
+      throw new Error(`이 ${binding.provider} 구현 세션은 다른 주제에서 이미 사용 중입니다.`);
     }
-    // 세션이 바뀌면 '전달한 sequence' 도 무효다 — 새 세션은 첫 프롬프트에 전부 받았고, 그 값은 호출자가 턴 뒤에 다시 적는다.
+    // 세션(또는 그 공급자)이 바뀌면 '전달한 sequence' 도 무효다 — 새 세션은 첫 프롬프트에 전부 받았고, 그 값은 호출자가 턴 뒤에 다시 적는다.
     const current = this.getFlags(topicId);
-    this.updateTopic(topicId, current.implementationSessionId === sessionId
+    const previous = this.implementationSessionBinding(topicId);
+    const same = current.implementationSessionId === sessionId && previous?.provider === binding.provider;
+    this.updateTopic(topicId, same
       ? { implementationSessionId: sessionId }
       : { implementationSessionId: sessionId, implementationPromptSequence: null });
+    this.db.prepare("UPDATE topics SET implementation_session_provider = ?, implementation_session_binding_json = ? WHERE id = ?")
+      .run(binding.provider, JSON.stringify(binding), topicId);
+  }
+
+  // 한 공급자가 계획자 단계(CLAUDE_PLAN·CLAUDE_REVISION)에서 남긴 최신 계획 제어 체크포인트(E2b). 공급자 키만으로 찾으면(planning.latest) 같은 공급자가
+  // 검토자로도 배정됐을 때 감사·종결 체크포인트를 집는다. 기본 배정에서는 Claude 체크포인트가 계획자 단계에만 있어 planning.latest(topic, 'claude') 와 같다.
+  latestPlannerCheckpoint(topicId: string, provider: SessionBinding["provider"]): PlanningCheckpoint | null {
+    const row = this.db.prepare(`SELECT record_json FROM planning_checkpoints WHERE topic_id = ? AND json_extract(record_json,'$.role') = ?
+      AND json_extract(record_json,'$.stage') IN ('CLAUDE_PLAN','CLAUDE_REVISION')
+      ORDER BY json_extract(record_json,'$.updatedAt') DESC, rowid DESC LIMIT 1`).get(topicId, provider) as { record_json: string } | undefined;
+    return row ? JSON.parse(row.record_json) as PlanningCheckpoint : null;
+  }
+
+  // 구현 세션의 바인딩(E2b). 구현 세션이 없으면 null.
+  implementationSessionBinding(topicId: string): SessionBinding | null {
+    const row = this.db.prepare("SELECT implementation_session_id, implementation_session_provider, implementation_session_binding_json FROM topics WHERE id = ?")
+      .get(topicId) as { implementation_session_id: string | null; implementation_session_provider: string | null; implementation_session_binding_json: string | null } | undefined;
+    if (!row) throw new Error(`주제를 찾을 수 없습니다: ${topicId}`);
+    return row.implementation_session_id ? parseBinding(row.implementation_session_binding_json, "claude", row.implementation_session_provider) : null;
   }
 
   // 계획 세션은 보존한다. 리뷰 세션은 승인된 계획·범위·계획 회차가 같은 동안에만 이어 쓴다.
@@ -638,23 +683,39 @@ export class ConsensusDatabase {
     return row?.session_id ?? null;
   }
 
-  setCodexReviewSession(topicId: string, sessionId: string): void {
+  // 현재 유효한 코드 리뷰 세션의 바인딩(E2b). 유효한 세션이 없으면 null.
+  codexReviewSessionBinding(topicId: string): SessionBinding | null {
+    const row = this.db.prepare(`
+      SELECT r.provider, r.binding_json FROM codex_review_sessions r JOIN topics t ON t.id = r.topic_id
+      WHERE r.topic_id = ? AND r.scope_generation = t.scope_generation
+        AND r.plan_epoch = t.plan_epoch AND r.plan_sha256 = t.plan_sha256
+        AND r.plan_sha256 = t.approved_plan_sha256
+    `).get(topicId) as { provider: string | null; binding_json: string | null } | undefined;
+    return row ? parseBinding(row.binding_json, "codex", row.provider) : null;
+  }
+
+  setCodexReviewSession(topicId: string, sessionId: string, binding: SessionBinding = legacyBinding("codex")): void {
     const topic = this.getTopic(topicId);
     if (!topic.planSHA256 || topic.approvedPlanSHA256 !== topic.planSHA256) {
       throw new Error("승인된 계획 없이 코드 리뷰 세션을 저장할 수 없습니다.");
     }
-    if (!sessionId.trim() || sessionId.startsWith("pending:") ||
-        topic.participants.some((participant) => participant.role === "codex" && participant.sessionId === sessionId) ||
-        this.participantSessionInUse(topicId, "codex", sessionId)) {
+    // 검토자 세션은 같은 공급자의 작성자·계획 검토 세션과 달라야 한다(plan §2.1 — 검토자는 작성자와 별도 세션). 같은 공급자의 같은 주제 세션 전부와 대조한다.
+    const sameTopicSession = Boolean(this.db.prepare(`
+      SELECT 1 FROM participants WHERE topic_id = ? AND session_id = ? AND COALESCE(provider, role) = ?
+      UNION ALL SELECT 1 FROM topics WHERE id = ? AND implementation_session_id = ? AND COALESCE(implementation_session_provider, 'claude') = ?
+      LIMIT 1
+    `).get(topicId, sessionId, binding.provider, topicId, sessionId, binding.provider));
+    if (!sessionId.trim() || sessionId.startsWith("pending:") || sameTopicSession ||
+        this.participantSessionInUse(topicId, binding.provider, sessionId)) {
       throw new Error("코드 리뷰 세션은 계획 세션 및 다른 주제 세션과 달라야 합니다.");
     }
     this.db.prepare(`
-      INSERT INTO codex_review_sessions(topic_id, session_id, scope_generation, plan_epoch, plan_sha256)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT INTO codex_review_sessions(topic_id, session_id, scope_generation, plan_epoch, plan_sha256, provider, binding_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(topic_id) DO UPDATE SET session_id = excluded.session_id,
         scope_generation = excluded.scope_generation, plan_epoch = excluded.plan_epoch, plan_sha256 = excluded.plan_sha256,
-        prompt_sequence = NULL
-    `).run(topicId, sessionId, topic.scopeGeneration, topic.planEpoch, topic.planSHA256);
+        prompt_sequence = NULL, provider = excluded.provider, binding_json = excluded.binding_json
+    `).run(topicId, sessionId, topic.scopeGeneration, topic.planEpoch, topic.planSHA256, binding.provider, JSON.stringify(binding));
   }
 
   getAutoRetry(topicId: string): AutoRetryState | null {
@@ -700,6 +761,62 @@ export class ConsensusDatabase {
     if (Number(result.changes) !== 1) throw new Error(`${role} 세션이 연결되지 않았습니다.`);
   }
 
+  // 연속성 v2 작성자 좌석의 복구 세션 전환(E3-3b) — 복구 세션 S1 이 읽기 전용 확인 턴으로 승인 계획 sha 를 답한 뒤에만 부른다. 참여자(세션·ACK = S1 이 답한
+  // 값)·구현 세션·승인 바인딩(검증 기록)·복구 계보를 한 transaction 으로 옮긴다 — 일부만 옮겨지면 구현 가드가 짝 없는 세션으로 멈추거나 옛 ACK 가 새 세션에
+  // 붙는다. 사용자 승인(approved_plan_sha256)과 계획자 checkpoint 는 건드리지 않는다. 세션 충돌은 다른 주제의 같은 공급자 세션과 대조해 거부한다.
+  // 계획 제어 좌석의 대기 중 자동 복구를 새 세션에 잇는다(E3-3b host-review 9c4d786 F001·F004) — 계보 기록(toSession·세션 목록)과, 연속성 v2 작성자
+  // 좌석이면 구현 연결을 한 transaction 으로 옮긴다. 구현 세션은 지금 값이 그 복구의 원래 세션(fromSession)이고 저장된 구현 바인딩이 이 좌석 바인딩과 같을
+  // 때만 옮긴다 — 다른 구현 세션·바뀐 바인딩은 덮지 않는다(그때는 기존 runImplementation 가드가 판정한다).
+  linkRecoveredPlanningSession(input: {
+    topicId: string; lineage: { jobRole: string; value: import("../shared/planningControl.js").RecoveryLineage };
+    implementation?: { fromSession: string; toSession: string; binding: SessionBinding };
+    checkpoint?: PlanningCheckpoint;
+  }): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.planning.saveRecoveryLineage(input.topicId, input.lineage.jobRole, input.lineage.value);
+      const move = input.implementation;
+      if (move && this.getFlags(input.topicId).implementationSessionId === move.fromSession) {
+        const stored = this.implementationSessionBinding(input.topicId) ?? legacyBinding("claude");
+        if (sameBinding(stored, move.binding)) this.setImplementationSession(input.topicId, move.toSession, move.binding);
+      }
+      // 계획 제어가 새 세션을 받은 checkpoint도 같은 transaction에서 저장한다. 중간 종료 때 세션 없는 checkpoint만 남지 않는다.
+      if (input.checkpoint) this.planning.save(input.checkpoint);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  switchRecoveredAuthorSession(input: {
+    topicId: string; sessionId: string; planSHA256: string; binding: SessionBinding; inputSequence: number;
+    recovery: { fromSession: string | null; verification: import("../shared/planningControl.js").RecoveryVerification };
+    lineage: { jobRole: string; value: import("../shared/planningControl.js").RecoveryLineage };
+    event: Omit<TimelineEventInput, "topicId">;
+  }): void {
+    let event!: TimelineEvent;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const topic = this.getTopic(input.topicId);
+      if (this.participantSessionInUse(input.topicId, input.binding.provider, input.sessionId)) {
+        throw new Error(`복구 세션 ${input.sessionId} 은(는) 다른 주제에서 이미 사용 중입니다.`);
+      }
+      const author = topic.participants.find(participant => participant.role === "claude");
+      this.upsertParticipant(input.topicId, { role: "claude", sessionId: input.sessionId, mode: author?.mode ?? "created",
+        acknowledgedPlanSHA256: input.planSHA256 }, input.binding);
+      this.setImplementationSession(input.topicId, input.sessionId, input.binding);
+      this.planning.bindRecoveredSession(this.getTopic(input.topicId), input.planSHA256, input.sessionId, input.inputSequence, input.recovery);
+      this.planning.saveRecoveryLineage(input.topicId, input.lineage.jobRole, input.lineage.value);
+      event = this.insertEventInTransaction({ ...input.event, topicId: input.topicId });
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    this.emitEvent(event);
+  }
+
   clearAcknowledgements(topicId: string): void {
     this.db.prepare(
       "UPDATE participants SET acknowledged_plan_sha256 = NULL WHERE topic_id = ?",
@@ -734,6 +851,10 @@ export class ConsensusDatabase {
     // 전이와 한 transaction 으로 남길 수정 작업 계약 행과 진단 상태 기록(수락 전이·회차 소비·반영 보고가 갈라지지 않게, 2026-09-15 감사 2차).
     contracts?: readonly FixContract[];
     diagnosisEntries?: ReadonlyArray<{ diagnosisId: string; status: DiagnosisStatus; detail?: Record<string, unknown> }>;
+    // 결과 불명확 전달 요청의 마감(E4 F016) — 결과 확인이 요청을 닫는 쓰기를 상태 전이·확정 기록·이벤트와 같은 transaction 에 둔다. 따로 쓰면 그 사이에서
+    // 멈췄을 때 요청은 닫혔는데 토픽이 복구 대기(USER_DECISION_REQUIRED)에 남아, 기동 복구(running 만 회수)·결과 확인·retry 어느 것으로도 빠져나오지 못했다.
+    // 마감할 행이 정확히 한 건이 아니면(이미 닫힘·다른 요청) 전체를 되돌린다.
+    deliveryResolution?: { action: "commit" | "push"; idempotencyKey: string; outcome: "succeeded" | "failed" };
   }): Topic {
     const recorded: TimelineEvent[] = [];
     this.db.exec("BEGIN IMMEDIATE");
@@ -747,6 +868,10 @@ export class ConsensusDatabase {
         this.planning.bindSession(previous, input.planningSessionAmendment.nextSHA256, binding.sessionId, binding.inputSequence);
       }
       if (input.planningMigration) this.planning.migrateInterrupted(this.getTopic(input.topicId), input.planningMigration);
+      if (input.deliveryResolution) {
+        const { action, idempotencyKey, outcome } = input.deliveryResolution;
+        this.resolveUnknownDeliveryAction(input.topicId, action, idempotencyKey, outcome);
+      }
       this.updateTopic(input.topicId, input.changes);
       const at = now();
       for (const contract of input.contracts ?? []) this.fixContracts.append(input.topicId, contract, at);
@@ -816,11 +941,13 @@ export class ConsensusDatabase {
   // 전체를 읽어 파싱한 뒤 버리고 있었다(감사 최적화 지적) — 필요한 행만 SQL로 고른다.
   // payload.usage 가 있는 행(턴 사용량 기록)은 프롬프트에 넣지 않는다 — 에이전트에게 되돌아가면 그 줄이 곧 입력 비용이다.
   // afterSequence: 이어지는 턴은 세션이 이미 받은 이벤트를 다시 싣지 않는다(2026-09-08 Codex 제안 ⑥).
-  getPromptTimeline(topicId: string, scopeGeneration: number, afterSequence = 0): TimelineEvent[] {
+  // all: 참조·색인으로 전달하는 턴은 최근 80개 제한 없이 대상 행 전부를 받는다. 범위·커서·계측 제외는 동일하다(E3-2-2a F002).
+  getPromptTimeline(topicId: string, scopeGeneration: number, afterSequence = 0,
+    mode: "recent" | "all" = "recent"): TimelineEvent[] {
     const rows = this.db.prepare(`
       SELECT * FROM timeline_events
       WHERE topic_id = ? AND scope_generation = ? AND sequence > ? AND json_extract(payload_json, '$.usage') IS NULL AND json_extract(payload_json, '$.promptMetrics') IS NULL AND json_extract(payload_json, '$.verificationMetrics') IS NULL AND json_extract(payload_json, '$.executionWarning') IS NULL AND (
-        kind IN ('scope_change', 'evidence', 'decision')
+        ? = 'all' OR kind IN ('scope_change', 'evidence', 'decision')
         OR sequence IN (
           SELECT sequence FROM timeline_events
           WHERE topic_id = ? AND scope_generation = ? AND json_extract(payload_json, '$.usage') IS NULL AND json_extract(payload_json, '$.promptMetrics') IS NULL AND json_extract(payload_json, '$.verificationMetrics') IS NULL AND json_extract(payload_json, '$.executionWarning') IS NULL
@@ -828,7 +955,7 @@ export class ConsensusDatabase {
         )
       )
       ORDER BY sequence
-    `).all(topicId, scopeGeneration, afterSequence, topicId, scopeGeneration) as Array<Record<string, unknown>>;
+    `).all(topicId, scopeGeneration, afterSequence, mode, topicId, scopeGeneration) as Array<Record<string, unknown>>;
     return rows.map((row) => this.mapEvent(row));
   }
 
@@ -1202,6 +1329,8 @@ export class ConsensusDatabase {
       WHERE status = 'running' AND action IN ('commit', 'push')
     `).run();
     for (const row of rows) {
+      // 닫힌 작업 묶음 단계의 동결 결과 push(E4 보완 F002)는 CLOSED 를 다시 열지 않는다 — 요청만 unknown 으로 남기고 reconcile-delivery 가 원격을 대조한다.
+      if (this.getTopic(String(row.topic_id)).state === "CLOSED") continue;
       this.updateTopic(String(row.topic_id), {
         state: "USER_DECISION_REQUIRED",
         lastError: "서버가 커밋 또는 push 도중 종료되었습니다. Git 결과를 확인한 뒤 다음 동작을 결정해 주세요.",

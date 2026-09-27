@@ -1,5 +1,7 @@
+import { execFileSync, spawnSync } from "node:child_process";
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
+import * as fsPromises from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { afterEach } from "vitest";
 import { describe, expect, it, vi } from "vitest";
@@ -10,6 +12,11 @@ import type { CommandResult, CommandRunner, CommandSpec, TurnUsage } from "../sr
 import { agentEnvironment } from "../src/server/security";
 import { DEFAULT_AGENT_SETTINGS } from "../src/shared/contracts";
 import { PlanningStepSchema } from "../src/shared/planningControl";
+
+vi.mock("node:fs/promises", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, readdir: vi.fn(actual.readdir) };
+});
 
 const planResult = {
   kind: "PLAN",
@@ -525,6 +532,61 @@ describe("에이전트별 권한 경계", () => {
     expect(await adapter.validateExistingSession("codex-thread-1")).toBe(true);
     expect(await adapter.validateExistingSession("codex-thread-2")).toBe(true);
     expect(await adapter.validateExistingSession("codex-thread-3")).toBe(false);
+  });
+
+  it("F006: Claude 부재 확인은 실제 파일·없는 저장소·조회 실패를 구분한다", async () => {
+    const root = mkdtempSync(join(tmpdir(), "claude-session-presence-"));
+    temporaryDirectories.push(root);
+    vi.stubEnv("HOME", root);
+    const runner = new RecordingRunner(successfulResult([planResult]));
+    const adapter = new ClaudeAdapter(runner);
+    const id = "11111111-1111-4111-8111-111111111111";
+    const project = join(root, ".claude", "projects", "-workspace");
+    try {
+      expect(await adapter.isSessionMissing(id)).toBe(true);
+      mkdirSync(project, { recursive: true });
+      expect(await adapter.isSessionMissing(id)).toBe(true);
+      writeFileSync(join(project, `${id}.jsonl`), "existing conversation\n");
+      expect(await adapter.isSessionMissing(id)).toBe(false);
+      expect(await adapter.validateExistingSession(id)).toBe(true);
+      for (const code of ["EACCES", "EIO", "ENOTDIR"]) {
+        const { readdir: original } = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+        const fault = Object.assign(new Error(`SESSION_LOOKUP_${code}`), { code });
+        const read = vi.spyOn(fsPromises, "readdir").mockImplementation((async (...args: Parameters<typeof original>) => {
+          if (String(args[0]) === project) throw fault;
+          return original(...args);
+        }) as typeof original);
+        try {
+          await expect(adapter.isSessionMissing(id)).rejects.toBe(fault);
+          // 연결 검증의 false는 그대로다. 자동 복구가 이 값을 부재 증명으로 사용하면 안 된다.
+          expect(await adapter.validateExistingSession(id)).toBe(false);
+        } finally { read.mockRestore(); }
+      }
+      await expect(adapter.isSessionMissing("invalid-id")).rejects.toThrow();
+      expect(runner.calls).toHaveLength(0);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it.each(["depth", "symlink"])("F006: Claude 조회를 끝내지 못한 경로는 부재로 확정하지 않는다(%s)", async mode => {
+    const root = mkdtempSync(join(tmpdir(), "claude-session-incomplete-"));
+    temporaryDirectories.push(root);
+    vi.stubEnv("HOME", root);
+    const id = "11111111-1111-4111-8111-111111111111";
+    const projects = join(root, ".claude", "projects");
+    const nested = join(projects, "project", "a", "b", "c");
+    mkdirSync(nested, { recursive: true });
+    writeFileSync(join(nested, `${id}.jsonl`), "existing conversation\n");
+    if (mode === "symlink") {
+      rmSync(join(projects, "project"), { recursive: true });
+      const target = join(root, "external");
+      mkdirSync(target);
+      writeFileSync(join(target, `${id}.jsonl`), "existing conversation\n");
+      symlinkSync(target, join(projects, "linked-project"));
+    }
+    try {
+      const adapter = new ClaudeAdapter(new RecordingRunner(successfulResult([planResult])));
+      await expect(adapter.isSessionMissing(id)).rejects.toThrow();
+    } finally { vi.unstubAllEnvs(); }
   });
 
   it("planMode 턴은 코드 편집이 아닌 plan 권한으로 실행한다", async () => {
@@ -1047,6 +1109,49 @@ describe("메모리 주입은 세션 생성 턴에만 한다", () => {
 
     expect(runner.calls[0].stdin).toContain("메모리 문서 시작");
     expect(runner.calls[1].stdin).not.toContain("메모리 문서 시작");
+  });
+});
+
+
+// E3-4c host-review 39d21df9 F004 — 엔진(실행기)이 "메모리 본문을 아직 받지 않은 세션"(프로토콜 턴이 만든 세션)의 첫 일반 resume 턴에 memoryBodies 를
+// 실으면 그 resume 에 한 번 본문을 싣는다(매니페스트 중복 없음). 필드가 없으면 위 계약(생성 턴에만) 그대로이고, 프로토콜·계획 제어 턴은 필드가 있어도 싣지 않는다.
+describe("세션별 메모리 본문 수신(memoryBodies) — 본문을 받지 않은 세션의 첫 일반 resume", () => {
+  function memoryFixture(): string {
+    const root = mkdtempSync(join(tmpdir(), "consensus-room-memory-bodies-"));
+    temporaryDirectories.push(root);
+    writeFileSync(join(root, "context-router.md"), "# Context Router\n\nMEMORY-BODIES-MARKER");
+    return root;
+  }
+  function adapters(runner: RecordingRunner) {
+    const directory = mkdtempSync(join(tmpdir(), "consensus-room-memory-bodies-codex-"));
+    temporaryDirectories.push(directory);
+    return {
+      claude: new ClaudeAdapter(runner, memoryFixture()),
+      codex: new CodexAdapter(runner, join(directory, "schema.json"), join(directory, "codex-home"), memoryFixture()),
+    };
+  }
+  const sessions = { claude: "11111111-1111-4111-8111-111111111111", codex: "thread-1" } as const;
+
+  it.each(["claude", "codex"] as const)("%s: memoryBodies 가 실린 resume 에는 본문만, 없으면 종전대로 매니페스트만 싣는다", async (provider) => {
+    const runner = new RecordingRunner(successfulResult([{ type: "thread.started", thread_id: "thread-1" }, planResult]));
+    const adapter = adapters(runner)[provider];
+    await adapter.resumeTurn({ sessionId: sessions[provider], prompt: "리뷰하세요.", cwd: "/tmp", memoryBodies: true });
+    await adapter.resumeTurn({ sessionId: sessions[provider], prompt: "리뷰하세요.", cwd: "/tmp" });
+    const [withBodies, plain] = runner.calls.map((call) => call.stdin ?? "");
+    expect(withBodies).toContain("메모리 문서 시작: context-router.md");
+    expect(withBodies).toContain("MEMORY-BODIES-MARKER");
+    expect(withBodies).not.toContain("메모리 스냅샷 갱신");
+    expect(plain).not.toContain("MEMORY-BODIES-MARKER");
+    expect(plain).toContain("메모리 스냅샷 갱신");
+  });
+
+  it.each(["claude", "codex"] as const)("%s: 프로토콜·계획 제어 턴은 memoryBodies 가 있어도 본문을 싣지 않는다", async (provider) => {
+    const runner = new RecordingRunner(successfulResult([{ type: "thread.started", thread_id: "thread-1" }, planResult]));
+    const adapter = adapters(runner)[provider];
+    await adapter.resumeTurn({ sessionId: sessions[provider], prompt: "확인하세요.", cwd: "/tmp", protocolOnly: true, memoryBodies: true });
+    await adapter.resumeTurn({ sessionId: sessions[provider], prompt: "계획을 조사하세요.", cwd: "/tmp", memoryBodies: true,
+      planningControl: { admissionId: "attempt", maxPromptBytes: 64 * 1024, instructionsInSession: true } });
+    for (const call of runner.calls) expect(call.stdin ?? "").not.toContain("MEMORY-BODIES-MARKER");
   });
 });
 
@@ -1598,7 +1703,64 @@ it("managed source evidence disables direct provider reads and permits only the 
   await adapter.createSession({ prompt: "Use cached evidence", cwd: "/tmp/worktree", evidenceManaged: true, readablePaths: [cachedImage] });
   const config = readFileSync(join(adapter.managedHomeFor("/tmp/worktree"), "config.toml"), "utf8");
   expect(config).toContain("web_search = false");
+  expect(config.split("\n[")[0]).toContain('web_search = "disabled"');
   expect(config).toContain(`"${cachedImage}" = "read"`);
+});
+
+it.each([
+  { job: { role: "implementer", operation: "implement" }, disabled: true },
+  { job: { role: "reviewer", operation: "ack" }, disabled: true },
+  { job: { role: "reviewer", operation: "audit" }, disabled: false },
+] as const)("Codex $job.role/$job.operation translates the web boundary into a top-level CLI setting", async entry => {
+  const runner = new RecordingRunner(successfulResult([{ type: "thread.started", thread_id: "web-policy" }, planResult]));
+  const { adapter } = codexAdapter(runner);
+  const cwd = mkdtempSync(join(tmpdir(), "web-policy-"));
+  temporaryDirectories.push(cwd);
+  await adapter.createSession({ prompt: "Check the current role", cwd, job: entry.job });
+  const config = readFileSync(join(adapter.managedHomeFor(cwd), "config.toml"), "utf8");
+  expect(config.split("\n[")[0].includes('web_search = "disabled"')).toBe(entry.disabled);
+});
+
+it.each([
+  { job: { role: "planner", operation: "plan" }, closed: true, toolsClosed: false },
+  { job: { role: "planner", operation: "revision" }, closed: true, toolsClosed: false },
+  { job: { role: "planner", operation: "diagnosis-revision" }, closed: true, toolsClosed: false },
+  { job: { role: "reviewer", operation: "ack" }, closed: true, toolsClosed: true },
+  { job: { role: "reviewer", operation: "audit" }, closed: false, toolsClosed: false },
+  { job: { role: "implementer", operation: "implement" }, closed: false, toolsClosed: false },
+] as const)("Codex fanout policy $job.role/$job.operation closes both agent routes without dropping planning instructions", async entry => {
+  // 공개 어댑터 진입점 → 공급자 설정 → 실제 CLI 소비. 계획자의 읽기 도구·프로젝트 지침을 보존하는 것이 같은 계약이다.
+  const runner = new RecordingRunner(successfulResult([{ type: "thread.started", thread_id: "fanout-policy" }, planResult]));
+  const { adapter, codexHome } = codexAdapter(runner);
+  const cwd = mkdtempSync(join(tmpdir(), "fanout-policy-"));
+  temporaryDirectories.push(cwd);
+  writeFileSync(join(cwd, "AGENTS.md"), "KEEP_PLANNING_INSTRUCTIONS_F004");
+  const previousHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = join(codexHome, "fixture-user");
+  try {
+    await adapter.createSession({ prompt: "Check the current role", cwd, job: entry.job });
+    const config = readFileSync(join(adapter.managedHomeFor(cwd), "config.toml"), "utf8");
+    expect(/^multi_agent = false$/m.test(config)).toBe(entry.closed);
+    expect(config).toContain(`[features.multi_agent_v2]\nenabled = ${!entry.closed}`);
+    expect(/^project_doc_max_bytes = 0$/m.test(config)).toBe(entry.toolsClosed);
+    expect(/^shell_tool = false$/m.test(config)).toBe(entry.toolsClosed);
+    if (process.env.CONSENSUS_CODEX_SANDBOX_TEST) {
+      const spec = runner.calls[0];
+      const options = { cwd: spec.cwd, env: spec.environment, encoding: "utf8" as const };
+      const features = execFileSync(spec.command, ["features", "list"], options);
+      const effective = Object.fromEntries(features.split("\n").map(line => line.trim().split(/\s+/))
+        .filter(parts => parts.length >= 3).map(parts => [parts[0], parts.at(-1)]));
+      expect(effective.multi_agent_v2).toBe(String(!entry.closed));
+      if (entry.closed) expect(effective.multi_agent).toBe("false");
+      if (entry.job.role === "planner") {
+        const input = execFileSync(spec.command, ["debug", "prompt-input", "probe"], options);
+        expect(input).toContain("KEEP_PLANNING_INSTRUCTIONS_F004");
+      }
+    }
+  } finally {
+    if (previousHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousHome;
+  }
 });
 
  it("keeps host evidence credentials out of every model subprocess environment", () => {
@@ -1629,4 +1791,110 @@ it("refuses to accept an implementation when its Figma tool response was not cap
   const adapter = new ClaudeAdapter(runner, undefined, { figmaMcpUrl: "http://127.0.0.1:3845/mcp" });
   await expect(adapter.createSession({ cwd: "/tmp", prompt: "Implement", implementation: true, figmaReadEnabled: true, onFigmaResult: observed })).rejects.toThrow("not captured");
   expect(observed).not.toHaveBeenCalled();
+});
+
+describe("E2e-3 승인 경로만 쓰기 — 어댑터 공개 호출", () => {
+  const fix = { role: "implementer", operation: "fix" } as const;
+  const REPAIR_SCHEMA = { type: "object", additionalProperties: false, required: ["status", "summary"],
+    properties: { status: { type: "string", enum: ["completed", "blocked"] }, summary: { type: "string" } } };
+
+  // 자동 수정 인계의 후보 clone 과 같은 모양 — 추적 중인 저장소 지시문과 소스.
+  function candidate() {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "consensus-room-scoped-write-")));
+    temporaryDirectories.push(root);
+    const work = join(root, "source");
+    mkdirSync(join(work, "src"), { recursive: true });
+    writeFileSync(join(work, "AGENTS.md"), "REPOSITORY INSTRUCTION");
+    writeFileSync(join(work, "src", "a.txt"), "original");
+    const git = (...args: string[]) => execFileSync("git", ["-C", work, ...args], { stdio: "pipe" });
+    git("init", "-q"); git("add", ".");
+    git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "candidate");
+    const outside = join(root, "outside"); mkdirSync(outside);
+    symlinkSync(outside, join(work, "linked"));
+    vi.stubEnv("CODEX_HOME", join(root, "user-codex"));
+    return { root, work, outside };
+  }
+
+  afterEach(() => { vi.unstubAllEnvs(); });
+
+  it("Codex·Claude 어댑터를 직접 불러도 런타임 경로와 같은 사유로 공급자 실행 전에 거부한다", async () => {
+    const { work, outside } = candidate();
+    const cases: Array<[string, string]> = [
+      [join(work, "linked", "file.txt"), `승인 경로가 심볼릭 링크를 지납니다: ${join(work, "linked")}`],
+      [join(work, ".git", "HEAD"), `승인 경로가 Git 메타데이터를 지납니다: ${join(work, ".git", "HEAD")}`],
+      [work, `승인 경로는 작업 폴더 안의 하위 경로여야 합니다: ${work}`],
+      [join(outside, "file.txt"), `승인 경로는 작업 폴더 안의 하위 경로여야 합니다: ${join(outside, "file.txt")}`],
+      [join(work, "AGENTS.md"), `승인 경로가 러너 제어 경로와 겹칩니다: ${join(work, "AGENTS.md")}`],
+      ["src/a.txt", "승인 경로는 정규화된 절대 경로여야 합니다: src/a.txt"],
+    ];
+    for (const [path, message] of cases) {
+      const runner = new RecordingRunner(successfulResult([]));
+      const { adapter } = codexAdapter(runner);
+      await expect(adapter.createStructuredSession({ cwd: work, prompt: "fix", job: fix, isolated: true, writablePaths: [path] }, REPAIR_SCHEMA), path)
+        .rejects.toThrow(message);
+      await expect(adapter.createSession({ cwd: work, prompt: "fix", job: fix, writablePaths: [path] }), path).rejects.toThrow(message);
+      expect(runner.calls, path).toEqual([]);
+    }
+    const runner = new RecordingRunner(successfulResult([]));
+    await expect(new ClaudeAdapter(runner).createSession({ cwd: work, prompt: "fix", job: fix, writablePaths: [join(work, "src", "a.txt")] }))
+      .rejects.toThrow("Claude 어댑터는 승인 경로만 쓰기(나머지 읽기·Git 메타데이터 거부)를 표현할 수 없습니다");
+    const reader = new RecordingRunner(successfulResult([]));
+    await expect(codexAdapter(reader).adapter.createSession({ cwd: work, prompt: "read", job: { role: "reviewer", operation: "review" },
+      writablePaths: [join(work, "src", "a.txt")] })).rejects.toThrow("승인 경로 쓰기(writablePaths)는 쓰기 턴에만 쓸 수 있습니다.");
+    expect([...runner.calls, ...reader.calls]).toEqual([]);
+  });
+
+  // 명시적 opt-in: 설치된 Codex CLI 의 macOS sandbox 로 실제 권한을 확인한다(모델 호출 없음). Codex 호스트 검증 단계에서 실행한다.
+  // 격리·비격리 턴과 일반 clone·연결 worktree 를 모두 본다 — 비격리 턴 설정은 공통 Git 디렉터리를 읽기에 넣던 경로라 설정 파싱·메타데이터 거부를
+  // 따로 확인해야 하고(host-review E2e-3 1차 F001), 연결 worktree 의 .git 은 파일이며 메타데이터는 작업 폴더 밖 원본 저장소(공통 디렉터리)에 있다.
+  it.skipIf(!process.env.CONSENSUS_CODEX_SANDBOX_TEST)("실제 Codex sandbox: 승인 경로만 쓰고, 그 밖·Git 메타데이터·지시문은 막으며, 격리 턴은 저장소 지시문을 입력에 싣지 않는다", async () => {
+    const { root, work, outside } = candidate();
+    const linked = join(root, "linked-worktree");
+    execFileSync("git", ["-C", work, "worktree", "add", "-q", "-b", "linked", linked], { stdio: "pipe" });
+    const common = join(work, ".git");
+    for (const [workspace, isolated] of [[work, true], [work, false], [linked, true], [linked, false]] as const) {
+      const label = `${workspace === work ? "clone" : "연결 worktree"} isolated=${isolated}`;
+      const gitDirectory = execFileSync("git", ["-C", workspace, "rev-parse", "--absolute-git-dir"], { encoding: "utf8" }).trim();
+      const runner = new RecordingRunner(successfulResult([
+        { type: "thread.started", thread_id: "repair-thread" },
+        { type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ status: "completed", summary: "fixed" }) } },
+        { type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } },
+      ]));
+      const { adapter } = codexAdapter(runner);
+      await adapter.createStructuredSession({ cwd: workspace, prompt: "fix", job: fix, ...(isolated ? { isolated } : {}),
+        writablePaths: [join(workspace, "src", "a.txt"), join(workspace, "src", "new")] }, REPAIR_SCHEMA);
+      const [spec] = runner.calls;
+      const options = { cwd: workspace, env: spec.environment, encoding: "utf8" as const };
+      // 설정 파싱 — 같은 키를 read·deny 로 두 번 쓰면 여기서 실패한다.
+      const effective = Object.fromEntries(execFileSync(spec.command, ["features", "list"], options).split("\n").map(line => line.trim().split(/\s+/))
+        .filter(parts => parts.length >= 3).map(parts => [parts[0], parts.at(-1)]));
+      const run = (script: string, ...args: string[]) => spawnSync(spec.command, ["sandbox", "-P", "consensus-implement", "-C", workspace,
+        "/bin/sh", "-c", script, "probe", ...args], { cwd: workspace, env: spec.environment, encoding: "utf8", timeout: 15000 });
+      const write = (path: string) => run('printf probe > "$1"', path);
+      const allowed = write(join(workspace, "src", "a.txt"));
+      expect(allowed.status, `${label}: ${allowed.stderr}`).toBe(0);
+      expect(readFileSync(join(workspace, "src", "a.txt"), "utf8"), label).toBe("probe");
+      const created = run('mkdir -p "$1" && printf probe > "$1/file.txt"', join(workspace, "src", "new"));
+      expect(created.status, `${label}: ${created.stderr}`).toBe(0);
+      const gitWrites = workspace === work ? [join(work, ".git", "index.lock")]
+        : [join(linked, ".git"), join(common, "index.lock"), join(gitDirectory, "index.lock")];
+      for (const path of [join(workspace, "src", "b.txt"), join(workspace, "other.txt"), ...gitWrites, join(workspace, "AGENTS.md"),
+        join(workspace, ".agents"), join(outside, "blocked"), ...(workspace === work ? [join(work, "linked", "blocked")] : [])]) {
+        const result = write(path);
+        expect(result.status, `${label} ${path}: ${result.stderr}`).not.toBe(0);
+      }
+      expect(run('cat "$1" > /dev/null', join(workspace, "src", "a.txt")).status, label).toBe(0);
+      for (const path of [join(common, "HEAD"), ...(workspace === linked ? [join(linked, ".git"), join(gitDirectory, "HEAD")] : [])]) {
+        // 실제 존재하고 호스트에서 읽히는 파일이어야 한다. 잘못된 경로의 ENOENT를 권한 차단으로 오인하지 않는다.
+        expect(readFileSync(path, "utf8").trim().length, `${label} ${path}`).toBeGreaterThan(0);
+        const result = run('cat "$1" > /dev/null', path);
+        expect(result.status, `${label} ${path}`).not.toBe(0);
+        expect(result.stderr, `${label} ${path}`).toMatch(/Operation not permitted|Permission denied/);
+      }
+      expect(readFileSync(join(workspace, "AGENTS.md"), "utf8"), label).toBe("REPOSITORY INSTRUCTION");
+      if (!isolated) continue;
+      expect(execFileSync(spec.command, ["debug", "prompt-input", "probe"], options), label).not.toContain("REPOSITORY INSTRUCTION");
+      expect([effective.multi_agent, effective.multi_agent_v2], label).toEqual(["false", "false"]);
+    }
+  }, 120000);
 });

@@ -2,7 +2,17 @@ import { spawn } from "node:child_process";
 import { execFileSync } from "node:child_process";
 import type { CommandResult, CommandRunner, CommandSpec } from "./types.js";
 
+// 공급자 프로세스 그룹의 소유자(엔진 개편 E2e). "own"(기본): 실행마다 새 그룹을 만들고 중단 때 그룹 전체를 끝낸다 — 엔진 서버 경로.
+// "caller": 호출한 프로세스의 그룹에 그대로 둔다 — 운영 도구가 런타임 CLI 를 새 그룹으로 띄우고 제한 시간·정상 종료·호스트 사망 때 그 그룹 전체를
+// 끝내는 계약(host-review run_process)이 공급자와 그 자식까지 덮게 한다. 이 모드의 중단은 공급자 프로세스만 끝내고 남은 자식은 호출자가 정리한다.
+export interface SpawnCommandRunnerOptions { processGroup?: "own" | "caller" }
+
 export class SpawnCommandRunner implements CommandRunner {
+  private readonly ownGroup: boolean;
+  constructor(options: SpawnCommandRunnerOptions = {}) {
+    this.ownGroup = (options.processGroup ?? "own") === "own";
+  }
+
   async run(spec: CommandSpec): Promise<CommandResult> {
     // 실행 허용 검사는 spawn 직전이다 — 여기까지 온 준비 작업(임시 디렉터리·슬롯)은 끝났고, 이 뒤엔 프로세스가 뜬다.
     if (spec.signal?.aborted) throw abortError(spec.signal.reason);
@@ -21,8 +31,9 @@ export class SpawnCommandRunner implements CommandRunner {
         cwd: spec.cwd,
         env: spec.environment ?? process.env,
         stdio: ["pipe", "pipe", "pipe"],
-        detached: process.platform !== "win32",
+        detached: this.ownGroup && process.platform !== "win32",
       });
+      const group = this.ownGroup;
       // close 이후에도 process group을 다룰 수 있도록 spawn 시점의 PID를 붙잡아 둔다.
       const childPID = child.pid;
       const stdoutTail = createTailBuffer(spec.maxOutputBytes ?? MAX_CAPTURE_BYTES);
@@ -43,7 +54,9 @@ export class SpawnCommandRunner implements CommandRunner {
       let terminatedAfterResult = false;
       child.stdout.setEncoding("utf8");
       child.stderr.setEncoding("utf8");
+      let lastOutputAt = Date.now();
       child.stdout.on("data", (chunk: string) => {
+        lastOutputAt = Date.now();
         stdoutBytes += Buffer.byteLength(chunk, "utf8");
         // Agent JSONL can legitimately be verbose for a long-running implementation.
         // Keep only a bounded diagnostic tail, but fail on cumulative overflow only
@@ -71,7 +84,34 @@ export class SpawnCommandRunner implements CommandRunner {
           }
         }
       });
-      child.stderr.on("data", (chunk: string) => { stderrTail.push(chunk); });
+      child.stderr.on("data", (chunk: string) => { lastOutputAt = Date.now(); stderrTail.push(chunk); });
+      // 호스트 소유 그룹(caller, E2e-1 host-review F002): 실행의 끝은 공급자 프로세스의 종료다. 공급자가 띄운 자식이 stdout·stderr 를 물려받아 열어
+      // 두면 파이프 EOF(close)가 오지 않는다 — 그 자식은 호스트가 그룹 종료로 끝낸다(운영 도구가 공급자를 직접 띄우던 때와 같은 계약).
+      // 공급자가 종료 전에 쓴 출력은 이미 파이프에 있다: 파이프 버퍼보다 큰 쓰기는 읽힐 때까지 공급자를 막으므로, 종료 뒤 남는 것은 버퍼 하나 분량이고
+      // 곧바로 읽을 수 있다. 출력이 CALLER_DRAIN_IDLE_MS 동안 멈췄는지를 타이머 단계에서 보고, 닫기 전에 check 단계(setImmediate)에서 한 번 더
+      // 확인한다 — 그 사이의 poll 단계가 대기 중인 파이프 데이터를 먼저 읽으므로, 이벤트 루프가 늦어 타이머가 늦게 돌아도 이미 쓴 출력을 버리지 않는다.
+      // 자식이 계속 써도 CALLER_DRAIN_MAX_MS 뒤에는 닫는다(그 뒤 출력은 공급자 것이 아니다). own 모드(엔진)는 그대로 close 를 기다린다.
+      if (!group) {
+        child.once("exit", () => {
+          const exitedAt = Date.now();
+          let confirming = false;
+          const timer = setInterval(() => {
+            if (child.stdout.destroyed && child.stderr.destroyed) { clearInterval(timer); return; }
+            const now = Date.now();
+            if (confirming || (now - lastOutputAt < CALLER_DRAIN_IDLE_MS && now - exitedAt < CALLER_DRAIN_MAX_MS)) return;
+            confirming = true;
+            const seen = lastOutputAt;
+            setImmediate(() => {
+              confirming = false;
+              if (lastOutputAt !== seen && Date.now() - exitedAt < CALLER_DRAIN_MAX_MS) return;
+              clearInterval(timer);
+              child.stdout.destroy();
+              child.stderr.destroy();
+            });
+          }, 20);
+          child.once("close", () => clearInterval(timer));
+        });
+      }
       const finishReject = (error: unknown) => {
         if (settled) return;
         settled = true;
@@ -79,14 +119,14 @@ export class SpawnCommandRunner implements CommandRunner {
       };
       const terminate = () => {
         try {
-          terminateProcessGroup(childPID, "SIGTERM");
+          terminateProcessGroup(childPID, "SIGTERM", group);
         } catch (error) {
           terminationError = error;
         }
         // 분리된 타이머로 승격하면 직속 자식 close로 실행이 먼저 끝나고, 그 뒤 서버가 종료되면
         // SIGTERM을 무시한 손자가 살아남는다. 승격을 promise로 붙잡아 두고 close가 이 promise를
         // 기다린 뒤에만 settle한다 — 실행은 process group이 실제로 빌 때까지 끝나지 않는다.
-        terminationDrain ??= drainProcessGroup(childPID).then((error) => {
+        terminationDrain ??= drainProcessGroup(childPID, group).then((error) => {
           if (error) terminationError ??= error;
         });
       };
@@ -287,10 +327,14 @@ function psEnvironment(): NodeJS.ProcessEnv {
   return { ...process.env, LC_ALL: "C", LC_TIME: "C" };
 }
 
-function terminateProcessGroup(pid: number | undefined, signal: NodeJS.Signals): void {
+// caller 모드에서 공급자 종료 뒤 남은 파이프를 읽는 시간 — 출력이 이만큼 멈추면 닫고, 자식이 계속 써도 상한 뒤에는 닫는다.
+const CALLER_DRAIN_IDLE_MS = 100;
+const CALLER_DRAIN_MAX_MS = 2_000;
+
+function terminateProcessGroup(pid: number | undefined, signal: NodeJS.Signals, group = true): void {
   if (!pid) return;
   try {
-    if (process.platform === "win32") process.kill(pid, signal);
+    if (process.platform === "win32" || !group) process.kill(pid, signal);
     else process.kill(-pid, signal);
   } catch (error) {
     if (!(error && typeof error === "object" && "code" in error && error.code === "ESRCH")) throw error;
@@ -298,22 +342,22 @@ function terminateProcessGroup(pid: number | undefined, signal: NodeJS.Signals):
 }
 
 // SIGTERM 유예 1초를 기다렸다가 남아 있으면 SIGKILL을 보내고 group이 빌 때까지(상한 5초) 확인한다.
-async function drainProcessGroup(pid: number | undefined): Promise<unknown> {
+async function drainProcessGroup(pid: number | undefined, group = true): Promise<unknown> {
   if (!pid) return undefined;
   const graceDeadline = Date.now() + 1_000;
   while (Date.now() < graceDeadline) {
-    if (!processGroupAlive(pid)) return undefined;
+    if (!processGroupAlive(pid, group)) return undefined;
     await delay(50);
   }
-  if (!processGroupAlive(pid)) return undefined;
+  if (!processGroupAlive(pid, group)) return undefined;
   try {
-    terminateProcessGroup(pid, "SIGKILL");
+    terminateProcessGroup(pid, "SIGKILL", group);
   } catch (error) {
     return error;
   }
   const killDeadline = Date.now() + 5_000;
   while (Date.now() < killDeadline) {
-    if (!processGroupAlive(pid)) return undefined;
+    if (!processGroupAlive(pid, group)) return undefined;
     await delay(50);
   }
   return new Error("SIGKILL 뒤에도 process group이 종료되지 않았습니다. 남은 프로세스를 직접 확인해 주세요.");
@@ -323,10 +367,10 @@ function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-function processGroupAlive(pid: number | undefined): boolean {
+function processGroupAlive(pid: number | undefined, group = true): boolean {
   if (!pid) return false;
   try {
-    if (process.platform === "win32") process.kill(pid, 0);
+    if (process.platform === "win32" || !group) process.kill(pid, 0);
     else process.kill(-pid, 0);
     return true;
   } catch (error) {

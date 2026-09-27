@@ -6,6 +6,9 @@ import type {
   MemoryUpdate,
   WorkflowState,
 } from "../shared/contracts.js";
+import type { TurnJob } from "../shared/roles.js";
+import type { TimelineDelivery } from "../shared/planningControl.js";
+import type { SessionBinding } from "./turnRouting.js";
 
 export type ParticipantRole = Extract<AgentRole, "claude" | "codex">;
 
@@ -70,9 +73,22 @@ export interface CommandRunner {
 }
 
 export interface SessionTurn {
+  // 엔진이 이 턴에 명시한 역할·작업(엔진 개편 E2a). 어댑터는 job 과 턴 형태로 역할 정책(adapters/turnPolicy.ts)을 계산해 자기 CLI 인자로 변환한다.
+  // implementation·protocolOnly 는 job 에서 유도한 값이 함께 실린다(래퍼가 읽는다). job 이 없으면 어댑터가 공급자·플래그로 유도한다(호환 경계).
+  job?: TurnJob;
+  // 이 턴의 경로 바인딩(엔진 개편 E2b) — 세션을 소유하는 공급자·참여자와 선택 근거. 계획 제어 래퍼가 체크포인트의 세션·응답이 이 바인딩의 것인지
+  // 대조한다(다른 참여자의 대화를 이어 쓰지 않게). 어댑터는 읽지 않는다.
+  binding?: SessionBinding;
   // Bounded planning is tool-free but still receives mandatory project instructions.
   planningControl?: { admissionId: string; maxPromptBytes: number; image?: { path: string; bytes: number };
     instructionsInSession?: boolean };
+  // 코드 리뷰 원장 ID(E3-4c) — 실행기가 경로(TurnRoute.reviewLedger)에서 옮겨 싣는다. 예산 래퍼(BudgetController)가 리뷰 좌석의 읽기·최종 판정 호출을
+  // 호출마다 새 ID 대신 이 ID 로 예약하고, 원장의 첫 spawn 뒤에는 spawn 전 실패에도 예약을 되돌리지 않는다. 어댑터는 읽지 않는다.
+  reviewLedger?: string;
+  // 메모리 본문 1회 주입(E3-4c host-review 39d21df9 F004) — 실행기가 "프로토콜 턴이 만들어 메모리 본문을 아직 받지 않은 세션"의 일반 resume 턴에만 싣는다.
+  // 어댑터는 이 resume 에 새 세션처럼 본문을 싣고(매니페스트는 중복하지 않는다) 프로토콜·계획 제어 턴이면 무시한다. 없으면 종전(생성 턴에만 본문, resume 은
+  // 매니페스트) — 모든 resume 재주입은 하지 않는다(2026-08-30 턴당 ~20K자 중복 과금 실측).
+  memoryBodies?: boolean;
   // Host-managed product evidence disables direct web reads; Figma implementation access is a separate opt-in.
   evidenceManaged?: boolean;
   // Host opt-in only for implementation with registered Figma links; never planning or protocol turns.
@@ -82,9 +98,15 @@ export interface SessionTurn {
   onFigmaResult?: (observation: { tool: string; input: unknown; content: unknown; isError?: boolean }) => void;
   sessionId: string;
   prompt: string;
+  // 엔진이 과제 프롬프트를 확정한 타임라인 순번. 래퍼의 비동기 대기 중 들어온 입력까지 반영했다고 기록하지 않는다.
+  // 본문의 개별 조각이 전부 전달되었다는 뜻은 아니다.
+  inputSequence?: number;
   // prompt 가 sessionId 세션이 이미 받은 내용 위의 변경분일 때만 둔다 — 과제를 다른 세션(교체·새 세션)에 전달하는 쪽은 prompt 대신 이
   // 전체 문맥 판을 쓴다. 변경분은 계산한 세션에서만 유효하다(host-review a7a9ce86 F-001).
   freshSessionPrompt?: string;
+  // 타임라인 참조 descriptor(E3-2-2a) — prompt·freshSessionPrompt 두 판이 실은 버전 고정 참조의 정본. 엔진이 계획 제어·세션 유지 턴에만 넘기고,
+  // 계획 제어 래퍼는 이것으로만 읽을 문서를 싣는다(프롬프트 문자열을 해석하지 않는다). 과제 문자열을 바꾸는 쪽은 짝을 맞춰 바꿔야 한다.
+  timelineDelivery?: TimelineDelivery;
   cwd: string;
   signal?: AbortSignal;
   // spawn 직전 실행 허용 검사(CommandSpec.beforeSpawn/admitSync 로 그대로 전달). 어댑터의 내부 재시도·슬롯 대기·세션 폴백도 매번 부른다.
@@ -102,6 +124,9 @@ export interface SessionTurn {
   // 진짜 계획을 세우는 두 턴에만 켠다: 최초 계획, 그리고 감사 findings가 0으로 수렴한 개정.
   planMode?: boolean;
   settings?: AgentExecutionSettings;
+  // 경로 프로필의 공급자 옵션(엔진 개편 E2c, shared/roles.ts PROVIDER_OPTION_SCHEMAS) — 경로 판정이 이 공급자의 스펙으로 검증한 값. 어댑터 입구
+  // (resolveSupportedTurn)가 다시 읽어 변환한다.
+  providerOptions?: Readonly<Record<string, unknown>>;
   onProcessSpawn?: (process: SpawnedProcess) => void;
   // 턴이 쓴 토큰·시간을 알린다(codex `turn.completed` / claude `result` 이벤트에서 읽음). 기록 전용 —
   // 관찰자가 던져도 턴 결과는 유지된다(adapters/usage.ts notifyUsage).
@@ -111,13 +136,28 @@ export interface SessionTurn {
   limits?: ExecutionLimits;
   // 세션 id 가 만들어진 즉시(프로세스 실행 전) 알린다 — 턴이 429·stop 으로 끊겨도 resume 할 수 있게 저장하기 위함(2026-09-03 실측).
   onSessionCreated?: (sessionId: string) => void;
+  // 공급자가 보고한 원시 사용량 객체(E2e-2, Codex turn.completed.usage) — 기록 전용, 합산·보정하지 않는다.
+  onProviderUsage?: (usage: Record<string, unknown>) => void;
   // 이 턴에서 추가로 읽기를 허용할 경로(예: 주제 디렉터리의 plan.md). 이어지는 턴이 계획 본문을 다시 받지 않는 대신
   // 세션 기억이 압축됐을 때 에이전트가 원문을 직접 읽을 수 있게 한다(2026-09-08 Codex 제안 ⑥).
   readablePaths?: readonly string[];
+  // 호스트 격리 입력(엔진 개편 E2e, turnPolicy.ts TurnPolicy.isolated) — 운영 도구가 입력 전체를 고정한 턴. 엔진은 쓰지 않는다.
+  isolated?: boolean;
+  // cwd 가 Git 체크아웃이 아닌 호스트 snapshot 이다(E2e.md 규칙 3) — 공급자 CLI 의 Git 저장소 요구를 끈다. 엔진은 쓰지 않는다.
+  snapshotWorkspace?: boolean;
+  // 호스트가 소유한 공급자 세션 홈(E2e-1 host-review F001) — 격리 턴에서만 쓴다. 없으면 어댑터가 데이터 폴더 아래 격리 홈을 만든다.
+  sessionHome?: string;
+  // 승인 경로만 쓰기(엔진 개편 E2e-3, turnPolicy.ts writeScopeProblem) — 쓰기 턴의 쓰기 범위를 작업 폴더 안의 이 절대 경로들로 좁힌다. 엔진은 쓰지 않는다.
+  writablePaths?: readonly string[];
 }
+
+// 소비처가 정한 결과 JSON Schema(엔진 개편 E2e) — 공급자 CLI 의 구조화 출력 제약으로 넘긴다. 의미 검증은 소비처가 한다.
+export type OutputSchema = Readonly<Record<string, unknown>>;
 
 // 한 CLI 턴의 사용량. inputTokens 는 캐시 읽기를 포함한 총 입력이고 cachedInputTokens 는 그중 캐시에서 읽은 양이다.
 export interface TurnUsage {
+  // 이 실행의 경로(엔진 개편 E2b) — 실제 공급자·참여자·프로필·선택 근거·job. 사용량 기록의 role 은 좌석 이름이다.
+  route?: { provider: string; participant: string; profileId: string | null; basis: unknown; job: TurnJob };
   lastRequestInputTokens?: number;
   peakRequestInputTokens?: number;
   imageBytes?: number;
@@ -167,6 +207,14 @@ export interface AgentAdapter {
   createSession(turn: Omit<SessionTurn, "sessionId">): Promise<CreatedSession>;
   resumeTurn(turn: SessionTurn): Promise<AgentResult>;
   resumePlanRepair?(turn: SessionTurn): Promise<PlanRepair>;
+  // 소비처 schema 의 결과(엔진 개편 E2e) — 마지막 구조화 응답을 JSON 객체로 돌려준다. 지원하지 않는 어댑터는 두지 않는다(호출 전 거부).
+  createStructuredSession?(turn: Omit<SessionTurn, "sessionId">, schema: OutputSchema): Promise<{ sessionId: string; value: Record<string, unknown> }>;
+  resumeStructuredTurn?(turn: SessionTurn, schema: OutputSchema): Promise<Record<string, unknown>>;
+  // 호스트 소유 세션 홈의 native 세션 기록 확인(E2e-2) — 읽기만 한다. 공급자 프로세스를 띄우지 않고 홈에 쓰지 않는다.
+  inspectSession?(sessionHome: string, cwd: string, sessionId: string): Promise<{ exists: boolean; reason: string }>;
+  // 자동 복구용 부재 확인: 전 범위를 확인해 없을 때만 true, 존재하면 false. 조회 실패·불완전 탐색은 throw한다.
+  // 지원하지 않는 제공자는 생략한다. 연결 검증(validateExistingSession)의 false로 대체하면 안 된다.
+  isSessionMissing?(sessionId: string): Promise<boolean>;
   validateExistingSession(sessionId: string): Promise<boolean>;
 }
 

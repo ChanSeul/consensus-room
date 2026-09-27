@@ -27,6 +27,10 @@ REST 연결 환경변수는 `CONSENSUS_EVIDENCE_SLACK_TOKEN`, `CONSENSUS_EVIDENC
 - 텍스트 단위와 PNG는 SHA-256으로 한 번 저장한다. 스냅샷은 내용의 해시를 참조한다. 변경 전 버전도 남아 근거를 추적할 수 있다.
 - 모델의 실제 세션·역할·주제별 전달 이력을 기록한다. 성공한 재개 턴에는 변경·삭제만 전달한다. 실패·취소한 호출은 읽었다고
   처리하지 않으며 새 세션에는 현재 자료가 필요하므로 다시 제공한다. 새 세션의 필요한 첫 읽기까지 생략하지 않는다.
+- 한 턴에는 근거 한 쪽만 싣는다. 쪽 크기는 바뀐 PNG 경로 줄까지 포함한 근거 블록의 UTF-8 바이트이며 최대 240,000이다.
+  남은 항목 수와 다음 위치를 블록 끝에 적고 다음 턴에 이어서 싣는다. 전달 이력에는 그 쪽에 실린 항목만 기록한다.
+  한 단위가 쪽보다 크면 아래 중재자 배치와 같은 코드 포인트 구간으로 나눠 싣고, 끝 구간을 실은 턴이 성공해야 그 단위를 받은 것으로 기록한다.
+  새로 전달할 항목이 없으면 근거 블록을 싣지 않는다. 처음 알리는 원문과 재확인이 필요한 원문은 원문 줄로 알린다.
 - 캐시가 제공된 턴에는 직접 Figma MCP와 두 모델의 웹 조회를 열지 않는다. 추가 자료는 중재자가 등록해 공유 캐시에 넣는다.
   PNG 파일 제공은 시각 검증 완료를 뜻하지 않는다. 모델이 캐시된 이미지를 확인하고 근거를 보고해야 한다.
   재개 턴에는 이미지 경로를 반복해 보내지 않지만, 현재 자료의 로컬 PNG 읽기 권한은 유지한다.
@@ -110,7 +114,7 @@ connector 자료를 자동으로 읽지 않고 REST 연결 필요 상태를 반�
 ```sh
 python3 scripts/evidence-bridge.py connections
 python3 scripts/evidence-bridge.py use-rest --id SOURCE_ID
-python3 scripts/evidence-bridge.py batch --id TOPIC_ID --session ACTUAL_MEDIATOR_SESSION_ID
+python3 scripts/evidence-bridge.py batch --id TOPIC_ID --session ACTUAL_MEDIATOR_SESSION_ID [--page-bytes BYTES]
 # 반환된 자료를 읽은 뒤에만 별도 실행한다. 조회 성공만으로 자동 확인하지 않는다.
 python3 scripts/evidence-bridge.py ack --id TOPIC_ID --session ACTUAL_MEDIATOR_SESSION_ID --batch BATCH_ID
 python3 scripts/evidence-bridge.py metrics --id TOPIC_ID
@@ -134,14 +138,28 @@ python3 scripts/evidence-bridge.py metrics --id TOPIC_ID
 삭제 ID만 제공하며 줄 단위 diff는 아니다. 같은 PNG는 수신 확인한 이미지 해시와 비교해 경로를 생략한다.
 모델은 원문을 신뢰하지 않는 참고 자료로 읽고 작성자·적용 플랫폼·후속 답변·반대 근거를 대조해야 한다.
 
-배치는 주제·범위 세대·실제 중재자 세션에 묶인다. 미확인 배치는 서버 재시작·중단 뒤에도 같은 batchId로
-다시 받는다. `ack`는 해당 배치의 원문 버전만 확인하며 동시에 도착한 새 변경을 지우지 않는다.
+배치 하나는 한 쪽이다. 응답 본문(JSON 전체)의 UTF-8 바이트는 요청한 `pageBytes` 이하이며, 기본값과 최대값은 240,000이다.
+출력을 읽는 도구의 한도가 더 작으면 `--page-bytes`로 더 작은 쪽을 요청한다. bridge는 응답 본문을 다시 직렬화하지 않고
+그대로 출력하며 끝에 개행 하나만 더한다. 원문 전체를 한 번에 출력하지 않으므로 쪽마다 읽고 확인한 뒤 다음 쪽을 받는다.
+`remaining`은 이 쪽 뒤에 남은 항목 수(일부만 받은 단위는 1)이고 `nextCursor`는 다음 항목 위치다.
+`remaining`이 0이고 다음 batch가 `batchId: null`을 돌려줄 때까지 근거 읽기를 마친 것으로 보지 않는다.
+한 단위가 쪽보다 크면 `changes` 항목에 `range: {offset, end, total}`이 붙고 `content`는 그 구간만 담는다.
+오프셋은 유니코드 코드 포인트 단위이고 서로게이트 쌍을 가르지 않는다. 같은 단위의 구간을 순서대로 이으면 본문과 같다.
+자소·결합 문자는 구간 경계에서 나뉠 수 있다. 쪽 머리(원문 목록)와 첫 항목의 한 코드 포인트도 담지 못하는 `pageBytes`는
+필요한 최소 바이트와 함께 409로 거부한다.
+
+배치는 주제·범위 세대·실제 중재자 세션에 묶인다. 미확인 쪽은 만든 시점의 원문 버전으로 고정되며 서버 재시작·중단 뒤에도
+같은 batchId로 다시 받는다. 대기 쪽이 새로 요청한 `pageBytes`보다 크면 아직 확인한 것이 없으므로 더 작은 새 쪽으로 바꾸고,
+옛 batchId는 ack할 수 없다. `ack`는 그 쪽에 실제로 실린 단위·구간·삭제만 확인하며 동시에 도착한 새 변경을 지우지 않는다.
+끝 구간을 확인하기 전에는 그 단위를 받은 것으로 기록하지 않는다. 구간을 받는 동안 단위가 바뀌면 새 버전을 처음부터 다시 싣는다.
 이미 확인한 배치의 중복 ack는 새 배치를 소비하지 않는다. 새로운 세션에는 첫 자료를 다시 제공한다.
 `batchId: null`은 전달할 변경이 없다는 뜻이며 ack하지 않는다. `superseded: true`이면 현재 원문이 배치보다
 앞서 있다. 읽기를 확인하고 다음 배치를 받아 `digest`와 `currentDigest`가 같아진 뒤 영향 검토를 마친다.
 수신 확인과 계획 검토는 별개이며, 기존 계획·원문 해시에 묶인 승인 검사는 계속 적용된다.
+쪽 전달 이전 서버가 남긴 확인 기록(원문별 스냅샷 버전)은 세션마다 한 번, 그 정확한 스냅샷의 단위만 확인한 것으로 옮긴다.
+스냅샷이 없거나 불완전하면 옮기지 않고 다시 싣는다. 이전 서버에서 받고 확인하지 않은 배치는 ack할 수 없으므로 batch를 다시 요청한다.
 
-API는 `POST /api/topics/:id/evidence/mediator/batch`에 sessionId,
+API는 `POST /api/topics/:id/evidence/mediator/batch`에 sessionId(선택 pageBytes),
 `POST /api/topics/:id/evidence/mediator/ack`에 sessionId·batchId를 받는다.
 기존 로컬 인증과 중재자 헤더가 필요하다. 두 API는 계획 승인이나 위임 설정을 변경하지 않는다.
 `GET /api/evidence/connections`는 인증값 없이 설정 여부·연결 주제·수집 통계를 제공한다.

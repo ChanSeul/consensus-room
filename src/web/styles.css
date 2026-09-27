@@ -134,6 +134,8 @@ h3 { font-size: 17px; }
 .context-list div { display: grid; grid-template-columns: 86px minmax(0,1fr); gap: 8px; }
 .context-list dt { color: var(--faint); font-size: 12px; }
 .context-list dd { margin: 0; overflow-wrap: anywhere; color: #ccd2de; font: 10px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.context-list .route-line { display: block; }
+.context-list .route-refusal { color: var(--amber); }
 .evidence-list { display: flex; flex-direction: column; gap: 7px; margin: 11px 0 0; padding: 0; list-style: none; }
 .evidence-list li { padding: 8px 9px; border-left: 2px solid #3b557b; color: var(--muted); background: #111722; font-size: 12px; line-height: 1.45; word-break: break-word; }
 .muted-copy { margin-top: 10px; color: var(--muted); font-size: 13px; line-height: 1.55; }

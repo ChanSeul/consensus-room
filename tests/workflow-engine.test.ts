@@ -7,6 +7,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { ArtifactStore } from "../src/server/artifacts";
 import { ConsensusDatabase } from "../src/server/database";
 import { GitService } from "../src/server/git";
+import { SpawnCommandRunner } from "../src/server/processRunner";
+import { execFileSync } from "node:child_process";
 import type { AgentAdapter, CommandRunner, ProjectMemoryWriter } from "../src/server/types";
 import { EngineCore, FormatViolation, isFormatOnlyViolation } from "../src/server/engine/core";
 import { resumedPlanTimeline } from "../src/server/engine/planning";
@@ -15,6 +17,7 @@ import { WorkflowEngine } from "../src/server/workflow";
 import { parseTolerancePolicy, ToleranceFormatError } from "../src/shared/tolerance";
 import { REQUIRED_PLAN_HEADINGS, type AgentResult } from "../src/shared/contracts";
 import { hashPlan, normalizePlan, redactSecrets } from "../src/shared/workflow";
+import { agentRunError } from "../src/server/adapters/resultParser";
 
 const temporaryDirectories: string[] = [];
 
@@ -497,9 +500,10 @@ describe("가짜 에이전트 전체 계획 왕복", () => {
     const { database, engine } = makeEngine("DRAFT", null);
     database.planning.enable("topic-1");
     database.updateTopic("topic-1", { state: "AWAITING_USER_APPROVAL", planSHA256: priorSHA });
-    database.planning.bindSession(database.getTopic("topic-1"), priorSHA, "claude-session", 0);
-    database.appendEvent({ topicId: "topic-1", actor: "user", kind: "decision", state: "DRAFT",
+    // 유지 세션은 OLD까지 받았다. 이후 들어온 결정만 재계획에 실린다.
+    const old = database.appendEvent({ topicId: "topic-1", actor: "user", kind: "decision", state: "DRAFT",
       body: "OLD_TIMELINE_MARKER 첫 정책", payload: {} });
+    database.planning.bindSession(database.getTopic("topic-1"), priorSHA, "claude-session", old.sequence);
     await engine.postMessage("topic-1", "decision", "NEW_TIMELINE_MARKER 로그인 때 다른 계정 초안을 지운다");
     const topic = database.getTopic("topic-1");
     database.appendEvent({ topicId: "topic-1", actor: "user", kind: "decision", state: "DRAFT",
@@ -507,8 +511,7 @@ describe("가짜 에이전트 전체 계획 왕복", () => {
       payload: { invalidatedPlanSHA256: priorSHA, planEpoch: topic.planEpoch } });
     const fullTimeline = database.getPromptTimeline("topic-1", topic.scopeGeneration);
     expect(database.planning.continuesPriorPlan(topic, priorSHA)).toBe(true);
-    const selected = resumedPlanTimeline(fullTimeline, "PREVIOUS_PLAN",
-      database.planning.continuesPriorPlan(topic, priorSHA), topic.planEpoch);
+    const selected = resumedPlanTimeline(database, topic, priorSHA);
     const replanPrompt = buildClaudePlanPrompt({ title: topic.title, worktreePath: topic.worktreePath,
       sourceRepositoryPath: topic.repositoryPath, baseRef: topic.baseRef, scopeGeneration: topic.scopeGeneration,
       timeline: selected, previousPlanMarkdown: "PREVIOUS_PLAN" });
@@ -520,8 +523,7 @@ describe("가짜 에이전트 전체 계획 왕복", () => {
       acknowledgedPlanSHA256: null });
     const replaced = database.getTopic("topic-1");
     expect(database.planning.continuesPriorPlan(replaced, priorSHA)).toBe(false);
-    expect(resumedPlanTimeline(fullTimeline, "PREVIOUS_PLAN",
-      database.planning.continuesPriorPlan(replaced, priorSHA), replaced.planEpoch)).toEqual(fullTimeline);
+    expect(resumedPlanTimeline(database, replaced, priorSHA)).toEqual(fullTimeline);
     database.close();
   });
 
@@ -1357,7 +1359,8 @@ class ReviewSessionAdapter implements AgentAdapter {
 }
 
 describe("저장된 구현 세션의 대화 파일이 없을 때", () => {
-  it("resume 이 'No conversation found' 로 실패하면 새 세션으로 시작하고 그 사실을 타임라인에 남긴다", async () => {
+  // E3-3b: 폴백은 문구가 아니라 어댑터 분류(session-missing)로만 열리고, 구현 좌석 계보의 자동 복구 1회로 기록된다.
+  it("resume 이 관측된 세션 유실(session-missing)로 실패하면 구현 계보의 자동 복구로 새 세션에서 다시 열고 그 사실을 타임라인·계보에 남긴다", async () => {
     const agreed = finding("F-ORIGINAL", "첫 리뷰가 고치기로 한 결함", { disposition: "AGREED_ACTION" });
     const resolved = finding("F-ORIGINAL", "첫 리뷰가 고치기로 한 결함", { disposition: "RESOLVED_BY_FIX" });
     const passed: AgentResult = { kind: "FINAL_REVIEW", summary: "수정을 확인한 최종 리뷰", findings: [resolved], evidenceRefs: [] };
@@ -1370,7 +1373,8 @@ describe("저장된 구현 세션의 대화 파일이 없을 때", () => {
       },
       async resumeTurn(turn) {
         calls.push(`resume:${turn.sessionId}`);
-        throw new Error("Claude 실행 실패(1): No conversation found with session ID: claude-implementation-session");
+        throw agentRunError("claude", 1, "No conversation found with session ID: claude-implementation-session\n",
+          JSON.stringify({ type: "result", subtype: "error_during_execution", is_error: true, num_turns: 0, session_id: "claude-implementation-session" }));
       },
       async validateExistingSession() { return false; },
     };
@@ -1385,9 +1389,13 @@ describe("저장된 구현 세션의 대화 파일이 없을 때", () => {
     // 수정 턴은 구현 세션을 resume 하는 경로라 동일 폴백이 적용돼야 한다 — 이 테스트는 그 경로가 아직 실패하면 붉다.
     const bodies = database.getTimeline("topic-1").map((event) => event.body);
     expect(calls[0]).toBe("resume:claude-implementation-session");
-    expect(bodies.some((body) => body.includes("대화 파일을 CLI 가 찾지 못해 새 세션으로 시작합니다"))).toBe(true);
+    expect(bodies.some((body) => body.includes("같은 경로의 새 세션으로 이 작업을 한 번 다시 엽니다"))).toBe(true);
     expect(calls).toContain("create");
     expect(database.getFlags("topic-1").implementationSessionId).toBe("claude-fresh-session");
+    const lineage = database.planning.storedRecoveryLineage("topic-1", "implementer")!;
+    expect(lineage.recoveries).toHaveLength(1);
+    expect(lineage.recoveries[0]).toMatchObject({ reason: "session-missing", fromSession: "claude-implementation-session", toSession: "claude-fresh-session",
+      error: { provider: "claude", code: "session-missing" } });
     database.close();
   });
 });
@@ -3627,9 +3635,9 @@ it("설명 길이와 마지막 쉼표 때문에 모델 교정을 요청하지 �
   const plan = validPlan("설명 보존").replace(/```tolerance[\s\S]*?```/, "```tolerance\n" + JSON.stringify(policy).replace(/}$/, ",}") + "\n```");
   let result: AgentResult | undefined;
   core.startAction("topic-1", "plan", async signal => {
-    result = await core.enforceResultContract("claude", database.getTopic("topic-1"),
+    result = await core.enforceResultContract(core.route(database.getTopic("topic-1"),{role:"planner",operation:"plan"}), database.getTopic("topic-1"),
       {kind:"PLAN",summary:"계획",planMarkdown:plan,findings:[],evidenceRefs:[]}, "session", {
-        signal, implementation:false, planMode:true, startedAfter:0,
+        signal, planMode:true, startedAfter:0,
         evidenceDigest: database.evidence.topic(database.getTopic("topic-1")).digest, check:r => {core.requirePlan(r);},
       });
   });
@@ -3726,17 +3734,212 @@ it("단계 토픽의 실제 호출은 공통 계약을 받고 작업 묶음 예�
  expect(codexCalls).toBe(0);database.close();
 });
 
-it("묶음의 중간 단계는 푸시 전에 닫을 수 없고 전달 뒤에는 닫을 수 있다",()=>{
- const {database,engine}=makeEngine("READY_TO_DELIVER","a".repeat(64),true);
+// E4(plan §3.3) 계약 변경: 중간 단계는 push 가 아니라 검증된 로컬 커밋(HEAD==committedOID·clean·커밋 트리==리뷰 트리·기준의 후손)에서 닫고, 닫을 때
+// 결과를 동결한다. 원격 전달은 단계 착수와 분리된 상태다. (E4 전 계약: "다음 단계로 넘어가려면 먼저 커밋과 푸시를 완료하세요.")
+it("묶음의 중간 단계는 검증된 로컬 커밋에서 push 없이 닫고 결과를 동결한다",async()=>{
+ const commit="c".repeat(40),tree="e".repeat(40);
+ let head="head",treeFiles="",ancestor=true;
+ const ok=(stdout:string,exitCode=0)=>({exitCode,stdout,stderr:"",jsonLines:[]});
+ const runner:CommandRunner={run:async spec=>{
+  const args=spec.args;
+  if(args[0]==="rev-parse"&&args[1]==="HEAD")return ok(`${head}\n`);
+  if(args[0]==="status")return ok("");
+  if(args[0]==="diff-tree"&&args.includes("--name-only"))return ok(treeFiles);
+  if(args[0]==="diff-tree")return ok("");
+  if(args[0]==="merge-base"&&args[1]==="--is-ancestor")return ok("",ancestor?0:1);
+  throw new Error(`예상하지 않은 git 호출: ${args.join(" ")}`);
+ }};
+ const {database,engine}=makeEngine("READY_TO_DELIVER","a".repeat(64),true,runner);
  const budget={execution:{inputTokens:10,outputTokens:10,durationMs:100},total:{inputTokens:100,outputTokens:100,durationMs:1000}};
  database.workGroups.create("group",{title:"작업",goal:"목표",contracts:"계약",stages:[
  {id:"a",kind:"work",title:"a",goal:"a",acceptance:"a",dependsOn:[],budget},
  {id:"b",kind:"integration",title:"b",goal:"b",acceptance:"b",dependsOn:["a"],budget}]},"/repo","head");
  database.workGroups.link("group","a","topic-1","head");
- expect(()=>engine.close("topic-1")).toThrow("푸시");expect(database.getTopic("topic-1").state).toBe("READY_TO_DELIVER");
- database.updateTopic("topic-1",{committedOID:"delivered",pushedOID:"delivered"});
- expect(engine.close("topic-1").state).toBe("CLOSED");database.close();
+ // 동기 close 는 묶음 단계를 닫지 않는다(동결 기록 없이 닫히면 다음 단계가 승계할 수 없다).
+ expect(()=>engine.close("topic-1")).toThrow("closeStage");
+ await expect(engine.closeStage("topic-1")).rejects.toThrow("먼저 검증된 결과를 커밋하세요");
+ database.updateTopic("topic-1",{committedOID:commit,reviewedTreeOID:tree});
+ await expect(engine.closeStage("topic-1")).rejects.toThrow("작업 트리 HEAD");
+ head=commit;treeFiles="form.swift\0";
+ await expect(engine.closeStage("topic-1")).rejects.toThrow("리뷰한 트리");
+ treeFiles="";ancestor=false;
+ await expect(engine.closeStage("topic-1")).rejects.toThrow("후손");
+ ancestor=true;
+ expect(database.getTopic("topic-1").state).toBe("READY_TO_DELIVER");
+ expect((await engine.closeStage("topic-1")).state).toBe("CLOSED");
+ expect(database.getFlags("topic-1").pushedOID??null).toBeNull();
+ expect(database.workGroups.get("group").results?.a).toMatchObject({stageId:"a",topicId:"topic-1",baseOID:"head",commitOID:commit,reviewedTreeOID:tree,planSHA256:"a".repeat(64)});
+ database.close();
 });
+
+// 합류·통합 close(E4-5·6): 합류 대상(기준에 모이지 않은 선행 결과)과 통합 단계의 다른 모든 단계 결과는 결과 커밋의 조상이어야 한다. git 확인 사이에
+// 결과 커밋이 바뀌면 거부한다. 변경 없이 검증만 한 통합 단계는 기준 커밋이 결과다.
+// 닫기 결과 확인의 합성 fixture — git 은 합성 응답이다. 공식 경로(병합 준비·병합 커밋·close·push)의 종단 증명은 tests/work-group-e2e.test.ts 가 실제 git 으로 한다.
+// 선행 단계 토픽은 CLOSED 이고 그 작업 트리 HEAD 가 동결 결과 커밋이다(승계 검사 — closeStage 가 어댑터와 같은 선행 결과 해석 함수를 쓴다).
+function stageCloseFixture(kind:"merge"|"integration"){
+ const commit="c".repeat(40),tree="e".repeat(40),dirtyTree="d".repeat(40);
+ const notAncestors=new Set<string>();let onMergeBase:(()=>void)|null=null;let head=commit;
+ const ok=(stdout:string,exitCode=0)=>({exitCode,stdout,stderr:"",jsonLines:[]});
+ const runner:CommandRunner={run:async spec=>{
+  const args=spec.args;
+  if(args[0]==="rev-parse"&&args[1]==="HEAD")return ok(`${spec.cwd.startsWith("/w-")?`${spec.cwd.slice(3)}-commit`:head}\n`);
+  if(args[0]==="status")return ok("");
+  // 리뷰 트리가 dirtyTree 면 리뷰한 작업 트리에 변경이 있었던 것이다.
+  if(args[0]==="diff-tree")return ok(args.includes(dirtyTree)&&args.includes("--name-only")?"changed.txt\0":"");
+  if(args[0]==="merge-base"&&args[1]==="--is-ancestor"){const hook=onMergeBase;onMergeBase=null;hook?.();return ok("",notAncestors.has(args[2])?1:0);}
+  throw new Error(`예상하지 않은 git 호출: ${args.join(" ")}`);
+ }};
+ const {database,engine}=makeEngine("READY_TO_DELIVER","a".repeat(64),true,runner);
+ const budget={execution:{inputTokens:10,outputTokens:10,durationMs:100},total:{inputTokens:100,outputTokens:100,durationMs:1000}};
+ const stage=(id:string,dependsOn:string[],stageKind:"work"|"integration"="work")=>({id,kind:stageKind,title:id,goal:id,acceptance:id,dependsOn,budget});
+ database.workGroups.create("group",{title:"작업",goal:"목표",contracts:"계약",stages:kind==="merge"
+  ?[stage("x",[]),stage("y",[]),stage("z",["x","y"]),stage("int",["z"],"integration")]
+  :[stage("x",[]),stage("y",[]),stage("w",[]),stage("int",["x"],"integration")]},"/repo","head");
+ const result=(stageId:string,topicId:string)=>({stageId,topicId,baseOID:"head",commitOID:`${stageId}-commit`,reviewedTreeOID:tree,planSHA256:"p".repeat(64),
+  evidenceDigest:null,verifications:[],memoryChanges:[],openQuestions:[],deferredFindings:[],decisions:[],closedAt:"2026-09-27T00:00:00.000Z"});
+ const closedPrior=(stageId:string,selected:boolean)=>{
+  database.createTopic({id:`topic-${stageId}`,slug:stageId,title:stageId,repositoryPath:"/repo",worktreePath:`/w-${stageId}`,baseRef:"head",branchName:`consensus/${stageId}`,
+   state:"CLOSED",scopeGeneration:1,planRevision:1,planSHA256:"b".repeat(64),approvedPlanSHA256:"b".repeat(64),createdAt:"2026-09-27T00:00:00.000Z",
+   updatedAt:"2026-09-27T00:00:00.000Z",lastError:null});
+  database.workGroups.link("group",stageId,`topic-${stageId}`,"head",selected?{selected:true}:{});database.workGroups.freezeResult("group",result(stageId,`topic-${stageId}`));
+ };
+ closedPrior("x",false);closedPrior("y",true);
+ // w 는 통합 단계가 의존하지도, 합류 대상으로 받지도 않는 단계다(기준 커밋에 이미 들었다고 본 결과) — 통합은 그래도 w 결과를 조상으로 요구한다.
+ if(kind==="integration")closedPrior("w",true);
+ if(kind==="merge")database.workGroups.link("group","z","topic-1","x-commit",{selected:true,mergeTargets:["y"],
+  preparedMerge:{tree,conflicts:[],targets:[{stageId:"y",commitOID:"y-commit"}]}});
+ else database.workGroups.link("group","int","topic-1","x-commit",{selected:true});
+ database.updateTopic("topic-1",{committedOID:commit,reviewedTreeOID:tree});
+ return {database,engine,commit,dirtyTree,notAncestors,setHead:(value:string)=>{head=value;},onMergeBase:(hook:()=>void)=>{onMergeBase=hook;}};
+}
+
+it("합류 대상 결과가 결과 커밋의 조상이 아니면 단계를 닫지 않고, 확인하는 동안 결과 커밋이 바뀌어도 닫지 않는다",async()=>{
+ const fx=stageCloseFixture("merge");
+ fx.notAncestors.add("y-commit");
+ await expect(fx.engine.closeStage("topic-1")).rejects.toThrow("단계 y 의 결과 커밋이 이 단계 결과에 포함되지 않았습니다(합류 대상)");
+ fx.notAncestors.clear();
+ fx.onMergeBase(()=>fx.database.updateTopic("topic-1",{committedOID:"f".repeat(40)}));
+ await expect(fx.engine.closeStage("topic-1")).rejects.toThrow();
+ expect(fx.database.getTopic("topic-1").state).toBe("READY_TO_DELIVER");
+ expect(fx.database.workGroups.get("group").results?.z).toBeUndefined();
+ fx.database.updateTopic("topic-1",{committedOID:fx.commit});
+ fx.onMergeBase(()=>fx.database.updateTopic("topic-1",{committedOID:"f".repeat(40)}));
+ fx.setHead(fx.commit);
+ // HEAD 확인 뒤(조상 확인 중) 결과 커밋이 바뀐 경우 — git 경계 뒤 재확인이 막는다.
+ await expect(fx.engine.closeStage("topic-1")).rejects.toThrow("결과 커밋이 바뀌었습니다");
+ fx.database.updateTopic("topic-1",{committedOID:fx.commit});
+ // 합류 병합을 준비한 단계는 커밋 없이(기준 커밋 그대로) 닫을 수 없다 — 준비한 병합은 병합 커밋으로만 결과가 된다.
+ fx.database.updateTopic("topic-1",{committedOID:null});fx.setHead("x-commit");
+ await expect(fx.engine.closeStage("topic-1")).rejects.toThrow("먼저 검증된 결과를 커밋하세요");
+ fx.database.updateTopic("topic-1",{committedOID:fx.commit});fx.setHead(fx.commit);
+ expect((await fx.engine.closeStage("topic-1")).state).toBe("CLOSED");
+ expect(fx.database.workGroups.get("group").results?.z).toMatchObject({commitOID:fx.commit,baseOID:"x-commit"});
+ fx.database.close();
+});
+
+it("통합 단계는 의존하지 않는 단계를 포함해 다른 모든 단계 결과가 조상이어야 닫히고, 변경 없이 검증만 했으면 리뷰한 기준 커밋이 결과이자 확정 커밋이다",async()=>{
+ const fx=stageCloseFixture("integration");
+ fx.notAncestors.add("y-commit");
+ await expect(fx.engine.closeStage("topic-1")).rejects.toThrow("단계 y 의 결과 커밋이 이 단계 결과에 포함되지 않았습니다(통합 대상)");
+ fx.notAncestors.clear();
+ // 합류 대상이 아닌 단계(w)의 결과도 조상이어야 한다 — 통합은 합류 대상만이 아니라 다른 모든 단계 결과를 확인한다.
+ fx.notAncestors.add("w-commit");
+ await expect(fx.engine.closeStage("topic-1")).rejects.toThrow("단계 w 의 결과 커밋이 이 단계 결과에 포함되지 않았습니다(통합 대상)");
+ fx.notAncestors.clear();
+ // 커밋 없이 기준(x-commit)에서 검증만 한 통합(F004) — 리뷰 HEAD 가 기준이 아니면(리뷰 기록 없음) 닫지 않는다.
+ fx.database.updateTopic("topic-1",{committedOID:null,reviewedHead:null});fx.setHead("x-commit");
+ await expect(fx.engine.closeStage("topic-1")).rejects.toThrow("변경 없는 통합 결과를 리뷰한 기록");
+ // 리뷰한 작업 트리에 변경이 있었는데(리뷰 트리 ≠ 기준 트리) 커밋하지 않고 되돌렸으면 리뷰한 결과가 아니다.
+ fx.database.updateTopic("topic-1",{reviewedHead:"x-commit",reviewedTreeOID:fx.dirtyTree});
+ await expect(fx.engine.closeStage("topic-1")).rejects.toThrow("리뷰한 작업 트리에 변경이 있었습니다");
+ fx.database.updateTopic("topic-1",{reviewedTreeOID:"e".repeat(40)});
+ expect((await fx.engine.closeStage("topic-1")).state).toBe("CLOSED");
+ expect(fx.database.workGroups.get("group").results?.int).toMatchObject({commitOID:"x-commit",baseOID:"x-commit"});
+ // 리뷰한 기준 커밋을 전달 계약의 확정 커밋으로 기록한다(F003) — 닫힌 단계 push 가 이 커밋을 싣는다.
+ expect(fx.database.getFlags("topic-1").committedOID).toBe("x-commit");
+ fx.database.close();
+});
+
+it("막힌 단계 판정: 사용자 결정·외부 근거 대기만 막힘이고, 예산·리뷰·재작성 같은 자원 정지와 진행 중 상태는 막힘이 아니다",()=>{
+ const {database,engine}=makeEngine("DRAFT",null);
+ expect(engine.stageBlockedExternally("topic-1")).toBe(false);
+ const interrupt=(state:"USER_DECISION_REQUIRED"|"BLOCKED_ON_EVIDENCE",payload:Record<string,unknown>)=>{
+  database.updateTopic("topic-1",{state});
+  database.appendEvent({topicId:"topic-1",actor:"system",kind:"system",state,body:"중단",payload:{resumeState:"CLAUDE_PLAN",...payload}});
+ };
+ interrupt("USER_DECISION_REQUIRED",{});expect(engine.stageBlockedExternally("topic-1")).toBe(true);
+ for(const key of ["budgetPause","revisionPause","planningPause"]) {interrupt("USER_DECISION_REQUIRED",{[key]:true});expect(engine.stageBlockedExternally("topic-1")).toBe(false);}
+ interrupt("USER_DECISION_REQUIRED",{reviewPause:"planning"});expect(engine.stageBlockedExternally("topic-1")).toBe(false);
+ interrupt("USER_DECISION_REQUIRED",{admissionRefused:"잠금"});expect(engine.stageBlockedExternally("topic-1")).toBe(false);
+ interrupt("BLOCKED_ON_EVIDENCE",{});expect(engine.stageBlockedExternally("topic-1")).toBe(true);
+ // 결정 대기 상태라도 실행이 돌고 있으면(결정을 처리하는 중) 막힌 것이 아니다.
+ interrupt("USER_DECISION_REQUIRED",{});
+ database.startAction({id:"running-action",topicId:"topic-1",kind:"retry",status:"running",createdAt:"2026-09-27T00:00:00.000Z",finishedAt:null,error:null,
+  pid:null,pgid:null,processExecutable:null,processCommand:null,processStartedAt:null});
+ expect(engine.stageBlockedExternally("topic-1")).toBe(false);
+ database.updateTopic("topic-1",{state:"FAILED"});expect(engine.stageBlockedExternally("topic-1")).toBe(false);
+ database.close();
+});
+
+// E4 D2 (c) 채택 경계: 턴 응답이 실행기의 현재성 대조(assertCurrent)를 지난 뒤, 결과 산출물 저장이 첫 비동기 경계에서 멈춘 사이에 작업 묶음 개정이
+// 저장돼 그 단계가 재계획 대기가 되면, 저장의 accept 가 그 응답을 채택하지 않는다(대기 중에는 표식이, 해제 뒤에는 세대 대조가 막는다).
+class ClaudePlanWriteLatch extends ArtifactStore {
+ onClaudePlan:(()=>void)|null=null;
+ override async write(...args:Parameters<ArtifactStore["write"]>){
+  const hook=args[1]==="claude-plan"?this.onClaudePlan:null;
+  if(hook)this.onClaudePlan=null;
+  const pending=super.write(...args);
+  hook?.();
+  return pending;
+ }
+}
+async function stagePlanAcrossRevisionWindow(revise:boolean){
+ const root=mkdtempSync(join(tmpdir(),"consensus-room-engine-accept-"));temporaryDirectories.push(root);
+ const repo=join(root,"repo");
+ execFileSync("git",["init","-q",repo]);execFileSync("git",["-C",repo,"config","user.name","Test"]);execFileSync("git",["-C",repo,"config","user.email","test@example.invalid"]);
+ writeFileSync(join(repo,"form.swift"),"let step = 0\n");execFileSync("git",["-C",repo,"add","."]);execFileSync("git",["-C",repo,"commit","-qm","fixture"]);
+ const head=execFileSync("git",["-C",repo,"rev-parse","HEAD"],{encoding:"utf8"}).trim();
+ const database=new ConsensusDatabase(join(root,"room.sqlite"));
+ database.createTopic({id:"topic-1",slug:"stage",title:"단계",repositoryPath:repo,baseRef:head,worktreePath:repo,branchName:null,state:"DRAFT",scopeGeneration:1,
+  planRevision:0,planSHA256:null,approvedPlanSHA256:null,createdAt:"2026-09-27T00:00:00.000Z",updatedAt:"2026-09-27T00:00:00.000Z",lastError:null});
+ for(const role of ["claude","codex"] as const)database.upsertParticipant("topic-1",{role,sessionId:`${role}-session`,mode:"attached",acknowledgedPlanSHA256:null});
+ const budget={execution:{inputTokens:100000,outputTokens:100000,durationMs:600000},total:{inputTokens:1000000,outputTokens:1000000,durationMs:3600000}};
+ const input={title:"작업",goal:"목표",contracts:"계약 v1",stages:[
+  {id:"s1",kind:"work" as const,title:"s1",goal:"s1",acceptance:"s1",dependsOn:[],budget},
+  {id:"int",kind:"integration" as const,title:"통합",goal:"통합",acceptance:"통합",dependsOn:["s1"],budget}]};
+ database.workGroups.create("group",input,repo,head);
+ database.workGroups.link("group","s1","topic-1",head);
+ const store=new ClaudePlanWriteLatch(join(root,"topics"),database);
+ if(revise)store.onClaudePlan=()=>{
+  const preview=database.workGroups.previewRevision("group",{...input,contracts:"계약 v2"},1,()=>false);
+  expect(preview.affected).toEqual(["s1"]);
+  database.workGroups.applyRevision("group",preview,{s1:database.getTopic("topic-1").scopeGeneration},"user");
+ };
+ const claude:AgentAdapter={role:"claude",validateExistingSession:async()=>true,
+  createSession:async turn=>{turn.onSessionCreated?.("claude-session");return {sessionId:"claude-session",result:{kind:"PLAN",summary:"계획",planMarkdown:validPlan("단계"),findings:[],evidenceRefs:[]}};},
+  resumeTurn:async()=>({kind:"PLAN",summary:"계획",planMarkdown:validPlan("단계"),findings:[],evidenceRefs:[]})};
+ const codex:AgentAdapter={role:"codex",validateExistingSession:async()=>true,
+  createSession:async()=>{throw new Error("감사는 이 검사의 대상이 아니다");},resumeTurn:async()=>{throw new Error("감사는 이 검사의 대상이 아니다");}};
+ const engine=new WorkflowEngine({database,artifacts:store,git:new GitService(new SpawnCommandRunner()),claude,codex});
+ engine.startPlan("topic-1");await waitForActionCompletion(database,"topic-1");
+ await engine.shutdown();
+ return database;
+}
+
+it("대조: 개정이 끼지 않으면 같은 계획 턴의 응답이 계획으로 저장된다",async()=>{
+ const database=await stagePlanAcrossRevisionWindow(false);
+ expect(database.artifactsForScope("topic-1","claude-plan")).toHaveLength(1);
+ expect(database.getTopic("topic-1").planSHA256).not.toBeNull();
+ database.close();
+},60_000);
+
+it("응답이 현재성 대조를 지난 뒤 결과 저장 도중 개정이 저장돼 재계획 대기가 되면 그 응답은 채택되지 않는다",async()=>{
+ const database=await stagePlanAcrossRevisionWindow(true);
+ expect(database.workGroups.get("group").links.s1.replanPending).toEqual({version:2,fromGeneration:1});
+ expect(database.artifactsForScope("topic-1","claude-plan")).toHaveLength(0);
+ expect(database.getTopic("topic-1")).toMatchObject({planSHA256:null,scopeGeneration:1});
+ database.close();
+},60_000);
 
 // 2026-09-13 S10H 실측: 개정 2회차 뒤 종결 확인이 처분을 되돌려 멈췄고, 결정을 올려도 retry 가
 // "허용되지 않은 상태 전이입니다: USER_DECISION_REQUIRED → CODEX_CLOSEOUT" 로 죽었다(2회차 재개가 종결 재실행으로 가는데 전이표가 막음).
@@ -4082,7 +4285,7 @@ it("부분 교정 한도 중단도 원본과 같은 세션을 복구해 부분 �
  for(const id of ["a","b","c"])database.revisions.admit("topic-1",id,"revision");
  let checked:AgentResult|undefined;
  const run=(core:EngineCore)=>core.startAction("topic-1","test",async signal=>{
-  checked=await core.turn("claude",database.getTopic("topic-1"),"처음 계획",signal,false,{freshSession:true,check:r=>{if(r.planMarkdown?.includes('"rules":[],'))throw new ToleranceFormatError("부분 교정이 필요한 형식 오류");}});
+  checked=await core.turn(core.route(database.getTopic("topic-1"),{role:"planner",operation:"plan"}),database.getTopic("topic-1"),"처음 계획",signal,{freshSession:true,check:r=>{if(r.planMarkdown?.includes('"rules":[],'))throw new ToleranceFormatError("부분 교정이 필요한 형식 오류");}});
  });
  run(new EngineCore(dependencies));await waitForActionCompletion(database,"topic-1");
  expect(database.getTopic("topic-1").state).toBe("USER_DECISION_REQUIRED");expect(calls).toEqual(["create"]);
@@ -4472,7 +4675,7 @@ it("원문 변경 뒤 교정 대기를 재개하면 옛 응답 대신 새 계획
  for(const id of ["a","b","c"])database.revisions.admit("topic-1",id,"revision");
  let checked:AgentResult|undefined;
  const run=(core:EngineCore)=>core.startAction("topic-1","test",async signal=>{
-  checked=await core.turn("claude",database.getTopic("topic-1"),"Write current plan",signal,false,{freshSession:true,check:r=>{if(r.planMarkdown?.includes('"rules":[],'))throw new ToleranceFormatError("부분 교정이 필요한 형식 오류");}});
+  checked=await core.turn(core.route(database.getTopic("topic-1"),{role:"planner",operation:"plan"}),database.getTopic("topic-1"),"Write current plan",signal,{freshSession:true,check:r=>{if(r.planMarkdown?.includes('"rules":[],'))throw new ToleranceFormatError("부분 교정이 필요한 형식 오류");}});
  });
  run(new EngineCore(dependencies));await waitForActionCompletion(database,"topic-1");
  expect(database.getTopic("topic-1").state).toBe("USER_DECISION_REQUIRED");expect(calls).toEqual(["create"]);
@@ -4502,7 +4705,7 @@ it("교정 호출 직전에 원문이 바뀌면 원본 응답을 보존하고 �
  let checked:AgentResult|undefined;
  const core=new EngineCore(dependencies);
  core.startAction("topic-1","test",async signal=>{
-  checked=await core.turn("claude",database.getTopic("topic-1"),"Write current plan",signal,false,{freshSession:true,check:()=>{throw new ToleranceFormatError("부분 교정이 필요한 형식 오류");}});
+  checked=await core.turn(core.route(database.getTopic("topic-1"),{role:"planner",operation:"plan"}),database.getTopic("topic-1"),"Write current plan",signal,{freshSession:true,check:()=>{throw new ToleranceFormatError("부분 교정이 필요한 형식 오류");}});
  });
  await waitForActionCompletion(database,"topic-1");
  expect(repairCalls).toBe(0);expect(checked).toBeUndefined();

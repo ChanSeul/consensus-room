@@ -49,6 +49,7 @@ def main():
     parser.add_argument("--input", type=Path, help="JSON file (do not place secret credentials here)")
     parser.add_argument("--session", help="실제 중재자 세션 ID; batch/ack에 필수")
     parser.add_argument("--batch", help="읽기를 마친 batchId; ack에 필수")
+    parser.add_argument("--page-bytes", type=int, help="batch 한 쪽의 최대 바이트(1~240000). 이 출력 전체(끝 개행 제외)가 이 크기 이하다")
     args = parser.parse_args()
     identity = mediator_identity()
     base, token = connection(args.launch_file)
@@ -72,7 +73,14 @@ def main():
         elif args.command in {"batch", "ack"}:
             if not args.session or (args.command == "ack" and not args.batch):
                 parser.error("batch/ack에는 --session, ack에는 --batch가 필요합니다")
-            data = json.dumps({"sessionId": args.session, **({"batchId": args.batch} if args.command == "ack" else {})}).encode()
+            if args.page_bytes is not None and args.command != "batch":
+                parser.error("--page-bytes는 batch에만 쓸 수 있습니다")
+            body = {"sessionId": args.session}
+            if args.command == "ack":
+                body["batchId"] = args.batch
+            elif args.page_bytes is not None:
+                body["pageBytes"] = args.page_bytes
+            data = json.dumps(body).encode()
         else:
             if not args.input:
                 parser.error("--input is required")
@@ -84,12 +92,15 @@ def main():
     })
     try:
         with build_opener(NoRedirect).open(request, timeout=200) as response:
-            result = json.load(response)
+            body = response.read()
     except HTTPError as error:
         # Server errors can contain operator data; return only code, no request headers/URL token.
         raise ValueError(f"Consensus Room returned HTTP {error.code}") from None
+    json.loads(body)
     # Only an explicit batch request returns changed source text. No command acknowledges it automatically.
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    # 서버 응답 본문 바이트를 그대로 쓴다(끝 개행 1바이트만 더한다) — 서버가 잰 쪽 크기가 곧 이 출력의 크기다. 다시 직렬화하지 않는다.
+    sys.stdout.buffer.write(body + b"\n")
+    sys.stdout.buffer.flush()
 
 
 if __name__ == "__main__":

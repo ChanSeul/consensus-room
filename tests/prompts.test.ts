@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 
 import type { AgentResult, Finding, TimelineEvent } from "../src/shared/contracts";
-import { buildCodexAuditPrompt, buildCodexCloseoutPrompt, buildClaudeFixPrompt, buildCodexReviewPrompt, buildImplementationPrompt } from "../src/shared/prompts";
+import { buildClaudePlanPrompt, buildCodexAuditPrompt, buildCodexCloseoutPrompt, buildClaudeFixPrompt, buildCodexReviewPrompt, buildImplementationPrompt,
+  DEFERRED_FINDINGS_INLINE_BYTES } from "../src/shared/prompts";
+import type { DeferredFinding } from "../src/shared/contracts";
 
 const implementation: AgentResult = { kind: "IMPLEMENTATION", summary: "구현을 마쳤습니다.", findings: [], evidenceRefs: [] };
 const finding: Finding = {
@@ -231,4 +233,54 @@ describe("중재 판단 정책 전달", () => {
       });
     }
   }
+});
+
+// E4 2차 보완 F012 — 이연 쟁점 목록은 근거를 자르지 않는다. 인라인 예산 안이면 근거 전문, 넘으면 예산 안까지의 색인 + 남은 건수 + 원문 산출물 참조.
+describe("이연 쟁점 목록 — 절단 없는 인라인 예산과 원문 산출물 참조", () => {
+  const deferred = (id: string, rationale: string, topicId = "topic-aaaa-1111"): DeferredFinding =>
+    ({ id, title: `${id} 제목`, severity: "MEDIUM", rationale, source: "review", topicId, recordedAt: "2026-09-27T00:00:00Z" });
+  const planWith = (findings: DeferredFinding[], deferredFindingsPath?: string) => buildClaudePlanPrompt({ title: "t", worktreePath: "/w",
+    sourceRepositoryPath: "/r", baseRef: "HEAD", scopeGeneration: 1, timeline: [], deferredFindings: findings, ...(deferredFindingsPath ? { deferredFindingsPath } : {}) });
+  const auditWith = (findings: DeferredFinding[], deferredFindingsPath?: string) => buildCodexAuditPrompt({ title: "t", planMarkdown, planSHA256,
+    scopeGeneration: 1, timeline: [], deferredFindings: findings, ...(deferredFindingsPath ? { deferredFindingsPath } : {}) });
+
+  it("작은 목록은 400자를 넘는 근거도 끝까지 인라인으로 싣고, 기존 제목·ID 표시를 유지한다", () => {
+    const long = `${"긴 근거 ".repeat(120)}LONG-RATIONALE-END`;
+    const findings = [deferred("DF-1", long), deferred("DF-2", "짧은 근거")];
+    for (const [prompt, heading] of [[planWith(findings, "/artifacts/deferred.md"), "**이연된 쟁점**"], [auditWith(findings, "/artifacts/deferred.md"), "이미 이연 판정을 받은 쟁점"]]) {
+      expect(prompt).toContain(heading);
+      expect(prompt).toContain(`- DF-1 [MEDIUM] DF-1 제목 (review, topic-aa): ${long}`);
+      expect(prompt).toContain("LONG-RATIONALE-END");
+      expect(prompt).toContain("- DF-2 [MEDIUM] DF-2 제목 (review, topic-aa): 짧은 근거");
+      expect(prompt).not.toContain("kind=artifact");
+    }
+  });
+
+  it("큰 목록은 예산 안까지의 색인과 남은 건수, 원문 산출물 참조를 싣고 근거를 인라인으로 싣지 않는다 — 조용히 빠지는 항목이 없다", () => {
+    const findings = Array.from({ length: 120 }, (_, index) => deferred(`DF-${String(index).padStart(3, "0")}`,
+      `근거 ${index} `.repeat(40) + (index === 119 ? "LAST-RATIONALE-END" : "")));
+    const path = "/data/topics/t/artifacts/deferred-findings-digest.md";
+    for (const prompt of [planWith(findings, path), auditWith(findings, path)]) {
+      expect(prompt).toContain(`kind=artifact selector=${path} 를 offset 0 부터 읽고, 돌려받은 nextOffset 을 따라 null 이 될 때까지 이어 읽으세요`);
+      expect(prompt).toContain(`계획 제어가 없는 턴이면 같은 경로의 파일(${path})을 직접 읽으세요`);
+      expect(prompt).toContain(`근거 전문 ${findings.length}건은 원문 산출물에 있습니다`);
+      expect(prompt).not.toContain("LAST-RATIONALE-END");
+      expect(prompt).not.toContain("근거 0 근거 0");
+      const indexed = findings.filter((finding) => prompt.includes(`- ${finding.id} [MEDIUM] ${finding.id} 제목 (review, topic-aa)`));
+      const rest = Number(/- … 외 (\d+)건/.exec(prompt)?.[1] ?? 0);
+      // 색인은 앞에서부터 예산 안까지, 나머지는 건수로 — 합이 전체와 같다.
+      expect(indexed.map((finding) => finding.id)).toEqual(findings.slice(0, indexed.length).map((finding) => finding.id));
+      expect(indexed.length).toBeGreaterThan(0);
+      expect(indexed.length + rest).toBe(findings.length);
+      const indexBytes = Buffer.byteLength(indexed.map((finding) => `- ${finding.id} [MEDIUM] ${finding.id} 제목 (review, topic-aa)`).join("\n"));
+      expect(indexBytes).toBeLessThanOrEqual(DEFERRED_FINDINGS_INLINE_BYTES);
+    }
+  });
+
+  it("원문 산출물 경로가 없으면 참조할 곳이 없으므로 예산과 무관하게 근거 전문을 모두 싣는다", () => {
+    const findings = Array.from({ length: 60 }, (_, index) => deferred(`DF-${index}`, `근거 ${index} `.repeat(40) + `END-${index}`));
+    const prompt = planWith(findings);
+    for (const finding of findings) expect(prompt).toContain(`${finding.rationale}`);
+    expect(prompt).not.toContain("kind=artifact");
+  });
 });

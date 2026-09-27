@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
@@ -59,8 +60,8 @@ it("blocks the actual spawn if a source changes during adapter preparation", asy
   };
   const core = new EngineCore(f.dependencies);
   core.startAction(f.topic.id, "evidence-test", async signal => {
-    await core.executor.execute({ role: "claude", topic: f.topic, signal, purpose: "턴", inputSequence: 0, expected: core.expectationOf(f.topic), write: true,
-      session: { mode: "create" }, prompt: "Implement", implementation: true, settings: { model: "opus", effort: "high" } });
+    await core.executor.execute({ route: core.route(f.topic, { role: "implementer", operation: "implement" }), topic: f.topic, signal, purpose: "턴", inputSequence: 0, expected: core.expectationOf(f.topic),
+      session: { mode: "create" }, prompt: "Implement", settings: { model: "opus", effort: "high" } });
   });
   await core.active.get(f.topic.id)!.completion;
   expect(spawned).toBe(false); expect(f.database.getTopic(f.topic.id).state).toBe("BLOCKED_ON_EVIDENCE");
@@ -70,8 +71,8 @@ it("preserves an in-flight result without accepting it when source content chang
   f.adapter.createSession = async () => { f.ingest("new"); return { sessionId: "s", result: { kind: "IMPLEMENTATION", summary: "old evidence result", findings: [], evidenceRefs: [], status: "completed" } as any }; };
   const core = new EngineCore(f.dependencies);
   core.startAction(f.topic.id, "evidence-test", async signal => {
-    await core.executor.execute({ role: "claude", topic: f.topic, signal, purpose: "턴", inputSequence: 0, expected: core.expectationOf(f.topic), write: true,
-      session: { mode: "create" }, prompt: "Implement", implementation: true, settings: { model: "opus", effort: "high" } });
+    await core.executor.execute({ route: core.route(f.topic, { role: "implementer", operation: "implement" }), topic: f.topic, signal, purpose: "턴", inputSequence: 0, expected: core.expectationOf(f.topic),
+      session: { mode: "create" }, prompt: "Implement", settings: { model: "opus", effort: "high" } });
     accepted = true;
   });
   await core.active.get(f.topic.id)!.completion;
@@ -94,8 +95,8 @@ it("rejects a plan repair response when its source changed during the call", asy
   f.adapter.resumePlanRepair = async () => { f.ingest("New planning decision"); return {} as any; };
   const core = new EngineCore(f.dependencies);
   core.startAction(f.topic.id, "evidence-repair-test", async signal => {
-    await core.executor.executePlanRepair({ role: "claude", topic: f.topic, signal, purpose: "계획 교정", inputSequence: 0,
-      expected: core.expectationOf(f.topic), write: false, session: { mode: "resume", sessionId: "s" }, prompt: "Repair format", implementation: false,
+    await core.executor.executePlanRepair({ route: core.route(f.topic, { role: "planner", operation: "plan-repair" }), topic: f.topic, signal, purpose: "계획 교정", inputSequence: 0,
+      expected: core.expectationOf(f.topic), session: { mode: "resume", sessionId: "s" }, prompt: "Repair format",
       settings: { model: "opus", effort: "high" } });
     accepted = true;
   });
@@ -216,12 +217,156 @@ it.each(["missing", "expired", "failed"])("admits planning and implementation wi
     f.database.evidence.review(topic, f.database.evidence.topic(topic).digest, "Product behavior checked; visual details deferred", topic);
     let accepted = false;
     core.startAction(topic.id, "design-test", async signal => {
-      await core.executor.execute({ role: "claude", topic, signal, purpose: "턴", inputSequence: 0, expected: core.expectationOf(topic), write: implementation,
-        session: { mode: "create" }, prompt: "Task", implementation, settings: { model: "opus", effort: "high" } });
+      await core.executor.execute({ route: core.route(topic, implementation ? { role: "implementer", operation: "implement" } : { role: "planner", operation: "plan" }),
+        topic, signal, purpose: "턴", inputSequence: 0, expected: core.expectationOf(topic),
+        session: { mode: "create" }, prompt: "Task", settings: { model: "opus", effort: "high" } });
       accepted = true;
     });
     await core.active.get(topic.id)!.completion;
     expect(accepted).toBe(true);
   }
   expect(f.adapter.createSession).toHaveBeenCalledTimes(2);
+});
+
+// E3-1 bridge 소비처: 중재자가 실제로 받는 것은 bridge stdout 이다. 작은 --page-bytes 로 batch → 읽기 → ack → 다음 쪽을 batchId:null 까지 돌린다.
+// 원문 전체를 먼저 출력하지 않는다 — 한 번의 batch 출력이 한 쪽이고, 그 바이트(끝 개행 제외)가 요청한 쪽 크기 이하다.
+it("bridge 가 작은 쪽 크기로 큰 단위를 구간으로 끝까지 받고, 출력은 응답 본문 그대로이며, 끝 구간 ack 전에는 완료 영수증이 없다", async () => {
+  const root = mkdtempSync(join(tmpdir(), "evidence-pages-")); roots.push(root);
+  const database = new ConsensusDatabase(join(root, "room.sqlite")); dbs.push(database);
+  const topic = database.createTopic({ id: "t", slug: "t", title: "Pages", repositoryPath: root, worktreePath: root, baseRef: "main", branchName: "work",
+    state: "AWAITING_USER_APPROVAL", scopeGeneration: 1, planRevision: 1, planSHA256: "a".repeat(64), approvedPlanSHA256: "a".repeat(64),
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), lastError: null });
+  const source = database.evidence.register(topic.id, { url: "https://team.atlassian.net/browse/APP-2", label: "Big", mode: "rest", intervalSeconds: 300 });
+  // 한국어·이모지(서로게이트 쌍)·JSON escape(따옴표·역슬래시·개행·제어 문자)가 섞인 최대 길이(160,000 UTF-16 코드 단위) 본문.
+  const alphabet = ["가", "😀", '"', "\\", "\n", "\u0001", "a", "é"];
+  let big = "";
+  for (let index = 0; big.length + alphabet[index % alphabet.length].length <= 160_000; index++) big += alphabet[index % alphabet.length];
+  database.evidence.ingest(source.id, { checkId: database.evidence.begin(source.id, true)!.checkId, revision: "r1", units: [
+    { id: "a-small", kind: "comment", content: "first small" }, { id: "b-big", kind: "comment", content: big }, { id: "c-small", kind: "comment", content: "last small" },
+  ] });
+  const runner: CommandRunner = { run: vi.fn(async () => ({ exitCode: 0, stdout: "", stderr: "", jsonLines: [] })) };
+  const adapter: AgentAdapter = { role: "claude", validateExistingSession: async () => true,
+    createSession: vi.fn(async () => { throw new Error("unused"); }), resumeTurn: vi.fn(async () => { throw new Error("unused"); }) };
+  const fetch = vi.fn(async () => ({ revision: "unused", units: [] }));
+  const config = loadConfig({ repositoryPath: root, dataDirectory: root, webDirectory: join(root, "no-web"), memoryDirectory: join(root, "memory"),
+    launchToken: "test-token", enforceBudgets: false });
+  const app = await buildApp({ config, database, runner, claude: adapter, codex: { ...adapter, role: "codex" }, evidenceConnector: { configured: () => true, fetch } });
+  const raw = new DatabaseSync(join(root, "room.sqlite"));
+  try {
+    const mediator = { "x-consensus-token": "test-token", "x-consensus-actor": "mediator" };
+    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const launch = join(root, "bridge.url"); writeFileSync(launch, `${address}/?token=test-token`, { mode: 0o600 });
+    const cli = (...args: string[]) => promisify(execFile)("python3", ["scripts/evidence-bridge.py", "--launch-file", launch, ...args], { maxBuffer: 4 << 20 });
+    const batch = async (session: string, pageBytes: number) => {
+      const { stdout } = await cli("batch", "--id", "t", "--session", session, "--page-bytes", String(pageBytes));
+      expect(stdout.endsWith("\n")).toBe(true);
+      expect(Buffer.byteLength(stdout) - 1).toBeLessThanOrEqual(pageBytes);
+      return { stdout, page: JSON.parse(stdout) as { batchId: string | null; changes: Array<{ id: string; content: string; range?: { offset: number; end: number; total: number } }>; remaining: number } };
+    };
+    const ack = (session: string, batchId: string) => cli("ack", "--id", "t", "--session", session, "--batch", batchId);
+    const received: Array<{ id: string; content: string; range?: { offset: number; end: number; total: number } }> = [];
+
+    const first = await batch("mediator", 50_000);
+    // 출력은 서버 응답 본문 바이트 그대로다(끝 개행만 더한다). 같은 대기 쪽을 HTTP 로 받은 본문과 비교한다.
+    const body = (await app.inject({ method: "POST", url: "/api/topics/t/evidence/mediator/batch", headers: mediator, payload: { sessionId: "mediator", pageBytes: 50_000 } })).body;
+    expect(first.stdout).toBe(`${body}\n`);
+    expect((await app.inject({ method: "POST", url: "/api/topics/t/evidence/mediator/batch", headers: mediator,
+      payload: { sessionId: "mediator", pageBytes: 240_001 } })).statusCode).toBe(400);
+    // 큰 단위는 이 쪽에 다 들어가지 않고 이미 다른 항목이 있으므로 다음 쪽으로 넘어간다.
+    expect(first.page.changes.map(change => change.id)).toEqual(["a-small"]);
+    received.push(...first.page.changes); await ack("mediator", first.page.batchId!);
+
+    const second = await batch("mediator", 50_000);
+    expect(second.page.changes.map(change => [change.id, change.range?.offset])).toEqual([["b-big", 0]]);
+    // 대기 쪽보다 작은 쪽을 요청하면 더 작은 새 쪽으로 바뀌고, 옛 batchId 는 ack 할 수 없다. 그 뒤 큰 요청은 작은 대기 쪽을 그대로 받는다.
+    const smaller = await batch("mediator", 20_000);
+    expect(smaller.page.batchId).not.toBe(second.page.batchId);
+    expect(smaller.page.changes[0].range!.end).toBeLessThan(second.page.changes[0].range!.end);
+    await expect(ack("mediator", second.page.batchId!)).rejects.toMatchObject({ code: 1, stderr: "Consensus Room returned HTTP 409\n" });
+    expect((await batch("mediator", 50_000)).page.batchId).toBe(smaller.page.batchId);
+    received.push(...smaller.page.changes); await ack("mediator", smaller.page.batchId!);
+
+    // 중간에 멈추고 새 세션으로 요청하면 처음부터 받는다 — 다른 세션의 진행 위치를 이어받지 않는다.
+    const other = await batch("second", 50_000);
+    expect(other.page.changes.map(change => change.id)).toEqual(["a-small"]);
+    await ack("second", other.page.batchId!);
+    expect((await batch("second", 50_000)).page.changes[0]).toMatchObject({ id: "b-big", range: { offset: 0 } });
+
+    const consumer = JSON.stringify(["t", 1, "mediator"]);
+    let pages = 2;
+    for (let round = 0; round < 40; round++) {
+      const next = await batch("mediator", 50_000);
+      if (next.page.batchId === null) { expect(next.page.changes).toEqual([]); break; }
+      pages++;
+      const last = next.page.changes.find(change => change.id === "b-big" && change.range?.end === change.range?.total);
+      if (last) {
+        // 끝 구간을 ack 하기 전에는 그 단위의 완료 영수증이 없고, 진행 위치만 이 구간의 시작에 있다.
+        expect(raw.prepare("SELECT unit_id FROM evidence_mediator_unit_receipts WHERE consumer=? AND unit_id='b-big'").all(consumer)).toEqual([]);
+        expect(raw.prepare("SELECT next_offset FROM evidence_mediator_progress WHERE consumer=? AND unit_id='b-big'").all(consumer))
+          .toEqual([{ next_offset: last.range!.offset }]);
+      }
+      received.push(...next.page.changes); await ack("mediator", next.page.batchId!);
+    }
+    expect(pages).toBeGreaterThan(4);
+    expect(raw.prepare("SELECT unit_id FROM evidence_mediator_unit_receipts WHERE consumer=? ORDER BY unit_id").all(consumer).map(row => row.unit_id))
+      .toEqual(["a-small", "b-big", "c-small"]);
+    const segments = received.filter(change => change.id === "b-big");
+    expect(segments.length).toBeGreaterThan(4);
+    let offset = 0;
+    for (const segment of segments) {
+      expect(segment.range!.offset).toBe(offset); offset = segment.range!.end;
+      expect(/^[\uDC00-\uDFFF]/.test(segment.content) || /[\uD800-\uDBFF]$/.test(segment.content)).toBe(false);
+    }
+    expect(segments.map(segment => segment.content).join("")).toBe(big);
+    expect(received.filter(change => change.id !== "b-big").map(change => [change.id, change.content])).toEqual([["a-small", "first small"], ["c-small", "last small"]]);
+    expect(fetch).not.toHaveBeenCalled();
+  } finally { raw.close(); await app.close(); dbs.splice(dbs.indexOf(database), 1); }
+});
+
+// ROOT-E3-01: 전달할 것이 없다는 응답(batchId:null)도 쪽이다. 모든 내용을 받은 뒤의 마지막 응답과 원문 없는 주제도 요청한 pageBytes 안에서만
+// 200 이고, 들어가지 않으면 최소 바이트 안내와 함께 409 다. 크기는 HTTP 가 실제로 보내는 본문(currentDigest·superseded 포함)으로 잰다.
+it("마지막 응답과 원문 없는 주제의 batchId:null 응답도 요청한 쪽 크기 안에서만 돌려주고, 넘치면 최소 바이트와 함께 409 다", async () => {
+  const root = mkdtempSync(join(tmpdir(), "evidence-final-page-")); roots.push(root);
+  const database = new ConsensusDatabase(join(root, "room.sqlite")); dbs.push(database);
+  const base = { repositoryPath: root, worktreePath: root, baseRef: "main", branchName: "work", state: "AWAITING_USER_APPROVAL" as const, scopeGeneration: 1,
+    planRevision: 1, planSHA256: "a".repeat(64), approvedPlanSHA256: "a".repeat(64), createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), lastError: null };
+  const topic = database.createTopic({ ...base, id: "t", slug: "t", title: "Final page" });
+  database.createTopic({ ...base, id: "empty", slug: "empty", title: "No evidence", worktreePath: join(root, "empty") });
+  const source = database.evidence.register(topic.id, { url: "https://team.atlassian.net/browse/APP-3", label: "Small", mode: "rest", intervalSeconds: 300 });
+  database.evidence.ingest(source.id, { checkId: database.evidence.begin(source.id, true)!.checkId, revision: "r1", units: [{ id: "issue", kind: "issue", content: "small body" }] });
+  const adapter: AgentAdapter = { role: "claude", validateExistingSession: async () => true,
+    createSession: vi.fn(async () => { throw new Error("unused"); }), resumeTurn: vi.fn(async () => { throw new Error("unused"); }) };
+  const fetch = vi.fn(async () => ({ revision: "unused", units: [] }));
+  const config = loadConfig({ repositoryPath: root, dataDirectory: root, webDirectory: join(root, "no-web"), memoryDirectory: join(root, "memory"),
+    launchToken: "test-token", enforceBudgets: false });
+  const runner: CommandRunner = { run: vi.fn(async () => ({ exitCode: 0, stdout: "", stderr: "", jsonLines: [] })) };
+  const app = await buildApp({ config, database, runner, claude: adapter, codex: { ...adapter, role: "codex" }, evidenceConnector: { configured: () => true, fetch } });
+  try {
+    const mediator = { "x-consensus-token": "test-token", "x-consensus-actor": "mediator" };
+    const batch = (topicId: string, pageBytes: number) => app.inject({ method: "POST", url: `/api/topics/${topicId}/evidence/mediator/batch`, headers: mediator,
+      payload: { sessionId: "mediator", pageBytes } });
+    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const launch = join(root, "bridge.url"); writeFileSync(launch, `${address}/?token=test-token`, { mode: 0o600 });
+    const cli = (...args: string[]) => promisify(execFile)("python3", ["scripts/evidence-bridge.py", "--launch-file", launch, ...args]);
+    const first = JSON.parse((await cli("batch", "--id", "t", "--session", "mediator", "--page-bytes", "50000")).stdout);
+    expect(first.changes.map((change: { id: string }) => change.id)).toEqual(["issue"]);
+    await cli("ack", "--id", "t", "--session", "mediator", "--batch", first.batchId);
+    for (const topicId of ["t", "empty"]) {
+      const refused = await batch(topicId, 1);
+      expect(refused.statusCode, topicId).toBe(409);
+      const minimum = Number(/최소 (\d+)B/.exec(refused.json().error)?.[1]);
+      expect(minimum, topicId).toBeGreaterThan(1);
+      // 패킷만 재면 이 크기에 들어간다 — 응답 본문(currentDigest·superseded 포함)은 들어가지 않는다.
+      expect((await batch(topicId, minimum - 1)).statusCode, topicId).toBe(409);
+      const fitted = await batch(topicId, minimum);
+      expect(fitted.statusCode, topicId).toBe(200);
+      expect(fitted.json(), topicId).toMatchObject({ batchId: null, changes: [], remaining: 0, nextCursor: null });
+      expect(Buffer.byteLength(fitted.body), topicId).toBeLessThanOrEqual(minimum);
+      expect((await batch(topicId, minimum)).body, topicId).toBe(fitted.body);
+      await expect(cli("batch", "--id", topicId, "--session", "mediator", "--page-bytes", "1"), topicId)
+        .rejects.toMatchObject({ code: 1, stderr: "Consensus Room returned HTTP 409\n" });
+      expect((await cli("batch", "--id", topicId, "--session", "mediator", "--page-bytes", String(minimum))).stdout, topicId).toBe(`${fitted.body}\n`);
+    }
+    expect(fetch).not.toHaveBeenCalled();
+  } finally { await app.close(); dbs.splice(dbs.indexOf(database), 1); }
 });

@@ -2,17 +2,21 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ArtifactStore } from "../src/server/artifacts";
 import { ConsensusDatabase } from "../src/server/database";
 import { GitService } from "../src/server/git";
 import { SpawnCommandRunner } from "../src/server/processRunner";
-import type { AgentAdapter, SessionTurn } from "../src/server/types";
+import type { AgentAdapter, CommandResult, CommandRunner, CommandSpec, SessionTurn } from "../src/server/types";
+import { ClaudeAdapter } from "../src/server/adapters/claude";
+import { CodexAdapter } from "../src/server/adapters/codex";
 import { pendingReviewRequests } from "../src/server/engine/reviewRequests";
 import { WorkflowEngine } from "../src/server/workflow";
 import { REQUIRED_PLAN_HEADINGS, type AgentResult } from "../src/shared/contracts";
+import { EXECUTION_POLICY_NOTE, timelineEventText, timelineReference } from "../src/shared/prompts";
 import { hashPlan } from "../src/shared/workflow";
+import { agentRunError } from "../src/server/adapters/resultParser";
 
 const temporaryDirectories: string[] = [];
 
@@ -802,5 +806,1140 @@ describe("구현 턴 계약 위반", () => {
     expect(claude.correctionSettings[0]).toEqual({ model: "opus", effort: "low" });
     expect(database.getTimeline(topicId).some((event) => event.body.includes("표기 교정 — 추론 low"))).toBe(true);
     database.close();
+  });
+});
+
+// ---- E3-2-2b 구현·수정·코드 리뷰 턴의 타임라인 쪽 ----
+// 공개 흐름(엔진 구현·수정·리뷰 + 실제 실행기 + 러너 대역)으로 본다. 러너의 파일 읽기는 관측할 수 없으므로 필수 참조(결정·범위 변경) 원문은 호스트가
+// 과제 프롬프트에 쪽으로 싣고, 정상 반환한 호출이 실제로 보낸 판의 쪽만 반환된 세션에 인정한다. 쪽은 프롬프트에서 표식으로 되읽어 원문과 대조한다.
+const WORK_PAGE = 48 * 1024;
+const REVIEW_PAGE = 96 * 1024;
+
+type PagedStep = {
+  status?: "completed" | "in_progress" | null;
+  // resume 중 CLI 가 알린 다른 세션 id(비연속 주제에서만 허용된 경로), create 면 만들 세션 id.
+  sessionId?: string;
+  missing?: boolean;
+  fail?: string;
+  latch?: Promise<void>;
+  // 사용자 결정을 청한다(열린 요청이 된다).
+  requestedUserDecision?: string;
+  // 프롬프트의 열린 요청 id 를 모두 해소했다고 답한다.
+  resolveRequests?: boolean;
+  // 이 호출이 보고하는 입력 토큰 사용량(예산 강제 검사용).
+  inputTokens?: number;
+};
+type PagedCall = { method: "create" | "resume"; sessionId: string | null; operation: string; prompt: string; readablePaths: readonly string[] };
+
+class PagingClaude implements AgentAdapter {
+  readonly role = "claude" as const;
+  readonly calls: PagedCall[] = [];
+  private kind: "IMPLEMENTATION" | "FIX" = "IMPLEMENTATION";
+  private created = 0;
+  constructor(private readonly worktree: string, readonly steps: PagedStep[] = []) {}
+
+  async createSession(turn: Omit<SessionTurn, "sessionId">) {
+    const step = this.begin("create", null, turn);
+    await step.latch;
+    if (step.fail) throw new Error(step.fail);
+    const sessionId = step.sessionId ?? `claude-s${++this.created}`;
+    turn.onSessionCreated?.(sessionId);
+    return { sessionId, result: this.result(step, turn.prompt) };
+  }
+
+  async resumeTurn(turn: SessionTurn) {
+    const step = this.begin("resume", turn.sessionId, turn);
+    await step.latch;
+    // 관측된 세션 유실 형태(E3-3b — 폴백은 문구가 아니라 어댑터 분류 session-missing 으로만 열린다).
+    if (step.missing) throw agentRunError("claude", 1, `No conversation found with session ID: ${turn.sessionId}\n`,
+      JSON.stringify({ type: "result", subtype: "error_during_execution", is_error: true, num_turns: 0, session_id: turn.sessionId }));
+    if (step.fail) throw new Error(step.fail);
+    if (step.sessionId) turn.onSessionCreated?.(step.sessionId);
+    return this.result(step, turn.prompt);
+  }
+
+  async validateExistingSession() { return true; }
+
+  private begin(method: PagedCall["method"], sessionId: string | null, turn: Omit<SessionTurn, "sessionId">): PagedStep {
+    const operation = turn.job?.operation ?? "";
+    if (operation === "implement") this.kind = "IMPLEMENTATION";
+    if (operation === "fix") this.kind = "FIX";
+    this.calls.push({ method, sessionId, operation, prompt: turn.prompt, readablePaths: turn.readablePaths ?? [] });
+    const step = this.steps.shift() ?? {};
+    if (step.inputTokens) turn.onUsage?.({ inputTokens: step.inputTokens, recordKind: "final" });
+    return step;
+  }
+
+  private result(step: PagedStep, prompt: string): AgentResult {
+    writeFileSync(join(this.worktree, "feature.txt"), `구현 ${this.calls.length}\n`);
+    const status = step.status === undefined ? "completed" as const : step.status;
+    const base = this.kind === "FIX"
+      ? result("FIX", "검토 지적을 보완했습니다.", [reviewFinding("RESOLVED_BY_FIX")])
+      : result("IMPLEMENTATION", "구현했습니다.");
+    const requests = step.resolveRequests ? [...prompt.matchAll(/^- \[([^\]]+)\] /gm)].map((match) => match[1]) : [];
+    return {
+      ...base, ...(status ? { status } : {}), ...(status === "in_progress" ? { remainingSteps: ["남은 구현"] } : {}),
+      ...(step.requestedUserDecision ? { requestedUserDecision: step.requestedUserDecision } : {}),
+      ...(requests.length ? { resolvesRequestedDecision: true, resolvedRequestIds: requests } : {}),
+    };
+  }
+}
+
+class PagingCodex implements AgentAdapter {
+  readonly role = "codex" as const;
+  readonly calls: PagedCall[] = [];
+  // invalidFirst: 첫 리뷰 응답이 계약을 어긴다(종류 오류) — 교정이 필요하다.
+  constructor(private readonly withFinding: boolean, private readonly invalidFirst = false) {}
+
+  async createSession(turn: Omit<SessionTurn, "sessionId">) {
+    this.calls.push({ method: "create", sessionId: null, operation: turn.job?.operation ?? "", prompt: turn.prompt, readablePaths: turn.readablePaths ?? [] });
+    return { sessionId: "codex-paged-review", result: this.review(turn.job?.operation) };
+  }
+
+  async resumeTurn(turn: SessionTurn) {
+    this.calls.push({ method: "resume", sessionId: turn.sessionId, operation: turn.job?.operation ?? "", prompt: turn.prompt, readablePaths: turn.readablePaths ?? [] });
+    return this.review(turn.job?.operation);
+  }
+
+  async validateExistingSession() { return true; }
+
+  // 리뷰 읽기 호출(E3-4c)은 ACK 만 답한다. 판정 호출의 순서는 읽기 호출을 빼고 센다.
+  private review(operation: string | undefined): AgentResult {
+    if (operation === "review-read") return result("ACK", "리뷰 읽기 쪽을 받았습니다.");
+    const judged = this.calls.filter((call) => call.operation !== "review-read").length;
+    if (this.invalidFirst && judged === 1) return result("PLAN", "종류를 잘못 적은 리뷰");
+    if (!this.withFinding) return result("REVIEW", "문제 없습니다.");
+    return judged === 1
+      ? result("REVIEW", "한 곳을 보완해야 합니다.", [reviewFinding("AGREED_ACTION")])
+      : result("FINAL_REVIEW", "보완 결과를 확인했습니다.", [reviewFinding("RESOLVED_BY_FIX")]);
+  }
+}
+
+type PageMark = { selector: string; offset: number; end: number; total: number; text: string };
+function pagesIn(prompt: string): PageMark[] {
+  return [...prompt.matchAll(/--- 쪽 (timeline:\d+@[0-9a-f]{64}) \[(\d+), (\d+)\) \/ (\d+) ---\n([\s\S]*?)\n--- 쪽 끝 ---/g)].map((match) => ({
+    selector: match[1], offset: Number(match[2]), end: Number(match[3]), total: Number(match[4]), text: match[5],
+  }));
+}
+
+// 한국어 결정 본문(글자당 3바이트) — seed 로 원문(해시)을 구별한다.
+function koreanDecision(chars: number, seed: string): string {
+  const alphabet = "가나다라마바사아자차카타파하";
+  let body = "";
+  for (let index = 0; body.length < chars; index += 1) body += alphabet[(index * 7 + seed.charCodeAt(0)) % alphabet.length];
+  return body;
+}
+
+async function pagedTopic(label: string, decisions: readonly string[]) {
+  const root = mkdtempSync(join(tmpdir(), `consensus-room-pages-${label}-`));
+  temporaryDirectories.push(root);
+  const repository = join(root, "repository");
+  const worktree = join(root, "worktrees", "topic");
+  const data = join(root, "data");
+  git(root, ["init", "--initial-branch=develop", repository]);
+  git(repository, ["config", "user.name", "Consensus Room Test"]);
+  git(repository, ["config", "user.email", "consensus-room@example.invalid"]);
+  writeFileSync(join(repository, "feature.txt"), "기준\n");
+  git(repository, ["add", "feature.txt"]);
+  git(repository, ["commit", "-m", "baseline"]);
+  const gitService = new GitService(new SpawnCommandRunner());
+  await gitService.createDetachedWorktree(repository, worktree, "develop");
+  const databasePath = join(data, "room.sqlite");
+  let database = new ConsensusDatabase(databasePath);
+  let artifacts = new ArtifactStore(join(data, "topics"), database);
+  const plan = validPlan();
+  const planSHA256 = hashPlan(plan);
+  const topicId = "e3220b00-2222-4333-8444-555555555555";
+  const timestamp = "2026-09-26T00:00:00.000Z";
+  database.createTopic({
+    id: topicId, slug: `pages-${label}`, title: "타임라인 쪽", repositoryPath: repository, baseRef: "develop", worktreePath: worktree,
+    branchName: null, state: "AWAITING_USER_APPROVAL", scopeGeneration: 1, planRevision: 2, planSHA256, approvedPlanSHA256: planSHA256,
+    createdAt: timestamp, updatedAt: timestamp, lastError: null,
+  });
+  database.upsertParticipant(topicId, { role: "claude", sessionId: "claude-plan-session", mode: "attached", acknowledgedPlanSHA256: planSHA256 });
+  database.upsertParticipant(topicId, { role: "codex", sessionId: "codex-plan-session", mode: "attached", acknowledgedPlanSHA256: planSHA256 });
+  await artifacts.write(topicId, "plan", 2, `${plan.trim()}\n`);
+  const events = decisions.map((body) => database.appendEvent({ topicId, actor: "user", kind: "decision", state: "AWAITING_USER_APPROVAL", body }));
+  const references = events.map((event) => ({ reference: timelineReference(event), text: timelineEventText(event) }));
+  const topic = { id: topicId, scopeGeneration: 1 };
+  return {
+    topicId, topic, worktree, references, get database() { return database; }, get artifacts() { return artifacts; },
+    engine: (claude: AgentAdapter, codex: AgentAdapter, enforceBudgets = false) =>
+      new WorkflowEngine({ database, artifacts, git: gitService, claude, codex, enforceBudgets }),
+    reopen: () => {
+      database.close();
+      database = new ConsensusDatabase(databasePath);
+      artifacts = new ArtifactStore(join(data, "topics"), database);
+    },
+    idle: () => waitUntil(() => database.runningAction(topicId) === null, 20_000),
+  };
+}
+
+// 한 참조로 간 쪽을 offset 순으로 이어 붙이면 원문인지(빈틈·겹침 없이).
+function joined(pages: readonly PageMark[], selector: string): string {
+  const own = pages.filter((page) => page.selector === selector).sort((left, right) => left.offset - right.offset);
+  own.forEach((page, index) => { if (index > 0) expect(page.offset).toBe(own[index - 1].end); });
+  return own.map((page) => page.text).join("");
+}
+
+const pageBytes = (pages: readonly PageMark[]) => pages.reduce((sum, page) => sum + page.end - page.offset, 0);
+const RECHECK = "이미 만든 결과를 그 결정과 다시 대조해";
+
+describe("E3-2-2b 타임라인 쪽 — 구현·수정·코드 리뷰", () => {
+  it("구현: 한국어 50,000자 결정이 첫 턴·계속 진행 쪽으로 나뉘어 원문과 같고, 완독 전 완료는 재대조 계속 진행이며, 한 리뷰 호출 예산을 넘는 리뷰는 판정 전 읽기 호출로 나눠 실은 뒤 한 번 판정한다", async () => {
+    const decision = koreanDecision(50_000, "a");
+    const room = await pagedTopic("impl", [decision]);
+    const { reference, text } = room.references[0];
+    expect(reference.bytes).toBeGreaterThan(3 * WORK_PAGE);
+    const claude = new PagingClaude(room.worktree);
+    const codex = new PagingCodex(false);
+    room.engine(claude, codex).startImplementation(room.topicId);
+    await room.idle();
+
+    // 첫 턴(create, 전체 판) + 완독 게이트의 계속 진행 3회. 러너는 매번 completed 를 보고했지만 필수 구간이 남은 동안은 채택하지 않았다.
+    expect(claude.calls.map((call) => `${call.method}:${call.operation}`)).toEqual(["create:implement", "resume:continue", "resume:continue", "resume:continue"]);
+    const pages = claude.calls.map((call) => pagesIn(call.prompt));
+    pages.forEach((own) => expect(pageBytes(own)).toBeLessThanOrEqual(WORK_PAGE));
+    expect(joined(pages.flat(), reference.selector)).toBe(text);
+    expect(pages[0][0].offset).toBe(0);
+    expect(claude.calls.slice(1).every((call) => call.prompt.includes(RECHECK))).toBe(true);
+    expect(claude.calls[0].prompt).toContain(`[참조·필수] selector=${reference.selector}`);
+    // 참조 원문 파일은 읽기 허용 경로로만 준다 — 그 경로가 있어도 인정·완료 판정에 쓰이지 않았다(위 계속 진행 3회).
+    const referencesFile = room.database.latestArtifact(room.topicId, "timeline-references")!.path;
+    expect(claude.calls.every((call) => call.readablePaths.includes(referencesFile))).toBe(true);
+    expect(readFileSync(referencesFile, "utf8")).toContain(text);
+    expect(claude.calls[0].prompt).toContain("파일 읽기를 전달·완독 근거로 쓰지 않습니다");
+    expect(room.database.planning.referenceComplete("claude-s1", room.topic, reference)).toBe(true);
+    // 구현 채택(구현 보고 산출물)은 마지막 쪽을 받은 뒤다.
+    const accepted = room.database.getTimeline(room.topicId).find((event) => event.state === "CODEX_REVIEW")!;
+    const lastContinuation = room.database.getTimeline(room.topicId).filter((event) => event.payload?.timelineRecheck).at(-1)!;
+    expect(accepted.sequence).toBeGreaterThan(lastContinuation.sequence);
+
+    // 코드 리뷰(새 세션)의 필수 구간 150,000B 는 한 호출 예산(96KiB)을 넘는다 — E3-4c 전에는 호출 전에 멈췄다(timelineReviewExceeded). 이제 판정 전 리뷰 읽기
+    // 호출(도구 없음·ACK)이 앞부분 쪽을 싣고, 남은 쪽이 한 호출에 드는 마지막 호출이 그 쪽과 함께 한 번 판정한다. 둘은 같은 원장으로 리뷰 1회만 쓴다.
+    expect(codex.calls.map((call) => `${call.method}:${call.operation}`)).toEqual(["create:review-read", "resume:review"]);
+    const reviewPages = codex.calls.map((call) => pagesIn(call.prompt));
+    reviewPages.forEach((own) => expect(pageBytes(own)).toBeLessThanOrEqual(REVIEW_PAGE));
+    expect(reviewPages[0][0].offset).toBe(0);
+    expect(pageBytes(reviewPages[0])).toBeGreaterThanOrEqual(REVIEW_PAGE - 3);
+    expect(joined(reviewPages.flat(), reference.selector)).toBe(text);
+    expect(room.database.planning.referenceComplete("codex-paged-review", room.topic, reference)).toBe(true);
+    expect(room.database.getTopic(room.topicId).state).toBe("READY_TO_DELIVER");
+    expect(room.database.latestArtifact(room.topicId, "codex-review")).not.toBeNull();
+    expect(room.database.reviews.account(room.topicId, "implementation").used).toBe(1);
+    expect(room.database.getTimeline(room.topicId).some((event) => event.payload?.timelineReviewExceeded)).toBe(false);
+
+    // 실제 패킷(J4): 과제 문자열 + 어댑터가 앞에 붙이는 실행 정책 지시문. 작업 공간 지시문(CLAUDE.md·AGENTS.md)·메모리는 저장소마다 더해진다.
+    const policy = Buffer.byteLength(EXECUTION_POLICY_NOTE) + 2;
+    console.log(`E3-2-2b packet implementation ${JSON.stringify(claude.calls.map((call, index) => ({
+      call: `${call.method}:${call.operation}`, promptBytes: Buffer.byteLength(call.prompt), withPolicyNote: Buffer.byteLength(call.prompt) + policy,
+      pageBytes: pageBytes(pages[index]),
+    })))}`);
+    room.database.close();
+  });
+
+  // E3-4b: 필수 읽기 턴은 계속 진행 상한(4)을 쓰지 않는다 — 첫 턴 + 4회의 쪽 합(245,760B)을 넘는 필수 결정도 한 액션에서 끝까지 읽고 채택한다.
+  it("필수 읽기 분리: 첫 턴 + 계속 진행 4회의 쪽 합보다 큰 필수 결정도 한 액션에서 끝까지 읽고, 쪽마다 인정된 바이트만큼 진척해 채택한다", async () => {
+    const room = await pagedTopic("limit", [koreanDecision(50_000, "b"), koreanDecision(50_000, "c")]);
+    const [first, second] = room.references;
+    const total = first.reference.bytes + second.reference.bytes;
+    expect(total).toBeGreaterThan(5 * WORK_PAGE);
+    const claude = new PagingClaude(room.worktree);
+    const codex = new PagingCodex(false);
+    room.engine(claude, codex).startImplementation(room.topicId);
+    await room.idle();
+
+    const pages = claude.calls.map((call) => pagesIn(call.prompt));
+    // 첫 턴 뒤는 모두 필수 읽기 턴 — 같은 세션, 쪽 ≤ 48KiB, 마지막 앞의 쪽은 예산을 채운다(UTF-8 경계로 최대 3바이트 줄어듦). 중복 쪽 없이 원문 그대로.
+    expect(claude.calls.slice(1).every((call) => call.method === "resume" && call.sessionId === "claude-s1" && call.prompt.includes(RECHECK))).toBe(true);
+    pages.forEach((own) => expect(pageBytes(own)).toBeLessThanOrEqual(WORK_PAGE));
+    pages.slice(0, -1).forEach((own) => expect(pageBytes(own)).toBeGreaterThanOrEqual(WORK_PAGE - 3));
+    expect(pageBytes(pages.flat())).toBe(total);
+    expect(joined(pages.flat(), first.reference.selector)).toBe(first.text);
+    expect(joined(pages.flat(), second.reference.selector)).toBe(second.text);
+    const readings = room.database.getTimeline(room.topicId).filter((event) => typeof event.payload?.readingTurn === "number");
+    expect(readings.map((event) => event.payload?.readingTurn)).toEqual(claude.calls.slice(1).map((_, index) => index + 1));
+    expect(readings.length).toBeGreaterThan(4);
+    expect(claude.calls.at(-1)!.prompt).toContain(`(필수 읽기 ${readings.length}회차)`);
+    expect(claude.calls.slice(1).some((call) => /계속 진행 \d+\/4/.test(call.prompt))).toBe(false);
+    expect(room.database.getTimeline(room.topicId).some((event) => event.payload?.continuationExhausted || event.payload?.readingStalled)).toBe(false);
+    expect(room.database.planning.referenceComplete("claude-s1", room.topic, first.reference)).toBe(true);
+    expect(room.database.planning.referenceComplete("claude-s1", room.topic, second.reference)).toBe(true);
+    expect(room.database.latestArtifact(room.topicId, "implementation")).not.toBeNull();
+    room.database.close();
+  });
+
+  it("진척 게이트: 필수 읽기 턴의 응답이 다른 세션 id 로 돌아와 작업 세션의 미인정 구간이 줄지 않으면 보존·명시 정지하고, DB 를 다시 연 뒤 재시도는 같은 세션에서 남은 쪽을 잇는다", async () => {
+    const room = await pagedTopic("stalled", [koreanDecision(50_000, "g")]);
+    const { reference, text } = room.references[0];
+    // 셋째 호출이 생기면 진척 게이트가 반복을 끊지 못한 것이다(같은 쪽을 다시 싣는 무한 반복) — 실패로 드러낸다.
+    const claude = new PagingClaude(room.worktree, [{}, { sessionId: "claude-s1-forked" }, { fail: "진척 없는 필수 읽기 반복" }]);
+    const codex = new PagingCodex(false);
+    room.engine(claude, codex).startImplementation(room.topicId);
+    await room.idle();
+
+    expect(claude.calls.map((call) => `${call.method}:${call.sessionId}`)).toEqual(["create:null", "resume:claude-s1"]);
+    const stalledPages = pagesIn(claude.calls[1].prompt);
+    expect(stalledPages[0]).toMatchObject({ offset: WORK_PAGE });
+    // 반환 세션(forked)에는 인정됐지만 작업 세션의 공백은 그대로다.
+    expect(room.database.planning.referenceGaps("claude-s1-forked", room.topic, reference)).toEqual([
+      { offset: 0, end: WORK_PAGE }, { offset: stalledPages[0].end, end: reference.bytes }]);
+    expect(room.database.planning.referenceGaps("claude-s1", room.topic, reference)).toEqual([{ offset: WORK_PAGE, end: reference.bytes }]);
+    expect(room.database.getTopic(room.topicId).state).toBe("USER_DECISION_REQUIRED");
+    expect(room.database.getFlags(room.topicId).resumeState).toBe("IMPLEMENTING");
+    const stop = room.database.getTimeline(room.topicId).filter((event) => event.payload?.timelineUnread).at(-1)!;
+    expect(stop.payload?.readingStalled).toBe(true);
+    expect(stop.payload?.continuationExhausted).toBeUndefined();
+    expect(stop.payload?.timelineUnread).toEqual({ references: [reference.selector], bytes: reference.bytes - WORK_PAGE });
+    expect(room.database.latestArtifact(room.topicId, "implementation")).toBeNull();
+    expect(codex.calls).toHaveLength(0);
+
+    claude.steps.length = 0;
+    room.reopen();
+    room.engine(claude, codex).retry(room.topicId);
+    await room.idle();
+    const retried = claude.calls.slice(2);
+    expect(retried.every((call) => call.method === "resume" && call.sessionId === "claude-s1")).toBe(true);
+    expect(pagesIn(retried[0].prompt)[0]).toMatchObject({ offset: WORK_PAGE });
+    const own = [...pagesIn(claude.calls[0].prompt), ...retried.flatMap((call) => pagesIn(call.prompt))];
+    expect(joined(own, reference.selector)).toBe(text);
+    expect(room.database.planning.referenceComplete("claude-s1", room.topic, reference)).toBe(true);
+    expect(room.database.latestArtifact(room.topicId, "implementation")).not.toBeNull();
+    room.database.close();
+  });
+
+  it("계속 진행 상한은 in_progress 에만 남는다: 러너가 in_progress 로 상한(4회)에 닿으면 필수 쪽이 남아도 계속 진행 상한으로 멈춘다", async () => {
+    const room = await pagedTopic("progress-cap", [koreanDecision(50_000, "h"), koreanDecision(50_000, "i")]);
+    const claude = new PagingClaude(room.worktree, Array.from({ length: 5 }, () => ({ status: "in_progress" as const })));
+    const codex = new PagingCodex(false);
+    room.engine(claude, codex).startImplementation(room.topicId);
+    await room.idle();
+
+    expect(claude.calls).toHaveLength(5);
+    expect(claude.calls.slice(1).every((call) => call.prompt.includes("status=in_progress 였습니다(계속 진행") && !call.prompt.includes(RECHECK))).toBe(true);
+    const stop = room.database.getTimeline(room.topicId).at(-1)!;
+    expect(stop.payload?.continuationExhausted).toBe(true);
+    expect(stop.payload?.remainingSteps).toEqual(["남은 구현"]);
+    expect(room.database.getTimeline(room.topicId).some((event) => typeof event.payload?.readingTurn === "number")).toBe(false);
+    expect(room.database.latestArtifact(room.topicId, "implementation")).toBeNull();
+    room.database.close();
+  });
+
+  it("섞임: in_progress 계속 진행 2회 + 필수 읽기 턴은 합쳐 4회를 넘어도 상한 정지 없이 끝까지 읽고 채택한다", async () => {
+    const room = await pagedTopic("mixed", [koreanDecision(50_000, "j"), koreanDecision(50_000, "k")]);
+    const [first, second] = room.references;
+    // 순서: 첫 턴 in_progress → 계속 진행 1 → 필수 읽기 1·2 → 필수 읽기 3 이 in_progress → 계속 진행 2 → 남은 필수 읽기. 필수 읽기가 in_progress 계수를 쓰면
+    // 계속 진행 2 앞에서 상한(4)에 닿는다.
+    const claude = new PagingClaude(room.worktree, [{ status: "in_progress" }, {}, {}, {}, { status: "in_progress" }]);
+    const codex = new PagingCodex(false);
+    room.engine(claude, codex).startImplementation(room.topicId);
+    await room.idle();
+
+    const timeline = room.database.getTimeline(room.topicId);
+    expect(timeline.filter((event) => typeof event.payload?.continuation === "number").map((event) => event.payload?.continuation)).toEqual([1, 2]);
+    const readings = timeline.filter((event) => typeof event.payload?.readingTurn === "number");
+    expect(readings.length).toBeGreaterThanOrEqual(3);
+    expect(2 + readings.length).toBeGreaterThan(4);
+    expect(timeline.some((event) => event.payload?.continuationExhausted || event.payload?.readingStalled)).toBe(false);
+    const pages = claude.calls.flatMap((call) => pagesIn(call.prompt));
+    expect(joined(pages, first.reference.selector)).toBe(first.text);
+    expect(joined(pages, second.reference.selector)).toBe(second.text);
+    expect(room.database.latestArtifact(room.topicId, "implementation")).not.toBeNull();
+    room.database.close();
+  });
+
+  it("예산: 필수 읽기 턴 도중 예산이 바닥나면 기존 예산 정지로 멈추고, 이미 인정된 구간은 보존된다", async () => {
+    const room = await pagedTopic("budget", [koreanDecision(50_000, "l"), koreanDecision(50_000, "m")]);
+    const [first, second] = room.references;
+    const policy = { execution: { inputTokens: 1_000, outputTokens: 1_000_000, durationMs: 10_000_000 },
+      total: { inputTokens: 30, outputTokens: 10_000_000, durationMs: 100_000_000 } };
+    room.database.budgets.configure(room.topicId, policy, "test");
+    const claude = new PagingClaude(room.worktree, Array.from({ length: 10 }, () => ({ inputTokens: 10 })));
+    const codex = new PagingCodex(false);
+    room.engine(claude, codex, true).startImplementation(room.topicId);
+    await room.idle();
+
+    // 호출마다 10 토큰 — 셋째 호출 뒤 누적 예산(30)이 바닥나 넷째 필수 읽기 턴은 열리지 않는다(허용 검사가 spawn 전에 막는다).
+    expect(claude.calls).toHaveLength(3);
+    expect(room.database.getTopic(room.topicId).state).toBe("USER_DECISION_REQUIRED");
+    expect(room.database.getTimeline(room.topicId).some((event) => event.payload?.budgetPause)).toBe(true);
+    expect(room.database.getTimeline(room.topicId).some((event) => event.payload?.continuationExhausted || event.payload?.readingStalled)).toBe(false);
+    const acknowledged = [first, second].reduce((sum, { reference }) => sum + reference.bytes - room.database.planning.referenceGaps("claude-s1", room.topic, reference)
+      .reduce((own, gap) => own + gap.end - gap.offset, 0), 0);
+    expect(acknowledged).toBe(pageBytes(claude.calls.flatMap((call) => pagesIn(call.prompt))));
+    expect(room.database.latestArtifact(room.topicId, "implementation")).toBeNull();
+    room.database.close();
+  });
+
+  it("첫 호출 취소(늦은 resolve 포함)는 인정하지 않고, 재시도가 같은 구간을 처음부터 다시 싣는다", async () => {
+    const room = await pagedTopic("cancel", [koreanDecision(30_000, "d")]);
+    const { reference } = room.references[0];
+    let release!: () => void;
+    const latch = new Promise<void>((resolve) => { release = resolve; });
+    const claude = new PagingClaude(room.worktree, [{ latch }]);
+    const codex = new PagingCodex(false);
+    const engine = room.engine(claude, codex);
+    engine.startImplementation(room.topicId);
+    await waitUntil(() => claude.calls.length === 1);
+    engine.stop(room.topicId);
+    // 취소 뒤에 늦게 끝난 응답 — 버려지고 인정되지 않는다.
+    release();
+    await room.idle();
+    expect(room.database.planning.referenceGaps("claude-s1", room.topic, reference)).toEqual([{ offset: 0, end: reference.bytes }]);
+    // 세션 id 는 생성 알림(onSessionCreated)으로 이미 저장됐다 — 재시도는 그 세션을 resume 하되, 인정이 없으므로 같은 구간을 다시 싣는다.
+    expect(room.database.getFlags(room.topicId).implementationSessionId).toBe("claude-s1");
+
+    engine.retry(room.topicId);
+    await room.idle();
+    const cancelled = pagesIn(claude.calls[0].prompt);
+    const retried = pagesIn(claude.calls[1].prompt);
+    expect(claude.calls[1]).toMatchObject({ method: "resume", sessionId: "claude-s1" });
+    expect(retried).toEqual(cancelled);
+    expect(retried[0].offset).toBe(0);
+    expect(room.database.planning.referenceComplete("claude-s1", room.topic, reference)).toBe(true);
+    room.database.close();
+  });
+
+  it("세션 유실 폴백의 새 세션은 fresh 판(offset 0부터)의 쪽만 인정받고 옛 세션 인정을 이어받지 않는다", async () => {
+    const room = await pagedTopic("fallback", [koreanDecision(50_000, "e")]);
+    const { reference, text } = room.references[0];
+    const claude = new PagingClaude(room.worktree, [{}, { fail: "네트워크 오류" }, { missing: true }, { sessionId: "claude-fallback" }]);
+    const codex = new PagingCodex(false);
+    const engine = room.engine(claude, codex);
+    engine.startImplementation(room.topicId);
+    await room.idle();
+    expect(room.database.getTopic(room.topicId).state).toBe("FAILED");
+    expect(room.database.planning.referenceGaps("claude-s1", room.topic, reference)).toEqual([{ offset: WORK_PAGE, end: reference.bytes }]);
+
+    engine.retry(room.topicId);
+    await room.idle();
+    // 재시도: resume 판(옛 세션 인정 뒤부터) → 세션 유실 → 폴백 create 는 fresh 판(처음부터).
+    expect(claude.calls[2]).toMatchObject({ method: "resume", sessionId: "claude-s1" });
+    expect(pagesIn(claude.calls[2].prompt)[0].offset).toBe(WORK_PAGE);
+    expect(claude.calls[3].method).toBe("create");
+    const fresh = pagesIn(claude.calls[3].prompt);
+    expect(fresh[0]).toMatchObject({ offset: 0, end: WORK_PAGE });
+    // 옛 세션 인정은 그대로(폴백 턴의 쪽이 옛 세션에 가지 않았다), 새 세션은 자기 쪽으로만 완독한다.
+    expect(room.database.planning.referenceGaps("claude-s1", room.topic, reference)).toEqual([{ offset: WORK_PAGE, end: reference.bytes }]);
+    const fallbackPages = claude.calls.slice(3).flatMap((call) => pagesIn(call.prompt));
+    expect(claude.calls.slice(4).every((call) => call.sessionId === "claude-fallback")).toBe(true);
+    expect(joined(fallbackPages, reference.selector)).toBe(text);
+    expect(room.database.planning.referenceComplete("claude-fallback", room.topic, reference)).toBe(true);
+    room.database.close();
+  });
+
+  it("resume 중 CLI 가 세션 id 를 바꾸면 resume 판 쪽만 새 세션에 인정하고, 다음 호출은 첫 공백부터 싣되 공백 뒤 인정 구간은 다시 싣지 않는다", async () => {
+    const room = await pagedTopic("changed-id", [koreanDecision(50_000, "f")]);
+    const { reference, text } = room.references[0];
+    const claude = new PagingClaude(room.worktree, [{}, { fail: "네트워크 오류" }, { sessionId: "claude-s1-forked" }]);
+    const codex = new PagingCodex(false);
+    const engine = room.engine(claude, codex);
+    engine.startImplementation(room.topicId);
+    await room.idle();
+    engine.retry(room.topicId);
+    await room.idle();
+
+    expect(claude.calls[2]).toMatchObject({ method: "resume", sessionId: "claude-s1" });
+    // 보낸 것은 resume 판([48KiB, 96KiB)) — created=true 여도 fresh 판으로 추정하지 않는다.
+    expect(pagesIn(claude.calls[2].prompt).map((page) => [page.offset, page.end])).toEqual([[WORK_PAGE, 2 * WORK_PAGE]]);
+    expect(claude.calls.slice(3).every((call) => call.sessionId === "claude-s1-forked")).toBe(true);
+    expect(claude.calls.slice(3).map((call) => pagesIn(call.prompt).map((page) => page.offset))).toEqual([[0], [2 * WORK_PAGE], [3 * WORK_PAGE]]);
+    const forked = claude.calls.slice(2).flatMap((call) => pagesIn(call.prompt));
+    expect(joined(forked, reference.selector)).toBe(text);
+    expect(room.database.planning.referenceComplete("claude-s1-forked", room.topic, reference)).toBe(true);
+    expect(room.database.planning.referenceGaps("claude-s1", room.topic, reference)).toEqual([{ offset: WORK_PAGE, end: reference.bytes }]);
+    room.database.close();
+  });
+
+  it("쪽 크기가 다르거나 겹친 인정 구간은 합집합으로 계산해 건너뛰거나 두 번 싣지 않는다(2a 조각 + 2b 쪽이 같은 세션에 섞인 경우)", async () => {
+    const room = await pagedTopic("overlap", [koreanDecision(40_000, "g")]);
+    const { reference, text } = room.references[0];
+    const header = Buffer.byteLength(text) - 3 * 40_000;
+    const at = (chars: number) => header + 3 * chars;
+    const seeded = [[0, at(300)], [at(100), at(1000)], [at(3000), at(6000)]] as const;
+    room.database.setImplementationSession(room.topicId, "claude-seeded");
+    room.database.planning.acknowledgeReferenceReads("claude-seeded", room.topic,
+      [{ selector: reference.selector, hash: reference.hash, offset: seeded[0][0], nextOffset: seeded[0][1], total: reference.bytes }]);
+    room.database.planning.acknowledgeReferencePages("claude-seeded", room.topic, seeded.slice(1).map(([offset, end]) =>
+      ({ selector: reference.selector, hash: reference.hash, offset, end, total: reference.bytes })));
+    const claude = new PagingClaude(room.worktree);
+    const codex = new PagingCodex(false);
+    room.engine(claude, codex).startImplementation(room.topicId);
+    await room.idle();
+
+    expect(claude.calls[0]).toMatchObject({ method: "resume", sessionId: "claude-seeded" });
+    const sent = claude.calls.flatMap((call) => pagesIn(call.prompt));
+    expect(sent[0]).toMatchObject({ offset: at(1000), end: at(3000) });
+    expect(sent[1].offset).toBe(at(6000));
+    // 보낸 쪽끼리도, 이미 인정된 구간과도 겹치지 않고, 합치면 원문 전체다.
+    const ranges = [...seeded.map(([offset, end]) => ({ offset, end })), ...sent.map(({ offset, end }) => ({ offset, end }))];
+    for (const page of sent) {
+      expect(ranges.filter((range) => range.offset < page.end && page.offset < range.end)).toHaveLength(1);
+    }
+    const bytes = Buffer.from(text);
+    for (const page of sent) expect(page.text).toBe(bytes.subarray(page.offset, page.end).toString("utf8"));
+    expect(pageBytes(sent) + at(1000) + (at(6000) - at(3000))).toBe(reference.bytes);
+    expect(room.database.planning.referenceComplete("claude-seeded", room.topic, reference)).toBe(true);
+    room.database.close();
+  });
+
+  it.each([false, true])("리뷰는 예산 안이면 한 호출에 필수 쪽을 모두 싣고, 수정 턴은 같은 세션이면 이어 싣고 새 세션이면 처음부터 싣는다(수정 세션 유실: %s)", async (fixSessionLost) => {
+    const room = await pagedTopic(fixSessionLost ? "fix-fresh" : "fix-same", [koreanDecision(30_000, "h")]);
+    const { reference, text } = room.references[0];
+    const claude = new PagingClaude(room.worktree, [{}, {}, ...(fixSessionLost ? [{ missing: true }, { sessionId: "claude-fix-fresh" }] : [])]);
+    const codex = new PagingCodex(true);
+    room.engine(claude, codex).startImplementation(room.topicId);
+    await waitForState(room.database, room.topicId, "READY_TO_DELIVER");
+    await room.idle();
+
+    // 코드 리뷰(새 세션): 필수 90,000B 가 한 호출에 모두 실리고 반환 뒤 리뷰 세션에 인정된다. 최종 리뷰(같은 세션)는 다시 싣지 않는다.
+    expect(codex.calls.map((call) => call.method)).toEqual(["create", "resume"]);
+    const reviewPages = pagesIn(codex.calls[0].prompt);
+    expect(joined(reviewPages, reference.selector)).toBe(text);
+    expect(pageBytes(reviewPages)).toBeLessThanOrEqual(REVIEW_PAGE);
+    expect(room.database.planning.referenceComplete("codex-paged-review", room.topic, reference)).toBe(true);
+    expect(pagesIn(codex.calls[1].prompt)).toEqual([]);
+    const referencesFile = room.database.latestArtifact(room.topicId, "timeline-references")!.path;
+    expect(codex.calls[0].readablePaths).toContain(referencesFile);
+
+    const fixCalls = claude.calls.filter((call, index) => index >= 2);
+    expect(fixCalls[0]).toMatchObject({ method: "resume", sessionId: "claude-s1", operation: "fix" });
+    if (!fixSessionLost) {
+      // 같은 구현 세션은 이미 완독했다 — 다시 싣지 않는다.
+      expect(fixCalls.flatMap((call) => pagesIn(call.prompt))).toEqual([]);
+      expect(fixCalls).toHaveLength(1);
+    } else {
+      // 새 수정 세션(폴백)은 처음부터 싣고 완독 뒤에만 채택된다.
+      expect(fixCalls[1].method).toBe("create");
+      expect(pagesIn(fixCalls[1].prompt)[0].offset).toBe(0);
+      expect(joined(fixCalls.slice(1).flatMap((call) => pagesIn(call.prompt)), reference.selector)).toBe(text);
+      expect(room.database.planning.referenceComplete("claude-fix-fresh", room.topic, reference)).toBe(true);
+    }
+    const reviewPolicy = Buffer.byteLength(EXECUTION_POLICY_NOTE) + 2;
+    console.log(`E3-2-2b packet review ${JSON.stringify(codex.calls.map((call) => ({
+      call: call.method, promptBytes: Buffer.byteLength(call.prompt), withPolicyNote: Buffer.byteLength(call.prompt) + reviewPolicy, pageBytes: pageBytes(pagesIn(call.prompt)),
+    })))}`);
+    room.database.close();
+  });
+
+  it("완료 확인 턴(읽기 전용 프로토콜 턴)은 쪽을 싣지 않고, 기존 렌더에서 20,000자로 잘린 결정은 인정하지 않아 확인 뒤 완료를 게이트가 계속 진행으로 잇는다", async () => {
+    const room = await pagedTopic("confirm", [koreanDecision(30_000, "i")]);
+    const { reference, text } = room.references[0];
+    const claude = new PagingClaude(room.worktree, [{ status: null }, {}]);
+    const codex = new PagingCodex(false);
+    room.engine(claude, codex).startImplementation(room.topicId);
+    await room.idle();
+
+    expect(claude.calls.map((call) => call.operation)).toEqual(["implement", "completion-confirmation", "continue"]);
+    expect(pagesIn(claude.calls[1].prompt)).toEqual([]);
+    expect(claude.calls[1].prompt).not.toContain("타임라인 쪽");
+    // 확인 턴 뒤의 계속 진행은 첫 턴이 인정받은 구간 뒤부터다(확인 턴이 인정을 더하거나 지우지 않았다).
+    expect(pagesIn(claude.calls[2].prompt)[0].offset).toBe(WORK_PAGE);
+    expect(joined(claude.calls.flatMap((call) => pagesIn(call.prompt)), reference.selector)).toBe(text);
+    room.database.close();
+  });
+});
+
+describe("E3-2-2b host-review 1차 보완(55f3795 F001~F003)", () => {
+  it("F001: 응답 수신 경계에서 의무 기록이 실패하면 커서도 전진하지 않아, DB 를 다시 연 재시도가 남은 필수 원문을 끝까지 실은 뒤에만 구현을 채택한다", async () => {
+    const room = await pagedTopic("f001", [koreanDecision(50_000, "j")]);
+    const { reference, text } = room.references[0];
+    const claude = new PagingClaude(room.worktree);
+    const codex = new PagingCodex(false);
+    const failing = vi.spyOn(room.database.planning, "rememberSessionReferences").mockImplementationOnce(() => {
+      throw new Error("참조 의무 INSERT 실패");
+    });
+    room.engine(claude, codex).startImplementation(room.topicId);
+    await room.idle();
+    expect(failing).toHaveBeenCalledTimes(1);
+    expect(room.database.getTopic(room.topicId).state).toBe("FAILED");
+    // 의무를 적지 못한 응답은 커서를 옮기지 않았다.
+    expect(room.database.getFlags(room.topicId).implementationPromptSequence ?? null).toBeNull();
+
+    room.reopen();
+    room.engine(claude, codex).retry(room.topicId);
+    await room.idle();
+    const retried = claude.calls.slice(1);
+    expect(retried[0]).toMatchObject({ method: "resume", sessionId: "claude-s1", operation: "implement" });
+    const pages = retried.flatMap((call) => pagesIn(call.prompt));
+    expect(joined(pages, reference.selector)).toBe(text);
+    // 소비 경계: 구현 채택(CODEX_REVIEW 전이)은 마지막 쪽을 받은 계속 진행 뒤다.
+    const timeline = room.database.getTimeline(room.topicId);
+    const accepted = timeline.find((event) => event.state === "CODEX_REVIEW")!;
+    expect(accepted.sequence).toBeGreaterThan(timeline.filter((event) => event.payload?.timelineRecheck).at(-1)!.sequence);
+    expect(room.database.planning.referenceComplete("claude-s1", room.topic, reference)).toBe(true);
+    room.database.close();
+  });
+
+  it.each([13, 0])("F002: 저장된 완료+열린 요청의 확인 턴 — 뒤에 20,000자 근거 %i건. 앞부분 절단으로 놓친 짧은 결정은 게이트가 쪽으로 실은 뒤에만 채택하고, 온전히 실린 결정은 추가 쓰기 턴 없이 채택한다", async (evidenceCount) => {
+    const room = await pagedTopic(`f002-${evidenceCount}`, []);
+    const claude = new PagingClaude(room.worktree, [{ requestedUserDecision: "버튼 색을 정해 주세요." }, { resolveRequests: true }]);
+    const codex = new PagingCodex(false);
+    const engine = room.engine(claude, codex);
+    engine.startImplementation(room.topicId);
+    await room.idle();
+    expect(room.database.getTopic(room.topicId).state).toBe("USER_DECISION_REQUIRED");
+
+    const decisionBody = "결정 F002: 버튼 색은 파랑으로 한다.";
+    const decision = room.database.appendEvent({ topicId: room.topicId, actor: "user", kind: "decision", state: "USER_DECISION_REQUIRED", body: decisionBody });
+    for (let index = 0; index < evidenceCount; index += 1) {
+      room.database.appendEvent({ topicId: room.topicId, actor: "user", kind: "evidence", state: "USER_DECISION_REQUIRED",
+        body: `근거 ${index} ${"가".repeat(20_000)}` });
+    }
+    const reference = timelineReference(decision);
+    engine.retry(room.topicId);
+    await room.idle();
+
+    const operations = claude.calls.map((call) => call.operation);
+    expect(operations.slice(0, 2)).toEqual(["implement", "completion-confirmation"]);
+    if (evidenceCount === 0) {
+      // 확인 턴이 결정을 온전히 실었다 — 정상 확인 응답 뒤 그 전달을 인정하고, 쓰기 턴 없이 채택한다(기존 읽기 전용 확인 경로 유지).
+      expect(claude.calls[1].prompt).toContain(decisionBody);
+      expect(operations).toEqual(["implement", "completion-confirmation"]);
+      expect(room.database.planning.referenceComplete("claude-s1", room.topic, reference)).toBe(true);
+      expect(room.database.getTimeline(room.topicId).some((event) => event.state === "CODEX_REVIEW")).toBe(true);
+      room.database.close();
+      return;
+    }
+    // 전제: 읽기 전용 확인 턴(기존 렌더)은 앞부분을 잘라 짧은 결정을 싣지 못했다.
+    expect(claude.calls[1].prompt).not.toContain(decisionBody);
+    // 완료 게이트가 그 결정을 쪽으로 실어 계속 진행을 열고, 받은 뒤에만 채택했다.
+    expect(operations[2]).toBe("continue");
+    const pages = pagesIn(claude.calls[2].prompt);
+    expect(joined(pages, reference.selector)).toBe(timelineEventText(decision));
+    expect(claude.calls[2].prompt).toContain(RECHECK);
+    expect(room.database.planning.referenceComplete("claude-s1", room.topic, reference)).toBe(true);
+    const timeline = room.database.getTimeline(room.topicId);
+    const accepted = timeline.find((event) => event.state === "CODEX_REVIEW")!;
+    expect(accepted.sequence).toBeGreaterThan(timeline.filter((event) => event.payload?.timelineRecheck).at(-1)!.sequence);
+    room.database.close();
+  });
+
+  it("F003: 리뷰 교정 대기본이 있어도 작업 트리가 바뀌어 새 프롬프트·쪽이 실제로 전달됐으면 반환 뒤 인정하고 리뷰를 저장한다", async () => {
+    const room = await pagedTopic("f003", [koreanDecision(30_000, "k")]);
+    const { reference, text } = room.references[0];
+    const claude = new PagingClaude(room.worktree);
+    const codex = new PagingCodex(false, true);
+    for (const id of ["pre-1", "pre-2"]) room.database.reviews.admit(room.topicId, id, "implementation");
+    const engine = room.engine(claude, codex);
+    engine.startImplementation(room.topicId);
+    await room.idle();
+    // 첫 리뷰 응답이 계약을 어겼고 교정은 리뷰 한도에 막혀 교정 대기본만 남았다.
+    expect(codex.calls).toHaveLength(1);
+    expect(engine.reviewPaused(room.topicId)).toBe("implementation");
+    expect(await room.artifacts.readLatest(room.topicId, "pending-contract-repair")).toContain("codex-paged-review");
+
+    // 작업 트리가 바뀌어(교정 문맥 키가 달라짐) 대기본을 이어 쓰지 않고 새 리뷰 프롬프트가 나간다.
+    writeFileSync(join(room.worktree, "feature.txt"), "리뷰 대기 중 바뀐 작업 트리\n");
+    room.database.reviews.grant(room.topicId, "implementation", "f003-more", room.database.reviews.account(room.topicId, "implementation").version);
+    engine.retry(room.topicId);
+    await room.idle();
+    expect(codex.calls).toHaveLength(2);
+    expect(codex.calls[1]).toMatchObject({ method: "resume", sessionId: "codex-paged-review" });
+    expect(joined(pagesIn(codex.calls[1].prompt), reference.selector)).toBe(text);
+    // 소비 경계: 실제로 전달된 쪽은 인정되고 리뷰가 저장돼 전달 준비까지 간다.
+    expect(room.database.planning.referenceComplete("codex-paged-review", room.topic, reference)).toBe(true);
+    expect(room.database.latestArtifact(room.topicId, "codex-review")).not.toBeNull();
+    expect(room.database.getTopic(room.topicId).state).toBe("READY_TO_DELIVER");
+    room.database.close();
+  });
+
+  it("F003 대조: 같은 트리·바인딩·세션이라 core.turn 이 교정 대기본을 실제로 이어 쓰면 이번 쪽은 보내지 않았으므로 인정하지 않고 리뷰도 저장하지 않으며, 다음 새 호출이 쪽을 싣는다", async () => {
+    const room = await pagedTopic("f003-reuse", [koreanDecision(30_000, "l")]);
+    const { reference, text } = room.references[0];
+    const claude = new PagingClaude(room.worktree);
+    const codex = new PagingCodex(false, true);
+    for (const id of ["pre-1", "pre-2"]) room.database.reviews.admit(room.topicId, id, "implementation");
+    const engine = room.engine(claude, codex);
+    engine.startImplementation(room.topicId);
+    await room.idle();
+    expect(engine.reviewPaused(room.topicId)).toBe("implementation");
+    const grant = (id: string) => room.database.reviews.grant(room.topicId, "implementation", id, room.database.reviews.account(room.topicId, "implementation").version);
+
+    // 작업 트리·바인딩·세션이 그대로라 대기본을 이어 쓴다 — 두 번째 Codex 호출은 교정 요청이고 리뷰 프롬프트·쪽이 아니다.
+    grant("reuse-1");
+    engine.retry(room.topicId);
+    await room.idle();
+    expect(codex.calls).toHaveLength(2);
+    expect(pagesIn(codex.calls[1].prompt)).toEqual([]);
+    expect(room.database.planning.referenceGaps("codex-paged-review", room.topic, reference)).toEqual([{ offset: 0, end: reference.bytes }]);
+    expect(room.database.latestArtifact(room.topicId, "codex-review")).toBeNull();
+    expect(room.database.getTopic(room.topicId).state).toBe("USER_DECISION_REQUIRED");
+    expect(room.database.getTimeline(room.topicId).at(-1)!.payload?.timelineReviewUnread).toEqual([reference.selector]);
+
+    // 대기본을 다 쓴 뒤의 재시도는 새 리뷰 프롬프트로 쪽을 싣고, 반환 뒤 인정·저장한다.
+    grant("reuse-2");
+    engine.retry(room.topicId);
+    await room.idle();
+    expect(codex.calls).toHaveLength(3);
+    expect(joined(pagesIn(codex.calls[2].prompt), reference.selector)).toBe(text);
+    expect(room.database.planning.referenceComplete("codex-paged-review", room.topic, reference)).toBe(true);
+    expect(room.database.latestArtifact(room.topicId, "codex-review")).not.toBeNull();
+    expect(room.database.getTopic(room.topicId).state).toBe("READY_TO_DELIVER");
+    room.database.close();
+  });
+});
+
+// ---- E3-4c 코드 리뷰 다중 호출 원장 ----
+// 공개 흐름(엔진 구현 → 코드 리뷰 + 실제 실행기·예산 래퍼 + 러너 대역)으로 본다. 리뷰 좌석 대역은 호출마다 job·세션·설정·원장 ID(SessionTurn.reviewLedger)를
+// 기록하고, 실제 CLI 처럼 준비(beforeSpawn·admitSync) → spawn → 응답 순서를 따른다(spawn 전 실패는 onProcessSpawn 없이 던진다).
+type LedgerStep = {
+  // 판정·읽기 호출의 응답을 바꾼다(없으면 읽기 = ACK, 판정 = 문제 없는 REVIEW·FINAL_REVIEW, 답변 확인 = 모든 질문에 마지막 결정으로 답함).
+  result?: AgentResult;
+  // resume 중 CLI 가 알린 다른 세션 id, create 면 만들 세션 id.
+  sessionId?: string;
+  missing?: boolean;
+  // spawn 뒤 실패.
+  fail?: string;
+  // spawn 전(준비 단계) 실패 — 예산 래퍼는 이 호출이 실행되지 않은 것으로 본다.
+  failBeforeSpawn?: string;
+};
+type LedgerCall = PagedCall & { protocolOnly: boolean; settings: SessionTurn["settings"]; reviewLedger: string | undefined };
+
+const codexMissing = (sessionId: string) => agentRunError("codex", 1,
+  `Error: thread/resume: thread/resume failed: no rollout found for thread id ${sessionId} (code -32600)\n`, "");
+
+// 리뷰 답변 확인 대역 — 입력의 질문 전부에 마지막 결정으로 답하고, 판정할 결정은 모두 구현 변경 요구 아님으로 적는다.
+function answerAll(prompt: string): AgentResult {
+  const input = JSON.parse(prompt.split("REVIEW_ANSWER_INPUT\n")[1].split("\nEND_REVIEW_ANSWER_INPUT")[0]) as {
+    requests: Array<{ id: string }>; decisions: Array<{ sequence: number }>; answerEvidence: Array<{ sequence: number }> };
+  const last = Math.max(...[...input.decisions, ...input.answerEvidence].map((decision) => decision.sequence));
+  return { kind: "REVIEW", summary: "답변을 확인했습니다.", status: "completed", findings: [], evidenceRefs: [],
+    reviewDecisionAnswers: input.requests.map((request) => ({ requestId: request.id, decisionSequence: last })),
+    decisionAssessments: input.decisions.map((decision) => ({ decisionSequence: decision.sequence, changesImplementation: false })) };
+}
+
+class LedgerCodex implements AgentAdapter {
+  readonly role = "codex" as const;
+  readonly calls: LedgerCall[] = [];
+  private created = 0;
+  constructor(readonly steps: LedgerStep[] = []) {}
+
+  async createSession(turn: Omit<SessionTurn, "sessionId">) {
+    const step = await this.begin("create", null, turn);
+    const sessionId = step.sessionId ?? `codex-ledger-${++this.created}`;
+    turn.onSessionCreated?.(sessionId);
+    if (step.fail) throw new Error(step.fail);
+    return { sessionId, result: this.reply(step, turn) };
+  }
+
+  async resumeTurn(turn: SessionTurn) {
+    const step = await this.begin("resume", turn.sessionId, turn);
+    if (step.missing) throw codexMissing(turn.sessionId);
+    if (step.fail) throw new Error(step.fail);
+    if (step.sessionId) turn.onSessionCreated?.(step.sessionId);
+    return this.reply(step, turn);
+  }
+
+  async validateExistingSession() { return true; }
+
+  // 판정 호출(review·final-review)만 — 읽기 호출·답변 확인은 판정이 아니다.
+  judgments(): LedgerCall[] { return this.calls.filter((call) => call.operation === "review" || call.operation === "final-review"); }
+
+  private async begin(method: PagedCall["method"], sessionId: string | null, turn: Omit<SessionTurn, "sessionId">): Promise<LedgerStep> {
+    this.calls.push({ method, sessionId, operation: turn.job?.operation ?? "", prompt: turn.prompt, readablePaths: turn.readablePaths ?? [],
+      protocolOnly: Boolean(turn.protocolOnly), settings: turn.settings, reviewLedger: turn.reviewLedger });
+    const step = this.steps.shift() ?? {};
+    if (step.failBeforeSpawn) throw new Error(step.failBeforeSpawn);
+    await turn.beforeSpawn?.();
+    turn.admitSync?.();
+    turn.onProcessSpawn?.({ pid: 4343, pgid: 4343, executable: "fake-codex", commandLine: "fake-codex", startedAt: new Date().toISOString() });
+    return step;
+  }
+
+  private reply(step: LedgerStep, turn: Omit<SessionTurn, "sessionId">): AgentResult {
+    if (step.result) return step.result;
+    const operation = turn.job?.operation;
+    if (operation === "review-read") return result("ACK", "리뷰 읽기 쪽을 받았습니다.");
+    if (operation === "answer-confirmation") return answerAll(turn.prompt);
+    return result(operation === "final-review" ? "FINAL_REVIEW" : "REVIEW", "문제 없습니다.");
+  }
+}
+
+// 두 한국어 결정(각 150,000B 대) — 리뷰 필수 구간이 한 호출 예산(96KiB)의 세 배를 넘는다.
+async function largeReviewRoom(label: string) {
+  const room = await pagedTopic(label, [koreanDecision(50_000, "p"), koreanDecision(50_000, "q")]);
+  const total = room.references.reduce((sum, { reference }) => sum + reference.bytes, 0);
+  expect(total).toBeGreaterThan(3 * REVIEW_PAGE);
+  return { room, total };
+}
+
+// 넉넉한 예산(예산 래퍼의 예약·되돌림 경로를 켠다).
+function generousBudget(room: Awaited<ReturnType<typeof pagedTopic>>) {
+  room.database.budgets.configure(room.topicId, { execution: { inputTokens: 1e9, outputTokens: 1e9, durationMs: 1e9 },
+    total: { inputTokens: 1e10, outputTokens: 1e10, durationMs: 1e10 } }, "test");
+}
+
+const reviewUsed = (room: Awaited<ReturnType<typeof pagedTopic>>) => room.database.reviews.account(room.topicId, "implementation").used;
+const operationsOf = (calls: readonly LedgerCall[]) => calls.map((call) => `${call.method}:${call.operation}`);
+
+describe("E3-4c 코드 리뷰 다중 호출 원장", () => {
+  it("한 호출 예산을 넘는 필수 자료는 판정 전 리뷰 읽기 호출(도구 없음·ACK·설정 상속)로 끝까지 싣고 판정은 한 번이며, 논리 리뷰 전체가 원장 ID 하나로 리뷰 1회만 쓴다", async () => {
+    const { room, total } = await largeReviewRoom("ledger-reads");
+    const [first, second] = room.references;
+    const claude = new PagingClaude(room.worktree);
+    const codex = new LedgerCodex();
+    room.engine(claude, codex).startImplementation(room.topicId);
+    await room.idle();
+
+    const reads = codex.calls.slice(0, -1);
+    const judgment = codex.calls.at(-1)!;
+    expect(operationsOf(codex.calls)).toEqual(["create:review-read", "resume:review-read", "resume:review-read", "resume:review"]);
+    // 읽기 호출: 프로토콜 턴(도구·읽기 경로 없음), 리뷰 경로의 모델·추론 설정을 그대로 쓴다(확인 턴처럼 낮추지 않는다), 판정 없이 ACK.
+    for (const read of reads) {
+      expect(read).toMatchObject({ protocolOnly: true, readablePaths: [] });
+      expect(read.settings).toEqual(judgment.settings);
+      expect(read.prompt).toContain("kind 는 ACK");
+      expect(read.prompt).not.toContain("승인된 계획");
+    }
+    expect(judgment.settings?.effort).not.toBe("low");
+    expect(judgment.protocolOnly).toBe(false);
+    expect(reads.map((read, index) => read.prompt.includes(`리뷰 읽기 ${index + 1}회차`))).toEqual([true, true, true]);
+    // 쪽: 호출마다 ≤ 96KiB, 읽기 호출은 예산을 채우고(UTF-8 경계로 최대 3바이트 줄어듦) 판정 호출이 나머지를 싣는다. 중복·누락 없이 원문 그대로.
+    const pages = codex.calls.map((call) => pagesIn(call.prompt));
+    pages.forEach((own) => expect(pageBytes(own)).toBeLessThanOrEqual(REVIEW_PAGE));
+    pages.slice(0, -1).forEach((own) => expect(pageBytes(own)).toBeGreaterThanOrEqual(REVIEW_PAGE - 3));
+    expect(pageBytes(pages.flat())).toBe(total);
+    expect(joined(pages.flat(), first.reference.selector)).toBe(first.text);
+    expect(joined(pages.flat(), second.reference.selector)).toBe(second.text);
+    // 판정 호출은 읽기 호출이 만든 세션을 잇지만 그 세션은 쪽만 받았으므로 전문 판(계획 본문)을 보낸다.
+    expect(judgment).toMatchObject({ method: "resume", sessionId: "codex-ledger-1" });
+    expect(judgment.prompt).toContain("승인된 계획:\n---");
+    // 원장: 네 호출이 같은 ID 로 예약해 리뷰는 1회, 판정 뒤 완료로 닫혔다. 커서·완료 산출물은 완료 판정 뒤에만.
+    const ledger = room.database.planning.latestReviewLedger(room.topicId)!;
+    expect(codex.calls.map((call) => call.reviewLedger)).toEqual(codex.calls.map(() => ledger.id));
+    expect(ledger).toMatchObject({ status: "completed", reads: 3, createdSessions: ["codex-ledger-1"], kind: "codex-review" });
+    expect(reviewUsed(room)).toBe(1);
+    expect(room.database.getCodexReviewPromptSequence(room.topicId)).not.toBeNull();
+    expect(room.database.getTopic(room.topicId).state).toBe("READY_TO_DELIVER");
+    const timeline = room.database.getTimeline(room.topicId);
+    expect(timeline.filter((event) => typeof event.payload?.reviewReadingTurn === "number").map((event) => event.payload?.reviewReadingTurn)).toEqual([1, 2, 3]);
+    // ACK 는 리뷰 산출물이 아니다 — codex agent_output 은 판정 하나뿐이다(리뷰 요청·재확인 해제가 이 기록을 센다).
+    expect(timeline.filter((event) => event.actor === "codex" && event.kind === "agent_output").map((event) => event.payload?.resultKind)).toEqual(["REVIEW"]);
+    expect(room.database.planning.referenceComplete("codex-ledger-1", room.topic, first.reference)).toBe(true);
+    expect(room.database.planning.referenceComplete("codex-ledger-1", room.topic, second.reference)).toBe(true);
+    room.database.close();
+  });
+
+  it.each([["읽기 호출", 1], ["판정 호출", 3]] as const)("%s이 실패한 뒤 DB 를 다시 열고 재시도하면 같은 원장·같은 예약으로 남은 구간부터 잇고, 판정은 한 번이다", async (_label, failAt) => {
+    const { room, total } = await largeReviewRoom(`ledger-reopen-${failAt}`);
+    const claude = new PagingClaude(room.worktree);
+    const steps: LedgerStep[] = Array.from({ length: failAt }, () => ({}));
+    const codex = new LedgerCodex([...steps, { fail: "네트워크 오류" }]);
+    room.engine(claude, codex).startImplementation(room.topicId);
+    await room.idle();
+    expect(room.database.getTopic(room.topicId).state).toBe("FAILED");
+    const ledger = room.database.planning.latestReviewLedger(room.topicId)!;
+    expect(ledger).toMatchObject({ status: "open", reads: failAt });
+    expect(reviewUsed(room)).toBe(1);
+    expect(room.database.latestArtifact(room.topicId, "codex-review")).toBeNull();
+    const failed = codex.calls.at(-1)!;
+
+    room.reopen();
+    room.engine(claude, codex).retry(room.topicId);
+    await room.idle();
+    expect(room.database.getTopic(room.topicId).state).toBe("READY_TO_DELIVER");
+    const retried = codex.calls.slice(failAt + 1);
+    // 실패한 호출의 쪽은 인정되지 않았다 — 재시도의 첫 호출이 같은 구간을 다시 싣고, 그 앞 구간은 다시 싣지 않는다.
+    expect(pagesIn(retried[0].prompt).map((page) => [page.selector, page.offset, page.end])).toEqual(
+      pagesIn(failed.prompt).map((page) => [page.selector, page.offset, page.end]));
+    const delivered = [...codex.calls.slice(0, failAt), ...retried].flatMap((call) => pagesIn(call.prompt));
+    expect(pageBytes(delivered)).toBe(total);
+    // 모든 호출이 같은 원장이고 예약은 한 번, 반환된 판정은 한 번이다.
+    expect(new Set(codex.calls.map((call) => call.reviewLedger))).toEqual(new Set([ledger.id]));
+    expect(reviewUsed(room)).toBe(1);
+    expect(codex.judgments().length).toBe(failAt === 3 ? 2 : 1);
+    expect(room.database.getTimeline(room.topicId).filter((event) => event.actor === "codex" && event.kind === "agent_output")).toHaveLength(1);
+    expect(room.database.planning.reviewLedger(ledger.id)).toMatchObject({ status: "completed", reads: 3 });
+    room.database.close();
+  });
+
+  it("세션 유실은 code-review 계보 복구로 같은 원장을 잇는다 — 새 세션은 처음부터 다시 읽고 추가 호출은 같은 원장 ID·같은 예약에 쌓인다", async () => {
+    const { room } = await largeReviewRoom("ledger-recovery");
+    const [first, second] = room.references;
+    const claude = new PagingClaude(room.worktree);
+    const codex = new LedgerCodex([{}, { missing: true }]);
+    room.engine(claude, codex).startImplementation(room.topicId);
+    await room.idle();
+
+    expect(room.database.getTopic(room.topicId).state).toBe("READY_TO_DELIVER");
+    expect(operationsOf(codex.calls.slice(0, 3))).toEqual(["create:review-read", "resume:review-read", "create:review-read"]);
+    const recovered = codex.calls.slice(2);
+    expect(recovered.every((call, index) => index === 0 || call.sessionId === "codex-ledger-2")).toBe(true);
+    expect(pagesIn(recovered[0].prompt)[0].offset).toBe(0);
+    const fresh = recovered.flatMap((call) => pagesIn(call.prompt));
+    expect(joined(fresh, first.reference.selector)).toBe(first.text);
+    expect(joined(fresh, second.reference.selector)).toBe(second.text);
+    const lineage = room.database.planning.storedRecoveryLineage(room.topicId, "code-review")!;
+    expect(lineage.recoveries).toEqual([expect.objectContaining({ fromSession: "codex-ledger-1", toSession: "codex-ledger-2", reason: "session-missing" })]);
+    const ledger = room.database.planning.latestReviewLedger(room.topicId)!;
+    expect(new Set(codex.calls.map((call) => call.reviewLedger))).toEqual(new Set([ledger.id]));
+    expect(ledger).toMatchObject({ status: "completed", createdSessions: ["codex-ledger-1", "codex-ledger-2"] });
+    expect(reviewUsed(room)).toBe(1);
+    expect(codex.judgments()).toHaveLength(1);
+    expect(codex.judgments()[0].prompt).toContain("승인된 계획:\n---");
+    expect(room.database.planning.referenceComplete("codex-ledger-2", room.topic, first.reference)).toBe(true);
+    room.database.close();
+  });
+
+  it.each([true, false])("원장의 호출이 spawn 한 뒤에는 뒤 호출이 spawn 전에 실패해도 예약을 되돌리지 않는다 — 첫 spawn 전 실패만 호출 단위로 되돌린다(앞선 spawn: %s)", async (spawnedBefore) => {
+    const { room } = await largeReviewRoom(`ledger-release-${spawnedBefore}`);
+    generousBudget(room);
+    const claude = new PagingClaude(room.worktree);
+    const codex = new LedgerCodex(spawnedBefore ? [{}, { failBeforeSpawn: "CLI 준비 실패" }] : [{ failBeforeSpawn: "CLI 준비 실패" }]);
+    room.engine(claude, codex, true).startImplementation(room.topicId);
+    await room.idle();
+    expect(room.database.getTopic(room.topicId).state).toBe("FAILED");
+    const ledger = room.database.planning.latestReviewLedger(room.topicId)!;
+    expect(ledger.spawned).toBe(spawnedBefore);
+    expect(reviewUsed(room)).toBe(spawnedBefore ? 1 : 0);
+
+    // 재시도는 같은 원장으로 잇는다 — 되돌린 예약은 다시 잡고, 남은 예약은 새로 세지 않는다.
+    room.reopen();
+    room.engine(claude, codex, true).retry(room.topicId);
+    await room.idle();
+    expect(room.database.getTopic(room.topicId).state).toBe("READY_TO_DELIVER");
+    expect(new Set(codex.calls.map((call) => call.reviewLedger))).toEqual(new Set([ledger.id]));
+    expect(reviewUsed(room)).toBe(1);
+    expect(room.database.planning.reviewLedger(ledger.id)).toMatchObject({ status: "completed", spawned: true });
+    room.database.close();
+  });
+
+  it("검토 tree 가 바뀌면 새 논리 리뷰다 — 새 원장 ID 로 다시 예약하고, 세션이 이미 인정받은 쪽은 다시 싣지 않는다", async () => {
+    const { room } = await largeReviewRoom("ledger-new-tree");
+    const claude = new PagingClaude(room.worktree);
+    const codex = new LedgerCodex([{}, { fail: "네트워크 오류" }]);
+    room.engine(claude, codex).startImplementation(room.topicId);
+    await room.idle();
+    const before = room.database.planning.latestReviewLedger(room.topicId)!;
+    const firstRead = pagesIn(codex.calls[0].prompt);
+
+    writeFileSync(join(room.worktree, "feature.txt"), "리뷰 대기 중 바뀐 작업 트리\n");
+    room.engine(claude, codex).retry(room.topicId);
+    await room.idle();
+    expect(room.database.getTopic(room.topicId).state).toBe("READY_TO_DELIVER");
+    const after = room.database.planning.latestReviewLedger(room.topicId)!;
+    expect(after.id).not.toBe(before.id);
+    expect(after.reviewedTree).not.toBe(before.reviewedTree);
+    expect(codex.calls.slice(2).every((call) => call.reviewLedger === after.id)).toBe(true);
+    expect(reviewUsed(room)).toBe(2);
+    expect(room.database.planning.reviewLedger(before.id)?.status).toBe("open");
+    // 같은 세션의 인정 구간은 원장과 무관하다 — 새 원장의 첫 호출은 첫 읽기 호출이 인정받은 구간 뒤부터 싣는다.
+    expect(codex.calls[2].sessionId).toBe("codex-ledger-1");
+    expect(pagesIn(codex.calls[2].prompt)[0].offset).toBe(firstRead.at(-1)!.end);
+    room.database.close();
+  });
+
+  it("미완료 판정은 원장을 닫되 커서·완료·저장 리뷰로 수정 열기의 근거가 아니다 — 질문은 agent_output 으로 보존되고, 결정 뒤 재시도는 새 원장으로 다시 판정한다", async () => {
+    const room = await pagedTopic("ledger-incomplete", [koreanDecision(1_000, "r")]);
+    const claude = new PagingClaude(room.worktree);
+    const question = "배포 채널을 정해 주세요.";
+    const incomplete: AgentResult = { ...result("REVIEW", "일부만 검토했습니다.", [reviewFinding("AGREED_ACTION")]),
+      status: "in_progress", remainingSteps: ["테스트 경로 검토"], requestedUserDecision: question };
+    const codex = new LedgerCodex([{ result: incomplete }]);
+    const engine = room.engine(claude, codex);
+    engine.startImplementation(room.topicId);
+    await room.idle();
+
+    expect(room.database.getTopic(room.topicId).state).toBe("USER_DECISION_REQUIRED");
+    const first = room.database.planning.latestReviewLedger(room.topicId)!;
+    expect(first.status).toBe("judged");
+    // 원문·질문은 기존 agent_output 계약으로 보존된다(리뷰 요청 목록이 그 이벤트에서 질문을 읽는다).
+    expect(room.database.latestArtifact(room.topicId, "codex-review")).not.toBeNull();
+    const topic = room.database.getTopic(room.topicId);
+    expect(pendingReviewRequests(room.database.getTimeline(room.topicId), topic.scopeGeneration).map((request) => request.question)).toEqual([question]);
+    // 커서는 완료 판정에서만 전진한다.
+    expect(room.database.getCodexReviewPromptSequence(room.topicId)).toBeNull();
+
+    room.database.appendEvent({ topicId: room.topicId, actor: "user", kind: "decision", state: "USER_DECISION_REQUIRED", body: "배포 채널은 A 로 합니다." });
+    engine.retry(room.topicId);
+    await room.idle();
+    // 결정 뒤에도 미완료 리뷰의 확정 결함을 곧장 수정으로 보내지 않는다 — 답변 확인 뒤 새 원장으로 다시 판정한다(남은 검토를 이어 보라는 안내와 함께).
+    expect(claude.calls.map((call) => call.operation)).toEqual(["implement"]);
+    expect(operationsOf(codex.calls)).toEqual(["create:review", "resume:answer-confirmation", "resume:review"]);
+    expect(codex.calls[2].prompt).toContain("이전 코드 리뷰는 미완료입니다");
+    const second = room.database.planning.latestReviewLedger(room.topicId)!;
+    expect(second.id).not.toBe(first.id);
+    expect(second.status).toBe("completed");
+    expect(codex.calls[2].reviewLedger).toBe(second.id);
+    expect(room.database.getCodexReviewPromptSequence(room.topicId)).not.toBeNull();
+    expect(room.database.getTopic(room.topicId).state).toBe("READY_TO_DELIVER");
+    room.database.close();
+  });
+
+  it("진척 게이트: 리뷰 읽기 호출이 다른 세션 id 로 돌아와 리뷰 세션의 미인정 구간이 줄지 않으면 판정 없이 보존·명시 정지하고, 재시도는 같은 원장·같은 세션에서 잇는다", async () => {
+    const { room, total } = await largeReviewRoom("ledger-stalled");
+    room.database.setCodexReviewSession(room.topicId, "codex-existing");
+    const claude = new PagingClaude(room.worktree);
+    // 둘째 호출이 생기면 진척 게이트가 반복을 끊지 못한 것이다 — 실패로 드러낸다.
+    const codex = new LedgerCodex([{ sessionId: "codex-forked" }, { fail: "진척 없는 리뷰 읽기 반복" }]);
+    room.engine(claude, codex).startImplementation(room.topicId);
+    await room.idle();
+
+    expect(operationsOf(codex.calls)).toEqual(["resume:review-read"]);
+    expect(codex.calls[0].sessionId).toBe("codex-existing");
+    const ledger = room.database.planning.latestReviewLedger(room.topicId)!;
+    const stop = room.database.getTimeline(room.topicId).at(-1)!;
+    expect(stop.payload).toMatchObject({ readingStalled: true, reviewLedger: ledger.id, reviewSession: "codex-existing" });
+    expect(stop.payload?.timelineUnread).toEqual({ references: room.references.map(({ reference }) => reference.selector), bytes: total });
+    expect(room.database.getTopic(room.topicId).state).toBe("USER_DECISION_REQUIRED");
+    expect(room.database.getFlags(room.topicId).resumeState).toBe("CODEX_REVIEW");
+    expect(room.database.getCodexReviewSession(room.topicId)).toBe("codex-existing");
+    expect(room.database.latestArtifact(room.topicId, "codex-review")).toBeNull();
+    expect(ledger).toMatchObject({ status: "open" });
+
+    codex.steps.length = 0;
+    room.reopen();
+    room.engine(claude, codex).retry(room.topicId);
+    await room.idle();
+    expect(room.database.getTopic(room.topicId).state).toBe("READY_TO_DELIVER");
+    const retried = codex.calls.slice(1);
+    expect(retried.every((call) => call.method === "resume" && call.sessionId === "codex-existing" && call.reviewLedger === ledger.id)).toBe(true);
+    expect(pagesIn(retried[0].prompt)[0].offset).toBe(0);
+    expect(pageBytes(retried.flatMap((call) => pagesIn(call.prompt)))).toBe(total);
+    // 원래 이어 쓰던 세션이라 판정 호출은 재개 판이다(계획 본문 생략).
+    expect(codex.judgments()).toHaveLength(1);
+    expect(codex.judgments()[0].prompt).not.toContain("승인된 계획:\n---");
+    expect(reviewUsed(room)).toBe(1);
+    room.database.close();
+  });
+
+  it("리뷰 읽기 호출이 ACK 가 아닌 판정을 내면 판정으로 쓰지 않고 멈추며, 실은 쪽의 인정은 보존해 재시도가 남은 구간부터 잇는다", async () => {
+    const { room } = await largeReviewRoom("ledger-invalid-ack");
+    const claude = new PagingClaude(room.worktree);
+    const codex = new LedgerCodex([{ result: result("REVIEW", "읽기 호출에서 판정했습니다.", [reviewFinding("AGREED_ACTION")]) }]);
+    const engine = room.engine(claude, codex);
+    engine.startImplementation(room.topicId);
+    await room.idle();
+
+    expect(operationsOf(codex.calls)).toEqual(["create:review-read"]);
+    const stop = room.database.getTimeline(room.topicId).at(-1)!;
+    expect(stop.payload?.reviewReadInvalid).toEqual({ round: 1, kind: "REVIEW" });
+    expect(room.database.latestArtifact(room.topicId, "codex-review")).toBeNull();
+    expect(room.database.getTimeline(room.topicId).some((event) => event.actor === "codex" && event.kind === "agent_output")).toBe(false);
+    const sent = pagesIn(codex.calls[0].prompt);
+
+    engine.retry(room.topicId);
+    await room.idle();
+    expect(room.database.getTopic(room.topicId).state).toBe("READY_TO_DELIVER");
+    expect(pagesIn(codex.calls[1].prompt)[0].offset).toBe(sent.at(-1)!.end);
+    expect(reviewUsed(room)).toBe(1);
+    room.database.close();
+  });
+});
+
+// ---- E3-4c host-review 39d21df9 F003·F004 — 세션별 수신 기록 ----
+// 원장(논리 리뷰 1회)과 별개로 "그 세션이 무엇을 받았는가"를 세션 단위로 둔다. 프로토콜 턴(도구·지시문·메모리 없음)이 만든 세션은 리뷰 전문 판과 메모리 본문을
+// 받지 않았으므로, 그 세션의 첫 일반 판정 호출이 전문 판을 보내고(F003) 어댑터가 resume 에도 메모리 본문을 한 번 싣는다(F004).
+
+// 리뷰 좌석 러너 대역 — 실제 어댑터가 만든 CLI 입력(stdin)을 그대로 기록하고, 과제 문구로 응답을 고른다(읽기 = ACK, 첫 판정 = 확정 결함 하나, 최종 = 해결 확인).
+class ScriptedReviewRunner implements CommandRunner {
+  readonly calls: CommandSpec[] = [];
+  private threads = 0;
+  constructor(private readonly provider: "claude" | "codex") {}
+  async run(spec: CommandSpec): Promise<CommandResult> {
+    this.calls.push(spec);
+    const stdin = spec.stdin ?? "";
+    const reply = stdin.includes("리뷰의 자료 읽기 호출입니다") ? result("ACK", "쪽을 받았습니다.")
+      : stdin.includes("반환 kind는 FINAL_REVIEW") ? result("FINAL_REVIEW", "보완 결과를 확인했습니다.", [reviewFinding("RESOLVED_BY_FIX")])
+      : result("REVIEW", "한 곳을 보완해야 합니다.", [reviewFinding("AGREED_ACTION")]);
+    const lines: unknown[] = [];
+    if (this.provider === "codex") {
+      const resume = spec.args.indexOf("resume");
+      lines.push({ type: "thread.started", thread_id: resume >= 0 ? spec.args[resume + 1] : `codex-thread-${++this.threads}` });
+    }
+    lines.push(reply);
+    return { exitCode: 0, stdout: lines.map((line) => JSON.stringify(line)).join("\n"), stderr: "", jsonLines: lines };
+  }
+  kinds(): string[] {
+    return this.calls.map((call) => (call.stdin ?? "").includes("리뷰의 자료 읽기 호출입니다") ? "read"
+      : (call.stdin ?? "").includes("반환 kind는 FINAL_REVIEW") ? "final-review" : "review");
+  }
+}
+
+const MEMORY_BODY = "REVIEW-MEMORY-BODY-MARKER";
+function reviewMemory(): string {
+  const root = mkdtempSync(join(tmpdir(), "consensus-room-review-memory-"));
+  temporaryDirectories.push(root);
+  writeFileSync(join(root, "context-router.md"), `# Context Router\n\n${MEMORY_BODY}\n`);
+  return root;
+}
+
+describe("E3-4c host-review 39d21df9 F003·F004 — 세션별 수신 기록", () => {
+  it("F003: 이전 원장의 리뷰 읽기 호출이 만든 세션은 트리가 바뀌어 새 원장이 열려도 첫 판정에 계획 전문·계획 검토 근거를 싣고 '이미 전달' 안내를 하지 않는다", async () => {
+    const { room } = await largeReviewRoom("receipt-new-tree");
+    const topic = room.database.getTopic(room.topicId);
+    // 계획 검토 종결 근거 — 전문 판(새 세션)만 싣는다.
+    await room.artifacts.write(room.topicId, "closeout", 1, JSON.stringify({ kind: "CLOSEOUT", summary: "계획 검토를 종결했습니다.",
+      planSHA256: topic.planSHA256, findings: [], evidenceRefs: ["closeout-evidence-marker"] }));
+    const claude = new PagingClaude(room.worktree);
+    const codex = new LedgerCodex([{}, { fail: "네트워크 오류" }]);
+    const engine = room.engine(claude, codex);
+    engine.startImplementation(room.topicId);
+    await room.idle();
+    const before = room.database.planning.latestReviewLedger(room.topicId)!;
+    expect(before.createdSessions).toEqual(["codex-ledger-1"]);
+
+    writeFileSync(join(room.worktree, "feature.txt"), "리뷰 대기 중 바뀐 작업 트리\n");
+    engine.retry(room.topicId);
+    await room.idle();
+    const after = room.database.planning.latestReviewLedger(room.topicId)!;
+    expect(after.id).not.toBe(before.id);
+    expect(after.createdSessions).toEqual([]);
+    const judgment = codex.judgments()[0];
+    expect(judgment).toMatchObject({ method: "resume", sessionId: "codex-ledger-1" });
+    // 새 원장에는 이 세션의 생성 기록이 없지만, 세션은 쪽만 받았다 — 전문 판이어야 한다.
+    expect(judgment.prompt).toContain("승인된 계획:\n---");
+    expect(judgment.prompt).toContain("계획 검토의 최종 처분과 근거");
+    expect(judgment.prompt).toContain("closeout-evidence-marker");
+    expect(judgment.prompt).not.toContain("이 리뷰 세션에 이미 전달한 계획과 같은 전문입니다");
+    expect(judgment.prompt).not.toContain("이 리뷰 세션의 직전 턴 이후");
+    expect(room.database.getTopic(room.topicId).state).toBe("READY_TO_DELIVER");
+    // 전문 판 판정이 돌아온 뒤에야 그 세션이 리뷰 문맥을 받았다고 적는다.
+    expect(room.database.planning.sessionReceipt("codex-ledger-1")).toMatchObject({ protocolCreated: true, reviewContext: true });
+    room.database.close();
+  });
+
+  it.each(["codex", "claude"] as const)("F004: 리뷰 읽기(프로토콜) 호출이 만든 리뷰 세션의 첫 판정 stdin 에 메모리 본문을 한 번 싣고, 다음 판정은 매니페스트만 싣는다(리뷰 경로 %s — 실제 어댑터 바이트)", async (provider) => {
+    const room = await pagedTopic(`receipt-memory-${provider}`, [koreanDecision(50_000, provider === "codex" ? "s" : "t")]);
+    const runner = new ScriptedReviewRunner(provider);
+    const memory = reviewMemory();
+    const paging = new PagingClaude(room.worktree);
+    let claude: AgentAdapter = paging;
+    let codex: AgentAdapter;
+    if (provider === "codex") {
+      const home = mkdtempSync(join(tmpdir(), "consensus-room-review-codex-"));
+      temporaryDirectories.push(home);
+      codex = new CodexAdapter(runner, join(home, "agent-result.schema.json"), join(home, "codex-home"), memory);
+    } else {
+      // 검토자 배정을 Claude 프로필로 옮긴다(E2b) — 리뷰 턴은 실제 ClaudeAdapter 로, 구현·수정 턴은 대역으로 간다.
+      room.database.roles.createProfile({ id: "claude-reviewer", provider: "claude", model: "claude-opus-5-5", effort: "high", options: {} });
+      room.database.roles.assign({ scope: `topic:${room.topicId}`, role: "reviewer", operation: "", participant: "reviewer-claude",
+        profileId: "claude-reviewer", sessionId: null, note: "", expectedVersion: 0 });
+      const reviewer = new ClaudeAdapter(runner, memory);
+      const byRole = (turn: Omit<SessionTurn, "sessionId">) => turn.job?.role === "reviewer" ? reviewer : paging;
+      claude = { role: "claude", validateExistingSession: async () => true,
+        createSession: (turn) => byRole(turn).createSession(turn), resumeTurn: (turn) => byRole(turn).resumeTurn(turn) };
+      codex = new LedgerCodex([{ fail: "Codex 로 가면 안 되는 호출" }]);
+    }
+    room.engine(claude, codex).startImplementation(room.topicId);
+    await room.idle();
+
+    expect(room.database.getTopic(room.topicId).state, room.database.getTopic(room.topicId).lastError ?? "").toBe("READY_TO_DELIVER");
+    expect(runner.kinds()).toEqual(["read", "review", "final-review"]);
+    const [read, review, finalReview] = runner.calls.map((call) => call.stdin ?? "");
+    // 읽기 호출(프로토콜)은 본문도 매니페스트도 싣지 않는다 — 기존 정책 그대로.
+    expect(read).not.toContain(MEMORY_BODY);
+    expect(read).not.toContain("메모리 스냅샷 갱신");
+    // 그 세션의 첫 일반 판정(resume)에 본문을 한 번 싣는다(매니페스트 중복 없이).
+    expect(review).toContain("--- 메모리 문서 시작: context-router.md ---");
+    expect(review).toContain(MEMORY_BODY);
+    expect(review).not.toContain("메모리 스냅샷 갱신");
+    // 다음 판정은 종전 resume 규칙 — 본문 없이 매니페스트만.
+    expect(finalReview).not.toContain(MEMORY_BODY);
+    expect(finalReview).toContain("메모리 스냅샷 갱신");
+    const session = room.database.getCodexReviewSession(room.topicId)!;
+    expect(room.database.planning.sessionReceipt(session)).toMatchObject({ protocolCreated: true, memoryBodies: true, reviewContext: true });
+    room.database.close();
   });
 });

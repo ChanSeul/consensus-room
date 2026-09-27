@@ -157,6 +157,122 @@ class UsageReportTests(unittest.TestCase):
         self.assertEqual(r['totals']['outputTokens'], 25)
         self.assertEqual(r['groups'][0]['topic'], 't1')
 
+    def test_admission_discovers_legacy_and_runtime_sessions_without_counting_copies_twice(self):
+        def events(session, usage):
+            return [{'type': 'session_meta', 'payload': {'id': session, 'cwd': '/fixture/work'}},
+                    {'type': 'event_msg', 'timestamp': '2026-01-01T00:01:00Z', 'payload': {
+                        'type': 'token_count', 'info': {'total_token_usage': usage, 'last_token_usage': usage}}}]
+        prefix = 'room/work-admission/tasks/task-1/'
+        old = events('old', {'input_tokens': 100, 'cached_input_tokens': 80, 'output_tokens': 10})
+        self.source(prefix + 'codex-home/sessions/old.jsonl', old)
+        # An older session may also be preserved in a runtime home; it remains one request.
+        self.source(prefix + 'runtime/codex-home/isolated/home-a/sessions/copied.jsonl', old)
+        new = self.source(prefix + 'runtime/codex-home/isolated/home-b/sessions/new.jsonl',
+                          events('new', {'input_tokens': 50, 'cached_input_tokens': 40, 'output_tokens': 5}))
+        r = self.report([])
+        self.assertEqual(r['totals']['inputTokens'], 150)
+        self.assertEqual(r['totals']['outputTokens'], 15)
+        self.assertEqual(r['totals']['cachedInputTokens'], 120)
+        self.assertEqual(len(r['groups']), 1)
+        self.assertEqual((r['groups'][0]['role'], r['groups'][0]['topic'], r['groups'][0]['requests']),
+                         ('work-admission', 't1', 2))
+        # Explicit attribution still takes precedence when the same file is discovered automatically.
+        mapped = self.report([{'path': str(new), 'provider': 'codex', 'role': 'pre-audit', 'topic': 't1'}])
+        self.assertEqual(mapped['totals'], r['totals'])
+        self.assertEqual(next(g for g in mapped['groups'] if g['role'] == 'pre-audit')['outputTokens'], 5)
+
+    def test_host_review_runtime_run_counts_its_native_session_once(self):
+        # E2e-2: the runtime keeps the job's Codex home as the session home. Its event log and raw usage receipt
+        # are execution observations, not extra requests; the runtime data folder holds no sessions.
+        usage = {'input_tokens': 120, 'cached_input_tokens': 100, 'output_tokens': 12}
+        prefix = 'room/review-tools/jobs/job-1/'
+        self.source(prefix + 'codex-home/sessions/rollout-s1.jsonl', [
+            {'type': 'session_meta', 'payload': {'id': 's1', 'cwd': '/fixture/review/workspace'}},
+            {'type': 'event_msg', 'timestamp': '2026-01-01T00:01:00Z', 'payload': {
+                'type': 'token_count', 'info': {'total_token_usage': usage, 'last_token_usage': usage}}}])
+        self.source(prefix + 'runtime/output-schemas/schema.json', [{'type': 'object'}])
+        run = self.root / prefix / 'workspace/runs/r1'
+        self.source(prefix + 'workspace/runs/r1/runtime.jsonl', [
+            {'type': 'spawn', 'pid': 4242, 'at': 1000}, {'type': 'session', 'sessionId': 's1'},
+            {'type': 'provider-usage', 'usage': usage}])
+        receipt = {'model': 'gpt-6-astra', 'effort': 'xhigh', 'reported': [usage]}
+        (run / 'usage.json').write_text(json.dumps(receipt))
+        with sqlite3.connect(self.home / 'review-tools/reviews.sqlite') as db:
+            db.execute('CREATE TABLE runs(id TEXT,job TEXT,status TEXT,directory TEXT,started REAL,seconds REAL,'
+                       'session_mode TEXT,input_bytes INTEGER,delta_bytes INTEGER,pid INTEGER,provider_pid INTEGER)')
+            db.execute('INSERT INTO runs VALUES(?,?,?,?,?,?,?,?,?,?,?)', ('r1', 'job-1', 'passed', str(run), 1, 2, 'create', 30, None, 77, 4242))
+        r = self.report([])
+        self.assertEqual((r['totals']['inputTokens'], r['totals']['outputTokens'], r['totals']['cachedInputTokens']), (120, 12, 100))
+        self.assertEqual([(g['role'], g['requests']) for g in r['groups']], [('host-review', 1)])
+        [observation] = r['executionObservations']
+        self.assertEqual((observation['role'], observation['reportedUsage'], observation['inputBytes']), ('host-review', receipt, 30))
+
+    def test_repair_sessions_are_requests_once_and_attempt_ledger_stays_an_execution_observation(self):
+        # E2e-3: each repair attempt runs in its own runtime home; the attempt ledger separates attempts from model calls.
+        usage = {'input_tokens': 100, 'cached_input_tokens': 80, 'output_tokens': 10}
+        session = [{'type': 'session_meta', 'payload': {'id': 'repair-1', 'cwd': '/fixture/repair/source'}},
+                   {'type': 'event_msg', 'timestamp': '2026-01-01T00:01:00Z', 'payload': {
+                       'type': 'token_count', 'info': {'total_token_usage': usage, 'last_token_usage': usage}}}]
+        prefix = 'room/work-admission/repairs/job-1/'
+        self.source(prefix + '1/runtime/codex-home/isolated/home-a/sessions/rollout-repair-1.jsonl', session)
+        self.source(prefix + '1/codex-home/sessions/copied.jsonl', session)  # an older copy of the same session
+        first = self.root / prefix / '1'
+        (first / 'usage.json').write_text(json.dumps(usage))
+        second = self.root / prefix / '2'
+        second.mkdir(parents=True)
+        (second / 'usage.json').write_text('null')
+        with sqlite3.connect(self.home / 'work-admission/admission.sqlite') as db:
+            db.execute('CREATE TABLE attempts(id TEXT,task TEXT,status TEXT,started REAL,seconds REAL)')
+            db.execute('CREATE TABLE repair_rounds(job TEXT,round INTEGER,directory TEXT,status TEXT,started REAL,seconds REAL,'
+                       'provider TEXT,model TEXT,effort TEXT,provider_pid INTEGER,spawned REAL,thread TEXT)')
+            db.execute('INSERT INTO repair_rounds VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                       ('job-1', 1, str(first), 'completed', 10, 5, 'codex', 'gpt-6-astra', 'medium', 77, 11, 'repair-1'))
+            # A refused attempt: the runtime stopped it before the provider started.
+            db.execute('INSERT INTO repair_rounds VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                       ('job-1', 2, str(second), 'failed', 20, 1, 'codex', 'gpt-6-astra', 'medium', None, None, None))
+        r = self.report([])
+        self.assertEqual((r['totals']['inputTokens'], r['totals']['outputTokens'], r['totals']['cachedInputTokens']), (100, 10, 80))
+        self.assertEqual([(g['role'], g['provider'], g['requests'], g['executions']) for g in r['groups']], [('repair', 'codex', 1, 2)])
+        observed = {e['id']: e for e in r['executionObservations']}
+        self.assertEqual((observed['job-1/1']['reportedUsage'], observed['job-1/1']['modelCall']), (usage, True))
+        self.assertEqual((observed['job-1/2']['reportedUsage'], observed['job-1/2']['modelCall']), (None, False))
+        self.assertEqual((observed['job-1/1']['startedAt'], observed['job-1/1']['endedAt']), (10, 15))
+
+    def test_repair_sessions_are_found_when_the_attempt_ledger_does_not_exist_yet(self):
+        usage = {'input_tokens': 7, 'output_tokens': 1}
+        self.source('room/work-admission/repairs/job-1/1/runtime/codex-home/isolated/home-a/sessions/rollout.jsonl', [
+            {'type': 'session_meta', 'payload': {'id': 'repair-2'}},
+            {'type': 'event_msg', 'timestamp': '2026-01-01T00:01:00Z', 'payload': {
+                'type': 'token_count', 'info': {'total_token_usage': usage, 'last_token_usage': usage}}}])
+        with sqlite3.connect(self.home / 'work-admission/admission.sqlite') as db:
+            db.execute('CREATE TABLE attempts(id TEXT,task TEXT,status TEXT,started REAL,seconds REAL)')
+        r = self.report([])
+        self.assertEqual((r['totals']['inputTokens'], r['totals']['outputTokens']), (7, 1))
+        self.assertEqual(r['executionObservations'], [])
+
+    def test_admission_runtime_missing_usage_stays_null_and_execution_receipt_is_not_added(self):
+        prefix = 'room/work-admission/tasks/task-1/'
+        self.source(prefix + 'runtime/codex-home/isolated/home-a/sessions/partial.jsonl', [
+            {'type': 'session_meta', 'payload': {'id': 'partial'}},
+            {'type': 'event_msg', 'timestamp': '2026-01-01T00:01:00Z', 'payload': {
+                'type': 'token_count', 'info': {
+                    'total_token_usage': {'output_tokens': 3}, 'last_token_usage': {'output_tokens': 3}}}}])
+        usage = [{'inputTokens': 9000, 'outputTokens': 900, 'stage': 'final'}]
+        path = self.source(prefix + 'workspace/attempt-1/usage.json', [])
+        path.write_text(json.dumps(usage))
+        with sqlite3.connect(self.home / 'work-admission/admission.sqlite') as db:
+            db.execute('CREATE TABLE attempts(id TEXT,task TEXT,status TEXT,started REAL,seconds REAL)')
+            db.execute('INSERT INTO attempts VALUES(?,?,?,?,?)', ('attempt-1', 'task-1', 'done', 1, 2))
+        r = self.report([])
+        self.assertEqual(r['totals']['outputTokens'], 3)
+        self.assertIsNone(r['totals']['inputTokens'])
+        self.assertIsNone(r['totals']['cachedInputTokens'])
+        self.assertIsNone(r['reportedCostUSD'])
+        self.assertEqual(r['executionObservations'][0]['reportedUsage'], usage)
+        self.assertEqual(r['groups'][0]['requests'], 1)
+        self.assertEqual(r['coverage']['missingRequestFields']['inputTokens'], 1)
+        self.assertEqual(r['coverage']['costMissingExecutions'], 1)
+
     def test_period_filter_keeps_output_completion_and_topic_filter_excludes_unassigned(self):
         path = self.source('claude.jsonl', [self.claude(1), self.claude(413)])
         r = self.report([{'path': str(path), 'provider': 'claude', 'role': 'runner', 'topic': 't1'}],

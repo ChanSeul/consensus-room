@@ -90,15 +90,118 @@ export class GitService {
   // 임시 index 에 add -A 한 뒤 write-tree 하므로 실제 index·worktree·stash 는 건드리지 않는다(사용자 규칙: stash 금지).
   // 트리는 refs/consensus/reviewed/<label> 로 잡아 gc 에 지워지지 않게 한다.
   async writeWorkingTree(worktreePath: string, label: string): Promise<string> {
-    const gitDirectory = (await this.run(worktreePath, ["rev-parse", "--absolute-git-dir"])).stdout.trim();
-    const indexFile = resolve(gitDirectory, `consensus-index-${process.pid}-${Date.now()}`);
-    const environment = { ...process.env, GIT_INDEX_FILE: indexFile };
-    try {
+    const tree = await this.workingTreeOID(worktreePath);
+    await this.run(worktreePath, ["update-ref", `refs/consensus/reviewed/${label}`, tree]);
+    return tree;
+  }
+
+  // 작업 트리 전체(추적 안 된 파일 포함, 무시 규칙 적용)의 트리 OID — writeWorkingTree 와 같은 계산이되 ref 를 남기지 않는다. 합류 병합 준비의 멱등 판정·
+  // 병합 커밋의 리뷰 트리 대조·허용 오차의 준비 트리 대비 변경 계산이 쓴다(엔진 개편 E4 보완 F001).
+  async workingTreeOID(worktreePath: string): Promise<string> {
+    return this.withTemporaryIndex(worktreePath, async (environment) => {
       await this.run(worktreePath, ["read-tree", "HEAD"], undefined, environment);
       await this.run(worktreePath, ["add", "-A", "--", "."], undefined, environment);
-      const tree = (await this.run(worktreePath, ["write-tree"], undefined, environment)).stdout.trim();
-      await this.run(worktreePath, ["update-ref", `refs/consensus/reviewed/${label}`, tree]);
-      return tree;
+      return (await this.run(worktreePath, ["write-tree"], undefined, environment)).stdout.trim();
+    });
+  }
+
+  // 합류 병합 준비(E4 보완 F001) — base 위에 targets 커밋을 순서대로 병합한 트리를 계산해 작업 트리에 **커밋 없이** 적용한다. 충돌 파일은 git 의 충돌
+  // 표식을 담은 채 적용되고 이름을 돌려준다 — 러너가 해소하고 리뷰가 확인한 뒤, 인도 때 엔진이 부모 [기준, 합류 대상…] 병합 커밋을 만든다.
+  //  - 병합 트리: mergeTree(아래). 작업 트리·index 불변.
+  //  - 적용: 임시 index(HEAD 로 읽고 stat 갱신) 위에서 read-tree -m -u HEAD <트리> — HEAD·실제 index 는 그대로라 기존 가드(기준 HEAD 고정, staged 없음)가
+  //    유지된다. 새 파일은 추적 안 된 파일로, 지운 파일은 작업 트리에서 빠진다.
+  //  - 작업 트리가 이미 그 트리이면 아무것도 바꾸지 않는다. HEAD 가 base 가 아니거나 작업 트리가 깨끗한 base 도 결과 트리도 아니면 거부하고, 적용 뒤
+  //    작업 트리 트리(무시 규칙 적용)가 결과 트리와 다르면(무시 규칙에 걸린 파일 등) 병합 결과를 온전히 재현할 수 없으므로 거부한다.
+  //  - 준비 트리는 단계가 쓰는 동안(허용 오차 대조·재개·범위 변경) 계속 읽힌다. DB 의 OID 만으로는 객체가 GC 에서 살아남지 않으므로 리뷰 트리처럼 ref
+  //    (refs/consensus/prepared/<tree>)로 잡는다(E4 2차 보완 F015). 수명도 리뷰 트리 ref 와 같다(지우지 않는다).
+  async prepareMerge(worktreePath: string, base: string, targets: readonly string[]): Promise<{ tree: string; conflicts: string[] }> {
+    await this.assertNoActiveRepositoryHooks(worktreePath);
+    if (targets.length === 0) throw new Error("병합할 합류 대상이 없습니다.");
+    if (await this.head(worktreePath) !== base) throw new Error("작업 트리 HEAD 가 단계 기준 커밋이 아니어서 합류 병합을 준비하지 않았습니다.");
+    const baseTree = (await this.run(worktreePath, ["rev-parse", `${base}^{tree}`])).stdout.trim();
+    const { tree, conflicts } = await this.mergeTree(worktreePath, base, targets);
+    await this.run(worktreePath, ["update-ref", preparedRef(tree), tree]);
+    const current = await this.workingTreeOID(worktreePath);
+    if (current !== tree) {
+      if (current !== baseTree) throw new Error("작업 트리가 단계 기준 커밋에서 바뀌어 합류 병합을 준비하지 않았습니다.");
+      await this.withTemporaryIndex(worktreePath, async (environment) => {
+        await this.run(worktreePath, ["read-tree", "HEAD"], undefined, environment);
+        const refreshed = await this.runner.run({ command: "git", args: ["update-index", "-q", "--refresh"], cwd: worktreePath, environment });
+        if (refreshed.exitCode !== 0 && refreshed.exitCode !== 1) throw new Error(`git update-index 실패: ${refreshed.stderr || refreshed.stdout}`);
+        await this.run(worktreePath, ["read-tree", "-m", "-u", "HEAD", tree], undefined, environment);
+      });
+      if (await this.workingTreeOID(worktreePath) !== tree) {
+        throw new Error("합류 병합 결과를 작업 트리에 온전히 재현하지 못했습니다(무시 규칙에 걸린 파일 등). 병합 준비를 중단합니다.");
+      }
+    }
+    return { tree, conflicts };
+  }
+
+  // 준비 트리를 읽기 전에 부른다(E4 2차 보완 F015) — 객체가 있으면 ref 를 보장하고, ref 가 지워져 객체가 GC 된 경우에는 같은 기준·대상으로 병합 트리를
+  // 다시 계산해(결정적) 기록된 트리와 같을 때만 ref 로 되살린다. 다르면 준비를 재현할 수 없으므로 던진다(다른 트리를 준비 트리로 쓰지 않는다).
+  async ensurePreparedTree(worktreePath: string, base: string, targets: readonly string[], tree: string): Promise<void> {
+    const present = await this.runner.run({ command: "git", args: ["cat-file", "-e", `${tree}^{tree}`], cwd: worktreePath, maxOutputBytes: 64 * 1024 });
+    if (present.exitCode !== 0 && (await this.mergeTree(worktreePath, base, targets)).tree !== tree) {
+      throw new Error(`합류 병합 준비 트리 ${tree} 가 저장소에 없고, 같은 기준·합류 대상으로 다시 계산한 트리도 다릅니다. 병합 준비를 재현할 수 없습니다.`);
+    }
+    await this.run(worktreePath, ["update-ref", preparedRef(tree), tree]);
+  }
+
+  // 병합 트리 계산(작업 트리·index·ref 불변) — merge-tree --write-tree. 둘째 대상부터는 앞 결과를 고정 신원·시각의 임시 병합 커밋(ref 없음)으로 만들어
+  // 이어 병합한다 — 병합 기준을 git 이 계보로 계산하고, 다시 계산해도 같은 트리가 나온다(재시도·재생성 멱등).
+  private async mergeTree(worktreePath: string, base: string, targets: readonly string[]): Promise<{ tree: string; conflicts: string[] }> {
+    const conflicts = new Set<string>();
+    const fixedIdentity = {
+      ...process.env, GIT_AUTHOR_NAME: "Consensus Room", GIT_AUTHOR_EMAIL: "consensus-room@localhost", GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z",
+      GIT_COMMITTER_NAME: "Consensus Room", GIT_COMMITTER_EMAIL: "consensus-room@localhost", GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z",
+    };
+    let accumulated = base;
+    let tree = "";
+    for (const [index, target] of targets.entries()) {
+      const merged = await this.runner.run({
+        command: "git", args: ["merge-tree", "--write-tree", "--name-only", "-z", "--no-messages", accumulated, target],
+        cwd: worktreePath, maxOutputBytes: 128 * 1024 * 1024,
+      });
+      if (merged.exitCode !== 0 && merged.exitCode !== 1) throw new Error(`git merge-tree 실패: ${merged.stderr || merged.stdout}`);
+      const [treeOID, ...names] = merged.stdout.split("\0").filter(Boolean);
+      if (!treeOID || !/^[a-f0-9]{40,64}$/.test(treeOID)) throw new Error("git merge-tree 가 병합 트리를 돌려주지 않았습니다.");
+      if (merged.exitCode === 1) for (const name of names) conflicts.add(name);
+      tree = treeOID;
+      if (index < targets.length - 1) {
+        accumulated = (await this.run(worktreePath, ["commit-tree", tree, "-p", accumulated, "-p", target, "-m", "consensus-room merge preparation"],
+          undefined, fixedIdentity)).stdout.trim();
+      }
+    }
+    return { tree, conflicts: [...conflicts].sort() };
+  }
+
+  // 합류 병합 커밋 객체를 만든다(ref·index·작업 트리 불변, hook 없음) — 호출자가 리뷰 트리·승인된 부모를 확인한 뒤 부른다. 브랜치 이동(moveBranch)과
+  // index 정렬(resyncIndex)은 따로 부른다: 호출자가 커밋 OID 를 브랜치를 옮기기 **전에** 기록해, 그 뒤 어느 단계에서 멈춰도 복구가 그 OID 를 안다(F014).
+  async writeMergeCommit(worktreePath: string, tree: string, parents: readonly string[], message: string): Promise<string> {
+    if (parents.length < 2) throw new Error("병합 커밋에는 기준과 합류 대상이 하나 이상 있어야 합니다.");
+    return (await this.run(worktreePath, ["commit-tree", tree, ...parents.flatMap((parent) => ["-p", parent]), "-m", message])).stdout.trim();
+  }
+
+  // 브랜치를 expectedHead 에서만 oid 로 옮긴다(update-ref 세 인자). 옮기기 전 index 에 stage 된 변경이 없어야 한다(엔진 전달의 불변식). index·작업 트리는
+  // 건드리지 않는다 — 정렬은 resyncIndex.
+  async moveBranch(worktreePath: string, branchName: string, oid: string, expectedHead: string): Promise<void> {
+    await this.assertNoActiveRepositoryHooks(worktreePath);
+    await this.assertCurrentBranch(worktreePath, branchName);
+    const staged = await this.run(worktreePath, ["diff", "--cached", "--name-only", "-z"]);
+    if (staged.stdout.trim()) throw new Error("이미 stage된 변경이 있어 안전하게 커밋할 수 없습니다.");
+    await this.run(worktreePath, ["update-ref", `refs/heads/${branchName}`, oid, expectedHead]);
+  }
+
+  // 두 트리 사이 한 파일의 문맥 0줄 패치 — 합류 준비 트리 대비 허용 오차 대조(E4 보완 F001).
+  async treeFileDiff(worktreePath: string, fromTree: string, toTree: string, file: string): Promise<string> {
+    return (await this.run(worktreePath, ["diff-tree", "-r", "-p", "-U0", "--no-color", "--no-renames", fromTree, toTree, "--", file], 16 * 1024 * 1024)).stdout;
+  }
+
+  private async withTemporaryIndex<T>(worktreePath: string, work: (environment: NodeJS.ProcessEnv) => Promise<T>): Promise<T> {
+    const gitDirectory = (await this.run(worktreePath, ["rev-parse", "--absolute-git-dir"])).stdout.trim();
+    const indexFile = resolve(gitDirectory, `consensus-index-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    try {
+      return await work({ ...process.env, GIT_INDEX_FILE: indexFile });
     } finally {
       await rm(indexFile, { force: true }).catch(() => undefined);
     }
@@ -173,10 +276,23 @@ export class GitService {
     return line.split(/\s+/).filter(Boolean).slice(1);
   }
 
+  // ancestor 가 descendant 의 조상(또는 같은 커밋)인가 — 작업 묶음 단계 결과의 계보 확인(엔진 개편 E4). 부모를 거슬러 걷는 대신
+  // merge-base --is-ancestor 로 판정한다: 비후손이면 저장소 전체 이력을 걷거나 임의 상한으로 거부해야 하기 때문이다. 종료 코드 1 은
+  // "조상 아님", 그 밖의 실패(없는 커밋 등)는 판정할 수 없으므로 던진다.
+  async isAncestor(worktreePath: string, ancestor: string, descendant: string): Promise<boolean> {
+    const result = await this.runner.run({
+      command: "git", args: ["merge-base", "--is-ancestor", ancestor, descendant], cwd: worktreePath, maxOutputBytes: 64 * 1024,
+    });
+    if (result.exitCode === 0) return true;
+    if (result.exitCode === 1) return false;
+    throw new Error(`git merge-base 실패: ${result.stderr || result.stdout}`);
+  }
+
+  // 병합 커밋(엔진의 합류 병합 커밋)은 첫 부모 대비 경로다 — 기본 diff-tree 는 병합 커밋에 아무 경로도 내지 않는다. 일반 커밋은 그대로다.
   async commitChangedPaths(worktreePath: string, oid: string): Promise<string[]> {
     return (await this.run(
       worktreePath,
-      ["diff-tree", "--no-renames", "--no-commit-id", "--name-only", "-r", "-z", oid, "--"],
+      ["diff-tree", "--diff-merges=first-parent", "--no-renames", "--no-commit-id", "--name-only", "-r", "-z", oid, "--"],
       128 * 1024 * 1024,
     )).stdout.split("\0").filter(Boolean).sort();
   }
@@ -300,4 +416,9 @@ function validateScopedPath(worktreePath: string, input: string): string {
     throw new Error(`worktree 밖 경로는 커밋할 수 없습니다: ${input}`);
   }
   return scope;
+}
+
+// 합류 병합 준비 트리의 보존 ref(F015) — 트리 OID 로 이름 짓는다(같은 준비는 같은 ref, 범위 변경 재준비·재생성도 멱등).
+function preparedRef(tree: string): string {
+  return `refs/consensus/prepared/${tree}`;
 }

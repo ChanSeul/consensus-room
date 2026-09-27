@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -7,9 +8,12 @@ import { ArtifactStore } from "../src/server/artifacts";
 import { ConsensusDatabase } from "../src/server/database";
 import { USAGE_LIMIT_RETRY, type RetryClock } from "../src/server/engine/usageLimitRetry";
 import { GitService } from "../src/server/git";
+import { SpawnCommandRunner } from "../src/server/processRunner";
 import type { AgentAdapter, SessionTurn } from "../src/server/types";
 import { WorkflowEngine } from "../src/server/workflow";
 import { parseResetTime, parseUsageLimit } from "../src/shared/usageLimit";
+import { REQUIRED_PLAN_HEADINGS, type AgentResult } from "../src/shared/contracts";
+import { hashPlan } from "../src/shared/workflow";
 
 const temporaryDirectories: string[] = [];
 
@@ -290,6 +294,186 @@ describe("사용 한도 자동 재시도 — 취소·지속·잠금", () => {
     expect(database.runningAction("topic-1")).toBeNull();
     expect(database.getTimeline("topic-1").some((event) => event.body.includes("예약된 자동 재시도를 건너뜁니다"))).toBe(true);
     core.scopeChangeActive.delete("topic-1");
+    database.close();
+  });
+});
+
+// ---- E3-4c 보완: 마지막 허용 리뷰 도중 429 뒤 같은 코드 리뷰 원장·같은 예약으로 자동 재개 ----
+// 공개 흐름: 실제 git 작업 트리에서 구현 → 코드 리뷰(마지막 허용 1회) → 리뷰 호출이 spawn 한 뒤 429 → FAILED → 자동 재시도 예약 → 시계 발화 → retry.
+// 예산 강제를 켠다 — 원장의 spawn 은 예산 래퍼가 기록한다(E3-4c).
+describe("E3-4c 코드 리뷰 원장과 사용 한도 자동 재시도", () => {
+  function git(cwd: string, args: string[]): string {
+    return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  }
+  const TOLERANCE_BLOCK = '\n\n```tolerance\n{"scopePaths":["**"],"rules":[]}\n```';
+  const validPlan = () => REQUIRED_PLAN_HEADINGS.map((heading) => `## ${heading}\n\n검증할 내용${heading === "허용 오차" ? TOLERANCE_BLOCK : ""}`).join("\n\n");
+  const PROCESS = { pid: 123, pgid: 123, executable: "fake", commandLine: "fake", startedAt: "now" };
+
+  class ImplementingClaude implements AgentAdapter {
+    readonly role = "claude" as const;
+    calls = 0;
+    constructor(private readonly worktree: string) {}
+    async createSession(turn: Omit<SessionTurn, "sessionId">) {
+      turn.onSessionCreated?.("claude-impl");
+      return { sessionId: "claude-impl", result: this.implement() };
+    }
+    async resumeTurn(_turn: SessionTurn) { return this.implement(); }
+    async validateExistingSession() { return true; }
+    private implement(): AgentResult {
+      this.calls += 1;
+      writeFileSync(join(this.worktree, "feature.txt"), `구현 ${this.calls}\n`);
+      return { kind: "IMPLEMENTATION", summary: "구현했습니다.", findings: [], evidenceRefs: ["feature.txt"], status: "completed" };
+    }
+  }
+  // 첫 리뷰 호출은 프로세스를 띄운 뒤 사용 한도로 실패하고, 그 뒤 호출은 문제 없는 리뷰를 돌려준다.
+  class LimitedCodex implements AgentAdapter {
+    readonly role = "codex" as const;
+    readonly calls: string[] = [];
+    async createSession(turn: Omit<SessionTurn, "sessionId">) {
+      return { sessionId: "codex-review-session", result: this.review(turn) };
+    }
+    async resumeTurn(turn: SessionTurn) { return this.review(turn); }
+    async validateExistingSession() { return true; }
+    private review(turn: Omit<SessionTurn, "sessionId">): AgentResult {
+      this.calls.push(turn.job?.operation ?? "");
+      turn.onProcessSpawn?.(PROCESS);
+      if (this.calls.length === 1) throw new Error(SESSION_LIMIT);
+      return { kind: "REVIEW", summary: "문제 없습니다.", findings: [], evidenceRefs: ["feature.txt"] };
+    }
+  }
+
+  async function lastAllowanceReview(label: string) {
+    const root = mkdtempSync(join(tmpdir(), `consensus-room-usage-review-${label}-`));
+    temporaryDirectories.push(root);
+    const repository = join(root, "repository");
+    const worktree = join(root, "worktrees", "topic");
+    git(root, ["init", "--initial-branch=develop", repository]);
+    git(repository, ["config", "user.name", "Consensus Room Test"]);
+    git(repository, ["config", "user.email", "consensus-room@example.invalid"]);
+    writeFileSync(join(repository, "feature.txt"), "기준\n");
+    git(repository, ["add", "feature.txt"]);
+    git(repository, ["commit", "-m", "baseline"]);
+    const gitService = new GitService(new SpawnCommandRunner());
+    await gitService.createDetachedWorktree(repository, worktree, "develop");
+    const database = new ConsensusDatabase(join(root, "room.sqlite"));
+    const artifacts = new ArtifactStore(join(root, "topics"), database);
+    const plan = validPlan();
+    const planSHA256 = hashPlan(plan);
+    const topicId = "topic-1";
+    database.createTopic({
+      id: topicId, slug: `usage-review-${label}`, title: "리뷰 한도와 자동 재시도", repositoryPath: repository, baseRef: "develop",
+      worktreePath: worktree, branchName: null, state: "AWAITING_USER_APPROVAL", scopeGeneration: 1, planRevision: 2, planSHA256,
+      approvedPlanSHA256: planSHA256, createdAt: "2026-09-26T00:00:00.000Z", updatedAt: "2026-09-26T00:00:00.000Z", lastError: null,
+    });
+    for (const role of ["claude", "codex"] as const) {
+      database.upsertParticipant(topicId, { role, sessionId: `${role}-plan-session`, mode: "attached", acknowledgedPlanSHA256: planSHA256 });
+    }
+    await artifacts.write(topicId, "plan", 2, `${plan.trim()}\n`);
+    database.budgets.configure(topicId, { execution: { inputTokens: 1_000_000, outputTokens: 1_000_000, durationMs: 10_000_000 },
+      total: { inputTokens: 10_000_000, outputTokens: 10_000_000, durationMs: 100_000_000 } }, "test");
+    // 구현 리뷰 한도 3회 가운데 2회를 앞서 썼다 — 이번 코드 리뷰가 마지막 허용 1회다.
+    database.reviews.admit(topicId, "earlier-review-1", "implementation");
+    database.reviews.admit(topicId, "earlier-review-2", "implementation");
+    const clock = new FakeClock("2026-09-07T22:10:00.000Z");
+    const claude = new ImplementingClaude(worktree);
+    const codex = new LimitedCodex();
+    const engine = new WorkflowEngine({ database, artifacts, git: gitService, claude, codex, clock, enforceBudgets: true });
+    engine.startImplementation(topicId);
+    await waitForIdle(database, topicId);
+    return { database, engine, clock, codex, worktree, topicId };
+  }
+  async function waitForIdle(database: ConsensusDatabase, topicId: string): Promise<void> {
+    const deadline = Date.now() + 20_000;
+    while (database.runningAction(topicId)) {
+      if (Date.now() >= deadline) throw new Error("action 종료 대기 시간 초과");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+  }
+  const used = (database: ConsensusDatabase) => database.reviews.account("topic-1", "implementation").used;
+
+  it("마지막 허용 리뷰가 spawn 뒤 429 로 끝나면 자동 재시도를 예약하고, 발화한 재시도는 같은 원장·같은 예약으로 리뷰를 마친다", async () => {
+    const room = await lastAllowanceReview("held");
+    const { database, clock, codex, topicId } = room;
+    expect(database.getTopic(topicId)).toMatchObject({ state: "FAILED", lastError: expect.stringContaining("session limit") });
+    expect(database.getFlags(topicId).resumeState).toBe("CODEX_REVIEW");
+    const ledger = database.planning.latestReviewLedger(topicId)!;
+    expect(ledger).toMatchObject({ status: "open", spawned: true, kind: "codex-review" });
+    expect(used(database)).toBe(3);
+    expect(database.reviews.account(topicId, "implementation").limit).toBe(3);
+    // 가용 횟수가 0 이어도 같은 원장의 예약으로 이어지므로 자동 재시도를 예약했다.
+    expect(clock.timers).toHaveLength(1);
+
+    clock.fire();
+    await waitForIdle(database, topicId);
+    expect(database.getTimeline(topicId).some((event) => event.body.includes("자동 재시도를 시작했습니다(1/3)"))).toBe(true);
+    expect(codex.calls).toEqual(["review", "review"]);
+    expect(database.getTopic(topicId).state).toBe("READY_TO_DELIVER");
+    expect(database.planning.latestReviewLedger(topicId)).toMatchObject({ id: ledger.id, status: "completed" });
+    expect(used(database)).toBe(3);
+    database.close();
+  });
+
+  it("발화 전에 원장이 판정으로 닫혔으면(새 예약이 필요) 발화한 자동 재시도를 건너뛰고 모델을 부르지 않는다", async () => {
+    const room = await lastAllowanceReview("judged");
+    const { database, clock, codex, topicId } = room;
+    expect(clock.timers).toHaveLength(1);
+    database.planning.judgeReviewLedger(database.planning.latestReviewLedger(topicId)!.id);
+    clock.fire();
+    await waitForIdle(database, topicId);
+    expect(codex.calls).toEqual(["review"]);
+    expect(database.getTopic(topicId).state).toBe("FAILED");
+    expect(database.getTimeline(topicId).some((event) => event.body.includes("예약된 자동 재시도를 건너뜁니다"))).toBe(true);
+    expect(used(database)).toBe(3);
+    database.close();
+  });
+
+  it("발화 전에 주제의 계획 epoch 가 원장 신원과 달라졌으면 발화한 자동 재시도를 건너뛰고 모델을 부르지 않는다", async () => {
+    const room = await lastAllowanceReview("epoch");
+    const { database, clock, codex, topicId } = room;
+    expect(clock.timers).toHaveLength(1);
+    database.updateTopic(topicId, { planEpoch: database.getTopic(topicId).planEpoch + 1 });
+    clock.fire();
+    await waitForIdle(database, topicId);
+    expect(codex.calls).toEqual(["review"]);
+    expect(database.getTopic(topicId).state).toBe("FAILED");
+    expect(database.getTimeline(topicId).some((event) => event.body.includes("예약된 자동 재시도를 건너뜁니다"))).toBe(true);
+    expect(used(database)).toBe(3);
+    database.close();
+  });
+
+  // 원장의 호출이 모두 spawn 전에 실패하면 예산 래퍼가 예약을 되돌려 원장은 판정 전(open)인 채 예약이 없다. 그런 원장은 재시도가 이어 쓸 예약이 아니다.
+  it("발화 전 최신 원장이 판정 전이지만 spawn 하지 않았으면(예약이 원장에 묶이지 않음) 발화한 자동 재시도를 건너뛰고 모델을 부르지 않는다", async () => {
+    const room = await lastAllowanceReview("unspawned");
+    const { database, clock, codex, topicId } = room;
+    expect(clock.timers).toHaveLength(1);
+    const held = database.planning.latestReviewLedger(topicId)!;
+    const { id: _id, createdSessions: _sessions, session: _session, spawned: _spawned, reads: _reads, status: _status, createdAt: _created,
+      updatedAt: _updated, ...identity } = held;
+    const unspawned = database.planning.openReviewLedger({ ...identity, reviewedTree: "tree-whose-calls-never-spawned" });
+    expect(unspawned).toMatchObject({ status: "open", spawned: false });
+    expect(database.planning.latestReviewLedger(topicId)!.id).toBe(unspawned.id);
+    clock.fire();
+    await waitForIdle(database, topicId);
+    expect(codex.calls).toEqual(["review"]);
+    expect(database.getTopic(topicId).state).toBe("FAILED");
+    expect(database.getTimeline(topicId).some((event) => event.body.includes("예약된 자동 재시도를 건너뜁니다"))).toBe(true);
+    expect(used(database)).toBe(3);
+    database.close();
+  });
+
+  it("검토 tree 가 바뀌면 사전 검사는 통과해도 실행 경로가 새 원장의 예약을 spawn 전에 막아 모델이 뜨지 않는다", async () => {
+    const room = await lastAllowanceReview("tree");
+    const { database, clock, codex, worktree, topicId } = room;
+    const ledger = database.planning.latestReviewLedger(topicId)!;
+    writeFileSync(join(worktree, "feature.txt"), "리뷰 뒤에 바뀐 작업 트리\n");
+    clock.fire();
+    await waitForIdle(database, topicId);
+    expect(codex.calls).toEqual(["review"]);
+    const topic = database.getTopic(topicId);
+    expect(topic.state).toBe("USER_DECISION_REQUIRED");
+    expect(database.getTimeline(topicId).at(-1)?.payload).toMatchObject({ reviewPause: "implementation", resumeState: "CODEX_REVIEW" });
+    expect(database.planning.latestReviewLedger(topicId)!.id).not.toBe(ledger.id);
+    expect(used(database)).toBe(3);
     database.close();
   });
 });

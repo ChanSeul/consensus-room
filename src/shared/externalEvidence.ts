@@ -81,16 +81,31 @@ export function parseEvidenceSource(input: EvidenceSourceInput): Pick<EvidenceSo
   throw new Error("Slack 스레드, Jira 이슈, Figma 노드 링크를 입력하세요. Figma는 node-id가 필요합니다.");
 }
 
+// 근거 한 쪽의 최대 크기(E3-1). 쪽 크기는 소비처가 실제로 받는 포장(중재자 응답 본문·러너 근거 블록)의 UTF-8 바이트다.
+// 요청자는 자기 도구 한도에 맞춰 더 작은 쪽을 고를 수 있다(중재자 batch 의 pageBytes).
+export const EVIDENCE_PAGE_BYTES = 240_000;
+// 단위 안 구간 — 유니코드 코드 포인트 오프셋 [offset, end), total 은 단위 본문의 코드 포인트 수. 서로게이트 쌍을 가르지 않는다.
+export interface EvidenceRange { offset: number; end: number; total: number }
+// 이 쪽 다음에 전달할 첫 항목. 단위 삭제는 unitId, 원문 삭제는 unitId null, offset 은 구간 시작이다.
+export interface EvidenceCursor { sourceId: string; unitId: string | null; offset: number }
+
 export const MediatorEvidenceInputSchema = z.object({ sessionId: z.string().trim().min(1).max(200) }).strict();
+export const MediatorEvidenceBatchInputSchema = MediatorEvidenceInputSchema.extend({
+  pageBytes: z.number().int().min(1).max(EVIDENCE_PAGE_BYTES).optional(),
+});
 export const MediatorEvidenceAckSchema = MediatorEvidenceInputSchema.extend({ batchId: z.string().uuid() });
 export interface MediatorEvidenceBatch {
   batchId: string | null;
   digest: string;
   sources: Array<Pick<EvidenceSource, "id" | "url" | "contentHash" | "checkedAt">>;
-  changes: Array<EvidenceUnit & { sourceId: string }>;
+  // range 가 있으면 content 는 그 구간만 담는다. 구간을 순서대로 이으면 단위 본문과 같다.
+  changes: Array<EvidenceUnit & { sourceId: string; range?: EvidenceRange }>;
   removedSources: string[];
   removedUnits: Array<{ sourceId: string; unitId: string }>;
   images: Array<{ hash: string; path: string }>;
+  // 이 쪽 뒤에 남은 항목 수(부분 전달한 단위는 1)와 다음 항목 위치. 남은 항목은 ack 뒤 다음 batch 가 잇는다.
+  remaining: number;
+  nextCursor: EvidenceCursor | null;
 }
 export interface MediatorEvidenceResponse extends MediatorEvidenceBatch {
   currentDigest: string;

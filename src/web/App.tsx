@@ -18,9 +18,11 @@ import type {
   AgentRole,
   ClientConfig,
   Finding,
+  JobRouteView,
   MediationAutonomy,
   MessageKind,
   Participant,
+  RoutingView,
   TimelineEvent,
   Topic,
   TopicActivity,
@@ -28,19 +30,21 @@ import type {
   WorkflowState,
 } from "../shared/contracts";
 import { ApiError, api, topicEventsUrl } from "./api";
+import type { WorkGroupView } from "../shared/workGroups";
 
 const STATE_COPY: Record<WorkflowState, { label: string; tone: StatusTone; hint: string }> = {
-  DRAFT: { label: "준비 중", tone: "quiet", hint: "두 에이전트 세션을 연결해 주세요." },
-  CLAUDE_PLAN: { label: "Claude 계획 작성", tone: "working", hint: "Claude가 첫 계획을 작성하고 있습니다." },
-  CODEX_AUDIT: { label: "Codex 검토", tone: "working", hint: "Codex가 계획의 빈틈과 근거를 확인하고 있습니다." },
-  CLAUDE_REVISION: { label: "Claude 계획 수정", tone: "working", hint: "검토 결과를 반영해 계획을 고치고 있습니다." },
-  CODEX_CLOSEOUT: { label: "Codex 최종 확인", tone: "working", hint: "합의할 수 있는 계획인지 마지막으로 확인합니다." },
-  CONSENSUS_ACK: { label: "계획 해시 확인", tone: "working", hint: "두 에이전트가 같은 계획을 읽었는지 확인합니다." },
+  DRAFT: { label: "준비 중", tone: "quiet", hint: "작성자·검토자 좌석 세션을 연결해 주세요." },
+  // 상태 값(CLAUDE_PLAN 등)은 호환용 이름이다 — 실제로 실행하는 AI 는 역할 배정이 정하므로 문구는 역할로 쓴다(E2c C3).
+  CLAUDE_PLAN: { label: "계획 작성", tone: "working", hint: "설계자가 첫 계획을 작성하고 있습니다." },
+  CODEX_AUDIT: { label: "계획 검토", tone: "working", hint: "검토자가 계획의 빈틈과 근거를 확인하고 있습니다." },
+  CLAUDE_REVISION: { label: "계획 수정", tone: "working", hint: "검토 결과를 반영해 계획을 고치고 있습니다." },
+  CODEX_CLOSEOUT: { label: "계획 최종 확인", tone: "working", hint: "합의할 수 있는 계획인지 마지막으로 확인합니다." },
+  CONSENSUS_ACK: { label: "계획 해시 확인", tone: "working", hint: "두 좌석이 같은 계획을 읽었는지 확인합니다." },
   AWAITING_USER_APPROVAL: { label: "승인 대기", tone: "attention", hint: "계획을 읽고 직접 승인해야 구현을 시작할 수 있습니다." },
-  IMPLEMENTING: { label: "Claude 구현", tone: "working", hint: "승인된 계획 범위 안에서 Claude가 코드를 고치고 있습니다." },
-  CODEX_REVIEW: { label: "Codex 코드 검토", tone: "working", hint: "Codex가 변경 내용을 읽기 전용으로 검토하고 있습니다." },
-  CLAUDE_FIX: { label: "Claude 보완", tone: "working", hint: "합의된 범위 안의 확정 문제를 한 번 보완합니다." },
-  CODEX_FINAL_REVIEW: { label: "Codex 마무리 검토", tone: "working", hint: "보완된 결과를 마지막으로 확인합니다." },
+  IMPLEMENTING: { label: "구현", tone: "working", hint: "승인된 계획 범위 안에서 구현자가 코드를 고치고 있습니다." },
+  CODEX_REVIEW: { label: "코드 검토", tone: "working", hint: "검토자가 변경 내용을 읽기 전용으로 검토하고 있습니다." },
+  CLAUDE_FIX: { label: "보완", tone: "working", hint: "구현자가 합의된 범위 안의 확정 문제를 한 번 보완합니다." },
+  CODEX_FINAL_REVIEW: { label: "마무리 검토", tone: "working", hint: "검토자가 보완된 결과를 마지막으로 확인합니다." },
   READY_TO_DELIVER: { label: "전달 준비 완료", tone: "success", hint: "검증 결과를 확인한 뒤 커밋할 수 있습니다." },
   CLOSED: { label: "종료", tone: "success", hint: "이 주제의 작업이 끝났습니다." },
   BLOCKED_ON_EVIDENCE: { label: "증거 필요", tone: "danger", hint: "결론을 내려면 추가 자료나 실행 결과가 필요합니다." },
@@ -55,12 +59,54 @@ const MESSAGE_COPY: Record<Exclude<MessageKind, "agent_output" | "system">, stri
   decision: "결정",
 };
 
+// 발화자 — 좌석(claude·codex)은 역할 좌석이다. 실제 실행 AI 는 이벤트에 경로가 기록된 경우에만 붙인다(actorLabel).
 const ACTOR_COPY: Record<AgentRole, string> = {
-  claude: "Claude",
-  codex: "Codex",
+  claude: "작성자",
+  codex: "검토자",
   system: "중앙 진행자",
   user: "나",
 };
+
+// 역할과 실제 실행 AI(E2c C3). 좌석 이름에서 실제 AI 를 유도하지 않는다 — 경로·세션 바인딩(detail.routing)이나 이벤트의 경로 기록에서만 읽는다.
+type Provider = "claude" | "codex";
+type Seat = "claude" | "codex";
+const PROVIDER_COPY: Record<Provider, string> = { claude: "Claude", codex: "Codex" };
+const ROLE_COPY: Record<JobRouteView["role"], string> = { planner: "설계자", implementer: "구현자", reviewer: "검토자" };
+const SEAT_COPY: Record<Seat, string> = { claude: "작성자", codex: "검토자" };
+const SESSION_SEAT_COPY: Record<RoutingView["sessions"][number]["seat"], string> = {
+  author: "작성자 좌석 세션", "plan-review": "계획 검토 좌석 세션", implementation: "구현 세션", "code-review": "코드 리뷰 세션",
+};
+// routing 이 없는 과거 응답에서만 쓰는 좌석의 기본 공급자(E2b 이전의 고정 대응).
+const DEFAULT_SEAT_PROVIDER: Record<Seat, Provider> = { claude: "claude", codex: "codex" };
+// 좌석이 지금 실행 중이거나 다음에 열 작업의 경로 — 단계별 작업은 서버가 엔진 호출 지점과 같은 표로 정한 값(routing.current)만 쓴다(화면이 추정하지 않는다).
+function seatRoute(routing: RoutingView | undefined, seat: Seat): JobRouteView | undefined {
+  const job = routing?.current[seat === "claude" ? "author" : "reviewer"];
+  return job ? routing?.jobs.find((entry) => entry.role === job.role && entry.operation === job.operation) : undefined;
+}
+
+function basisCopy(basis: NonNullable<JobRouteView["route"]>["basis"]): string {
+  return basis.kind === "default" ? "기본 배정" : `배정 ${basis.scope} v${basis.version}`;
+}
+
+function routeCopy(entry: JobRouteView): string {
+  // 부속 턴은 부모 작업의 배정·세션으로 실행된다 — 이 작업에 따로 둔 배정은 적용되지 않는다는 것을 함께 쓴다(host-review F003).
+  const inherited = entry.inheritsFrom ? ` · ${entry.inheritsFrom} 경로 상속(이 작업의 독립 배정은 적용되지 않음)` : "";
+  if (!entry.route) return `실행할 수 없는 배정${inherited}`;
+  const route = entry.route;
+  return `${PROVIDER_COPY[route.provider]} · ${route.settings.model} · ${route.settings.effort} · ${basisCopy(route.basis)}`
+    + `${route.profileId ? `(프로필 ${route.profileId}, 참여자 ${route.participant})` : ""}${inherited}`;
+}
+
+// 타임라인 발화자 — 이벤트에 경로(E2b 부터 agent_output 의 payload.route)가 있으면 역할과 실제 AI 를, 없으면 좌석 역할만 쓴다(추측한 AI 를 붙이지 않는다).
+function actorLabel(event: TimelineEvent): string {
+  const route = event.payload.route as { provider?: unknown; job?: { role?: unknown } } | undefined;
+  const provider = route?.provider;
+  const role = route?.job?.role;
+  if ((provider === "claude" || provider === "codex") && (role === "planner" || role === "implementer" || role === "reviewer")) {
+    return `${ROLE_COPY[role]} · ${PROVIDER_COPY[provider]}`;
+  }
+  return ACTOR_COPY[event.actor];
+}
 
 type StatusTone = "quiet" | "working" | "attention" | "success" | "danger";
 type Dialog = "create" | "claude" | "codex" | "commit" | "push" | null;
@@ -206,6 +252,25 @@ function extractEvidence(detail: TopicDetail | null): string[] {
   return [...refs];
 }
 
+// 작업 묶음 단계의 전달 진입 — 토픽 상세에는 묶음 판정이 없어 묶음 목록 뷰로 판정한다. 화면은 진입만 열고 최종 판정은 서버가 한다.
+//  - closedPush(host-review F002): 그 토픽을 링크로 가진 단계에 그 토픽의 동결 결과가 있고, 결과 커밋이 기록된 로컬 커밋이며 아직 push 되지 않았다.
+//  - pendingMerge(2차 F001): 엔진이 합류 병합을 준비해 두었고 아직 확정 커밋이 없다 — 파일 차이가 없어도 계보를 잇는 병합 커밋이 필요하다. 서버 commit 도
+//    확정 커밋이 없을 때만 합류 병합 경로를 타므로(확정 뒤 경로 없는 커밋은 일반 커밋으로 거부된다) 같은 조건으로 진입을 연다.
+interface StageDeliveryView { closedPush: boolean; pendingMerge: boolean }
+function stageDeliveryOf(groups: readonly WorkGroupView[], topicId: string): StageDeliveryView {
+  for (const group of groups) {
+    const stageId = Object.keys(group.links).find((id) => group.links[id].topicId === topicId);
+    if (!stageId) continue;
+    const result = group.results?.[stageId];
+    const delivery = group.delivery[stageId];
+    return {
+      closedPush: Boolean(result && result.topicId === topicId && delivery?.committedOID === result.commitOID && delivery.pushedOID !== result.commitOID),
+      pendingMerge: Boolean(group.links[stageId].preparedMerge) && !delivery?.committedOID,
+    };
+  }
+  return { closedPush: false, pendingMerge: false };
+}
+
 function participantFor(topic: Topic, role: "claude" | "codex"): Participant | undefined {
   return topic.participants.find((participant) => participant.role === role);
 }
@@ -224,6 +289,7 @@ export function App() {
   const [autonomy, setAutonomy] = useState<MediationAutonomy | null>(null);
   const [autonomyBusy, setAutonomyBusy] = useState(false);
   const [activity, setActivity] = useState<TopicActivity | null>(null);
+  const [stageDelivery, setStageDelivery] = useState<({ topicId: string } & StageDeliveryView) | null>(null);
   const reconnectRef = useRef(0);
   const selectedTopicRef = useRef<string | null>(null);
   const detailRequestRef = useRef(0);
@@ -301,6 +367,19 @@ export function App() {
     const timer = window.setInterval(() => { void load(); }, 10_000);
     return () => { cancelled = true; window.clearInterval(timer); };
   }, [selectedTopicId, detail?.topic.id, detail?.topic.state]);
+
+  // 묶음 단계의 전달 진입 판정 — 선택한 토픽이 전달 준비(READY_TO_DELIVER)나 CLOSED 가 될 때 한 번, 전달 동작(commit·push·결과 확인) 뒤에 다시 읽는다.
+  // 읽지 못하면 진입을 닫는다(최종 판정은 서버 몫이다).
+  const refreshStageDelivery = useCallback(async (topicId: string) => {
+    let view: StageDeliveryView = { closedPush: false, pendingMerge: false };
+    try { view = stageDeliveryOf(await api.listWorkGroups(), topicId); } catch { /* 진입만 닫는다 */ }
+    if (selectedTopicRef.current === topicId) setStageDelivery({ topicId, ...view });
+  }, []);
+  useEffect(() => {
+    const state = detail?.topic.id === selectedTopicId ? detail.topic.state : null;
+    if (!selectedTopicId || (state !== "CLOSED" && state !== "READY_TO_DELIVER")) { setStageDelivery(null); return; }
+    void refreshStageDelivery(selectedTopicId);
+  }, [selectedTopicId, detail?.topic.id, detail?.topic.state, refreshStageDelivery]);
 
   const toggleAutonomy = useCallback(async () => {
     if (!autonomy || autonomyBusy) return;
@@ -404,6 +483,9 @@ export function App() {
         await refreshTopics();
         if (targetTopicId && selectedTopicRef.current === targetTopicId) {
           await refreshDetail(targetTopicId);
+          if ((name === "commit" || name === "push" || name === "reconcile-delivery") && selectedTopicRef.current === targetTopicId) {
+            await refreshStageDelivery(targetTopicId);
+          }
           if(selectedTopicRef.current===targetTopicId)setActionNotice(response && typeof response==="object" && "resumeBlocked" in response && typeof response.resumeBlocked==="string"?response.resumeBlocked:null);
         }
         return true;
@@ -414,7 +496,7 @@ export function App() {
         setBusyAction(null);
       }
     },
-    [refreshDetail, refreshTopics, selectedTopicId],
+    [refreshDetail, refreshStageDelivery, refreshTopics, selectedTopicId],
   );
 
   const selected = detail?.topic.id === selectedTopicId ? detail.topic : null;
@@ -506,6 +588,7 @@ export function App() {
                 budgetPaused={Boolean(activity?.budget?.pause || activity?.revisionPaused || activity?.reviewPaused)}
                 autoRetryAt={activity?.autoRetryAt ?? null}
                 topic={selected}
+                routing={detail.routing}
                 busyAction={busyAction}
                 onSession={(role) => setDialog(role)}
                 onAction={(action, body) => void run(action, () => api.runAction(selected.id, action, body))}
@@ -550,6 +633,7 @@ export function App() {
               findings={findings}
               evidence={evidence}
               busyAction={busyAction}
+              closedStagePush={stageDelivery?.topicId === selected.id && stageDelivery.closedPush}
               onAction={(action, body) => void run(action, () => api.runAction(selected.id, action, body))}
               onDelivery={(action) => setDialog(action)}
             />
@@ -579,6 +663,7 @@ export function App() {
       {(dialog === "claude" || dialog === "codex") && selected && (
         <SessionDialog
           role={dialog}
+          route={seatRoute(detail?.routing, dialog)?.route ?? null}
           existing={participantFor(selected, dialog)}
           settings={selected.agentSettings[dialog]}
           canChangeSession={selected.state === "DRAFT"}
@@ -596,6 +681,10 @@ export function App() {
         <DeliveryDialog
           mode={dialog}
           availablePaths={detail?.changedPaths ?? []}
+          // 합류 병합을 준비했고 아직 확정 커밋이 없는 단계가 파일 차이 없이 전달 준비됐으면 경로 없이 계보 병합 커밋을 요청한다(2차 F001). 그 밖의 경로 없는
+          // 커밋(확정 뒤 포함)은 서버가 일반 커밋으로 거부한다.
+          lineageMerge={selected.state === "READY_TO_DELIVER" && stageDelivery?.topicId === selected.id && stageDelivery.pendingMerge
+            && (detail?.changedPaths.length ?? 0) === 0}
           busy={busyAction === dialog}
           onClose={() => setDialog(null)}
           onSubmit={(message, paths) =>
@@ -614,8 +703,10 @@ function RoomHeader({
   budgetPaused,
   onSession,
   onAction,
+  routing,
 }: {
   topic: Topic;
+  routing?: RoutingView;
   busyAction: string | null;
   // FAILED 상태에 예약된 사용 한도 자동 재시도 시각 — 있으면 '예약 취소'(stop) 를 제공한다.
   autoRetryAt: string | null;
@@ -641,12 +732,16 @@ function RoomHeader({
         <p>{topic.repositoryPath} · {topic.baseRef}</p>
       </div>
       <div className="room-actions">
-        <button className={`session-chip ${claude ? "connected" : ""}`} onClick={() => onSession("claude")}>
-          Claude {claude ? "연결됨" : "연결"} · <StageSettings topic={topic} role="claude" />
-        </button>
-        <button className={`session-chip ${codex ? "connected" : ""}`} onClick={() => onSession("codex")}>
-          Codex {codex ? "연결됨" : "연결"} · <StageSettings topic={topic} role="codex" />
-        </button>
+        {(["claude", "codex"] as const).map((seat) => {
+          const participant = seat === "claude" ? claude : codex;
+          const entry = seatRoute(routing, seat);
+          const provider = routing ? entry?.route?.provider : DEFAULT_SEAT_PROVIDER[seat];
+          return (
+            <button key={seat} className={`session-chip ${participant ? "connected" : ""}`} onClick={() => onSession(seat)}>
+              {SEAT_COPY[seat]} · {provider ? PROVIDER_COPY[provider] : "실행할 수 없는 배정"} {participant ? "연결됨" : "연결"} · <StageSettings topic={topic} role={seat} routing={routing} />
+            </button>
+          );
+        })}
         {canStop ? (
           <button className="danger-button" disabled={Boolean(busyAction)} onClick={() => onAction("stop")}>{pendingRetry ? "재시도 예약 취소" : "중단"}</button>
         ) : canRetry ? (
@@ -680,7 +775,7 @@ function Timeline({ events }: { events: TimelineEvent[] }) {
         <article className={`message message-${event.actor}`} key={event.id}>
           <div className="message-meta">
             <span className={`actor-dot actor-${event.actor}`} aria-hidden="true" />
-            <strong>{ACTOR_COPY[event.actor]}</strong>
+            <strong>{actorLabel(event)}</strong>
             <span>{event.kind === "agent_output" ? "작업 결과" : event.kind === "system" ? "진행 기록" : MESSAGE_COPY[event.kind]}</span>
             <time>{formatTime(event.createdAt)}</time>
           </div>
@@ -753,6 +848,7 @@ function Inspector({
   findings,
   evidence,
   busyAction,
+  closedStagePush,
   onAction,
   onDelivery,
 }: {
@@ -762,11 +858,12 @@ function Inspector({
   findings: Finding[];
   evidence: string[];
   busyAction: string | null;
+  // 닫힌 묶음 단계의 결과 커밋이 아직 push 되지 않았다(목록 뷰 판정) — CLOSED 토픽의 push 진입을 연다.
+  closedStagePush: boolean;
   onAction: (action: string, body?: Record<string, unknown>) => void;
   onDelivery: (action: "commit" | "push") => void;
 }) {
   const { topic } = detail;
-  const [recoveryOID, setRecoveryOID] = useState("");
   const claude = participantFor(topic, "claude");
   const codex = participantFor(topic, "codex");
   const bothAck = Boolean(
@@ -779,7 +876,9 @@ function Inspector({
   const canCommit = topic.state === "READY_TO_DELIVER";
   // 닫으면 되돌리기 경로가 영구히 막히므로, 남은 로컬 커밋을 처분하기 전에는 닫기를 열지 않는다.
   const canClose = canCommit && !detail.orphanCommitOID;
-  const canPush = topic.state === "READY_TO_DELIVER" && Boolean(topic.branchName);
+  // 닫힌 단계의 push 결과가 불명확하면(서버 재시작으로 요청만 unknown) 결과 확인 전에는 서버가 push 를 거부한다 — 진입도 막는다(2차 F002).
+  const closedPushRecovery = topic.state === "CLOSED" && detail.deliveryRecovery?.action === "push" ? detail.deliveryRecovery : null;
+  const canPush = (topic.state === "READY_TO_DELIVER" && Boolean(topic.branchName)) || (topic.state === "CLOSED" && closedStagePush && !detail.deliveryRecovery);
 
   return (
     <div className="inspector-scroll">
@@ -797,8 +896,8 @@ function Inspector({
           <code title={topic.planSHA256 ?? ""}>{shortHash(topic.planSHA256)}</code>
         </div>
         <div className="ack-grid">
-          <Ack role="Claude" participant={claude} planHash={topic.planSHA256} />
-          <Ack role="Codex" participant={codex} planHash={topic.planSHA256} />
+          <Ack role={seatSessionLabel(detail.routing, "claude")} participant={claude} planHash={topic.planSHA256} />
+          <Ack role={seatSessionLabel(detail.routing, "codex")} participant={codex} planHash={topic.planSHA256} />
         </div>
         {detail.currentPlan ? <pre className="plan-preview">{detail.currentPlan}</pre> : <p className="muted-copy">아직 작성된 계획이 없습니다.</p>}
         {detail.previousPlan && detail.currentPlan && (
@@ -853,16 +952,20 @@ function Inspector({
       {(detail.implementationReport || detail.codexReview) && (
         <section className="inspector-section">
           <div className="section-heading"><div><p className="eyebrow">REPORTS</p><h3>구현·검토 보고서</h3></div></div>
-          {detail.implementationReport && <details><summary>Claude 구현 보고</summary><pre className="plan-preview">{detail.implementationReport}</pre></details>}
-          {detail.codexReview && <details><summary>Codex 코드 검토</summary><pre className="plan-preview">{detail.codexReview}</pre></details>}
+          {detail.implementationReport && <details><summary>구현 보고</summary><pre className="plan-preview">{detail.implementationReport}</pre></details>}
+          {detail.codexReview && <details><summary>코드 검토 보고</summary><pre className="plan-preview">{detail.codexReview}</pre></details>}
         </section>
       )}
 
       <section className="inspector-section">
         <div className="section-heading"><div><p className="eyebrow">CONTEXT</p><h3>실행 정보</h3></div></div>
         <dl className="context-list">
-          <div><dt>Claude 세션</dt><dd>{claude?.sessionId ?? "연결 안 됨"}</dd></div>
-          <div><dt>Codex 세션</dt><dd>{codex?.sessionId ?? "연결 안 됨"}</dd></div>
+          {detail.routing ? <RoutingRows routing={detail.routing} /> : (
+            <>
+              <div><dt>작성자 좌석 세션</dt><dd>{claude?.sessionId ?? "연결 안 됨"}</dd></div>
+              <div><dt>검토자 좌석 세션</dt><dd>{codex?.sessionId ?? "연결 안 됨"}</dd></div>
+            </>
+          )}
           <div><dt>범위 세대</dt><dd>{topic.scopeGeneration}</dd></div>
           <div><dt>브랜치</dt><dd>{topic.branchName ?? "구현 승인 뒤 생성"}</dd></div>
           <div><dt>작업 디렉터리</dt><dd>{topic.worktreePath}</dd></div>
@@ -885,44 +988,18 @@ function Inspector({
           )}
           {topic.state === "USER_DECISION_REQUIRED" && topic.lastError?.includes("커밋 또는 push 도중") && (
             detail.deliveryRecovery ? (
-              <div className="recovery-panel">
-                <p>
-                  복구 대상: <strong>{detail.deliveryRecovery.action}</strong> · 요청 {detail.deliveryRecovery.idempotencyKey.slice(0, 10)}…
-                </p>
-                {detail.deliveryRecovery.requestedPaths.length > 0 && (
-                  <p>요청 파일: {detail.deliveryRecovery.requestedPaths.join(", ")}</p>
-                )}
-                <label>
-                  <span>성공했다고 확인할 Git OID</span>
-                  <input
-                    value={recoveryOID}
-                    onChange={(event) => setRecoveryOID(event.target.value.trim().toLowerCase())}
-                    placeholder="현재 커밋 OID 전체"
-                    spellCheck={false}
-                  />
-                </label>
-                <div className="button-row">
-                  <button
-                    className="secondary-button"
-                    disabled={Boolean(busyAction)}
-                    onClick={() => onAction("reconcile-delivery", {
-                      outcome: "failed",
-                      idempotencyKey: detail.deliveryRecovery!.idempotencyKey,
-                    })}
-                  >Git 작업이 실패함</button>
-                  <button
-                    className="primary-button"
-                    disabled={Boolean(busyAction) || !/^[a-f0-9]{40,64}$/.test(recoveryOID)}
-                    onClick={() => onAction("reconcile-delivery", {
-                      outcome: "succeeded",
-                      oid: recoveryOID,
-                      idempotencyKey: detail.deliveryRecovery!.idempotencyKey,
-                    })}
-                  >OID를 검증해 성공 확인</button>
-                </div>
-              </div>
+              <DeliveryRecoveryPanel recovery={detail.deliveryRecovery} busy={Boolean(busyAction)} onAction={onAction} />
             ) : <p>복구할 전달 요청을 찾지 못했습니다. 서버를 다시 열어 상태를 갱신해 주세요.</p>
           )}
+        </section>
+      )}
+
+      {/* 닫힌 묶음 단계의 push 도중 서버가 멈추면 요청만 결과 불명확으로 남고 CLOSED 는 그대로다(2차 F002) — 같은 결과 확인으로 복구한다. */}
+      {closedPushRecovery && (
+        <section className="gate-card gate-danger">
+          <strong>푸시 결과를 확인해야 합니다</strong>
+          <p>닫힌 단계의 push 도중 서버가 멈춰 결과를 알 수 없습니다. 원격 저장소를 확인해 결과를 기록하기 전에는 다시 push 할 수 없습니다.</p>
+          <DeliveryRecoveryPanel recovery={closedPushRecovery} busy={Boolean(busyAction)} onAction={onAction} />
         </section>
       )}
 
@@ -978,9 +1055,64 @@ function Ack({ role, participant, planHash }: { role: string; participant?: Part
   );
 }
 
+// 계획 확인 표의 좌석 이름 — 좌석 역할과, 그 좌석 세션을 실제로 만든 AI(바인딩)를 함께 쓴다.
+function seatSessionLabel(routing: RoutingView | undefined, seat: Seat): string {
+  const session = routing?.sessions.find((entry) => entry.seat === (seat === "claude" ? "author" : "plan-review"));
+  const provider = routing ? session?.binding?.provider : DEFAULT_SEAT_PROVIDER[seat];
+  return provider ? `${SEAT_COPY[seat]} · ${PROVIDER_COPY[provider]}` : SEAT_COPY[seat];
+}
+
+// 실행 정보 — 역할별 실제 경로(작업별 배정이 달라지면 작업마다), 실행 전 거부 사유, 네 좌석 세션과 그 세션을 만든 AI.
+function RoutingRows({ routing }: { routing: RoutingView }) {
+  const roles = ["planner", "implementer", "reviewer"] as const;
+  return (
+    <>
+      {roles.map((role) => {
+        const groups = new Map<string, { operations: string[]; entry: JobRouteView }>();
+        for (const entry of routing.jobs.filter((job) => job.role === role)) {
+          const key = `${routeCopy(entry)}\u0000${entry.refusal ?? ""}`;
+          const group = groups.get(key);
+          if (group) group.operations.push(entry.operation);
+          else groups.set(key, { operations: [entry.operation], entry });
+        }
+        const list = [...groups.values()];
+        return (
+          <div key={role}>
+            <dt>{ROLE_COPY[role]}</dt>
+            <dd>
+              {list.map(({ operations, entry }) => (
+                <span className="route-line" key={operations.join(",")}>
+                  {list.length > 1 ? `${operations.join("·")}: ` : ""}{routeCopy(entry)}
+                  {entry.refusal && <span className="route-refusal"> — 실행 불가: {entry.refusal}</span>}
+                </span>
+              ))}
+            </dd>
+          </div>
+        );
+      })}
+      {routing.sessions.map((session) => (
+        <div key={session.seat}>
+          <dt>{SESSION_SEAT_COPY[session.seat]}</dt>
+          <dd>{session.sessionId ?? "없음"}{session.binding ? ` · ${PROVIDER_COPY[session.binding.provider]}(${session.binding.participant}, ${basisCopy(session.binding.basis)})` : ""}</dd>
+        </div>
+      ))}
+    </>
+  );
+}
+
 // 지금 단계에 실제로 적용되는 모델·추론을 보여 준다. 구현 전용 오버라이드가 있을 때만 어느 쪽인지
 // 라벨을 붙인다 — 오버라이드가 없으면 모든 단계가 같은 설정이라 라벨이 잡음이다.
-function StageSettings({ topic, role }: { topic: Topic; role: "claude" | "codex" }) {
+function StageSettings({ topic, role, routing }: { topic: Topic; role: "claude" | "codex"; routing?: RoutingView }) {
+  // routing 이 있으면 서버가 그 좌석의 현재 작업에 실제로 적용하는 설정을 쓴다 — 배정이면 프로필 설정, 기본 배정이면 주제 설정(구현 작업이면 구현 전용
+  // 모델). 멈춘 상태의 재개 단계도 서버가 정한다(host-review F004: FAILED·재개 IMPLEMENTING 에서 계획 모델을 보였다). 아래의 상태 추정은 routing 이 없는
+  // 과거 응답에만 쓴다.
+  if (routing) {
+    const job = routing.current[role === "claude" ? "author" : "reviewer"];
+    const route = seatRoute(routing, role)?.route;
+    if (!route) return <span className="stage-settings">—</span>;
+    const label = route.basis.kind === "assignment" ? "배정 " : topic.agentSettings[role].implementation ? (job.role === "implementer" ? "구현 " : "계획 ") : "";
+    return <span className="stage-settings">{label}{route.settings.model} · {route.settings.effort}</span>;
+  }
   const settings = topic.agentSettings[role];
   const implementationStage = runsImplementationTurn(role, topic.state);
   const applied = appliedExecutionSettings(settings, implementationStage);
@@ -1008,7 +1140,7 @@ function CreateTopicDialog({ busy, repositoryPath, memoryDirectory, onClose, onS
   const [branchPrefix, setBranchPrefix] = useState("consensus");
   const [requestedBranchName, setRequestedBranchName] = useState("");
   return (
-    <Modal title="새 주제 만들기" description="한 주제에는 Claude 세션 하나와 Codex 세션 하나만 연결됩니다." onClose={onClose}>
+    <Modal title="새 주제 만들기" description="한 주제에는 작성자 좌석 세션 하나와 검토자 좌석 세션 하나가 연결됩니다. 각 역할을 실제로 실행하는 AI 는 역할 배정이 정합니다." onClose={onClose}>
       <form className="modal-form" onSubmit={(event) => { event.preventDefault(); onSubmit({ title, baseRef, branchPrefix, requestedBranchName: requestedBranchName.trim() || null , predecessorTopicId: null }); }}>
         <label><span>주제 이름</span><input autoFocus required minLength={2} maxLength={120} value={title} onChange={(event) => setTitle(event.target.value)} placeholder="예: 채팅 취소 처리 정리" /></label>
         <label><span>고정 저장소</span><output className="fixed-value">{repositoryPath}</output></label>
@@ -1034,6 +1166,7 @@ function CreateTopicDialog({ busy, repositoryPath, memoryDirectory, onClose, onS
 
 function SessionDialog({
   role,
+  route,
   existing,
   settings,
   canChangeSession,
@@ -1043,6 +1176,7 @@ function SessionDialog({
   onSettingsSubmit,
 }: {
   role: "claude" | "codex";
+  route: JobRouteView["route"];
   existing?: Participant;
   settings: AgentExecutionSettings;
   canChangeSession: boolean;
@@ -1060,9 +1194,13 @@ function SessionDialog({
   const [useImplementation, setUseImplementation] = useState(Boolean(settings.implementation));
   const [implementationModel, setImplementationModel] = useState(settings.implementation?.model ?? settings.model);
   const [implementationEffort, setImplementationEffort] = useState(settings.implementation?.effort ?? settings.effort);
-  const label = role === "claude" ? "Claude" : "Codex";
+  // 입력은 이 좌석의 기본 배정 공급자 설정(topic.agentSettings)이다 — 좌석이 배정 경로로 실행되면 그 사실을 알린다(E2c C3).
+  const label = PROVIDER_COPY[DEFAULT_SEAT_PROVIDER[role]];
+  const assignment = route && route.basis.kind === "assignment"
+    ? ` 지금 이 좌석은 ${basisCopy(route.basis)}(프로필 ${route.profileId ?? "없음"}, ${PROVIDER_COPY[route.provider]})으로 실행됩니다 — 아래 설정은 배정이 없을 때(기본 배정)의 ${label} 설정입니다.`
+    : "";
   return (
-    <Modal title={`${label} 세션과 실행 설정`} description="모델과 추론 강도를 바꿔도 세션 ID는 유지됩니다. 현재 호출은 그대로 끝나고 다음 호출부터 새 설정을 씁니다." onClose={onClose}>
+    <Modal title={`${SEAT_COPY[role]} 좌석 세션과 실행 설정`} description={`모델과 추론 강도를 바꿔도 세션 ID는 유지됩니다. 현재 호출은 그대로 끝나고 다음 호출부터 새 설정을 씁니다.${assignment}`} onClose={onClose}>
       <form
         className="modal-form"
         onSubmit={(event) => {
@@ -1121,16 +1259,70 @@ function SessionDialog({
   );
 }
 
+// 결과 불명확 전달 요청의 확인 — 원격·로컬 상태를 사람이 확인해 실패, 또는 성공한 Git OID 를 기록한다(서버가 OID 를 검증한다).
+function DeliveryRecoveryPanel({
+  recovery,
+  busy,
+  onAction,
+}: {
+  recovery: NonNullable<TopicDetail["deliveryRecovery"]>;
+  busy: boolean;
+  onAction: (action: string, body?: Record<string, unknown>) => void;
+}) {
+  const [recoveryOID, setRecoveryOID] = useState("");
+  return (
+    <div className="recovery-panel">
+      <p>
+        복구 대상: <strong>{recovery.action}</strong> · 요청 {recovery.idempotencyKey.slice(0, 10)}…
+      </p>
+      {recovery.requestedPaths.length > 0 && (
+        <p>요청 파일: {recovery.requestedPaths.join(", ")}</p>
+      )}
+      <label>
+        <span>성공했다고 확인할 Git OID</span>
+        <input
+          value={recoveryOID}
+          onChange={(event) => setRecoveryOID(event.target.value.trim().toLowerCase())}
+          placeholder="현재 커밋 OID 전체"
+          spellCheck={false}
+        />
+      </label>
+      <div className="button-row">
+        <button
+          className="secondary-button"
+          disabled={busy}
+          onClick={() => onAction("reconcile-delivery", {
+            outcome: "failed",
+            idempotencyKey: recovery.idempotencyKey,
+          })}
+        >Git 작업이 실패함</button>
+        <button
+          className="primary-button"
+          disabled={busy || !/^[a-f0-9]{40,64}$/.test(recoveryOID)}
+          onClick={() => onAction("reconcile-delivery", {
+            outcome: "succeeded",
+            oid: recoveryOID,
+            idempotencyKey: recovery.idempotencyKey,
+          })}
+        >OID를 검증해 성공 확인</button>
+      </div>
+    </div>
+  );
+}
+
 function DeliveryDialog({
   mode,
   busy,
   availablePaths,
+  lineageMerge = false,
   onClose,
   onSubmit,
 }: {
   mode: "commit" | "push";
   busy: boolean;
   availablePaths: string[];
+  // 합류 병합을 준비했고 아직 확정 커밋이 없는 단계가 파일 차이 없이 전달 준비됐다 — 경로 없이 계보 병합 커밋을 요청할 수 있다(2차 F001).
+  lineageMerge?: boolean;
   onClose: () => void;
   onSubmit: (message: string, paths: string[]) => void;
 }) {
@@ -1145,7 +1337,13 @@ function DeliveryDialog({
             <label><span>커밋 메시지</span><input autoFocus required value={message} onChange={(event) => setMessage(event.target.value)} /></label>
             <fieldset className="path-picker">
               <legend>커밋할 파일을 직접 고르세요.</legend>
-              {availablePaths.length === 0 ? <p className="muted-copy">현재 변경 파일이 없습니다.</p> : availablePaths.map((path) => (
+              {availablePaths.length === 0 ? (
+                <p className="muted-copy">
+                  {lineageMerge
+                    ? "파일 차이가 없습니다. 준비한 합류 대상을 부모로 잇는 병합 커밋을 경로 없이 요청합니다."
+                    : "현재 변경 파일이 없습니다."}
+                </p>
+              ) : availablePaths.map((path) => (
                 <label key={path}>
                   <input
                     type="checkbox"
@@ -1165,7 +1363,7 @@ function DeliveryDialog({
             <p>이 동작은 커밋을 새로 만들거나 파일을 추가하지 않습니다.</p>
           </div>
         )}
-        <div className="modal-actions"><button type="button" className="ghost-button" onClick={onClose}>취소</button><button className={mode === "push" ? "danger-button" : "primary-button"} disabled={busy || (mode === "commit" && (!message.trim() || paths.length === 0))}>{busy ? "실행 중…" : mode === "commit" ? "이 범위만 커밋" : "푸시 실행"}</button></div>
+        <div className="modal-actions"><button type="button" className="ghost-button" onClick={onClose}>취소</button><button className={mode === "push" ? "danger-button" : "primary-button"} disabled={busy || (mode === "commit" && (!message.trim() || (paths.length === 0 && !(lineageMerge && availablePaths.length === 0))))}>{busy ? "실행 중…" : mode === "commit" ? "이 범위만 커밋" : "푸시 실행"}</button></div>
       </form>
     </Modal>
   );

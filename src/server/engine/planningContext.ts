@@ -9,7 +9,8 @@ const cursorSchema = z.object({
 });
 
 // 커서는 모델 응답이 아닌, 검증된 산출물을 저장한 서버가 기록한다.
-export async function preparePlanningContext(core: EngineCore, topic: Topic, markdown: string, sha256: string) {
+export async function preparePlanningContext(core: EngineCore, topic: Topic, markdown: string, sha256: string,
+  timelineMode: "recent" | "all" = "recent") {
   const { database, artifacts, git } = core.dependencies;
   const sequence = core.latestSequence(topic.id);
   const current = await artifacts.verifiedRevision(topic.id, "plan", sha256);
@@ -41,9 +42,9 @@ export async function preparePlanningContext(core: EngineCore, topic: Topic, mar
   }
   return {
     text, mode, inputSequence: sequence, readablePaths: [...new Set(readablePaths)],
-    timeline: database.getPromptTimeline(topic.id, topic.scopeGeneration, since),
+    timeline: database.getPromptTimeline(topic.id, topic.scopeGeneration, since, timelineMode),
     // 변경분은 계산한 세션(sessionId)에서만 유효하다 — 과제가 다른 세션(교체·새 세션)으로 가면 이 전체 문맥으로 다시 만든다(host-review a7a9ce86 F-001).
-    full: mode === "delta" ? { text: markdown, timeline: database.getPromptTimeline(topic.id, topic.scopeGeneration, 0) } : null,
+    full: mode === "delta" ? { text: markdown, timeline: database.getPromptTimeline(topic.id, topic.scopeGeneration, 0, timelineMode) } : null,
     async accept(signal: AbortSignal, prompt: string) {
       core.assertCurrent(topic.id, signal, topic.scopeGeneration, topic.state);
       const now = database.getTopic(topic.id);

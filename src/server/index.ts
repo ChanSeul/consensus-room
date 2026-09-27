@@ -1,5 +1,4 @@
-import { ClaudeAdapter } from "./adapters/claude.js";
-import { CodexAdapter } from "./adapters/codex.js";
+import { createRuntimeAdapters } from "./runtime/providers.js";
 import { buildApp } from "./app.js";
 import { ConsensusDatabase } from "./database.js";
 import type { MemoryReaderOptions } from "./projectMemory.js";
@@ -16,22 +15,19 @@ const app = await buildApp({
   config,
   database,
   runner,
-  claude: new ClaudeAdapter(runner, config.memoryDirectory, {
-    memoryReaderOptions,
-    protectedWritePaths: [config.dataDirectory, config.memoryDirectory],
-    figmaMcpUrl: config.figmaMcpUrl,
-    skillsDirectories: config.claudeSkillDirectories,
-    managedPluginDirectory: join(config.dataDirectory, "claude-plugin"),
-    repositoryPath: config.repositoryPath,
-    onZeroTurnRetry: () => console.warn("[claude] 0턴 합성 결과(num_turns=0) — 같은 호출을 한 번 더 돌립니다"),
+  ...createRuntimeAdapters(runner, {
+    dataDirectory: config.dataDirectory,
+    memoryDirectory: config.memoryDirectory,
+    claude: {
+      memoryReaderOptions,
+      figmaMcpUrl: config.figmaMcpUrl,
+      skillsDirectories: config.claudeSkillDirectories,
+      repositoryPath: config.repositoryPath,
+      onZeroTurnRetry: () => console.warn("[claude] 0턴 합성 결과(num_turns=0) — 같은 호출을 한 번 더 돌립니다"),
+    },
+    codex: { memoryReaderOptions, skillsDirectories: config.codexSkillDirectories,
+      repositoryPath: config.repositoryPath, maxConcurrentTurns: config.codexConcurrency },
   }),
-  codex: new CodexAdapter(
-    runner,
-    join(config.dataDirectory, "agent-result.schema.json"),
-    undefined,
-    config.memoryDirectory,
-    { memoryReaderOptions, skillsDirectories: config.codexSkillDirectories, repositoryPath: config.repositoryPath, maxConcurrentTurns: config.codexConcurrency },
-  ),
 });
 
 await app.listen({ host: config.host, port: config.port });

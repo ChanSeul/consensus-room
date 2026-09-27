@@ -10,10 +10,10 @@ import { describe, expect, it } from "vitest";
 const ROOT = join(import.meta.dirname, "..");
 const RAW_PLAN_READ = /readLatest\([^)]*"plan"\)|verifiedPath\([^)]*"plan"\)|requireStoredPlan\(/g;
 
-// 허용 목록 — 계획 단계(초안·감사·ACK·계획 재개)는 방금 저장한 최신 계획이 곧 대상이다. core.ts 는 requireStoredPlan 정의(내부 readLatest) 한 곳.
+// 허용 목록 — 계획 단계(초안·ACK)는 방금 저장한 최신 계획이 곧 대상이다. core.ts 는 requireStoredPlan 정의(내부 readLatest) 한 곳.
 const ALLOWED: Record<string, number> = {
   "src/server/engine/core.ts": 2,      // requireStoredPlan 정의 + 그 안의 readLatest
-  "src/server/engine/planning.ts": 3,  // 이전 계획 문맥 · 계획 재개(storedPlanForResume) · ACK
+  "src/server/engine/planning.ts": 2,  // 이전 계획 문맥 · ACK — 계획 재개(storedPlanForResume)는 확정 sha 결속본을 읽는다(host-review 39d21df9 5차 F010)
   "src/server/app.ts": 1,              // 화면 표시용 현재 계획 — 현재 sha 결속본이 없을 때(계획 전)만 최신 저장본
 };
 

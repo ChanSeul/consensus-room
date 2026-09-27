@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { loadConfig } from "../src/server/config";
 import { isMissingSessionError } from "../src/server/engine/delivery";
-import { parseAgentResult } from "../src/server/adapters/resultParser";
+import { agentRunError, parseAgentResult } from "../src/server/adapters/resultParser";
 import { replanDirective } from "../src/shared/workflow";
 
 const temporaryDirectories: string[] = [];
@@ -55,8 +55,14 @@ describe("재계획 지시 판정(2026-09-07 'REPLAN 아님' 사고)", () => {
 });
 
 describe("구현 세션 유실 판정", () => {
-  it("CLI 의 'No conversation found with session ID' 만 유실로 본다", () => {
-    expect(isMissingSessionError(new Error("Claude 실행 실패(1): No conversation found with session ID: ff30"))).toBe(true);
+  // E3-3b: 문구가 아니라 어댑터가 관측으로 분류한 코드(session-missing — 모델 턴 없음 관측이 필요조건)로만 본다.
+  it("어댑터가 session-missing 으로 분류한 실패만 유실로 본다 — 같은 문구를 담은 일반 Error 는 유실이 아니다", () => {
+    const result = JSON.stringify({ type: "result", subtype: "error_during_execution", is_error: true, num_turns: 0, session_id: "ff30" });
+    expect(isMissingSessionError(agentRunError("claude", 1, "No conversation found with session ID: ff30\n", result))).toBe(true);
+    // 모델 턴이 있었던 실패(num_turns 3)는 관측 형태가 아니다 — unknown.
+    expect(isMissingSessionError(agentRunError("claude", 1, "No conversation found with session ID: ff30\n",
+      JSON.stringify({ type: "result", is_error: true, num_turns: 3 })))).toBe(false);
+    expect(isMissingSessionError(new Error("Claude 실행 실패(1): No conversation found with session ID: ff30"))).toBe(false);
     expect(isMissingSessionError(new Error("Claude 실행 실패(1): rate limited"))).toBe(false);
     expect(isMissingSessionError("문자열 오류")).toBe(false);
   });

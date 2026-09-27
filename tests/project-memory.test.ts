@@ -199,6 +199,82 @@ describe("Duse iOS 프로젝트 메모리 읽기", () => {
   });
 });
 
+// 계획 제어의 허용 색인(E3-5)이 읽는 목록 — 선택(select)이 고르지 않은 문서도 찾을 수 있어야 하므로 관련도·문서 수 한도 없이 링크 대상 전부를 돌려준다.
+// 역할·경로·용량·가림 규칙은 선택과 같다. 버전은 가린 본문의 해시라 계획 제어 조각의 hash 와 같은 값이다.
+describe("Duse iOS 프로젝트 메모리 허용 색인", () => {
+  function indexedRoot() {
+    const root = makeMemoryRoot();
+    const outside = mkdtempSync(join(tmpdir(), "consensus-room-memory-outside-"));
+    temporaryDirectories.push(outside);
+    const routerLine = "- 공용: [인증 계약](auth-rule.md), [라우터 자신](context-router.md)";
+    const groupedLine = "- 도구: [인증](auth-rule.md) · [무관 문서](unrelated.md) · [목록 자신](MEMORY.md)";
+    writeFileSync(join(root, "context-router.md"), document("context-router", "shared", [
+      "- 숏폼: [미디어 계약](shortform-media-contract.md)", routerLine,
+    ].join("\n")));
+    writeFileSync(join(root, "MEMORY.md"), document("project-memory-index", "shared", [
+      groupedLine,
+      "- 역할: [Claude 절차](claude-only/steps.md) · [Codex 절차](codex-only/steps.md)",
+      "- 제외: [없는 문서](missing.md) · [외부](linked.md) · [큰 문서](huge.md)",
+    ].join("\n")));
+    const authRaw = document("auth-rule", "shared", "검증용 token=do-not-send-this-value");
+    writeFileSync(join(root, "shortform-media-contract.md"), document("shortform-media-contract", "shared", "숏폼 카드 재생 계약"));
+    writeFileSync(join(root, "auth-rule.md"), authRaw);
+    writeFileSync(join(root, "unrelated.md"), document("unrelated", "shared", "관련 없는 기록"));
+    writeFileSync(join(root, "claude-only", "steps.md"), document("steps", "claude", "Claude 전용 절차"));
+    writeFileSync(join(root, "codex-only", "steps.md"), document("steps", "codex", "Codex 전용 절차"));
+    writeFileSync(join(outside, "linked.md"), document("linked", "shared", "외부 내용"));
+    symlinkSync(join(outside, "linked.md"), join(root, "linked.md"));
+    writeFileSync(join(root, "huge.md"), "x".repeat(80_001));
+    return { root, authRaw, routerLine, groupedLine };
+  }
+
+  it("이 역할이 읽을 수 있는 링크 대상 전부를 가린 본문의 버전·바이트·링크 문맥과 함께 돌려준다", async () => {
+    const { root, authRaw, routerLine } = indexedRoot();
+    const reader = new ProjectMemoryReader(root);
+
+    const codex = await reader.index("codex");
+    // 라우터 링크가 먼저, MEMORY.md 링크가 다음이다. 라우터·MEMORY.md 자신, 다른 역할 폴더, 없는 문서, 심볼릭 링크, 80KB 초과는 오르지 않는다.
+    expect(codex.map((entry) => entry.path)).toEqual(["shortform-media-contract.md", "auth-rule.md", "unrelated.md", "codex-only/steps.md"]);
+    expect((await reader.index("claude")).map((entry) => entry.path))
+      .toEqual(["shortform-media-contract.md", "auth-rule.md", "unrelated.md", "claude-only/steps.md"]);
+
+    const auth = codex.find((entry) => entry.path === "auth-rule.md")!;
+    expect(auth.content).toContain("token=[REDACTED]");
+    expect(auth.content).not.toContain("do-not-send-this-value");
+    expect(auth.redacted).toBe(true);
+    // 버전·바이트는 가린 본문 기준이다(원문 해시는 memoryUpdates 용 스냅숏 sha256 에만 쓴다).
+    expect(auth.version).toBe(sha256(auth.content));
+    expect(auth.version).not.toBe(sha256(authRaw));
+    expect(auth.bytes).toBe(Buffer.byteLength(auth.content, "utf8"));
+    // 두 곳에서 링크한 문서는 두 문맥을 모두 가진다. ` · `로 묶은 줄은 자기 조각만 문맥이다.
+    expect(auth.contexts).toEqual([routerLine, "- 도구: [인증](auth-rule.md)"]);
+    expect(codex.find((entry) => entry.path === "unrelated.md")!.contexts).toEqual(["- 도구: [무관 문서](unrelated.md)"]);
+    const unrelated = codex.find((entry) => entry.path === "unrelated.md")!;
+    expect(unrelated).toMatchObject({ redacted: false, version: sha256(unrelated.content) });
+  });
+
+  it("선택이 고르지 않은 문서도 목록에 올리고, 선택 결과는 바꾸지 않는다", async () => {
+    const { root } = indexedRoot();
+    const reader = new ProjectMemoryReader(root);
+    const before = await reader.selectWithDiagnostics("숏폼 재생", "codex");
+
+    const index = await reader.index("codex");
+
+    expect(before.snapshots.map((snapshot) => snapshot.path)).toEqual(["context-router.md", "shortform-media-contract.md"]);
+    expect(index.map((entry) => entry.path)).toContain("unrelated.md");
+    expect(await reader.selectWithDiagnostics("숏폼 재생", "codex")).toEqual(before);
+  });
+
+  it("라우터가 없으면 MEMORY.md 링크가 있어도 빈 목록이다", async () => {
+    const root = makeMemoryRoot();
+    writeFileSync(join(root, "MEMORY.md"), document("project-memory-index", "shared", "- [규칙](rule.md)"));
+    writeFileSync(join(root, "rule.md"), document("rule", "shared", "규칙"));
+
+    expect(await new ProjectMemoryReader(root).index("claude")).toEqual([]);
+    expect(await new ProjectMemoryReader(join(root, "missing")).index("claude")).toEqual([]);
+  });
+});
+
 describe("Duse iOS 프로젝트 메모리 쓰기", () => {
   it("공용 문서와 자기 역할 문서를 현재 해시가 맞을 때만 바꾼다", async () => {
     const root = makeMemoryRoot();

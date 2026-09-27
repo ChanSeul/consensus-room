@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import { PlanningPaused } from "../../shared/planningControl.js";
-import { toolTreeDirectories } from "../toolTree.js";
 import { readdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, symlink, unlink, writeFile } from "node:fs/promises";
@@ -18,9 +17,10 @@ import type { AgentAdapter, CommandRunner, CommandResult, CreatedSession, Sessio
 import { agentEnvironment } from "../security.js";
 import { ProjectMemoryReader, type MemoryReaderOptions } from "../projectMemory.js";
 import { readAppliedInstructions } from "../projectInstructions.js";
-import { describeCommandFailure, parsePlanRepair, parseAgentResult, isZeroTurnResult } from "./resultParser.js";
+import { agentRunError, parsePlanRepair, parseAgentResult, isZeroTurnResult } from "./resultParser.js";
 import { ExecutionMetrics } from "./executionMetrics.js";
 import { createToolTimeMeter } from "./toolTime.js";
+import { resolveSupportedTurn, runnerControlPaths } from "./turnPolicy.js";
 
 export interface ClaudeAdapterOptions {
   memoryReaderOptions?: MemoryReaderOptions;
@@ -82,6 +82,8 @@ export class ClaudeAdapter implements AgentAdapter {
   }
 
   async createSession(turn: Omit<SessionTurn, "sessionId">): Promise<CreatedSession> {
+    // 세션 id 를 알리기 전에 표현 가능 여부를 본다 — 거부될 턴의 세션 id 가 참여자·리뷰 세션에 저장되지 않게(E2b).
+    resolveSupportedTurn("claude", turn);
     const sessionId = randomUUID();
     turn.onSessionCreated?.(sessionId);
     return { sessionId, result: await this.invoke(turn, ["--session-id", sessionId], true) };
@@ -113,29 +115,54 @@ export class ClaudeAdapter implements AgentAdapter {
     return findFile(join(homedir(), ".claude", "projects"), `${sessionId}.jsonl`, 3);
   }
 
+  async isSessionMissing(sessionId: string): Promise<boolean> {
+    if (!isUUID(sessionId)) throw new Error("Cannot confirm session absence for an invalid session ID.");
+    const root = join(homedir(), ".claude", "projects");
+    const target = `${sessionId}.jsonl`;
+    const contains = async (directory: string, depth: number): Promise<boolean> => {
+      const entries = await readdir(directory, { withFileTypes: true }).catch(error => {
+        // 저장소 자체가 아직 없는 경우만 확인된 부재다. 열거한 하위 경로가 사라지면 조회 중 변경이므로 보존·정지한다.
+        if (directory === root && (error as NodeJS.ErrnoException).code === "ENOENT") return [];
+        throw error;
+      });
+      // 대화 이름이 있으면 내용의 유효성과 무관하게 보존한다. 손상·재개 가능 여부를 부재로 바꾸지 않는다.
+      if (entries.some(entry => entry.name === target)) return true;
+      for (const entry of entries) {
+        if (entry.isSymbolicLink()) throw new Error("Cannot confirm session absence through a symbolic link.");
+        if (entry.isDirectory()) {
+          if (depth === 0) throw new Error("Cannot confirm session absence beyond the session lookup depth.");
+          if (await contains(join(directory, entry.name), depth - 1)) return true;
+        }
+      }
+      return false;
+    };
+    return !await contains(root, 3);
+  }
+
   private async invokeOutput(
     turn: Omit<SessionTurn, "sessionId"> | SessionTurn,
     sessionArgs: string[],
     newSession: boolean,
     outputSchema: unknown = AgentResultJsonSchema,
   ): Promise<CommandResult> {
+    // 역할 정책(turnPolicy.ts)을 이 CLI 의 인자·설정으로 변환만 한다. 표현할 수 없는 정책은 조용히 바꾸지 않고 실행 전에 거부한다.
+    // 하위 에이전트 팬아웃은 Workflow 로만 낸다 — Task 는 중첩 증식을 막을 수 없어 열지 않는다(위 주석).
+    const { policy, protocolOnly, options: providerOptions } = resolveSupportedTurn("claude", turn);
     const workspace = resolve(turn.cwd);
     const actionTemp = await mkdtemp(join(tmpdir(), "consensus-room-claude-"));
     try {
-      const permissionMode = turn.implementation ? "dontAsk" : (turn.planMode ? "plan" : "dontAsk");
+      const permissionMode = policy.planMode ? "plan" : "dontAsk";
       const executionSettings = turn.settings ?? DEFAULT_AGENT_SETTINGS.claude;
-      const figmaMcpUrl = turn.implementation && turn.figmaReadEnabled && turn.onFigmaResult && !turn.protocolOnly && !turn.planningControl
-        ? this.options.figmaMcpUrl ?? null : null;
+      const figmaMcpUrl = policy.figma ? this.options.figmaMcpUrl ?? null : null;
       // 빈 객체 {}는 실 CLI가 "Invalid MCP configuration"으로 거부한다(실측). mcpServers 키는 항상 있어야 한다.
       const mcpConfig = {
         mcpServers: figmaMcpUrl ? { "figma-desktop": { type: "http", url: figmaMcpUrl } } : {},
       };
       // 웹은 도구로만 연다(WebSearch/WebFetch는 CLI 프로세스 소관). Bash의 네트워크는 sandbox가 계속 전면 차단한다.
       // Skill 도구가 목록에 없으면 관리형 플러그인 스킬이 로드돼도 쓸 수 없다(실측).
-      // 웹은 계획 턴에만 연다 — 외부 증거(1차 자료) 수집이 계획 수렴의 정당한 기능이라서다.
-      // 구현 턴은 코드 쓰기 접근과 웹이 결합해 유출 표면이 가장 커서 닫는다(2026-08-31 Codex 지적, 정책 c).
+      // 웹은 정책이 연 읽기 턴(policy.web)에만 연다 — 외부 증거(1차 자료) 수집이 계획 수렴의 정당한 기능이라서다.
+      // 쓰기 턴은 코드 쓰기 접근과 웹이 결합해 유출 표면이 가장 커서 정책이 닫는다(2026-08-31 Codex 지적, 정책 c).
       const baseTools = "Read,Glob,Grep,Bash,Skill";
-      const planningTools = turn.evidenceManaged ? baseTools : `${baseTools},WebSearch,WebFetch`;
       const { pluginDirectory, skillSourceDirectories } = await this.prepareManagedPlugin();
       const args = [
         "-p",
@@ -150,21 +177,29 @@ export class ClaudeAdapter implements AgentAdapter {
         "--strict-mcp-config",
         "--mcp-config", JSON.stringify(mcpConfig),
         "--setting-sources", "",
+        // 문맥 압축 창·쓰기 환경은 job 의 쓰기 접근으로, Workflow 허용·ultracode 는 정책의 팬아웃으로 정한다(E2c — 전에는 둘 다 쓰기 접근에 묶여
+        // 검토자 읽기 턴의 팬아웃을 낼 수 없었다).
         "--settings", JSON.stringify(buildIsolationSettings(
-          workspace, actionTemp, Boolean(turn.implementation),
+          workspace, actionTemp, policy.access === "write",
           {
+            fanout: policy.fanout,
             protectedWritePaths: this.options.protectedWritePaths,
             figmaMcpEnabled: Boolean(figmaMcpUrl),
             skillSourceDirectories,
             readablePaths: turn.readablePaths,
+            ultracode: providerOptions.ultracode,
           },
         )),
-        // 구현 턴만 Workflow를 연다. 계획 턴은 읽기 전용 계약이라 에이전트 팬아웃을 열지 않는다.
-        // Workflow 하위 에이전트는 부모의 --tools 상한을 물려받는다(실측: Read만 준 부모의 에이전트가 Read만 받음).
-        // 프로토콜 확인 턴은 도구를 전부 닫는다 — 판단에 필요한 값은 프롬프트가 이미 다 담고 있다.
-        "--tools", turn.protocolOnly || turn.planningControl
-          ? ""
-          : turn.implementation ? `${baseTools},Edit,Write,Workflow` : planningTools,
+        // 도구 목록은 정책 값으로 조립한다: 쓰기 도구 상한이면 Edit·Write, 웹이면 WebSearch·WebFetch, 팬아웃이면 Workflow. 정책은 쓰기 턴과 검토자의
+        // 읽기 턴에서 팬아웃을 열고 계획자의 읽기 턴에서 닫는다. Workflow 하위 에이전트는 부모의 --tools 상한을 물려받는다(실측: Read만 준 부모의
+        // 에이전트가 Read만 받음) — 읽기 턴의 하위 에이전트도 쓰기 도구가 없고 sandbox 가 작업 폴더 쓰기를 막는다.
+        // 프로토콜 확인 턴은 정책이 도구를 전부 닫는다(policy.tools "none", 계획 제어 턴도 같다) — 판단에 필요한 값은 프롬프트가 이미 다 담고 있다.
+        "--tools", policy.tools === "none" ? "" : [
+          baseTools,
+          ...(policy.tools === "write" ? ["Edit", "Write"] : []),
+          ...(policy.web ? ["WebSearch", "WebFetch"] : []),
+          ...(policy.fanout ? ["Workflow"] : []),
+        ].join(","),
         ...(pluginDirectory ? ["--plugin-dir", pluginDirectory] : []),
         "--permission-mode", permissionMode,
         "--output-format", "stream-json",
@@ -175,7 +210,7 @@ export class ClaudeAdapter implements AgentAdapter {
       ];
       // 프로토콜 확인 턴은 판단에 필요한 값을 프롬프트가 다 담고 있어 지시문(CLAUDE.md)도 싣지 않는다
       // (2026-09-07 Codex 자기 최적화 제안 ②: ACK 턴마다 전역·프로젝트 지시문 블록을 재전송하던 낭비).
-      const { blocks: instructions } = turn.protocolOnly || (!newSession && turn.planningControl?.instructionsInSession)
+      const { blocks: instructions } = protocolOnly || (!newSession && turn.planningControl?.instructionsInSession)
         ? { blocks: [] as string[] }
         : await readAppliedInstructions({
           strict: Boolean(turn.planningControl),
@@ -186,10 +221,12 @@ export class ClaudeAdapter implements AgentAdapter {
       // 기억하고 있고, 매 턴 다시 붙이면 턴당 ~20K자가 중복 과금된다(2026-08-30 실측: 55자 프롬프트가
       // 20,735자로 불어남). protocolOnly 턴은 판단에 메모리가 필요 없어 새 세션이어도 주입하지 않는다.
       // 트레이드오프: 주제 진행 중 메모리 문서가 갱신돼도 기존 세션은 예전 내용을 기억한다.
-      const injectMemory = Boolean(this.memory) && newSession && !turn.protocolOnly && !turn.planningControl;
+      // 예외 하나(E3-4c F004): 프로토콜 턴이 만든 세션은 생성 턴에 본문을 받지 않았다 — 엔진이 그 세션의 첫 일반 resume 에 memoryBodies 를 실으면 그 resume 에
+      // 한 번 싣는다(매니페스트 없이). 그 뒤 resume 은 다시 매니페스트만이다.
+      const injectMemory = Boolean(this.memory) && !protocolOnly && !turn.planningControl && (newSession || turn.memoryBodies === true);
       const enriched = injectMemory
         ? await this.memory!.buildPrompt(turn.prompt, this.role)
-        : turn.planningControl ? turn.prompt : await this.withMemoryManifest(turn);
+        : turn.planningControl ? turn.prompt : await this.withMemoryManifest(turn, protocolOnly);
       const stdin = [EXECUTION_POLICY_NOTE, ...instructions, enriched].join("\n\n");
       if (turn.planningControl && Buffer.byteLength(stdin) > turn.planningControl.maxPromptBytes) {
         throw new PlanningPaused("Final planning input including mandatory instructions exceeds its byte limit.");
@@ -268,7 +305,7 @@ export class ClaudeAdapter implements AgentAdapter {
       for (const value of output.jsonLines) { metrics.observe(value); observeDesign(value); }
       recordFinal();
       if (output.exitCode !== 0) {
-        throw new Error(describeCommandFailure("Claude", output.exitCode, output.stderr, output.stdout));
+        throw agentRunError("claude", output.exitCode, output.stderr, output.stdout);
       }
       if (designCaptureError) throw designCaptureError;
       if ([...designCalls.values()].some(call => !call.received)) {
@@ -288,11 +325,12 @@ export class ClaudeAdapter implements AgentAdapter {
   }
 
 
-  // resume·fork 턴에는 본문 대신 매니페스트만 덧붙인다. protocolOnly 턴은 메모리 자체가 필요 없다.
+  // resume·fork 턴에는 본문 대신 매니페스트만 덧붙인다. protocolOnly 턴(resolveTurn 이 job 에서 유도한 값)은 메모리 자체가 필요 없다.
   private async withMemoryManifest(
     turn: Omit<SessionTurn, "sessionId"> | SessionTurn,
+    protocolOnly: boolean,
   ): Promise<string> {
-    if (!this.memory || turn.protocolOnly) return turn.prompt;
+    if (!this.memory || protocolOnly) return turn.prompt;
     const manifest = await this.memory.buildManifest(turn.prompt, this.role);
     return manifest ? `${turn.prompt}\n\n${manifest}` : turn.prompt;
   }
@@ -390,6 +428,10 @@ export function buildIsolationSettings(
     skillSourceDirectories?: readonly string[];
     // 턴 단위 추가 읽기 허용(주제 plan.md 등). 쓰기는 열지 않는다 — denyWrite(dataDirectory carve-out)가 그대로 막는다.
     readablePaths?: readonly string[];
+    // 프로필 옵션 ultracode(E2c, shared/roles.ts PROVIDER_OPTION_SCHEMAS) — false 면 팬아웃을 연 턴에서도 켜지 않는다. 없으면 켠다(E2c 이전 동작).
+    ultracode?: boolean;
+    // 정책의 하위 에이전트 팬아웃(E2c) — Workflow 허용과 ultracode 를 정한다. 없으면 쓰기 접근(implementation)과 같다(E2c 이전: 쓰기 턴에서만 팬아웃).
+    fanout?: boolean;
   } = {},
 ): Record<string, unknown> {
   const home = homedir();
@@ -400,9 +442,11 @@ export function buildIsolationSettings(
   // 구현 턴은 워크트리를 고쳐야 한다. 보호 경로가 워크트리를 품고 있으면(dataDirectory가 그렇다) 그대로
   // deny할 수 없다 — permissions 층에서도 deny가 allow를 이겨 Edit은 경로 deny로, Write는 dontAsk 기본
   // 거부로 막힌다(2026-08-30 실측). sandbox와 같은 carve-out을 여기에도 적용한다.
+  // 러너 제어 경로(지시문·실행 설정·단계 도구 트리)는 두 어댑터가 같은 목록을 쓴다(turnPolicy.runnerControlPaths, E2c) — 아직 없는 경로의 생성도 막는다.
   const deniedEditPaths = implementation
-    ? [...protectedGitPaths, ...protectedRulePaths.flatMap((path) => carveOutWorkspace(path, workspace)), ...toolTreeDirectories(workspace)]
+    ? [...protectedGitPaths, ...protectedRulePaths.flatMap((path) => carveOutWorkspace(path, workspace)), ...runnerControlPaths(workspace)]
     : [...protectedGitPaths, ...protectedRulePaths];
+  const fanout = options.fanout ?? implementation;
   const editRules = ["Edit", "Write"].flatMap((tool) =>
     deniedEditPaths.flatMap((path) => [
       `${tool}(${permissionPath(path)})`,
@@ -425,8 +469,9 @@ export function buildIsolationSettings(
     autoCompactWindow: implementation ? RUNNER_AUTO_COMPACT_WINDOW.implementation : RUNNER_AUTO_COMPACT_WINDOW.planning,
     // ultracode는 effort 값이 아니라 session-start 설정 키다. `--effort ultracode`는 CLI가 경고만 찍고
     // 조용히 기본 effort로 떨어뜨린다(실측: "Valid values: low, medium, high, xhigh, max").
-    // 구현 턴에서만 켠다 — 계획 턴은 Workflow를 열지 않아 켜 봐야 동작할 도구가 없다.
-    ...(implementation ? { ultracode: true } : {}),
+    // 팬아웃을 연 턴(쓰기 턴·검토자 읽기 턴)에서만 켠다 — 계획자 턴은 Workflow를 열지 않아 켜 봐야 동작할 도구가 없다. 프로필이 ultracode:false 를
+    // 지정하면 켜지 않는다(사용자가 지정한 값을 보존한다 — plan §2.3). Workflow 도구 자체는 정책(팬아웃)대로 남는다.
+    ...(fanout && options.ultracode !== false ? { ultracode: true } : {}),
     permissions: {
       allow: [
         `Read(${permissionPath(workspace)}/**)`,
@@ -440,8 +485,8 @@ export function buildIsolationSettings(
         // 계획 턴에만 명시로 연다(정책 c — 구현 턴은 --tools에서도 빠져 이중으로 닫힌다).
         ...(implementation ? [] : ["WebSearch", "WebFetch"]),
         "Skill",
-        // 도구 목록에 Workflow가 있어도 allow 규칙이 없으면 dontAsk가 거부한다(실측: 계획 없이 열었을 때 차단됨).
-        ...(implementation ? ["Workflow"] : []),
+        // 도구 목록에 Workflow가 있어도 allow 규칙이 없으면 dontAsk가 거부한다(실측: 계획 없이 열었을 때 차단됨). 팬아웃을 연 턴에서만 둔다.
+        ...(fanout ? ["Workflow"] : []),
         ...figmaRules.allow,
       ],
       deny: [...editRules, ...figmaRules.deny, `Read(${permissionPath(credentialPath)})`],
@@ -485,8 +530,9 @@ export function buildIsolationSettings(
         // allowWrite를 이기기 때문이다. 그렇다고 통째로 빼면 원장 DB·다른 주제 worktree·codex-home까지
         // 열린다. 그래서 worktree로 가는 길만 열고 형제 항목은 그대로 막는다(carveOutWorkspace).
         // 단계 도구 트리(DerivedData/*-logs/{scripts,…})는 구현 턴에서도 쓰기 거부 — "러너는 앱 코드만" 이 권한이 된다(Codex 감사 R02).
+        // 러너 제어 경로(지시문·실행 설정)도 쓰기 거부 — 아직 없는 파일·디렉터리의 생성까지 막는다(E2c, F002 계열).
         denyWrite: implementation
-          ? [...protectedGitPaths, ...protectedRulePaths.flatMap((path) => carveOutWorkspace(path, workspace)), ...toolTreeDirectories(workspace)]
+          ? [...protectedGitPaths, ...protectedRulePaths.flatMap((path) => carveOutWorkspace(path, workspace)), ...runnerControlPaths(workspace)]
           : [workspace, ...protectedGitPaths, ...protectedRulePaths],
         denyRead: [home, credentialPath],
         allowRead: [

@@ -25,7 +25,9 @@
 }
 ```
 
-`provider`는 `claude` 또는 `codex`, `role`은 `runner`, `mediator`, `pre-audit`, `host-review`, `work-admission`이다.
+`provider`는 `claude` 또는 `codex`, `role`은 `runner`, `mediator`, `pre-audit`, `host-review`, `work-admission`, `repair`이다.
+자동 수정 인계(`repair`)는 `reviewJobs`로 토픽을 연결한다. 원본 세션은 요청 사용량으로 집계하고, 회차 원장은
+별도 실행 관측으로만 남겨 토큰 합계에 다시 더하지 않는다.
 `sources`의 `topic`은 선택 사항이다. 생략하면 Codex cwd로 연결 가능한 경우만 연결하고 나머지는 공통·미배정으로 남긴다.
 여러 작업이 섞인 세션을 시간만으로 한 단계에 몰아넣지 않는다. 단일 worktree 아래 기록도 다른 목적으로 실행했다면
 mapping에서 정확한 파일의 역할을 먼저 지정한다. 원본 메시지나 도구 결과 본문은 보고서에 넣지 않는다.

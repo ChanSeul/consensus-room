@@ -3,6 +3,9 @@ import type { DiagnosisPrompt } from "./diagnoses";
 import type { AgentResult, DeferredFinding, Finding, ImplementationNote, TimelineEvent } from "./contracts";
 import type { TolerancePolicy } from "./tolerance";
 import { DISPOSITIONS, FIX_AWARE_KINDS, REQUIRED_PLAN_HEADINGS } from "./contracts";
+import { TIMELINE_DELIVERY_LIMITS, TIMELINE_REFERENCE_UNIT, TIMELINE_REFERENCE_VERSION, TIMELINE_REQUIRED_KINDS,
+  type TimelineDeliveryPlan, type TimelineIndexReference, type TimelineReference } from "./planningControl";
+import { sha256 } from "./workflow";
 
 // 서버는 처분을 두 곳에서 기계적으로 검사한다 — assertDispositionsResolved(앞 단계 쟁점에 처분이 있는지)와
 // assertFixDispositionAllowed(RESOLVED_BY_FIX는 실제 수정이 일어난 단계에서만). 그 규칙이 프롬프트에 없으면
@@ -70,14 +73,36 @@ export function renderImplementationNotes(notes: readonly ImplementationNote[] |
     : `\n**개정 없이 넘어온 경미 지적(구현 노트)** — 구현 중 전부 처리하고 반환 findings 에 id 별 처분을 적으세요(고쳤으면 RESOLVED_BY_FIX + evidenceRefs, 근거 있는 미조치는 AGREED_NO_ACTION/DEFERRED_OUT_OF_SCOPE + 근거; 빠뜨리면 서버가 재제출을 요구합니다):\n${lines}\n`;
 }
 
-function renderDeferredFindings(findings: readonly DeferredFinding[] | undefined, stage: "plan" | "audit"): string {
+// 이연 쟁점 목록의 인라인 예산(E4 2차 보완 F012) — 이 목록은 계획·감사의 필수 과제 패킷(계획 64KB·감사 96KB)에 실리므로 크기를 정해 둔다. 근거는 자르지
+// 않는다: 전체(근거 전문)가 예산 안이면 전문을 싣고, 넘으면 예산 안까지의 색인(ID·심각도·제목·출처·토픽)과 남은 건수를 싣고 근거 전문은 엔진이 쓴 원문
+// 산출물을 참조로 읽게 한다(계획 제어 턴은 kind=artifact 문서, 그 밖의 턴은 같은 경로 파일). 모든 항목은 전문·색인·남은 건수 중 하나로 드러난다 —
+// 조용히 빼는 항목이 없다. 산출물 경로가 없으면(엔진이 산출물을 쓰지 않는 직접 호출) 참조할 곳이 없으므로 예산과 무관하게 전문을 모두 싣는다.
+export const DEFERRED_FINDINGS_INLINE_BYTES = 8 * 1024;
+
+function renderDeferredFindings(findings: readonly DeferredFinding[] | undefined, stage: "plan" | "audit", sourcePath?: string): string {
   if (!findings || findings.length === 0) return "";
-  const lines = findings
-    .map((item) => `- ${item.id} [${item.severity}] ${item.title} (${item.source}, ${item.topicId.slice(0, 8)}): ${item.rationale.slice(0, 400)}`)
-    .join("\n");
+  const head = (item: DeferredFinding) => `- ${item.id} [${item.severity}] ${item.title} (${item.source}, ${item.topicId.slice(0, 8)})`;
+  const full = findings.map((item) => `${head(item)}: ${item.rationale}`).join("\n");
+  let body = full;
+  if (sourcePath && Buffer.byteLength(full) > DEFERRED_FINDINGS_INLINE_BYTES) {
+    const index: string[] = [];
+    let used = 0;
+    for (const item of findings) {
+      const bytes = Buffer.byteLength(head(item)) + 1;
+      if (used + bytes > DEFERRED_FINDINGS_INLINE_BYTES) break;
+      index.push(head(item));
+      used += bytes;
+    }
+    const rest = findings.length - index.length;
+    body = [
+      ...index,
+      ...(rest ? [`- … 외 ${rest}건(인라인 예산을 넘어 색인을 생략했습니다 — 원문 산출물에 모두 있습니다)`] : []),
+      `근거 전문 ${findings.length}건은 원문 산출물에 있습니다: kind=artifact selector=${sourcePath} 를 offset 0 부터 읽고, 돌려받은 nextOffset 을 따라 null 이 될 때까지 이어 읽으세요. 계획 제어가 없는 턴이면 같은 경로의 파일(${sourcePath})을 직접 읽으세요.`,
+    ].join("\n");
+  }
   return stage === "plan"
-    ? `\n이전 계획·선행 토픽에서 **이연된 쟁점**(이번 범위에서 다시 판단하세요 — 넣으면 계획에 반영하고, 아니면 계획의 범위 밖 절에 이유와 함께 적으세요):\n${lines}\n`
-    : `\n이미 이연 판정을 받은 쟁점(이번 범위에서 다시 판단하되, 같은 근거로 재지적하지 말고 계획이 이를 어떻게 다뤘는지만 확인하세요):\n${lines}\n`;
+    ? `\n이전 계획·선행 토픽에서 **이연된 쟁점**(이번 범위에서 다시 판단하세요 — 넣으면 계획에 반영하고, 아니면 계획의 범위 밖 절에 이유와 함께 적으세요):\n${body}\n`
+    : `\n이미 이연 판정을 받은 쟁점(이번 범위에서 다시 판단하되, 같은 근거로 재지적하지 말고 계획이 이를 어떻게 다뤘는지만 확인하세요):\n${body}\n`;
 }
 
 function renderFindingIndex(findings: readonly Finding[]): string {
@@ -87,25 +112,194 @@ function renderFindingIndex(findings: readonly Finding[]): string {
 }
 
 function renderTimeline(events: readonly TimelineEvent[], includeAllNotes = false, emptyText = "(아직 메시지가 없습니다.)"): string {
-  if (events.length === 0) return emptyText;
+  return renderTimelineManifest(events, includeAllNotes, emptyText).text;
+}
+
+// 기존 렌더의 선택·절단(비중요 최근 80개, 이벤트당 20,000자, 전체 뒤쪽 240,000자)을 그대로 하면서, 결과에 **온전히** 남은 이벤트 순번(whole)을
+// 같은 계산에서 함께 돌려준다(E3-2-2b host-review 55f3795 F002). 온전한 이벤트의 표시는 참조 문서 원문(timelineEventText)과 같다. 엔진은 이 목록으로만
+// 읽기 전용 확인 턴이 실제로 전달한 필수 이벤트를 인정한다 — 문자열 포함 여부로 추정하거나 절단을 따로 계산하지 않는다.
+function renderTimelineManifest(events: readonly TimelineEvent[], includeAllNotes = false, emptyText = "(아직 메시지가 없습니다.)"): { text: string; whole: number[] } {
+  if (events.length === 0) return { text: emptyText, whole: [] };
   const important = events.filter((event) => ["scope_change", "evidence", "decision"].includes(event.kind) ||
     (includeAllNotes && event.kind === "note"));
   const recent = events.slice(-80);
   const selected = [...new Map([...important, ...recent].map((event) => [event.id, event])).values()]
     .sort((left, right) => left.sequence - right.sequence);
-  const rendered = selected
+  const parts = selected
     .map((event) => {
       // agent_output의 payload(findings 배열)는 싣지 않는다. 그 데이터는 각 단계 프롬프트가 이미 명시적으로
       // 전달하므로(개정=감사 JSON, 종결=개정 findings) 타임라인 경유는 순수 중복이다 — 2026-08-30 실측:
       // 세대3 타임라인 렌더 77K자 중 57K자가 이 중복이었고, 타임라인을 싣는 모든 턴에 반복 과금됐다.
       const includePayload = event.kind !== "agent_output" && Object.keys(event.payload).length > 0;
       const payload = includePayload ? `\n메타데이터: ${JSON.stringify(event.payload)}` : "";
-      return `[${event.sequence}] ${event.actor}/${event.kind}\n${event.body.slice(0, 20_000)}${payload.slice(0, 20_000)}`;
-    })
-    .join("\n\n");
-  return rendered.length <= 240_000
-    ? rendered
-    : `[앞부분 생략: 입력 한도를 넘었습니다.]\n\n${rendered.slice(-240_000)}`;
+      const body = event.body.slice(0, 20_000);
+      const meta = payload.slice(0, 20_000);
+      return { sequence: event.sequence, text: `[${event.sequence}] ${event.actor}/${event.kind}\n${body}${meta}`,
+        intact: body.length === event.body.length && meta.length === payload.length };
+    });
+  const rendered = parts.map((part) => part.text).join("\n\n");
+  // 뒤쪽 240,000자만 남기면 시작 위치가 잘린 길이 이후인 이벤트만 온전하다(구분자 "\n\n" 포함 같은 단위로 센다).
+  const dropped = Math.max(0, rendered.length - 240_000);
+  const whole: number[] = [];
+  let start = 0;
+  for (const part of parts) {
+    if (part.intact && start >= dropped) whole.push(part.sequence);
+    start += part.text.length + 2;
+  }
+  return {
+    text: dropped === 0 ? rendered : `[앞부분 생략: 입력 한도를 넘었습니다.]\n\n${rendered.slice(-240_000)}`,
+    whole,
+  };
+}
+
+// 타임라인 참조 descriptor 만들기(E3-2-2a) — 형식·단위는 planningControl.ts. 계획 제어 래퍼는 같은 함수로 불변 행에서 문서를 다시 만들어 해시를 대조한다.
+// (웹 화면도 읽는 contracts → planningControl 에 node:crypto 를 들이지 않도록 서버 쪽 공용 모듈인 여기에 둔다.)
+type TimelineSource = Pick<TimelineEvent, "sequence" | "actor" | "kind" | "body" | "payload">;
+// 한 이벤트의 표시·문서 원문(renderTimeline 과 같은 모양이되 자르지 않는다). agent_output 의 payload 는 각 단계 프롬프트가 따로 싣는 중복이라 뺀다.
+export function timelineEventText(event: TimelineSource): string {
+  const includePayload = event.kind !== "agent_output" && Object.keys(event.payload).length > 0;
+  return `[${event.sequence}] ${event.actor}/${event.kind}\n${event.body}${includePayload ? `\n메타데이터: ${JSON.stringify(event.payload)}` : ""}`;
+}
+export function timelineReference(event: TimelineSource): TimelineReference {
+  const text = timelineEventText(event);
+  const hash = sha256(text);
+  return { seq: event.sequence, hash, bytes: Buffer.byteLength(text), required: TIMELINE_REQUIRED_KINDS.has(event.kind),
+    unit: TIMELINE_REFERENCE_UNIT, version: TIMELINE_REFERENCE_VERSION, selector: `timeline:${event.sequence}@${hash}` };
+}
+export function timelineIndexText(references: readonly TimelineReference[]): string {
+  return references.map(reference => JSON.stringify(reference)).join("\n");
+}
+export function timelineIndexReference(references: readonly TimelineReference[]): TimelineIndexReference {
+  const text = timelineIndexText(references);
+  const hash = sha256(text);
+  return { selector: `timeline-index@${hash}`, hash, bytes: Buffer.byteLength(text), count: references.length,
+    required: references.filter(reference => reference.required).length };
+}
+// 받은 이벤트 전부를 인라인 원문이나 참조로 나눈다(조용한 절단·제외 없음). 필수 이벤트가 인라인 예산을 먼저 쓰고, 통째로 들지 않는 이벤트는 참조가 된다.
+export function planTimelineDelivery(events: readonly TimelineSource[], limits: { inlineBytes: number; referenceBytes: number } = TIMELINE_DELIVERY_LIMITS): TimelineDeliveryPlan {
+  const ordered = [...events].sort((left, right) => left.sequence - right.sequence);
+  const required = ordered.filter(event => TIMELINE_REQUIRED_KINDS.has(event.kind));
+  const others = ordered.filter(event => !TIMELINE_REQUIRED_KINDS.has(event.kind));
+  const inline: number[] = [];
+  const references: TimelineReference[] = [];
+  let remaining = limits.inlineBytes;
+  for (const event of [...required, ...others]) {
+    const bytes = Buffer.byteLength(timelineEventText(event)) + 2;
+    if (bytes <= remaining) {
+      inline.push(event.sequence);
+      remaining -= bytes;
+    } else references.push(timelineReference(event));
+  }
+  inline.sort((left, right) => left - right);
+  references.sort((left, right) => left.seq - right.seq);
+  const index = references.length && Buffer.byteLength(JSON.stringify(references)) > limits.referenceBytes
+    ? timelineIndexReference(references) : null;
+  return { inline, references, index };
+}
+
+// 참조 모드 표시(E3-2-2a) — 엔진이 계획 제어·세션 유지 턴에만 descriptor 를 넘긴다. 인라인 이벤트는 자르지 않고, 나머지는 버전 고정 참조 줄(또는 색인
+// 한 줄)로 싣는다. 표시는 descriptor 를 따를 뿐이고 읽기 권한의 정본은 descriptor 다. 받은 이벤트가 인라인·참조 어디에도 없으면 조용히 빼지 않고 실패한다.
+function renderTimelineDelivery(events: readonly TimelineEvent[], plan: TimelineDeliveryPlan, emptyText: string): string {
+  if (events.length === 0) return emptyText;
+  const inline = new Set(plan.inline);
+  const references = new Map(plan.references.map((reference) => [reference.seq, reference]));
+  const lines: string[] = [];
+  for (const event of [...events].sort((left, right) => left.sequence - right.sequence)) {
+    const reference = references.get(event.sequence);
+    if (inline.has(event.sequence)) lines.push(timelineEventText(event));
+    else if (!reference) throw new Error(`타임라인 전달 계획에 이벤트 ${event.sequence} 가 없습니다.`);
+    else if (!plan.index) {
+      lines.push(`[${event.sequence}] ${event.actor}/${event.kind} — [참조${reference.required ? "·필수" : ""}] kind=context selector=${reference.selector} (${reference.bytes} bytes, ${reference.unit} v${reference.version})`);
+    }
+  }
+  if (!plan.references.length) return lines.join("\n\n");
+  const required = plan.references.filter((reference) => reference.required).length;
+  const guide = [
+    `[참조 안내] 이벤트 ${plan.references.length}개(필수 ${required}개)는 크거나 많아 원문 대신 버전 고정 참조로 실었습니다.`,
+    "계획 제어 읽기(kind=context, selector 그대로)로 offset 0 부터 돌려받은 nextOffset 을 따라 nextOffset 이 null 이 될 때까지 읽으세요.",
+    "필수(결정·범위 변경) 참조를 끝까지 읽기 전에는 complete=true 를 낼 수 없습니다.",
+    ...(plan.index ? [`참조 목록은 색인 kind=context selector=${plan.index.selector} (${plan.index.bytes} bytes, 한 줄에 참조 하나)에 있습니다. 색인을 끝까지 읽고 각 참조를 읽으세요.`] : []),
+  ].join("\n");
+  return [guide, ...lines].join("\n\n");
+}
+
+function renderPlanningTimeline(events: readonly TimelineEvent[], delivery: TimelineDeliveryPlan | undefined, emptyText = "(아직 메시지가 없습니다.)"): string {
+  return delivery ? renderTimelineDelivery(events, delivery, emptyText) : renderTimeline(events, false, emptyText);
+}
+
+// 구현·수정·코드 리뷰 턴의 타임라인 쪽(E3-2-2b). 러너 CLI 의 파일 읽기는 호스트가 바이트 구간으로 확인할 수 없어(Claude stream Read 는 줄 단위·잘림,
+// Codex 는 셸 명령), 필수 참조(결정·범위 변경)의 원문은 호스트가 과제 프롬프트에 구간으로 직접 싣고 정상 반환한 호출의 쪽만 그 세션에 인정한다.
+// 참조 원문 파일은 조회 경로일 뿐 전달·완독 근거가 아니다. 선택·descriptor·단위는 2a 와 같다(planTimelineDelivery·timeline:<seq>@<sha256>·UTF-8 바이트 v1).
+export interface TimelinePage { seq: number; selector: string; offset: number; end: number; total: number; text: string }
+export interface TimelinePages {
+  pages: readonly TimelinePage[];
+  // 이 세션이 아직 끝까지 받지 않은 필수 참조 — 이 판의 참조와, 앞 턴에서 받았지만 끝까지 받지 않은 참조(이월).
+  required: readonly TimelineReference[];
+  // 이번 쪽을 싣고도 남는 미인정 필수 바이트.
+  remainingBytes: number;
+  // 참조 원문 파일(조회용, 읽기 허용). 참조가 없으면 null.
+  referencesPath: string | null;
+}
+export interface TimelinePush extends TimelinePages { delivery: TimelineDeliveryPlan }
+
+function renderPushedTimeline(events: readonly TimelineEvent[], push: TimelinePush, emptyText: string): string {
+  if (events.length === 0) return emptyText;
+  const inline = new Set(push.delivery.inline);
+  const references = new Map(push.delivery.references.map((reference) => [reference.seq, reference]));
+  const lines: string[] = [];
+  for (const event of [...events].sort((left, right) => left.sequence - right.sequence)) {
+    const reference = references.get(event.sequence);
+    if (inline.has(event.sequence)) lines.push(timelineEventText(event));
+    else if (!reference) throw new Error(`타임라인 전달 계획에 이벤트 ${event.sequence} 가 없습니다.`);
+    else if (!push.delivery.index) {
+      lines.push(`[${event.sequence}] ${event.actor}/${event.kind} — [참조${reference.required ? "·필수" : ""}] selector=${reference.selector} (${reference.bytes} bytes, ${reference.unit} v${reference.version})`);
+    }
+  }
+  if (!push.delivery.references.length) return lines.join("\n\n");
+  const required = push.delivery.references.filter((reference) => reference.required).length;
+  const guide = [
+    `[참조 안내] 이벤트 ${push.delivery.references.length}개(필수 ${required}개)는 크거나 많아 원문 대신 버전 고정 참조로 실었습니다.`,
+    "필수(결정·범위 변경) 참조의 원문은 아래 '타임라인 쪽' 절에 서버가 바이트 구간으로 나눠 싣습니다. 이 세션이 이미 받은 구간은 다시 싣지 않습니다.",
+    ...(push.delivery.index ? [`참조 ${push.delivery.references.length}개의 목록은 아래 참조 원문 파일에 있습니다.`] : []),
+    ...(push.referencesPath ? [referencesFileNote(push.referencesPath)] : []),
+  ].join("\n");
+  return [guide, ...lines].join("\n\n");
+}
+
+// 참조 안내(renderPushedTimeline)가 표시됐는가 — 이벤트가 있고 참조가 있을 때만 안내와 파일 경로가 나간다.
+function pushNotesFile(events: readonly TimelineEvent[], push: TimelinePush): boolean {
+  return events.length > 0 && push.delivery.references.length > 0;
+}
+
+function referencesFileNote(path: string): string {
+  return `참조 원문 파일(조회용, 읽기 허용): ${path} — 서버는 파일을 읽었는지 확인할 수 없어 파일 읽기를 전달·완독 근거로 쓰지 않습니다. 필수 구간은 이 프롬프트의 쪽으로만 전달됩니다.`;
+}
+
+// audience: 작업(구현·수정·계속 진행)은 남은 구간을 다음 계속 진행에 이어 받고 이미 만든 결과를 재대조한다. 리뷰는 한 호출의 쪽 예산을 넘는 구간을 판정 전
+// 리뷰 읽기 호출로 나눠 받고, 남은 구간이 한 호출에 드는 마지막 호출에서만 판정한다(E3-4c).
+// fileNoted: 위 참조 안내가 이미 참조 원문 파일을 알렸다(계속 진행 턴처럼 안내가 없으면 여기서 알린다).
+function timelinePagesSection(pages: TimelinePages | undefined, audience: "work" | "review", fileNoted: boolean): string {
+  if (!pages || pages.required.length === 0) return "";
+  const file = pages.referencesPath && !fileNoted ? `\n${referencesFileNote(pages.referencesPath)}` : "";
+  const use = audience === "work"
+    ? "이미 만든 결과가 있으면 이 결정들과 다시 대조해 어긋나는 곳을 같은 승인 범위에서 보완하세요."
+    : "리뷰 판정은 이 결정들을 반영해야 합니다.";
+  const next = audience === "work"
+    ? "다음 계속 진행 턴에 이어 싣습니다. 필수 구간을 다 받기 전에는 완료를 보고해도 서버가 채택하지 않고 계속 진행으로 잇습니다."
+    : "다음 리뷰 호출(읽기 또는 판정)에 이어 싣습니다. 판정은 필수 구간을 모두 받는 마지막 리뷰 호출에서만 합니다.";
+  return `
+타임라인 쪽(서버 전달 — 이 세션이 아직 받지 않은 필수 결정·범위 변경 원문 구간):
+이 세션에 남은 필수 참조 ${pages.required.length}개 가운데 이번에 쪽 ${pages.pages.length}개를 싣습니다. 각 쪽은 selector 원문의 UTF-8 바이트 구간 [offset, end) / total 이며, 같은 selector 의 쪽을 offset 순서로 이어 붙이면 원문입니다. ${use}${
+  pages.remainingBytes > 0 ? `\n이번 쪽 뒤에도 필수 구간 ${pages.remainingBytes} bytes 가 남습니다 — ${next}` : ""}${file}
+${pages.pages.map((page) => `--- 쪽 ${page.selector} [${page.offset}, ${page.end}) / ${page.total} ---\n${page.text}\n--- 쪽 끝 ---`).join("\n")}
+`;
+}
+
+
+// 구현·수정 턴의 타임라인 절 — 엔진이 쪽을 넘기면 참조 표시 + 쪽 절, 아니면 기존 표시다(빌더 기본은 그대로).
+function workTimeline(events: readonly TimelineEvent[], push: TimelinePush | undefined, emptyText: string | undefined): string {
+  if (!push) return renderTimeline(events, false, emptyText);
+  return `${renderPushedTimeline(events, push, emptyText ?? "(아직 메시지가 없습니다.)")}${timelinePagesSection(push, "work", pushNotesFile(events, push))}`;
 }
 
 // 어댑터가 매 턴 프롬프트 앞에 붙인다. 개방된 도구의 사용 규칙은 프롬프트가 아니라 sandbox가 강제하지만,
@@ -183,8 +377,12 @@ export function buildClaudePlanPrompt(input: {
   previousPlanMarkdown?: string | null;
   // 이 토픽·선행 토픽이 이연한 쟁점 — 이번 범위에서 다시 판단한다(2026-09-07).
   deferredFindings?: readonly DeferredFinding[];
+  // 이연 쟁점 원문 산출물(근거 전문)의 정본 경로 — 목록이 인라인 예산을 넘으면 색인과 이 참조를 싣는다(E4 2차 보완 F012).
+  deferredFindingsPath?: string;
+  // 참조 모드(E3-2-2a) — 엔진이 계획 제어·세션 유지 턴에만 넘긴다. 없으면 기존 렌더.
+  timelineDelivery?: TimelineDeliveryPlan;
 }): string {
-  const deferred = renderDeferredFindings(input.deferredFindings, "plan");
+  const deferred = renderDeferredFindings(input.deferredFindings, "plan", input.deferredFindingsPath);
   const previous = input.previousPlanMarkdown
     ? `\n직전 계획 전문(재시작 전 마지막 판): 아래 본문을 **그대로 기반**으로 삼고, 타임라인의 최신 결정과 감사 지적만 반영해 다시 내세요. 압축 재작성으로 합의된 검증 규칙·스키마·명령을 빠뜨리지 마세요(2026-09-03 S6 실측: 재시작마다 합의가 새어 3라운드 반복).\n${input.previousPlanMarkdown}\n`
     : "";
@@ -197,7 +395,7 @@ export function buildClaudePlanPrompt(input: {
 범위 세대: ${input.scopeGeneration}
 
 대화와 증거:
-${renderTimeline(input.timeline)}
+${renderPlanningTimeline(input.timeline, input.timelineDelivery)}
 ${previous}${deferred}
 ${planContract()}
 
@@ -217,8 +415,11 @@ export function buildCodexAuditPrompt(input: {
   planningContextMode?: "full" | "delta";
   claudePlan?: AgentResult;
   deferredFindings?: readonly DeferredFinding[];
+  // 이연 쟁점 원문 산출물의 정본 경로(계획 프롬프트와 같은 규칙).
+  deferredFindingsPath?: string;
   // 중재자 진단의 계획 개정 뒤 감사(구현 도중의 개정).
   diagnosisRevision?: DiagnosisRevisionAuditContext;
+  timelineDelivery?: TimelineDeliveryPlan;
 }): string {
   return `당신은 Consensus Room의 읽기 전용 적대적 검토자입니다. 코드를 절대 수정하지 마세요.
 
@@ -235,8 +436,8 @@ Claude가 계획과 함께 기록한 쟁점:
 ${JSON.stringify(input.claudePlan?.findings ?? [], null, 2)}
 ${diagnosisRevisionAuditSection(input.diagnosisRevision)}
 ${input.planningContextMode === "delta" ? "직전 전달 이후 추가된 결정과 증거:" : "대화와 증거:"}
-${renderTimeline(input.timeline, false, input.planningContextMode === "delta" ? "(직전 전달 이후 새 결정·증거 없음)" : undefined)}
-${renderDeferredFindings(input.deferredFindings, "audit")}
+${renderPlanningTimeline(input.timeline, input.timelineDelivery, input.planningContextMode === "delta" ? "(직전 전달 이후 새 결정·증거 없음)" : undefined)}
+${renderDeferredFindings(input.deferredFindings, "audit", input.deferredFindingsPath)}
 ${severityPolicyContract()}
 ${outputLanguageContract({ planBody: false })}
 ${dispositionContract("AUDIT")}
@@ -258,6 +459,7 @@ export function buildClaudeRevisionPrompt(input: {
   timeline?: readonly TimelineEvent[];
   // "closeout": 종결 확인이 낸 새 쟁점만 반영하는 개정 2회차(2026-09-07). audit 에는 그 새 쟁점만 담아 보낸다.
   source?: "audit" | "closeout";
+  timelineDelivery?: TimelineDeliveryPlan;
 }): string {
   const closeoutRound = input.source === "closeout";
   return `이 단계에서도 코드를 수정하지 마세요. ${closeoutRound
@@ -271,7 +473,7 @@ ${closeoutRound ? "Codex 종결 확인의 새 쟁점:" : "Codex 감사:"}
 ${JSON.stringify(input.audit, null, 2)}
 
 방에 추가된 결정과 증거:
-${renderTimeline(input.timeline ?? [])}
+${renderPlanningTimeline(input.timeline ?? [], input.timelineDelivery)}
 
 ${dispositionContract("REVISION")}
 ${outputLanguageContract({ planBody: true })}
@@ -316,6 +518,7 @@ export function buildDiagnosisPlanRevisionPrompt(input: {
   diagnoses: readonly DiagnosisPrompt[];
   carry: DiagnosisPlanRevisionCarry;
   timeline?: readonly TimelineEvent[];
+  timelineDelivery?: TimelineDeliveryPlan;
 }): string {
   const ids = input.diagnoses.map((item) => item.id).join(", ");
   const changed = input.carry.changedPaths;
@@ -335,7 +538,7 @@ ${planRevisionDiagnoses(input.diagnoses)}
 - 검증된 허용 오차 원장 ${input.carry.verifiedLedgerRows}행(개정 계획의 허용 오차 규칙으로 구현 재개 때 다시 대조합니다)
 ${input.carry.openRequests.length ? `열린 요청(개정 뒤 구현으로 그대로 이어집니다 — 개정으로 닫히지 않습니다):\n${input.carry.openRequests.map((request) => `- [${request.id}] ${clip(request.text, 1_000)}`).join("\n")}\n` : ""}
 방에 추가된 결정과 증거:
-${renderTimeline(input.timeline ?? [])}
+${renderPlanningTimeline(input.timeline ?? [], input.timelineDelivery)}
 
 개정 규칙:
 - 진단이 요구하는 변경만 반영하세요. 진단과 무관한 부분을 다시 쓰지 말고, 이미 작성된 코드를 되돌리는 단계는 진단이 지시할 때만 넣으세요.
@@ -381,6 +584,7 @@ export function buildCodexCloseoutPrompt(input: {
   // 개정 2회차 뒤의 종결 확인이면 true — 새 ID 를 또 내면 처음부터 다시 돌게 되므로 정말 새 결함일 때만.
   secondRound?: boolean;
   implementationNotes?: readonly ImplementationNote[];
+  timelineDelivery?: TimelineDeliveryPlan;
 }): string {
   return `읽기 전용 최종 의견 수렴입니다. 코드를 수정하지 마세요.
 
@@ -394,7 +598,7 @@ Claude의 처분:
 ${JSON.stringify(input.claudeRevision.findings, null, 2)}
 
 ${input.planningContextMode === "delta" ? "직전 전달 이후 추가된 결정과 증거:" : "방에 추가된 결정과 증거:"}
-${renderTimeline(input.timeline, false, input.planningContextMode === "delta" ? "(직전 전달 이후 새 결정·증거 없음)" : undefined)}
+${renderPlanningTimeline(input.timeline, input.timelineDelivery, input.planningContextMode === "delta" ? "(직전 전달 이후 새 결정·증거 없음)" : undefined)}
 
 이미 같은 증거로 끝난 논점을 다시 열지 마세요. 재개할 수 있는 조건은 변경된 리비전, 새 실행 증거, 새로 읽은 1차 자료,
 서로 다른 새 결함, 사용자의 명시적 재개뿐입니다. 각 finding의 최종 disposition을 확인하세요.
@@ -519,6 +723,8 @@ export function buildImplementationPrompt(input: {
   diagnoses?: readonly DiagnosisPrompt[];
   // 계획 변경 진단의 개정 계획이 승인된 뒤 첫 구현 — 이어받은 세션에도 개정 계획 전문과 개정 알림을 싣는다.
   planRevised?: PlanRevisionNotice;
+  // 타임라인 참조·쪽(E3-2-2b) — 엔진이 구현 턴에 넘긴다. 없으면 기존 표시(renderTimeline)다.
+  timelinePush?: TimelinePush;
 }): string {
   return `${input.planningHandoff
     ? "이 세션에서 확정한 계획을 사용자가 승인했습니다. 이제 승인 범위의 구현을 시작하세요."
@@ -535,7 +741,7 @@ export function buildImplementationPrompt(input: {
 ${planSection(input.planRevised && !input.planAlreadyKnown ? { ...input, resumedSession: false } : input)}${planRevisedSection(input.planRevised)}
 
 ${continuedTimelineHeading(input.resumedSession, "현재 방의 사용자 결정과 증거:")}
-${renderTimeline(input.timeline, false, continuedTimelineEmpty(input.resumedSession))}
+${workTimeline(input.timeline, input.timelinePush, continuedTimelineEmpty(input.resumedSession))}
 ${decisionsSection(input.decisionsPath)}
 ${openRequestsSection(input.openRequests)}${diagnosesSection(input.diagnoses)}${input.resumedSession && !input.planningHandoff ? "" : renderImplementationNotes(input.implementationNotes, "implementation")}
 구현 중 발견해 이 턴에서 실제로 고친 쟁점은 RESOLVED_BY_FIX로 처분하고 확인 방법을 evidenceRefs에 남기세요.
@@ -582,6 +788,9 @@ export function buildCodexReviewPrompt(input: {
   // 최종 리뷰: 수정 작업 계약의 원본 쟁점(최종 리뷰 정지 쟁점·되돌린 진단 판정 등). 서버가 이 id 들의 처분을 요구하므로 프롬프트에도 싣는다 — 싣지 않으면
   // 리뷰어가 모른 채 답해 누락 교정을 한 번 더 사고 그 교정이 리뷰 한도를 소비했다(2026-09-15 감사 2차 후속).
   fixSourceFindings?: readonly Finding[];
+  // 타임라인 참조·쪽(E3-2-2b) — 판정 호출은 이 세션에 남은 필수 쪽을 모두 싣는다. 한 호출의 쪽 예산을 넘는 앞부분은 엔진이 판정 전 리뷰 읽기 호출로 먼저
+  // 실었다(E3-4c — 이 세션이 이미 받은 구간은 다시 싣지 않는다). 없으면 기존 표시다.
+  timelinePush?: TimelinePush;
 }): string {
   const knownDelta = input.finalPass && input.resumedSession && input.remainingReviewSteps === undefined ? input.deltaSinceLastReview : null;
   const delta = knownDelta
@@ -625,7 +834,10 @@ ${input.verificationReceipts ?? ""}
 
 ${reviewDiagnosesSection(input.diagnoses)}${originalFindings}${fixSource}${delta}${input.tolerance ? `\n허용 오차 대조(서버가 git diff 로 판정한 결과 — 승인 범위 밖 변경은 이 결과와 원장으로 판정하세요; 원장에 있고 술어를 만족하는 hunk 는 범위 이탈이 아닙니다):\n${input.tolerance}\n` : ""}
 ${input.resumedSession ? "이 리뷰 세션의 직전 턴 이후 방에 추가된 사용자 결정과 증거(그 전 것은 이 세션이 이미 받았습니다):" : "방에 추가된 사용자 결정과 증거:"}
-${renderTimeline(input.timeline, true, input.resumedSession ? "(직전 리뷰 턴 이후 새 결정·증거 없음)" : undefined)}
+${input.timelinePush
+    ? `${renderPushedTimeline(input.timeline, input.timelinePush, input.resumedSession ? "(직전 리뷰 턴 이후 새 결정·증거 없음)" : "(아직 메시지가 없습니다.)")}${
+      timelinePagesSection(input.timelinePush, "review", pushNotesFile(input.timeline, input.timelinePush))}`
+    : renderTimeline(input.timeline, true, input.resumedSession ? "(직전 리뷰 턴 이후 새 결정·증거 없음)" : undefined)}
 
 ${knownDelta
     ? "finding 별 수정 근거(원인 → 고친 위치 → 실행한 검증 → 미확인 부분)를 실제 코드와 대조해 판정하세요. 같은 코드·의존성·실행 조건에서 이미 통과한 검사는 결과를 재사용하고, 이번 수정이 영향을 준 검사만 다시 요구하세요."
@@ -637,6 +849,16 @@ ${dispositionContract(input.finalPass ? "FINAL_REVIEW" : "REVIEW")}
 ${outputLanguageContract({ planBody: false })}
 
 반환 kind는 ${input.finalPass ? "FINAL_REVIEW" : "REVIEW"}입니다.`;
+}
+
+// 코드 리뷰의 리뷰 읽기 호출(E3-4c, job reviewer/review-read) — 이 리뷰에 필요한 필수 결정·범위 변경 원문이 한 리뷰 호출의 쪽 예산을 넘을 때, 판정 전에
+// 앞부분 쪽을 나눠 싣는다. 도구가 닫힌 프로토콜 턴이라 쪽만 싣고(참조 원문 파일 안내 없음) ACK 만 받는다 — 판정·질문은 남은 쪽과 함께 오는 마지막 리뷰
+// 호출(buildCodexReviewPrompt)에서만 한다. 서버는 정상 반환한 호출이 실은 쪽만 그 세션에 인정한다(응답 내용은 전달 근거가 아니다).
+export function buildReviewReadPrompt(input: { round: number; finalPass: boolean; pages: TimelinePages }): string {
+  return `코드 ${input.finalPass ? "최종 " : ""}리뷰의 자료 읽기 호출입니다(리뷰 읽기 ${input.round}회차). 이 리뷰에 필요한 필수 결정·범위 변경 원문이 한 리뷰 호출에 다 들어가지 않아 서버가 판정 전에 여러 호출로 나눠 싣습니다.
+이번 호출에서는 아래 쪽을 읽고 이어질 리뷰를 위해 기억만 하세요. 코드·파일을 조사하거나 판정하지 마세요 — 도구가 열려 있지 않고, 리뷰 판정(${input.finalPass ? "FINAL_REVIEW" : "REVIEW"})은 남은 쪽·계획·구현 보고와 함께 오는 마지막 리뷰 호출에서만 합니다.
+반환 kind 는 ACK 이고 summary 는 한 문장, findings 는 빈 배열입니다. requestedUserDecision·판정·처분을 적지 마세요.
+${timelinePagesSection(input.pages, "review", true)}`;
 }
 
 // 리뷰어에게 주는 중재자 진단 원문(host-review R4) — 러너의 반영 보고(RESOLVED_BY_FIX)를 원본 지시·검증 기준과 대조해 판정하게 한다.
@@ -673,14 +895,19 @@ export function completionStatusContract(): string {
 }
 
 // 러너가 status=in_progress 로 멈춘 뒤 같은 세션에서 여는 "계속 진행" 턴 — 새 결정이 아니라 남은 단계의 이행 요청이다(D01).
+// timeline: 이 세션이 아직 받지 않은 필수 타임라인 쪽(E3-2-2b). recheck 면 러너가 완료를 보고했지만 필수 구간이 남아 최종 채택·검증 전에 잇는 턴이다(J2) —
+// 남은 구간을 읽고 이미 만든 결과를 재대조·보완하게 한다. 필수 읽기 턴은 계속 진행 상한을 쓰지 않아 회차만 표시한다(round = 필수 읽기 회차, E3-4b).
 export function buildContinuationPrompt(
   remainingSteps: readonly string[], round: number, limit: number, kind: "IMPLEMENTATION" | "FIX" = "IMPLEMENTATION",
-  openRequests?: readonly OpenRequestPrompt[],
+  openRequests?: readonly OpenRequestPrompt[], timeline?: TimelinePages & { recheck: boolean },
 ): string {
-  return `직전 결과가 status=in_progress 였습니다(계속 진행 ${round}/${limit}). 같은 승인 범위에서 남은 단계를 이어서 수행하세요. 반환 kind 는 ${kind} 입니다.
+  const opening = timeline?.recheck
+    ? `직전 결과가 완료를 보고했지만, 이 세션이 아직 받지 않은 필수 타임라인 구간(사용자 결정·범위 변경 원문)이 남아 서버가 최종 채택·검증 전에 이어갑니다(필수 읽기 ${round}회차). 아래 쪽을 읽고, 이미 만든 결과를 그 결정과 다시 대조해 어긋나는 곳을 같은 승인 범위에서 보완한 뒤 다시 완료를 보고하세요. 어긋남이 없으면 대조한 근거를 evidenceRefs 에 남기고 status=completed 로 답하세요. 반환 kind 는 ${kind} 입니다.`
+    : `직전 결과가 status=in_progress 였습니다(계속 진행 ${round}/${limit}). 같은 승인 범위에서 남은 단계를 이어서 수행하세요. 반환 kind 는 ${kind} 입니다.`;
+  return `${opening}
 남은 단계(직전 제출):
 ${remainingSteps.length ? remainingSteps.map((step) => `- ${step}`).join("\n") : "- (명시 없음 — 계획의 다음 단계)"}
-${openRequestsSection(openRequests)}
+${timelinePagesSection(timeline, "work", false)}${openRequestsSection(openRequests)}
 규칙: 결과 JSON 은 이번 턴까지 누적된 보고입니다(직전 findings·evidenceRefs 는 서버가 병합해 보존합니다). ${completionStatusContract()} 허용 오차 원장(toleranceLedger)은 **이번 턴에 새로 생기거나 바뀐 범위 밖 변경만** {ruleId, file, note} 로 적으세요 — 앞 턴에서 서버가 받아들인 행은 같은 파일이 그대로 바뀐 채면 서버가 승계하므로 다시 적지 않습니다(한 번 응답의 원장은 500행까지).
 
 ${dispositionContract(kind)}`;
@@ -688,25 +915,34 @@ ${dispositionContract(kind)}`;
 
 // 완료 상태 읽기 전용 확인 턴(PLAN §3) — 저장된 누적 결과·승인 계획·열린 요청·그 뒤의 결정을 주고 status/remainingSteps/해소 여부만 묻는다.
 // 도구는 닫혀 있다(protocolOnly). 작업을 다시 하지 않는다. 최대 1회 — 그래도 불명확하면 서버가 보존한 채 멈춘다.
-export function buildStatusConfirmationPrompt(input: {
+export function buildStatusConfirmationPrompt(input: StatusConfirmationInput): string {
+  return buildStatusConfirmationDelivery(input).prompt;
+}
+
+type StatusConfirmationInput = {
   kind: "IMPLEMENTATION" | "FIX"; reason: string; accumulated: AgentResult; planPath?: string | null;
   openRequests?: readonly OpenRequestPrompt[]; decisionsSince: readonly TimelineEvent[];
-}): string {
+};
+
+// 확인 턴 프롬프트와, 그 프롬프트에 온전히 실린 결정·증거 이벤트 순번(whole — 렌더 선택 결과 그대로). 확인 턴의 읽기 전용·부분 필드 계약은 그대로다.
+export function buildStatusConfirmationDelivery(input: StatusConfirmationInput): { prompt: string; whole: number[] } {
   const stripped = { ...input.accumulated, memoryUpdates: undefined };
-  return `서버가 저장한 이 작업의 누적 결과를 **완료로 판정하지 못했습니다**: ${input.reason}
+  const since = renderTimelineManifest(input.decisionsSince, false);
+  const prompt = `서버가 저장한 이 작업의 누적 결과를 **완료로 판정하지 못했습니다**: ${input.reason}
 이 턴은 읽기 전용 확인 턴입니다(도구 없음, 최대 1회). 작업을 다시 하거나 새 내용을 추가하지 말고, 저장된 결과와 승인 계획을 근거로 아래만 답하세요.
 
 저장된 누적 결과(JSON):
 ${JSON.stringify(stripped, null, 2)}
 ${input.planPath ? `승인 계획 원문(이미 세션에 있음): ${input.planPath}\n` : ""}
 ${openRequestsSection(input.openRequests)}
-${input.decisionsSince.length ? `열린 요청 뒤에 도착한 결정·증거:\n${renderTimeline(input.decisionsSince, false)}\n` : ""}
+${input.decisionsSince.length ? `열린 요청 뒤에 도착한 결정·증거:\n${since.text}\n` : ""}
 답할 것 — 같은 kind(${input.kind})로 전체 결과 JSON 을 다시 반환하되 다음 필드만 바꿉니다:
 - \`status\`: completed(모든 단계 끝, remainingSteps 비움) · in_progress(남은 단계를 remainingSteps 에) · blocked(입력 필요).
 - 열린 요청이 있으면 \`resolvesRequestedDecision: true\` + 위 결정으로 해소된 요청 id 전부를 \`resolvedRequestIds\` 에(하나뿐이면 \`resolvedRequestId\` 도 됩니다). 보류·미해소 요청은 나열하지 말고 그대로 둡니다.
 findings·evidenceRefs·summary 는 저장된 값을 그대로 유지하세요(처분도 그대로). 확신이 없으면 completed 라고 적지 마세요 — 서버가 결과를 보존한 채 사람에게 넘깁니다.
 
 ${dispositionContract(input.kind)}`;
+  return { prompt, whole: input.decisionsSince.length ? since.whole : [] };
 }
 
 export function buildClaudeFixPrompt(input: {
@@ -722,6 +958,8 @@ export function buildClaudeFixPrompt(input: {
   // 적용된 중재자 진단(수정 지시). 진단 전용 수정 작업이면 heading 이 그 사실을 알린다.
   diagnoses?: readonly DiagnosisPrompt[];
   heading?: string;
+  // 타임라인 참조·쪽(E3-2-2b) — 엔진이 수정 턴에 넘긴다. 없으면 기존 표시다.
+  timelinePush?: TimelinePush;
 }): string {
   return `${input.heading ?? "승인된 계획 범위 안에서 Codex가 확정한 finding을 한 번만 수정하세요."}
 
@@ -731,7 +969,7 @@ ${input.resumedSession ? `승인된 계획 SHA-256: ${input.planSHA256 ?? "(미�
 ${JSON.stringify(input.reviewFindings, null, 2)}
 
 ${continuedTimelineHeading(input.resumedSession, "방에 추가된 사용자 결정과 증거:")}
-${renderTimeline(input.timeline, false, continuedTimelineEmpty(input.resumedSession))}
+${workTimeline(input.timeline, input.timelinePush, continuedTimelineEmpty(input.resumedSession))}
 ${decisionsSection(input.decisionsPath)}
 ${openRequestsSection(input.openRequests)}${diagnosesSection(input.diagnoses)}
 실제로 고친 finding은 RESOLVED_BY_FIX로 처분하고, **finding 별로** evidenceRefs 에 다음 형식의 한 줄을 남기세요

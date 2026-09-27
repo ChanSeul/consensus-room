@@ -1,4 +1,5 @@
 import { ArtifactStore } from "../src/server/artifacts";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { buildApp } from "../src/server/app";
 import { ConsensusDatabase } from "../src/server/database";
+import { SpawnCommandRunner } from "../src/server/processRunner";
 import type { AgentAdapter, CommandRunner } from "../src/server/types";
 
 const temporaryDirectories: string[] = [];
@@ -110,9 +112,17 @@ afterEach(() => {
   }
 });
 
-async function makeApp(runner?: CommandRunner, validateSession: () => Promise<boolean> = async () => false) {
+// gitRepository: 저장소 경로(root)를 실제 git 저장소로 만든다 — 계획 제어(v2) 턴은 작업 트리 스냅숏(writeWorkingTree)에 실제 git 이 필요하다.
+async function makeApp(runner?: CommandRunner, validateSession: () => Promise<boolean> = async () => false, options: { gitRepository?: boolean } = {}) {
   const root = mkdtempSync(join(tmpdir(), "consensus-room-app-"));
   temporaryDirectories.push(root);
+  if (options.gitRepository) {
+    execFileSync("git", ["init", "-q", root]);
+    for (const [key, value] of [["user.name", "App Test"], ["user.email", "app-test@example.invalid"]]) execFileSync("git", ["-C", root, "config", key, value]);
+    writeFileSync(join(root, "README.txt"), "기준\n");
+    execFileSync("git", ["-C", root, "add", "README.txt"]);
+    execFileSync("git", ["-C", root, "commit", "-qm", "baseline"]);
+  }
   const unavailableRunner: CommandRunner = {
     run: async () => { throw new Error("이 테스트에서는 명령을 실행하지 않습니다."); },
   };
@@ -155,6 +165,16 @@ async function makeApp(runner?: CommandRunner, validateSession: () => Promise<bo
     codex: adapter("codex"),
   });
   return { app, database, root, adapterCalls };
+}
+
+// 실제 git 에 위임하면서 worktree 생성 명령만 센다 — 작업 묶음 새 단계 토픽은 계획 제어 v2 라(E4 2차 보완 F012) 계획 턴이 실제 작업 트리 스냅숏을 만든다.
+function countingRealGitRunner(): { runner: CommandRunner; worktreeAdds: string[] } {
+  const inner = new SpawnCommandRunner();
+  const worktreeAdds: string[] = [];
+  return { worktreeAdds, runner: { run: async (spec) => {
+    if (spec.args[0] === "worktree" && spec.args[1] === "add") worktreeAdds.push(spec.args.join(" "));
+    return inner.run(spec);
+  } } };
 }
 
 // worktree 생성 명령만 세는 가짜 git. 실제 저장소 없이 "몇 번 만들었는지"를 관측한다.
@@ -578,8 +598,9 @@ it("activity API는 현재 세대의 역할별 최신 관측과 시각을 반환
 });
 
 it("작업 묶음 API는 단계 생성 중복을 막고 계약 변경 때 승인을 무효화한다",async()=>{
- const {runner,worktreeAdds}=countingGitRunner();let failWorktree=false;
- const {app,database,adapterCalls}=await makeApp({run:spec=>{if(failWorktree&&spec.args[0]==="worktree")throw new Error("worktree failure");return runner.run(spec);}});
+ // 새 단계 토픽은 계획 제어 v2 다(E4 2차 보완 F012) — 예산 재개 뒤 계획 턴이 실제 작업 트리 스냅숏을 거쳐 에이전트에 닿도록 실제 git 저장소를 쓴다.
+ const {runner,worktreeAdds}=countingRealGitRunner();let failWorktree=false;
+ const {app,database,adapterCalls}=await makeApp({run:spec=>{if(failWorktree&&spec.args[0]==="worktree")throw new Error("worktree failure");return runner.run(spec);}},undefined,{gitRepository:true});
  const budget={execution:{inputTokens:100,outputTokens:100,durationMs:100000},total:{inputTokens:1000,outputTokens:1000,durationMs:1000000}};
  const input={title:"단계 작업",goal:"목표",contracts:"기존 계약",stages:[
   {id:"one",kind:"work",title:"구현",goal:"구현",acceptance:"테스트",dependsOn:[],budget},
@@ -588,6 +609,7 @@ it("작업 묶음 API는 단계 생성 중복을 막고 계약 변경 때 승인
  try {
   const created=await post("/api/work-groups",input,"create");expect(created.statusCode).toBe(201);const group=created.json();
   const next=await post(`/api/work-groups/${group.id}/next`,{},"next");expect(next.statusCode).toBe(201);const topic=next.json();
+  expect(database.planning.policyVersion(topic.id)).toBe(2);
   const repeated=await post(`/api/work-groups/${group.id}/next`,{},"next");expect(repeated.json().id).toBe(topic.id);expect(worktreeAdds).toHaveLength(1);
   const blocked=await post(`/api/work-groups/${group.id}/next`,{},"next-new");expect(blocked.statusCode).toBeGreaterThanOrEqual(400);expect(worktreeAdds).toHaveLength(1);
   database.updateTopic(topic.id,{state:"AWAITING_USER_APPROVAL",planSHA256:"a".repeat(64),approvedPlanSHA256:"a".repeat(64)});
@@ -595,11 +617,20 @@ it("작업 묶음 API는 단계 생성 중복을 막고 계약 변경 때 승인
   expect(database.getTopic(topic.id)).toMatchObject({state:"DRAFT",planSHA256:null,approvedPlanSHA256:null,planEpoch:2});
   expect(database.budgets.account(topic.id)?.policy).toEqual(budget);
   expect(database.workGroups.forTopic(topic.id)?.version).toBe(2);
+  // E4 D2(저장 우선 + 명시적 재계획 대기) — 범위 변경이 끊겨도 개정은 저장되고, 대기 표식이 그 단계를 막으며, 같은 입력을 새 키로 다시 보내면 이어 적용한다.
+  // (E4 전 계약은 "실패하면 개정을 저장하지 않는다" 였는데, 영향 단계가 둘이면 일부만 초기화된 채 개정이 사라졌다 — E0 관측.)
   database.updateTopic(topic.id,{state:"READY_TO_DELIVER",approvedPlanSHA256:"a".repeat(64)});failWorktree=true;
-  const failure=await post(`/api/work-groups/${group.id}/revise`,{input:{...input,contracts:"저장되면 안 되는 계약"},version:2},"revision-failure");
+  const failure=await post(`/api/work-groups/${group.id}/revise`,{input:{...input,contracts:"범위 변경이 끊긴 계약"},version:2},"revision-failure");
   expect(failure.statusCode).toBeGreaterThanOrEqual(400);
-  expect(database.workGroups.get(group.id)).toMatchObject({version:2,contracts:"새 계약"});
-  expect(database.getTopic(topic.id).approvedPlanSHA256).toBe("a".repeat(64));failWorktree=false;
+  expect(database.workGroups.get(group.id)).toMatchObject({version:3,contracts:"범위 변경이 끊긴 계약"});
+  expect(database.workGroups.get(group.id).links.one.replanPending).toEqual({version:3,fromGeneration:2});
+  expect(database.getTopic(topic.id)).toMatchObject({state:"READY_TO_DELIVER",scopeGeneration:2,approvedPlanSHA256:"a".repeat(64)});failWorktree=false;
+  const reapplied=await post(`/api/work-groups/${group.id}/revise`,{input:{...input,contracts:"범위 변경이 끊긴 계약"},version:3},"revision-reapply");
+  expect(reapplied.statusCode).toBe(200);
+  expect(database.workGroups.get(group.id)).toMatchObject({version:3,contracts:"범위 변경이 끊긴 계약"});
+  expect(database.workGroups.get(group.id).links.one.replanPending).toBeUndefined();
+  expect(database.getTopic(topic.id)).toMatchObject({state:"DRAFT",scopeGeneration:3,approvedPlanSHA256:null});
+  expect(database.budgets.account(topic.id)?.policy).toEqual(budget);
   database.updateTopic(topic.id,{state:"USER_DECISION_REQUIRED",resumeState:"CLAUDE_PLAN"});
   database.appendEvent({topicId:topic.id,actor:"system",kind:"system",state:"USER_DECISION_REQUIRED",body:"예산 중단",payload:{budgetPause:true,resumeState:"CLAUDE_PLAN"}});
   database.budgets.start({id:"group-cap",accounts:[group.id],startedAt:Date.now(),stage:"PLAN",role:"claude",model:"test",effort:"test"});

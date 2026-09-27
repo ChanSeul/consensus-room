@@ -116,6 +116,23 @@ describe("이벤트 원장과 재시작 복구", () => {
     database.close();
   });
 
+  // 엔진 개편 E4 보완(F002) — 닫힌 작업 묶음 단계의 동결 결과 push 가 서버 종료로 끊겨도 CLOSED 를 다시 열지 않는다. 요청만 unknown 으로 남아
+  // reconcile-delivery 가 원격을 대조한다. 닫히지 않은 주제는 기존대로 전달 확인 대기(USER_DECISION_REQUIRED/READY_TO_DELIVER)로 간다.
+  it("닫힌 단계의 push 가 끊기면 요청만 unknown 으로 남기고 CLOSED 는 그대로 둔다", () => {
+    const { database } = openDatabase();
+    database.createTopic({ ...topic("closed-stage"), state: "CLOSED" });
+    database.createTopic({ ...topic("open-topic"), state: "READY_TO_DELIVER" });
+    database.claimActionRequest("closed-stage", "push", "closed-push", {});
+    database.claimActionRequest("open-topic", "push", "open-push", {});
+    database.recoverInterruptedDeliveryRequests();
+    expect(database.getTopic("closed-stage")).toMatchObject({ state: "CLOSED" });
+    expect(database.getFlags("closed-stage").resumeState ?? null).toBeNull();
+    expect(database.unknownDeliveryAction("closed-stage")).toMatchObject({ action: "push", idempotencyKey: "closed-push" });
+    expect(database.getTopic("open-topic")).toMatchObject({ state: "USER_DECISION_REQUIRED" });
+    expect(database.getFlags("open-topic").resumeState).toBe("READY_TO_DELIVER");
+    database.close();
+  });
+
   it("서버 재시작 때 전달 외 요청의 running idempotency key를 영구 대기 상태로 남기지 않는다", () => {
     const { database } = openDatabase();
     database.createTopic(topic());
@@ -353,6 +370,52 @@ describe("이벤트 원장과 재시작 복구", () => {
     });
     expect(upgraded.getScopedTimeline("topic-1", 3).at(-1)?.body).toBe("업그레이드 뒤 메모");
     upgraded.close();
+  });
+
+  it("결과 불명확 전달 요청의 마감은 상태 전이·기록과 한 transaction 이고, 알림은 COMMIT 뒤에만 나간다(E4 F016)", () => {
+    const { database, path } = openDatabase();
+    database.createTopic({ ...topic(), state: "READY_TO_DELIVER" });
+    database.claimActionRequest("topic-1", "commit", "commit-key", { message: "커밋", paths: ["owned.txt"] });
+    database.recoverInterruptedDeliveryRequests();
+    expect(database.getTopic("topic-1").state).toBe("USER_DECISION_REQUIRED");
+    const confirm = (idempotencyKey: string, payload: Record<string, unknown> = {}) => database.applyTopicTransition({
+      topicId: "topic-1",
+      changes: { state: "READY_TO_DELIVER", lastError: null, resumeState: null, committedOID: "c".repeat(40) },
+      deliveryResolution: { action: "commit", idempotencyKey, outcome: "succeeded" },
+      events: [{ actor: "system", kind: "system", state: "READY_TO_DELIVER", body: "중단됐던 commit 결과를 확인했습니다.", payload }],
+    });
+    const unchanged = () => {
+      expect(database.getTopic("topic-1")).toMatchObject({ state: "USER_DECISION_REQUIRED" });
+      expect(database.getFlags("topic-1")).toMatchObject({ committedOID: null, resumeState: "READY_TO_DELIVER" });
+      expect(database.unknownDeliveryAction("topic-1")).toMatchObject({ action: "commit", idempotencyKey: "commit-key" });
+      expect(database.getTimeline("topic-1")).toEqual([]);
+    };
+    const notified: string[] = [];
+    database.events.on("topic:topic-1", (event: { body: string }) => notified.push(event.body));
+    // 복구 대상이 아닌 요청을 마감하려 하면(대상 행 없음) 전이·기록 전체가 없던 일이 되고 알림도 없다.
+    expect(() => confirm("other-key")).toThrow("확인할 전달 요청이 이미 바뀌었거나 존재하지 않습니다");
+    unchanged();
+    // 요청 마감을 쓴 뒤 같은 transaction 의 다음 쓰기가 실패하면(그 사이 서버 정지) 마감도 되돌아간다 — 요청이 사라진 채 복구 대기에 남지 않는다.
+    const poisoned: Record<string, unknown> = {};
+    Object.defineProperty(poisoned, "confirmed", { enumerable: true, get() { throw new Error("기록 도중 서버가 죽었습니다."); } });
+    expect(() => confirm("commit-key", poisoned)).toThrow("기록 도중");
+    unchanged();
+    expect(notified).toEqual([]);
+    // 정상 마감: 요청 마감·상태·확정 기록·이벤트가 함께 저장되고, 알림 시점에 다른 연결에서 이미 COMMIT 된 값이 보인다.
+    const reader = new DatabaseSync(path);
+    const observed: unknown[] = [];
+    database.events.on("topic:topic-1", () => observed.push({
+      state: (reader.prepare("SELECT state FROM topics WHERE id = ?").get("topic-1") as { state: string }).state,
+      committedOID: (reader.prepare("SELECT committed_oid FROM topics WHERE id = ?").get("topic-1") as { committed_oid: string | null }).committed_oid,
+      request: (reader.prepare("SELECT status FROM action_requests WHERE topic_id = ? AND idempotency_key = ?").get("topic-1", "commit-key") as { status: string }).status,
+    }));
+    confirm("commit-key");
+    expect(observed).toEqual([{ state: "READY_TO_DELIVER", committedOID: "c".repeat(40), request: "failed" }]);
+    expect(notified).toEqual(["중단됐던 commit 결과를 확인했습니다."]);
+    expect(database.unknownDeliveryAction("topic-1")).toBeNull();
+    expect(database.getActionRequest("topic-1", "commit", "commit-key")).toMatchObject({ status: "failed" });
+    reader.close();
+    database.close();
   });
 
   it("상태 전이와 기록 이벤트는 함께 성공하거나 함께 없던 일이 된다", () => {
@@ -653,6 +716,40 @@ describe("타임라인 전용 쿼리", () => {
     const sequences = prompt.map((event) => event.sequence);
     expect([...sequences].sort((a, b) => a - b)).toEqual(sequences);
     database.close();
+  });
+});
+
+// E3-2-2a F002: 참조를 만드는 소비처는 이 공개 조회에서 전체 대상 행을 받아야 한다.
+// SQL 계층 계약만 검증한다. 실제 모델 프롬프트의 인라인·참조·색인 전달은 guarded-planning 공개 흐름 검사에서 확인한다.
+describe("참조용 전체 프롬프트 타임라인 조회", () => {
+  it("최근 80개 밖의 note도 보존하면서 주제·범위·커서·계측 제외와 기존 조회 정책을 유지한다", () => {
+    const { database } = openDatabase();
+    try {
+      database.createTopic(topic());
+      database.createTopic({ ...topic("other"), slug: "other", worktreePath: "/tmp/other-worktree" });
+      database.appendEvent({ topicId: "topic-1", actor: "user", kind: "note", state: "DRAFT", body: "이전 범위" });
+      database.appendEvent({ topicId: "other", actor: "user", kind: "note", state: "DRAFT", body: "다른 주제" });
+      database.updateTopic("topic-1", { scopeGeneration: 2 });
+      database.appendEvent({ topicId: "topic-1", actor: "user", kind: "decision", state: "DRAFT", body: "오래된 결정" });
+      const bodies = Array.from({ length: 100 }, (_, index) => `참고 ${index + 1}`);
+      const events = bodies.map(body => database.appendEvent({ topicId: "topic-1", actor: "user", kind: "note", state: "DRAFT", body }));
+      for (const key of ["usage", "promptMetrics", "verificationMetrics", "executionWarning"]) {
+        database.appendEvent({ topicId: "topic-1", actor: "system", kind: "system", state: "DRAFT",
+          body: `계측 ${key}`, payload: { [key]: {} } });
+      }
+      database.updateTopic("topic-1", { scopeGeneration: 3 });
+      database.appendEvent({ topicId: "topic-1", actor: "user", kind: "note", state: "DRAFT", body: "다음 범위" });
+
+      expect(database.getPromptTimeline("topic-1", 2, 0, "all").map(event => event.body)).toEqual(["오래된 결정", ...bodies]);
+      expect(database.getPromptTimeline("topic-1", 2, events[10].sequence, "all").map(event => event.body)).toEqual(bodies.slice(11));
+      expect(database.getPromptTimeline("topic-1", 2, events[99].sequence, "all")).toEqual([]);
+      expect(database.getPromptTimeline("topic-1", 2).map(event => event.body)).toEqual(["오래된 결정", ...bodies.slice(20)]);
+      expect(database.getPromptTimeline("topic-1", 2, 0, "recent")).toEqual(database.getPromptTimeline("topic-1", 2));
+      expect(database.getPromptTimeline("topic-1", 1, 0, "all").map(event => event.body)).toEqual(["이전 범위"]);
+      expect(database.getPromptTimeline("other", 1, 0, "all").map(event => event.body)).toEqual(["다른 주제"]);
+    } finally {
+      database.close();
+    }
   });
 });
 

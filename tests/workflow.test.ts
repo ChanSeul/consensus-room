@@ -631,8 +631,8 @@ describe("applyPlanEdits", () => {
 describe("프롬프트 처분 계약 스위프", () => {
   it("finding을 방출하는 모든 build*Prompt는 dispositionContract를 포함한다", () => {
     const source = readFileSync(join(__dirname, "..", "src", "shared", "prompts.ts"), "utf8");
-    // finding을 방출하지 않는 빌더만 예외: ACK·리뷰 답변 확인(프로토콜 확인), 교정(메타 프롬프트).
-    const exempt = new Set(["buildPlanAckPrompt", "buildContractCorrectionPrompt", "buildReviewAnswerConfirmationPrompt"]);
+    // finding을 방출하지 않는 빌더만 예외: ACK·리뷰 답변 확인·리뷰 읽기(E3-4c — 판정 전 쪽만 싣고 ACK 만 받는 프로토콜 확인), 교정(메타 프롬프트).
+    const exempt = new Set(["buildPlanAckPrompt", "buildContractCorrectionPrompt", "buildReviewAnswerConfirmationPrompt", "buildReviewReadPrompt"]);
     const names = [...source.matchAll(/export function (build\w*Prompt)/g)].map((match) => match[1]);
     expect(names.length).toBeGreaterThanOrEqual(8);
     const boundaries = [...source.matchAll(/export function build\w*Prompt/g)].map((match) => match.index!);

@@ -18,11 +18,17 @@ it("does not allow unverified content to be marked reviewed and preserves the re
   const view = render(<EvidencePanel topicId="t" busy={false} />);
   const button = await screen.findByRole("button", { name: "현재 계획에서 검토 완료", hidden: true });
   expect(button).toBeDisabled(); expect(review).not.toHaveBeenCalled();
-  view.unmount(); vi.spyOn(api, "evidence").mockResolvedValue(state());
+  view.unmount();
+  const loaded = pending<EvidenceTopicState>();
+  vi.spyOn(api, "evidence").mockReturnValue(loaded.promise);
   render(<EvidencePanel topicId="t" busy={false} />);
   fireEvent.click(screen.getByText(/Slack · Jira · Figma 근거/));
-  const input = await screen.findByLabelText("원문 변경 영향");
+  expect(screen.queryByLabelText("원문 변경 영향")).not.toBeInTheDocument();
+  // 초기 응답과 그에 따른 이유 초기화가 반영된 뒤 사용자의 입력을 시작한다.
+  await act(async () => { loaded.resolve(state()); await loaded.promise; });
+  const input = screen.getByLabelText("원문 변경 영향");
   fireEvent.change(input, { target: { value: "Compared source and plan" } });
+  expect(input).toHaveValue("Compared source and plan");
   fireEvent.click(screen.getByRole("button", { name: "현재 계획에서 검토 완료" }));
   expect(await screen.findByRole("alert")).toHaveTextContent("Source changed");
   expect(input).toHaveValue("Compared source and plan");
@@ -48,12 +54,15 @@ it("registers once while pending and ignores an older poll that finishes after t
 it("clears the old review reason when polling detects a different plan", async () => {
   vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
   const current = { ...state(), plan: { ...state().plan, planSHA256: "e".repeat(64) } };
-  vi.spyOn(api, "evidence").mockResolvedValueOnce(state()).mockResolvedValue(current);
+  const loaded = pending<EvidenceTopicState>();
+  vi.spyOn(api, "evidence").mockReturnValueOnce(loaded.promise).mockResolvedValue(current);
   const review = vi.spyOn(api, "reviewEvidence").mockResolvedValue({});
   render(<EvidencePanel topicId="t" busy={false} />);
   fireEvent.click(screen.getByText(/Slack · Jira · Figma 근거/));
-  const input = await screen.findByLabelText("원문 변경 영향");
+  await act(async () => { loaded.resolve(state()); await loaded.promise; });
+  const input = screen.getByLabelText("원문 변경 영향");
   fireEvent.change(input, { target: { value: "Reason for old plan" } });
+  expect(input).toHaveValue("Reason for old plan");
   await act(async () => { await vi.advanceTimersByTimeAsync(15_000); });
   await waitFor(() => expect(input).toHaveValue(""));
   fireEvent.change(input, { target: { value: "Compared new plan" } });

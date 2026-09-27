@@ -248,6 +248,43 @@ export const TimelineEventSchema = z.object({
 });
 export type TimelineEvent = z.infer<typeof TimelineEventSchema>;
 
+// 역할과 실제 실행 AI(엔진 개편 E2c C3) — 토픽 상세가 역할·작업별 실제 경로와 좌석 세션의 바인딩을 함께 준다. 좌석 이름(claude·codex)은 호환 저장
+// 키일 뿐 실제 실행 AI 가 아니다 — 화면은 이 값으로 역할과 실제 AI 를 나눠 보여 준다. 과거 응답에는 없을 수 있다(선택 필드).
+const RouteProviderSchema = z.enum(["claude", "codex"]);
+export const RouteBasisViewSchema = z.union([
+  z.object({ kind: z.literal("default") }),
+  z.object({ kind: z.literal("assignment"), scope: z.string(), role: z.string(), operation: z.string(), version: z.number().int() }),
+]);
+export const SessionBindingViewSchema = z.object({
+  provider: RouteProviderSchema, participant: z.string(), profileId: z.string().nullable(), basis: RouteBasisViewSchema,
+});
+export const JobRouteViewSchema = z.object({
+  role: z.enum(["planner", "implementer", "reviewer"]),
+  operation: z.string(),
+  // 이 작업을 실제로 실행할 경로(공급자·참여자·프로필·근거·실행 설정). 배정이 실행할 수 없으면 null 이고 refusal 에 사유가 있다.
+  route: SessionBindingViewSchema.extend({ settings: AgentExecutionSettingsSchema }).nullable(),
+  // 실행 전 거부 사유(엔진 경로 판정과 같은 식) — 없으면 null.
+  refusal: z.string().nullable(),
+  // 부속 턴이면 경로를 물려받는 부모 작업(operation) — 엔진은 부모 작업의 배정·세션으로 실행하고 이 작업에 따로 둔 배정은 적용하지 않는다. 독립 작업이면 null.
+  inheritsFrom: z.string().nullable(),
+});
+export const SeatSessionViewSchema = z.object({
+  // 작성자 좌석(계획·구현 연속)·계획 검토 좌석·구현 세션·코드 리뷰 세션.
+  seat: z.enum(["author", "plan-review", "implementation", "code-review"]),
+  sessionId: z.string().nullable(),
+  // 그 세션을 만든 실제 공급자·참여자와 선택 근거. 세션이 없으면 null.
+  binding: SessionBindingViewSchema.nullable(),
+});
+const JobRefViewSchema = z.object({ role: z.enum(["planner", "implementer", "reviewer"]), operation: z.string() });
+export const RoutingViewSchema = z.object({
+  jobs: z.array(JobRouteViewSchema),
+  sessions: z.array(SeatSessionViewSchema),
+  // 두 좌석이 지금 실행 중이거나 다음에 열 작업 — 엔진 호출 지점과 같은 표로 서버가 정한다(화면이 단계별 작업을 따로 추정하지 않게).
+  current: z.object({ author: JobRefViewSchema, reviewer: JobRefViewSchema }),
+});
+export type RoutingView = z.infer<typeof RoutingViewSchema>;
+export type JobRouteView = z.infer<typeof JobRouteViewSchema>;
+
 export const TopicDetailSchema = z.object({
   topic: TopicSchema,
   timeline: z.array(TimelineEventSchema),
@@ -264,6 +301,7 @@ export const TopicDetailSchema = z.object({
     createdAt: z.string().datetime(),
     requestedPaths: z.array(z.string()),
   }).nullable(),
+  routing: RoutingViewSchema.optional(),
 });
 export type TopicDetail = z.infer<typeof TopicDetailSchema>;
 
@@ -386,9 +424,10 @@ export const ImplementInputSchema = z.object({
 });
 export type ImplementInput = z.infer<typeof ImplementInputSchema>;
 
+// paths 는 비어 있을 수 있다 — 파일 차이 없는 합류 병합 커밋(E4 2차 보완 F001)만 받는다. 일반 커밋은 인도 경로가 경로를 요구한다.
 export const DeliveryInputSchema = z.object({
   message: z.string().trim().min(1).max(500),
-  paths: z.array(z.string().min(1)).min(1).max(200),
+  paths: z.array(z.string().min(1)).max(200),
 });
 
 export const ReconcileDeliveryInputSchema = z.object({
