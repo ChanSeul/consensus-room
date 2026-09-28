@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readdir, readFile } from "node:fs/promises";
+import { open, readdir, readFile } from "node:fs/promises";
+import { constants } from "node:fs";
 import { join } from "node:path";
 import type { ExecutionLimits, TurnUsage } from "../types.js";
 import { codexUsageEvidence, sameTokenCounts, type CodexUsageEvidence } from "./codexUsageEvidence.js";
@@ -7,6 +8,70 @@ import { codexUsageEvidence, sameTokenCounts, type CodexUsageEvidence } from "./
 type CodexHomeUsage = Partial<TurnUsage> & { turnEvidence?: CodexUsageEvidence };
 
 type RecordValue = Record<string, unknown>;
+
+export interface ClaudeUsageBaseline {
+  sessionId: string;
+  modelUsage: Record<string, unknown>;
+  totalCostUSD?: number;
+  totalAPIDuration?: number;
+}
+
+// Claude's result.modelUsage is session-cumulative, including compaction. Its result.usage can
+// omit compaction. Anchor the former BEFORE spawning; never turn a missing resume anchor into zero.
+export async function readClaudeUsageBaseline(root: string, sessionId: string): Promise<ClaudeUsageBaseline | null> {
+  if (!/^[0-9a-f-]{36}$/i.test(sessionId)) return null;
+  const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const file = await open(join(root, entry.name, `${sessionId}.jsonl`), constants.O_RDONLY | constants.O_NOFOLLOW).catch(() => null);
+    if (!file) continue;
+    try {
+      const stat = await file.stat(), size = Math.min(stat.size, 2 * 1024 * 1024);
+      const buffer = Buffer.alloc(size);
+      const { bytesRead } = await file.read(buffer, 0, size, stat.size - size);
+      if (bytesRead !== size) return null;
+      const after = await file.stat();
+      if (stat.size !== after.size || stat.mtimeMs !== after.mtimeMs) return null;
+      const lines = buffer.toString("utf8").split("\n");
+      if (size < stat.size) lines.shift();
+      for (const line of lines.reverse()) {
+        let value: RecordValue;
+        try { value = JSON.parse(line); } catch { continue; }
+        if (value?.type !== "cost-state") continue;
+        if (value.sessionId !== sessionId || !record(value.modelUsage)) return null;
+        return { sessionId, modelUsage: value.modelUsage as RecordValue,
+          totalCostUSD: typeof value.totalCostUSD === "number" ? value.totalCostUSD : undefined,
+          totalAPIDuration: typeof value.totalAPIDuration === "number" ? value.totalAPIDuration : undefined };
+      }
+    } finally { await file.close(); }
+    return null;
+  }
+  return null;
+}
+
+function claudeSessionDelta(baseline: ClaudeUsageBaseline | undefined, event: RecordValue): Partial<TurnUsage> | null {
+  const models = record(event.modelUsage);
+  if (!baseline || event.session_id !== baseline.sessionId || !models || !Object.keys(models).length) return null;
+  if (Object.keys(baseline.modelUsage).some(model => !record(models[model]))) return null;
+  const keys = ["inputTokens", "cacheReadInputTokens", "cacheCreationInputTokens", "outputTokens"] as const;
+  const sum = { inputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, outputTokens: 0 };
+  for (const [model, raw] of Object.entries(models)) {
+    const current = record(raw), before = record(baseline.modelUsage[model]);
+    if (!current || (baseline.modelUsage[model] !== undefined && !before)) return null;
+    for (const key of keys) {
+      const now = current[key], prior = before ? before[key] : 0;
+      if (!Number.isSafeInteger(now) || !Number.isSafeInteger(prior) || (prior as number) < 0 || (now as number) < (prior as number)) return null;
+      sum[key] += (now as number) - (prior as number);
+      if (!Number.isSafeInteger(sum[key])) return null;
+    }
+  }
+  const inputTokens = sum.inputTokens + sum.cacheReadInputTokens + sum.cacheCreationInputTokens;
+  if (!Number.isSafeInteger(inputTokens)) return null;
+  const difference = (now: unknown, before: unknown): number | undefined =>
+    typeof now === "number" && Number.isFinite(now) && typeof before === "number" && Number.isFinite(before) && before >= 0 && now >= before ? now - before : undefined;
+  return { inputTokens, cachedInputTokens: sum.cacheReadInputTokens, outputTokens: sum.outputTokens,
+    costUSD: difference(event.total_cost_usd, baseline.totalCostUSD), apiDurationMs: difference(event.duration_api_ms, baseline.totalAPIDuration) };
+}
 
 function record(value: unknown): RecordValue | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value as RecordValue : null;
@@ -68,6 +133,10 @@ export class ExecutionMetrics {
   private claudeAssistantRequests = 0;
   private reconciliation: TurnUsage["sourceUsage"];
   private reconciledCodexTurn = false;
+  private claudeBaseline?: ClaudeUsageBaseline;
+  private claudeCompacted = false;
+
+  setClaudeBaseline(baseline: ClaudeUsageBaseline | null): void { this.claudeBaseline = baseline ?? undefined; }
 
   constructor(
     private readonly kind: "claude" | "codex",
@@ -80,6 +149,7 @@ export class ExecutionMetrics {
 
   observe(value: unknown): void {
     const envelope = record(value);
+    if (this.kind === "claude" && envelope?.type === "system" && envelope.subtype === "compact_boundary") this.claudeCompacted = true;
     if (this.kind === "claude" && envelope?.type === "stream_event") {
       if (this.finalSourceSeen || envelope.parent_tool_use_id) return;
       const chunk = record(envelope.event);
@@ -176,6 +246,26 @@ export class ExecutionMetrics {
       }
       // num_turns is the authoritative aggregate when present. The streamed count is retained only for
       // an aborted run that never emitted result.
+      const sessionDelta = claudeSessionDelta(this.claudeBaseline, event);
+      const coversObserved = sessionDelta && (["inputTokens", "cachedInputTokens", "outputTokens"] as const).every(key =>
+        sessionDelta[key] !== undefined && sessionDelta[key]! >= Math.max(streamed[key] ?? 0, this.totals[key] ?? 0));
+      if (coversObserved) {
+        this.reconciliation = { cli: { ...this.totals }, claudeStream: streamed, claudeSession: sessionDelta, status: "matched" };
+        this.totals = { inputTokens: sessionDelta.inputTokens, cachedInputTokens: sessionDelta.cachedInputTokens, outputTokens: sessionDelta.outputTokens };
+        this.metadata = { ...this.metadata, costUSD: sessionDelta.costUSD, apiDurationMs: sessionDelta.apiDurationMs };
+        this.finalUsageComplete = true;
+      } else if (record(event.modelUsage)) {
+        // These fields are cumulative too; without a verified baseline they are not this run's cost.
+        delete this.metadata.costUSD;
+        delete this.metadata.apiDurationMs;
+        if (this.claudeCompacted || this.claudeBaseline) {
+          this.finalUsageComplete = false;
+          this.reconciliation = { cli: { ...this.totals }, claudeStream: streamed, status: "unavailable" };
+          for (const key of ["inputTokens", "cachedInputTokens", "outputTokens"] as const) {
+            if (streamed[key] !== undefined) this.totals[key] = Math.max(this.totals[key] ?? 0, streamed[key]!);
+          }
+        }
+      }
       this.internalRequests = number(event.num_turns) ?? this.claudeAssistantRequests;
       return;
     }

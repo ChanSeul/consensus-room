@@ -599,7 +599,7 @@ it("activity API는 현재 세대의 역할별 최신 관측과 시각을 반환
   await app.close();
 });
 
-it("작업 묶음 API는 단계 생성 중복을 막고 계약 변경 때 승인을 무효화한다",async()=>{
+it.each(["grant","resume"])("작업 묶음 API는 단계 생성 중복·계약 개정·예산 %s 경계를 지킨다",async mode=>{
  // 새 단계 토픽은 계획 제어 v2 다(E4 2차 보완 F012) — 예산 재개 뒤 계획 턴이 실제 작업 트리 스냅숏을 거쳐 에이전트에 닿도록 실제 git 저장소를 쓴다.
  const {runner,worktreeAdds}=countingRealGitRunner();let failWorktree=false;
  const {app,database,adapterCalls,adapterCalled}=await makeApp({run:spec=>{if(failWorktree&&spec.args[0]==="worktree")throw new Error("worktree failure");return runner.run(spec);}},undefined,{gitRepository:true});
@@ -635,15 +635,18 @@ it("작업 묶음 API는 단계 생성 중복을 막고 계약 변경 때 승인
   expect(database.budgets.account(topic.id)?.policy).toEqual(budget);
   database.updateTopic(topic.id,{state:"USER_DECISION_REQUIRED",resumeState:"CLAUDE_PLAN"});
   database.appendEvent({topicId:topic.id,actor:"system",kind:"system",state:"USER_DECISION_REQUIRED",body:"예산 중단",payload:{budgetPause:true,resumeState:"CLAUDE_PLAN"}});
-  database.budgets.start({id:"group-cap",accounts:[group.id],startedAt:Date.now(),stage:"PLAN",role:"claude",model:"test",effort:"test"});
+  database.budgets.start({id:"group-cap",accounts:[group.id,topic.id],startedAt:Date.now(),stage:"PLAN",role:"claude",model:"test",effort:"test"});
   database.budgets.observe("group-cap",{inputTokens:100},Date.now(),true);
+  database.budgets.resumeExecution(topic.id,"topic-resume","group-cap",1);
   const groupPolicy=database.budgets.account(group.id)!.policy;
-  const granted=await post(`/api/work-groups/${group.id}/budget`,{version:1,policy:{...groupPolicy,execution:{...groupPolicy.execution,inputTokens:200}}},"grant");
+  const budgetBody=mode==="resume"?{version:1,resumeExecutionId:"group-cap"}:{version:1,policy:{...groupPolicy,execution:{...groupPolicy.execution,inputTokens:200}}};
+  const granted=await post(`/api/work-groups/${group.id}/budget`,budgetBody,"grant");
   expect(granted.statusCode).toBe(200);
   expect(await adapterCalled).toBe("claude");
   expect(adapterCalls).toEqual(["claude"]);
   await vi.waitFor(()=>expect(database.runningAction(topic.id)).toBeNull());
   expect(database.budgets.account(group.id)?.used.inputTokens).toBe(100);
+  if(mode==="resume")expect(database.budgets.account(group.id)?.policy).toEqual(groupPolicy);
 
  } finally {await app.close();}
 });
@@ -683,6 +686,94 @@ it("재작성 승인 후 토큰 예산이 없으면 승인만 보존하고 호�
   const grant=await app.inject({method:"POST",url:"/api/topics/both/actions/revision-resume",payload:{version:1},headers:{"x-consensus-token":"launch-token-for-test","idempotency-key":"grant"}});
   expect(grant.statusCode).toBe(200);expect(grant.json().resumeBlocked).toContain("예산");
   expect(database.revisions.account("both")).toMatchObject({used:3,limit:4});expect(adapterCalls).toHaveLength(0);
+ } finally {await app.close();}
+});
+
+it("authenticated budget resumption keeps the policy and prior usage and dispatches only once",async()=>{
+ const {app,database,root,adapterCalls,adapterCalled}=await makeApp(countingGitRunner().runner);
+ const policy={execution:{inputTokens:1000,outputTokens:1000,durationMs:100000},total:{inputTokens:10000,outputTokens:10000,durationMs:1000000}};
+ try {
+  draftTopic(database,"resume-budget",{worktreePath:root});
+  for(const role of ["claude","codex"] as const)database.upsertParticipant("resume-budget",{role,sessionId:`${role}-same`,mode:"attached",acknowledgedPlanSHA256:null});
+  database.updateTopic("resume-budget",{state:"USER_DECISION_REQUIRED",resumeState:"CLAUDE_PLAN"});
+  database.budgets.configure("resume-budget",policy,"test");
+  database.budgets.start({id:"stopped",accounts:["resume-budget"],stage:"CLAUDE_PLAN",role:"claude",model:"opus",effort:"xhigh",startedAt:0,dispatchStarted:true});
+  database.budgets.observe("stopped",{inputTokens:1100},1,true);
+  const url="/api/topics/resume-budget/actions/budget-resume",payload={resumeExecutionId:"stopped",version:1};
+  expect((await app.inject({method:"POST",url,payload})).statusCode).toBe(401);
+  const headers={"x-consensus-token":"launch-token-for-test","idempotency-key":"same-allowance"};
+  expect((await app.inject({method:"POST",url,payload:{...payload,policy},headers:{...headers,"idempotency-key":"mixed"}})).statusCode).toBeGreaterThanOrEqual(400);
+  const response=await app.inject({method:"POST",url,payload,headers});
+  expect(response.statusCode,response.body).toBe(200);
+  expect(await adapterCalled).toBe("claude");
+  await vi.waitFor(()=>expect(database.runningAction("resume-budget")).toBeNull());
+  expect((await app.inject({method:"POST",url,payload,headers})).json()).toEqual(response.json());
+  expect(adapterCalls).toEqual(["claude"]);
+  expect(database.budgets.account("resume-budget")).toMatchObject({policy,used:{inputTokens:1100},version:2});
+  expect(database.budgets.execution("stopped").used.inputTokens).toBe(1100);
+ } finally {await app.close();}
+});
+
+it("records a topic resume while its shared account remains paused, then resumes only that execution's topic",async()=>{
+ const {app,database,root,adapterCalls,adapterCalled}=await makeApp(countingGitRunner().runner);
+ const policy={execution:{inputTokens:100,outputTokens:1000,durationMs:100000},total:{inputTokens:1000,outputTokens:10000,durationMs:1000000}};
+ const post=(url:string,payload:unknown,key:string)=>app.inject({method:"POST",url,payload:payload as any,
+  headers:{"x-consensus-token":"launch-token-for-test","idempotency-key":key}});
+ try {
+  const stages=[{id:"first",kind:"work" as const,title:"Earlier",goal:"Earlier",acceptance:"Check",dependsOn:[],budget:policy},
+   {id:"target",kind:"work" as const,title:"Target",goal:"Target",acceptance:"Check",dependsOn:[],budget:policy},
+   {id:"integration",kind:"integration" as const,title:"Integrate",goal:"Integrate",acceptance:"Check",dependsOn:["first","target"],budget:policy}];
+  database.workGroups.create("shared",{title:"Group",goal:"Goal",contracts:"Contract",stages},root,"a".repeat(40));
+  database.budgets.configure("shared",policy,"test");
+  for(const id of ["first","target"]) {
+   draftTopic(database,id,{repositoryPath:root,worktreePath:root});
+   database.workGroups.link("shared",id,id,"a".repeat(40));
+   database.budgets.configure(id,policy,"test");
+   database.updateTopic(id,{state:id==="first"?"FAILED":"USER_DECISION_REQUIRED",resumeState:"CLAUDE_PLAN"});
+   for(const role of ["claude","codex"] as const)database.upsertParticipant(id,{role,sessionId:`${id}-${role}`,mode:"attached",acknowledgedPlanSHA256:null});
+  }
+  database.appendEvent({topicId:"target",actor:"system",kind:"system",state:"USER_DECISION_REQUIRED",body:"Budget stopped",payload:{budgetPause:true,resumeState:"CLAUDE_PLAN"}});
+  database.budgets.start({id:"shared-stop",accounts:["shared","target"],stage:"CLAUDE_PLAN",role:"claude",model:"opus",effort:"xhigh",startedAt:0});
+  database.budgets.observe("shared-stop",{inputTokens:110},1,true);
+  const payload={resumeExecutionId:"shared-stop",version:1},url="/api/topics/target/actions/budget-resume";
+  const recorded=await post(url,payload,"topic-resume");
+  expect(recorded.statusCode,recorded.body).toBe(200);expect(recorded.json().resumeBlocked).toContain("예산");
+  expect((await post(url,payload,"topic-resume")).json()).toEqual(recorded.json());
+  expect(database.budgets.account("target")).toMatchObject({pause:null,version:2,used:{inputTokens:110},policy});
+  expect(database.budgets.account("shared")?.pause?.executionId).toBe("shared-stop");
+  expect(adapterCalls).toEqual([]);
+  const resumed=await post("/api/work-groups/shared/budget",payload,"group-resume");
+  expect(resumed.statusCode,resumed.body).toBe(200);expect(resumed.json().resumedTopicId).toBe("target");
+  expect(await adapterCalled).toBe("claude");
+  await vi.waitFor(()=>expect(database.runningAction("target")).toBeNull());
+  expect(database.getTopic("first").state).toBe("FAILED");expect(database.latestAction("first")).toBeNull();
+  expect(adapterCalls).toEqual(["claude"]);
+ } finally {await app.close();}
+});
+
+it.each(["held","closed","stale"])("budget resume checks the existing %s review reservation before requiring a new allowance",async kind=>{
+ const {app,database,root}=await makeApp(countingGitRunner().runner);
+ const policy={execution:{inputTokens:100,outputTokens:1000,durationMs:100000},total:{inputTokens:1000,outputTokens:10000,durationMs:1000000}};
+ try {
+  draftTopic(database,"reserved",{worktreePath:root});
+  const topic=database.updateTopic("reserved",{state:"USER_DECISION_REQUIRED",resumeState:"CODEX_REVIEW"});
+  database.appendEvent({topicId:topic.id,actor:"system",kind:"system",state:topic.state,body:"Budget stopped",payload:{budgetPause:true,resumeState:"CODEX_REVIEW"}});
+  const ledger=database.planning.openReviewLedger({topicId:topic.id,kind:"codex-review",scopeGeneration:topic.scopeGeneration,
+   planEpoch:topic.planEpoch,planSHA256:topic.planSHA256,reviewedTree:"tree",reportRevision:1});
+  for(const id of ["old-1","old-2",ledger.id])database.reviews.admit(topic.id,id,"implementation");
+  database.planning.markReviewLedgerSpawned(ledger.id);
+  if(kind==="closed")database.planning.judgeReviewLedger(ledger.id);
+  if(kind==="stale")database.updateTopic(topic.id,{planEpoch:topic.planEpoch+1});
+  database.budgets.configure(topic.id,policy,"test");
+  database.budgets.start({id:"reserved-stop",accounts:[topic.id],stage:"CODEX_REVIEW",role:"codex",model:"test",effort:"test",startedAt:0});
+  database.budgets.observe("reserved-stop",{inputTokens:110},1,true);
+  const response=await app.inject({method:"POST",url:`/api/topics/${topic.id}/actions/budget-resume`,payload:{version:1,resumeExecutionId:"reserved-stop"},
+   headers:{"x-consensus-token":"launch-token-for-test","idempotency-key":"resume-held"}});
+  expect(response.statusCode,response.body).toBe(200);
+  if(kind==="held") {expect(response.json().resumeBlocked).toBeUndefined();expect(database.latestAction(topic.id)).not.toBeNull();}
+  else {expect(response.json().resumeBlocked).toContain("리뷰");expect(database.latestAction(topic.id)).toBeNull();}
+  await vi.waitFor(()=>expect(database.runningAction(topic.id)).toBeNull());
+  expect(database.reviews.account(topic.id,"implementation")).toMatchObject({used:3,limit:3,version:1});
  } finally {await app.close();}
 });
 

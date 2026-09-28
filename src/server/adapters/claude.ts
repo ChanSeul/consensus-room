@@ -18,7 +18,7 @@ import { agentEnvironment } from "../security.js";
 import { ProjectMemoryReader, type MemoryReaderOptions } from "../projectMemory.js";
 import { readAppliedInstructions } from "../projectInstructions.js";
 import { agentRunError, parsePlanRepair, parseAgentResult, isZeroTurnResult } from "./resultParser.js";
-import { ExecutionMetrics } from "./executionMetrics.js";
+import { ExecutionMetrics, readClaudeUsageBaseline } from "./executionMetrics.js";
 import { createToolTimeMeter } from "./toolTime.js";
 import { resolveSupportedTurn, runnerControlPaths } from "./turnPolicy.js";
 
@@ -38,10 +38,17 @@ export interface ClaudeAdapterOptions {
   onZeroTurnRetry?: () => void;
 }
 
-// --plugin-dir로 로드되는 유일한 스킬 원천. 다른 원천은 --safe-mode와 빈 --setting-sources가 계속 차단한다.
-// 구현 세션(sonnet, 여러 턴을 resume)은 600K — 850K 이상 resume 이 빈 턴으로 죽은 실측 때문. 계획·개정·ACK 세션(fable 1M,
-// 턴마다 새 세션)은 사용자 설정과 같은 800K — 계획 턴은 문서를 넓게 읽는 단일 턴이라 일찍 압축하면 근거를 잃는다(2026-09-14 사용자 지적).
+// 기존 사용자가 지정한 압축 상한. 자율 도구 턴에는 아래 예산 기반 목표를 함께 적용한다.
+// 세션을 교체하거나 모델·추론 설정을 바꾸지 않으며, 계획 제어·프로토콜 호출은 기존 값을 유지한다.
 export const RUNNER_AUTO_COMPACT_WINDOW = { implementation: 600_000, planning: 800_000 } as const;
+
+// Leave room for repeated tool/model round trips, not just one request fitting the context window.
+// 64 is a sizing allowance, NOT a tool/turn limit. Claude's supported minimum is 100k; below that
+// the ledger still enforces the real allowance. Compaction is provider-native in the SAME session.
+function budgetedCompactWindow(defaultWindow: number, inputAllowance?: number): number {
+  if (inputAllowance === undefined || !Number.isSafeInteger(inputAllowance) || inputAllowance <= 0) return defaultWindow;
+  return Math.min(defaultWindow, Math.max(100_000, Math.floor(inputAllowance / 64)));
+}
 
 const MANAGED_PLUGIN_MANIFEST = JSON.stringify({
   name: "consensus-room",
@@ -153,6 +160,9 @@ export class ClaudeAdapter implements AgentAdapter {
     try {
       const permissionMode = policy.planMode ? "plan" : "dontAsk";
       const executionSettings = turn.settings ?? DEFAULT_AGENT_SETTINGS.claude;
+      const defaultWindow = policy.access === "write" ? RUNNER_AUTO_COMPACT_WINDOW.implementation : RUNNER_AUTO_COMPACT_WINDOW.planning;
+      const compactWindow = policy.tools !== "none" && !turn.planningControl
+        ? budgetedCompactWindow(defaultWindow, turn.executionBudget?.inputTokens) : defaultWindow;
       const figmaMcpUrl = policy.figma ? this.options.figmaMcpUrl ?? null : null;
       // 빈 객체 {}는 실 CLI가 "Invalid MCP configuration"으로 거부한다(실측). mcpServers 키는 항상 있어야 한다.
       const mcpConfig = {
@@ -188,6 +198,7 @@ export class ClaudeAdapter implements AgentAdapter {
             skillSourceDirectories,
             readablePaths: turn.readablePaths,
             ultracode: providerOptions.ultracode,
+            autoCompactWindow: compactWindow,
           },
         )),
         // 도구 목록은 정책 값으로 조립한다: 쓰기 도구 상한이면 Edit·Write, 웹이면 WebSearch·WebFetch, 팬아웃이면 Workflow. 정책은 쓰기 턴과 검토자의
@@ -244,7 +255,16 @@ export class ClaudeAdapter implements AgentAdapter {
       }
       const startedAt = Date.now();
       const toolTime = createToolTimeMeter("claude");
+      const environment = agentEnvironment({
+        TMPDIR: actionTemp,
+        XDG_CACHE_HOME: join(actionTemp, "cache"),
+        CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
+      });
       const metrics = new ExecutionMetrics("claude", Buffer.byteLength(stdin, "utf8"), executionSettings.model, executionSettings.effort, !newSession, startedAt);
+      const requestedSession = sessionArgs[1];
+      metrics.setClaudeBaseline(newSession
+        ? { sessionId: requestedSession, modelUsage: {}, totalCostUSD: 0, totalAPIDuration: 0 }
+        : await readClaudeUsageBaseline(resolve(workspace, environment.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "projects"), requestedSession));
       const designCalls = new Map<string, { tool: string; input: unknown; content?: unknown; received: boolean; error: boolean; delivered: boolean }>();
       let designCaptureError: unknown;
       const observeDesign = (value: unknown) => {
@@ -278,11 +298,11 @@ export class ClaudeAdapter implements AgentAdapter {
         finalRecorded = true;
         // abort/error라도 이미 스트림에서 받은 관측값과 실행 메타데이터는 남긴다. 이벤트가 전혀 없으면
         // 토큰을 0으로 만들지 않고 completeness=partial로만 기록한다.
-        try { turn.onUsage?.(metrics.snapshot(toolTime.summary(), "final")); } catch { /* observer is non-fatal */ }
+        try { turn.onUsage?.({ ...metrics.snapshot(toolTime.summary(), "final"), autoCompactWindowTokens: compactWindow }); } catch { /* observer is non-fatal */ }
       };
       const progressTimer = setInterval(() => {
         if (!metrics.hasFinalSource()) {
-          try { turn.onUsage?.(metrics.snapshot(toolTime.summary(), "progress")); } catch { /* observer is non-fatal */ }
+          try { turn.onUsage?.({ ...metrics.snapshot(toolTime.summary(), "progress"), autoCompactWindowTokens: compactWindow }); } catch { /* observer is non-fatal */ }
         }
       }, 10_000);
       try {
@@ -295,11 +315,7 @@ export class ClaudeAdapter implements AgentAdapter {
         // stream-json 의 마지막 줄은 {"type":"result"} 다. 그 뒤 2분 안에 프로세스가 안 끝나면 hang 으로 보고 정리한다.
         finalResultTimeoutMs: FINAL_RESULT_TIMEOUT_MS,
         isFinalResult: (value) => typeof value === "object" && value !== null && (value as { type?: unknown }).type === "result",
-        environment: agentEnvironment({
-          TMPDIR: actionTemp,
-          XDG_CACHE_HOME: join(actionTemp, "cache"),
-          CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
-        }),
+        environment,
       });
       // 테스트용 runner가 onJSONLine을 생략해도 최종 버퍼를 한 번 관찰한다.
       for (const value of output.jsonLines) { metrics.observe(value); observeDesign(value); }
@@ -432,6 +448,7 @@ export function buildIsolationSettings(
     ultracode?: boolean;
     // 정책의 하위 에이전트 팬아웃(E2c) — Workflow 허용과 ultracode 를 정한다. 없으면 쓰기 접근(implementation)과 같다(E2c 이전: 쓰기 턴에서만 팬아웃).
     fanout?: boolean;
+    autoCompactWindow?: number;
   } = {},
 ): Record<string, unknown> {
   const home = homedir();
@@ -466,7 +483,7 @@ export function buildIsolationSettings(
     // 러너는 --setting-sources "" 라 사용자 settings 의 autoCompactWindow 를 못 받는다 → CLI 기본 임계값까지 컨텍스트가 자라
     // 850K 이상 세션을 resume 하면 빈 턴("No response requested")으로 죽었다(2026-09-06 실측, 중재자가 600K 넘으면 손으로 세션 교체).
     // 600K 에서 압축하도록 명시한다(2026-09-14 사용자 결정 "그 값으로 해").
-    autoCompactWindow: implementation ? RUNNER_AUTO_COMPACT_WINDOW.implementation : RUNNER_AUTO_COMPACT_WINDOW.planning,
+    autoCompactWindow: options.autoCompactWindow ?? (implementation ? RUNNER_AUTO_COMPACT_WINDOW.implementation : RUNNER_AUTO_COMPACT_WINDOW.planning),
     // ultracode는 effort 값이 아니라 session-start 설정 키다. `--effort ultracode`는 CLI가 경고만 찍고
     // 조용히 기본 effort로 떨어뜨린다(실측: "Valid values: low, medium, high, xhigh, max").
     // 팬아웃을 연 턴(쓰기 턴·검토자 읽기 턴)에서만 켠다 — 계획자 턴은 Workflow를 열지 않아 켜 봐야 동작할 도구가 없다. 프로필이 ultracode:false 를

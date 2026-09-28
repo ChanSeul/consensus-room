@@ -3,6 +3,8 @@ import {reviewScope,type ReviewScope} from "../shared/reviews.js";
 import { assertToleranceWidening, normalizeToleranceBlocks, parseTolerancePolicy, replaceToleranceBlock, TolerancePolicySchema } from "../shared/tolerance.js";
 import { hashPlan, normalizePlan } from "../shared/workflow.js";
 import { RevisionBlocked } from "./revisionLedger.js";
+import { ReviewBlocked } from "./reviewLedger.js";
+import { BudgetBlocked } from "./budgetLedger.js";
 import { createHash, randomUUID } from "node:crypto";
 import { describePrune, pruneBuildTrees } from "./buildTrees.js";
 import { basename, dirname, join } from "node:path";
@@ -518,6 +520,19 @@ export class WorkflowEngine {
       else this.core.resetToDraft(topic, message);
       await this.planning.runPlanningLoop(topic.id, signal);
     }, actionId);
+  }
+
+  // A recorded budget resume may still need another account or a new allowance. Reuse the
+  // retry admission check so an already-held logical review/rewrite is not charged again.
+  budgetResumeBlocker(topicId: string): string | null {
+    try {
+      this.core.assertBudgetAvailable(topicId);
+      this.core.assertRetryRewriteAvailable(topicId);
+      return null;
+    } catch (error) {
+      if (error instanceof BudgetBlocked || error instanceof ReviewBlocked || error instanceof RevisionBlocked) return error.message;
+      throw error;
+    }
   }
 
   reviewPaused(topicId:string):ReviewScope|null {

@@ -403,6 +403,7 @@ describe("E3-4c 코드 리뷰 원장과 사용 한도 자동 재시도", () => {
     // 가용 횟수가 0 이어도 같은 원장의 예약으로 이어지므로 자동 재시도를 예약했다.
     expect(clock.timers).toHaveLength(1);
 
+    expect(room.engine.budgetResumeBlocker(topicId)).toBeNull();
     clock.fire();
     await waitForIdle(database, topicId);
     expect(database.getTimeline(topicId).some((event) => event.body.includes("자동 재시도를 시작했습니다(1/3)"))).toBe(true);
@@ -418,6 +419,7 @@ describe("E3-4c 코드 리뷰 원장과 사용 한도 자동 재시도", () => {
     const { database, clock, codex, topicId } = room;
     expect(clock.timers).toHaveLength(1);
     database.planning.judgeReviewLedger(database.planning.latestReviewLedger(topicId)!.id);
+    expect(room.engine.budgetResumeBlocker(topicId)).toContain("리뷰");
     clock.fire();
     await waitForIdle(database, topicId);
     expect(codex.calls).toEqual(["review"]);
@@ -432,6 +434,7 @@ describe("E3-4c 코드 리뷰 원장과 사용 한도 자동 재시도", () => {
     const { database, clock, codex, topicId } = room;
     expect(clock.timers).toHaveLength(1);
     database.updateTopic(topicId, { planEpoch: database.getTopic(topicId).planEpoch + 1 });
+    expect(room.engine.budgetResumeBlocker(topicId)).toContain("리뷰");
     clock.fire();
     await waitForIdle(database, topicId);
     expect(codex.calls).toEqual(["review"]);

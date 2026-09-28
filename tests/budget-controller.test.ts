@@ -5,6 +5,24 @@ import { BudgetLedger } from "../src/server/budgetLedger";
 import type { AgentAdapter, SessionTurn } from "../src/server/types";
 const policy={execution:{inputTokens:10,outputTokens:10,durationMs:100000},total:{inputTokens:50,outputTokens:50,durationMs:300000}};
 afterEach(()=>vi.useRealTimers());
+it("passes the narrowest remaining account allowance without changing limits, model, or resumed session", async () => {
+ const db=new DatabaseSync(":memory:"),ledger=new BudgetLedger(db);
+ const large={execution:{inputTokens:9000000,outputTokens:240000,durationMs:2400000},total:{inputTokens:45000000,outputTokens:900000,durationMs:28800000}};
+ ledger.configure("t",large,"test");ledger.configure("group",{...large,total:{...large.total,inputTokens:5000000}},"test");
+ ledger.start({id:"prior",accounts:["group"],stage:"PLAN",role:"claude",model:"m",effort:"xhigh",startedAt:0});
+ ledger.observe("prior",{inputTokens:1800000},1,true);
+ const result={kind:"ACK" as const,summary:"done",findings:[],evidenceRefs:[]};
+ const received:SessionTurn[]=[];
+ const adapter:AgentAdapter={role:"claude",validateExistingSession:async()=>true,createSession:async()=>{throw Error("must resume");},
+  resumeTurn:async turn=>{received.push(turn);return result;}};
+ const wrapped=new BudgetController(ledger,()=>({topicId:"t",accounts:["t","group"],stage:"IMPLEMENTING"}),async()=>{}).wrap(adapter);
+ await wrapped.resumeTurn({cwd:"/tmp",prompt:"approved work",sessionId:"same-planning-session",settings:{model:"opus",effort:"xhigh"},
+  executionBudget:{inputTokens:Number.MAX_SAFE_INTEGER,outputTokens:Number.MAX_SAFE_INTEGER,durationMs:Number.MAX_SAFE_INTEGER}});
+ expect(received[0]).toMatchObject({sessionId:"same-planning-session",settings:{model:"opus",effort:"xhigh"},
+  executionBudget:{inputTokens:3200000,outputTokens:240000,durationMs:2400000}});
+ expect(ledger.account("t")!.policy).toEqual(large);
+ expect(ledger.account("group")!.used.inputTokens).toBe(1800000);db.close();
+});
 it("records dispatch before the process can start while preserving the caller's admission guard", async () => {
  const db=new DatabaseSync(":memory:"),ledger=new BudgetLedger(db);ledger.configure("t",policy,"test");
  const current=()=>ledger.execution(String(db.prepare("SELECT id FROM budget_executions").get()!.id));

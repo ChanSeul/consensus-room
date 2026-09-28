@@ -10,6 +10,11 @@ export const BUDGET_KEYS = ["inputTokens", "outputTokens", "durationMs"] as cons
 export const zeroBudget = (): BudgetVector => ({ inputTokens: 0, outputTokens: 0, durationMs: 0 });
 export const BudgetPolicySchema = z.object({ execution: BudgetVectorSchema, total: BudgetVectorSchema }).strict();
 export type BudgetPolicy = z.infer<typeof BudgetPolicySchema>;
+// Resuming a FINISHED per-execution stop is distinct from purchasing a larger allowance.
+export const BudgetResumeInputSchema = z.union([
+  z.object({ policy: BudgetPolicySchema, version: z.number().int().positive() }).strict(),
+  z.object({ resumeExecutionId: z.string().min(1), version: z.number().int().positive() }).strict(),
+]);
 export interface BudgetPause {
   reason: string;
   executionId?: string;

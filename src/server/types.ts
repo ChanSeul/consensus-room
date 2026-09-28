@@ -134,6 +134,9 @@ export interface SessionTurn {
   onInterruptedOutput?: CommandSpec["onInterruptedOutput"];
   // 모든 값이 기본 미설정인 실행별 관찰 한도. 한도는 중단이 아닌 경고에만 쓴다.
   limits?: ExecutionLimits;
+  // Host-owned remaining allowance for this invocation (minimum of execution and account totals).
+  // Providers may compact earlier to fit it; this neither replaces nor increases ledger limits.
+  executionBudget?: Readonly<import("../shared/budgets.js").BudgetVector>;
   // 세션 id 가 만들어진 즉시(프로세스 실행 전) 알린다 — 턴이 429·stop 으로 끊겨도 resume 할 수 있게 저장하기 위함(2026-09-03 실측).
   onSessionCreated?: (sessionId: string) => void;
   // 공급자가 보고한 원시 사용량 객체(E2e-2, Codex turn.completed.usage) — 기록 전용, 합산·보정하지 않는다.
@@ -160,6 +163,7 @@ export interface TurnUsage {
   route?: { provider: string; participant: string; profileId: string | null; basis: unknown; job: TurnJob };
   lastRequestInputTokens?: number;
   peakRequestInputTokens?: number;
+  autoCompactWindowTokens?: number;
   imageBytes?: number;
   // 한 CLI 프로세스를 식별한다. 기존 TurnUsage 소비처는 아래 숫자 필드만 사용해도 된다.
   executionId?: string;
@@ -193,6 +197,7 @@ export interface TurnUsage {
 export interface UsageSourceComparison {
   cli?: Partial<TurnUsage>;
   claudeStream?: Partial<TurnUsage>;
+  claudeSession?: Partial<TurnUsage>;
   codexHome?: Partial<TurnUsage>;
   status: "matched" | "mismatch" | "unavailable";
 }

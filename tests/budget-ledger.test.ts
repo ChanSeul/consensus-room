@@ -3,6 +3,38 @@ import { describe, it, expect } from "vitest";
 import { BudgetLedger } from "../src/server/budgetLedger";
 import { calibrateBudget } from "../src/shared/budgets";
 const policy = {execution:{inputTokens:100,outputTokens:20,durationMs:10000},total:{inputTokens:200,outputTokens:40,durationMs:30000}};
+it("explicitly resumes a finished execution without enlarging or refunding any allowance",()=>{
+ const db=new DatabaseSync(":memory:"),ledger=new BudgetLedger(db);ledger.configure("t",policy,"test",0);
+ const start={id:"first",accounts:["t"],stage:"IMPLEMENTING",role:"claude",model:"m",effort:"xhigh",startedAt:0,dispatchStarted:true};
+ ledger.start(start);ledger.observe("first",{inputTokens:120,outputTokens:3,durationMs:30},1);
+ expect(()=>ledger.resumeExecution("t","resume","first",1)).toThrow("실행 종료");
+ ledger.observe("first",{},2,true);
+ const old=ledger.execution("first");
+ expect(()=>ledger.resumeExecution("t","stale","first",2)).toThrow("변경");
+ expect(()=>ledger.resumeExecution("t","wrong","other",1)).toThrow("현재 중단");
+ ledger.resumeExecution("t","resume","first",1);
+ expect(ledger.account("t")).toMatchObject({policy,used:{inputTokens:120,outputTokens:3,durationMs:30},pause:null,version:2,startedAt:0});
+ expect(ledger.execution("first")).toEqual(old);
+ expect(()=>ledger.resumeExecution("t","resume","first",1)).not.toThrow();
+ expect(()=>ledger.grant("t","resume",policy,2)).toThrow("같은 요청 키");
+ ledger.start({...start,id:"next"});ledger.observe("next",{inputTokens:100},3,true);
+ // The next execution also reaches its own cap, but exhausted totals must prevent resumption.
+ expect(ledger.account("t")!.used.inputTokens).toBe(220);
+ expect(()=>ledger.resumeExecution("t","exhausted","next",2)).toThrow("누적 예산");
+ expect(()=>ledger.resumeExecution("t","resume","next",2)).toThrow("같은 요청 키");
+ expect(()=>ledger.assertAvailable(["t"])).toThrow();db.close();
+});
+it("resuming one account cannot release a shared account or an unfinished overlapping execution",()=>{
+ const db=new DatabaseSync(":memory:"),ledger=new BudgetLedger(db);
+ for(const id of ["t","g"])ledger.configure(id,policy,"test");
+ const start={id:"first",accounts:["t","g"],stage:"IMPLEMENTING",role:"claude",model:"m",effort:"xhigh",startedAt:0};
+ ledger.start(start);ledger.observe("first",{inputTokens:100},1,true);
+ ledger.resumeExecution("t","resume","first",1);
+ expect(ledger.account("g")!.pause?.executionId).toBe("first");
+ expect(()=>ledger.start({...start,id:"blocked"})).toThrow();
+ ledger.resumeExecution("g","resume-group","first",1);
+ expect(()=>ledger.start({...start,id:"next"})).not.toThrow();db.close();
+});
 describe("예산 원장", () => {
   it("중복 관측을 더하지 않고 종료와 새 실행에도 누적량을 유지한다", () => {
     const db = new DatabaseSync(":memory:"); const ledger = new BudgetLedger(db);

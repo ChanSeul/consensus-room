@@ -119,6 +119,30 @@ it("collects bounded snapshot evidence before returning one final plan and reser
   expect(fake.calls).toHaveLength(2);
 });
 
+it("a budget resume can continue the last held rewrite but cannot reuse it after the plan epoch changes", async () => {
+  const {root,repo,database,git}=setup();
+  database.updateTopic("topic",{state:"CLAUDE_REVISION"});
+  database.revisions.admit("topic","first-plan","plan");
+  for(const id of ["revision-1","revision-2"])database.revisions.admit("topic",id,"revision");
+  const fake=scripted(async()=>{throw new Error("provider interrupted after spawn");});
+  const wrapped=new BudgetController(database.budgets,()=>({topicId:"topic",accounts:["topic"],stage:"CLAUDE_REVISION"}),
+    async()=>{},database.revisions,true,database.reviews,database).wrap(guardedPlanning(fake.adapter,database,git));
+  await expect(wrapped.createSession({cwd:repo,prompt:"Continue the approved revision"})).rejects.toThrow("provider interrupted");
+  const checkpoint=database.planning.latest("topic")!;
+  expect(checkpoint).toMatchObject({started:true,finalized:false,stage:"CLAUDE_REVISION"});
+  database.updateTopic("topic",{state:"USER_DECISION_REQUIRED",resumeState:"CLAUDE_REVISION"});
+  database.appendEvent({topicId:"topic",actor:"system",kind:"system",state:"USER_DECISION_REQUIRED",body:"Budget stopped",
+    payload:{budgetPause:true,resumeState:"CLAUDE_REVISION"}});
+  const engine=new WorkflowEngine({database,git,artifacts:new ArtifactStore(join(root,"artifacts"),database),
+    claude:fake.adapter,codex:scripted(async()=>answer(step()),"codex").adapter,enforceBudgets:true});
+  expect(database.revisions.account("topic")).toMatchObject({used:3,limit:3});
+  expect(engine.budgetResumeBlocker("topic")).toBeNull();
+  database.updateTopic("topic",{planEpoch:checkpoint.planEpoch+1});
+  expect(engine.budgetResumeBlocker("topic")).toContain("재작성");
+  expect(database.revisions.account("topic")).toMatchObject({used:3,limit:3});
+  await engine.shutdown();
+});
+
 it("fulfills intermediate reads without accepting facts that cite undelivered evidence", async () => {
   const { repo, database, git } = setup();
   const fake = scripted(async (turn, n) => {
@@ -1170,14 +1194,20 @@ it("public workflow retry preserves the epoch and blocks a malformed final resul
   await engine.shutdown();
 });
 
-it.each([false, true])("public retry reuses a finalized first plan with prior-epoch artifact=%s", async hasPriorArtifact => {
+it.each([{hasPriorArtifact:false,changed:false},{hasPriorArtifact:true,changed:false},{hasPriorArtifact:false,changed:true}])(
+ "public retry reuses a finalized first plan at the last allowance with prior-epoch artifact=$hasPriorArtifact and later decision=$changed", async ({hasPriorArtifact,changed}) => {
   const { root, repo, database, git } = setup();
   database.updateTopic("topic", { state: "DRAFT" });
+  database.revisions.admit("topic","previous-plan","plan");
+  for(const id of ["previous-rewrite-1","previous-rewrite-2"])database.revisions.admit("topic",id,"revision");
   for (const role of ["claude", "codex"] as const) database.upsertParticipant("topic", {
     role, sessionId: `${role}-existing`, mode: "attached", acknowledgedPlanSHA256: null,
   });
   const plan = REQUIRED_PLAN_HEADINGS.map(heading => `## ${heading}\n\nPlan${heading === "허용 오차" ? '\n```tolerance\n{"scopePaths":["**"],"rules":[]}\n```' : ""}`).join("\n\n");
-  const claude = scripted(async () => ({ ...answer(step({ questions: [], complete: true })), planMarkdown: plan }));
+  const claude = scripted(async turn => {
+    turn.onUsage?.({inputTokens:100000,outputTokens:20,recordKind:"final",completeness:"complete"});
+    return { ...answer(step({ questions: [], complete: true })), planMarkdown: plan };
+  });
   const codex = scripted(async () => { throw new Error("Stop after first plan recovery"); }, "codex");
   const artifacts = new ArtifactStore(join(root, "artifacts"), database);
   if (hasPriorArtifact) {
@@ -1194,10 +1224,8 @@ it.each([false, true])("public retry reuses a finalized first plan with prior-ep
     }
     return write(...args);
   });
-  const engine = new WorkflowEngine({ database, git, artifacts,
-    claude: new BudgetController(database.budgets, () => ({ topicId: "topic", accounts: ["topic"],
-      stage: database.getTopic("topic").state }), async () => {}, database.revisions, true, database.reviews, database)
-      .wrap(guardedPlanning(claude.adapter, database, git)), codex: codex.adapter });
+  const engine = new WorkflowEngine({ database, git, artifacts, enforceBudgets:true,
+    claude:guardedPlanning(claude.adapter,database,git),codex:codex.adapter });
   const settle = async () => {
     const deadline = Date.now() + 5000;
     while (database.runningAction("topic")) {
@@ -1207,11 +1235,23 @@ it.each([false, true])("public retry reuses a finalized first plan with prior-ep
   };
   engine.startPlan("topic"); await settle();
   const epoch = database.getTopic("topic").planEpoch;
-  expect(database.getTopic("topic").state).toBe("FAILED");
+  expect(database.getTopic("topic").state, database.getTopic("topic").lastError ?? "").toBe("FAILED");
   expect(database.planning.latest("topic")!.finalized).toBe(true);
   expect(database.latestArtifact("topic", "claude-plan")).toEqual(previousArtifact);
   const usedBeforeRetry = database.revisions.account("topic").used;
+  expect(usedBeforeRetry).toBe(3);
+  const account=database.budgets.account("topic")!;
+  expect(account.pause?.executionId).toBeTruthy();
+  database.budgets.resumeExecution("topic","resume-finished-plan",account.pause!.executionId!,account.version);
   writing.mockRestore();
+  if(changed) {
+    await engine.postMessage("topic","decision","Change the plan before proceeding");
+    expect(engine.budgetResumeBlocker("topic")).toContain("재작성");
+    expect(claude.calls).toHaveLength(1);
+    await engine.shutdown();
+    return;
+  }
+  expect(engine.budgetResumeBlocker("topic")).toBeNull();
   engine.retry("topic"); await settle();
   expect(database.getTopic("topic").planEpoch).toBe(epoch);
   expect(claude.calls).toHaveLength(1);

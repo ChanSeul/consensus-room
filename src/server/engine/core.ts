@@ -5,6 +5,7 @@ import { RevisionBlocked } from "../revisionLedger.js";
 import type { RewriteKind } from "../../shared/revisions.js";
 import { wrapWorkGroupAdapter } from "../workGroupAdapter.js";
 import { BudgetController } from "../budgetController.js";
+import { recoverableFinalizedFirstPlan } from "../planningStore.js";
 import { PlanningPaused, type TimelineDelivery } from "../../shared/planningControl.js";
 import { BudgetBlocked } from "../budgetLedger.js";
 import { applyPlanLineEdits, applyPlanRepair, planRepairPrompt, repairablePlan } from "../../shared/planPatches.js";
@@ -178,7 +179,8 @@ export class EngineCore {
     const stage=this.dependencies.database.getFlags(topicId).resumeState;
     const checkpoint = this.dependencies.database.planning.latest(topicId);
     const topic = this.dependencies.database.getTopic(topicId);
-    if (checkpoint?.started && !checkpoint.finalized && checkpoint.stage === stage &&
+    if (checkpoint?.started && (!checkpoint.finalized || (stage === "CLAUDE_PLAN" &&
+        recoverableFinalizedFirstPlan(checkpoint, topic, this.dependencies.database.getTimeline(topicId)))) && checkpoint.stage === stage &&
         checkpoint.scopeGeneration === topic.scopeGeneration && checkpoint.planEpoch === topic.planEpoch && checkpoint.planSHA256 === topic.planSHA256) return;
     const review=reviewScope(stage??"");
     if(review && !this.heldReviewLedger(stage, topic))this.dependencies.database.reviews.assertAvailable(topicId,review);

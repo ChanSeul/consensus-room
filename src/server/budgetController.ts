@@ -60,8 +60,13 @@ export class BudgetController {
       return invoke(preparedTurn);
     }
     const reserve=()=>{if(kind)this.revisions?.reserve(ctx.topicId,admissionId,kind);if(review)this.reviews?.reserve(ctx.topicId,admissionId,review);};
-    this.ledger.start({id,accounts:ctx.accounts,stage:ctx.stage,role,model:turn.settings?.model??"unknown",
+    const execution=this.ledger.start({id,accounts:ctx.accounts,stage:ctx.stage,role,model:turn.settings?.model??"unknown",
       effort:turn.settings?.effort??"unknown",startedAt,dispatchStarted:false},reserve);
+    const executionBudget = Object.fromEntries(BUDGET_KEYS.map(key => [key, Math.min(execution.limit[key],
+      ...ctx.accounts.map(accountId => {
+        const account = this.ledger.account(accountId)!;
+        return Math.max(0, account.policy.total[key] - account.used[key]);
+      }))])) as import("../shared/budgets.js").BudgetVector;
     const controller=new AbortController();
     const observed=zeroBudget();
     let failure:unknown; let partial:unknown; let sessionId = (turn as SessionTurn).sessionId;
@@ -84,7 +89,7 @@ export class BudgetController {
     };
     const timer=setInterval(()=>observe({}),1000);
     try {
-      const result=await invoke({...preparedTurn,signal:controller.signal,
+      const result=await invoke({...preparedTurn,executionBudget,signal:controller.signal,
         // Persist before spawn (not merely in its callback), closing the crash-between-spawn-and-record gap.
         admitSync:()=>{turn.admitSync?.();this.ledger.markDispatching(id);},
         // 원장 호출의 spawn 은 원장에 영속한다 — 이 뒤 원장의 다른 호출이 spawn 전에 실패해도 원장의 예약을 되돌리지 않는다(재시작 뒤에도).

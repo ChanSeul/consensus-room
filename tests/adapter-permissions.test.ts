@@ -15,6 +15,7 @@ import { PlanningStepSchema } from "../src/shared/planningControl";
 import { DatabaseSync } from "node:sqlite";
 import { BudgetLedger } from "../src/server/budgetLedger";
 import { BudgetController } from "../src/server/budgetController";
+import { ExecutionMetrics, readClaudeUsageBaseline } from "../src/server/adapters/executionMetrics";
 
 vi.mock("node:fs/promises", async importOriginal => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
@@ -1740,6 +1741,75 @@ it("Claude 부분 교정은 별도 스키마·도구 없는 권한을 쓰고 사
 
 // 2026-09-14 사용자 결정: 러너는 사용자 settings 를 안 읽으므로 압축 임계값을 격리 설정에 명시한다(600K).
 describe("러너 auto-compact 임계값", () => {
+  it.each(["absolute", "relative"])("anchors resumed usage in the %s CLAUDE_CONFIG_DIR actually passed to Claude", async kind => {
+    const root=mkdtempSync(join(tmpdir(),"claude-config-cost-"));temporaryDirectories.push(root);
+    const sessionId="22222222-2222-4222-8222-222222222222", config=join(root,"custom");
+    mkdirSync(join(config,"projects","project"),{recursive:true});
+    writeFileSync(join(config,"projects","project",`${sessionId}.jsonl`),JSON.stringify({type:"cost-state",sessionId,
+      totalCostUSD:2,totalAPIDuration:1000,modelUsage:{opus:{inputTokens:100,cacheReadInputTokens:1000,cacheCreationInputTokens:200,outputTokens:30}}})+"\n");
+    const previous=process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR=kind==="absolute"?config:"custom";
+    try {
+      const runner=new RecordingRunner(successfulResult([{type:"system",subtype:"compact_boundary"},planResult,
+        {type:"result",session_id:sessionId,num_turns:1,total_cost_usd:3,duration_api_ms:2000,
+          usage:{input_tokens:2,cache_read_input_tokens:10,cache_creation_input_tokens:18,output_tokens:20},
+          modelUsage:{opus:{inputTokens:150,cacheReadInputTokens:1010,cacheCreationInputTokens:700,outputTokens:130}}}]));
+      const usage:TurnUsage[]=[];
+      await new ClaudeAdapter(runner).resumeTurn({sessionId,cwd:root,prompt:"continue",onUsage:u=>usage.push(u)});
+      expect(runner.calls[0].environment?.CLAUDE_CONFIG_DIR).toBe(process.env.CLAUDE_CONFIG_DIR);
+      expect(usage.at(-1)).toMatchObject({inputTokens:560,outputTokens:100,costUSD:1,completeness:"complete"});
+    } finally {if(previous===undefined)delete process.env.CLAUDE_CONFIG_DIR;else process.env.CLAUDE_CONFIG_DIR=previous;}
+  });
+  it("charges compaction from anchored session deltas rather than omitting it or charging old history", async () => {
+    // Public metrics boundary -> TurnUsage -> BudgetController. Compaction is omitted by result.usage
+    // but included in native cost-state/modelUsage. The fixture independently describes old + new work.
+    const root=mkdtempSync(join(tmpdir(),"claude-cost-baseline-"));temporaryDirectories.push(root);
+    const sessionId="11111111-1111-4111-8111-111111111111";
+    mkdirSync(join(root,"project"));
+    writeFileSync(join(root,"project",`${sessionId}.jsonl`),JSON.stringify({type:"cost-state",sessionId,totalCostUSD:2,totalAPIDuration:1000,
+      modelUsage:{opus:{inputTokens:100,cacheReadInputTokens:1000,cacheCreationInputTokens:200,outputTokens:30}}})+"\n");
+    const metrics=new ExecutionMetrics("claude",100,"opus","xhigh",true,Date.now());
+    metrics.setClaudeBaseline(await readClaudeUsageBaseline(root,sessionId));
+    metrics.observe({type:"system",subtype:"compact_boundary"});
+    metrics.observe({type:"result",session_id:sessionId,num_turns:1,total_cost_usd:3,duration_api_ms:2000,
+      usage:{input_tokens:2,cache_read_input_tokens:10,cache_creation_input_tokens:18,output_tokens:20},
+      modelUsage:{opus:{inputTokens:150,cacheReadInputTokens:1010,cacheCreationInputTokens:700,outputTokens:130}}});
+    expect(metrics.snapshot({toolCalls:0,toolDurationMs:0},"final")).toMatchObject({inputTokens:560,cachedInputTokens:10,outputTokens:100,
+      costUSD:1,apiDurationMs:1000,completeness:"complete",sourceUsage:{claudeSession:{inputTokens:560},cli:{inputTokens:30}}});
+  });
+  it.each(["missing", "wrong-session", "decreasing", "below-stream"])("does not turn %s cumulative evidence into billable usage", async kind => {
+    const metrics=new ExecutionMetrics("claude",100,"opus","xhigh",true,Date.now());
+    if(kind!=="missing")metrics.setClaudeBaseline({sessionId:kind==="wrong-session"?"different":"same",modelUsage:{opus:{inputTokens:100,cacheReadInputTokens:1000,cacheCreationInputTokens:200,outputTokens:30}},totalCostUSD:2});
+    metrics.observe({type:"system",subtype:"compact_boundary"});
+    if(kind==="below-stream")metrics.observe({type:"assistant",message:{id:"observed",usage:{input_tokens:900,output_tokens:1}}});
+    metrics.observe({type:"result",session_id:"same",num_turns:1,total_cost_usd:3,
+      usage:{input_tokens:2,cache_read_input_tokens:10,cache_creation_input_tokens:18,output_tokens:20},
+      modelUsage:{opus:{inputTokens:kind==="decreasing"?1:150,cacheReadInputTokens:1010,cacheCreationInputTokens:700,outputTokens:130}}});
+    const result=metrics.snapshot({toolCalls:0,toolDurationMs:0},"final");
+    expect(result.completeness).toBe("partial");expect(result.costUSD).toBeUndefined();
+    expect(result.sourceUsage?.claudeSession).toBeUndefined();
+  });
+  it.each([9_000_000, 3_200_000, 100_000_000])("fits native compaction to %i input allowance while preserving the same session and model", async inputTokens => {
+    const runner = new RecordingRunner(successfulResult([planResult]));
+    const usage: TurnUsage[] = [];
+    await new ClaudeAdapter(runner).resumeTurn({ sessionId:"same-planning-session", cwd:"/tmp", prompt:"continue approved work",
+      job:{role:"implementer",operation:"implement"}, settings:{model:"opus",effort:"xhigh"}, providerOptions:{ultracode:true},
+      executionBudget:{inputTokens,outputTokens:240000,durationMs:2400000},onUsage:u=>usage.push(u) });
+    const args=runner.calls[0].args, settings=JSON.parse(args[args.indexOf("--settings")+1]);
+    expect(args[args.indexOf("--resume")+1]).toBe("same-planning-session");
+    expect(args[args.indexOf("--model")+1]).toBe("opus");expect(args[args.indexOf("--effort")+1]).toBe("xhigh");
+    expect(settings.ultracode).toBe(true);
+    const expected=inputTokens===9_000_000?140625:inputTokens===3_200_000?100000:600000;
+    expect(settings.autoCompactWindow).toBe(expected);
+    expect(usage.at(-1)?.autoCompactWindowTokens).toBe(expected);
+  });
+  it("keeps tool-free planning outside autonomous context sizing", async () => {
+    const runner=new RecordingRunner(successfulResult([planResult]));
+    await new ClaudeAdapter(runner).resumeTurn({sessionId:"s",cwd:"/tmp",prompt:"plan",planningControl:{admissionId:"a",maxPromptBytes:1000000},
+      executionBudget:{inputTokens:9000000,outputTokens:240000,durationMs:2400000}});
+    const args=runner.calls[0].args;
+    expect(JSON.parse(args[args.indexOf("--settings")+1]).autoCompactWindow).toBe(800000);
+  });
   it("구현 세션은 600K, 계획 세션(fable 1M)은 800K 에서 압축한다", async () => {
     const { buildIsolationSettings, RUNNER_AUTO_COMPACT_WINDOW } = await import("../src/server/adapters/claude");
     expect(RUNNER_AUTO_COMPACT_WINDOW).toEqual({ implementation: 600_000, planning: 800_000 });

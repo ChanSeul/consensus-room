@@ -109,13 +109,44 @@ export class BudgetLedger {
       this.db.prepare("UPDATE budget_executions SET record_json=? WHERE id=?").run(JSON.stringify(execution), execution.id);
     }
   }
+  // Explicitly acknowledge one finished execution stop. No automatic retry, discount, or reset:
+  // the same total allowance, usage, execution evidence and all review/revision reservations survive.
+  resumeExecution(id: string, requestId: string, executionId: string, expectedVersion: number): BudgetAccount {
+    return this.transaction(() => {
+      const previous = this.db.prepare("SELECT account_id,record_json FROM budget_grants WHERE id=?").get(requestId);
+      if (previous) {
+        const saved = JSON.parse(String(previous.record_json));
+        if (previous.account_id !== id || saved.kind !== "resume-execution" || saved.executionId !== executionId) {
+          throw new Error("같은 요청 키의 재개 대상이 다릅니다.");
+        }
+        return this.account(id)!;
+      }
+      const account = this.account(id);
+      if (!account || account.version !== expectedVersion) throw new Error("예산이 변경됐습니다. 새로 확인하세요.");
+      if (account.pause?.executionId !== executionId) throw new Error("현재 중단된 실행만 재개할 수 있습니다.");
+      const execution = this.execution(executionId);
+      const unfinished = this.db.prepare("SELECT record_json FROM budget_executions").all()
+        .map(row => JSON.parse(String(row.record_json)) as Execution)
+        .some(row => !row.finished && row.accounts.includes(id));
+      if (!execution.finished || !execution.accounts.includes(id) || unfinished) throw new Error("실행 종료와 사용량 기록을 먼저 확인하세요.");
+      if (BUDGET_KEYS.some(key => account.used[key] >= account.policy.total[key])) throw new Error("누적 예산이 소진되어 증액이 필요합니다.");
+      const limit = execution.accountLimits?.[id] ?? execution.limit;
+      if (!BUDGET_KEYS.some(key => execution.used[key] >= limit[key])) throw new Error("실행당 예산으로 중단된 기록이 아닙니다.");
+      account.pause = null;
+      account.version++;
+      this.save(account);
+      this.db.prepare("INSERT INTO budget_grants VALUES (?,?,?)").run(requestId, id,
+        JSON.stringify({ kind: "resume-execution", executionId, policy: account.policy, version: account.version, at: Date.now() }));
+      return account;
+    });
+  }
   grant(id: string, requestId: string, policy: BudgetPolicy, expectedVersion: number): BudgetAccount {
     policy = BudgetPolicySchema.parse(policy);
     return this.transaction(() => {
       const previous = this.db.prepare("SELECT account_id,record_json FROM budget_grants WHERE id=?").get(requestId);
       if (previous) {
         const saved = JSON.parse(String(previous.record_json));
-        if (previous.account_id !== id || JSON.stringify(saved.policy) !== JSON.stringify(policy)) throw new Error("같은 요청 키의 예산이 다릅니다.");
+        if (previous.account_id !== id || saved.kind === "resume-execution" || JSON.stringify(saved.policy) !== JSON.stringify(policy)) throw new Error("같은 요청 키의 예산이 다릅니다.");
         return this.account(id)!;
       }
       const a = this.account(id); if (!a) throw new Error("먼저 예산을 설정하세요.");
