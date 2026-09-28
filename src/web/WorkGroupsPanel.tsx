@@ -1,5 +1,6 @@
 import { useEffect, useState, type FormEvent } from "react";
 import type { WorkGroupInput, WorkGroupView } from "../shared/workGroups";
+import { hasBudgetLimits, OBSERVE_USAGE } from "../shared/budgets";
 import { BudgetPanel } from "./BudgetPanel";
 import { api } from "./api";
 
@@ -22,7 +23,7 @@ const withStagePlan = (
   data: FormData,
 ): WorkGroupInput => {
   const number = (name: string) => Number(data.get(name));
-  const budget = {
+  const budget = BUDGET_FIELDS.every(([name]) => !String(data.get(name) ?? "").trim()) ? OBSERVE_USAGE : {
     execution: {
       inputTokens: number("input"),
       outputTokens: number("output"),
@@ -61,7 +62,7 @@ const budgetDefault = (
   budget: WorkGroupView["stages"][number]["budget"],
   name: (typeof BUDGET_FIELDS)[number][0],
 ) => {
-  if (!budget) return undefined;
+  if (!budget || !hasBudgetLimits(budget)) return undefined;
   return {
     input: budget.execution.inputTokens,
     output: budget.execution.outputTokens,
@@ -148,7 +149,7 @@ export function WorkGroupsPanel({
       goal: text("goal"),
       contracts: text("contracts"),
       stages: Array.from({ length: count }, (_, i) => {
-        // 완료 조건을 비운 단계는 대략 단계다 — 완료 조건·예산이 정해지기 전에는 열지 않는다.
+        // 완료 조건을 비운 단계는 대략 단계다 — 완료 조건이 정해지기 전에는 열지 않는다.
         const acceptance = text(`acceptance${i}`).trim();
         return {
           id: `stage-${i + 1}`,
@@ -157,7 +158,7 @@ export function WorkGroupsPanel({
           goal: text(`goal${i}`),
           dependsOn: i ? [`stage-${i}`] : [],
           ...(acceptance
-            ? { acceptance, budget: { execution: vector, total } }
+            ? { acceptance, budget: BUDGET_FIELDS.every(([name]) => !text(name).trim()) ? OBSERVE_USAGE : { execution: vector, total } }
             : {}),
         };
       }),
@@ -176,7 +177,7 @@ export function WorkGroupsPanel({
           <p>
             각 단계의 계획을 승인한 뒤 구현합니다. 마지막 단계는 전체 통합
             검증입니다. 완료 조건을 비운 단계는 대략 단계로 두고, 완료 조건과
-            예산이 정해진 뒤에 엽니다.
+            검증 방법이 정해진 뒤에 엽니다.
           </p>
           <label>
             작업 이름
@@ -228,14 +229,12 @@ export function WorkGroupsPanel({
           <fieldset>
             <legend>각 단계의 예산</legend>
             <p>
-              실행당 상한과 단계 누적 상한을 각각 입력하세요. 완료 조건을 적은
-              단계에 적용되고, 작업 묶음에는 그 단계들의 누적 상한 합계가
-              적용됩니다.
+              기본은 한도 없이 사용량만 기록합니다. 상한을 원하면 여섯 칸을 모두 입력하세요. 입력한 한도는 완료 조건을 적은 단계에 적용됩니다.
             </p>
             {BUDGET_FIELDS.map(([name, label]) => (
               <label key={name}>
                 {label}
-                <input name={name} type="number" min="1" step="1" required />
+                <input name={name} type="number" min="1" step="1" />
               </label>
             ))}
           </fieldset>
@@ -328,8 +327,8 @@ export function WorkGroupsPanel({
                 return (
                   <li key={stage.id}>
                     {stage.title} · {stageStatus(state)}
-                    {!stage.acceptance || !stage.budget
-                      ? " · 대략 단계(완료 조건·예산 미정)"
+                    {!stage.acceptance
+                      ? " · 대략 단계(완료 조건 미정)"
                       : ""}
                     {group.readyStages.includes(stage.id) ? " · 준비됨" : ""}
                     {group.replanPending.includes(stage.id)
@@ -394,7 +393,6 @@ export function WorkGroupsPanel({
                                 type="number"
                                 min={MINUTE_FIELDS.has(name) ? undefined : "1"}
                                 step={MINUTE_FIELDS.has(name) ? "any" : "1"}
-                                required
                                 defaultValue={budgetDefault(stage.budget, name)}
                               />
                             </label>

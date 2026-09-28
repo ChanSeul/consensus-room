@@ -60,7 +60,7 @@ describe("예산 원장", () => {
     ledger.start({id:"a1",accounts:["a","group"],startedAt:0,stage:"PLAN",role:"claude",model:"test",effort:"high"});
     ledger.observe("a1",{inputTokens:80},0,true);
     expect(()=>ledger.start({id:"b1",accounts:["b","group"],startedAt:1,stage:"PLAN",role:"claude",model:"test",effort:"high"})).toThrow();
-    expect(()=>ledger.assertAvailable(["missing"])).toThrow(); db.close();
+    expect(()=>ledger.assertAvailable(["missing"])).not.toThrow(); db.close();
   });
   it("정상 완료와 원본을 검증한 표본만 상한 산정에 쓴다", () => {
     const sample={executionId:"a",stage:"PLAN",role:"claude",model:"m",effort:"high",verified:true,successful:true,completeness:"complete" as const,mismatch:false,usage:{inputTokens:100,outputTokens:10,durationMs:1000}};

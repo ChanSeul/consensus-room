@@ -2,7 +2,7 @@ import {reviewScope} from "../shared/reviews.js";
 import type {ReviewLedger} from "./reviewLedger.js";
 import type { RevisionLedger } from "./revisionLedger.js";
 import type { RewriteKind } from "../shared/revisions.js";
-import { BUDGET_KEYS, zeroBudget } from "../shared/budgets.js";
+import { BUDGET_KEYS, hasBudgetLimits, zeroBudget } from "../shared/budgets.js";
 import { randomUUID } from "node:crypto";
 import type { AgentAdapter, SessionTurn } from "./types.js";
 import { BudgetBlocked, type BudgetLedger } from "./budgetLedger.js";
@@ -62,11 +62,10 @@ export class BudgetController {
     const reserve=()=>{if(kind)this.revisions?.reserve(ctx.topicId,admissionId,kind);if(review)this.reviews?.reserve(ctx.topicId,admissionId,review);};
     const execution=this.ledger.start({id,accounts:ctx.accounts,stage:ctx.stage,role,model:turn.settings?.model??"unknown",
       effort:turn.settings?.effort??"unknown",startedAt,dispatchStarted:false},reserve);
-    const executionBudget = Object.fromEntries(BUDGET_KEYS.map(key => [key, Math.min(execution.limit[key],
-      ...ctx.accounts.map(accountId => {
-        const account = this.ledger.account(accountId)!;
-        return Math.max(0, account.policy.total[key] - account.used[key]);
-      }))])) as import("../shared/budgets.js").BudgetVector;
+    const boundedAccounts = ctx.accounts.map(id => this.ledger.account(id)!).flatMap(account =>
+      hasBudgetLimits(account.policy) ? [{ used: account.used, policy: account.policy }] : []);
+    const executionBudget = execution.limit ? Object.fromEntries(BUDGET_KEYS.map(key => [key, Math.min(execution.limit![key],
+      ...boundedAccounts.map(account => Math.max(0, account.policy.total[key] - account.used[key])))])) as import("../shared/budgets.js").BudgetVector : undefined;
     const controller=new AbortController();
     const observed=zeroBudget();
     let failure:unknown; let partial:unknown; let sessionId = (turn as SessionTurn).sessionId;

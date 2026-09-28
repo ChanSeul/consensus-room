@@ -4373,7 +4373,7 @@ describe("Codex 후속 F01 — 수정 턴의 완료 판정", () => {
     const topic = database.getTopic("topic-1");
     expect(topic.state, topic.lastError ?? "").toBe("READY_TO_DELIVER");
     expect(claude.calls).toHaveLength(2);
-    expect(claude.calls[1]).toContain("계속 진행 1/4");
+    expect(claude.calls[1]).toContain("계속 진행 1회차");
     expect(claude.calls[1]).toContain("반환 kind 는 FIX");
     expect(codex.calls).toHaveLength(1); // 최종 리뷰는 completed 뒤 한 번만
     expect(database.getTimeline("topic-1").map((event) => event.body).some((body) => body.includes("같은 세션에서 계속 진행합니다"))).toBe(true);

@@ -438,6 +438,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       executionUsage: database.getExecutionUsage(topic.id),
       ...activity,
       budget: database.budgets.account(topic.id),
+      budgetRecoveryRequired: !database.runningAction(topic.id) && database.budgets.hasUnfinishedExecution(topic.id),
       planningProgress: database.planning.progress(topic.id),
       revisionAllowance: database.revisions.account(topic.id),
       revisionPaused: workflow.revisionPaused(topic.id),

@@ -15,7 +15,7 @@ import {
   type WorkGroupRevision,
   type WorkStage,
 } from "../shared/workGroups.js";
-import { BUDGET_KEYS, type BudgetPolicy } from "../shared/budgets.js";
+import { BUDGET_KEYS, hasBudgetLimits, OBSERVE_USAGE, type BudgetPolicy } from "../shared/budgets.js";
 
 // 단계 문맥(엔진 개편 E4-3) — 단계 토픽의 턴 머리말과 결속 해시의 유일한 원천이다. 머리말(renderContext)과 해시(digestContext)를 같은
 // 객체에서 만들어, 해시가 구성상 실제로 전달한 내용과 같게 한다. 담는 것: 묶음 목표·공통 계약, 자기 단계 서술(분리 근거·체크리스트 포함), 이
@@ -141,10 +141,11 @@ export class WorkGroups {
   groupPolicy(group: WorkGroup | WorkGroupInput): BudgetPolicy {
     if (group.budgetPolicy) return group.budgetPolicy;
     const declared = group.stages.flatMap((s) => (s.budget ? [s.budget] : []));
-    if (!declared.length) throw new Error("묶음 예산이나 단계 예산이 하나 이상 필요합니다.");
+    if (!declared.length || group.stages.some(stage => stage.acceptance && !stage.budget) || declared.some(policy => !hasBudgetLimits(policy))) return OBSERVE_USAGE;
+    const bounded = declared.filter(hasBudgetLimits);
     return {
-      execution: Object.fromEntries(BUDGET_KEYS.map((key) => [key, Math.max(...declared.map((b) => b.execution[key]))])),
-      total: Object.fromEntries(BUDGET_KEYS.map((key) => [key, declared.reduce((sum, b) => sum + b.total[key], 0)])),
+      execution: Object.fromEntries(BUDGET_KEYS.map((key) => [key, Math.max(...bounded.map((b) => b.execution[key]))])),
+      total: Object.fromEntries(BUDGET_KEYS.map((key) => [key, bounded.reduce((sum, b) => sum + b.total[key], 0)])),
     } as BudgetPolicy;
   }
   // selected 가 없으면 기존 규칙("앞 단계부터" = 연결 안 된 첫 단계)이다 — 기존 호출·검사 호환. 착수 선택 규칙(외부 결정 막힘·준비·의존 폐포·

@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { buildApp } from "../src/server/app";
 import { ConsensusDatabase } from "../src/server/database";
+import { TopicActivitySchema } from "../src/shared/contracts";
 import { SpawnCommandRunner } from "../src/server/processRunner";
 import type { AgentAdapter, CommandRunner } from "../src/server/types";
 
@@ -599,7 +600,7 @@ it("activity API는 현재 세대의 역할별 최신 관측과 시각을 반환
   await app.close();
 });
 
-it.each(["grant","resume"])("작업 묶음 API는 단계 생성 중복·계약 개정·예산 %s 경계를 지킨다",async mode=>{
+it.each(["grant","resume","observe"])("작업 묶음 API는 단계 생성 중복·계약 개정·예산 %s 경계를 지킨다",async mode=>{
  // 새 단계 토픽은 계획 제어 v2 다(E4 2차 보완 F012) — 예산 재개 뒤 계획 턴이 실제 작업 트리 스냅숏을 거쳐 에이전트에 닿도록 실제 git 저장소를 쓴다.
  const {runner,worktreeAdds}=countingRealGitRunner();let failWorktree=false;
  const {app,database,adapterCalls,adapterCalled}=await makeApp({run:spec=>{if(failWorktree&&spec.args[0]==="worktree")throw new Error("worktree failure");return runner.run(spec);}},undefined,{gitRepository:true});
@@ -639,7 +640,8 @@ it.each(["grant","resume"])("작업 묶음 API는 단계 생성 중복·계약 �
   database.budgets.observe("group-cap",{inputTokens:100},Date.now(),true);
   database.budgets.resumeExecution(topic.id,"topic-resume","group-cap",1);
   const groupPolicy=database.budgets.account(group.id)!.policy;
-  const budgetBody=mode==="resume"?{version:1,resumeExecutionId:"group-cap"}:{version:1,policy:{...groupPolicy,execution:{...groupPolicy.execution,inputTokens:200}}};
+  if (!("execution" in groupPolicy)) throw Error("bounded fixture expected");
+  const budgetBody=mode==="observe"?{version:1,policy:{mode:"observe"}}:mode==="resume"?{version:1,resumeExecutionId:"group-cap"}:{version:1,policy:{...groupPolicy,execution:{...groupPolicy.execution,inputTokens:200}}};
   const granted=await post(`/api/work-groups/${group.id}/budget`,budgetBody,"grant");
   expect(granted.statusCode).toBe(200);
   expect(await adapterCalled).toBe("claude");
@@ -647,6 +649,7 @@ it.each(["grant","resume"])("작업 묶음 API는 단계 생성 중복·계약 �
   await vi.waitFor(()=>expect(database.runningAction(topic.id)).toBeNull());
   expect(database.budgets.account(group.id)?.used.inputTokens).toBe(100);
   if(mode==="resume")expect(database.budgets.account(group.id)?.policy).toEqual(groupPolicy);
+  if(mode==="observe")expect(database.budgets.account(group.id)?.policy).toEqual({mode:"observe"});
 
  } finally {await app.close();}
 });
@@ -677,10 +680,13 @@ it("재작성 승인은 1회만 늘리고 실제 호출을 재개하며 중복·
  } finally {await app.close();}
 });
 
-it("재작성 승인 후 토큰 예산이 없으면 승인만 보존하고 호출하지 않는다",async()=>{
+it("재작성 승인 후 명시한 토큰 예산이 소진됐으면 승인만 보존하고 호출하지 않는다",async()=>{
  const {app,database,root,adapterCalls}=await makeApp(countingGitRunner().runner);
  try {
   draftTopic(database,"both",{worktreePath:root});
+  database.budgets.configure("both",{execution:{inputTokens:1,outputTokens:1,durationMs:1000},total:{inputTokens:1,outputTokens:1,durationMs:1000}},"user-explicit");
+  database.budgets.start({id:"both-cap",accounts:["both"],startedAt:0,stage:"PLAN",role:"claude",model:"test",effort:"test"});
+  database.budgets.observe("both-cap",{inputTokens:1},1,true);
   database.revisions.admit("both","initial","plan");
   for(const id of ["a","b","c"])database.revisions.admit("both",id,"revision");
   const grant=await app.inject({method:"POST",url:"/api/topics/both/actions/revision-resume",payload:{version:1},headers:{"x-consensus-token":"launch-token-for-test","idempotency-key":"grant"}});
@@ -689,28 +695,46 @@ it("재작성 승인 후 토큰 예산이 없으면 승인만 보존하고 호�
  } finally {await app.close();}
 });
 
-it("authenticated budget resumption keeps the policy and prior usage and dispatches only once",async()=>{
+it.each(["same", "observe", "recovery"])("authenticated %s budget policy preserves usage and dispatches only once",async mode=>{
  const {app,database,root,adapterCalls,adapterCalled}=await makeApp(countingGitRunner().runner);
  const policy={execution:{inputTokens:1000,outputTokens:1000,durationMs:100000},total:{inputTokens:10000,outputTokens:10000,durationMs:1000000}};
  try {
   draftTopic(database,"resume-budget",{worktreePath:root});
   for(const role of ["claude","codex"] as const)database.upsertParticipant("resume-budget",{role,sessionId:`${role}-same`,mode:"attached",acknowledgedPlanSHA256:null});
   database.updateTopic("resume-budget",{state:"USER_DECISION_REQUIRED",resumeState:"CLAUDE_PLAN"});
-  database.budgets.configure("resume-budget",policy,"test");
+  database.budgets.configure("resume-budget",mode==="recovery"?{mode:"observe"}:policy,"test");
   database.budgets.start({id:"stopped",accounts:["resume-budget"],stage:"CLAUDE_PLAN",role:"claude",model:"opus",effort:"xhigh",startedAt:0,dispatchStarted:true});
-  database.budgets.observe("stopped",{inputTokens:1100},1,true);
-  const url="/api/topics/resume-budget/actions/budget-resume",payload={resumeExecutionId:"stopped",version:1};
+  database.budgets.observe("stopped",{inputTokens:1100},1,mode!=="recovery");
+  if(mode==="recovery")database.budgets.recoverInterruptedExecutions();
+  const url="/api/topics/resume-budget/actions/budget-resume",payload=mode!=="same"?{policy:{mode:"observe" as const},version:1}:{resumeExecutionId:"stopped",version:1};
   expect((await app.inject({method:"POST",url,payload})).statusCode).toBe(401);
   const headers={"x-consensus-token":"launch-token-for-test","idempotency-key":"same-allowance"};
-  expect((await app.inject({method:"POST",url,payload:{...payload,policy},headers:{...headers,"idempotency-key":"mixed"}})).statusCode).toBeGreaterThanOrEqual(400);
+  expect((await app.inject({method:"POST",url,payload:{resumeExecutionId:"stopped",version:1,policy},headers:{...headers,"idempotency-key":"mixed"}})).statusCode).toBeGreaterThanOrEqual(400);
+  if(mode==="recovery") {
+   const activity=()=>app.inject({method:"GET",url:"/api/topics/resume-budget/activity",headers});
+   expect(TopicActivitySchema.parse((await activity()).json()).budgetRecoveryRequired).toBe(true);
+   database.startAction({id:"still-running",topicId:"resume-budget",kind:"retry",status:"running",createdAt:new Date().toISOString(),finishedAt:null,error:null,
+    pid:null,pgid:null,processExecutable:null,processCommand:null,processStartedAt:null});
+   const denied=await app.inject({method:"POST",url,payload,headers:{...headers,"idempotency-key":"active"}});
+   expect(denied.statusCode).toBeGreaterThanOrEqual(400);
+   expect(database.budgets.execution("stopped").finished).toBe(false);
+   expect(database.budgets.account("resume-budget")!.version).toBe(1);
+   expect(adapterCalls).toEqual([]);
+   expect(TopicActivitySchema.parse((await activity()).json()).budgetRecoveryRequired).toBe(false);
+   database.finishAction("still-running","failed","confirmed stopped");
+  }
   const response=await app.inject({method:"POST",url,payload,headers});
   expect(response.statusCode,response.body).toBe(200);
   expect(await adapterCalled).toBe("claude");
   await vi.waitFor(()=>expect(database.runningAction("resume-budget")).toBeNull());
   expect((await app.inject({method:"POST",url,payload,headers})).json()).toEqual(response.json());
   expect(adapterCalls).toEqual(["claude"]);
-  expect(database.budgets.account("resume-budget")).toMatchObject({policy,used:{inputTokens:1100},version:2});
+  expect(database.budgets.account("resume-budget")).toMatchObject({policy:mode!=="same"?{mode:"observe"}:policy,used:{inputTokens:1100},version:2});
   expect(database.budgets.execution("stopped").used.inputTokens).toBe(1100);
+  if(mode==="recovery") {
+   const activity=await app.inject({method:"GET",url:"/api/topics/resume-budget/activity",headers});
+   expect(TopicActivitySchema.parse(activity.json()).budgetRecoveryRequired).toBe(false);
+  }
  } finally {await app.close();}
 });
 
@@ -781,6 +805,9 @@ it("리뷰 1회 승인은 지정된 검토만 늘리고 예산 부족 시 재개
  const {app,database,adapterCalls}=await makeApp();
  try {
   draftTopic(database,"review");database.updateTopic("review",{state:"FAILED",resumeState:"CODEX_REVIEW"});
+  database.budgets.configure("review",{execution:{inputTokens:1,outputTokens:1,durationMs:1000},total:{inputTokens:1,outputTokens:1,durationMs:1000}},"user-explicit");
+  database.budgets.start({id:"review-cap",accounts:["review"],startedAt:0,stage:"CODEX_REVIEW",role:"codex",model:"test",effort:"test"});
+  database.budgets.observe("review-cap",{inputTokens:1},1,true);
   for(const id of ["a","b","c"])database.reviews.admit("review",id,"implementation");
   const post=(scope:string,key:string)=>app.inject({method:"POST",url:"/api/topics/review/actions/review-resume",payload:{scope,version:1},headers:{"x-consensus-token":"launch-token-for-test","idempotency-key":key}});
   expect((await post("planning","wrong")).statusCode).toBeGreaterThanOrEqual(400);

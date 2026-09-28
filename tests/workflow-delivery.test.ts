@@ -816,6 +816,8 @@ const WORK_PAGE = 48 * 1024;
 const REVIEW_PAGE = 96 * 1024;
 
 type PagedStep = {
+  noChange?: boolean;
+  remainingSteps?: string[];
   status?: "completed" | "in_progress" | null;
   // resume 중 CLI 가 알린 다른 세션 id(비연속 주제에서만 허용된 경로), create 면 만들 세션 id.
   sessionId?: string;
@@ -871,14 +873,14 @@ class PagingClaude implements AgentAdapter {
   }
 
   private result(step: PagedStep, prompt: string): AgentResult {
-    writeFileSync(join(this.worktree, "feature.txt"), `구현 ${this.calls.length}\n`);
+    if (!step.noChange) writeFileSync(join(this.worktree, "feature.txt"), `구현 ${this.calls.length}\n`);
     const status = step.status === undefined ? "completed" as const : step.status;
     const base = this.kind === "FIX"
       ? result("FIX", "검토 지적을 보완했습니다.", [reviewFinding("RESOLVED_BY_FIX")])
       : result("IMPLEMENTATION", "구현했습니다.");
     const requests = step.resolveRequests ? [...prompt.matchAll(/^- \[([^\]]+)\] /gm)].map((match) => match[1]) : [];
     return {
-      ...base, ...(status ? { status } : {}), ...(status === "in_progress" ? { remainingSteps: ["남은 구현"] } : {}),
+      ...base, ...(status ? { status } : {}), ...(status === "in_progress" ? { remainingSteps: step.remainingSteps ?? ["남은 구현"] } : {}),
       ...(step.requestedUserDecision ? { requestedUserDecision: step.requestedUserDecision } : {}),
       ...(requests.length ? { resolvesRequestedDecision: true, resolvedRequestIds: requests } : {}),
     };
@@ -1108,20 +1110,52 @@ describe("E3-2-2b 타임라인 쪽 — 구현·수정·코드 리뷰", () => {
     room.database.close();
   });
 
-  it("계속 진행 상한은 in_progress 에만 남는다: 러너가 in_progress 로 상한(4회)에 닿으면 필수 쪽이 남아도 계속 진행 상한으로 멈춘다", async () => {
+  it("진척이 있으면 네 번을 넘어 같은 세션에서 계속하고 완료 후 한 번만 리뷰한다", async () => {
     const room = await pagedTopic("progress-cap", [koreanDecision(50_000, "h"), koreanDecision(50_000, "i")]);
-    const claude = new PagingClaude(room.worktree, Array.from({ length: 5 }, () => ({ status: "in_progress" as const })));
+    const claude = new PagingClaude(room.worktree, Array.from({ length: 6 }, () => ({ status: "in_progress" as const })));
     const codex = new PagingCodex(false);
     room.engine(claude, codex).startImplementation(room.topicId);
     await room.idle();
 
-    expect(claude.calls).toHaveLength(5);
+    expect(claude.calls).toHaveLength(7);
+    expect(claude.calls.slice(1).every(call => call.sessionId === "claude-s1")).toBe(true);
     expect(claude.calls.slice(1).every((call) => call.prompt.includes("status=in_progress 였습니다(계속 진행") && !call.prompt.includes(RECHECK))).toBe(true);
-    const stop = room.database.getTimeline(room.topicId).at(-1)!;
-    expect(stop.payload?.continuationExhausted).toBe(true);
-    expect(stop.payload?.remainingSteps).toEqual(["남은 구현"]);
+    expect(room.database.getTopic(room.topicId).state).toBe("READY_TO_DELIVER");
+    expect(codex.calls.filter(call => call.operation === "review")).toHaveLength(1);
     expect(room.database.getTimeline(room.topicId).some((event) => typeof event.payload?.readingTurn === "number")).toBe(false);
+    expect(room.database.latestArtifact(room.topicId, "implementation")).not.toBeNull();
+    room.database.close();
+  });
+
+  it("같은 결과를 반복하고 파일 변경과 필수 읽기 진척이 없으면 보존 후 멈춘다", async () => {
+    const room = await pagedTopic("no-progress", []);
+    const claude = new PagingClaude(room.worktree, Array.from({ length: 4 }, () => ({ status: "in_progress" as const, noChange: true })));
+    const codex = new PagingCodex(false);
+    room.engine(claude, codex).startImplementation(room.topicId);
+    await room.idle();
+    expect(claude.calls).toHaveLength(3);
+    expect(room.database.getTopic(room.topicId).state).toBe("USER_DECISION_REQUIRED");
+    expect(room.database.getTimeline(room.topicId).at(-1)!.payload?.continuationStalled).toBe(true);
+    expect(room.database.latestArtifact(room.topicId, "implementation-progress")).not.toBeNull();
     expect(room.database.latestArtifact(room.topicId, "implementation")).toBeNull();
+    expect(codex.calls).toHaveLength(0); room.database.close();
+  });
+
+  it("파일을 바꾸지 않는 조사도 남은 작업이 줄어들면 같은 세션에서 계속한다", async () => {
+    const room = await pagedTopic("investigation-progress", []);
+    const claude = new PagingClaude(room.worktree, [
+      { status: "in_progress", remainingSteps: ["A 확인", "B 확인", "C 확인", "최종 확인"] },
+      { status: "in_progress", noChange: true, remainingSteps: ["B 확인", "C 확인", "최종 확인"] },
+      { status: "in_progress", noChange: true, remainingSteps: ["C 확인", "최종 확인"] },
+      { status: "in_progress", noChange: true, remainingSteps: ["최종 확인"] },
+      { status: "completed", noChange: true },
+    ]);
+    const codex = new PagingCodex(false);
+    room.engine(claude, codex).startImplementation(room.topicId);
+    await room.idle();
+    expect(claude.calls).toHaveLength(5);
+    expect(room.database.getTopic(room.topicId).state).toBe("READY_TO_DELIVER");
+    expect(codex.calls.filter(call => call.operation === "review")).toHaveLength(1);
     room.database.close();
   });
 

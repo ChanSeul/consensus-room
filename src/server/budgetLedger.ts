@@ -1,11 +1,11 @@
 import type { DatabaseSync } from "node:sqlite";
-import { BUDGET_KEYS, BudgetPolicySchema, zeroBudget, type BudgetAccount, type BudgetPolicy, type BudgetVector } from "../shared/budgets.js";
+import { BUDGET_KEYS, BudgetPolicySchema, hasBudgetLimits, OBSERVE_USAGE, zeroBudget, type BudgetAccount, type BudgetPolicy, type BudgetVector } from "../shared/budgets.js";
 
 export class BudgetBlocked extends Error {
   constructor(readonly accountId: string, message = "예산을 추가한 뒤 재개해야 합니다.") { super(message); this.name = "BudgetBlocked"; }
 }
 interface Execution {
-  id: string; accounts: string[]; limit: BudgetVector; accountLimits: Record<string,BudgetVector>; used: BudgetVector;
+  id: string; accounts: string[]; limit: BudgetVector | null; accountLimits: Record<string,BudgetVector | null>; used: BudgetVector;
   startedAt: number; stage: string; role: string; model: string; effort: string; finished: boolean;
   // Absent in legacy rows: unknown, never evidence that a paid process did not start.
   dispatchStarted?: boolean;
@@ -20,12 +20,23 @@ export class BudgetLedger {
     const row = this.db.prepare("SELECT record_json FROM budget_accounts WHERE id=?").get(id);
     return row ? JSON.parse(String(row.record_json)) : null;
   }
+  hasUnfinishedExecution(id: string): boolean {
+    return Boolean(this.db.prepare(`SELECT 1 FROM budget_executions,
+      json_each(budget_executions.record_json, '$.accounts')
+      WHERE json_each.value=? AND NOT coalesce(json_extract(budget_executions.record_json, '$.finished'), 0) LIMIT 1`).get(id));
+  }
   private save(account: BudgetAccount): void {
     this.db.prepare("INSERT INTO budget_accounts VALUES (?,?) ON CONFLICT(id) DO UPDATE SET record_json=excluded.record_json")
       .run(account.id, JSON.stringify(account));
   }
+  private assertNoLostAccount(id: string): void {
+    const prior = this.db.prepare("SELECT 1 FROM budget_grants WHERE account_id=? LIMIT 1").get(id) ||
+      this.db.prepare("SELECT 1 FROM budget_executions, json_each(budget_executions.record_json, '$.accounts') WHERE json_each.value=? LIMIT 1").get(id);
+    if (prior) throw new BudgetBlocked(id, "사용량 기록에 연결된 계정이 없습니다. 기록을 복구한 뒤 진행하세요.");
+  }
   configure(id: string, policy: BudgetPolicy, source: string, now = Date.now()): BudgetAccount {
     if (this.account(id)) throw new Error("기존 예산은 덮어쓸 수 없습니다. 증액을 사용하세요.");
+    this.assertNoLostAccount(id);
     const account: BudgetAccount = { id, policy: BudgetPolicySchema.parse(policy), used: zeroBudget(), startedAt: now,
       pause: null, version: 1, source };
     this.save(account); return account;
@@ -34,8 +45,9 @@ export class BudgetLedger {
   assertNotExhausted(ids: string[]): void {
     for (const id of ids) {
       const a = this.account(id);
-      if (!a) throw new BudgetBlocked(id, "검증된 기본 예산이 없습니다. 예산을 설정한 뒤 진행하세요.");
-      if (a.pause || BUDGET_KEYS.some(key => a.used[key] >= a.policy.total[key])) throw new BudgetBlocked(id);
+      if (!a) this.assertNoLostAccount(id);
+      const policy = a?.policy;
+      if (a && (a.pause || (policy && hasBudgetLimits(policy) && BUDGET_KEYS.some(key => a.used[key] >= policy.total[key])))) throw new BudgetBlocked(id);
     }
   }
 
@@ -43,11 +55,12 @@ export class BudgetLedger {
     const unfinished = this.db.prepare("SELECT record_json FROM budget_executions").all()
       .map(row=>JSON.parse(String(row.record_json)) as Execution)
       .find(execution=>!execution.finished && execution.accounts.some(id=>ids.includes(id)));
-    if(unfinished) throw new BudgetBlocked(unfinished.accounts.find(id=>ids.includes(id))!,"집계가 끝나지 않은 실행이 있습니다. 진행 상태를 확인하고 예산을 추가하세요.");
+    if(unfinished) throw new BudgetBlocked(unfinished.accounts.find(id=>ids.includes(id))!,"집계가 끝나지 않은 실행이 있습니다. 중단된 실행을 확인하고 재개하세요.");
     for (const id of ids) {
       const a = this.account(id);
-      if (!a) throw new BudgetBlocked(id, "검증된 기본 예산이 없습니다. 예산을 설정한 뒤 진행하세요.");
-      if (a.pause || BUDGET_KEYS.some(key => a.used[key] >= a.policy.total[key])) throw new BudgetBlocked(id);
+      if (!a) this.assertNoLostAccount(id);
+      const policy = a?.policy;
+      if (a && (a.pause || (policy && hasBudgetLimits(policy) && BUDGET_KEYS.some(key => a.used[key] >= policy.total[key])))) throw new BudgetBlocked(id);
     }
   }
   start(input: Omit<Execution, "used" | "finished" | "limit" | "accountLimits">, reserve?: () => void): Execution {
@@ -55,8 +68,10 @@ export class BudgetLedger {
       if (!input.accounts.length || new Set(input.accounts).size !== input.accounts.length) throw new Error("예산 계정은 비어 있거나 중복될 수 없습니다.");
       this.assertAvailable(input.accounts);
       reserve?.();
-      const limit = Object.fromEntries(BUDGET_KEYS.map(key => [key, Math.min(...input.accounts.map(id => this.account(id)!.policy.execution[key]))])) as BudgetVector;
-      const execution = { ...input, limit, accountLimits:Object.fromEntries(input.accounts.map(id=>[id,this.account(id)!.policy.execution])), used: zeroBudget(), finished: false };
+      const accounts = input.accounts.map(id => this.account(id) ?? this.configure(id, OBSERVE_USAGE, "usage-only", input.startedAt));
+      const policies = accounts.map(a => a.policy).filter(hasBudgetLimits);
+      const limit = policies.length ? Object.fromEntries(BUDGET_KEYS.map(key => [key, Math.min(...policies.map(p => p.execution[key]))])) as BudgetVector : null;
+      const execution = { ...input, limit, accountLimits:Object.fromEntries(accounts.map(a => [a.id, hasBudgetLimits(a.policy) ? a.policy.execution : null])), used: zeroBudget(), finished: false };
       this.db.prepare("INSERT INTO budget_executions VALUES (?,?)").run(input.id, JSON.stringify(execution));
       return execution;
     });
@@ -86,9 +101,12 @@ export class BudgetLedger {
       }
       const accounts = execution.accounts.map(accountId => {
         const a = this.account(accountId)!;
-        const exceeded = BUDGET_KEYS.filter(key => execution.used[key] >= (execution.accountLimits?.[accountId] ?? execution.limit)[key]);
+        // A recorded null is deliberately unbounded; only legacy rows without accountLimits use the merged limit.
+        const limit = execution.accountLimits?.[accountId] === undefined ? execution.limit : execution.accountLimits[accountId];
+        const exceeded = limit ? BUDGET_KEYS.filter(key => execution.used[key] >= limit[key]) : [];
         for (const key of BUDGET_KEYS) a.used[key] += delta[key];
-        const total = BUDGET_KEYS.filter(key => a.used[key] >= a.policy.total[key]);
+        const policy = a.policy;
+        const total = hasBudgetLimits(policy) ? BUDGET_KEYS.filter(key => a.used[key] >= policy.total[key]) : [];
         if (!a.pause && (exceeded.length || total.length)) a.pause = { executionId:id, detectedAt:now, deadline:now+60_000,
           reason: `${exceeded.length ? "실행" : "누적"} 예산 도달: ${(exceeded.length ? exceeded : total).join(", ")}` };
         this.save(a); return a;
@@ -129,9 +147,10 @@ export class BudgetLedger {
         .map(row => JSON.parse(String(row.record_json)) as Execution)
         .some(row => !row.finished && row.accounts.includes(id));
       if (!execution.finished || !execution.accounts.includes(id) || unfinished) throw new Error("실행 종료와 사용량 기록을 먼저 확인하세요.");
-      if (BUDGET_KEYS.some(key => account.used[key] >= account.policy.total[key])) throw new Error("누적 예산이 소진되어 증액이 필요합니다.");
-      const limit = execution.accountLimits?.[id] ?? execution.limit;
-      if (!BUDGET_KEYS.some(key => execution.used[key] >= limit[key])) throw new Error("실행당 예산으로 중단된 기록이 아닙니다.");
+      const policy = account.policy;
+      if (hasBudgetLimits(policy) && BUDGET_KEYS.some(key => account.used[key] >= policy.total[key])) throw new Error("누적 예산이 소진되어 증액이 필요합니다.");
+      const limit = execution.accountLimits?.[id] === undefined ? execution.limit : execution.accountLimits[id];
+      if (!limit || !BUDGET_KEYS.some(key => execution.used[key] >= limit[key])) throw new Error("실행당 예산으로 중단된 기록이 아닙니다.");
       account.pause = null;
       account.version++;
       this.save(account);
@@ -152,21 +171,26 @@ export class BudgetLedger {
       const a = this.account(id); if (!a) throw new Error("먼저 예산을 설정하세요.");
       policy = BudgetPolicySchema.parse(policy);
       if (a.version !== expectedVersion) throw new Error("예산이 변경됐습니다. 새로 확인하세요.");
-      for (const key of BUDGET_KEYS) {
-        if (policy.execution[key] < a.policy.execution[key] || policy.total[key] < a.policy.total[key]
+      if (hasBudgetLimits(policy)) for (const key of BUDGET_KEYS) {
+        if ((hasBudgetLimits(a.policy) && (policy.execution[key] < a.policy.execution[key] || policy.total[key] < a.policy.total[key]))
           || policy.total[key] <= a.used[key]) throw new Error("사용량보다 큰 예산을 지정하고 기존 상한을 낮추지 마세요.");
       }
-      if (JSON.stringify(policy) === JSON.stringify(a.policy)) throw new Error("추가 예산이 필요합니다.");
-      for(const row of this.db.prepare("SELECT record_json FROM budget_executions").all()) {
-        const execution=JSON.parse(String(row.record_json)) as Execution;
-        if(!execution.finished && execution.accounts.includes(id)) {
-          execution.finished=true;
-          this.db.prepare("UPDATE budget_executions SET record_json=? WHERE id=?").run(JSON.stringify(execution),execution.id);
-        }
+      const interrupted = this.db.prepare("SELECT record_json FROM budget_executions").all()
+        .map(row => JSON.parse(String(row.record_json)) as Execution)
+        .filter(execution => !execution.finished && execution.accounts.includes(id));
+      // The authenticated resume API first proves there is no active action. It may
+      // acknowledge interrupted observation without inventing a numeric allowance.
+      if (JSON.stringify(policy) === JSON.stringify(a.policy) && (hasBudgetLimits(policy) || !interrupted.length)) {
+        throw new Error("변경할 정책이나 확인할 중단 실행이 없습니다.");
+      }
+      for (const execution of interrupted) {
+        execution.finished = true;
+        this.db.prepare("UPDATE budget_executions SET record_json=? WHERE id=?").run(JSON.stringify(execution),execution.id);
       }
       a.policy = policy; a.pause = null; a.version++;
       this.save(a);
-      this.db.prepare("INSERT INTO budget_grants VALUES (?,?,?)").run(requestId,id,JSON.stringify({ policy, version:a.version, at:Date.now() }));
+      this.db.prepare("INSERT INTO budget_grants VALUES (?,?,?)").run(requestId,id,
+        JSON.stringify({ policy, version:a.version, at:Date.now(), acknowledgedExecutions:interrupted.map(execution=>execution.id) }));
       return a;
     });
   }

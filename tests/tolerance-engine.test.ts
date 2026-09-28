@@ -485,7 +485,7 @@ describe("Codex 감사 2026-09-14 — 결과 수명·진행 상태·도구 트�
     const { worktree, database, artifacts, gitService, topicId } = await setup("d01");
     const claude = scripted([
       () => { writeFileSync(join(worktree, "feature.txt"), "1\n"); return result("IMPLEMENTATION", "P3 완료", { status: "in_progress", remainingSteps: ["P3.5 문서 동결", "P3.6"], evidenceRefs: ["p3"] }); },
-      (prompt) => { expect(prompt).toContain("status=in_progress 였습니다(계속 진행 1/4)"); expect(prompt).toContain("- P3.5 문서 동결");
+      (prompt) => { expect(prompt).toContain("status=in_progress 였습니다(계속 진행 1회차)"); expect(prompt).toContain("- P3.5 문서 동결");
         writeFileSync(join(worktree, "feature.txt"), "2\n"); return result("IMPLEMENTATION", "P3.5 완료", { status: "in_progress", remainingSteps: ["P3.6"], evidenceRefs: ["p35"] }); },
       () => { writeFileSync(join(worktree, "feature.txt"), "3\n"); return result("IMPLEMENTATION", "P3.6 완료 — 전부 끝", { status: "completed", evidenceRefs: ["p36"] }); },
     ]);

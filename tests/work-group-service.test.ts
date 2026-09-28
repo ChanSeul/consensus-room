@@ -194,7 +194,7 @@ describe("착수 선택과 기준 커밋", () => {
     const blocked = service.next(group.id);
     await expect(blocked).rejects.toThrow("열 수 있는 준비된 단계가 없습니다");
     const message = await blocked.catch((error: Error) => error.message);
-    expect(message).toContain("b: 완료 조건·예산이 정해지지 않은 대략 단계입니다");
+    expect(message).toContain("b: 완료 조건이 정해지지 않은 대략 단계입니다");
     expect(message).toContain("c: 의존 단계 b 가 아직 착수되지 않았습니다");
     expect(message).toContain("d: 착수를 막는 미정 질문 q1 이 해소되지 않았습니다");
     expect(message).toContain("z: 통합 단계는 다른 모든 단계가 닫힌 뒤에 엽니다(남은 단계 b, c, d)");
@@ -324,6 +324,15 @@ describe("착수 선택과 기준 커밋", () => {
     expect(a.approvedPlanSHA256).toBeNull();
     expect(git.created).toEqual([fx.base]);
     expect(fx.database.workGroups.get(group.id).pending?.a).toBeUndefined();
+  });
+
+  it("완료 조건이 정해진 단계는 숫자 예산 없이 열고 사용량만 기록한다", async () => {
+    const fx = fixture(), service = fx.service();
+    const group = await service.create(groupInput([work("a", { budget: undefined }), { ...integration("z", ["a"]), budget: undefined }]));
+    expect(service.selectableStages(group)).toContain("a");
+    const topic = await service.next(group.id);
+    expect(fx.database.budgets.account(group.id)?.policy).toEqual({ mode: "observe" });
+    expect(fx.database.budgets.account(topic.id)?.policy).toEqual({ mode: "observe" });
   });
 
   it("묶음 예산은 묶음 정책이 있으면 그것, 없으면 예산을 선언한 단계들로 정하고(계정 출처는 늘 explicit-stage-budgets) 대략 단계를 허용한다", async () => {

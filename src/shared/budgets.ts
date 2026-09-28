@@ -8,8 +8,14 @@ export const BudgetVectorSchema = z.object({
 export type BudgetVector = z.infer<typeof BudgetVectorSchema>;
 export const BUDGET_KEYS = ["inputTokens", "outputTokens", "durationMs"] as const;
 export const zeroBudget = (): BudgetVector => ({ inputTokens: 0, outputTokens: 0, durationMs: 0 });
-export const BudgetPolicySchema = z.object({ execution: BudgetVectorSchema, total: BudgetVectorSchema }).strict();
+export const BoundedBudgetPolicySchema = z.object({ execution: BudgetVectorSchema, total: BudgetVectorSchema }).strict();
+// No configured ceiling is a real policy, not a very large invented token allowance.
+export const BudgetPolicySchema = z.union([BoundedBudgetPolicySchema, z.object({ mode: z.literal("observe") }).strict()]);
 export type BudgetPolicy = z.infer<typeof BudgetPolicySchema>;
+export const OBSERVE_USAGE = { mode: "observe" } as const;
+export function hasBudgetLimits(policy: BudgetPolicy): policy is z.infer<typeof BoundedBudgetPolicySchema> {
+  return !("mode" in policy);
+}
 // Resuming a FINISHED per-execution stop is distinct from purchasing a larger allowance.
 export const BudgetResumeInputSchema = z.union([
   z.object({ policy: BudgetPolicySchema, version: z.number().int().positive() }).strict(),

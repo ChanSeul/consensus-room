@@ -1,5 +1,5 @@
 import { dependencyClosure, stageReady, WorkGroupInputSchema } from "../shared/workGroups.js";
-import { BudgetPolicySchema } from "../shared/budgets.js";
+import { BudgetPolicySchema, OBSERVE_USAGE } from "../shared/budgets.js";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
@@ -174,8 +174,7 @@ export class WorkGroupService {
         "작업 묶음이 변경됐습니다. 생성한 작업 트리는 보존했습니다.",
       );
     this.admit(current, requested, stage.id);
-    const budget = stage.budget;
-    if (!budget) throw new Error(`단계 ${stage.id} 의 예산이 정해지지 않았습니다.`);
+    const budget = stage.budget ?? OBSERVE_USAGE;
     const created = this.database.workGroups.atomic(() => {
       const timestamp = new Date().toISOString();
       const topic =
@@ -328,8 +327,8 @@ export class WorkGroupService {
   // 결과가 없는 닫힌 단계는 E4 전에 닫힌 것이고, next 가 이전 계약 증거로 동결한다.
   private readinessBlocker(group: WorkGroup, stage: WorkStage): string | null {
     if (!stageReady(group, stage.id)) {
-      if (!stage.acceptance || !stage.budget)
-        return `${stage.id}: 완료 조건·예산이 정해지지 않은 대략 단계입니다`;
+      if (!stage.acceptance)
+        return `${stage.id}: 완료 조건이 정해지지 않은 대략 단계입니다`;
       const questions = (group.questions ?? [])
         .filter((question) => question.blocksStart && !question.resolution && (question.stageId === null || question.stageId === stage.id))
         .map((question) => question.id);

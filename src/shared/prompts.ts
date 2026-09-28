@@ -660,7 +660,7 @@ function mediationDecisionContract(): string {
 export function stopPolicyContract(): string {
   return `정지 정책 — requestedUserDecision 은 드물게 씁니다:
 - 승인 범위 밖 변경이 필요한 자리는 먼저 계획의 \`## 허용 오차\` 규칙과 대조하세요. **규칙 술어를 만족하면 구현하고 반환 JSON 의 toleranceLedger 에 {ruleId, file, note} 로 적으세요**(서버가 git diff 로 대조하며, 원장에 없는 범위 밖 변경은 되돌리게 합니다). 규칙 밖(다른 단계가 소유한 파일의 다른 변경, 모듈 선언, 우회 표기가 필요한 자리)은 **코드를 건드리지 말고 to-do 로 남기고 계속**하세요. 원장·보고서에 진단 정체성·원인 선언·필요한 변경·권장 형태를 한 줄로 적고 다음 일로 갑니다. 현재 완료 조건과 무관한 항목 때문에 턴을 끝내지 마세요. 필수 조건을 막으면 그 근거와 필요한 범위 결정을 보고하고 완료로 제출하지 마세요. 범위 밖을 미리 구현하는 것도 금지입니다(리뷰가 되돌리게 합니다).
-- requestedUserDecision 으로 턴을 끝내는 경우는 넷뿐입니다: (1) 중재자가 실행해야 하는 게이트(시뮬레이터·xcodebuild 등 러너가 돌릴 수 없는 단계), (2) 계획의 전제가 계측으로 반박돼 남은 작업의 방향이 갈릴 때, (3) 되돌리기 어려운 변경(외부 계약·동작 변경)을 피할 수 없을 때, (4) 계획 단계가 남았는데 턴을 끊어야 할 때 — 남은 단계를 적고 "계속 진행 요청" 으로 정지합니다(중재자가 곧 재개합니다).
+- requestedUserDecision 으로 턴을 끝내는 경우는 다음과 같습니다: (1) 중재자가 실행해야 하는 게이트(시뮬레이터·xcodebuild 등 러너가 돌릴 수 없는 단계), (2) 계획의 전제가 계측으로 반박돼 남은 작업의 방향이 갈릴 때, (3) 되돌리기 어려운 변경(외부 계약·동작 변경)을 피할 수 없을 때. 승인된 작업이 남은 채 턴을 마칠 때는 requestedUserDecision 없이 status=in_progress 와 remainingSteps 로 보고하세요. 서버가 같은 세션에서 이어갑니다.
 - **완료 선언 계약**: 결과 JSON 의 \`status\` 로 진행 상태를 명시하세요 — \`completed\`(계획의 모든 단계가 끝남 → 서버가 즉시 Codex 리뷰로 넘김) · \`in_progress\`(단계가 남았고 같은 세션에서 계속 — \`remainingSteps\` 에 남은 단계를 적으면 서버가 곧바로 "계속 진행" 턴을 엽니다) · \`blocked\`(중재자·사용자 입력이 필요해 정지, \`remainingSteps\` + requestedUserDecision). \`status\` 는 필수입니다 — 없으면 서버가 완료로 보지 않고 읽기 전용 확인 턴을 엽니다. 중간 보고·진행 상황 정리를 completed 로 내지 마세요(2026-09-14 S11: 완료 형식 중간 보고가 두 번 리뷰로 흘렀습니다).
 - to-do 는 원장·보고서 표와 함께 **반환 findings 에도** 남기세요: id \`TODO-n\`, disposition \`DEFERRED_OUT_OF_SCOPE\`, rationale 에 진단 정체성·원인 선언·필요한 변경·권장 형태. 방이 후속 목록에 기록합니다. 현재 완료 조건을 막지 않는 항목의 후속 토픽·다음 계획 포함·폐기 선택은 현재 인도의 선행 조건이 아닙니다. 별도 범위 결정 전에는 후속 목록에 보존하세요.
 - 그 경우에도 **한 턴에 한 번, 턴 끝에 모아서** 요청하세요. 요청 전에 결정과 무관한 일을 전부 끝내고, 요청문에는 실측 값·후보·권고를 적어 한 번의 답으로 끝나게 하세요.
@@ -898,12 +898,12 @@ export function completionStatusContract(): string {
 // timeline: 이 세션이 아직 받지 않은 필수 타임라인 쪽(E3-2-2b). recheck 면 러너가 완료를 보고했지만 필수 구간이 남아 최종 채택·검증 전에 잇는 턴이다(J2) —
 // 남은 구간을 읽고 이미 만든 결과를 재대조·보완하게 한다. 필수 읽기 턴은 계속 진행 상한을 쓰지 않아 회차만 표시한다(round = 필수 읽기 회차, E3-4b).
 export function buildContinuationPrompt(
-  remainingSteps: readonly string[], round: number, limit: number, kind: "IMPLEMENTATION" | "FIX" = "IMPLEMENTATION",
+  remainingSteps: readonly string[], round: number, kind: "IMPLEMENTATION" | "FIX" = "IMPLEMENTATION",
   openRequests?: readonly OpenRequestPrompt[], timeline?: TimelinePages & { recheck: boolean },
 ): string {
   const opening = timeline?.recheck
     ? `직전 결과가 완료를 보고했지만, 이 세션이 아직 받지 않은 필수 타임라인 구간(사용자 결정·범위 변경 원문)이 남아 서버가 최종 채택·검증 전에 이어갑니다(필수 읽기 ${round}회차). 아래 쪽을 읽고, 이미 만든 결과를 그 결정과 다시 대조해 어긋나는 곳을 같은 승인 범위에서 보완한 뒤 다시 완료를 보고하세요. 어긋남이 없으면 대조한 근거를 evidenceRefs 에 남기고 status=completed 로 답하세요. 반환 kind 는 ${kind} 입니다.`
-    : `직전 결과가 status=in_progress 였습니다(계속 진행 ${round}/${limit}). 같은 승인 범위에서 남은 단계를 이어서 수행하세요. 반환 kind 는 ${kind} 입니다.`;
+    : `직전 결과가 status=in_progress 였습니다(계속 진행 ${round}회차). 같은 승인 범위에서 남은 단계를 이어서 수행하세요. 횟수 때문에 작업을 쪼개지 마세요. 파일 변경과 필수 읽기 진척 없이 같은 보고를 반복하면 서버가 멈춥니다. 반환 kind 는 ${kind} 입니다.`;
   return `${opening}
 남은 단계(직전 제출):
 ${remainingSteps.length ? remainingSteps.map((step) => `- ${step}`).join("\n") : "- (명시 없음 — 계획의 다음 단계)"}

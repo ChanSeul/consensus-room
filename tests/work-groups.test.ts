@@ -39,7 +39,7 @@ it("단계 ID·의존관계·순서와 재시작 후 연결을 보존한다", ()
     ),
   ).toThrow();
   const g = groups.create("g", input, "/repo", "head");
-  expect(groups.groupPolicy(g).total.inputTokens).toBe(200);
+  expect(groups.groupPolicy(g)).toMatchObject({ total: { inputTokens: 200 } });
   expect(() => groups.link("g", "b", "t", "head")).toThrow();
   groups.link("g", "a", "t", "head");
   expect(new WorkGroups(db).forTopic("t")?.id).toBe("g");
@@ -163,8 +163,8 @@ it("E4-1 대략 단계로 만들고 새 필드를 초기화하며, 묶음 예산
   const policy = { execution: { inputTokens: 1, outputTokens: 2, durationMs: 3 }, total: { inputTokens: 4, outputTokens: 5, durationMs: 6 } };
   expect(groups.groupPolicy(groups.create("p", { ...rough, budgetPolicy: policy }, "/repo", "base"))).toEqual(policy);
   const none = { ...rough, stages: rough.stages.map((stage) => ({ ...stage, budget: undefined })) };
-  expect(() => groups.create("n", none, "/repo", "base")).toThrow("묶음 예산이나 단계 예산이 하나 이상 필요합니다.");
-  expect(() => groups.groupPolicy(none)).toThrow("묶음 예산이나 단계 예산이 하나 이상 필요합니다.");
+  expect(groups.groupPolicy(groups.create("n", none, "/repo", "base"))).toEqual({ mode: "observe" });
+  expect(groups.groupPolicy(none)).toEqual({ mode: "observe" });
   db.close();
 });
 

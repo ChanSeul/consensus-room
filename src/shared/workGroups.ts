@@ -3,7 +3,7 @@ import { BudgetPolicySchema, type BudgetAccount } from "./budgets.js";
 import type { DeferredFinding } from "./contracts.js";
 
 // 작업 묶음(큰 그림) 계약 — 엔진 개편 E4(plan.md §3.1–3.3, v4 단계 분할 기준).
-// 미착수 단계는 대략으로 둘 수 있다: 완료 조건(acceptance)·예산(budget)이 없으면 "준비되지 않은" 단계이고, 둘 다 있고 그 단계에 걸린
+// 미착수 단계는 대략으로 둘 수 있다: 완료 조건(acceptance)이 없으면 "준비되지 않은" 단계이고, 완료 조건이 있고 그 단계에 걸린
 // 미해소 차단 질문이 없을 때만 연다(준비된 단계). 과거 레코드(모든 필드 있음)는 그대로 읽힌다 — 새 필드는 전부 선택 필드다.
 
 const StageIdSchema = z
@@ -61,7 +61,7 @@ export const WorkGroupInputSchema = z
     goal: z.string().trim().min(1),
     contracts: z.string().trim().min(1),
     stages: z.array(WorkStageSchema).min(2).max(20),
-    // 묶음 예산 정책. 없으면 예산을 선언한 단계들로 정한다(total 합·execution 최대) — 선언한 단계도 없으면 만들 수 없다.
+    // 선택적 묶음 예산. 선언된 예산이 없으면 사용량만 기록한다.
     // 목록 뷰의 budget(묶음 예산 계정)과 이름이 겹치지 않게 budgetPolicy 로 둔다.
     budgetPolicy: BudgetPolicySchema.optional(),
     // 선택 필드다(과거 레코드·기존 호출의 입력 형식 유지). 없으면 빈 목록으로 읽는다.
@@ -91,8 +91,6 @@ export const WorkGroupInputSchema = z
         ctx.addIssue({ code: "custom", message: `단계 ${s.id} 의 선행 결과 근거는 의존 관계 안의 단계를 가리켜야 합니다.` });
       seen.add(s.id);
     }
-    if (!g.budgetPolicy && !g.stages.some((s) => s.budget))
-      ctx.addIssue({ code: "custom", message: "묶음 예산이나 단계 예산이 하나 이상 필요합니다." });
     const questionIds = new Set<string>();
     for (const q of g.questions ?? []) {
       if (questionIds.has(q.id)) ctx.addIssue({ code: "custom", message: "질문 ID는 고유해야 합니다." });
@@ -194,10 +192,10 @@ export interface WorkGroupView extends WorkGroup {
   replanPending: string[];
 }
 
-// 준비된 단계: 완료 조건·예산이 있고, 그 단계(또는 묶음 전체)에 걸린 미해소 차단 질문이 없다.
+// 준비된 단계: 완료 조건이 있고, 그 단계(또는 묶음 전체)에 걸린 미해소 차단 질문이 없다. 비용 상한은 선택 사항이다.
 export function stageReady(group: Pick<WorkGroupInput, "stages" | "questions">, stageId: string): boolean {
   const stage = group.stages.find((s) => s.id === stageId);
-  if (!stage || !stage.acceptance || !stage.budget) return false;
+  if (!stage || !stage.acceptance) return false;
   return !(group.questions ?? []).some((q) => q.blocksStart && !q.resolution && (q.stageId === null || q.stageId === stageId));
 }
 // 의존 추이 폐포(자기 제외).

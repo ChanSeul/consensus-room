@@ -43,8 +43,6 @@ it("토큰 예산 거절은 횟수를 쓰지 않고 횟수 거절은 실행 원�
       },
       () => revisions.reserve("t", id, "revision"),
     );
-  expect(() => start("blocked")).toThrow();
-  expect(revisions.account("t").used).toBe(0);
   budgets.configure(
     "t",
     {
@@ -53,6 +51,11 @@ it("토큰 예산 거절은 횟수를 쓰지 않고 횟수 거절은 실행 원�
     },
     "test",
   );
+  budgets.start({ id: "explicit-cap", accounts: ["t"], stage: "IMPLEMENTING", role: "claude", model: "m", effort: "e", startedAt: 0 });
+  budgets.observe("explicit-cap", { inputTokens: 10 }, 0, true);
+  expect(() => start("blocked")).toThrow();
+  expect(revisions.account("t").used).toBe(0);
+  budgets.resumeExecution("t", "resume", "explicit-cap", 1);
   for (const id of ["1", "2", "3"]) {
     start(id);
     budgets.observe(id, {}, 0, true);

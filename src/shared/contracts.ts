@@ -642,6 +642,7 @@ export const TopicActivitySchema = z.object({
   state: WorkflowStateSchema,
   runningAction: z.boolean(),
   budget: z.custom<BudgetAccount>().nullable().optional(),
+  budgetRecoveryRequired: z.boolean().optional(),
   revisionAllowance: RevisionAllowanceSchema.optional(),
   revisionPaused: z.boolean().optional(),
   reviewAllowances: z.array(ReviewAllowanceSchema).optional(),

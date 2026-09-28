@@ -173,9 +173,13 @@ function renderReport(result: AgentResult): string {
   return `# ${result.kind}\n\n${result.summary}\n\n## Findings\n\n\`\`\`json\n${JSON.stringify(result.findings, null, 2)}\n\`\`\`\n\n## Evidence\n\n${result.evidenceRefs.map((item) => `- ${item}`).join("\n") || "- 없음"}\n`;
 }
 
-// status=in_progress 로 멈춘 러너를 같은 액션 안에서 다시 여는 상한. 그 뒤엔 USER_DECISION_REQUIRED(resume IMPLEMENTING)로 넘겨 retry 로 잇는다.
-// 완료 보고 뒤 남은 필수 타임라인 구간을 싣는 필수 읽기 턴은 이 상한을 쓰지 않는다 — 진척 게이트가 끊는다(E3-4b).
-const CONTINUATION_LIMIT = 4;
+// Stop repeated identical reports without observed changes, not useful read-only investigation.
+const STALLED_CONTINUATIONS = 2;
+
+function progressReport(result: AgentResult): string {
+  return JSON.stringify({ summary: result.summary, remainingSteps: result.remainingSteps ?? [],
+    findings: result.findings, evidenceRefs: result.evidenceRefs });
+}
 
 function isWithinSelectedPaths(path: string, selectedPaths: readonly string[]): boolean {
   return selectedPaths.some((scope) => path === scope || path.startsWith(`${scope.replace(/\/$/, "")}/`));
@@ -804,13 +808,17 @@ export class DeliveryPipeline {
     const workSession = sessionId;
     if (initialTurn) freshlyVerified = true;
     // 3) 완료 판정 루프
-    // 계수는 둘이다(E3-4b): 러너 in_progress 의 계속 진행(상한 CONTINUATION_LIMIT)과 완료 게이트의 필수 읽기 턴(상한 없음 — 진척 게이트).
+    // Counts describe progress; they do not impose a maximum number of useful implementation turns.
     let continuations = 0;
     let readingTurns = 0;
+    let stalledContinuations = 0;
     // 같은 세션의 계속 진행 턴 — 러너의 in_progress 와 필수 타임라인 완독 게이트(recheck)가 같은 경로를 쓴다. 쪽은 이 세션이 아직 받지 않은 필수
     // 구간(커서 뒤 필수 이벤트 전부 + 세션 참조 목록)에서 고르고, 반환 뒤에만 반환 세션에 인정한다(E3-2-2b).
     const continueWork = async (remainingSteps: readonly string[], send: TimelineSend, recheck: boolean): Promise<WorkState | null> => {
       const round = recheck ? ++readingTurns : ++continuations;
+      const before = !recheck ? await this.core.dependencies.git.snapshot(topic.worktreePath) : null;
+      const unreadBefore = this.unacknowledgedBytes(topic, workSession, send.push.required);
+      const reportBefore = progressReport(state.base);
       // 호출을 열기 전에 누적본을 보존한다(옛 progress 산출물은 사람·옛 소비처 호환).
       await this.core.saveAgentOutput(topic, setup.route, state.base, setup.progressKind, signal);
       await this.core.checkpoints.record(topic, {
@@ -823,7 +831,7 @@ export class DeliveryPipeline {
           { readingTurn: round, timelineRecheck: send.push.required.map((reference) => reference.selector) });
       } else {
         this.core.event(topicId, "system", "system",
-          `러너가 진행 중(status=in_progress)으로 멈췄습니다 — 남은 단계 ${remainingSteps.length}개. 같은 세션에서 계속 진행합니다(${round}/${CONTINUATION_LIMIT}).`,
+          `러너가 진행 중(status=in_progress)으로 멈췄습니다 — 남은 단계 ${remainingSteps.length}개. 같은 세션에서 계속 진행합니다(${round}회차).`,
           { continuation: round, remainingSteps });
       }
       const referencesPath = await this.writeTimelineReferences(topic, [send], signal);
@@ -831,7 +839,7 @@ export class DeliveryPipeline {
       const continued = await this.core.executor.execute({
         route: continueRoute, topic, signal, purpose: "계속 진행 턴", inputSequence: setup.inputSequence, expected, writeGuards,
         session: { mode: "resume", sessionId: workSession }, recoverable: true,
-        prompt: buildContinuationPrompt(remainingSteps, round, CONTINUATION_LIMIT, setup.kind, state.openRequests,
+        prompt: buildContinuationPrompt(remainingSteps, round, setup.kind, state.openRequests,
           send.push.required.length ? { ...send.push, referencesPath, recheck } : undefined),
         readablePaths: withReferences(setup.readablePaths, referencesPath), settings: continueRoute.settings,
         onResponse: (outcome) => this.rememberTimeline(topic, outcome.sessionId, send),
@@ -839,7 +847,18 @@ export class DeliveryPipeline {
       this.acknowledgeTimeline(topic, signal, setup.work.resumeState, continued.sessionId, send);
       await this.assertBaselineIntact(topic, setup.baselineHead, "계속 진행 중");
       this.assertToolTreesIntact(topic, setup.toolTreesBefore, "계속 진행 중");
-      return this.absorbTurn(setup, work, state, continued.result, workSession, expected, writeGuards, signal);
+      const absorbed = await this.absorbTurn(setup, work, state, continued.result, workSession, expected, writeGuards, signal);
+      if (absorbed && before) {
+        const after = await this.core.dependencies.git.snapshot(topic.worktreePath);
+        const unreadAfter = this.unacknowledgedBytes(topic, workSession, send.push.required);
+        // Investigation may produce no file write. A changed report permits continuation, but never proves completion.
+        const reportChanged = progressReport(absorbed.base) !== reportBefore;
+        const progressed = before.head !== after.head || before.diffSHA256 !== after.diffSHA256 || unreadAfter < unreadBefore || reportChanged;
+        stalledContinuations = progressed ? 0 : stalledContinuations + 1;
+        this.core.event(topicId, "system", "system", progressed ? "계속 진행 턴의 파일·필수 읽기·작업 보고 중 변경이 있어 이어갑니다." : "계속 진행 턴에서 파일과 필수 읽기 진척 없이 같은 작업 보고를 반복했습니다.",
+          { continuationProgress: { round, progressed, reportChanged, stalledContinuations, before, after, unreadBefore, unreadAfter } });
+      }
+      return absorbed;
     };
     for (;;) {
       // 루프에 들어오는 모든 누적본(첫 턴·복구·재대조·계속 진행·확인 턴)에서 먼저 본다 — 러너가 이 작업에 실린 진단을 반박하거나 증거를 요구했으면
@@ -888,10 +907,10 @@ export class DeliveryPipeline {
         return;
       }
       if (verdict.kind === "continue") {
-        if (continuations >= CONTINUATION_LIMIT) {
+        if (stalledContinuations >= STALLED_CONTINUATIONS) {
           await this.pauseWork(setup, work, state, "USER_DECISION_REQUIRED",
-            `러너가 계속 진행 상한(${CONTINUATION_LIMIT}회)에 닿았는데 아직 in_progress 입니다 — 남은 단계: ${verdict.remainingSteps.join(" · ") || "(명시 없음)"}. 재시도(retry)로 같은 세션에서 이어갑니다.`,
-            { continuationExhausted: true, remainingSteps: verdict.remainingSteps }, signal);
+            `계속 진행 ${STALLED_CONTINUATIONS}회 연속 파일과 필수 읽기 진척 없이 같은 작업 보고를 반복했습니다. 결과와 같은 세션을 보존했습니다 — 남은 단계: ${verdict.remainingSteps.join(" · ") || "(명시 없음)"}. 반복 원인을 확인한 뒤 같은 세션에서 재개하세요.`,
+            { continuationStalled: true, remainingSteps: verdict.remainingSteps }, signal);
           return;
         }
         const absorbed = await continueWork(verdict.remainingSteps,

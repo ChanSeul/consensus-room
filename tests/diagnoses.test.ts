@@ -922,14 +922,13 @@ async function revisedCycleReady(label: string) {
   return { r, register, apply };
 }
 
-// 구현 리뷰 한도 정지는 리뷰 1회 추가 승인(review-resume) + retry 로 넘기고, 그 밖의 멈춤 상태를 돌려준다.
+// 구현 리뷰 1회 추가 승인(review-resume)이 자동으로 재개한다. 그 밖의 멈춤 상태를 돌려준다.
 async function g6aSettleWithGrants(r: Awaited<ReturnType<typeof room>>, label: string): Promise<string> {
   for (let attempt = 0; attempt < 4; attempt += 1) {
     const settled = await settledState(r, label);
     if (settled !== "USER_DECISION_REQUIRED" || !(r.database.getTopic(r.topicId).lastError ?? "").includes("구현 리뷰 한도")) return settled;
     const { version } = r.database.reviews.account(r.topicId, "implementation");
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/review-resume`, { scope: "implementation", version })).status).toBe(200);
-    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(200);
   }
   return settledState(r, label);
 }
@@ -2018,7 +2017,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
       expect(diagnosisTurn.prompt).toContain("[DG-1]");
       expect(continuation.mode).toBe("resume");
       expect(continuation.protocolOnly).toBe(false);
-      expect(continuation.prompt).toContain("계속 진행 1/");
+      expect(continuation.prompt).toContain("계속 진행 1회차");
       expect(continuation.prompt).toContain(`반환 kind 는 ${kind}`);
       expect(continuation.prompt).toContain("중재자 진단 DG-1");
       expect(atContinuation).toEqual({ state: workState, diagnosis: "delivered", codexPrompts: codexBeforeApply });
@@ -2706,11 +2705,10 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(String(blocked.body.error)).toContain("READY_TO_DELIVER");
 
     // 리뷰 1회를 추가 승인하고 재개하면 같은 세션의 교정이 F-2 를 지목하고, 리뷰어는 F-2 를 판정 필요인 채 유지한다.
-    // (review-resume 은 승인을 기록하지만 이 방에는 토큰·시간 예산 계정이 없어 재개를 보류(resumeBlocked)한다 — retry 로 재개한다.)
+    // 별도 토큰·시간 한도가 없으므로 review-resume이 같은 작업을 자동 재개한다.
     const codexBeforeGrant = r.codex.prompts.length;
     const { version } = r.database.reviews.account(r.topicId, "implementation");
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/review-resume`, { scope: "implementation", version })).status).toBe(200);
-    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(200);
     await r.idle("USER_DECISION_REQUIRED");
     const correction = r.codex.prompts.slice(codexBeforeGrant).find((prompt) => prompt.includes("서버 기계 검사가 방금 응답을 거부했습니다"));
     expect(correction).toBeTruthy();
@@ -3112,9 +3110,8 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.claude.turns, JSON.stringify(applyDg2.body)).toHaveLength(2);
     expect((await r.diagnoses()).map((record) => [record.id, record.status])).toEqual([["DG-1", "superseded"], ["DG-2", "applied"]]);
     const allowance = r.database.revisions.account(r.topicId);
-    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/revision-resume`, { version: allowance.version })).status).toBe(200);
     const sequenceBeforeRetry = r.database.getTimeline(r.topicId).at(-1)!.sequence;
-    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(200);
+    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/revision-resume`, { version: allowance.version })).status).toBe(200);
     await r.idle("USER_DECISION_REQUIRED");
 
     // 세 번째 Claude 턴은 DG-2 원문을 실은 새 개정 턴이다 — DG-1 응답의 교정 재개(같은 세션 resume·계약 교정문)가 아니다.
@@ -3707,10 +3704,9 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(topic.lastError).toContain("리뷰 한도");
     expect(r.codex.prompts).toHaveLength(6);
     // 리뷰 1회를 추가 승인하고 재개하면 최종 리뷰도 개정 전 정지 쟁점 F-2 를 싣지 않고 DG-4 반영을 대조해 인도 대기에 이르고 커밋이 열린다.
-    // (review-resume 은 승인을 기록하지만 이 방에는 토큰·시간 예산 계정이 없어 재개를 보류한다 — retry 로 재개한다.)
+    // 별도 토큰·시간 한도가 없으므로 review-resume이 같은 작업을 자동 재개한다.
     const { version } = r.database.reviews.account(r.topicId, "implementation");
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/review-resume`, { scope: "implementation", version })).status).toBe(200);
-    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(200);
     expect(await g6aSettleWithGrants(r, "revision-abandons-contract 추가 승인")).toBe("READY_TO_DELIVER");
     expect(r.claude.turns).toHaveLength(8);
     expect(r.codex.prompts).toHaveLength(7);
@@ -3751,7 +3747,6 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     const codexBeforeGrant = r.codex.prompts.length;
     const { version } = r.database.reviews.account(r.topicId, "implementation");
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/review-resume`, { scope: "implementation", version })).status).toBe(200);
-    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(200);
     expect(await settledState(r, "shadowed-stop-omit 추가 승인")).toBe("USER_DECISION_REQUIRED");
     const correction = r.codex.prompts.slice(codexBeforeGrant).find((prompt) => prompt.includes("서버 기계 검사가 방금 응답을 거부했습니다"));
     expect(correction).toContain("검토 쟁점을 누락했습니다: F-2");
@@ -4399,7 +4394,6 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     // 4) 리뷰 1회를 추가 승인하고 재개하면 최종 리뷰도 F-2 없이 DG-5 반영을 대조해 인도 대기에 이르고 커밋이 열린다.
     const { version } = r.database.reviews.account(r.topicId, "implementation");
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/review-resume`, { scope: "implementation", version })).status).toBe(200);
-    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(200);
     await r.idle("READY_TO_DELIVER");
     const finals = r.codex.prompts.slice(codexBefore).filter((prompt) => prompt.includes("반환 kind는 FINAL_REVIEW"));
     expect(finals).toHaveLength(1);
@@ -4435,7 +4429,6 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.codex.prompts).toHaveLength(codexBefore);
     const { version } = r.database.reviews.account(r.topicId, "implementation");
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/review-resume`, { scope: "implementation", version })).status).toBe(200);
-    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(200);
     await r.idle("READY_TO_DELIVER");
     // 최종 리뷰의 대조 보고는 개정 계획의 구현 결과다.
     const finals = r.codex.prompts.slice(codexBefore).filter((prompt) => prompt.includes("반환 kind는 FINAL_REVIEW"));
@@ -4471,7 +4464,6 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.getTopic(r.topicId).lastError).toContain("리뷰 한도");
     const { version } = r.database.reviews.account(r.topicId, "implementation");
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/review-resume`, { scope: "implementation", version })).status).toBe(200);
-    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(200);
     await r.idle("READY_TO_DELIVER");
     const finals = r.codex.prompts.slice(codexBefore).filter((prompt) => prompt.includes("반환 kind는 FINAL_REVIEW"));
     expect(finals).toHaveLength(1);
@@ -4530,9 +4522,8 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
       && (r.database.getTopic(r.topicId).lastError ?? "").includes("리뷰 한도"), "재시도 뒤 리뷰 한도 정지");
     expect(r.codex.prompts).toHaveLength(codexBefore);
     const { version } = r.database.reviews.account(r.topicId, "implementation");
-    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/review-resume`, { scope: "implementation", version })).status).toBe(200);
     const retryAt = r.database.getTimeline(r.topicId).at(-1)!.sequence;
-    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(200);
+    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/review-resume`, { scope: "implementation", version })).status).toBe(200);
     await waitFor(() => r.codex.prompts.length > codexBefore && r.database.runningAction(r.topicId) === null
       && ["READY_TO_DELIVER", "USER_DECISION_REQUIRED", "FAILED"].includes(r.database.getTopic(r.topicId).state), "재시도 뒤 최종 리뷰 정지");
     // 최종 리뷰의 대조 보고는 재구현 결과다.
@@ -4991,7 +4982,6 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     const resumedAt = r.database.getTimeline(r.topicId).at(-1)!.sequence;
     const { version } = r.database.reviews.account(r.topicId, "implementation");
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/review-resume`, { scope: "implementation", version })).status).toBe(200);
-    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(200);
     const settledC = await settledState(r, "g2-withdrawn-source-kept 최종 리뷰 #C");
     const finals = r.codex.prompts.slice(codexBefore).filter((prompt) => prompt.includes("반환 kind는 FINAL_REVIEW"));
     expect(finals).toHaveLength(1);
@@ -6240,7 +6230,6 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     const codexBefore = r.codex.prompts.length;
     const { version } = r.database.reviews.account(r.topicId, "implementation");
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/review-resume`, { scope: "implementation", version })).status).toBe(200);
-    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(200);
     expect(await g6aSettleWithGrants(r, "g6c-stop-after-ready-kept 추가 승인")).toBe("READY_TO_DELIVER");
     const finals = r.codex.prompts.slice(codexBefore).filter((prompt) => prompt.includes("반환 kind는 FINAL_REVIEW"));
     expect(finals).toHaveLength(1);
@@ -6348,7 +6337,6 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     const resumedAt = r.database.getTimeline(r.topicId).at(-1)!.sequence;
     const { version } = r.database.reviews.account(r.topicId, "implementation");
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/review-resume`, { scope: "implementation", version })).status).toBe(200);
-    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(200);
     const settled = await settledState(r, "g6d-agreed-not-shadowed R3");
     const finals = r.codex.prompts.slice(codexBefore).filter((prompt) => prompt.includes("반환 kind는 FINAL_REVIEW"));
     expect(finals).toHaveLength(1);
@@ -6383,7 +6371,6 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.getTopic(r.topicId).lastError).toContain("리뷰 한도에 도달했습니다");
     const { version } = r.database.reviews.account(r.topicId, "implementation");
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/review-resume`, { scope: "implementation", version })).status).toBe(200);
-    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(200);
     expect(await settledState(r, "g6d-evidence-control R3")).toBe("USER_DECISION_REQUIRED");
     expect(r.database.getTopic(r.topicId).lastError).toContain("수정 확인 없이 닫았습니다(F-2)");
     expect(r.database.getFlags(r.topicId).resumeState).toBe("CODEX_FINAL_REVIEW");
@@ -6522,7 +6509,6 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.getTopic(r.topicId).lastError).toContain("리뷰");
     const { version } = r.database.reviews.account(r.topicId, "implementation");
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/review-resume`, { scope: "implementation", version })).status).toBe(200);
-    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(200);
     await r.idle("READY_TO_DELIVER");
     expect(r.codex.prompts).toHaveLength(codexBefore + 1);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "질문 해소 뒤 인도", paths: ["feature.txt"] })).status).toBe(200);
@@ -6623,7 +6609,6 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     if (revoked) r.codex.answerHandlers.push(({ requests, decisions }) => [{ requestId: requests.find(request => request.question.includes("배포 시간?"))!.id, decisionSequence: decisions.at(-1)!.sequence }]);
     const { version } = r.database.reviews.account(r.topicId, "implementation");
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/review-resume`, { scope: "implementation", version })).status).toBe(200);
-    await r.call("POST", `/api/topics/${r.topicId}/actions/retry`);
     if (revoked) {
       await r.idle("USER_DECISION_REQUIRED");
       expect(r.database.getTopic(r.topicId).lastError).toContain("배포 채널?");

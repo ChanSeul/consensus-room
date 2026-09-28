@@ -585,7 +585,7 @@ export function App() {
           {selected && detail ? (
             <>
               <RoomHeader
-                budgetPaused={Boolean(activity?.budget?.pause || activity?.revisionPaused || activity?.reviewPaused)}
+                budgetPaused={Boolean(activity?.budget?.pause || activity?.budgetRecoveryRequired || activity?.revisionPaused || activity?.reviewPaused)}
                 autoRetryAt={activity?.autoRetryAt ?? null}
                 topic={selected}
                 routing={detail.routing}
@@ -594,6 +594,7 @@ export function App() {
                 onAction={(action, body) => void run(action, () => api.runAction(selected.id, action, body))}
               />
               {activity && <BudgetPanel account={activity.budget ?? null} busy={Boolean(busyAction) || activity.runningAction}
+                recoveryRequired={activity.budgetRecoveryRequired ?? false}
                 onSubmit={(action,body)=>void run(action,async()=>{ const result=await api.runAction(selected.id,action,body as Record<string,unknown>);const next=await api.getActivity(selected.id);if(selectedTopicRef.current===selected.id)setActivity(next);return result; })}/>}
               {activity?.revisionAllowance && <RevisionPanel account={activity.revisionAllowance} paused={activity.revisionPaused ?? false}
                 busy={Boolean(busyAction) || activity.runningAction}
@@ -628,7 +629,7 @@ export function App() {
           {selected && detail ? (
             <Inspector
               evidenceBusy={Boolean(busyAction) || Boolean(activity?.runningAction) || selected.state === "CLOSED"}
-              budgetPaused={Boolean(activity?.budget?.pause || activity?.revisionPaused || activity?.reviewPaused)}
+              budgetPaused={Boolean(activity?.budget?.pause || activity?.budgetRecoveryRequired || activity?.revisionPaused || activity?.reviewPaused)}
               detail={detail}
               findings={findings}
               evidence={evidence}

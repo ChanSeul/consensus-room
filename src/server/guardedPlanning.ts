@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { hasBudgetLimits } from "../shared/budgets.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
@@ -568,17 +569,19 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
     };
     const softLimit = () => accounts.some(id => {
       const account = database.budgets.account(id);
-      return account && (["inputTokens", "outputTokens", "durationMs"] as const).some(k =>
-        record.usage[k] >= account.policy.execution[k] * 0.8 || account.used[k] >= account.policy.total[k] * 0.8);
+      const policy = account?.policy;
+      return account && policy && hasBudgetLimits(policy) && (["inputTokens", "outputTokens", "durationMs"] as const).some(k =>
+        record.usage[k] >= policy.execution[k] * 0.8 || account.used[k] >= policy.total[k] * 0.8);
     });
     const canFinalize = () => accounts.every(id => {
       const account = database.budgets.account(id);
-      if (!account) return true;
+      if (!account || !hasBudgetLimits(account.policy)) return true;
+      const policy = account.policy;
       // Reserve the largest observed step, with headroom. Missing usage never authorizes another paid call.
       return (["inputTokens", "outputTokens", "durationMs"] as const).every(k => {
         const reserve = Math.ceil((record.peakStep?.[k] ?? 0) * 1.25);
-        return reserve > 0 && record.usage[k] + reserve < account.policy.execution[k] &&
-          account.used[k] + reserve < account.policy.total[k];
+        return reserve > 0 && record.usage[k] + reserve < policy.execution[k] &&
+          account.used[k] + reserve < policy.total[k];
       });
     });
     // 한 회차 묶음 한도(batchBytes)를 넘어 싣지 못한 요청(unserved)과, 이 세션이 이미 받아 싣지 않은 요청(held — 재읽기 사유 없음)을 돌려준다. 모델 요청은
