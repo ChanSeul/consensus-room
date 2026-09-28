@@ -11,6 +11,8 @@ export const REVIEW_ANSWER_BATCH_LIMIT = 100;
 
 export const WORKFLOW_STATES = [
   "DRAFT",
+  "BRAINSTORM_READY",
+  "BRAINSTORMING",
   "CLAUDE_PLAN",
   "CODEX_AUDIT",
   "CLAUDE_REVISION",
@@ -150,6 +152,7 @@ export const PlanRepairJsonSchema = {
 export const AgentResultSchema = z.object({
   planningStep: PlanningStepSchema.optional(),
   kind: z.enum([
+    "BRAINSTORM",
     "PLAN",
     "AUDIT",
     "REVISION",
@@ -324,6 +327,7 @@ export const BranchNameSchema = z.string().trim().min(1).max(120)
 
 export const CreateTopicInputSchema = z.object({
   title: z.string().trim().min(2).max(120),
+  startMode: z.enum(["plan", "brainstorm"]).default("plan"),
   // '-'로 시작하면 git worktree add에서 옵션으로 해석될 수 있다(감사 부차 지적).
   baseRef: z.string().trim().min(1).refine((value) => !value.startsWith("-"), "기준 리비전은 '-'로 시작할 수 없습니다.").default("HEAD"),
   branchPrefix: BranchPrefixSchema.default("consensus"),

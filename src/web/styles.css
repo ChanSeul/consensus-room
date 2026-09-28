@@ -68,6 +68,10 @@ h3 { font-size: 17px; }
 .room-title-row { display: flex; align-items: center; gap: 9px; }
 .room-header p { max-width: 500px; margin-top: 5px; overflow: hidden; color: var(--muted); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
 .room-actions, .button-row { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+.room-header.brainstorm-header { align-items: flex-start; flex-direction: column; gap: 12px; }
+.brainstorm-header > div { min-width: 0; max-width: 100%; }
+.brainstorm-header p { max-width: 100%; }
+.brainstorm-header .room-actions { width: 100%; }
 .primary-button, .secondary-button, .danger-button, .ghost-button, .session-chip { min-height: 34px; padding: 8px 11px; border-radius: 9px; font-size: 13px; font-weight: 720; cursor: pointer; }
 .primary-button { border: 1px solid #63eab3; color: #06130e; background: var(--green); }
 .primary-button:hover:not(:disabled) { background: #68ebb9; }

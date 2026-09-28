@@ -28,6 +28,8 @@ import { redactRecord } from "./security.js";
 import type { AgentAdapter, ExecutionLimits, ParticipantRole, ProjectMemoryWriter } from "./types.js";
 import { EngineCore, type MaintenanceLockOwner } from "./engine/core.js";
 import { PlanningPipeline } from "./engine/planning.js";
+import { BrainstormPipeline } from "./engine/brainstorm.js";
+import { BrainstormDecisionSchema, BrainstormInputSchema, brainstormReplies, latestBrainstormRound } from "../shared/brainstorm.js";
 import { DeliveryPipeline } from "./engine/delivery.js";
 import { CheckpointCorrupt, checkpointOpenRequests, WORK_CHECKPOINT_KIND } from "./engine/checkpoint.js";
 import { pendingReviewRequests } from "./engine/reviewRequests.js";
@@ -92,6 +94,8 @@ export interface WorkflowDependencies {
 // 범위 변경을 허용하는 상태. WorkflowState가 늘어나면 이 표가 컴파일을 막아 새 상태를 의식적으로 판단하게 만든다.
 const SCOPE_CHANGE_ALLOWED_STATES: Readonly<Record<WorkflowState, boolean>> = {
   DRAFT: true,
+  BRAINSTORM_READY: true,
+  BRAINSTORMING: true,
   CLAUDE_PLAN: true,
   CODEX_AUDIT: true,
   CLAUDE_REVISION: true,
@@ -114,6 +118,7 @@ const SCOPE_CHANGE_ALLOWED_STATES: Readonly<Record<WorkflowState, boolean>> = {
 export class WorkflowEngine {
   private readonly core: EngineCore;
   private readonly planning: PlanningPipeline;
+  private readonly brainstorming: BrainstormPipeline;
   private readonly delivery: DeliveryPipeline;
   private readonly usageLimitRetry: UsageLimitRetryScheduler;
   // 결과 확인(git) 중인 묶음 단계 닫기 — 같은 단계를 두 번 동시에 닫지 않는다.
@@ -122,6 +127,7 @@ export class WorkflowEngine {
   constructor(dependencies: WorkflowDependencies) {
     this.core = new EngineCore(dependencies);
     this.planning = new PlanningPipeline(this.core);
+    this.brainstorming = new BrainstormPipeline(this.core);
     this.delivery = new DeliveryPipeline(this.core);
     this.usageLimitRetry = new UsageLimitRetryScheduler(this.core, (topicId) => this.retry(topicId), dependencies.clock);
     this.core.failureObserver = (topicId, message) => this.usageLimitRetry.consider(topicId, message);
@@ -144,19 +150,22 @@ export class WorkflowEngine {
     requestKey?: string,
   ): Promise<Topic> {
     const topic = this.core.dependencies.database.getTopic(topicId);
-    if (topic.state !== "DRAFT") throw new Error("세션 연결은 계획 실행 전에만 바꿀 수 있습니다.");
+    if (topic.state !== "DRAFT" && topic.state !== "BRAINSTORM_READY") throw new Error("세션 연결은 계획 실행 전이나 논의 대기 중에만 바꿀 수 있습니다.");
+    this.core.assertNoActiveWork(topicId);
     const generation = topic.scopeGeneration;
     let participant: Participant;
     let binding: SessionBinding | undefined;
     if (input.mode === "attach") {
       // 기존 세션은 좌석이 라우팅되는 공급자의 CLI 세션이다 — 그 공급자의 어댑터로 확인하고 그 공급자의 세션 이름공간에서 중복을 본 뒤 바인딩과 함께 저장한다
       // (E2b — 다른 공급자 CLI 에 이 id 를 보내지 않게). 기본 배정에서는 좌석 이름과 같은 공급자라 E2b 이전과 같은 어댑터·검사다.
-      const route = this.seatRoute(topic, SEAT_JOB[role]);
+      const route = this.seatRoute(topic, topic.state === "BRAINSTORM_READY"
+        ? { role: SEAT_JOB[role].role, operation: "brainstorm" } as TurnJob : SEAT_JOB[role]);
       if (!await this.core.adapter(route.provider).validateExistingSession(input.sessionId)) {
         throw new Error(`${role} 세션을 확인할 수 없습니다${route.provider === role ? "" : `(${describeBinding(route)} 세션으로 확인)`}.`);
       }
       const current = this.core.dependencies.database.getTopic(topicId);
-      if (current.state !== "DRAFT" || current.scopeGeneration !== generation) {
+      this.core.assertNoActiveWork(topicId);
+      if (current.state !== topic.state || current.scopeGeneration !== generation) {
         throw new Error("세션을 확인하는 동안 합의가 시작되었거나 범위가 바뀌었습니다.");
       }
       if (this.core.dependencies.database.participantSessionInUse(topicId, route.provider, input.sessionId)) {
@@ -289,6 +298,63 @@ export class WorkflowEngine {
 
   assertBudgetEditable(topicId: string): void { this.core.assertNoActiveWork(topicId); }
 
+  private brainstormPreconditions(topicId: string): Topic {
+    this.core.assertNotShuttingDown();
+    this.core.assertNoActiveWork(topicId);
+    const topic = this.core.requireState(topicId, "BRAINSTORM_READY");
+    if (topic.planSHA256 || this.core.dependencies.database.workGroups.forTopic(topicId)) {
+      throw new Error("계획 전의 독립 주제에서만 논의할 수 있습니다.");
+    }
+    return topic;
+  }
+
+  startBrainstorm(topicId: string, input: { message?: string } = {}, actionId?: string): string {
+    const parsed = BrainstormInputSchema.parse(input);
+    const topic = this.brainstormPreconditions(topicId);
+    this.core.requireParticipants(topic);
+    this.core.assertBudgetAvailable(topicId);
+    return this.core.startAction(topicId, "brainstorm", async signal => {
+      if (parsed.message) this.core.dependencies.database.appendEvent({ topicId, actor: "user", kind: "note", state: topic.state, body: redactSecrets(parsed.message) });
+      await this.brainstorming.run(topicId, signal, true);
+    }, actionId);
+  }
+
+  finishBrainstorm(topicId: string, input: { decision: string }, next: "plan" | "close", actionId?: string, origin?: CallOrigin): string {
+    const parsed = BrainstormDecisionSchema.parse(input);
+    const topic = this.brainstormPreconditions(topicId);
+    if (next === "plan") {
+      this.core.requireParticipants(topic);
+      this.core.assertBudgetAvailable(topicId);
+    }
+    // 논의 전용 배정은 계획 연속성 v2의 시작 세션이 아니다. 다른 배정으로 넘길 때만 새 세션을 예약하고,
+    // 이전 세션 신원과 사용자 결정을 상태 전이와 함께 남긴다. 같은 배정의 대화는 그대로 이어 쓴다.
+    const handoffs = next === "plan" ? topic.participants.flatMap(participant => {
+      if (!participant.sessionId || participant.sessionId.startsWith("pending:")) return [];
+      const route = this.seatRoute(topic, participant.role === "claude" ? { role: "planner", operation: "plan" } : { role: "reviewer", operation: "audit" });
+      const stored = this.core.dependencies.database.participantBinding(topicId, participant.role) ?? legacyBinding(participant.role);
+      return sameBinding(stored, route) ? [] : [{
+        participant: { ...participant, sessionId: `pending:${randomUUID()}`, mode: "created" as const, acknowledgedPlanSHA256: null },
+        previous: { sessionId: participant.sessionId, binding: stored }, next: bindingOf(route),
+      }];
+    }) : [];
+    return this.core.startAction(topicId, `brainstorm-${next}`, async signal => {
+      const state: WorkflowState = next === "plan" ? "DRAFT" : "CLOSED";
+      this.core.dependencies.database.applyTopicTransition({ topicId,
+        changes: { state, lastError: null, resumeState: null },
+        participants: handoffs.map(handoff => handoff.participant),
+        events: [...handoffs.map(handoff => ({ actor: "system" as const, kind: "system" as const, state,
+          body: "논의와 계획의 참여자 배정이 달라 계획용 새 세션을 연결합니다. 논의 기록은 계획에 전달합니다.",
+          payload: { sessionRebound: { seat: handoff.participant.role, previous: handoff.previous, next: handoff.next } },
+        })), { actor: "user", kind: "decision", state, body: redactSecrets(parsed.decision),
+          payload: { brainstormConclusion: next, ...(origin ? { origin } : {}) } },
+        { actor: "system", kind: "system", state,
+          body: next === "plan" ? "사용자가 논의 결과를 바탕으로 계획 작성을 선택했습니다. 기존 발언의 가설·대안은 승인으로 간주하지 않습니다."
+            : "사용자의 결정으로 논의를 마쳤습니다. 계획이나 구현은 시작하지 않습니다." }],
+      });
+      if (next === "plan") await this.planning.runPlanningLoop(topicId, signal);
+    }, actionId);
+  }
+
   startPlan(topicId: string, actionId?: string): string {
     // 원장에 running 행을 만들기 전에 상태를 확인한다. 비동기 work에서 거부하면 이미 끝난 주제까지 FAILED로 덮인다.
     this.core.assertNotShuttingDown();
@@ -414,6 +480,17 @@ export class WorkflowEngine {
       return this.core.startAction(topicId, "retry", (signal) => this.planning.runDiagnosisPlanRevision(topicId, signal), actionId);
     }
     if (!resume) throw new Error("재시도할 단계가 기록되어 있지 않습니다.");
+    if (resume === "BRAINSTORM_READY") {
+      // 라운드나 사용자 결정을 저장하기 전 종료됐다. 시작 의도를 추측해 AI를 호출하지 않고 선택 화면을 복구한다.
+      return this.core.startAction(topicId, "retry", async () => {
+        this.core.transitionWith(topicId, "BRAINSTORM_READY", "논의 대기를 복구했습니다. 다음 행동을 다시 선택해 주세요.", {
+          payload: { brainstormCompletedActionId: this.core.active.get(topicId)!.actionId },
+        });
+      }, actionId);
+    }
+    if (resume === "BRAINSTORMING") {
+      return this.core.startAction(topicId, "retry", signal => this.brainstorming.run(topicId, signal, false), actionId);
+    }
     const migration = this.core.dependencies.database.getTimeline(topicId).filter(e => e.payload?.planningMigration).at(-1)?.payload?.planningMigration as PlanningMigration | undefined;
     if (resume === "CLAUDE_PLAN" && migration && this.core.dependencies.database.planning.continuityEnabled(topicId) &&
         migration.scopeGeneration === topic.scopeGeneration && migration.planEpoch === topic.planEpoch &&
@@ -612,6 +689,7 @@ export class WorkflowEngine {
       .map(request => ({ id: request.id, question: request.question, askedAtSequence: request.sequence, answerDecisionSequence: request.answerDecisionSequence ?? null }));
     const findings = await this.resumeFindings(topic, flags.resumeState ?? null);
     const planArtifact = db.latestArtifact(topicId, "plan");
+    const brainstormRound = latestBrainstormRound(timeline);
     return {
       topicId: topic.id, title: topic.title, state: topic.state, resumeState: flags.resumeState ?? null,
       scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch, planRevision: topic.planRevision,
@@ -622,6 +700,13 @@ export class WorkflowEngine {
       },
       delivery: { branchName: topic.branchName, committedOID: flags.committedOID ?? null, pushedOID: flags.pushedOID ?? null, orphanCommitOID: flags.orphanCommitOID ?? null },
       runningAction: running ? { id: running.id, kind: running.kind } : null,
+      brainstorm: brainstormRound ? {
+        round: brainstormRound.number, order: brainstormRound.order,
+        replies: brainstormReplies(timeline, brainstormRound.sequence).map(event => ({
+          role: event.payload.brainstormRole, sequence: event.sequence, body: event.body, route: event.payload.route,
+        })),
+        conclusion: timeline.findLast(event => event.actor === "user" && event.payload.brainstormConclusion)?.body ?? null,
+      } : null,
       autoRetryAt: this.scheduledRetryAt(topicId),
       stop,
       openRequests: {
@@ -748,7 +833,15 @@ export class WorkflowEngine {
     const flags = db.getFlags(topicId);
     if (db.runningAction(topicId) || this.core.active.has(topicId)) return [{ action: "stop", blocker: null }];
     const actions: ResumeAction[] = [];
-    if (topic.state === "DRAFT") {
+    if (topic.state === "BRAINSTORM_READY") {
+      const blocker = this.blocker(() => { this.brainstormPreconditions(topicId); });
+      const runnable = this.blocker(() => {
+        const current = this.brainstormPreconditions(topicId); this.core.requireParticipants(current); this.core.assertBudgetAvailable(topicId);
+      });
+      actions.push({ action: "brainstorm", blocker: runnable },
+        { action: "brainstorm-plan", blocker: runnable, input: { decision: null } },
+        { action: "brainstorm-close", blocker, input: { decision: null } });
+    } else if (topic.state === "DRAFT") {
       actions.push({ action: "plan", blocker: this.blocker(() => {
         this.core.assertNotShuttingDown(); this.core.assertNoActiveWork(topicId); this.core.requireState(topicId, "DRAFT");
         this.assertStageContextCurrent(topicId);
@@ -1198,6 +1291,8 @@ export class WorkflowEngine {
 
   async handleScopeChange(topicId: string, body: string, requestKey?: string, origin?: CallOrigin): Promise<Topic> {
     const topic = this.assertScopeChangeAllowed(topicId);
+    const nextState = topic.state === "BRAINSTORM_READY" || topic.state === "BRAINSTORMING"
+      || ["BRAINSTORMING", "BRAINSTORM_READY"].includes(this.core.dependencies.database.getFlags(topicId).resumeState ?? "") ? "BRAINSTORM_READY" : "DRAFT";
     this.core.scopeChangeActive.add(topicId);
     // 범위 변경은 새 사건이다 — 예약된 자동 재시도와 그 지속 상태를 지운다(잠금 중 발화하면 fire 가 건너뛴다).
     this.usageLimitRetry.reset(topicId);
@@ -1252,7 +1347,7 @@ export class WorkflowEngine {
       const updated = this.core.dependencies.database.applyTopicTransition({
         topicId,
         changes: {
-          state: "DRAFT",
+          state: nextState,
           scopeGeneration: nextGeneration,
           planEpoch: topic.planEpoch + 1,
           planRevision: 0,
@@ -1278,7 +1373,7 @@ export class WorkflowEngine {
           {
             actor: "user",
             kind: "scope_change",
-            state: "DRAFT",
+            state: nextState,
             body: redactSecrets(body),
             payload: redactRecord({
               scopeGeneration: nextGeneration,
@@ -1297,7 +1392,7 @@ export class WorkflowEngine {
           {
             actor: "system",
             kind: "system",
-            state: "DRAFT",
+            state: nextState,
             body: "범위 세대가 올라갔습니다. 이전 세대의 대화와 에이전트 응답은 다음 프롬프트에 들어가지 않고, 두 에이전트 세션도 새로 시작합니다. 계속 필요한 근거와 결정은 이 세대에 다시 남겨 주세요. 기존 세션을 다시 쓰려면 연결을 바꿔 주세요.",
           },
         ],

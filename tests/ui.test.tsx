@@ -102,7 +102,7 @@ describe("저장소와 에이전트 실행 설정", () => {
 
     await waitFor(() => expect(createTopic).toHaveBeenCalledWith({
       title: "설정 변경", baseRef: "HEAD", branchPrefix: "consensus", requestedBranchName: null,
-    predecessorTopicId: null,
+    predecessorTopicId: null, startMode: "plan",
     }));
   });
 
@@ -119,7 +119,7 @@ describe("저장소와 에이전트 실행 설정", () => {
 
     await waitFor(() => expect(createTopic).toHaveBeenCalledWith({
       title: "Rx 제거", baseRef: "HEAD", branchPrefix: "refactoring", requestedBranchName: null,
-    predecessorTopicId: null,
+    predecessorTopicId: null, startMode: "plan",
     }));
   });
 
@@ -696,6 +696,61 @@ describe("자율중재 위임 토글", () => {
     const toggle = await screen.findByRole("switch", { name: "자율중재 위임" });
     await waitFor(() => expect(toggle).toHaveTextContent("자율중재 위임 OFF"));
     expect(toggle.getAttribute("title")).toContain("파일이 없어");
+  });
+});
+
+describe("계획 전 선택형 논의", () => {
+  it("같은 AI의 두 참여자를 버튼과 발언의 접근 가능한 이름으로 구분한다", async () => {
+    const topic = { ...makeTopic(), state: "BRAINSTORM_READY" as const };
+    const jobs: RoutingView["jobs"] = (["planner", "reviewer"] as const).map((role, index) => ({
+      role, operation: "brainstorm", refusal: null, inheritsFrom: null,
+      route: { provider: "codex", participant: `person-${index}`, profileId: "shared-model", basis: { kind: "default" }, settings: { model: "gpt-6-astra", effort: "high" } },
+    }));
+    const events = jobs.map((job, index) => ({ ...timelineEvent(index + 1, `발언 ${index + 1}`), actor: index === 0 ? "claude" as const : "codex" as const,
+      kind: "agent_output" as const, payload: { route: { ...job.route, job: { role: job.role, operation: "brainstorm" } } } }));
+    vi.spyOn(api, "listTopics").mockResolvedValue([topic]);
+    vi.spyOn(api, "getTopic").mockResolvedValue({ ...makeDetail(topic, events), routing: {
+      jobs, sessions: [], current: { author: { role: "planner", operation: "brainstorm" }, reviewer: { role: "reviewer", operation: "brainstorm" } },
+    } });
+    render(<App />);
+    expect(await screen.findByRole("button", { name: /^참여자 1 · Codex/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^참여자 2 · Codex/ })).toBeInTheDocument();
+    expect(screen.getByText("논의 참여자 1 · Codex")).toBeInTheDocument();
+    expect(screen.getByText("논의 참여자 2 · Codex")).toBeInTheDocument();
+  });
+
+  it("먼저 논의하기로 주제를 만들고 AI를 자동 호출하지 않는다", async () => {
+    vi.spyOn(api, "listTopics").mockResolvedValue([]);
+    const created = { ...makeTopic(), state: "BRAINSTORM_READY" as const };
+    const create = vi.spyOn(api, "createTopic").mockResolvedValue(created);
+    vi.spyOn(api, "getTopic").mockResolvedValue(makeDetail(created));
+    const run = vi.spyOn(api, "runAction");
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "첫 주제 만들기" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "주제 이름" }), { target: { value: "긴 계획 전달 방법" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "시작 방식" }), { target: { value: "brainstorm" } });
+    fireEvent.click(screen.getByRole("button", { name: "주제 만들기" }));
+    await waitFor(() => expect(create).toHaveBeenCalledWith(expect.objectContaining({ startMode: "brainstorm" })));
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it.each(["plan", "close"] as const)("논의 후 %s 선택은 사용자가 결론을 입력한 뒤에만 실행된다", async choice => {
+    const topic: Topic = { ...makeTopic(), state: "BRAINSTORM_READY", participants: ["claude", "codex"].map(role => ({
+      role: role as "claude" | "codex", sessionId: `${role}-session`, mode: "created", acknowledgedPlanSHA256: null,
+    })) };
+    vi.spyOn(api, "listTopics").mockResolvedValue([topic]);
+    vi.spyOn(api, "getTopic").mockResolvedValue(makeDetail(topic));
+    const run = vi.spyOn(api, "runAction").mockResolvedValue({ accepted: true, actionId: "action", topic });
+    render(<App />);
+    expect(await screen.findByRole("button", { name: "한 바퀴 논의" })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "합의 시작" })).not.toBeInTheDocument();
+    expect(run).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: choice === "plan" ? "계획으로 진행" : "논의 종료" }));
+    const submit = screen.getByRole("button", { name: choice === "plan" ? "계획 시작" : "결론 남기고 종료" });
+    expect(submit).toBeDisabled();
+    fireEvent.change(screen.getByRole("textbox", { name: "결론과 다음 행동" }), { target: { value: "작은 실험으로 먼저 확인합니다." } });
+    fireEvent.click(submit);
+    await waitFor(() => expect(run).toHaveBeenCalledWith(topic.id, `brainstorm-${choice}`, { decision: "작은 실험으로 먼저 확인합니다." }));
   });
 });
 

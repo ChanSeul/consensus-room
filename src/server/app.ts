@@ -1,3 +1,4 @@
+import { BrainstormDecisionSchema, BrainstormInputSchema } from "../shared/brainstorm.js";
 import { PlanningMigrationSchema } from "../shared/planningControl.js";
 import {ReviewGrantInputSchema} from "../shared/reviews.js";
 import { DIAGNOSIS_ID_PATTERN, DiagnosisInputSchema } from "../shared/diagnoses.js";
@@ -95,7 +96,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   // 중재 세션의 호출은 헤더 x-consensus-actor: mediator 로 구분한다. 결정·승인·실행·인도 류는 위임 스위치(mediation-autonomy.json)가
   // on 일 때만 받는다(off 면 403) — "중재자가 사용자와 같은 인증으로 무엇이든 부른다" 를 닫는다(2026-09-14 Codex 감사 D03).
   const delegationPath = join(config.dataDirectory, "mediation-autonomy.json");
-  const DELEGATED_ACTIONS = new Set(["approve", "implement", "tool-tree-rebaseline", "commit", "push", "close", "review-resume", "revision-resume", "budget-configure", "budget-resume", "amend-tolerance", "resume-implementation", "reconcile-delivery", "discard-orphan-commit"]);
+  const DELEGATED_ACTIONS = new Set(["brainstorm-plan", "brainstorm-close", "approve", "implement", "tool-tree-rebaseline", "commit", "push", "close", "review-resume", "revision-resume", "budget-configure", "budget-resume", "amend-tolerance", "resume-implementation", "reconcile-delivery", "discard-orphan-commit"]);
   const callOrigin = (request: { headers: Record<string, unknown> }, subject: string): CallOrigin | undefined => {
     if (request.headers["x-consensus-actor"] !== "mediator") return undefined;
     let doc: { autonomy?: string; set_at?: string } = {};
@@ -360,7 +361,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
           branchPrefix: input.branchPrefix,
           requestedBranchName: input.requestedBranchName,
           predecessorTopicId: input.predecessorTopicId,
-          branchName: null, state: "DRAFT", scopeGeneration: 1, planRevision: 0,
+          branchName: null, state: input.startMode === "brainstorm" ? "BRAINSTORM_READY" : "DRAFT", scopeGeneration: 1, planRevision: 0,
           planSHA256: null, approvedPlanSHA256: null, createdAt: timestamp, updatedAt: timestamp, lastError: null,
           agentSettings: config.defaultAgentSettings,
         });
@@ -368,7 +369,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
         return created;
       });
       database.appendEvent({
-        topicId: id, actor: "system", kind: "system", state: "DRAFT",
+        topicId: id, actor: "system", kind: "system", state: topic.state,
         body: "주제 전용 detached worktree를 만들었습니다.",
         payload: { worktreePath, baseRef: input.baseRef, requestKey: idempotencyKey },
       });
@@ -583,6 +584,9 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
             : accepted(workflow.retry(topicId,actionId),database.getTopic(topicId));
         } else response = accepted(randomUUID(),database.getTopic(topicId));
       }
+      else if (action === "brainstorm") response = accepted(workflow.startBrainstorm(topicId, BrainstormInputSchema.parse(request.body ?? {}), actionId), database.getTopic(topicId));
+      else if (action === "brainstorm-plan" || action === "brainstorm-close") response = accepted(workflow.finishBrainstorm(topicId,
+        BrainstormDecisionSchema.parse(request.body), action === "brainstorm-plan" ? "plan" : "close", actionId, origin), database.getTopic(topicId));
       else if (action === "plan") response = accepted(workflow.startPlan(topicId, actionId), database.getTopic(topicId));
       else if (action === "stop") {
         workflow.stop(topicId);

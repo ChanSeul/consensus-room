@@ -144,7 +144,7 @@ export class PlanningStore {
     // Existing policies and in-flight/approved work retain their original session contract.
     const topic = this.db.prepare("SELECT state,resume_state,plan_sha256,implementation_session_id FROM topics WHERE id=?").get(topicId);
     const unstartedPlan = !topic?.plan_sha256 && !topic?.implementation_session_id &&
-      (["DRAFT", "CLAUDE_PLAN"].includes(String(topic?.state)) ||
+      (["DRAFT", "BRAINSTORM_READY", "CLAUDE_PLAN"].includes(String(topic?.state)) ||
         (["USER_DECISION_REQUIRED", "FAILED"].includes(String(topic?.state)) && topic?.resume_state === "CLAUDE_PLAN"));
     // A paused response can contain a complete plan before topics.plan_sha256 is assigned.
     // Preserve every previously executed topic, including saved response reuse and partial calls.

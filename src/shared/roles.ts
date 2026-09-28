@@ -94,8 +94,8 @@ export const MEDIATOR_VERSION_HEADER = "x-consensus-mediator-version";
 // 엔진은 모든 모델 턴에 job 을 명시하고, 쓰기 접근·구현 모델 선택·프로토콜 전용 여부는 호출자가 따로 적지 않고 job 에서 유도한다(turnFlags).
 // review-read(E3-4c): 한 리뷰 호출의 쪽 예산을 넘는 필수 타임라인 구간을 판정 전에 나눠 싣는 읽기 호출 — 판정(REVIEW·FINAL_REVIEW)은 하지 않고 ACK 만 답한다.
 export const TURN_OPERATIONS = {
-  planner: ["plan", "diagnosis-revision", "revision", "ack", "plan-repair", "contract-correction"],
-  reviewer: ["audit", "closeout", "review", "final-review", "answer-confirmation", "review-read", "ack", "plan-repair", "contract-correction"],
+  planner: ["brainstorm", "plan", "diagnosis-revision", "revision", "ack", "plan-repair", "contract-correction"],
+  reviewer: ["brainstorm", "audit", "closeout", "review", "final-review", "answer-confirmation", "review-read", "ack", "plan-repair", "contract-correction"],
   implementer: ["implement", "fix", "continue", "tolerance-correction", "completion-confirmation", "contract-correction"],
 } as const;
 export type TurnRole = keyof typeof TURN_OPERATIONS;

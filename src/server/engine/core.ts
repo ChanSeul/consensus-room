@@ -595,7 +595,9 @@ export class EngineCore {
     await context.beforeCorrection?.(raw, violation);
     this.event(topic.id, "system", "system",
       `기계 계약 위반을 같은 세션에 돌려보내 1회 교정합니다${formatOnly ? "(표기 교정 — 추론 low)" : ""}: ${violation}`);
-    const correctionRoute: TurnRoute = { ...route, job: { role: route.job.role, operation: "contract-correction" } };
+    // 논의의 재제출도 같은 읽기·팬아웃 금지 정책이다. 일반 검토자 교정 job으로 바꾸면 하위 에이전트 권한이 열린다.
+    const discussion = route.job.operation === "brainstorm";
+    const correctionRoute: TurnRoute = discussion ? route : { ...route, job: { role: route.job.role, operation: "contract-correction" } };
     const settings = route.settings;
     // 실행 허용(새 입력·계획 변경·취소·유지보수·예산·쓰기 기준)은 실행기가 adapter 호출 전과 spawn 직전에 본다(R3-03 → PLAN §2).
     const { result: corrected } = await this.executor.execute({
@@ -604,13 +606,18 @@ export class EngineCore {
       expected: { ...this.expectationOf(topic), state: this.dependencies.database.getTopic(topic.id).state },
       writeGuards: context.writeGuards,
       session: { mode: "resume", sessionId }, prompt: buildContractCorrectionPrompt(violation),
-      planMode: context.planMode, planningWrite: "repair", readablePaths: context.readablePaths,
+      planMode: context.planMode, planningWrite: discussion ? undefined : "repair", readablePaths: context.readablePaths,
       settings: formatOnly ? { ...settings, effort: "low" } : settings,
     });
     this.assertCurrent(topic.id, context.signal, topic.scopeGeneration, this.dependencies.database.getTopic(topic.id).state);
     // 교정 응답은 원본에서 개별로 유효했던 필드(요약·쟁점·증거·요청 결정·상태) 위에 병합한다 — 교정이 거부된 필드만 고치고
     // 나머지를 비워 내면 본 턴의 보고와 미해결 결정 요청이 흐름에서 사라진다(Codex 감사 R01 ②).
     const parsedCorrection = redactAgentResult(AgentResultSchema.parse(corrected));
+    if (discussion) {
+      // 논의는 전체 발언을 재제출한다. 계획·감사용 병합으로 금지한 쟁점을 원본에서 되살리지 않는다.
+      context.check?.(parsedCorrection);
+      return parsedCorrection;
+    }
     const salvaged = salvageResultFields(raw, parsedCorrection.kind);
     const merged = mergeCorrectionResult(salvaged, parsedCorrection);
     if (merged.preserved.length > 0) {

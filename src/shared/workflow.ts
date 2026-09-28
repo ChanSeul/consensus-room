@@ -5,6 +5,7 @@ import { FIX_AWARE_KINDS, FindingSchema, RESPONSE_RESOLVED_IDS_LIMIT, validatePl
 import { parseTolerancePolicy } from "./tolerance";
 
 export const ACTIVE_WORKFLOW_STATES: ReadonlySet<WorkflowState> = new Set([
+  "BRAINSTORMING",
   "CLAUDE_PLAN",
   "CODEX_AUDIT",
   "CLAUDE_REVISION",
@@ -23,6 +24,8 @@ export const INTERRUPTED_WORKFLOW_STATES: ReadonlySet<WorkflowState> = new Set([
 
 const NEXT_STATES: Readonly<Record<WorkflowState, ReadonlySet<WorkflowState>>> = {
   DRAFT: new Set(["CLAUDE_PLAN", "FAILED"]),
+  BRAINSTORM_READY: new Set(["BRAINSTORMING", "DRAFT", "CLOSED", "FAILED"]),
+  BRAINSTORMING: new Set(["BRAINSTORM_READY", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED", "FAILED"]),
   CLAUDE_PLAN: new Set(["CODEX_AUDIT", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED", "FAILED"]),
   // CODEX_CLOSEOUT 직행: 감사 지적이 전부 경미(MEDIUM 이하)면 개정 턴을 생략하고 구현 노트로 넘긴다(2026-09-13 사용자 규칙).
   CODEX_AUDIT: new Set(["CLAUDE_REVISION", "CODEX_CLOSEOUT", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED", "FAILED"]),
@@ -40,10 +43,13 @@ const NEXT_STATES: Readonly<Record<WorkflowState, ReadonlySet<WorkflowState>>> =
   READY_TO_DELIVER: new Set(["CLOSED", "DRAFT", "FAILED", "CLAUDE_FIX", "CLAUDE_PLAN", "USER_DECISION_REQUIRED"]),
   CLOSED: new Set(),
   BLOCKED_ON_EVIDENCE: new Set([
+    "BRAINSTORMING",
     "DRAFT", "CLAUDE_PLAN", "CODEX_AUDIT", "CLAUDE_REVISION", "CODEX_CLOSEOUT",
     "IMPLEMENTING", "CODEX_REVIEW", "CLAUDE_FIX", "CODEX_FINAL_REVIEW", "FAILED",
   ]),
   USER_DECISION_REQUIRED: new Set([
+    "BRAINSTORM_READY",
+    "BRAINSTORMING",
     "DRAFT",
     "CLAUDE_PLAN",
     "CLAUDE_REVISION",
@@ -59,7 +65,7 @@ const NEXT_STATES: Readonly<Record<WorkflowState, ReadonlySet<WorkflowState>>> =
   ]),
   // CONSENSUS_ACK 포함: ACK 턴이 인프라 오류(사용량 한도 등)로 죽으면 그 지점부터 재개해야 한다.
   // 빠져 있으면 retry가 합의 완료 직전 상태를 버리고 전체 재계획으로 떨어진다(2026-08-30 실측).
-  FAILED: new Set(["DRAFT", "CLAUDE_PLAN", "CODEX_AUDIT", "CLAUDE_REVISION", "CODEX_CLOSEOUT", "CONSENSUS_ACK", "IMPLEMENTING", "CODEX_REVIEW", "CLAUDE_FIX", "CODEX_FINAL_REVIEW"]),
+  FAILED: new Set(["BRAINSTORM_READY", "BRAINSTORMING", "DRAFT", "CLAUDE_PLAN", "CODEX_AUDIT", "CLAUDE_REVISION", "CODEX_CLOSEOUT", "CONSENSUS_ACK", "IMPLEMENTING", "CODEX_REVIEW", "CLAUDE_FIX", "CODEX_FINAL_REVIEW"]),
 };
 
 // 구현 브랜치 이름 규칙. 지정 이름이 있으면 그것을, 없으면 접두사와 slug와 topic id를 base로 쓴다.

@@ -49,7 +49,7 @@ export function turnPolicy(job: TurnJob, shape: TurnShape): TurnPolicy {
     tools,
     planMode: Boolean(shape.planMode) && access !== "write",
     web: tools === "read" && !shape.evidenceManaged && !isolated,
-    fanout: !isolated && (tools === "write" || (tools === "read" && job.role === "reviewer")),
+    fanout: !isolated && job.operation !== "brainstorm" && (tools === "write" || (tools === "read" && job.role === "reviewer")),
     figma: tools === "write" && Boolean(shape.figmaRequested),
     isolated,
     scopedWrite: Boolean(shape.scopedWrite),

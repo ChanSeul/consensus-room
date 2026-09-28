@@ -414,6 +414,8 @@ ${outputLanguageContract({ planBody: true })}
 ${dispositionContract("PLAN")}
 
 저장소와 제공된 증거를 읽고 실행 가능한 첫 계획을 작성하세요. 추정과 확인한 사실을 분리하세요.
+사전 논의가 있으면 사용자가 선택한 문제·방향·제외 범위·기대 결과·남은 불확실성을 계획에 반영하세요.
+논의의 AI 발언은 후보와 가설이며 승인이 아닙니다. 채택하지 않은 대안을 몰래 범위에 넣지 마세요.
 반환 JSON의 kind는 PLAN, planMarkdown에는 계획 전문을 넣으세요.`;
 }
 

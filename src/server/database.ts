@@ -50,6 +50,7 @@ function now(): string {
 
 // 실행이 끝났거나 사용자 판단을 기다리는 상태 — 실패 원장 처리가 이 상태를 FAILED로 덮으면 복구 경로가 사라진다.
 export const COMPLETED_TOPIC_STATES: ReadonlySet<WorkflowState> = new Set([
+  "BRAINSTORM_READY",
   "AWAITING_USER_APPROVAL", "READY_TO_DELIVER", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED", "CLOSED",
 ]);
 
@@ -424,6 +425,15 @@ export class ConsensusDatabase {
     return true;
   }
 
+  private actionReachedWaitingState(topicId: string, actionId: string, state: WorkflowState): boolean {
+    // 논의 대기는 시작 전에도 같은 상태다. action 생성 직후 중단된 요청을 완료로 오인하지 않는다.
+    if (state === "BRAINSTORM_READY") return Boolean(this.db.prepare(`
+      SELECT 1 FROM timeline_events WHERE topic_id=? AND actor='system' AND state='BRAINSTORM_READY'
+        AND json_extract(payload_json, '$.brainstormCompletedActionId')=? LIMIT 1
+    `).get(topicId, actionId));
+    return COMPLETED_TOPIC_STATES.has(state);
+  }
+
   recoverInterruptedActions(): void {
     const interrupted = this.db.prepare(`
       SELECT actions.id, actions.topic_id, topics.state,
@@ -435,7 +445,7 @@ export class ConsensusDatabase {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       for (const row of interrupted) {
-        if (COMPLETED_TOPIC_STATES.has(String(row.state) as WorkflowState)) {
+        if (this.actionReachedWaitingState(String(row.topic_id), String(row.id), String(row.state) as WorkflowState)) {
           this.db.prepare("UPDATE actions SET status = 'succeeded', finished_at = ?, error = NULL WHERE id = ?")
             .run(timestamp, row.id as SqlValue);
           continue;
@@ -1073,7 +1083,7 @@ export class ConsensusDatabase {
       const stateRow = this.db.prepare("SELECT state FROM topics WHERE id = ?")
         .get(input.topicId) as { state: string } | undefined;
       if (!stateRow) throw new Error(`주제를 찾을 수 없습니다: ${input.topicId}`);
-      if (COMPLETED_TOPIC_STATES.has(stateRow.state as WorkflowState)) {
+      if (this.actionReachedWaitingState(input.topicId, input.actionId, stateRow.state as WorkflowState)) {
         // 주제를 바꾸지 않는 경로다. 바꿀 대상이 없으니 세대 일치 조건도 적용할 곳이 없다.
         this.db.exec("COMMIT");
         return { actionFinished: true, topicFailed: false };

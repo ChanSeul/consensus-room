@@ -164,10 +164,12 @@ export function profileSuitability(profile: AgentProfile): ProfileSuitability {
 // 두 좌석이 단계마다 실행하거나 다음에 여는 작업 — 엔진 호출 지점의 core.route 인자와 같다: 계획(planning.ts) plan·audit·revision·closeout·ack,
 // 구현(delivery.ts) implement·review·fix·final-review. 계속 진행·확인·교정 같은 하위 턴은 여는 작업의 경로를 따르므로(E2b) 여는 작업으로 충분하다.
 // 쉬는 좌석은 그 흐름에서 다음에 열 작업이다. 다음 턴이 없는 전달·종료 상태는 구현 단계의 대표 작업(implement·review)이다.
-const plannerJob = (operation: "plan" | "revision" | "diagnosis-revision" | "ack"): TurnJob => ({ role: "planner", operation });
+const plannerJob = (operation: "brainstorm" | "plan" | "revision" | "diagnosis-revision" | "ack"): TurnJob => ({ role: "planner", operation });
 const implementerJob = (operation: "implement" | "fix"): TurnJob => ({ role: "implementer", operation });
-const reviewerJob = (operation: "audit" | "closeout" | "ack" | "review" | "final-review"): TurnJob => ({ role: "reviewer", operation });
+const reviewerJob = (operation: "brainstorm" | "audit" | "closeout" | "ack" | "review" | "final-review"): TurnJob => ({ role: "reviewer", operation });
 const STAGE_JOBS: Readonly<Partial<Record<WorkflowState, { author: TurnJob; reviewer: TurnJob }>>> = {
+  BRAINSTORM_READY: { author: plannerJob("brainstorm"), reviewer: reviewerJob("brainstorm") },
+  BRAINSTORMING: { author: plannerJob("brainstorm"), reviewer: reviewerJob("brainstorm") },
   DRAFT: { author: plannerJob("plan"), reviewer: reviewerJob("audit") },
   CLAUDE_PLAN: { author: plannerJob("plan"), reviewer: reviewerJob("audit") },
   CODEX_AUDIT: { author: plannerJob("revision"), reviewer: reviewerJob("audit") },

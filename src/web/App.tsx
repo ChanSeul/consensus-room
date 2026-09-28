@@ -33,6 +33,8 @@ import { ApiError, api, topicEventsUrl } from "./api";
 import type { WorkGroupView } from "../shared/workGroups";
 
 const STATE_COPY: Record<WorkflowState, { label: string; tone: StatusTone; hint: string }> = {
+  BRAINSTORM_READY: { label: "논의 대기", tone: "attention", hint: "AI가 한 번씩 의견을 낸 뒤 멈춥니다. 다음 행동은 사용자가 선택합니다." },
+  BRAINSTORMING: { label: "논의 중", tone: "working", hint: "무작위로 정한 순서에 따라 두 참여자가 의견을 나누고 있습니다." },
   DRAFT: { label: "준비 중", tone: "quiet", hint: "작성자·검토자 좌석 세션을 연결해 주세요." },
   // 상태 값(CLAUDE_PLAN 등)은 호환용 이름이다 — 실제로 실행하는 AI 는 역할 배정이 정하므로 문구는 역할로 쓴다(E2c C3).
   CLAUDE_PLAN: { label: "계획 작성", tone: "working", hint: "설계자가 첫 계획을 작성하고 있습니다." },
@@ -99,11 +101,11 @@ function routeCopy(entry: JobRouteView): string {
 
 // 타임라인 발화자 — 이벤트에 경로(E2b 부터 agent_output 의 payload.route)가 있으면 역할과 실제 AI 를, 없으면 좌석 역할만 쓴다(추측한 AI 를 붙이지 않는다).
 function actorLabel(event: TimelineEvent): string {
-  const route = event.payload.route as { provider?: unknown; job?: { role?: unknown } } | undefined;
+  const route = event.payload.route as { provider?: unknown; job?: { role?: unknown; operation?: unknown } } | undefined;
   const provider = route?.provider;
   const role = route?.job?.role;
   if ((provider === "claude" || provider === "codex") && (role === "planner" || role === "implementer" || role === "reviewer")) {
-    return `${ROLE_COPY[role]} · ${PROVIDER_COPY[provider]}`;
+    return `${route?.job?.operation === "brainstorm" ? `논의 참여자 ${role === "planner" ? 1 : 2}` : ROLE_COPY[role]} · ${PROVIDER_COPY[provider]}`;
   }
   return ACTOR_COPY[event.actor];
 }
@@ -112,6 +114,7 @@ type StatusTone = "quiet" | "working" | "attention" | "success" | "danger";
 type Dialog = "create" | "claude" | "codex" | "commit" | "push" | null;
 
 const ACTIVE_STATES = new Set<WorkflowState>([
+  "BRAINSTORMING",
   "CLAUDE_PLAN",
   "CODEX_AUDIT",
   "CLAUDE_REVISION",
@@ -157,6 +160,7 @@ function AutonomyToggle({
 }
 
 const WORKING_STATES = new Set<WorkflowState>([
+  "BRAINSTORMING",
   "CLAUDE_PLAN", "CODEX_AUDIT", "CLAUDE_REVISION", "CODEX_CLOSEOUT", "CONSENSUS_ACK",
   "IMPLEMENTING", "CODEX_REVIEW", "CLAUDE_FIX", "CODEX_FINAL_REVIEW",
 ]);
@@ -667,7 +671,7 @@ export function App() {
           route={seatRoute(detail?.routing, dialog)?.route ?? null}
           existing={participantFor(selected, dialog)}
           settings={selected.agentSettings[dialog]}
-          canChangeSession={selected.state === "DRAFT"}
+          canChangeSession={["DRAFT", "BRAINSTORM_READY"].includes(selected.state)}
           busy={busyAction === `session-${dialog}` || busyAction === `settings-${dialog}`}
           onClose={() => setDialog(null)}
           onSessionSubmit={(input) =>
@@ -724,7 +728,7 @@ function RoomHeader({
   const canRetry = ["FAILED", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED"].includes(topic.state) && !deliveryRecovery && !budgetPaused;
 
   return (
-    <div className="room-header">
+    <div className={`room-header${topic.state.startsWith("BRAINSTORM") ? " brainstorm-header" : ""}`}>
       <div>
         <div className="room-title-row">
           <h2>{topic.title}</h2>
@@ -739,11 +743,13 @@ function RoomHeader({
           const provider = routing ? entry?.route?.provider : DEFAULT_SEAT_PROVIDER[seat];
           return (
             <button key={seat} className={`session-chip ${participant ? "connected" : ""}`} onClick={() => onSession(seat)}>
-              {SEAT_COPY[seat]} · {provider ? PROVIDER_COPY[provider] : "실행할 수 없는 배정"} {participant ? "연결됨" : "연결"} · <StageSettings topic={topic} role={seat} routing={routing} />
+              {topic.state.startsWith("BRAINSTORM") ? `참여자 ${seat === "claude" ? 1 : 2}` : SEAT_COPY[seat]} · {provider ? PROVIDER_COPY[provider] : "실행할 수 없는 배정"} {participant ? "연결됨" : "연결"} · <StageSettings topic={topic} role={seat} routing={routing} />
             </button>
           );
         })}
-        {canStop ? (
+        {topic.state === "BRAINSTORM_READY" ? (
+          <BrainstormActions key={topic.id} connected={Boolean(claude && codex)} busy={Boolean(busyAction)} budgetPaused={budgetPaused} onAction={onAction} />
+        ) : canStop ? (
           <button className="danger-button" disabled={Boolean(busyAction)} onClick={() => onAction("stop")}>{pendingRetry ? "재시도 예약 취소" : "중단"}</button>
         ) : canRetry ? (
           <button className="secondary-button" disabled={Boolean(busyAction)} onClick={() => onAction("retry")}>다시 시도</button>
@@ -753,6 +759,28 @@ function RoomHeader({
       </div>
     </div>
   );
+}
+
+function BrainstormActions({ connected, busy, budgetPaused, onAction }: {
+  connected: boolean; busy: boolean; budgetPaused: boolean; onAction: (action: string, body?: Record<string, unknown>) => void;
+}) {
+  const [choice, setChoice] = useState<"plan" | "close" | null>(null);
+  const [decision, setDecision] = useState("");
+  return <>
+    <button className="primary-button" disabled={!connected || busy || budgetPaused} onClick={() => onAction("brainstorm")}>한 바퀴 논의</button>
+    <button className="secondary-button" disabled={!connected || busy || budgetPaused} onClick={() => setChoice("plan")}>계획으로 진행</button>
+    <button className="ghost-button" disabled={busy} onClick={() => setChoice("close")}>논의 종료</button>
+    {choice && <Modal title={choice === "plan" ? "논의에서 계획으로" : "논의 마치기"}
+      description={choice === "plan" ? "선택한 방향을 남기면 계획 작성과 검토를 시작합니다. 구현은 계획을 승인한 뒤 시작합니다." : "지금 진행하지 않기로 한 이유나 논의에서 얻은 결론을 남겨 주세요."}
+      onClose={() => setChoice(null)}>
+      <form className="modal-form" onSubmit={event => { event.preventDefault(); onAction(`brainstorm-${choice}`, { decision: decision.trim() }); setChoice(null); }}>
+        <label><span>결론과 다음 행동</span><textarea required maxLength={12000} rows={8} value={decision} onChange={event => setDecision(event.target.value)}
+          placeholder={choice === "plan" ? "해결할 문제, 선택한 방향과 이유, 이번에 하지 않을 것, 확인할 결과, 남은 불확실성을 적어 주세요. 작은 실험만 계획해도 됩니다." : "예: 현재 방식으로 충분해서 진행하지 않음 / 자료가 부족해 보류 / 논의만으로 궁금한 점이 해결됨"} /></label>
+        <div className="modal-actions"><button type="button" className="ghost-button" onClick={() => setChoice(null)}>취소</button>
+          <button className="primary-button" disabled={busy || !decision.trim()}>{choice === "plan" ? "계획 시작" : "결론 남기고 종료"}</button></div>
+      </form>
+    </Modal>}
+  </>;
 }
 
 function Timeline({ events }: { events: TimelineEvent[] }) {
@@ -1135,15 +1163,19 @@ function Modal({ title, description, onClose, children }: { title: string; descr
   );
 }
 
-function CreateTopicDialog({ busy, repositoryPath, memoryDirectory, onClose, onSubmit }: { busy: boolean; repositoryPath: string; memoryDirectory: string; onClose: () => void; onSubmit: (input: { title: string; baseRef: string; branchPrefix: string; requestedBranchName: string | null; predecessorTopicId: string | null }) => void }) {
+function CreateTopicDialog({ busy, repositoryPath, memoryDirectory, onClose, onSubmit }: { busy: boolean; repositoryPath: string; memoryDirectory: string; onClose: () => void; onSubmit: (input: { title: string; baseRef: string; branchPrefix: string; requestedBranchName: string | null; predecessorTopicId: string | null; startMode: "plan" | "brainstorm" }) => void }) {
   const [title, setTitle] = useState("");
+  const [startMode, setStartMode] = useState<"plan" | "brainstorm">("plan");
   const [baseRef, setBaseRef] = useState("HEAD");
   const [branchPrefix, setBranchPrefix] = useState("consensus");
   const [requestedBranchName, setRequestedBranchName] = useState("");
   return (
-    <Modal title="새 주제 만들기" description="한 주제에는 작성자 좌석 세션 하나와 검토자 좌석 세션 하나가 연결됩니다. 각 역할을 실제로 실행하는 AI 는 역할 배정이 정합니다." onClose={onClose}>
-      <form className="modal-form" onSubmit={(event) => { event.preventDefault(); onSubmit({ title, baseRef, branchPrefix, requestedBranchName: requestedBranchName.trim() || null , predecessorTopicId: null }); }}>
+    <Modal title="새 주제 만들기" description="목표가 정해졌다면 바로 계획하고, 할 가치가 있는지부터 생각하고 싶다면 먼저 논의하세요. 참여할 AI는 역할 배정에 따릅니다." onClose={onClose}>
+      <form className="modal-form" onSubmit={(event) => { event.preventDefault(); onSubmit({ title, baseRef, branchPrefix, requestedBranchName: requestedBranchName.trim() || null , predecessorTopicId: null, startMode }); }}>
         <label><span>주제 이름</span><input autoFocus required minLength={2} maxLength={120} value={title} onChange={(event) => setTitle(event.target.value)} placeholder="예: 채팅 취소 처리 정리" /></label>
+        <label><span>시작 방식</span><select aria-label="시작 방식" value={startMode} onChange={event => setStartMode(event.target.value as "plan" | "brainstorm")}>
+          <option value="plan">바로 계획하기</option><option value="brainstorm">먼저 논의하기</option>
+        </select><small>논의는 매번 순서를 무작위로 정해 AI가 한 번씩 발언합니다. 계획으로 넘어갈지는 직접 선택합니다.</small></label>
         <label><span>고정 저장소</span><output className="fixed-value">{repositoryPath}</output></label>
         <label><span>공용 메모리</span><output className="fixed-value">{memoryDirectory}</output><small>현재 주제에 맞는 문서만 골라 각 모델에 전달합니다.</small></label>
         <label><span>기준 리비전</span><input required value={baseRef} onChange={(event) => setBaseRef(event.target.value)} /></label>
