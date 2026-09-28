@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { BudgetPolicySchema, type BudgetAccount } from "./budgets.js";
-import type { DeferredFinding } from "./contracts.js";
+import { BranchNameSchema, BranchPrefixSchema, type DeferredFinding } from "./contracts.js";
 
 // 작업 묶음(큰 그림) 계약 — 엔진 개편 E4(plan.md §3.1–3.3, v4 단계 분할 기준).
 // 미착수 단계는 대략으로 둘 수 있다: 완료 조건(acceptance)이 없으면 "준비되지 않은" 단계이고, 완료 조건이 있고 그 단계에 걸린
@@ -38,6 +38,9 @@ export const WorkStageSchema = z
     separation: StageSeparationSchema.optional(),
     // 같은 결과를 위한 파일·역할별 항목. 미착수 단계에서만 바꿀 수 있고, 체크리스트만 바뀐 개정은 어떤 단계도 다시 계획하게 하지 않는다.
     checklist: z.array(z.string().trim().min(1)).max(50).optional(),
+    // 단계 토픽의 요청 브랜치 이름(토픽 생성 입력의 requestedBranchName). 없으면 묶음 접두사로 엔진이 만든다. 연결 뒤에는 바꿀 수 없고,
+    // 계획 입력이 아니라 전달 위치라 단계 문맥·해시에는 넣지 않는다.
+    branchName: BranchNameSchema.optional(),
   })
   .strict();
 export type WorkStage = z.infer<typeof WorkStageSchema>;
@@ -91,6 +94,15 @@ export const WorkGroupInputSchema = z
         ctx.addIssue({ code: "custom", message: `단계 ${s.id} 의 선행 결과 근거는 의존 관계 안의 단계를 가리켜야 합니다.` });
       seen.add(s.id);
     }
+    // 단계마다 자기 브랜치에 전달한다. 실제 ref 는 요청 이름 뒤에 범위 세대 접미사 `-g<세대>` 를 붙인 것이다(shared/workflow resolveBranchName).
+    // 이름이 같거나, 한 단계의 `<이름>-g<n>` 아래 경로에 다른 단계 이름이 놓이면 git 이 두 ref 를 함께 둘 수 없어 뒤 단계의 브랜치 생성이
+    // 계획·승인을 마친 뒤에 실패한다(연결 뒤에는 이름을 바꿀 수 없다) — 입력에서 거부한다.
+    const named = g.stages.filter((s): s is typeof s & { branchName: string } => s.branchName !== undefined);
+    const nests = (outer: string, inner: string) => inner.startsWith(`${outer}-g`) && /^\d+\//.test(inner.slice(outer.length + 2));
+    for (const [index, s] of named.entries())
+      for (const other of named.slice(index + 1))
+        if (s.branchName === other.branchName || nests(s.branchName, other.branchName) || nests(other.branchName, s.branchName))
+          ctx.addIssue({ code: "custom", message: `단계 브랜치 이름이 겹칩니다: ${s.id}(${s.branchName}) ↔ ${other.id}(${other.branchName})` });
     const questionIds = new Set<string>();
     for (const q of g.questions ?? []) {
       if (questionIds.has(q.id)) ctx.addIssue({ code: "custom", message: "질문 ID는 고유해야 합니다." });
@@ -100,6 +112,30 @@ export const WorkGroupInputSchema = z
     }
   });
 export type WorkGroupInput = z.infer<typeof WorkGroupInputSchema>;
+
+// 묶음 생성 전용 입력 — 개정(revise) 입력에는 없다(WorkGroupInputSchema 가 strict 라 개정 본문에 실으면 거부된다). 토픽 생성 입력
+// (CreateTopicInputSchema)과 같은 검증을 쓴다.
+//  - baseRef: 묶음 기준 커밋. 없으면 저장소 HEAD(기존 동작). 서비스가 커밋 OID 로 해석해 baseOID 로 저장한다.
+//  - branchPrefix: 단계 토픽의 브랜치 접두사. 없으면 "consensus"(기존 동작).
+//  - predecessorTopicId: 묶음 밖 선행 토픽. 같은 저장소이고 전달 커밋이 묶음 기준에 포함돼야 한다(서비스가 검증). 생성 때 그 토픽의
+//    범위 세대·전달 커밋·보류 원장을 묶음 레코드(predecessor)에 동결한다 — 뒤에 선행 토픽이 바뀌어도 승계 근거가 바뀌지 않고, 모든 단계가
+//    같은 기준 위에서 시작하므로 모든 단계가 그 원장을 이어받는다(inheritedDeferredFindings → deferredFindingsFor).
+export const WorkGroupCreateOptionsSchema = z
+  .object({
+    baseRef: z.string().trim().min(1).refine((value) => !value.startsWith("-"), "기준 리비전은 '-'로 시작할 수 없습니다.").optional(),
+    branchPrefix: BranchPrefixSchema.optional(),
+    predecessorTopicId: z.string().uuid().optional(),
+  })
+  .strict();
+export type WorkGroupCreateOptions = z.infer<typeof WorkGroupCreateOptionsSchema>;
+const CREATE_OPTION_KEYS = ["baseRef", "branchPrefix", "predecessorTopicId"] as const;
+// 생성 요청 본문을 묶음 입력과 생성 전용 입력으로 나눠 각각 검증한다.
+export function parseWorkGroupCreateBody(body: unknown): { input: WorkGroupInput; options: WorkGroupCreateOptions } {
+  const record = body && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, unknown>) : {};
+  const input = Object.fromEntries(Object.entries(record).filter(([key]) => !(CREATE_OPTION_KEYS as readonly string[]).includes(key)));
+  const options = Object.fromEntries(Object.entries(record).filter(([key]) => (CREATE_OPTION_KEYS as readonly string[]).includes(key)));
+  return { input: WorkGroupInputSchema.parse(body === record ? input : body), options: WorkGroupCreateOptionsSchema.parse(options) };
+}
 
 // 재계획 대기(D2) — 개정 저장과 같은 transaction 에서 켜지고, 그 단계 토픽의 범위 세대가 fromGeneration 보다 오른 뒤에만 꺼진다.
 export interface ReplanPending {
@@ -155,6 +191,15 @@ export interface StageResult {
   closedAt: string;
   legacy?: boolean;
 }
+// 묶음 밖 선행 작업의 동결 기록(생성 때 한 번) — 검증한 범위 세대·전달 커밋과 그때의 보류 원장. 뒤에 선행 토픽이 범위를 바꾸거나 다시 커밋해도
+// 이 기록은 바뀌지 않는다(묶음 기준 커밋이 그대로이므로 승계 근거도 그대로다).
+export interface ExternalPredecessor {
+  topicId: string;
+  scopeGeneration: number;
+  committedOID: string;
+  deferredFindings: DeferredFinding[];
+  frozenAt: string;
+}
 export interface WorkGroupRevision {
   version: number;
   at: string;
@@ -173,6 +218,9 @@ export interface WorkGroup extends WorkGroupInput {
   id: string;
   repositoryPath: string;
   baseOID: string;
+  // 생성 전용 입력(WorkGroupCreateOptionsSchema) — 없으면 기존 동작(접두사 consensus, 선행 토픽 없음). 개정으로 바뀌지 않는다.
+  branchPrefix?: string;
+  predecessor?: ExternalPredecessor;
   version: number;
   createdAt: string;
   pending?: Record<string, { topicId: string; worktreePath: string; baseOID: string }>;

@@ -219,6 +219,12 @@ export class GitService {
     return (await this.run(worktreePath, ["rev-parse", "HEAD"])).stdout.trim();
   }
 
+  // ref(커밋 OID·브랜치·태그 등)를 커밋 OID 로 해석한다 — 작업 묶음의 명시 기준 커밋. 커밋이 아니거나 없으면 던진다. '-' 로 시작하는 입력은
+  // 호출 전 스키마가 막는다(옵션 해석 방지).
+  async resolveCommit(repositoryPath: string, ref: string): Promise<string> {
+    return (await this.run(repositoryPath, ["rev-parse", "--verify", `${ref}^{commit}`])).stdout.trim();
+  }
+
   async diffPlanFiles(cwd: string, previous: string, current: string): Promise<string> {
     const result = await this.runner.run({
       command: "git", args: ["diff", "--no-index", "--no-ext-diff", "--no-textconv", "--no-color", "--", previous, current],

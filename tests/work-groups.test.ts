@@ -2,7 +2,8 @@ import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { expect, it } from "vitest";
 import { decisionDigest, WorkGroups } from "../src/server/workGroups";
-import type { StageResult, WorkGroup, WorkGroupInput } from "../src/shared/workGroups";
+import { parseWorkGroupCreateBody, WorkGroupInputSchema, type StageResult, type WorkGroup, type WorkGroupInput } from "../src/shared/workGroups";
+import { resolveBranchName } from "../src/shared/workflow";
 import { wrapWorkGroupAdapter } from "../src/server/workGroupAdapter";
 import type { ConsensusDatabase } from "../src/server/database";
 import type { GitService } from "../src/server/git";
@@ -539,4 +540,61 @@ it("§4 승계 도우미 — 이어받는 단계의 결정·보류 지적을 묶
     payload: { inheritedDecision: { groupId: "g", stageId: "s1", topicId: "t1", sequence: 3, scopeGeneration: 2, sha256: "t1-3" } },
   });
   db.close();
+});
+
+it("생성 요청 본문은 묶음 입력과 생성 전용 입력(기준 커밋·단계 브랜치 접두사·묶음 밖 선행 토픽)으로 나눠 검증하고, 개정 입력은 생성 전용 필드를 받지 않는다", () => {
+  const input = { title: "작업", goal: "전체 목표", contracts: "계약", stages: [stage("a"), stage("z", "integration")] };
+  const predecessorTopicId = "11111111-1111-4111-8111-111111111111";
+  expect(parseWorkGroupCreateBody({ ...input, baseRef: "da81092", branchPrefix: "feature", predecessorTopicId }))
+    .toEqual({ input: WorkGroupInputSchema.parse(input), options: { baseRef: "da81092", branchPrefix: "feature", predecessorTopicId } });
+  expect(parseWorkGroupCreateBody(input)).toEqual({ input: WorkGroupInputSchema.parse(input), options: {} });
+  expect(() => parseWorkGroupCreateBody({ ...input, baseRef: "-x" })).toThrow("기준 리비전은 '-'로 시작할 수 없습니다.");
+  expect(() => parseWorkGroupCreateBody({ ...input, branchPrefix: "feature/x" })).toThrow();
+  expect(() => parseWorkGroupCreateBody({ ...input, predecessorTopicId: "not-a-uuid" })).toThrow();
+  // 개정 본문(revise)은 묶음 입력 스키마 그대로라 생성 전용 필드를 실으면 거부된다.
+  expect(() => WorkGroupInputSchema.parse({ ...input, branchPrefix: "feature" })).toThrow();
+  // 생성 전용 입력이 없으면 레코드에 필드를 두지 않는다(기존 레코드 모양 그대로).
+  const db = new DatabaseSync(":memory:"), groups = new WorkGroups(db);
+  const plain = groups.create("plain", input, "/repo", "head");
+  expect(Object.keys(plain)).not.toContain("branchPrefix");
+  expect(Object.keys(plain)).not.toContain("predecessor");
+  const predecessor = { topicId: predecessorTopicId, scopeGeneration: 2, committedOID: "head", deferredFindings: [],
+    frozenAt: "2026-09-28T00:00:00.000Z" };
+  expect(groups.create("named", input, "/repo", "head", { branchPrefix: "feature", predecessor }))
+    .toMatchObject({ branchPrefix: "feature", predecessor });
+  expect(groups.get("named")).toMatchObject({ branchPrefix: "feature", predecessor });
+  db.close();
+});
+
+it("묶음 밖 선행 작업의 동결 원장은 모든 단계(뿌리·의존·통합)가 이어받고, 단계 결과 원장과 같은 지적은 한 번만 싣는다", () => {
+  const db = new DatabaseSync(":memory:"), groups = new WorkGroups(db);
+  const finding = (topicId: string, id: string) => ({ id, title: id, severity: "LOW" as const, rationale: "근거", source: "closeout" as const,
+    topicId, recordedAt: "2026-09-27T00:00:00.000Z" });
+  const input = { title: "작업", goal: "전체 목표", contracts: "계약",
+    stages: [stage("a"), { ...stage("b"), dependsOn: ["a"] }, stage("z", "integration")] };
+  groups.create("g", input, "/repo", "head", { predecessor: { topicId: "p", scopeGeneration: 1, committedOID: "head",
+    deferredFindings: [finding("p", "P-1"), finding("p", "P-2")], frozenAt: "2026-09-28T00:00:00.000Z" } });
+  groups.link("g", "a", "ta", "head");
+  const ids = (stageId: string) => groups.inheritedDeferredFindings(groups.get("g"), stageId).map((f) => `${f.topicId}/${f.id}`);
+  expect(ids("a")).toEqual(["p/P-1", "p/P-2"]);
+  // a 가 선행 지적 하나(P-2)를 자기 원장에 다시 남기고 새 지적(A-1)을 더했다 — 뒤 단계는 선행 원장과 a 결과를 겹치지 않게 받는다.
+  groups.freezeResult("g", { stageId: "a", topicId: "ta", baseOID: "head", commitOID: "a-commit", reviewedTreeOID: "a-tree", planSHA256: "a-plan",
+    evidenceDigest: null, verifications: [], memoryChanges: [], openQuestions: [], deferredFindings: [finding("p", "P-2"), finding("ta", "A-1")],
+    decisions: [], closedAt: "2026-09-28T01:00:00.000Z" });
+  expect(ids("b")).toEqual(["p/P-1", "p/P-2", "ta/A-1"]);
+  expect(ids("z")).toEqual(["p/P-1", "p/P-2", "ta/A-1"]);
+  db.close();
+});
+
+it("단계 브랜치 이름은 같거나 세대 접미사(-g<n>) 뒤 경로로 겹치면 거부하고, 실제 ref 가 겹치지 않는 비슷한 이름은 받는다", () => {
+  const input = (a: string, z: string) => ({ title: "작업", goal: "전체 목표", contracts: "계약",
+    stages: [{ ...stage("a"), branchName: a }, { ...stage("z", "integration"), branchName: z }] });
+  // 실제 ref 이름 규칙(resolveBranchName)으로 a 의 1세대 브랜치를 만든 뒤 그 아래 경로를 z 로 준다.
+  const refOfA = resolveBranchName({ requestedBranchName: "feature/x", branchPrefix: "feature", slug: "stage-a", id: "00000000", scopeGeneration: 1 });
+  expect(refOfA).toBe("feature/x-g1");
+  expect(() => WorkGroupInputSchema.parse(input("feature/x", `${refOfA}/verify`))).toThrow("단계 브랜치 이름이 겹칩니다: a(feature/x) ↔ z(feature/x-g1/verify)");
+  expect(() => WorkGroupInputSchema.parse(input("feature/x-g12/verify", "feature/x"))).toThrow("단계 브랜치 이름이 겹칩니다");
+  expect(() => WorkGroupInputSchema.parse(input("feature/same", "feature/same"))).toThrow("단계 브랜치 이름이 겹칩니다");
+  for (const [a, z] of [["feature/x", "feature/x/verify"], ["feature/x", "feature/x-g/verify"], ["feature/x", "feature/x-gate"], ["feature/x-cp1", "feature/x"]])
+    expect(() => WorkGroupInputSchema.parse(input(a, z))).not.toThrow();
 });

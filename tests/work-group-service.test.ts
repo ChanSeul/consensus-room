@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,8 +10,8 @@ import { GitService } from "../src/server/git";
 import { SpawnCommandRunner } from "../src/server/processRunner";
 import { wrapWorkGroupAdapter } from "../src/server/workGroupAdapter";
 import { WorkGroups } from "../src/server/workGroups";
-import { resolvePriorResults, stageEvidence, WorkGroupService } from "../src/server/workGroupService";
-import { DEFAULT_AGENT_SETTINGS } from "../src/shared/contracts";
+import { resolvePriorResults, stageEvidence, WorkGroupService, type WorkGroupServiceOptions } from "../src/server/workGroupService";
+import { DEFAULT_AGENT_SETTINGS, type DeferredFinding } from "../src/shared/contracts";
 import type { AgentAdapter, SessionTurn } from "../src/server/types";
 import type { StageResult, WorkGroupInput } from "../src/shared/workGroups";
 
@@ -58,9 +58,13 @@ function fixture(git: GitService = new GitService(new SpawnCommandRunner())) {
   const blocked = new Set<string>();
   const memory = join(root, "memory");
   mkdirSync(memory);
-  const service = (gitService: GitService = git) => new WorkGroupService(database, gitService, repository, join(root, "trees"),
-    DEFAULT_AGENT_SETTINGS, { blockedExternally: (topicId) => blocked.has(topicId), memoryDirectory: memory });
-  return { root, repository, base, database, blocked, memory, git, service };
+  // 토픽별 보류 원장(엔진의 deferred-findings 산출물 자리) — 묶음 밖 선행 토픽의 원장 동결이 읽는다.
+  const ledgers = new Map<string, DeferredFinding[]>();
+  const service = (gitService: GitService = git, extra: Partial<WorkGroupServiceOptions> = {}) =>
+    new WorkGroupService(database, gitService, repository, join(root, "trees"), DEFAULT_AGENT_SETTINGS,
+      { blockedExternally: (topicId) => blocked.has(topicId), memoryDirectory: memory,
+        deferredFindingsOf: async (topicId) => ledgers.get(topicId) ?? [], ...extra });
+  return { root, repository, base, database, blocked, memory, git, service, ledgers };
 }
 type Fixture = ReturnType<typeof fixture>;
 
@@ -748,5 +752,110 @@ describe("새 단계 토픽의 계획 제어 v2(E4 2차 보완 F012)", () => {
     const a = await fx.service().next(group.id);
     expect(a.id).toBe(reservation.topicId);
     expect(fx.database.planning.policyVersion(a.id)).toBe(1);
+  });
+});
+
+// 묶음 밖 선행 토픽 — 전달 커밋(committedOID)을 가진 일반 토픽. patch 로 저장소·전달 커밋을 바꾼다(null 이면 전달 커밋 없음).
+function predecessor(fx: Fixture, patch: { repositoryPath?: string; committedOID?: string | null } = {}) {
+  const id = randomUUID(), timestamp = new Date().toISOString();
+  fx.database.createTopic({ id, slug: `pred-${id.slice(0, 8)}`, title: "선행", repositoryPath: patch.repositoryPath ?? fx.repository,
+    worktreePath: join(fx.root, `pred-${id.slice(0, 8)}`), baseRef: fx.base, branchName: null, state: "READY_TO_DELIVER", scopeGeneration: 1,
+    planRevision: 0, planSHA256: null, approvedPlanSHA256: null, createdAt: timestamp, updatedAt: timestamp, lastError: null });
+  if (patch.committedOID !== null) fx.database.updateTopic(id, { committedOID: patch.committedOID ?? fx.base });
+  return id;
+}
+
+describe("생성 전용 입력 — 명시 기준 커밋·단계 브랜치·묶음 밖 선행 토픽", () => {
+  it("명시 기준 커밋(ref)으로 묶음을 만들면 저장소 HEAD 가 달라도 첫 단계를 그 커밋에서 열고, 해석할 수 없는 ref 는 묶음을 만들지 않고 거부한다", async () => {
+    const fx = fixture();
+    const service = fx.service();
+    run(fx.repository, "branch", "stacked", fx.base);
+    writeFileSync(join(fx.repository, "later.txt"), "later\n");
+    run(fx.repository, "add", ".");
+    run(fx.repository, "commit", "-qm", "later");
+    const head = run(fx.repository, "rev-parse", "HEAD");
+    // 입력이 없으면 기존대로 저장소 HEAD 다.
+    expect((await service.create(groupInput([work("a"), integration("z", ["a"])]))).baseOID).toBe(head);
+    const group = await service.create(groupInput([work("a"), integration("z", ["a"])]), undefined, { baseRef: "stacked" });
+    expect(group.baseOID).toBe(fx.base);
+    const a = await service.next(group.id);
+    expect(fx.database.workGroups.get(group.id).links.a.baseOID).toBe(fx.base);
+    expect(run(a.worktreePath, "rev-parse", "HEAD")).toBe(fx.base);
+    const count = fx.database.workGroups.list().length;
+    await expect(service.create(groupInput([work("a"), integration("z", ["a"])]), undefined, { baseRef: "no-such-ref" }))
+      .rejects.toThrow("작업 묶음 기준 커밋을 찾을 수 없습니다: no-such-ref");
+    await expect(service.create(groupInput([work("a"), integration("z", ["a"])]), undefined, { baseRef: "-x" }))
+      .rejects.toThrow("기준 리비전은 '-'로 시작할 수 없습니다.");
+    expect(fx.database.workGroups.list()).toHaveLength(count);
+  });
+
+  it("단계 토픽은 묶음 접두사와 단계 브랜치 이름을 받고, 입력이 없으면 기존 값(consensus·요청 없음)이다. 단계끼리 같은 브랜치 이름은 거부한다", async () => {
+    const fx = fixture();
+    const service = fx.service();
+    const named = await service.create(groupInput([work("a", { branchName: "feature/T-1-a" }), work("b"), integration("z", ["a", "b"])]),
+      undefined, { branchPrefix: "feature" });
+    const a = await service.next(named.id);
+    expect(fx.database.getTopic(a.id)).toMatchObject({ branchPrefix: "feature", requestedBranchName: "feature/T-1-a" });
+    closeStage(fx, named.id, "a", "2026-09-28T01:00:00.000Z");
+    const b = await service.next(named.id);
+    expect(fx.database.getTopic(b.id)).toMatchObject({ branchPrefix: "feature", requestedBranchName: null });
+    const plain = await service.create(groupInput([work("a"), integration("z", ["a"])]));
+    const plainA = await service.next(plain.id);
+    expect(fx.database.getTopic(plainA.id)).toMatchObject({ branchPrefix: "consensus", requestedBranchName: null });
+    await expect(service.create(groupInput([work("a", { branchName: "feature/same" }), { ...integration("z", ["a"]), branchName: "feature/same" }])))
+      .rejects.toThrow("단계 브랜치 이름이 겹칩니다: a(feature/same) ↔ z(feature/same)");
+  });
+
+  it("묶음 밖 선행 토픽은 생성 때 세대·전달 커밋·보류 원장을 동결해 모든 단계가 이어받고, 뒤에 선행 토픽이 바뀌어도 승계 근거는 그대로다", async () => {
+    const fx = fixture();
+    const service = fx.service();
+    const predecessorId = predecessor(fx);
+    const carried: DeferredFinding = { id: "P-1", title: "선행 토픽이 미룬 개선", severity: "LOW", rationale: "다음 단계에서 판단",
+      source: "closeout", topicId: predecessorId, recordedAt: "2026-09-27T00:00:00.000Z" };
+    fx.ledgers.set(predecessorId, [carried]);
+    const group = await service.create(groupInput([work("a"), work("b", { dependsOn: ["a"] }), integration("z", ["a", "b"])]),
+      undefined, { predecessorTopicId: predecessorId });
+    expect(group.predecessor).toEqual({ topicId: predecessorId, scopeGeneration: 1, committedOID: fx.base, deferredFindings: [carried],
+      frozenAt: expect.any(String) });
+    // 단계 토픽은 선행 토픽을 참조하지 않는다 — 기존 deferredFindingsFor 가 읽는 묶음 승계(inheritedDeferredFindings)로 모든 단계가 받는다.
+    const a = await service.next(group.id);
+    expect(fx.database.getTopic(a.id).predecessorTopicId).toBeNull();
+    const inherited = (stageId: string) => fx.database.workGroups.inheritedDeferredFindings(fx.database.workGroups.get(group.id), stageId)
+      .map((finding) => `${finding.topicId}/${finding.id}`);
+    expect(inherited("a")).toEqual([`${predecessorId}/P-1`]);
+    // 생성 뒤 선행 토픽이 바뀌어도(원장 교체·전달 커밋 해제 — 범위 변경이 남기는 모양) 동결한 근거는 그대로다.
+    fx.ledgers.set(predecessorId, []);
+    fx.database.updateTopic(predecessorId, { committedOID: null });
+    closeStage(fx, group.id, "a", "2026-09-28T01:00:00.000Z");
+    const b = await service.next(group.id);
+    expect(fx.database.getTopic(b.id).predecessorTopicId).toBeNull();
+    expect(inherited("b")).toEqual([`${predecessorId}/P-1`]);
+    expect(inherited("z")).toEqual([`${predecessorId}/P-1`]);
+  });
+
+  it("묶음 밖 선행 토픽은 같은 저장소이고 전달 커밋이 기준에 포함돼야 하며, 원장을 읽을 수 없거나 읽는 사이 바뀌면 묶음을 만들지 않는다", async () => {
+    const fx = fixture();
+    const service = fx.service();
+    const input = groupInput([work("a"), integration("z", ["a"])]);
+    await expect(service.create(input, undefined, { predecessorTopicId: randomUUID() })).rejects.toThrow("선행 토픽을 찾을 수 없습니다");
+    await expect(service.create(input, undefined, { predecessorTopicId: predecessor(fx, { repositoryPath: join(fx.root, "other") }) }))
+      .rejects.toThrow("다른 저장소의 토픽입니다");
+    await expect(service.create(input, undefined, { predecessorTopicId: predecessor(fx, { committedOID: null }) }))
+      .rejects.toThrow("전달(커밋)한 결과가 없습니다");
+    await expect(fx.service(undefined, { deferredFindingsOf: undefined }).create(input, undefined, { predecessorTopicId: predecessor(fx) }))
+      .rejects.toThrow("선행 토픽의 보류 원장을 읽을 수 없어");
+    const moving = predecessor(fx);
+    await expect(fx.service(undefined, { deferredFindingsOf: async (topicId) => {
+      fx.database.updateTopic(topicId, { committedOID: null });
+      return [];
+    } }).create(input, undefined, { predecessorTopicId: moving })).rejects.toThrow(`선행 토픽 ${moving} 이(가) 확인하는 동안 바뀌었습니다.`);
+    run(fx.repository, "checkout", "-qb", "side", fx.base);
+    writeFileSync(join(fx.repository, "side.txt"), "side\n");
+    run(fx.repository, "add", ".");
+    run(fx.repository, "commit", "-qm", "side");
+    const side = run(fx.repository, "rev-parse", "HEAD");
+    await expect(service.create(input, undefined, { baseRef: fx.base, predecessorTopicId: predecessor(fx, { committedOID: side }) }))
+      .rejects.toThrow(`선행 토픽의 전달 커밋 ${side} 가 작업 묶음 기준 커밋 ${fx.base} 에 포함되지 않았습니다.`);
+    expect(fx.database.workGroups.list()).toHaveLength(0);
   });
 });

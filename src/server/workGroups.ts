@@ -113,17 +113,20 @@ export class WorkGroups {
       ) ?? null
     );
   }
+  // options 는 생성 전용 입력(검증은 서비스가 끝냈다) — 없으면 레코드에 필드를 두지 않아 기존 동작과 같다.
   create(
     id: string,
     input: WorkGroupInput,
     repositoryPath: string,
     baseOID: string,
+    options: Pick<WorkGroup, "branchPrefix" | "predecessor"> = {},
   ): WorkGroup {
     const group: WorkGroup = {
       ...sanitizeInput(input),
       id,
       repositoryPath,
       baseOID,
+      ...compact({ branchPrefix: options.branchPrefix, predecessor: options.predecessor ? structuredClone(options.predecessor) : undefined }),
       version: 1,
       createdAt: new Date().toISOString(),
       links: {},
@@ -394,13 +397,16 @@ export function inheritedDecisions(group: WorkGroup, stageId: string): Array<{ s
 export function inheritedDeferredFindings(group: WorkGroup, stageId: string): DeferredFinding[] {
   const seen = new Set<string>();
   const out: DeferredFinding[] = [];
+  const add = (finding: DeferredFinding) => {
+    const key = `${finding.topicId}\u0000${finding.id}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ ...finding });
+  };
+  // 묶음 밖 선행 작업의 보류 원장(생성 때 동결) — 모든 단계가 그 결과를 담은 묶음 기준 위에서 시작하므로 모든 단계가 이어받는다.
+  for (const finding of group.predecessor?.deferredFindings ?? []) add(finding);
   for (const id of inheritedStages(group, stageId))
-    for (const finding of group.results?.[id]?.deferredFindings ?? []) {
-      const key = `${finding.topicId}\u0000${finding.id}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push({ ...finding });
-    }
+    for (const finding of group.results?.[id]?.deferredFindings ?? []) add(finding);
   return out;
 }
 // 승계 결정을 받는 토픽 타임라인에 넣을 이벤트 입력 — 생성(서비스)과 범위 변경(workflow)이 같은 함수를 써서 같은 본문·표식을 만든다.
@@ -565,6 +571,9 @@ function planRevision(old: WorkGroup, parsed: WorkGroupInput, expectedVersion: n
     if (!next) throw new Error(`연결된 단계는 없앨 수 없습니다: ${stage.id}`);
     if (canonical(shapeOf(stage)) !== canonical(shapeOf(next)))
       throw new Error(`연결된 단계의 ID·종류·의존·예산·체크리스트는 바꿀 수 없습니다: ${stage.id}`);
+    // 연결된 단계 토픽은 요청 브랜치 이름을 이미 받았다 — 묶음에서만 바꾸면 기록과 실제 전달 브랜치가 갈라진다.
+    if ((stage.branchName ?? null) !== (next.branchName ?? null))
+      throw new Error(`연결된 단계의 브랜치 이름은 바꿀 수 없습니다: ${stage.id}`);
     // 닫힌 단계는 결과가 확정됐다 — 서술까지 그대로여야 한다(E4 전 app 검사를 옮겼다).
     if (closedIds.has(stage.id) && canonical(fullStage(stage)) !== canonical(fullStage(next)))
       throw new Error("완료한 단계의 목표와 조건은 바꿀 수 없습니다.");

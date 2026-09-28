@@ -1,4 +1,4 @@
-import { dependencyClosure, stageReady, WorkGroupInputSchema } from "../shared/workGroups.js";
+import { dependencyClosure, stageReady, WorkGroupCreateOptionsSchema, WorkGroupInputSchema } from "../shared/workGroups.js";
 import { BudgetPolicySchema, OBSERVE_USAGE } from "../shared/budgets.js";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -6,8 +6,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { ConsensusDatabase } from "./database.js";
 import type { GitService } from "./git.js";
-import type { PreparedMerge, StageLink, StageResult, WorkGroup, WorkGroupInput, WorkStage } from "../shared/workGroups.js";
-import type { AgentSettings } from "../shared/contracts.js";
+import type { ExternalPredecessor, PreparedMerge, StageLink, StageResult, WorkGroup, WorkGroupCreateOptions, WorkGroupInput, WorkStage } from "../shared/workGroups.js";
+import type { AgentSettings, DeferredFinding } from "../shared/contracts.js";
 
 export interface WorkGroupServiceOptions {
   // 열린 단계가 외부 결정(사용자 결정·외부 근거)에 막혔는가 — 엔진의 정지 분류(workflow.stageBlockedExternally)를 그대로 쓴다.
@@ -15,6 +15,8 @@ export interface WorkGroupServiceOptions {
   blockedExternally?: (topicId: string) => boolean;
   // 공용 위키(메모리) 루트 — 통합 단계를 열 때 단계 결과가 기록한 위키 문서의 지금 버전을 잰다.
   memoryDirectory?: string;
+  // 토픽의 보류 원장(deferred-findings 산출물) — 묶음 밖 선행 토픽의 원장을 생성 때 동결한다. 없으면 선행 토픽을 받지 않는다.
+  deferredFindingsOf?: (topicId: string) => Promise<DeferredFinding[]>;
 }
 
 // 단계 결과의 승계 근거 — 어댑터·생성 이벤트·과거 호출이 쓰는 기존 반환 형식.
@@ -47,13 +49,25 @@ export class WorkGroupService {
     private readonly options: WorkGroupServiceOptions = {},
   ) {}
 
+  // options 는 생성 전용 입력(WorkGroupCreateOptionsSchema) — 명시 기준 커밋·단계 브랜치 접두사·묶음 밖 선행 토픽. 없으면 기존 동작이다.
   async create(
     input: WorkGroupInput,
     prepared?: (id: string) => void,
+    options: WorkGroupCreateOptions = {},
   ): Promise<WorkGroup> {
     const id = randomUUID();
-    const base = await this.git.head(this.repositoryPath);
+    const creation = WorkGroupCreateOptionsSchema.parse(options);
     const parsed = WorkGroupInputSchema.parse(input);
+    let base: string;
+    if (creation.baseRef === undefined) base = await this.git.head(this.repositoryPath);
+    else {
+      try {
+        base = await this.git.resolveCommit(this.repositoryPath, creation.baseRef);
+      } catch (error) {
+        throw new Error(`작업 묶음 기준 커밋을 찾을 수 없습니다: ${creation.baseRef} (${error instanceof Error ? error.message : String(error)})`);
+      }
+    }
+    const predecessor = creation.predecessorTopicId === undefined ? undefined : await this.freezePredecessor(creation.predecessorTopicId, base);
     // 대략 단계(완료 조건·예산 없음)를 허용한다 — 묶음 예산은 묶음 정책이 있으면 그것, 없으면 예산을 선언한 단계들로 정한다(저장소 groupPolicy).
     // 계정 출처는 어느 쪽이든 "explicit-stage-budgets" 다: 예산 화면이 이 값으로 묶음 계정(작업 묶음 누적 상한)을 알아본다. 정책이 어디서 왔는지는
     // 묶음 레코드의 budgetPolicy 유무에 남는다.
@@ -75,6 +89,7 @@ export class WorkGroupService {
         parsed,
         this.repositoryPath,
         base,
+        { branchPrefix: creation.branchPrefix, predecessor },
       );
       this.database.budgets.configure(
         id,
@@ -83,6 +98,26 @@ export class WorkGroupService {
       );
       return group;
     });
+  }
+
+  // 묶음 밖 선행 토픽(생성 전용 입력)을 확인하고 동결한다 — 같은 저장소의 토픽이고 그 전달 커밋(committedOID)이 묶음 기준 커밋이거나 그
+  // 조상이어야 한다(기준에 들어 있지 않은 토픽의 원장은 싣지 않는다). 확인한 범위 세대·전달 커밋과 그때의 보류 원장을 함께 기록해, 뒤에 선행
+  // 토픽이 범위를 바꾸거나 다시 커밋해도 승계 근거가 바뀌지 않게 한다. 원장을 읽는 사이 선행 토픽이 바뀌었으면 동결하지 않는다.
+  private async freezePredecessor(topicId: string, baseOID: string): Promise<ExternalPredecessor> {
+    const topic = this.database.listTopics().find((candidate) => candidate.id === topicId);
+    if (!topic) throw new Error(`선행 토픽을 찾을 수 없습니다: ${topicId}`);
+    if (resolve(topic.repositoryPath) !== resolve(this.repositoryPath))
+      throw new Error(`선행 토픽이 이 작업 묶음과 다른 저장소의 토픽입니다: ${topicId}`);
+    const committed = this.database.getFlags(topicId).committedOID;
+    if (!committed) throw new Error(`선행 토픽에 전달(커밋)한 결과가 없습니다: ${topicId}`);
+    if (committed !== baseOID && !(await this.git.isAncestor(this.repositoryPath, committed, baseOID)))
+      throw new Error(`선행 토픽의 전달 커밋 ${committed} 가 작업 묶음 기준 커밋 ${baseOID} 에 포함되지 않았습니다.`);
+    if (!this.options.deferredFindingsOf) throw new Error("선행 토픽의 보류 원장을 읽을 수 없어 묶음 밖 선행 토픽을 받지 않습니다.");
+    const deferredFindings = await this.options.deferredFindingsOf(topicId);
+    if (this.database.getTopic(topicId).scopeGeneration !== topic.scopeGeneration || this.database.getFlags(topicId).committedOID !== committed)
+      throw new Error(`선행 토픽 ${topicId} 이(가) 확인하는 동안 바뀌었습니다. 묶음을 다시 만들어 주세요.`);
+    return { topicId, scopeGeneration: topic.scopeGeneration, committedOID: committed, deferredFindings: structuredClone(deferredFindings),
+      frozenAt: new Date().toISOString() };
   }
 
   // 골라 열 수 있는 단계(목록 뷰) — next(id, _, stageId) 가 받아들일 조건 중 DB 로 정해지는 전부다. next 와 같은 판정 함수(admit)를 그대로 부른다
@@ -186,8 +221,10 @@ export class WorkGroupService {
           repositoryPath: group.repositoryPath,
           worktreePath,
           baseRef: baseOID,
-          branchPrefix: "consensus",
-          requestedBranchName: null,
+          // 묶음 생성 전용 입력(없으면 기존 값). 묶음 밖 선행 작업은 토픽 참조로 잇지 않는다 — 묶음이 생성 때 동결한 원장을 모든 단계가
+          // 이어받는다(inheritedDeferredFindings → deferredFindingsFor).
+          branchPrefix: group.branchPrefix ?? "consensus",
+          requestedBranchName: stage.branchName ?? null,
           predecessorTopicId: null,
           branchName: null,
           state: "DRAFT",

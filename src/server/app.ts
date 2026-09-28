@@ -7,7 +7,7 @@ import {
   ToolTreeRebaselineInputSchema,
   ResumeImplementationInputSchema, AmendToleranceInputSchema } from "../shared/contracts.js";
 import { RevisionGrantInputSchema } from "../shared/revisions.js";
-import { stageReady, WorkGroupInputSchema, type WorkGroupView } from "../shared/workGroups.js";
+import { parseWorkGroupCreateBody, stageReady, WorkGroupInputSchema, type WorkGroupView } from "../shared/workGroups.js";
 import { WorkGroupService } from "./workGroupService.js";
 import { BudgetPolicySchema, BudgetResumeInputSchema } from "../shared/budgets.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -21,6 +21,7 @@ import {
   ApprovalInputSchema,
   AttachParticipantInputSchema,
   CreateTopicInputSchema,
+  DeferredFindingsSchema,
   DeliveryInputSchema,
   ImplementInputSchema,
   PostMessageInputSchema,
@@ -114,8 +115,17 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     policyVersion: readMediationPolicy(DEFAULT_MEDIATION_POLICY_PATH).version,
   });
   // 막힌 단계 옆 독립 준비 단계 선택은 엔진의 정지 분류(외부 결정 대 자원 정지)를 쓰고, 통합 단계는 연결 때 위키 기록 버전을 지금 버전과 잰다(E4).
+  // 묶음 밖 선행 토픽의 보류 원장은 엔진이 쓰는 산출물(deferred-findings)을 그대로 읽어 생성 때 동결한다 — 동결 근거라 형식이 틀리면 빈 목록으로
+  // 넘기지 않고 거부한다.
   const workGroups = new WorkGroupService(database,git,config.repositoryPath,config.worktreesDirectory,config.defaultAgentSettings,
-    {blockedExternally:topicId=>workflow.stageBlockedExternally(topicId),memoryDirectory:config.memoryDirectory});
+    {blockedExternally:topicId=>workflow.stageBlockedExternally(topicId),memoryDirectory:config.memoryDirectory,
+      deferredFindingsOf:async topicId=>{
+        const raw=await artifacts.readLatest(topicId,"deferred-findings");
+        if(!raw)return [];
+        const parsed=DeferredFindingsSchema.safeParse(JSON.parse(raw));
+        if(!parsed.success)throw new Error(`선행 토픽 ${topicId} 의 보류 원장 형식이 올바르지 않습니다.`);
+        return parsed.data.findings;
+      }});
   // 시작 URL의 일회성 token이나 인증 헤더가 request log에 남지 않도록 HTTP request logging을 끈다.
   const app = Fastify({ logger: false });
 
@@ -185,8 +195,9 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       replanPending:group.stages.filter(stage=>group.links[stage.id]?.replanPending).map(stage=>stage.id)};
   }));
   app.post("/api/work-groups",async(request,reply)=>{
-    const input=WorkGroupInputSchema.parse(request.body);
-    return runIdempotent(request,reply,globalLedger(database,"work-group:create"),201,key=>workGroups.create(input,id=>database.annotateGlobalRequest("work-group:create",key,{plannedGroupId:id})));
+    // 생성 전용 입력(기준 커밋·단계 브랜치 접두사·묶음 밖 선행 토픽)은 묶음 입력과 따로 검증한다 — 개정 입력(revise)에는 없다.
+    const {input,options}=parseWorkGroupCreateBody(request.body);
+    return runIdempotent(request,reply,globalLedger(database,"work-group:create"),201,key=>workGroups.create(input,id=>database.annotateGlobalRequest("work-group:create",key,{plannedGroupId:id}),options));
   });
   // 본문 stageId 가 있으면 막힌 단계 옆 독립 준비 단계를 골라 연다(E4-6). 없으면 기본 규칙(한 번에 한 단계, 첫 준비 단계).
   app.post<{Params:{id:string}}>("/api/work-groups/:id/next",async(request,reply)=>{
