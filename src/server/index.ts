@@ -1,5 +1,5 @@
 import { createRuntimeAdapters } from "./runtime/providers.js";
-import { buildApp } from "./app.js";
+import { buildApp, probeNestedSandbox } from "./app.js";
 import { ConsensusDatabase } from "./database.js";
 import type { MemoryReaderOptions } from "./projectMemory.js";
 import { loadConfig } from "./config.js";
@@ -11,10 +11,16 @@ const config = loadConfig();
 const runner = new SpawnCommandRunner();
 const database = new ConsensusDatabase(config.databasePath);
 const memoryReaderOptions: MemoryReaderOptions = { resolveEvidenceStatus: dependencies => database.evidence.status(dependencies) };
+// 샌드박스 안에서 뜬 서버는 러너·Codex 의 sandbox-exec 를 막는다. 방(UI·API)은 그대로 띄우고, 실행 허용 검사가 모든 에이전트 실행을 거부한다.
+const hostSandbox = probeNestedSandbox();
+if (hostSandbox.kind === "unavailable") {
+  console.warn(`[host-sandbox] 서버가 macOS 샌드박스 안에서 실행 중입니다(${hostSandbox.detail}). 러너·Codex 실행을 거부합니다 — 샌드박스 밖(사용자 터미널)에서 재시작하세요.`);
+}
 const app = await buildApp({
   config,
   database,
   runner,
+  hostSandbox,
   ...createRuntimeAdapters(runner, {
     dataDirectory: config.dataDirectory,
     memoryDirectory: config.memoryDirectory,

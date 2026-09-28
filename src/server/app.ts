@@ -38,7 +38,7 @@ import { redactRecord, safeError } from "./security.js";
 import { redactSecrets } from "../shared/workflow.js";
 import type { AgentAdapter, CommandRunner, ParticipantRole } from "./types.js";
 import {
-  type CallOrigin, WorkflowEngine } from "./workflow.js";
+  type CallOrigin, type HostSandboxStatus, WorkflowEngine } from "./workflow.js";
 import { ProcessSupervisor } from "./processSupervisor.js";
 import { ProjectMemoryStore } from "./memoryStore.js";
 import { readMediationAutonomy, writeMediationAutonomy } from "./mediationAutonomy.js";
@@ -52,6 +52,27 @@ import { profileSuitability, routingView } from "./turnRouting.js";
 import { guardRunnerControl } from "./adapters/turnPolicy.js";
 import { RestEvidenceConnector, evidenceCredentials, type EvidenceConnector } from "./evidence/connectors.js";
 import { registerEvidenceRoutes } from "./evidence/routes.js";
+import { spawnSync, type SpawnSyncReturns } from "node:child_process";
+
+export const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
+type SandboxProbeRun = (command: string, args: string[]) => Pick<SpawnSyncReturns<string>, "status" | "stderr" | "error">;
+
+// 서버가 macOS 샌드박스(seatbelt) 안에서 떠 있으면 자식이 sandbox-exec 로 새 프로필을 적용하지 못한다(중첩 불가, rc 71 "sandbox_apply: Operation not
+// permitted"). 2026-09-28 Claude 중재 세션 Bash(work-admission guard.py exec 의 sandbox-exec) 안에서 restart_room.sh 로 띄운 서버가 그랬다 — 러너 Bash 가
+// 전부 실패한 채 구현 턴이 끝까지 돌았고, Codex 리뷰는 세션 생성에서 죽었다. 판정은 부팅 때 한 번이다. 프로세스는 샌드박스를 벗어날 수 없어 결과가 바뀌지 않는다.
+export function probeNestedSandbox(options: { run?: SandboxProbeRun; platform?: NodeJS.Platform } = {}): HostSandboxStatus {
+  const platform = options.platform ?? process.platform;
+  if (platform !== "darwin") return { kind: "not-applicable", detail: `platform ${platform}` };
+  const run: SandboxProbeRun = options.run ?? ((command, args) => spawnSync(command, args, { encoding: "utf8", timeout: 10_000 }));
+  // 러너·Codex 가 하는 일(새 프로필 적용 뒤 exec)을 가장 작은 형태로 한 번 해 본다.
+  const result = run(SANDBOX_EXEC, ["-p", "(version 1)(allow default)", "/usr/bin/true"]);
+  if (result.error) {
+    if ((result.error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "not-applicable", detail: `${SANDBOX_EXEC} 없음` };
+    return { kind: "unavailable", detail: `${SANDBOX_EXEC} 실행 실패: ${result.error.message}` };
+  }
+  if (result.status === 0) return { kind: "available" };
+  return { kind: "unavailable", detail: `${SANDBOX_EXEC} rc ${result.status}: ${(result.stderr ?? "").trim().slice(0, 200)}` };
+}
 
 export interface AppDependencies {
   evidenceConnector?: EvidenceConnector;
@@ -60,6 +81,8 @@ export interface AppDependencies {
   runner: CommandRunner;
   claude: AgentAdapter;
   codex: AgentAdapter;
+  // 부팅 때 판정한 중첩 샌드박스 가능 여부(index.ts 가 probeNestedSandbox 로 판정). 실행 허용 검사가 쓴다.
+  hostSandbox?: HostSandboxStatus;
 }
 
 export async function buildApp(dependencies: AppDependencies): Promise<FastifyInstance> {
@@ -93,6 +116,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     executionLimits: config.executionLimits,
     enforceBudgets: config.enforceBudgets ?? true,
     maintenanceLockPath: join(config.dataDirectory, "maintenance.lock"),
+    hostSandbox: dependencies.hostSandbox,
   });
   // 중재 세션의 호출은 헤더 x-consensus-actor: mediator 로 구분한다. 결정·승인·실행·인도 류는 위임 스위치(mediation-autonomy.json)가
   // on 일 때만 받는다(off 면 403) — "중재자가 사용자와 같은 인증으로 무엇이든 부른다" 를 닫는다(2026-09-14 Codex 감사 D03).

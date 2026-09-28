@@ -6,7 +6,7 @@ import { AgentRunError } from "../adapters/resultParser.js";
 //
 // 실행 허용 검사(admit)는 두 번 돈다: adapter 를 부르기 전에 한 번(가짜 adapter·값싼 조기 종료), 그리고 어댑터가 준비(임시 파일·슬롯 대기·
 // 세션 폴백·내부 재시도)를 마치고 **프로세스를 spawn 하기 직전**에 한 번 더(SessionTurn.beforeSpawn → CommandSpec.beforeSpawn).
-// 검사 항목: 취소 · 늦은 응답(assertCurrent) · 새 결정/증거 · 계획 변경(epoch·sha, 쓰기 호출은 승인 계획) · 유지보수 잠금 · 예산 소진 ·
+// 검사 항목: 취소 · 늦은 응답(assertCurrent) · 서버 샌드박스(hostSandbox) · 새 결정/증거 · 계획 변경(epoch·sha, 쓰기 호출은 승인 계획) · 유지보수 잠금 · 예산 소진 ·
 // 쓰기 호출의 Git 기준·도구 트리 기준. 거부하면 프로세스는 뜨지 않고, 사유는 구조화된 이벤트로 남으며, 결과·재개 위치는 호출자가
 // checkpoint 로 이미 보존한 상태다(호출자가 execute 전에 record 한다).
 import type { AgentExecutionSettings, AgentResult, PlanRepair, Topic, WorkflowState } from "../../shared/contracts.js";
@@ -83,9 +83,10 @@ export function invocationFailure(error: unknown): InvocationFailure | undefined
 
 export class AdmissionRefused extends Error {
   // unsupported-route: 배정된 공급자가 이 job 의 정책을 표현할 수 없거나 배정이 실행할 수 없다(E2b). session-binding: 연속성 정책에서 좌석 세션을 다른
-  // 공급자·참여자로 이어 쓸 수 없다(E2b). 둘 다 재시도해도 같으므로 결정 대기로 멈춘다.
+  // 공급자·참여자로 이어 쓸 수 없다(E2b). 둘 다 재시도해도 같으므로 결정 대기로 멈춘다. host-sandbox: 서버가 샌드박스 안에서 떠 러너·Codex 가
+  // 중첩 샌드박스를 만들 수 없다(app.ts probeNestedSandbox) — 서버를 샌드박스 밖에서 다시 띄워야 풀린다.
   constructor(readonly reason: "cancelled" | "stale" | "plan-changed" | "unapproved-plan" | "maintenance" | "budget" | "baseline" | "tool-tree"
-    | "unsupported-route" | "session-binding", message: string) {
+    | "unsupported-route" | "session-binding" | "host-sandbox", message: string) {
     super(message);
     this.name = "AdmissionRefused";
   }
@@ -109,7 +110,7 @@ export class TurnExecutor {
   }
 
   // 실행 허용 검사 — 던지면 실행하지 않는다. 두 부분으로 나뉜다:
-  //   sync  : 취소 · 늦은 응답 · 계획 변경 · 승인 계획 · 새 결정/증거 · 유지보수 잠금 · 예산 소진 · 도구 트리 지문 — 전부 동기라 spawn 직전에
+  //   sync  : 취소 · 늦은 응답 · 서버 샌드박스 · 계획 변경 · 승인 계획 · 새 결정/증거 · 유지보수 잠금 · 예산 소진 · 도구 트리 지문 — 전부 동기라 spawn 직전에
   //           await 없이 마지막으로 다시 돈다(CommandSpec.admitSync).
   //   async : Git HEAD(쓰기 호출) — 비동기 준비 단계(CommandSpec.beforeSpawn)에서 돈다. 그 뒤 sync 가 한 번 더 돈다.
   // 새 사용자 입력은 인터럽트(상태 전이)까지 하고 HandledWorkflowInterruption 을 던진다.
@@ -122,6 +123,11 @@ export class TurnExecutor {
       const db = this.core.dependencies.database;
       const current = db.getTopic(topic.id);
       this.core.assertCurrent(topic.id, signal, expected.scopeGeneration, expected.state);
+      // 근거·계획보다 먼저 본다 — 이 조건에서는 어떤 호출도 도구를 쓰지 못하고, 근거를 갱신해도 풀리지 않는다.
+      const host = this.core.dependencies.hostSandbox;
+      if (host?.kind === "unavailable") {
+        this.refuse(request, "host-sandbox", `${request.purpose} 을 열지 않습니다 — 서버 프로세스가 macOS 샌드박스 안에서 실행 중이라 러너 Bash·Codex 세션이 중첩 샌드박스를 만들지 못합니다(${host.detail}). 샌드박스 밖(사용자 터미널)에서 서버를 재시작한 뒤 retry 하세요.`);
+      }
       const evidence = db.evidence.topic(current);
       if (!evidence.ready || evidence.digest !== request.evidenceDigest || (write && !evidence.reviewed)) {
         this.core.interrupt(topic.id, "BLOCKED_ON_EVIDENCE", "외부 근거가 바뀌었거나 확인이 필요합니다. 원문을 갱신하고 현재 계획에 미치는 영향을 확인하세요.", expected.state, { externalEvidence: true });

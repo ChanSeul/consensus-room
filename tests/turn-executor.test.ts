@@ -194,6 +194,61 @@ describe("실행 허용 거부의 재개와 예약 복원", () => {
     expect(ledger.account("u")).toMatchObject({ used: 0, firstPlanUsed: true });
     database.close();
   });
+  it("HS-01: 서버가 샌드박스 안이면 spawn 없이 host-sandbox 로 멈추고, 샌드박스 밖에서 다시 띄운 엔진의 retry 는 같은 단계를 잇는다", async () => {
+    const root = mkdtempSync(join(tmpdir(), "consensus-room-host-sandbox-")); temporaryDirectories.push(root);
+    const database = new ConsensusDatabase(join(root, "room.sqlite"));
+    const at = new Date().toISOString();
+    database.createTopic({ id: "t", slug: "t", title: "t", repositoryPath: root, baseRef: "develop", worktreePath: root, branchName: null, state: "DRAFT", scopeGeneration: 1, planRevision: 0, planSHA256: null, approvedPlanSHA256: null, createdAt: at, updatedAt: at, lastError: null });
+    for (const role of ["claude", "codex"] as const) database.upsertParticipant("t", { role, sessionId: `${role}-session`, mode: "attached", acknowledgedPlanSHA256: null });
+    database.budgets.configure("t", { execution: { inputTokens: 1000, outputTokens: 1000, durationMs: 60000 }, total: { inputTokens: 100000, outputTokens: 100000, durationMs: 600000 } }, "probe");
+    const lock = join(root, "maintenance.json");
+    const { REQUIRED_PLAN_HEADINGS } = await import("../src/shared/contracts");
+    const plan = REQUIRED_PLAN_HEADINGS.map((h) => `## ${h}\n\n${h}${h === "허용 오차" ? '\n\n```tolerance\n{"scopePaths":["owned.txt"],"rules":[]}\n```' : ""}`).join("\n\n");
+    let claudeCalls = 0, codexCalls = 0;
+    const runClaude = async (turn: { beforeSpawn?: () => void | Promise<void>; admitSync?: () => void }) => { await turn.beforeSpawn?.(); turn.admitSync?.(); claudeCalls++; return { kind: "PLAN" as const, summary: "plan", planMarkdown: plan, findings: [], evidenceRefs: [] }; };
+    const claude = { role: "claude" as const, validateExistingSession: async () => true, resumeTurn: runClaude, createSession: async (turn: Parameters<typeof runClaude>[0]) => ({ sessionId: "c", result: await runClaude(turn) }) };
+    // 두 번째 엔진의 감사는 CF-07 과 같은 유지보수 잠금으로 spawn 직전에 멈춰, 샌드박스 거부가 풀린 뒤 흐름이 감사까지 이어졌음을 끝에서 확인한다.
+    const runCodex = async (turn: { beforeSpawn?: () => void | Promise<void>; admitSync?: () => void }) => { codexCalls++; writeFileSync(lock, JSON.stringify({ at: new Date().toISOString(), reason: "probe" })); await turn.beforeSpawn?.(); turn.admitSync?.(); throw new Error("unexpected spawn"); };
+    const codex = { role: "codex" as const, validateExistingSession: async () => true, resumeTurn: runCodex, createSession: async (turn: Parameters<typeof runCodex>[0]) => ({ sessionId: "x", result: await runCodex(turn) }) };
+    const { WorkflowEngine } = await import("../src/server/workflow");
+    const settled = async () => { while (database.runningAction("t")) await new Promise((resolve) => setTimeout(resolve, 10)); };
+    const detail = "/usr/bin/sandbox-exec rc 71: sandbox-exec: sandbox_apply: Operation not permitted";
+    const sandboxed = new WorkflowEngine({ database, artifacts: new ArtifactStore(join(root, "topics"), database), git: {} as never, claude, codex, enforceBudgets: true, maintenanceLockPath: lock,
+      hostSandbox: { kind: "unavailable", detail } });
+    sandboxed.startPlan("t"); await settled();
+    expect(database.getTopic("t").state).toBe("USER_DECISION_REQUIRED");
+    const refusal = database.getTimeline("t").find((event) => event.payload?.admissionRefused === "host-sandbox");
+    expect(refusal?.body).toContain(detail);
+    expect(claudeCalls + codexCalls).toBe(0);                                          // 어떤 공급자도 부르지 않았다
+    expect(database.revisions.account("t")).toMatchObject({ used: 0, firstPlanUsed: false });   // 무료 최초 계획 예약도 돌아왔다
+    const resumeState = database.getFlags("t").resumeState;
+    const restarted = new WorkflowEngine({ database, artifacts: new ArtifactStore(join(root, "topics"), database), git: {} as never, claude, codex, enforceBudgets: true, maintenanceLockPath: lock,
+      hostSandbox: { kind: "available" } });
+    restarted.retry("t"); await settled();
+    expect(resumeState).toBe("CLAUDE_PLAN");
+    expect(claudeCalls).toBe(1);          // 멈춘 계획 단계에서 이어 계획을 한 번 만들었다
+    expect(codexCalls).toBe(1);           // 그 다음 단계(감사)까지 갔다
+    expect(database.getFlags("t").resumeState).toBe("CODEX_AUDIT");
+    expect(database.reviews.account("t", "planning").used).toBe(0);
+    database.close();
+  });
+});
+
+describe("서버 샌드박스 판정 — app.probeNestedSandbox", () => {
+  it("중첩 적용이 되면 available, 거부(rc 71)·실행 실패면 unavailable, sandbox-exec 가 없거나 macOS 가 아니면 not-applicable 이다", async () => {
+    const { probeNestedSandbox } = await import("../src/server/app");
+    const calls: string[][] = [];
+    const run = (status: number | null, stderr = "", error?: Error) => (command: string, args: string[]) => { calls.push([command, ...args]); return { status, stderr, error }; };
+    expect(probeNestedSandbox({ platform: "darwin", run: run(0) })).toEqual({ kind: "available" });
+    expect(calls[0]).toEqual(["/usr/bin/sandbox-exec", "-p", "(version 1)(allow default)", "/usr/bin/true"]);
+    const nested = probeNestedSandbox({ platform: "darwin", run: run(71, "sandbox-exec: sandbox_apply: Operation not permitted\n") });
+    expect(nested).toEqual({ kind: "unavailable", detail: "/usr/bin/sandbox-exec rc 71: sandbox-exec: sandbox_apply: Operation not permitted" });
+    expect(probeNestedSandbox({ platform: "darwin", run: run(null, "", Object.assign(new Error("spawnSync /usr/bin/sandbox-exec ENOENT"), { code: "ENOENT" })) }).kind).toBe("not-applicable");
+    expect(probeNestedSandbox({ platform: "darwin", run: run(null, "", Object.assign(new Error("spawnSync /usr/bin/sandbox-exec ETIMEDOUT"), { code: "ETIMEDOUT" })) }).kind).toBe("unavailable");
+    const before = calls.length;
+    expect(probeNestedSandbox({ platform: "linux", run: run(0) })).toEqual({ kind: "not-applicable", detail: "platform linux" });
+    expect(calls.length).toBe(before);   // macOS 가 아니면 실행하지 않는다
+  });
 });
 
 // E3-4c — 코드 리뷰 원장. 논리 리뷰 한 번의 읽기·최종 판정 호출은 원장 ID 하나로 리뷰 1회를 예약하고(ReviewLedger 예약은 ID 마다 멱등), 원장의 첫 spawn 뒤에는

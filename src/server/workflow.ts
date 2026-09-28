@@ -75,6 +75,13 @@ export interface CallOrigin {
   policyVersion?: string | null;
 }
 
+// 서버 프로세스가 중첩 샌드박스를 만들 수 있는지(부팅 때 app.ts probeNestedSandbox 가 한 번 판정). 샌드박스 안에서 뜬 서버는 자식이 새 seatbelt 를
+// 적용하지 못해 러너 Bash(Claude Code sandbox)와 Codex 새 세션(fs sandbox helper)이 exit 71 로 죽는다(2026-09-28~29 실측).
+export type HostSandboxStatus =
+  | { kind: "available" }
+  | { kind: "not-applicable"; detail: string }
+  | { kind: "unavailable"; detail: string };
+
 export interface WorkflowDependencies {
   database: ConsensusDatabase;
   artifacts: ArtifactStore;
@@ -89,6 +96,8 @@ export interface WorkflowDependencies {
   enforceBudgets?: boolean;
   // 중재자 유지보수 잠금 파일(도구 트리 교체·서버 교체 중). 있으면 새 실행을 시작하지 않는다(2026-09-14 Codex 감사 R04).
   maintenanceLockPath?: string;
+  // 부팅 때 판정한 중첩 샌드박스 가능 여부. unavailable 이면 러너·Codex 를 spawn 하지 않는다. 없으면 판정하지 않은 것(테스트).
+  hostSandbox?: HostSandboxStatus;
 }
 
 // 범위 변경을 허용하는 상태. WorkflowState가 늘어나면 이 표가 컴파일을 막아 새 상태를 의식적으로 판단하게 만든다.
