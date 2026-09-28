@@ -5,10 +5,14 @@ import { PLANNING_LIMITS, PlanningPaused, type PlanningFragment, type PlanningRe
 import { planningHash } from "./planningStore.js";
 
 const execute = promisify(execFile);
+// Only a malformed byte offset is correctable by the planner. Snapshot/access failures remain hard stops.
+export class InvalidPlanningOffset extends PlanningPaused {
+  constructor() { super("Invalid UTF-8 continuation offset; reuse the returned nextOffset, or start at offset 0. Do not guess byte offsets."); }
+}
 export function utf8Slice(text: string, offset: number, limit: number): { text: string; next: number | null } {
   const bytes = Buffer.from(text);
-  if (offset > bytes.length || (offset < bytes.length && (bytes[offset] & 0xc0) === 0x80)) {
-    throw new PlanningPaused("Invalid UTF-8 continuation offset; reuse the returned nextOffset.");
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset > bytes.length || (offset < bytes.length && (bytes[offset] & 0xc0) === 0x80)) {
+    throw new InvalidPlanningOffset();
   }
   let end = Math.min(bytes.length, offset + limit);
   while (end < bytes.length && end > offset && (bytes[end] & 0xc0) === 0x80) end--;

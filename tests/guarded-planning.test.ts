@@ -12,7 +12,7 @@ import { SpawnCommandRunner } from "../src/server/processRunner";
 import { guardedPlanning } from "../src/server/guardedPlanning";
 import { BudgetController } from "../src/server/budgetController";
 import { PlanningReader, utf8Slice } from "../src/server/planningReader";
-import { PLANNING_LIMITS, type PlanningFragment, type PlanningStep } from "../src/shared/planningControl";
+import { PLANNING_LIMITS, PlanningPaused, type PlanningFragment, type PlanningStep } from "../src/shared/planningControl";
 import { buildClaudePlanPrompt, buildCodexAuditPrompt, planTimelineDelivery, timelineEventText, timelineReference } from "../src/shared/prompts";
 import { WorkflowEngine } from "../src/server/workflow";
 import { ArtifactStore } from "../src/server/artifacts";
@@ -1011,6 +1011,183 @@ it("reads dirty snapshot content, rejects symlinks/credential paths and paginate
   expect(() => utf8Slice("한", 1, 100)).toThrow("UTF-8");
 });
 
+// Public boundary: guarded adapter -> pinned reader -> next model prompt -> accepted plan.
+// Reproduces the invalid-offset stop with real git/SQLite; the model double corrects its request,
+// or interrupts/repeats it. No UI, native-provider behavior or production deployment is claimed.
+describe("invalid planning read offsets", () => {
+  it.each([1, 100_000])("lets the model correct offset %i without a new decision or attempt", async offset => {
+    const { repo, database, git } = setup();
+    writeFileSync(join(repo, "form.swift"), "한글🙂");
+    const fake = scripted(async (turn, n) => {
+      if (n === 1) return answer(step({ requests: [{ kind: "file", selector: "form.swift", question: "Read text", offset }] }));
+      if (n === 2) {
+        expect(turn.prompt).toContain("Read request errors:");
+        expect(turn.prompt).toContain(`\"offset\":${offset}`);
+        expect(turn.prompt).toContain("nextOffset");
+        expect(JSON.parse(turn.prompt.split("Fragments: ").at(-1)!)).toEqual([]);
+        return answer(step({ requests: [{ kind: "file", selector: "form.swift", question: "Read text", offset: 0 }] }));
+      }
+      const fragments = JSON.parse(turn.prompt.split("Fragments: ").at(-1)!) as PlanningFragment[];
+      expect(fragments.map(fragment => fragment.content)).toEqual(["한글🙂"]);
+      return answer(step({ questions: [], complete: true, facts: [{ statement: "Read intact text", refs: [fragments[0].id] }] }));
+    });
+    const result = await guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Plan" });
+    expect(result.result.planMarkdown).toBe("Final navigation plan");
+    expect(fake.calls).toHaveLength(3);
+    expect(database.planning.latest("topic")).toMatchObject({ finalized: true, usage: { inputTokens: 300 } });
+  });
+
+  it("preserves valid sibling reads and error feedback across an interrupted correction", async () => {
+    const { root, repo, database, git } = setup();
+    writeFileSync(join(repo, "form.swift"), "한글🙂");
+    writeFileSync(join(repo, "sibling.swift"), "let sibling = true");
+    const fake = scripted(async (turn, n) => {
+      if (n === 1) return answer(step({ requests: [
+        { kind: "file", selector: "sibling.swift", question: "Read sibling", offset: 0 },
+        { kind: "file", selector: "form.swift", question: "Read text", offset: 1 },
+      ] }));
+      if (n === 2) throw new Error("Interrupted correction");
+      if (n === 3) {
+        expect(turn.prompt).toContain("Read request errors:");
+        expect(turn.prompt).toContain("let sibling = true");
+        return answer(step({ requests: [{ kind: "file", selector: "form.swift", question: "Read text", offset: 0 }] }));
+      }
+      const fragments = JSON.parse(turn.prompt.split("Fragments: ").at(-1)!) as PlanningFragment[];
+      expect(fragments[0].content).toBe("한글🙂");
+      return answer(step({ questions: [], complete: true }));
+    });
+    await expect(guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Plan" }))
+      .rejects.toThrow("Interrupted correction");
+    const before = database.planning.latest("topic")!;
+    const reopened = new ConsensusDatabase(join(root, "room.db"));
+    cleanups.push(() => reopened.close());
+    const result = await guardedPlanning(fake.adapter, reopened, git).resumeTurn({ cwd: repo, prompt: "Plan", sessionId: before.sessionId! });
+    expect(result.planMarkdown).toBe("Final navigation plan");
+    expect(database.planning.latest("topic")).toMatchObject({ id: before.id, admissionId: before.admissionId,
+      sessionId: before.sessionId, finalized: true, usage: { inputTokens: 400 } });
+  });
+
+  it("recovers the pending request saved by the former hard-stop reader without another user decision", async () => {
+    const { repo, database, git } = setup();
+    writeFileSync(join(repo, "form.swift"), "한글🙂");
+    const fake = scripted(async (_turn, n) => n < 3
+      ? answer(step({ requests: [{ kind: "file", selector: "form.swift", question: "Read text", offset: n === 1 ? 1 : 0 }] }))
+      : answer(step({ questions: [], complete: true })));
+    const read = PlanningReader.prototype.read;
+    const legacy = vi.spyOn(PlanningReader.prototype, "read").mockImplementation(function (this: PlanningReader, request) {
+      if (request.offset === 1) throw new PlanningPaused("Invalid UTF-8 continuation offset; reuse the returned nextOffset.");
+      return read.call(this, request);
+    });
+    await expect(guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Invalid UTF-8");
+    const before = database.planning.latest("topic")!;
+    expect(before.stopped).toBe("Planning checkpoint accepted; deferred reads pending.");
+    legacy.mockRestore();
+    const result = await guardedPlanning(fake.adapter, database, git).resumeTurn({ cwd: repo, prompt: "Plan", sessionId: before.sessionId! });
+    expect(result.planMarkdown).toBe("Final navigation plan");
+    expect(fake.calls).toHaveLength(3);
+    expect(database.planning.latest("topic")).toMatchObject({ id: before.id, admissionId: before.admissionId, finalized: true });
+  });
+
+  it("keeps a rejected deferred read outstanding until its corrected request is adopted", async () => {
+    const { repo, database, git } = setup();
+    writeFileSync(join(repo, "form.swift"), "한글🙂");
+    const request = { kind: "file" as const, selector: "form.swift", question: "Read after decision", offset: 1 };
+    const fake = scripted(async (turn, n) => {
+      if (n === 1) return { ...answer(step({ requests: [request] })), requestedUserDecision: "Proceed?" };
+      if (n === 2) {
+        expect(turn.prompt).toContain("Read request errors:");
+        // An attempted completion cannot discard the rejected deferred obligation.
+        return answer(step({ questions: [], complete: true }));
+      }
+      if (n === 3) return answer(step({ requests: [{ ...request, offset: 0 }] }));
+      expect(JSON.parse(turn.prompt.split("Fragments: ").at(-1)!)[0].content).toBe("한글🙂");
+      expect(database.planning.latest("topic")).toMatchObject({ finalized: false, deferredReads: [{ offset: 0 }] });
+      return answer(step({ questions: [], complete: true }));
+    });
+    const adapter = guardedPlanning(fake.adapter, database, git);
+    await adapter.createSession({ cwd: repo, prompt: "Plan" });
+    database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CLAUDE_PLAN", body: "Proceed" });
+    const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+    expect(result.result.planMarkdown).toBe("Final navigation plan");
+    expect(fake.calls).toHaveLength(4);
+    expect(database.planning.latest("topic")!.deferredReads).toBeUndefined();
+  });
+
+  it("bounds repeated invalid requests and does not reset the limit on retry", async () => {
+    const { repo, database, git } = setup();
+    writeFileSync(join(repo, "form.swift"), "한글🙂");
+    const fake = scripted(async () => answer(step({ requests: [
+      { kind: "file", selector: "form.swift", question: "Read text", offset: 1 },
+    ] })));
+    for (let retry = 0; retry < 2; retry++) {
+      await expect(guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Plan" }))
+        .rejects.toThrow("Two planning rounds produced no new evidence");
+    }
+    expect(fake.calls).toHaveLength(2);
+    expect(database.planning.latest("topic")).toMatchObject({ finalized: false, stalled: 2, delivered: [], fragments: [] });
+  });
+
+  it("F001: preserves a new reread reason when an offset correction asks for another decision", async () => {
+    const { repo, database, git } = setup();
+    writeFileSync(join(repo, "form.swift"), "한글🙂");
+    const request = { kind: "file" as const, selector: "form.swift", question: "Read text", offset: 0 };
+    const reason = "Compaction lost the previously delivered text";
+    const fake = scripted(async (turn, n) => {
+      if (n === 1) return answer(step({ requests: [request] }));
+      if (n === 2) return { ...answer(step({ requests: [{ ...request, offset: 1 }] })), requestedUserDecision: "First decision" };
+      if (n === 3) return { ...answer(step({ requests: [{ ...request, rereadReason: reason }] })), requestedUserDecision: "Second decision" };
+      expect(JSON.parse(turn.prompt.split("Fragments: ").at(-1)!)[0]?.content).toBe("한글🙂");
+      return answer(step({ questions: [], complete: true }));
+    });
+    const adapter = guardedPlanning(fake.adapter, database, git);
+    await adapter.createSession({ cwd: repo, prompt: "Plan" });
+    for (const body of ["First answer", "Second answer"]) {
+      database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CLAUDE_PLAN", body });
+      await adapter.createSession({ cwd: repo, prompt: "Plan" });
+    }
+    expect(fake.calls).toHaveLength(4);
+    expect(database.planning.latest("topic")!.finalized).toBe(true);
+  });
+
+  it("F002: resumes corrected reads after the soft budget limit without losing them to the stall limit", async () => {
+    const { repo, database, git } = setup("claude", 1100);
+    writeFileSync(join(repo, "form.swift"), "한글🙂".repeat(3000));
+    const fake = scripted(async (turn, n) => {
+      if (n <= 9) return answer(step({ requests: [{ kind: "file", selector: "form.swift", question: "Read text",
+        offset: n < 7 ? (n - 1) * 10 : n < 9 ? 1 : 70 }] }));
+      expect(JSON.parse(turn.prompt.split("Fragments: ").at(-1)!)[0]?.offset).toBe(70);
+      return answer(step({ questions: [], complete: true }));
+    });
+    const adapter = guardedPlanning(fake.adapter, database, git);
+    for (let retry = 0; retry < 2; retry++) {
+      await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("budget");
+    }
+    const paused = database.planning.latest("topic")!;
+    expect(fake.calls).toHaveLength(9);
+    expect(paused.step.requests[0].offset).toBe(70);
+    database.budgets.grant("topic", "offset-budget", { execution: { inputTokens: 3000, outputTokens: 10000, durationMs: 100000 },
+      total: { inputTokens: 300000, outputTokens: 30000, durationMs: 300000 } }, database.budgets.account("topic")!.version);
+    const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+    expect(result.result.planMarkdown).toBe("Final navigation plan");
+    expect(fake.calls).toHaveLength(10);
+    expect(database.planning.latest("topic")).toMatchObject({ id: paused.id, admissionId: paused.admissionId, finalized: true });
+  });
+
+  it.each([".env", "../outside", "link.swift", "missing.swift"])("keeps %s as a hard failure", async selector => {
+    const { repo, database, git } = setup();
+    writeFileSync(join(repo, "form.swift"), "한글🙂");
+    symlinkSync("form.swift", join(repo, "link.swift"));
+    const fake = scripted(async () => answer(step({ requests: [
+      { kind: "file", selector: "form.swift", question: "Invalid offset", offset: 1 },
+      { kind: "file", selector, question: "Must remain denied", offset: 0 },
+    ] })));
+    await expect(guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Plan" }))
+      .rejects.toThrow(/approved snapshot|regular files/);
+    expect(fake.calls).toHaveLength(1);
+    expect(database.planning.latest("topic")!.finalized).toBe(false);
+  });
+});
+
 it("streams oversized planner instructions before accepting completion without truncating them", async () => {
   const { repo, database, git } = setup();
   const rules = "필수 규칙".repeat(10000);
@@ -1665,6 +1842,84 @@ describe("E3-2-2a timeline references", () => {
   }
   const eventOf = (database: ConsensusDatabase, body: string) => database.getTimeline("topic").find(event => event.body === body)!;
   const stopAudit = () => scripted(async () => { throw new Error("E3_2_2A_AUDIT_STOP"); }, "codex");
+
+  // Contract: a later planning stage may cite a range acknowledged by the same session, topic and scope.
+  // The guarded adapter is the public boundary; the final plan/review consumes the accepted citation.
+  // The model reads real immutable event text, then cites that received ID without requesting it again.
+  // Cancellation, session/scope changes and changed source text must still prevent inheritance.
+  async function priorDecisionCitation(role: "claude" | "codex", cancel = false) {
+    const context = setup(role);
+    const { repo, database, git } = context;
+    const event = database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "DRAFT",
+      body: "Keep the user's entered address when returning to the previous step." });
+    const reference = timelineReference(event);
+    const controller = new AbortController();
+    let cited!: PlanningFragment;
+    const model = scripted(async (turn, call) => {
+      if (call === 1) return answer(step({ requests: [{ kind: "context", selector: reference.selector,
+        offset: 0, question: "Read the owner's decision" }] }));
+      if (call === 2) {
+        cited = (JSON.parse(turn.prompt.split("Fragments: ").at(-1)!) as PlanningFragment[])
+          .find(fragment => fragment.selector === reference.selector)!;
+        expect(cited.content).toBe(timelineEventText(event));
+        expect(cited.nextOffset).toBeNull();
+        if (cancel) controller.abort();
+      } else {
+        expect(turn.prompt).not.toContain(event.body);
+        expect(JSON.parse(turn.prompt.split("Fragments: ").at(-1)!)).toEqual([]);
+      }
+      return { ...answer(step({ facts: [{ statement: "Preserve the entered address", refs: [cited.id] }], questions: [], complete: true })),
+        ...(cancel && call > 2 ? { requestedUserDecision: "Approve the unacknowledged decision" } : {}) };
+    }, role);
+    const adapter = guardedPlanning(model.adapter, database, git);
+    const first = adapter.resumeTurn({ cwd: repo, sessionId: "existing-planner", prompt: "Read the decision before planning",
+      signal: controller.signal, timelineDelivery: { prompt: { inline: [], references: [reference], index: null } } });
+    if (cancel) await expect(first).rejects.toThrow();
+    else expect((await first).planMarkdown).toBe("Final navigation plan");
+    expect(database.planning.deliveredToSession("existing-planner").map(fragment => fragment.id)).toContain(cited.id);
+    expect(database.planning.referenceComplete("existing-planner", database.getTopic("topic"), reference)).toBe(!cancel);
+    database.updateTopic("topic", { state: role === "claude" ? "CLAUDE_REVISION" : "CODEX_CLOSEOUT" });
+    const next = { cwd: repo, sessionId: "existing-planner", prompt: "Revise using the decision already read",
+      timelineDelivery: { prompt: { inline: [], references: [], index: null } } };
+    return { ...context, adapter, model, cited, reference, event, next };
+  }
+
+  it.each(["claude", "codex"] as const)("inherits an acknowledged timeline citation across planning stages (%s)", async role => {
+    const { adapter, model, database, cited, next } = await priorDecisionCitation(role);
+    expect((await adapter.resumeTurn(next)).planMarkdown).toBe("Final navigation plan");
+    expect(database.planning.latest("topic")!.step.facts[0].refs).toEqual([cited.id]);
+    expect(database.planning.latest("topic")!.timeline?.carried).toEqual([]);
+    const sourceHash = database.planning.latest("topic")!.sourceHash;
+    expect((await adapter.resumeTurn(next)).planMarkdown).toBe("Final navigation plan");
+    expect(database.planning.latest("topic")!.sourceHash).toBe(sourceHash);
+    expect(model.calls).toHaveLength(3);
+  });
+
+  it.each(["replacement session", "different scope", "changed event", "cancelled delivery"] as const)(
+    "rejects an inherited timeline citation after %s", async condition => {
+      const { root, adapter, database, next, reference } = await priorDecisionCitation("claude", condition === "cancelled delivery");
+      if (condition === "replacement session") next.sessionId = "replacement-planner";
+      if (condition === "different scope") database.updateTopic("topic", { scopeGeneration: 2 });
+      if (condition === "changed event") {
+        const sql = new DatabaseSync(join(root, "room.db"));
+        try { sql.prepare("UPDATE timeline_events SET body=? WHERE topic_id=? AND sequence=?")
+          .run("Changed source text", "topic", reference.seq); } finally { sql.close(); }
+      }
+      await expect(adapter.resumeTurn(next)).rejects.toThrow("Checkpoint cites evidence that was not delivered.");
+      expect(database.planning.latest("topic")!.finalized).toBe(false);
+    });
+
+  it("rejects an inherited timeline citation from another topic even when the event text matches", async () => {
+    const { repo, root, adapter, database, event, reference, next } = await priorDecisionCitation("claude");
+    database.updateTopic("topic", { worktreePath: join(root, "previous-worktree") });
+    database.createTopic({ ...database.getTopic("topic"), id: "second-topic", slug: "second-topic",
+      worktreePath: repo, state: "CLAUDE_PLAN" });
+    database.planning.enable("second-topic");
+    const copied = database.appendEvent({ topicId: "second-topic", actor: event.actor, kind: event.kind, state: "DRAFT", body: event.body });
+    expect(timelineReference(copied)).toEqual(reference);
+    await expect(adapter.resumeTurn(next)).rejects.toThrow("Checkpoint cites evidence that was not delivered.");
+    expect(database.planning.latest("second-topic")!.finalized).toBe(false);
+  });
 
   it("reads a large required decision and a mixed reference to the end within one attempt before the plan is accepted", async () => {
     const { database, git, artifacts, settle } = referenceTopic();
@@ -3752,6 +4007,109 @@ describe("E3-5 허용 색인에서 위키 추가 검색", () => {
     return { dir, write };
   }
   const READ_FORM = { kind: "file" as const, selector: "form.swift", question: "Read form", offset: 0 };
+
+  it.each([false, true].flatMap(continuity => ["interrupted", "mixed", "replay"].map(mode => ({ continuity, mode }))))(
+    "F003: revalidates deferred wiki versions while retaining read errors ($continuity, $mode)", async ({ continuity, mode }) => {
+    const { root, repo, database, git } = setup("claude", 100000, 100000, continuity);
+    if (!continuity) {
+      await new ArtifactStore(join(root, "artifacts"), database).write("topic", "interrupted-output", 1, "{}");
+      database.planning.enable("topic");
+    }
+    expect(database.planning.continuityEnabled("topic")).toBe(continuity);
+    const { dir, write } = wiki();
+    const request = { kind: "memory" as const, selector: "alpha.md", question: "Read alpha",
+      offset: Buffer.byteLength("# alpha\nALPHA_BODY_V1\n") + 1 };
+    let interruptAdoption = false;
+    const save = database.planning.save.bind(database.planning);
+    vi.spyOn(database.planning, "save").mockImplementation(record => {
+      save(record);
+      if (interruptAdoption && record.responsePending) {
+        interruptAdoption = false;
+        throw new Error("connection interrupted before adoption");
+      }
+    });
+    const fake = scripted(async (turn, n) => {
+      if (n === 1) return { ...answer(step({ requests: [request, ...(mode === "mixed" ? [READ_FORM] : [])] })), requestedUserDecision: "Read after decision" };
+      if (n === 2) {
+        expect(turn.prompt).toContain("Read request errors:");
+        if (mode === "replay") {
+          interruptAdoption = true;
+          return answer(step({ requests: [{ ...request, offset: 0 }] }));
+        }
+        throw new Error("connection interrupted");
+      }
+      if (n === 3 && mode !== "replay") {
+        if (mode === "mixed") expect(fragmentsIn(turn).some(fragment => fragment.selector === "form.swift")).toBe(true);
+        return answer(step({ requests: [{ ...request, offset: 0 }] }));
+      }
+      expect(n).toBe(mode === "replay" ? 3 : 4);
+      expect(fragmentsIn(turn).find(fragment => fragment.selector === "alpha.md")?.content).toContain("ALPHA_BODY_V2");
+      return answer(step({ questions: [], complete: true }));
+    });
+    const adapter = guardedPlanning(fake.adapter, database, git, dir);
+    await adapter.createSession({ cwd: repo, prompt: "Plan" });
+    database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CLAUDE_PLAN", body: "Proceed" });
+    await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("connection interrupted");
+    expect(database.planning.latest("topic")!.memoryReads).toBeUndefined();
+    expect(database.planning.latest("topic")!.fragments).toHaveLength(mode === "mixed" ? 1 : 0);
+    expect(database.planning.latest("topic")!.responsePending).toBe(mode === "replay");
+    write("alpha.md", ALPHA_V2);
+    const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+    expect(result.result.planMarkdown).toBe("Final navigation plan");
+    expect(fake.calls).toHaveLength(mode === "replay" ? 3 : 4);
+    expect(database.planning.latest("topic")!.deferredReads).toBeUndefined();
+    expect(database.getTimeline("topic").some(event => event.payload?.deferredReadChanged)).toBe(true);
+  });
+
+  it.each([false, true])("preserves a correction reread reason after version revalidation (decision %s)", async decision => {
+    const { repo, database, git } = setup("codex");
+    const { dir, write } = wiki();
+    const request = { kind: "memory" as const, selector: "alpha.md", question: "Read alpha", offset: 0 };
+    write("alpha.md", ALPHA_V2);
+    const prime = scripted(async (_turn, n) => answer(step(n === 1 ? { requests: [request] } : { questions: [], complete: true })), "codex");
+    await guardedPlanning(prime.adapter, database, git, dir).resumeTurn({ cwd: repo, prompt: "Prime", sessionId: "audit-session" });
+    write("alpha.md", ALPHA_V1);
+    let interruptAdoption = false;
+    const save = database.planning.save.bind(database.planning);
+    vi.spyOn(database.planning, "save").mockImplementation(record => {
+      save(record);
+      if (interruptAdoption && record.responsePending) {
+        interruptAdoption = false;
+        throw new Error("interrupted before correction adoption");
+      }
+    });
+    const fake = scripted(async (turn, n) => {
+      if (n === 1) return { ...answer(step({ requests: [{ ...request, offset: 23 }] })), requestedUserDecision: "First decision" };
+      if (n === 2) {
+        expect(turn.prompt).toContain("Read request errors:");
+        interruptAdoption = true;
+        const largeReads = decision ? [] : [0, 7000, 14000].map(offset => ({ ...READ_FORM, offset }));
+        return { ...answer(step({ requests: [...largeReads, { ...request, rereadReason: "Compaction lost the previously delivered text" }] })),
+          ...(decision ? { requestedUserDecision: "Second decision" } : {}) };
+      }
+      if (!decision && n === 3) {
+        // The batch is full; completing without repeating the request must still deliver the deferred reread.
+        expect(fragmentsIn(turn).map(fragment => fragment.selector)).toEqual(["form.swift", "form.swift", "form.swift"]);
+        return answer(step({ questions: [], complete: true }));
+      }
+      expect(fragmentsIn(turn).find(fragment => fragment.selector === "alpha.md")?.content).toContain("ALPHA_BODY_V2");
+      return answer(step({ questions: [], complete: true }));
+    }, "codex");
+    const adapter = guardedPlanning(fake.adapter, database, git, dir);
+    const turn = { cwd: repo, prompt: "Plan", sessionId: "audit-session" };
+    await adapter.resumeTurn(turn);
+    database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CODEX_AUDIT", body: "First answer" });
+    await expect(adapter.resumeTurn(turn)).rejects.toThrow("interrupted before correction adoption");
+    write("alpha.md", ALPHA_V2);
+    let result = await adapter.resumeTurn(turn);
+    if (decision) {
+      expect(result.requestedUserDecision).toBe("Second decision");
+      database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CODEX_AUDIT", body: "Second answer" });
+      result = await adapter.resumeTurn(turn);
+    }
+    expect(result.planMarkdown).toBe("Final navigation plan");
+    expect(fake.calls).toHaveLength(decision ? 3 : 4);
+  });
 
   it("finds an additional document through the allowed index, reads it by kind=memory ranges and cites it", async () => {
     const { repo, database, git } = setup();

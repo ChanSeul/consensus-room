@@ -69,6 +69,8 @@ export interface PlanningCheckpoint {
   planSHA256: string | null;
   admissionId: string; round: number; stalled: number; sessionId: string | null;
   step: PlanningStep; fragments: PlanningFragment[]; delivered: string[];
+  // Request feedback, never evidence. Persist until the next response is adopted, including interrupted calls.
+  readErrors?: Array<{ request: PlanningRead; message: string }>;
   usage: PlanningUsage; updatedAt: string; stopped: string | null;
   finalized: boolean; finalAttempted: boolean;
   citationRepairAttempted?: boolean;
