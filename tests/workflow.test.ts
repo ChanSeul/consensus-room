@@ -12,8 +12,11 @@ import {
   buildClaudeRevisionPrompt,
   buildCodexAuditPrompt,
   buildCodexCloseoutPrompt,
+  buildCodexReviewPrompt,
 } from "../src/shared/prompts";
 import {
+  ACTIONABLE_SEVERITIES,
+  DOWNGRADED_DISPOSITIONS,
   applyPlanEdits,
   assertImplementationGate,
   assertDispositionsResolved,
@@ -489,6 +492,25 @@ describe("처분 프롬프트와 단계 제약의 정합", () => {
       const allowed = prompt.slice(prompt.indexOf("처분(disposition)은 다음 값만 씁니다:"));
       expect(allowed.split("\n")[0]).not.toContain("RESOLVED_BY_FIX");
     }
+  });
+
+  // 처분 되돌림 가드(dispositionRegressions)가 도는 단계(종결 확인·수정 수락·최종 리뷰)는 그 규칙을 말해야 한다 — 종결 확인이
+  // 개정으로 반영된 합의 쟁점을 "해소됐다면 AGREED_NO_ACTION" 안내대로 닫아 멈췄다(2026-09-28 CP1 32e69740 P-5).
+  // 가드가 없는 감사·개정 단계는 반박(REFUTED)이 정상 경로이므로 이 규칙을 말하지 않는다.
+  it("되돌림 가드가 도는 단계만 합의 쟁점의 하향이 정지로 이어진다고 말한다", () => {
+    const auditPrompt = buildCodexAuditPrompt({ title: "t", planMarkdown: "# 계획", planSHA256: "a".repeat(64), scopeGeneration: 1, timeline: [] });
+    const finalReviewPrompt = buildCodexReviewPrompt({
+      planMarkdown: "# 계획", planSHA256: "a".repeat(64), finalPass: true, timeline: [],
+      implementation: { kind: "IMPLEMENTATION", summary: "s", findings: [], evidenceRefs: [] } as AgentResult,
+    });
+    const line = (prompt: string, marker: string) => prompt.split("\n").find((text) => text.includes(marker)) ?? "";
+    for (const prompt of [closeoutPrompt, fixPrompt]) {
+      const rule = line(prompt, "합의 철회");
+      for (const value of [...DOWNGRADED_DISPOSITIONS, ...ACTIONABLE_SEVERITIES, "사용자 판단을 기다립니다"]) expect(rule).toContain(value);
+    }
+    expect(line(closeoutPrompt, "합의 철회")).toContain("AGREED_ACTION 을 유지하세요");
+    for (const value of DOWNGRADED_DISPOSITIONS) expect(line(finalReviewPrompt, "요구 자체를 철회하려면")).toContain(value);
+    for (const prompt of [auditPrompt, revisionPrompt]) expect(prompt).not.toContain("합의 철회");
   });
 
   // 패치 계약도 같은 짝 규칙을 따른다 — 서버가 applyPlanEdits로 유일 일치를 강제하므로

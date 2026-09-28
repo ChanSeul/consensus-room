@@ -384,8 +384,9 @@ export function newFindingIDs(
 }
 
 // 앞 단계가 고치기로 합의한 심각도. 수정 단계 판정과 처분 강등 감시가 같은 집합을 봐야 한다.
-const ACTIONABLE_SEVERITIES = ["BLOCKER", "HIGH", "MEDIUM", "LOW"];
-const DOWNGRADED_DISPOSITIONS = ["AGREED_NO_ACTION", "REFUTED", "DEFERRED_OUT_OF_SCOPE"];
+// 가드가 적용되는 단계의 프롬프트(prompts.ts agreedActionRule)도 이 두 상수로 규칙을 안내한다.
+export const ACTIONABLE_SEVERITIES: readonly string[] = ["BLOCKER", "HIGH", "MEDIUM", "LOW"];
+export const DOWNGRADED_DISPOSITIONS: readonly string[] = ["AGREED_NO_ACTION", "REFUTED", "DEFERRED_OUT_OF_SCOPE"];
 
 // 수정이 실제로 일어난 단계에서만 "수정으로 종결" 처분을 쓸 수 있다. 앞 단계가 이 값으로 확정 조치를 닫으면 M2가 막으려던 구멍이 다시 열린다.
 // IMPLEMENTATION도 수정이 실제로 일어나는 단계다 — 구현 중 발견해 즉시 고친 쟁점의 정직한 처분이 이 값이고,

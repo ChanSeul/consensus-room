@@ -5,7 +5,7 @@ import type { TolerancePolicy } from "./tolerance";
 import { DISPOSITIONS, FIX_AWARE_KINDS, REQUIRED_PLAN_HEADINGS } from "./contracts";
 import { TIMELINE_DELIVERY_LIMITS, TIMELINE_REFERENCE_UNIT, TIMELINE_REFERENCE_VERSION, TIMELINE_REQUIRED_KINDS,
   type TimelineDeliveryPlan, type TimelineIndexReference, type TimelineReference } from "./planningControl";
-import { sha256 } from "./workflow";
+import { ACTIONABLE_SEVERITIES, DOWNGRADED_DISPOSITIONS, sha256 } from "./workflow";
 
 // 서버는 처분을 두 곳에서 기계적으로 검사한다 — assertDispositionsResolved(앞 단계 쟁점에 처분이 있는지)와
 // assertFixDispositionAllowed(RESOLVED_BY_FIX는 실제 수정이 일어난 단계에서만). 그 규칙이 프롬프트에 없으면
@@ -52,12 +52,28 @@ function dispositionContract(kind: AgentResult["kind"]): string {
   const forbidden = fixAware
     ? "이 단계는 실제 수정을 확인하는 단계이므로 RESOLVED_BY_FIX를 쓸 수 있습니다."
     : "이 단계에서 RESOLVED_BY_FIX를 쓰면 서버가 응답 전체를 거부합니다 — 아직 수정이 일어나지 않았기 때문입니다.";
+  const agreedRule = agreedActionRule(kind);
   return `처분(disposition)은 다음 값만 씁니다: ${usable.join(", ")}.
 ${forbidden}
 앞 단계 쟁점 중 **행동이 필요한 것**(AGREED_ACTION·EXTERNAL_EVIDENCE·requiresUserDecision·처분 없음)은 하나도 빠짐없이 처분을 붙이세요.
 이미 판단이 끝난 쟁점(AGREED_NO_ACTION·REFUTED·DEFERRED_OUT_OF_SCOPE)은 되돌려 적지 않아도 됩니다 — 서버가 같은 처분으로 승계합니다. 처분을 **바꾸려는** 쟁점만 적으세요.${
   reviewStage ? " 앞 단계가 RESOLVED_BY_FIX 로 주장한 쟁점은 승계되지 않습니다 — 수정이 실제로 확인되는지 반드시 판정해 적으세요." : ""} 이 단계에서 새로 발견한 쟁점은 처분을 비워 둬도 됩니다.
-EXTERNAL_EVIDENCE는 증거를 **아직 기다리는 중**일 때만 씁니다 — 이미 방에 기록된 증거로 해소된 쟁점에 이 값을 쓰면 서버가 증거 대기로 읽어 진행을 막습니다. 해소됐다면 AGREED_NO_ACTION(또는 실제 조치 합의면 AGREED_ACTION)으로 처분하세요.`;
+EXTERNAL_EVIDENCE는 증거를 **아직 기다리는 중**일 때만 씁니다 — 이미 방에 기록된 증거로 해소된 쟁점에 이 값을 쓰면 서버가 증거 대기로 읽어 진행을 막습니다. 해소됐다면 AGREED_NO_ACTION(또는 실제 조치 합의면 AGREED_ACTION)으로 처분하세요${
+  agreedRule ? ` — 단, 앞 단계가 AGREED_ACTION 으로 합의한 쟁점은 다음 규칙을 따릅니다.\n${agreedRule}` : "."}`;
+}
+
+// 처분 되돌림 가드(workflow.dispositionRegressions)가 적용되는 단계의 안내 — 종결 확인(judgeCloseout)·수정 수락(judgeFixAcceptance).
+// 최종 리뷰는 finalReviewContract 가 같은 규칙을 말한다. 하향 처분과 조치 대상 심각도는 가드와 같은 상수에서 만든다.
+// 안내가 "해소됐다면 AGREED_NO_ACTION" 뿐이라 종결 확인이 개정으로 반영된 합의 쟁점을 그 값으로 닫아 멈췄다(2026-09-28 CP1 32e69740 P-5).
+function agreedActionRule(kind: AgentResult["kind"]): string | null {
+  const downgrade = `${DOWNGRADED_DISPOSITIONS.join("·")} 로 바꾸거나 심각도를 조치 대상(${ACTIONABLE_SEVERITIES.join("·")}) 밖으로 낮추면`;
+  if (kind === "CLOSEOUT") {
+    return `Claude의 처분이 AGREED_ACTION 인 쟁점(합의한 조치)은 개정 반영을 확인했어도 AGREED_ACTION 을 유지하세요 — 이행 의무는 구현으로 넘어가고 구현 리뷰가 확인합니다. ${downgrade} 서버가 합의 철회로 읽어 합의 종결 없이 사용자 판단을 기다립니다.`;
+  }
+  if (kind === "FIX") {
+    return `수정 대상 중 AGREED_ACTION 인 쟁점을 ${downgrade} 서버가 합의 철회로 읽어 최종 리뷰로 넘기지 않고 사용자 판단을 기다립니다.`;
+  }
+  return null;
 }
 
 // 심각도 정책(2026-09-13 사용자 규칙): 계획 개정은 BLOCKER/HIGH 만 연다. MEDIUM 이하는 개정 없이 구현 노트로 러너에게 간다.
