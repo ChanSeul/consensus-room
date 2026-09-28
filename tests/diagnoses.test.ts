@@ -2679,7 +2679,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     const codexBeforeRetry = r.codex.prompts.length;
     const retrySequence = r.database.getTimeline(r.topicId).at(-1)!.sequence;
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(200);
-    // 인도 대기로 가지 않는다 — F-2 를 적지 않은 최종 리뷰는 커버리지 검사에 걸려 교정을 요구받고, 이 흐름에서는 그 교정 호출이 구현 리뷰 한도에 걸려 멈춘다.
+    // F-2 누락은 같은 논리 리뷰 안에서 교정된다. 교정 뒤에도 사용자 판정이 필요하므로 인도 대기로 가지 않는다.
     await r.idle("USER_DECISION_REQUIRED");
 
     // 1) 러너 턴은 더 열리지 않았다. 최종 리뷰의 대조 보고는 수락된 F-1 수정 결과다 — 반환된 결과(DG-1 반박·F-2 러너 단독 하향)가 아니다.
@@ -2704,13 +2704,8 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(blocked.status).toBeGreaterThanOrEqual(400);
     expect(String(blocked.body.error)).toContain("READY_TO_DELIVER");
 
-    // 리뷰 1회를 추가 승인하고 재개하면 같은 세션의 교정이 F-2 를 지목하고, 리뷰어는 F-2 를 판정 필요인 채 유지한다.
-    // 별도 토큰·시간 한도가 없으므로 review-resume이 같은 작업을 자동 재개한다.
-    const codexBeforeGrant = r.codex.prompts.length;
-    const { version } = r.database.reviews.account(r.topicId, "implementation");
-    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/review-resume`, { scope: "implementation", version })).status).toBe(200);
-    await r.idle("USER_DECISION_REQUIRED");
-    const correction = r.codex.prompts.slice(codexBeforeGrant).find((prompt) => prompt.includes("서버 기계 검사가 방금 응답을 거부했습니다"));
+    // 추가 승인 없이 같은 세션에서 교정됐고, 리뷰어는 F-2 를 판정 필요인 채 유지한다.
+    const correction = r.codex.prompts.slice(codexBeforeRetry).find((prompt) => prompt.includes("서버 기계 검사가 방금 응답을 거부했습니다"));
     expect(correction).toBeTruthy();
     expect(correction).toContain("검토 쟁점을 누락했습니다: F-2");
     // 4) 리뷰어가 미결로 둔 F-2 는 최종 리뷰 정지로 남는다 — 저장된 최종 리뷰의 F-2 는 리뷰어 자신의 판정(수정 합의 + 판정 필요)이다.
@@ -3742,13 +3737,8 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     const commit = await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "F-2 판정 없이 인도", paths: ["feature.txt"] });
     expect(commit.status).toBeGreaterThanOrEqual(400);
     expect(String(commit.body.error)).toContain("READY_TO_DELIVER");
-    // 6) 리뷰 1회를 추가 승인하고 재개하면(이 방은 예산 계정이 없어 retry 로 재개) 같은 세션의 교정이 F-2 를 지목하고, 리뷰어가 F-2 를 판정 필요인 채
-    // 유지하면 최종 리뷰 정지로 남는다 — 멈춤이 리뷰 한도 덕이 아니라 F-2 판정 요구 때문임을 확인한다.
-    const codexBeforeGrant = r.codex.prompts.length;
-    const { version } = r.database.reviews.account(r.topicId, "implementation");
-    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/review-resume`, { scope: "implementation", version })).status).toBe(200);
-    expect(await settledState(r, "shadowed-stop-omit 추가 승인")).toBe("USER_DECISION_REQUIRED");
-    const correction = r.codex.prompts.slice(codexBeforeGrant).find((prompt) => prompt.includes("서버 기계 검사가 방금 응답을 거부했습니다"));
+    // 6) 같은 논리 리뷰에서 추가 승인 없이 교정됐지만 F-2 판정 요구는 유지된다. 리뷰 한도로 인한 정지가 아니다.
+    const correction = r.codex.prompts.find((prompt) => prompt.includes("서버 기계 검사가 방금 응답을 거부했습니다"));
     expect(correction).toContain("검토 쟁점을 누락했습니다: F-2");
     expect(r.database.getTopic(r.topicId).lastError).toContain(SHADOWED_F2_KEPT);
     expect(r.database.getFlags(r.topicId).resumeState).toBe("CODEX_FINAL_REVIEW");
@@ -6733,12 +6723,22 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
   it.each(["blocked", "in_progress", "completed"] as const)("R14 남은 검토가 있는 최종 리뷰(%s)는 정상 리뷰 완료 전 재사용하지 않는다", async (status) => {
     class IncompleteFinal extends EchoCodex {
       finalCalls = 0;
+      lastIncomplete: AgentResult | null = null;
       override async resumeTurn(turn: SessionTurn): Promise<AgentResult> {
+        if (turn.prompt.includes("서버 기계 검사가 방금 응답을 거부했습니다") && this.lastIncomplete) {
+          spawned(turn);
+          this.prompts.push(turn.prompt);
+          // completed + 남은 검토의 모순만 바로잡는다. 자료 없이 남은 검토를 완료한 척하지 않는다.
+          return { ...this.lastIncomplete, status: "in_progress" };
+        }
         const review = await super.resumeTurn(turn);
         if (review.kind !== "FINAL_REVIEW") return review;
         this.finalCalls += 1;
-        return this.finalCalls === 1 ? { ...review, status, remainingSteps: ["새 자료에서 인증 계약을 검토해야 합니다."] }
-          : { ...review, status: "completed", remainingSteps: [] };
+        if (this.finalCalls === 1) {
+          this.lastIncomplete = { ...review, status, remainingSteps: ["새 자료에서 인증 계약을 검토해야 합니다."] };
+          return this.lastIncomplete;
+        }
+        return { ...review, status: "completed", remainingSteps: [] };
       }
     }
     const codex = new IncompleteFinal();

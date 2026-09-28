@@ -340,12 +340,23 @@ function outputLanguageContract(options: { planBody: boolean }): string {
 
 export const DESIGN_PLANNING_CONTRACT = "Design is implementation-time work. Planning and plan review retain screen-level Figma links and functional flows only. These links are locators, not evidence for visual claims or delivered fragment IDs. Do not fetch or reproduce layout, dimensions, spacing, typography, colors, node trees or screenshots in the plan. Resolve product behavior from confirmed requirements; missing visual detail is not a planning blocker. At implementation, inspect the linked screen on demand and stop for a product decision only if it changes the agreed behavior or scope.";
 
+function verificationScopeContract(): string {
+  return `검증 범위와 재사용:
+- 바뀐 동작과 깨질 수 있는 계약을 확인하는 최소 범위를 고르세요. 먼저 기존 관련 검사를 사용하고, 그 검사로 잡을 수 없는 새 동작·구체적인 결함에만 테스트를 추가하세요. 구현을 그대로 옮긴 assertion, 같은 계약의 중복 테스트, 테스트 개수·커버리지 수치만을 위한 추가는 하지 마세요.
+- 되돌리기 쉬운 문서·문구·형식 수정에는 새 테스트나 전체 실행을 붙이지 마세요. 동작에 영향이 없으면 diff·정적 확인으로 끝내고, 여러 작은 수정은 한 작업 단위로 묶어 영향받는 검사만 한 번 실행하세요.
+- 같은 코드·의존성·설정·검사 입력에서 통과한 결과는 구현·리뷰·커밋·푸시 단계가 바뀌어도 로그와 함께 재사용하세요. 관련 변경·새 실패·새 반증이 생겼을 때만 영향 범위를 다시 실행하세요.
+- 전체 테스트·전체 빌드는 넓은 공통 경계나 의존성이 바뀌어 영향 범위를 좁힐 수 없거나, 승인된 계획·저장소 규칙이 명시적으로 요구할 때만 실행하세요. 전체 실행이 필요한 이유를 한 줄로 적고 수정마다 반복하지 마세요.
+- 리뷰의 테스트 공백 지적에는 현재 검사로 놓치는 구체적인 실패와 영향을 받는 소비처를 적으세요. 테스트 파일이 늘지 않았다는 이유만으로 수정이나 재승인을 요구하지 마세요.
+- 명시된 필수 검사·권한 경계는 유지하세요. 실패·미실행을 통과로 바꾸지 말고, 재사용할 근거가 없으면 확인했다고 주장하지 마세요.`;
+}
+
 function planContract(): string {
   return [
     "최종 plan.md에는 아래 제목이 모두 있어야 합니다.",
     ...REQUIRED_PLAN_HEADINGS.map((heading) => `- ## ${heading}`),
     "`## 허용 오차` 절에는 fenced 블록 ```tolerance {JSON} ``` 을 둡니다 — scopePaths(이 계획의 승인 경로 glob 목록)와 rules(각각 id `T-n`·title·paths(적용 영역 glob)·hunk(`insert-token`|`annotation-only`|`any`)·tokens·maxFiles·maxHunks·invariants). 규칙이 없으면 `\"rules\": []`. 설명은 의미가 충분히 전달되게 작성하세요. 기계 매칭에 쓰는 tokens는 각 80자 이하여야 합니다. 서버가 이 블록을 파싱해 구현 결과의 승인 범위 밖 변경을 git diff 로 기계 대조하므로, 술어는 diff 만으로 판정 가능해야 하고 상한은 숫자여야 합니다. 부류 예: 다른 단계 소유 파일의 격리 표기 한 줄(insert-token: nonisolated), 모듈 선언의 표기 변경(annotation-only: @Sendable). 동작 변경·우회 표기(`@unchecked Sendable`·`nonisolated(unsafe)`·`assumeIsolated`)는 규칙으로 허용하지 마세요.",
     DESIGN_PLANNING_CONTRACT,
+    verificationScopeContract(),
     "확정되지 않은 분석 이벤트, API 계약, SDK 동작을 추정해서 만들지 마세요.",
     "외부 증거가 없으면 EXTERNAL_EVIDENCE로 남기고 억지로 합의하지 마세요.",
   ].join("\n");
@@ -439,6 +450,7 @@ ${input.planningContextMode === "delta" ? "직전 전달 이후 추가된 결정
 ${renderPlanningTimeline(input.timeline, input.timelineDelivery, input.planningContextMode === "delta" ? "(직전 전달 이후 새 결정·증거 없음)" : undefined)}
 ${renderDeferredFindings(input.deferredFindings, "audit", input.deferredFindingsPath)}
 ${severityPolicyContract()}
+${verificationScopeContract()}
 ${outputLanguageContract({ planBody: false })}
 ${dispositionContract("AUDIT")}
 
@@ -604,6 +616,7 @@ ${renderPlanningTimeline(input.timeline, input.timelineDelivery, input.planningC
 서로 다른 새 결함, 사용자의 명시적 재개뿐입니다. 각 finding의 최종 disposition을 확인하세요.
 ${renderImplementationNotes(input.implementationNotes, "closeout")}
 ${severityPolicyContract()}
+${verificationScopeContract()}
 ${dispositionContract("CLOSEOUT")}
 ${outputLanguageContract({ planBody: false })}
 
@@ -648,7 +661,9 @@ export function runnerScopeContract(): string {
 }
 
 function mediationDecisionContract(): string {
-  return `작업 판단과 종료 기준:
+  return `${verificationScopeContract()}
+
+작업 판단과 종료 기준:
 - 승인 범위 안의 확정 결함·이번 변경으로 생긴 결함은 담당 구현자가 수정하고 영향 경로를 검증합니다. 실행 순서·동등한 방법은 기존 승인과 명시된 계획 조건 안에서 판단하며, 구현 방법을 고른다는 이유만으로 사용자 결정을 요청하지 마세요.
 - 기존 결함·범위 밖 개선은 현재 완료 조건을 막는지 먼저 확인하세요. 막지 않으면 DEFERRED_OUT_OF_SCOPE로 기록하고 현재 작업을 계속합니다. 기존 결함이라는 이유로 필수 검증 실패를 면제하거나 미해결 확정 결함을 이연해 통과시키지 마세요.
 - 검증 기준 완화·계약/범위 변경·미승인 병합·명시적 보류 해제는 기존 결정으로 해결되는지 먼저 확인하고, 해결되지 않은 항목만 사용자 판단을 요청하세요. 최종 파일이 같아도 계획이 요구한 단계별 커밋 구조를 바꾸는 것은 동등한 실행 방법으로 간주하지 마세요.
@@ -757,7 +772,7 @@ ${stopPolicyContract()}
 
 ${runnerScopeContract()}
 
-관련 테스트를 실행하되 commit과 push는 하지 마세요. 반환 kind는 IMPLEMENTATION이며 변경 파일과 검증 근거를 evidenceRefs에 적으세요.`;
+위 검증 범위·재사용 기준에 따라 필요한 검사만 실행하세요. commit과 push는 하지 마세요. 반환 kind는 IMPLEMENTATION이며 변경 파일과 검증 근거를 evidenceRefs에 적으세요.`;
 }
 
 // resumedSession: 이 코드 리뷰 전용 세션이 이미 승인된 계획 전문과 검토 findings를 받았다. 그때는
@@ -846,6 +861,11 @@ ${mediationDecisionContract()}
 ${input.finalPass ? finalReviewContract() : "수정이 필요한 finding은 AGREED_ACTION으로 표시하세요."}
 
 ${dispositionContract(input.finalPass ? "FINAL_REVIEW" : "REVIEW")}
+리뷰 완료 보고 계약:
+- status 는 이번 리뷰의 완료 여부입니다. 필요한 검토를 끝냈으면 수정할 finding 이 남아 있어도 completed 로 보고하고 remainingSteps 는 비우세요. 구현자가 고칠 일은 findings 에 남깁니다.
+- remainingSteps 는 리뷰어가 아직 검토하지 못한 작업만 적습니다. 구현자의 수정, 그 뒤의 재검토, 이번 리뷰 범위 밖의 빌드·커밋·배포를 남은 리뷰로 적지 마세요.
+- 실제로 미검토 부분이 있으면 status=in_progress 와 remainingSteps 에 남겨야 합니다. 필수 증거를 확인하지 못했는데 완료로 바꾸거나, 실행하지 않은 검사를 통과했다고 쓰지 마세요.
+- 승인 범위에서 고칠 수 있는 확정 지적은 AGREED_ACTION 으로 전달하세요. 이미 내려진 결정이나 일반 수정 착수 승인을 requestedUserDecision 으로 다시 묻지 마세요. 새로운 범위·제품 결정이나 외부 증거가 정말 필요하면 기존 결정과 무엇이 다른지 근거를 적고 요청을 유지하세요.
 ${outputLanguageContract({ planBody: false })}
 
 반환 kind는 ${input.finalPass ? "FINAL_REVIEW" : "REVIEW"}입니다.`;
@@ -986,7 +1006,7 @@ ${stopPolicyContract()}
 
 ${runnerScopeContract()}
 
-관련 테스트를 실행하되 commit과 push는 하지 마세요. 반환 kind는 FIX입니다.`;
+위 검증 범위·재사용 기준에 따라 필요한 검사만 실행하세요. commit과 push는 하지 마세요. 반환 kind는 FIX입니다.`;
 }
 
 // 기계 검사가 거부한 응답을 같은 세션에 돌려보내 표기만 고친 재제출을 받는다. 작업을 다시 시키는 것이

@@ -224,6 +224,9 @@ describe("중재 판단 정책 전달", () => {
     for (const [stage, prompt] of prompts) {
       it(`${stage} ${resumedSession ? "재개" : "최초"}: 실행 판단과 승인 경계를 함께 전달한다`, () => {
         expect(prompt.match(/작업 판단과 종료 기준:/g)).toHaveLength(1);
+        expect(prompt.match(/검증 범위와 재사용:/g)).toHaveLength(1);
+        expect(prompt).toContain("관련 변경·새 실패·새 반증이 생겼을 때만 영향 범위를 다시 실행");
+        expect(prompt).toContain("명시된 필수 검사·권한 경계는 유지");
         expect(prompt).toContain("실행 순서·동등한 방법은 기존 승인과 명시된 계획 조건 안에서 판단");
         expect(prompt).toContain("기존 결함이라는 이유로 필수 검증 실패를 면제");
         expect(prompt).toContain("위임 OFF·명시적 금지·승인 및 예산 한도는 그대로");
@@ -233,6 +236,19 @@ describe("중재 판단 정책 전달", () => {
       });
     }
   }
+  it("계획·감사·종결도 최소 검증과 통과 결과 재사용 기준을 받는다", () => {
+    const prompts = [
+      buildClaudePlanPrompt({ title: "t", worktreePath: "/w", sourceRepositoryPath: "/r", baseRef: "HEAD", scopeGeneration: 1, timeline: [] }),
+      buildCodexAuditPrompt({ title: "t", planMarkdown, planSHA256, scopeGeneration: 1, timeline: [] }),
+      buildCodexCloseoutPrompt({ revisedPlan: planMarkdown, revisedPlanSHA256: planSHA256,
+        claudeRevision: { kind: "REVISION", summary: "s", findings: [], evidenceRefs: [] }, timeline: [] }),
+    ];
+    for (const prompt of prompts) {
+      expect(prompt.match(/검증 범위와 재사용:/g)).toHaveLength(1);
+      expect(prompt).toContain("기존 관련 검사를 사용");
+      expect(prompt).toContain("명시된 필수 검사·권한 경계는 유지");
+    }
+  });
 });
 
 // E4 2차 보완 F012 — 이연 쟁점 목록은 근거를 자르지 않는다. 인라인 예산 안이면 근거 전문, 넘으면 예산 안까지의 색인 + 남은 건수 + 원문 산출물 참조.

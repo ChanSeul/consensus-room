@@ -48,7 +48,7 @@ import {
 import { HandledWorkflowInterruption, type ResultNormalizer, type EngineCore } from "./core.js";
 import { AdmissionRefused, invocationFailure, type InvocationFailure, type TurnExpectation, type WriteGuards } from "./turnExecutor.js";
 import {
-  accumulate, checkpointOpenRequests, requestId, workId, workEvidenceDigest, EMPTY_EVIDENCE_DIGEST, CheckpointCorrupt, type Accumulation, type RecoveredWork, type WorkBinding, type WorkCheckpoint, type WorkKind,
+  accumulate, checkpointOpenRequests, requestId, turnUnmatchedResolution, workId, workEvidenceDigest, EMPTY_EVIDENCE_DIGEST, CheckpointCorrupt, type Accumulation, type RecoveredWork, type WorkBinding, type WorkCheckpoint, type WorkKind,
 } from "./checkpoint.js";
 import { acceptResult, completionVerdict, decisionRequestTexts, renderOpenRequests, type AcceptedResult, type CompletionVerdict, type OpenRequest } from "./completion.js";
 import type { DiagnosisRecord } from "../../shared/diagnoses.js";
@@ -1110,10 +1110,18 @@ export class DeliveryPipeline {
       openRequests: first.openRequests, confirmations,
     }, signal);
     let last: Accumulation | null = null;
+    // 이 턴의 모든 누적(원본·계약 교정·허용 오차 교정)이 닫은 요청 — 보고는 마지막 누적이 아니라 이 목록을 기준으로 한다. 교정 응답이 앞 누적에서 이미
+    // 닫힌 id 를 되풀이하면 마지막 누적만 볼 때 닫힘 기록이 사라지고 그 id 가 미일치로 보고됐다(2026-09-28 운영 16625).
+    const resolvedThisTurn: OpenRequest[] = [];
+    const resolutionWarnings: Array<Pick<Accumulation, "unmatchedIds" | "unmatchedResolution">> = [];
     const latestRequests = () => (last as Accumulation | null)?.openRequests ?? first.openRequests;
     const normalize: ResultNormalizer = (parsed) => {
       const acc = accumulate(current.base, parsed, current.openRequests, setup.inputSequence);
       last = acc;
+      for (const request of acc.resolvedRequests) {
+        if (!resolvedThisTurn.some((closed) => closed.id === request.id)) resolvedThisTurn.push(request);
+      }
+      if (acc.unmatchedResolution) resolutionWarnings.push({ unmatchedIds: acc.unmatchedIds, unmatchedResolution: acc.unmatchedResolution });
       current = { base: acc.result, openRequests: acc.openRequests };
       return setup.carry(acc.result);
     };
@@ -1174,7 +1182,7 @@ export class DeliveryPipeline {
     await this.assertBaselineIntact(topic, setup.baselineHead, "허용 오차 교정 중");
     this.assertToolTreesIntact(topic, setup.toolTreesBefore, "허용 오차 교정 중");
     const acc = last as Accumulation | null;
-    if (acc) this.reportAccumulation(topicId, acc);
+    if (acc) this.reportAccumulation(topicId, acc, resolvedThisTurn, resolutionWarnings);
     const next: WorkState = {
       base: checked, openRequests: latestRequests(), verifiedLedger: [...(checked.toleranceLedger ?? [])], confirmations,
     };
@@ -1185,12 +1193,15 @@ export class DeliveryPipeline {
     return next;
   }
 
-  private reportAccumulation(topicId: string, acc: Accumulation): void {
-    for (const request of acc.resolvedRequests) {
+  // resolvedThisTurn: 한 턴을 여러 번 누적했으면 그 누적들이 닫은 요청 전부(중복 없음). 한 번 누적한 경로는 그 누적의 목록이다.
+  private reportAccumulation(topicId: string, acc: Accumulation, resolvedThisTurn: readonly OpenRequest[] = acc.resolvedRequests,
+    resolutionWarnings: readonly Pick<Accumulation, "unmatchedIds" | "unmatchedResolution">[] = []): void {
+    for (const request of resolvedThisTurn) {
       this.core.event(topicId, "system", "system", `열린 요청 ${request.id} 를 러너가 해소로 확인해 닫았습니다: ${request.text.slice(0, 120)}`, { resolvedRequest: request.id });
     }
-    if (acc.unmatchedResolution) {
-      this.core.event(topicId, "system", "system", `해소 표식을 적용하지 않았습니다 — ${acc.unmatchedResolution}`, { unmatchedResolution: acc.unmatchedResolution });
+    const unmatchedResolution = turnUnmatchedResolution(acc, resolvedThisTurn, resolutionWarnings);
+    if (unmatchedResolution) {
+      this.core.event(topicId, "system", "system", `해소 표식을 적용하지 않았습니다 — ${unmatchedResolution}`, { unmatchedResolution });
     }
   }
 
@@ -1556,6 +1567,13 @@ export class DeliveryPipeline {
       },
       check: (r) => {
         this.core.assertKind(r, finalPass ? "FINAL_REVIEW" : "REVIEW");
+        // 리뷰를 끝낸 뒤 구현자가 할 일을 remainingSteps 에 쓰면 수정 단계조차 열리지 않는다. 내용을 추측해 지우지 않고,
+        // 기존 계약 교정 경로로 같은 세션·리뷰 원장에서 한 번 확인한다. 실제 미검토·결정·증거 대기는 그대로 보존한다.
+        if (r.status === "completed" && r.remainingSteps?.length) {
+          throw new Error("리뷰 status=completed 와 remainingSteps 가 모순됩니다. remainingSteps 는 리뷰어가 아직 검토하지 못한 작업만 적습니다. "
+            + "리뷰를 끝냈다면 구현자의 수정·후속 재검토는 findings 에 보존하고 remainingSteps 를 비우세요. "
+            + "실제 미검토 부분이 있으면 status=in_progress 로 정정하고 남은 검토를 유지하세요. 실제 사용자 결정·외부 증거 요청은 지우지 마세요.");
+        }
         assertFindingCoverage(implementation.findings, r.findings, finalPass ? "Codex final review" : "Codex review");
         if (originalReview) assertFindingCoverage(originalReview.findings, r.findings, "Codex final review");
         if (base?.sources.length) assertFindingCoverage(base.sources, r.findings, "Codex final review(수정 작업 원본)");

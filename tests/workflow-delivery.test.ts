@@ -11,6 +11,7 @@ import { SpawnCommandRunner } from "../src/server/processRunner";
 import type { AgentAdapter, CommandResult, CommandRunner, CommandSpec, SessionTurn } from "../src/server/types";
 import { ClaudeAdapter } from "../src/server/adapters/claude";
 import { CodexAdapter } from "../src/server/adapters/codex";
+import { ReviewBlocked } from "../src/server/reviewLedger";
 import { pendingReviewRequests } from "../src/server/engine/reviewRequests";
 import { WorkflowEngine } from "../src/server/workflow";
 import { REQUIRED_PLAN_HEADINGS, type AgentResult } from "../src/shared/contracts";
@@ -895,11 +896,17 @@ class PagingCodex implements AgentAdapter {
 
   async createSession(turn: Omit<SessionTurn, "sessionId">) {
     this.calls.push({ method: "create", sessionId: null, operation: turn.job?.operation ?? "", prompt: turn.prompt, readablePaths: turn.readablePaths ?? [] });
+    await turn.beforeSpawn?.();
+    turn.admitSync?.();
+    turn.onProcessSpawn?.({ pid: 4545, pgid: 4545, executable: "fake-codex", commandLine: "fake-codex", startedAt: new Date().toISOString() });
     return { sessionId: "codex-paged-review", result: this.review(turn.job?.operation) };
   }
 
   async resumeTurn(turn: SessionTurn) {
     this.calls.push({ method: "resume", sessionId: turn.sessionId, operation: turn.job?.operation ?? "", prompt: turn.prompt, readablePaths: turn.readablePaths ?? [] });
+    await turn.beforeSpawn?.();
+    turn.admitSync?.();
+    turn.onProcessSpawn?.({ pid: 4545, pgid: 4545, executable: "fake-codex", commandLine: "fake-codex", startedAt: new Date().toISOString() });
     return this.review(turn.job?.operation);
   }
 
@@ -915,6 +922,21 @@ class PagingCodex implements AgentAdapter {
       ? result("REVIEW", "한 곳을 보완해야 합니다.", [reviewFinding("AGREED_ACTION")])
       : result("FINAL_REVIEW", "보완 결과를 확인했습니다.", [reviewFinding("RESOLVED_BY_FIX")]);
   }
+}
+
+// 구버전의 교정 대기본 복구 검증용: 당시 계약 교정은 별도 리뷰 예약에 막혔다. 현재 예약 정책에 기대지 않고 그 호출 경계의
+// 거부를 한 번 재현한다. 대기본 생성·저장·문맥 대조·재개는 모두 실제 엔진이 수행한다.
+function legacyPausedReview(topicId: string): PagingCodex {
+  return new class extends PagingCodex {
+    private paused = false;
+    override async resumeTurn(turn: SessionTurn) {
+      if (!this.paused && turn.job?.operation === "contract-correction") {
+        this.paused = true;
+        throw new ReviewBlocked(topicId, "implementation");
+      }
+      return super.resumeTurn(turn);
+    }
+  }(false, true);
 }
 
 type PageMark = { selector: string; offset: number; end: number; total: number; text: string };
@@ -1453,12 +1475,12 @@ describe("E3-2-2b host-review 1차 보완(55f3795 F001~F003)", () => {
     const room = await pagedTopic("f003", [koreanDecision(30_000, "k")]);
     const { reference, text } = room.references[0];
     const claude = new PagingClaude(room.worktree);
-    const codex = new PagingCodex(false, true);
+    const codex = legacyPausedReview(room.topicId);
     for (const id of ["pre-1", "pre-2"]) room.database.reviews.admit(room.topicId, id, "implementation");
-    const engine = room.engine(claude, codex);
+    const engine = room.engine(claude, codex, true);
     engine.startImplementation(room.topicId);
     await room.idle();
-    // 첫 리뷰 응답이 계약을 어겼고 교정은 리뷰 한도에 막혀 교정 대기본만 남았다.
+    // 구버전의 교정 예약 거부를 재현해 실제 엔진이 교정 대기본을 저장하게 한다.
     expect(codex.calls).toHaveLength(1);
     expect(engine.reviewPaused(room.topicId)).toBe("implementation");
     expect(await room.artifacts.readLatest(room.topicId, "pending-contract-repair")).toContain("codex-paged-review");
@@ -1482,9 +1504,9 @@ describe("E3-2-2b host-review 1차 보완(55f3795 F001~F003)", () => {
     const room = await pagedTopic("f003-reuse", [koreanDecision(30_000, "l")]);
     const { reference, text } = room.references[0];
     const claude = new PagingClaude(room.worktree);
-    const codex = new PagingCodex(false, true);
+    const codex = legacyPausedReview(room.topicId);
     for (const id of ["pre-1", "pre-2"]) room.database.reviews.admit(room.topicId, id, "implementation");
-    const engine = room.engine(claude, codex);
+    const engine = room.engine(claude, codex, true);
     engine.startImplementation(room.topicId);
     await room.idle();
     expect(engine.reviewPaused(room.topicId)).toBe("implementation");
@@ -1502,7 +1524,7 @@ describe("E3-2-2b host-review 1차 보완(55f3795 F001~F003)", () => {
     expect(room.database.getTimeline(room.topicId).at(-1)!.payload?.timelineReviewUnread).toEqual([reference.selector]);
 
     // 대기본을 다 쓴 뒤의 재시도는 새 리뷰 프롬프트로 쪽을 싣고, 반환 뒤 인정·저장한다.
-    grant("reuse-2");
+    // 교정은 같은 리뷰 횟수에 포함되므로 앞서 추가한 새 리뷰 1회가 그대로 남아 있다.
     engine.retry(room.topicId);
     await room.idle();
     expect(codex.calls).toHaveLength(3);
@@ -1761,6 +1783,76 @@ describe("E3-4c 코드 리뷰 다중 호출 원장", () => {
     // 같은 세션의 인정 구간은 원장과 무관하다 — 새 원장의 첫 호출은 첫 읽기 호출이 인정받은 구간 뒤부터 싣는다.
     expect(codex.calls[2].sessionId).toBe("codex-ledger-1");
     expect(pagesIn(codex.calls[2].prompt)[0].offset).toBe(firstRead.at(-1)!.end);
+    room.database.close();
+  });
+
+  it.each([false, true])("완료 리뷰에 구현자의 다음 작업을 적었으면 같은 세션에서 보고만 교정하고 수정·재검토까지 자동 진행한다 (최종 리뷰: %s)", async (finalPass) => {
+    const room = await pagedTopic(`review-completion-${finalPass}`, []);
+    const claude = new PagingClaude(room.worktree);
+    const first: AgentResult = { ...result("REVIEW", "검토 완료, 확정 결함을 수정해야 합니다.", [reviewFinding("AGREED_ACTION")]), status: "completed" };
+    const final: AgentResult = { ...result("FINAL_REVIEW", "수정을 확인했습니다.", [reviewFinding("RESOLVED_BY_FIX")]), status: "completed" };
+    const confused = { ...(finalPass ? final : first), remainingSteps: ["구현자가 확정 지적을 수정하고 해당 부분만 재검토합니다."] };
+    const codex = new LedgerCodex(finalPass
+      ? [{ result: first }, { result: confused }, { result: final }]
+      : [{ result: confused }, { result: first }, { result: final }]);
+    room.engine(claude, codex, true).startImplementation(room.topicId);
+    await room.idle();
+
+    expect(room.database.getTopic(room.topicId).state).toBe("READY_TO_DELIVER");
+    expect(claude.calls.map(call => call.operation)).toEqual(["implement", "fix"]);
+    expect(operationsOf(codex.calls)).toEqual(finalPass
+      ? ["create:review", "resume:final-review", "resume:contract-correction"]
+      : ["create:review", "resume:contract-correction", "resume:final-review"]);
+    expect(codex.calls.slice(1).every(call => call.sessionId === "codex-ledger-1")).toBe(true);
+    expect(reviewUsed(room)).toBe(2); // 보고 교정은 원래 리뷰 원장에 속하며 새 전체 리뷰를 사지 않는다.
+    const correction = codex.calls.find(call => call.operation === "contract-correction")!;
+    expect(correction.prompt).toContain("리뷰어가 아직 검토하지 못한 작업");
+    expect(correction.settings).toEqual(codex.calls[0].settings);
+    expect(correction.reviewLedger).toBe(codex.calls[finalPass ? 1 : 0].reviewLedger);
+    const reviewed = JSON.parse((await room.artifacts.readLatest(room.topicId, finalPass ? "codex-final-review" : "codex-review"))!);
+    expect(reviewed.findings).toContainEqual(expect.objectContaining({ id: "F-1", disposition: finalPass ? "RESOLVED_BY_FIX" : "AGREED_ACTION" }));
+    expect(reviewed.remainingSteps ?? []).toEqual([]);
+    expect(room.database.getTimeline(room.topicId).some(event => event.state === "USER_DECISION_REQUIRED")).toBe(false);
+    room.database.close();
+  });
+
+  it.each(["incomplete", "decision", "evidence"] as const)("완료 보고 교정에서도 실제 미검토·사용자 결정·외부 증거는 자동 통과시키지 않는다 (%s)", async (blocker) => {
+    const room = await pagedTopic(`review-completion-blocker-${blocker}`, []);
+    const claude = new PagingClaude(room.worktree);
+    const first: AgentResult = { ...result("REVIEW", "검토 보고", [reviewFinding("AGREED_ACTION")]),
+      status: "completed", remainingSteps: ["다음 작업"] };
+    const corrected: AgentResult = { ...first,
+      ...(blocker === "incomplete" ? { status: "in_progress", remainingSteps: ["리뷰어가 테스트 실패 경로를 아직 확인하지 못했습니다."] }
+        : blocker === "decision" ? { remainingSteps: [], requestedUserDecision: "승인된 범위를 넓힐지 결정해 주세요." }
+          : { remainingSteps: [], findings: [{ ...reviewFinding("AGREED_ACTION"), disposition: "EXTERNAL_EVIDENCE" }] }) };
+    const codex = new LedgerCodex([{ result: first }, { result: corrected }]);
+    room.engine(claude, codex).startImplementation(room.topicId);
+    await room.idle();
+
+    expect(room.database.getTopic(room.topicId).state).toBe(blocker === "evidence" ? "BLOCKED_ON_EVIDENCE" : "USER_DECISION_REQUIRED");
+    expect(claude.calls.map(call => call.operation)).toEqual(["implement"]);
+    expect(operationsOf(codex.calls)).toEqual(["create:review", "resume:contract-correction"]);
+    expect(reviewUsed(room)).toBe(1);
+    expect(room.database.planning.latestReviewLedger(room.topicId)?.status).toBe(blocker === "incomplete" ? "judged" : "completed");
+    room.database.close();
+  });
+
+  it.each([true, false])("리뷰 보고 교정 실패는 원본·같은 리뷰 예약을 보존하고 수정 작업을 열지 않는다 (spawn 전 실패: %s)", async (beforeSpawn) => {
+    const room = await pagedTopic(`review-completion-failed-${beforeSpawn}`, []);
+    const claude = new PagingClaude(room.worktree);
+    const original: AgentResult = { ...result("REVIEW", "검토한 지적", [reviewFinding("AGREED_ACTION")]),
+      status: "completed", remainingSteps: ["구현자가 수정합니다."] };
+    const codex = new LedgerCodex([{ result: original }, beforeSpawn ? { failBeforeSpawn: "교정 준비 실패" } : { fail: "교정 응답 실패" }]);
+    room.engine(claude, codex, true).startImplementation(room.topicId);
+    await room.idle();
+    expect(room.database.getTopic(room.topicId).state).toBe("FAILED");
+    expect(claude.calls.map(call => call.operation)).toEqual(["implement"]);
+    expect(operationsOf(codex.calls)).toEqual(["create:review", "resume:contract-correction"]);
+    expect(codex.calls[1].reviewLedger).toBe(codex.calls[0].reviewLedger);
+    expect(reviewUsed(room)).toBe(1);
+    expect(room.database.planning.latestReviewLedger(room.topicId)).toMatchObject({ status: "open", spawned: true });
+    const saved = JSON.parse((await room.artifacts.readLatest(room.topicId, "contract-repair-source"))!);
+    expect(saved.original).toMatchObject(original);
     room.database.close();
   });
 

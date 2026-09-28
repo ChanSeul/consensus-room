@@ -35,7 +35,7 @@ export interface TurnRoute extends SessionBinding {
   options: Readonly<Record<string, unknown>>;
   // 코드 리뷰 원장 ID(E3-4c) — delivery 가 연 논리 리뷰 한 번의 호스트 소유 ID. 리뷰 좌석의 읽기 호출(review-read)·최종 판정 호출(review·final-review)이
   // 이 경로로 core.turn·실행기를 지나 SessionTurn.reviewLedger 로 예산 래퍼에 닿는다(core.turn 의 턴 요청은 호출자 필드를 받지 않아 경로가 유일한 통로다).
-  // 예산 래퍼는 그 세 작업에서만 이 ID 로 리뷰를 예약한다 — 같은 경로를 펼쳐 만든 계약 교정 경로는 지금처럼 호출마다 예약한다. 경로 판정·바인딩과는 무관하다.
+  // 예산 래퍼는 읽기·판정·그 판정의 계약 교정에서 이 ID 로 리뷰를 예약한다. 원장 없는 교정은 호출마다 예약하며 경로 판정·바인딩과는 무관하다.
   reviewLedger?: string;
 }
 

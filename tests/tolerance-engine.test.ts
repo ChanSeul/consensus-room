@@ -950,6 +950,62 @@ describe("PLAN 2026-09-14 — 완료 판정·상태 확인·요청별 보존·ch
     database.close();
   });
 
+  // 2026-09-28 운영 16625: 원본 응답을 누적하면서 요청이 닫히고, 교정 응답이 같은 해소 id 를 되풀이하면 마지막 누적만 보고해 닫힘 이벤트가 사라지고
+  // 이미 닫힌 id 가 "열린 요청이 아닙니다" 로 보고됐다. 보고는 이 턴의 누적 전체를 기준으로 한다.
+  it("교정 응답이 같은 해소 id 를 되풀이해도 닫힌 요청은 한 번 '닫았습니다'로 보고되고 미일치 경고가 남지 않는다", async () => {
+    const { worktree, database, artifacts, gitService, topicId } = await setup("resolve-across-correction");
+    let resolved = "";
+    const claude = scripted([
+      () => { writeFileSync(join(worktree, "feature.txt"), "x\n"); return result("IMPLEMENTATION", "P3", { status: "blocked", remainingSteps: ["P4"], requestedUserDecision: "A?" }); },
+      // 원본: A 를 id 로 해소하지만 kind 가 틀려 계약 교정으로 간다 — 서버는 검사 전에 원본을 누적해 A 를 닫는다.
+      (turn) => { [resolved] = requestIdsIn(turn.prompt); return result("FIX", "P4 done (wrong kind)", { status: "completed", resolvesRequestedDecision: true, resolvedRequestId: resolved }); },
+      // 계약 교정: 같은 해소 id 를 되풀이한다.
+      () => result("IMPLEMENTATION", "P4 done", { status: "completed", resolvesRequestedDecision: true, resolvedRequestId: resolved }),
+    ]);
+    const engine = new WorkflowEngine({ database, artifacts, git: gitService, claude: claude.adapter, codex: new PassingCodex() });
+    engine.startImplementation(topicId); await settled(database, topicId);
+    expect(database.getTopic(topicId).lastError).toContain("A?");
+    await engine.postMessage(topicId, "decision", "A 답"); engine.retry(topicId); await settled(database, topicId);
+    expect(database.getTopic(topicId).state, database.getTopic(topicId).lastError ?? "").toBe("READY_TO_DELIVER");
+    expect(claude.calls()).toBe(3);
+    expect(resolved).toMatch(/^Q-[0-9a-f]{8}$/);
+    const bodies = database.getTimeline(topicId).map((event) => event.body);
+    expect(bodies.filter((body) => body.includes("기계 계약 위반을 같은 세션에 돌려보내"))).toHaveLength(1);   // 교정 경로를 실제로 지났다
+    expect(bodies.filter((body) => body.includes(`열린 요청 ${resolved} 를 러너가 해소로 확인해 닫았습니다`))).toHaveLength(1);
+    expect(bodies.filter((body) => body.includes("해소 표식을 적용하지 않았습니다"))).toHaveLength(0);
+    const checkpoint = JSON.parse((await artifacts.readLatest(topicId, "work-checkpoint"))!);
+    expect(checkpoint.openRequests).toEqual([]);
+    database.close();
+  });
+
+  it.each([true, false])("교정의 해소 id 반복(%s) 여부와 무관하게 실제 미일치만 보고한다", async (repeatIds) => {
+    const { worktree, database, artifacts, gitService, topicId } = await setup("resolve-unknown-across-correction");
+    let resolved = "";
+    const claude = scripted([
+      () => { writeFileSync(join(worktree, "feature.txt"), "x\n"); return result("IMPLEMENTATION", "P3", { status: "blocked", remainingSteps: ["P4"], requestedUserDecision: "A?" }); },
+      (turn) => {
+        [resolved] = requestIdsIn(turn.prompt);
+        if (!repeatIds) writeFileSync(join(worktree, "service", "S.swift"), "func renamed() {}\nfunc b() {}\n");
+        return result(repeatIds ? "FIX" : "IMPLEMENTATION", "P4 done (needs correction)", { status: "completed", resolvesRequestedDecision: true, resolvedRequestIds: [resolved, "Q-deadbeef"] });
+      },
+      () => {
+        if (!repeatIds) writeFileSync(join(worktree, "service", "S.swift"), "func a() {}\nfunc b() {}\n");
+        return result("IMPLEMENTATION", "P4 done", { status: "completed", ...(repeatIds ? { resolvesRequestedDecision: true, resolvedRequestIds: [resolved, "Q-deadbeef"] } : {}) });
+      },
+    ]);
+    const engine = new WorkflowEngine({ database, artifacts, git: gitService, claude: claude.adapter, codex: new PassingCodex() });
+    engine.startImplementation(topicId); await settled(database, topicId);
+    await engine.postMessage(topicId, "decision", "A 답"); engine.retry(topicId); await settled(database, topicId);
+    expect(database.getTopic(topicId).state, database.getTopic(topicId).lastError ?? "").toBe("READY_TO_DELIVER");
+    const bodies = database.getTimeline(topicId).map((event) => event.body);
+    expect(bodies.filter((body) => body.includes(`열린 요청 ${resolved} 를 러너가 해소로 확인해 닫았습니다`))).toHaveLength(1);
+    const warnings = bodies.filter((body) => body.includes("해소 표식을 적용하지 않았습니다"));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("resolvedRequestId Q-deadbeef 는 열린 요청이 아닙니다");
+    expect(warnings[0]).toContain(`이 응답으로 닫힘: ${resolved}`);
+    database.close();
+  });
+
   it("허용 오차 교정 프롬프트는 이번 턴이 새로 연 요청의 id 도 싣는다 — 교정이 원인을 되돌렸으면 그 요청을 resolvedRequestIds 로 닫을 수 있다(host-review R03)", async () => {
     const { worktree, database, artifacts, gitService, topicId } = await setup("r03-latest");
     const claude = scripted([

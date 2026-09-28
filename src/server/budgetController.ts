@@ -13,8 +13,9 @@ import { jobOfTurn } from "./adapters/turnPolicy.js";
 import { planningPacketLimit } from "../shared/planningControl.js";
 
 interface Context { topicId: string; accounts: string[]; stage: string; }
-// 코드 리뷰 원장(E3-4c)이 소유하는 작업 — 논리 리뷰 한 번의 읽기 호출과 최종 판정 호출. 계약 교정·답변 확인은 원장 밖이라 지금처럼 호출마다 예약한다.
-const REVIEW_LEDGER_OPERATIONS: ReadonlySet<string> = new Set(["review", "final-review", "review-read"]);
+// 코드 리뷰 원장이 소유하는 작업 — 읽기·판정·그 판정의 계약 교정은 한 논리 리뷰다. 교정에도 호스트가 넘긴 원장 ID 가 있어야 재사용하며,
+// 답변 확인이나 원장 밖 교정은 기존처럼 호출마다 예약한다. 사용량·실제 호출 기록은 계속 각 실행에 남긴다.
+const REVIEW_LEDGER_OPERATIONS: ReadonlySet<string> = new Set(["review", "final-review", "review-read", "contract-correction"]);
 // All model methods pass through this boundary, including direct delivery/correction calls.
 export class BudgetController {
   constructor(private readonly ledger: BudgetLedger, private readonly context: (cwd:string) => Context,

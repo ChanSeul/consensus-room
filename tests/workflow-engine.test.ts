@@ -4264,14 +4264,14 @@ it("최초 계획 교정 재개는 epoch를 바꾸거나 계획 호출을 다시
  expect(database.getTopic("topic-1").planEpoch).toBe(epoch);database.close();
 });
 
-it("리뷰 교정 재개는 새 전체 리뷰 대신 같은 리뷰 세션에서 결과만 교정한다",async()=>{
+it("리뷰 결과 교정은 추가 승인 없이 같은 리뷰 세션과 논리 리뷰 한도에서 진행한다",async()=>{
  const codex=new ReviewSessionAdapter([{kind:"REVIEW",summary:"종류 오류",findings:[],evidenceRefs:[]},{kind:"FINAL_REVIEW",summary:"교정 완료",findings:[],evidenceRefs:[]}]);
  const {database,engine}=await makeReviewRecovery({resumeState:"CODEX_FINAL_REVIEW",implementationFindings:[],originalReviewFindings:[],codexResult:{kind:"FINAL_REVIEW",summary:"unused",findings:[],evidenceRefs:[]},codex});
  database.reviews.admit("topic-1","a","implementation");database.reviews.admit("topic-1","b","implementation");
- engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");expect(database.getTopic("topic-1").state).toBe("USER_DECISION_REQUIRED");
- database.reviews.grant("topic-1","implementation","more",1);engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");
+ engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");
  expect(codex.calls).toHaveLength(2);expect(codex.calls[1]).toMatchObject({sessionId:codex.calls[0].sessionId,created:false});
- expect(codex.calls[1].turn.prompt).toContain("서버 기계 검사");expect(database.getTopic("topic-1").state).toBe("READY_TO_DELIVER");database.close();
+ expect(codex.calls[1].turn.prompt).toContain("서버 기계 검사");expect(database.getTopic("topic-1").state).toBe("READY_TO_DELIVER");
+ expect(database.reviews.account("topic-1","implementation").used).toBe(3);database.close();
 });
 
 it("부분 교정 한도 중단도 원본과 같은 세션을 복구해 부분 패치만 호출한다",async()=>{

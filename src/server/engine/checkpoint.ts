@@ -113,6 +113,26 @@ export interface Accumulation {
   resolvedRequests: OpenRequest[];
   // 해소 표식은 있었지만 요청 id 가 없거나 열린 요청과 맞지 않아 지우지 않은 경우(진단용).
   unmatchedResolution: string | null;
+  // unmatchedResolution 중 열린 요청과 맞지 않은 id(id 없는 표식이면 빈 목록) — 한 턴의 여러 누적을 합쳐 보고할 때 쓴다.
+  unmatchedIds: string[];
+}
+
+function describeUnmatchedResolution(unmatched: readonly string[], open: readonly OpenRequest[], closed: readonly OpenRequest[]): string {
+  const stillOpen = open.map((request) => request.id).join(", ") || "없음";
+  return `resolvedRequestId ${unmatched.join(", ")} 는 열린 요청이 아닙니다(열린 요청: ${stillOpen}${closed.length ? `; 이 응답으로 닫힘: ${closed.map((request) => request.id).join(", ")}` : ""})`;
+}
+
+// 한 턴의 응답은 원본·계약 교정·허용 오차 교정으로 여러 번 누적된다. 교정 응답이 앞 누적에서 이미 닫힌 id 를 되풀이하면 그 누적만 보면 미일치지만,
+// 이 턴의 해소로는 닫힌 요청이다 — 턴 전체에서 닫힌 요청을 빼고 남은 미일치만 같은 문구로 다시 만든다(2026-09-28 운영 16625).
+export function turnUnmatchedResolution(last: Accumulation, resolvedThisTurn: readonly OpenRequest[],
+  warnings: readonly Pick<Accumulation, "unmatchedIds" | "unmatchedResolution">[] = []): string | null {
+  // 교정이 해소 필드를 생략해도 앞 응답의 실제 미일치는 진단에 남긴다.
+  const reports = [...warnings, last];
+  const closed = new Set(resolvedThisTurn.map((request) => request.id));
+  const remaining = [...new Set(reports.flatMap((report) => report.unmatchedIds))].filter((id) => !closed.has(id));
+  const messages = new Set(reports.flatMap((report) => report.unmatchedResolution && !report.unmatchedIds.length ? [report.unmatchedResolution] : []));
+  if (remaining.length) messages.add(describeUnmatchedResolution(remaining, last.openRequests, resolvedThisTurn));
+  return [...messages].join(" · ") || null;
 }
 
 // 구버전 checkpoint 가 목록에 담지 않았던 finding·blocked 요청도 저장된 응답에서 복구한다.
@@ -132,6 +152,7 @@ export function accumulate(
   let openRequests = [...open];
   const resolvedRequests: OpenRequest[] = [];
   let unmatchedResolution: string | null = null;
+  let unmatchedIds: string[] = [];
   for (const asked of decisionRequestTexts(next)) {
     // 서버가 렌더한 열린 요청 목록(`[Q-…] 문구`)이 교정 병합으로 되돌아온 것은 새 질문이 아니다 — **id 와 문구가 모두** 열린 요청과 같을 때만 재출력으로
     // 본다. 기존 id 를 인용하며 다른 문구를 적은 것은 새 질문이다(r3: id 만 비교해 새 질문 B 를 버렸다).
@@ -159,13 +180,13 @@ export function accumulate(
     if (ids.length === 0) {
       unmatchedResolution = "resolvesRequestedDecision 에 resolvedRequestId(s) 가 없어 어느 요청도 닫지 않았습니다";
     } else if (unmatched.length > 0) {
-      const stillOpen = openRequests.map((request) => request.id).join(", ") || "없음";
-      unmatchedResolution = `resolvedRequestId ${unmatched.join(", ")} 는 열린 요청이 아닙니다(열린 요청: ${stillOpen}${resolvedRequests.length ? `; 이 응답으로 닫힘: ${resolvedRequests.map((request) => request.id).join(", ")}` : ""})`;
+      unmatchedIds = unmatched;
+      unmatchedResolution = describeUnmatchedResolution(unmatched, openRequests, resolvedRequests);
     }
   }
   const { requestedUserDecision: _decision, resolvesRequestedDecision: _flag, resolvedRequestId: _rid, resolvedRequestIds: _rids, ...rest } = merged.result;
   const result: AgentResult = openRequests.length > 0 ? { ...rest, requestedUserDecision: renderOpenRequests(openRequests) } : rest;
-  return { result, openRequests, preserved: merged.preserved, resolvedRequests, unmatchedResolution };
+  return { result, openRequests, preserved: merged.preserved, resolvedRequests, unmatchedResolution, unmatchedIds };
 }
 
 export class CheckpointCorrupt extends Error {

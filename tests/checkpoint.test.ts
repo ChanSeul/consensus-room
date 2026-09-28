@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { accumulate, checkpointOpenRequests, requestId, resolutionIds, workId, type WorkBinding } from "../src/server/engine/checkpoint";
+import { accumulate, checkpointOpenRequests, requestId, resolutionIds, turnUnmatchedResolution, workId, type WorkBinding } from "../src/server/engine/checkpoint";
 import { completionVerdict, acceptResult, type OpenRequest } from "../src/server/engine/completion";
 import type { AgentResult } from "../src/shared/contracts";
 
@@ -71,6 +71,28 @@ describe("accumulate — 요청별 보존", () => {
     expect(noFlag.openRequests).toHaveLength(3);
     expect(noFlag.resolvedRequests).toEqual([]);
     expect(noFlag.result.resolvedRequestIds).toBeUndefined();
+  });
+  it("미일치 id 는 구조값으로도 남고, 턴 단위 보고는 같은 턴 앞 누적이 닫은 id 를 빼고 남은 것만 같은 문구로 다시 만든다(2026-09-28 운영 16625)", () => {
+    const a = accumulate(null, result({ requestedUserDecision: "A?" }), [], 10);
+    const b = accumulate(a.result, result({ requestedUserDecision: "B?" }), a.openRequests, 20);
+    const [idA, idB] = b.openRequests.map((request) => request.id);
+    // 원본 누적: A 를 닫는다. 교정 누적: 같은 id 를 되풀이하면(+ 열린 적 없는 id) 그 누적만 보면 A 도 미일치다.
+    const original = accumulate(b.result, result({ resolvesRequestedDecision: true, resolvedRequestId: idA }), b.openRequests, 30);
+    expect(original.unmatchedIds).toEqual([]);
+    const correction = accumulate(original.result, result({ resolvesRequestedDecision: true, resolvedRequestIds: [idA, "Q-deadbeef"] }), original.openRequests, 30);
+    expect(correction.resolvedRequests).toEqual([]);
+    expect(correction.unmatchedIds).toEqual([idA, "Q-deadbeef"]);
+    const turn = turnUnmatchedResolution(correction, original.resolvedRequests);
+    expect(turn).toBe(`resolvedRequestId Q-deadbeef 는 열린 요청이 아닙니다(열린 요청: ${idB}; 이 응답으로 닫힘: ${idA})`);
+    // 되풀이한 id 만 있으면 보고할 미일치가 없다.
+    const repeatOnly = accumulate(original.result, result({ resolvesRequestedDecision: true, resolvedRequestId: idA }), original.openRequests, 30);
+    expect(turnUnmatchedResolution(repeatOnly, original.resolvedRequests)).toBeNull();
+    // 한 번 누적한 경로(그 누적의 목록을 넘김)는 기존 문구와 같다. id 없는 표식 경고는 그대로 남는다.
+    const single = accumulate(b.result, result({ resolvesRequestedDecision: true, resolvedRequestIds: [idA, "Q-deadbeef"] }), b.openRequests, 30);
+    expect(turnUnmatchedResolution(single, single.resolvedRequests)).toBe(single.unmatchedResolution);
+    const noId = accumulate(b.result, result({ resolvesRequestedDecision: true }), b.openRequests, 30);
+    expect(noId.unmatchedIds).toEqual([]);
+    expect(turnUnmatchedResolution(noId, original.resolvedRequests)).toBe(noId.unmatchedResolution);
   });
   it("resolutionIds 는 단수·복수를 합쳐 공백을 지우고 순서를 지키며 중복을 없앤다", () => {
     expect(resolutionIds({})).toEqual([]);

@@ -192,7 +192,7 @@ export class EngineCore {
   // (spawn 뒤에는 spawn 전 실패로도 되돌리지 않는다), 리뷰 종류가 재개 단계와 같고 범위 세대·계획 epoch·계획 SHA 가 지금 주제와 같을 때만 참이다. 그러면
   // 재시도의 읽기·판정 호출은 같은 원장 ID 로 멱등 예약해 새 1회를 쓰지 않으므로 가용 횟수 사전 검사를 건너뛴다. 여기서는 검토 tree·보고판을 보지 않는다 —
   // 실행 경로가 원장 신원을 대조해(openReviewLedger) 달라졌으면 새 원장 ID 로 예약하고, 한도에 닿았으면 ReviewLedger.reserve 가 spawn 전에 막는다. 답변
-  // 확인·계약 교정처럼 원장 밖에서 호출마다 예약하는 턴과 예산 검사도 그대로 막힌다. 예산 강제가 꺼진 구성은 spawn 을 기록하지 않아 이 예외가 적용되지 않는다.
+  // 확인·원장 없는 계약 교정처럼 호출마다 예약하는 턴과 예산 검사도 그대로 막힌다. 예산 강제가 꺼진 구성은 spawn 을 기록하지 않아 이 예외가 적용되지 않는다.
   private heldReviewLedger(stage: string | null | undefined, topic: Topic): boolean {
     const kind = stage === "CODEX_FINAL_REVIEW" ? "codex-final-review" : stage === "CODEX_REVIEW" ? "codex-review" : null;
     const ledger = kind ? this.dependencies.database.planning.latestReviewLedger(topic.id) : null;

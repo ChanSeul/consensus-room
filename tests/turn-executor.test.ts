@@ -197,7 +197,7 @@ describe("실행 허용 거부의 재개와 예약 복원", () => {
 });
 
 // E3-4c — 코드 리뷰 원장. 논리 리뷰 한 번의 읽기·최종 판정 호출은 원장 ID 하나로 리뷰 1회를 예약하고(ReviewLedger 예약은 ID 마다 멱등), 원장의 첫 spawn 뒤에는
-// 어느 호출의 spawn 전 실패로도 예약을 되돌리지 않는다(원장의 spawn 기록은 PlanningStore 에 영속한다). 계약 교정·원장 없는 호출은 지금처럼 호출마다 예약한다.
+// 어느 호출의 spawn 전 실패로도 예약을 되돌리지 않는다(원장의 spawn 기록은 PlanningStore 에 영속한다). 같은 판정의 계약 교정도 포함하며 원장 없는 호출은 각각 예약한다.
 describe("E3-4c 코드 리뷰 원장 — 예산 래퍼의 예약·되돌림과 원장 신원", () => {
   const identity = { topicId: "t", kind: "codex-review" as const, scopeGeneration: 1, planEpoch: 0, planSHA256: null, reviewedTree: "tree-a", reportRevision: 3 };
   function reviewRoom() {
@@ -230,7 +230,7 @@ describe("E3-4c 코드 리뷰 원장 — 예산 래퍼의 예약·되돌림과 �
     ({ cwd: root, sessionId: "s", prompt, job: job(operation), ...(reviewLedger ? { reviewLedger } : {}) });
   const used = (database: ConsensusDatabase) => database.reviews.account("t", "implementation").used;
 
-  it.each([true, false])("같은 원장의 읽기·판정 호출은 리뷰 1회이고, 같은 원장 ID 를 실은 계약 교정과 원장 없는 호출은 호출마다 센다(예산 적용: %s)", async (budgetsEnabled) => {
+  it.each([true, false])("같은 원장의 읽기·판정·계약 교정은 리뷰 1회이고, 원장 없는 호출은 각각 센다(예산 적용: %s)", async (budgetsEnabled) => {
     const room = reviewRoom();
     const ledger = room.database.planning.openReviewLedger(identity);
     const wrapped = reviewer(room.database, budgetsEnabled);
@@ -239,13 +239,17 @@ describe("E3-4c 코드 리뷰 원장 — 예산 래퍼의 예약·되돌림과 �
     await wrapped.resumeTurn(turn(room.root, "review", "ok", ledger.id));
     expect(used(room.database)).toBe(1);
     await wrapped.resumeTurn(turn(room.root, "contract-correction", "ok", ledger.id));
-    expect(used(room.database)).toBe(2);
+    expect(used(room.database)).toBe(1);
     await wrapped.resumeTurn(turn(room.root, "review", "ok"));
+    expect(used(room.database)).toBe(2);
+    await wrapped.resumeTurn(turn(room.root, "contract-correction", "ok"));
     expect(used(room.database)).toBe(3);
     // 한도(3)에 닿아도 이미 예약한 원장의 호출은 새로 세지 않아 막히지 않고, 원장 없는 호출은 막힌다.
     await wrapped.resumeTurn(turn(room.root, "review-read", "ok", ledger.id));
+    await wrapped.resumeTurn(turn(room.root, "contract-correction", "ok", ledger.id));
     expect(used(room.database)).toBe(3);
     await expect(wrapped.resumeTurn(turn(room.root, "review", "ok"))).rejects.toThrow("구현 리뷰 한도");
+    await expect(wrapped.resumeTurn(turn(room.root, "answer-confirmation", "ok", ledger.id))).rejects.toThrow("구현 리뷰 한도");
     room.database.close();
   });
 
