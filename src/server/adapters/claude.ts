@@ -19,6 +19,7 @@ import { ProjectMemoryReader, type MemoryReaderOptions } from "../projectMemory.
 import { readAppliedInstructions } from "../projectInstructions.js";
 import { agentRunError, parsePlanRepair, parseAgentResult, isZeroTurnResult } from "./resultParser.js";
 import { ExecutionMetrics, readClaudeUsageBaseline } from "./executionMetrics.js";
+import { captureFigma } from "./figmaCapture.js";
 import { createToolTimeMeter } from "./toolTime.js";
 import { resolveSupportedTurn, runnerControlPaths } from "./turnPolicy.js";
 
@@ -162,6 +163,7 @@ export class ClaudeAdapter implements AgentAdapter {
       : null;
     const workspace = resolve(turn.cwd);
     const actionTemp = await mkdtemp(join(tmpdir(), "consensus-room-claude-"));
+    let figmaCapture: Awaited<ReturnType<typeof captureFigma>> | undefined;
     try {
       const permissionMode = policy.planMode ? "plan" : "dontAsk";
       const executionSettings = turn.settings ?? DEFAULT_AGENT_SETTINGS.claude;
@@ -169,9 +171,10 @@ export class ClaudeAdapter implements AgentAdapter {
       const compactWindow = policy.tools !== "none" && !turn.planningControl
         ? budgetedCompactWindow(defaultWindow, turn.executionBudget?.inputTokens) : defaultWindow;
       const figmaMcpUrl = policy.figma ? this.options.figmaMcpUrl ?? null : null;
+      if (figmaMcpUrl) figmaCapture = await captureFigma(figmaMcpUrl, FIGMA_READ_METHODS, turn);
       // 빈 객체 {}는 실 CLI가 "Invalid MCP configuration"으로 거부한다(실측). mcpServers 키는 항상 있어야 한다.
       const mcpConfig = {
-        mcpServers: figmaMcpUrl ? { "figma-desktop": { type: "http", url: figmaMcpUrl } } : {},
+        mcpServers: figmaMcpUrl ? { "figma-desktop": { type: "http", url: figmaCapture!.url } } : {},
       };
       // 웹은 도구로만 연다(WebSearch/WebFetch는 CLI 프로세스 소관). Bash의 네트워크는 sandbox가 계속 전면 차단한다.
       // Skill 도구가 목록에 없으면 관리형 플러그인 스킬이 로드돼도 쓸 수 없다(실측).
@@ -331,8 +334,9 @@ export class ClaudeAdapter implements AgentAdapter {
       if (output.exitCode !== 0) {
         throw agentRunError("claude", output.exitCode, output.stderr, output.stdout);
       }
+      figmaCapture?.assertCaptured();
       if (designCaptureError) throw designCaptureError;
-      if ([...designCalls.values()].some(call => !call.received)) {
+      if (figmaCapture?.hasPending() || [...designCalls.values()].some(call => !call.received)) {
         const result = parseAgentResult(output.jsonLines, output.stdout);
         if (result.status !== "blocked" && result.status !== "in_progress") {
           throw new Error("Figma response was not captured; implementation cannot be accepted without shared design evidence.");
@@ -344,6 +348,7 @@ export class ClaudeAdapter implements AgentAdapter {
         recordFinal();
       }
     } finally {
+      await figmaCapture?.close();
       await rm(actionTemp, { recursive: true, force: true });
     }
   }
