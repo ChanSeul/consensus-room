@@ -79,6 +79,7 @@ export function loadConfig(overrides: Partial<ServerConfig> = {}): ServerConfig 
   }
   const defaultAgentSettings = AgentSettingsSchema.parse(overrides.defaultAgentSettings ?? {
     claude: {
+      ...DEFAULT_AGENT_SETTINGS.claude,
       model: process.env.CONSENSUS_ROOM_CLAUDE_MODEL ?? DEFAULT_AGENT_SETTINGS.claude.model,
       effort: process.env.CONSENSUS_ROOM_CLAUDE_EFFORT ?? DEFAULT_AGENT_SETTINGS.claude.effort,
     },

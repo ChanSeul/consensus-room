@@ -1,20 +1,45 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { loadConfig } from "../src/server/config";
 import { isMissingSessionError } from "../src/server/engine/delivery";
 import { agentRunError, parseAgentResult } from "../src/server/adapters/resultParser";
 import { replanDirective } from "../src/shared/workflow";
+import { appliedExecutionSettings } from "../src/shared/execution";
 
 const temporaryDirectories: string[] = [];
 const savedEnv = process.env.CONSENSUS_ROOM_DATA_DIR;
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   for (const directory of temporaryDirectories.splice(0)) rmSync(directory, { recursive: true, force: true });
   if (savedEnv === undefined) delete process.env.CONSENSUS_ROOM_DATA_DIR;
   else process.env.CONSENSUS_ROOM_DATA_DIR = savedEnv;
+});
+
+describe("설정 초기화에서 구현 모델 보존", () => {
+  it.each([
+    [undefined, undefined, "fable", "xhigh"],
+    ["claude-opus-5-5", "high", "claude-opus-5-5", "high"],
+  ])("계획 환경변수 %s/%s와 별개로 구현은 opus를 쓴다", (model, effort, expectedModel, expectedEffort) => {
+    vi.stubEnv("CONSENSUS_ROOM_CLAUDE_MODEL", model);
+    vi.stubEnv("CONSENSUS_ROOM_CLAUDE_EFFORT", effort);
+    const settings = loadConfig({ dataDirectory: tmpdir() }).defaultAgentSettings.claude;
+    expect(appliedExecutionSettings(settings, false)).toEqual({ model: expectedModel, effort: expectedEffort });
+    expect(appliedExecutionSettings(settings, true)).toEqual({ model: "opus", effort: "xhigh" });
+  });
+
+  it("명시적으로 주어진 설정에는 기본 구현 모델을 추가하지 않는다", () => {
+    const explicit = {
+      claude: { model: "claude-opus-5-5", effort: "high" as const },
+      codex: { model: "gpt-6-astra", effort: "xhigh" as const },
+    };
+    const settings = loadConfig({ dataDirectory: tmpdir(), defaultAgentSettings: explicit }).defaultAgentSettings;
+    expect(settings).toEqual(explicit);
+    expect(appliedExecutionSettings(settings.claude, true)).toEqual(explicit.claude);
+  });
 });
 
 describe("데이터 디렉터리 환경변수 방어(2026-09-08 빈 DB 사고)", () => {
