@@ -99,20 +99,21 @@ it("a durable frontier collects more than 64 children and requires human approva
   expect(db.evidence.packet(db.getTopic("a"),"claude").text).not.toContain("APP-2");
   await service.stop();
 });
-it("Jira pages retain all comments and descendants, then reject a revision changed during collection", async () => {
+it.each([undefined, "11111111-1111-4111-8111-111111111111"])("Jira root traversal retains comments and descendants with cloud routing %s", async jiraCloudId => {
   const {db} = fixture(); const source = db.evidence.ensureSource({url:"https://team.atlassian.net/browse/APP-1",label:"Root",mode:"rest",intervalSeconds:900});
   let changed = false; const paths: string[] = [];
   const request = (async (raw: string) => {
-    const url = new URL(raw); paths.push(url.pathname+url.search);
+    const url = new URL(raw); paths.push(raw);
     const data = url.pathname.endsWith("/comment") ? { startAt:0,total:1,comments:[{id:"1",body:{text:"Policy https://docs.google.com/spreadsheets/d/policy/edit"},author:{displayName:"Owner"},updated:"r1"}] }
       : url.pathname.endsWith("/search/jql") ? {isLast:true,issues:[{key:"APP-2",fields:{summary:"Child"}}]}
       : url.pathname.endsWith("/remotelink") ? [] : {fields:{summary:"Root",updated:changed ? "r2" : "r1"}};
     return Response.json(data);
   }) as typeof fetch;
   let cursor: string|null = null; const units: string[] = [], links: string[] = [];
-  do { const page = await collectPage(source,cursor,{},request,new AbortController().signal,async()=>({revision:"unused"}));
+  do { const page = await collectPage(source,cursor,{jiraCloudId},request,new AbortController().signal,async()=>({revision:"unused"}));
     units.push(...page.units.map(u=>u.id)); links.push(...page.links.map(l=>l.url)); cursor=page.cursor;
   } while(cursor);
+  expect(paths.every(url => url.startsWith(jiraCloudId ? "https://api.atlassian.com/ex/jira/11111111-1111-4111-8111-111111111111/rest/api/3/" : "https://team.atlassian.net/rest/api/3/"))).toBe(true);
   expect(units).toContain("comment:1"); expect(links).toContain("https://team.atlassian.net/browse/APP-2");
   expect(links).toContain("https://docs.google.com/spreadsheets/d/policy/edit");
   changed=true;

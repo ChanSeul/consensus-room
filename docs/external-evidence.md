@@ -14,6 +14,10 @@ Figma 파일 전체 대신 실제 작업할 화면을 node-id로 지정한다. �
 REST 연결 환경변수는 `CONSENSUS_EVIDENCE_SLACK_TOKEN`, `CONSENSUS_EVIDENCE_SLACK_WORKSPACE`(예: `team.slack.com`),
 `CONSENSUS_EVIDENCE_JIRA_SITE`(예: `https://team.atlassian.net`), `CONSENSUS_EVIDENCE_JIRA_EMAIL`,
 `CONSENSUS_EVIDENCE_JIRA_TOKEN`, `CONSENSUS_EVIDENCE_FIGMA_TOKEN`이다.
+범위를 제한한 Jira API 토큰은 `read:jira-work`와 `CONSENSUS_EVIDENCE_JIRA_CLOUD_ID`를 함께 설정한다.
+Cloud ID가 있으면 Jira 요청만 `https://api.atlassian.com/ex/jira/{cloudId}`로 보낸다. 원문 URL과 사이트 일치 검사는
+기존 `CONSENSUS_EVIDENCE_JIRA_SITE`를 유지한다. Cloud ID가 없으면 기존 사이트 API 경로를 유지하며, 잘못된 ID는
+외부 요청 전에 거부한다. Jira 전용 토큰으로 Confluence 읽기 권한이 생기는 것은 아니다.
 이 값은 호스트 HTTP 요청에만 사용하고 모델·브라우저·로그·공개 저장소에 전달하지 않는다.
 이 기능은 외부 서비스에 메시지·댓글을 쓰거나 디자인을 수정하지 않는다.
 

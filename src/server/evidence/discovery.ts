@@ -2,7 +2,7 @@ import { lookup } from "node:dns/promises";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
 import type { EvidenceDiscoveryLink, EvidenceDiscoveryPage, EvidenceSource, EvidenceUnitInput } from "../../shared/externalEvidence.js";
-import { EvidenceFetchError, type EvidenceCredentials, type EvidenceFetchResult } from "./connectors.js";
+import { EvidenceFetchError, jiraApiBase, type EvidenceCredentials, type EvidenceFetchResult } from "./connectors.js";
 import { evidenceHash, stableJSON } from "./store.js";
 
 type ObjectData = Record<string, any>;
@@ -146,7 +146,8 @@ export async function collectPage(source: EvidenceSource, rawCursor: string | nu
       return page(data.results.map((c: ObjectData) => unit(`comment:${c.id}`, "comment", c)), continuation);
     }
 
-    const base = `https://${host}/rest/api/3/issue/${encodeURIComponent(key)}`;
+    const apiBase = jiraApiBase(host, credentials);
+    const base = `${apiBase}/issue/${encodeURIComponent(key)}`;
     if (!cursor.stage) {
       const issue = await json(`${base}?fields=*all`, headers);
       const links: EvidenceDiscoveryLink[] = (issue.fields?.subtasks ?? []).map((child: ObjectData) => ({
@@ -164,7 +165,7 @@ export async function collectPage(source: EvidenceSource, rawCursor: string | nu
         next < data.total ? { ...cursor, start: next, total: data.total } : { stage: "children", updated: cursor.updated });
     }
     if (cursor.stage === "children") {
-      const data = await json(`https://${host}/rest/api/3/search/jql?${new URLSearchParams({ jql: `parent = "${key}"`, fields: "summary", maxResults: "100", ...(cursor.next ? { nextPageToken: cursor.next } : {}) })}`, headers);
+      const data = await json(`${apiBase}/search/jql?${new URLSearchParams({ jql: `parent = "${key}"`, fields: "summary", maxResults: "100", ...(cursor.next ? { nextPageToken: cursor.next } : {}) })}`, headers);
       if (!Array.isArray(data.issues) || (!data.isLast && !data.nextPageToken)) throw new EvidenceFetchError("Jira 하위 티켓 검색이 불완전합니다.");
       return page([], data.nextPageToken ? { ...cursor, next: data.nextPageToken } : { stage: "remote", updated: cursor.updated },
         data.issues.map((child: ObjectData) => ({ url: `https://${host}/browse/${child.key}`, label: child.fields?.summary ?? child.key, unitId: key, relation: "child" })));

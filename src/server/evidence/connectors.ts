@@ -6,15 +6,22 @@ type JSONRecord = Record<string, any>;
 export interface EvidenceFetchResult { revision: string; units?: EvidenceUnitInput[]; unchanged?: boolean }
 export interface EvidenceConnector { configured?(source: EvidenceSource): boolean; fetch(source: EvidenceSource, previous: EvidenceSnapshot | null, signal: AbortSignal, onBytes?: (bytes: number) => void): Promise<EvidenceFetchResult>;
   discover?(source: EvidenceSource, cursor: string | null, signal: AbortSignal): Promise<EvidenceDiscoveryPage> }
-export interface EvidenceCredentials { slackToken?: string; slackWorkspace?: string; jiraSite?: string; jiraEmail?: string; jiraToken?: string; figmaToken?: string; googleToken?: string }
+export interface EvidenceCredentials { slackToken?: string; slackWorkspace?: string; jiraSite?: string; jiraCloudId?: string; jiraEmail?: string; jiraToken?: string; figmaToken?: string; googleToken?: string }
 export class EvidenceFetchError extends Error { constructor(message: string, readonly retryAfterSeconds = 300, readonly restart = false) { super(message); } }
 
 // These credentials belong to the host collector. Never add them to a model process environment.
 export function evidenceCredentials(env = process.env): EvidenceCredentials {
   return { slackToken: env.CONSENSUS_EVIDENCE_SLACK_TOKEN, slackWorkspace: env.CONSENSUS_EVIDENCE_SLACK_WORKSPACE,
-    jiraSite: env.CONSENSUS_EVIDENCE_JIRA_SITE, jiraEmail: env.CONSENSUS_EVIDENCE_JIRA_EMAIL,
+    jiraSite: env.CONSENSUS_EVIDENCE_JIRA_SITE, jiraCloudId: env.CONSENSUS_EVIDENCE_JIRA_CLOUD_ID, jiraEmail: env.CONSENSUS_EVIDENCE_JIRA_EMAIL,
     jiraToken: env.CONSENSUS_EVIDENCE_JIRA_TOKEN, figmaToken: env.CONSENSUS_EVIDENCE_FIGMA_TOKEN,
     googleToken: env.CONSENSUS_EVIDENCE_GOOGLE_TOKEN };
+}
+// Scoped Jira API tokens use Atlassian's gateway; source URLs retain the original site identity.
+export function jiraApiBase(host: string, credentials: EvidenceCredentials): string {
+  if (credentials.jiraCloudId === undefined) return `https://${host}/rest/api/3`;
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(credentials.jiraCloudId))
+    throw new EvidenceFetchError("Jira Cloud ID 형식이 올바르지 않습니다.");
+  return `https://api.atlassian.com/ex/jira/${credentials.jiraCloudId}/rest/api/3`;
 }
 async function boundedBody(response: Response, limit: number, onBytes?: (bytes: number) => void): Promise<Buffer> {
   if (!response.body) throw new EvidenceFetchError("원문 응답이 비어 있습니다.");
@@ -91,7 +98,7 @@ export class RestEvidenceConnector implements EvidenceConnector {
     const [site, key] = source.resource.split("/"); const credentials = this.credentials;
     if (credentials.jiraSite !== `https://${site}` || !credentials.jiraEmail || !credentials.jiraToken) throw new EvidenceFetchError("Jira 호스트 연결이 없습니다. connector 방식으로 수집하거나 해당 사이트 연결을 설정하세요.");
     const headers = { Authorization: `Basic ${Buffer.from(`${credentials.jiraEmail}:${credentials.jiraToken}`).toString("base64")}`, Accept: "application/json" };
-    const issueURL = `https://${site}/rest/api/3/issue/${encodeURIComponent(key)}`;
+    const issueURL = `${jiraApiBase(site, credentials)}/issue/${encodeURIComponent(key)}`;
     const probe = await this.json(new URL(`${issueURL}?fields=updated`), headers, signal);
     const revision = probe.fields?.updated;
     if (typeof revision !== "string") throw new EvidenceFetchError("Jira 변경 시각을 확인하지 못했습니다.");

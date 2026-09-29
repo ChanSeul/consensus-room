@@ -7,7 +7,7 @@ import { ConsensusDatabase } from "../src/server/database";
 import { EVIDENCE_PAGE_BYTES, parseEvidenceSource, type EvidenceRange, type EvidenceSourceInput, type EvidenceUnitInput,
   type MediatorEvidenceBatch } from "../src/shared/externalEvidence";
 import { EvidenceService, withEvidence } from "../src/server/evidence/service";
-import { RestEvidenceConnector } from "../src/server/evidence/connectors";
+import { RestEvidenceConnector, evidenceCredentials } from "../src/server/evidence/connectors";
 import type { AgentAdapter } from "../src/server/types";
 
 // Public contracts: source ingestion -> topic freshness/gates, packet -> actual adapter prompt,
@@ -157,7 +157,7 @@ describe("read-only provider collection", () => {
     await expect(limited.fetch(source, null, new AbortController().signal)).rejects.toMatchObject({ retryAfterSeconds: 900 });
     await expect(limited.fetch(source, null, new AbortController().signal)).rejects.not.toThrow("secret");
   });
-  it("uses Jira revision probes; paginates comments and rejects an update during collection", async () => {
+  it.each([undefined, "11111111-1111-4111-8111-111111111111"])("uses Jira revision probes and all comments with cloud routing %s", async jiraCloudId => {
     const { db, topic } = setup();
     const source = db.evidence.register(topic.id, { ...sourceInput, url: "https://team.atlassian.net/browse/APP-12" });
     const calls: string[] = []; let finalRevision = "r1"; let commentText = "Decision";
@@ -170,9 +170,10 @@ describe("read-only provider collection", () => {
       }
       return Response.json({ fields: { updated: "r1", summary: "Feature", description: { text: "A" } } });
     });
-    const connector = new RestEvidenceConnector({ jiraSite: "https://team.atlassian.net", jiraEmail: "test", jiraToken: "secret" }, request as typeof fetch);
+    const connector = new RestEvidenceConnector(evidenceCredentials({ CONSENSUS_EVIDENCE_JIRA_SITE: "https://team.atlassian.net", CONSENSUS_EVIDENCE_JIRA_EMAIL: "test", CONSENSUS_EVIDENCE_JIRA_TOKEN: "secret", CONSENSUS_EVIDENCE_JIRA_CLOUD_ID: jiraCloudId }), request as typeof fetch);
     const initial = await connector.fetch(source, null, new AbortController().signal);
     expect(initial.units).toHaveLength(3);
+    expect(calls.every(url => url.startsWith(jiraCloudId ? "https://api.atlassian.com/ex/jira/11111111-1111-4111-8111-111111111111/rest/api/3/" : "https://team.atlassian.net/rest/api/3/"))).toBe(true);
     expect(initial.units?.some(unit => unit.content.includes("Latest owner reply"))).toBe(true);
     calls.length = 0;
     const cached = { sourceId: source.id, contentHash: "h", units: initial.units!.map(unit => ({ ...unit, contentHash: "h" })) };
@@ -1057,4 +1058,19 @@ describe("E3-1 근거 쪽·구간 전달", () => {
       expect(reopened.evidence.mediatorBatch(topic, "legacy").batchId).toBeNull();
     });
   });
+});
+
+it("rejects invalid scoped Jira routing and a different source site before sending credentials", async () => {
+  const { db, topic } = setup();
+  const source = db.evidence.register(topic.id, { ...sourceInput, url: "https://team.atlassian.net/browse/APP-12" });
+  const request = vi.fn();
+  for (const jiraCloudId of ["", "../another-tenant", "11111111-1111-4111-8111-111111111111/extra"]) {
+    const connector = new RestEvidenceConnector({ jiraSite: "https://team.atlassian.net", jiraEmail: "test", jiraToken: "secret", jiraCloudId }, request);
+    await expect(connector.fetch(source, null, new AbortController().signal)).rejects.toThrow("Cloud ID");
+    await expect(connector.discover(source, null, new AbortController().signal)).rejects.toThrow("Cloud ID");
+  }
+  const differentSite = new RestEvidenceConnector({ jiraSite: "https://other.atlassian.net", jiraEmail: "test", jiraToken: "secret", jiraCloudId: "11111111-1111-4111-8111-111111111111" }, request);
+  await expect(differentSite.fetch(source, null, new AbortController().signal)).rejects.toThrow("연결");
+  await expect(differentSite.discover(source, null, new AbortController().signal)).rejects.toThrow("연결");
+  expect(request).not.toHaveBeenCalled();
 });
