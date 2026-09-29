@@ -2948,8 +2948,9 @@ export class DeliveryPipeline {
       if (idempotencyKey) {
         this.core.dependencies.database.annotateActionRequest(topicId, "commit", idempotencyKey, { parent: deliveryBase });
       }
-      this.core.dependencies.database.evidence.captureForCommit(this.core.dependencies.database.getTopic(topicId));
+      const evidenceInput = this.core.dependencies.database.evidence.captureForCommit(topic);
       const oid = await this.core.dependencies.git.commit(topic.worktreePath, topic.branchName, message, paths);
+      this.core.dependencies.database.evidence.bindCommitInput(topic,evidenceInput,oid);
       this.assertDeliverySnapshot(topic);
       if (await this.core.dependencies.git.commitParent(topic.worktreePath, oid) !== deliveryBase) {
         this.rejectOrphanCommit(topicId, oid, "생성된 커밋의 부모가 최종 리뷰 기준과 다릅니다.");
@@ -3023,8 +3024,9 @@ export class DeliveryPipeline {
     }
     const tree = await git.workingTreeOID(topic.worktreePath);
     if (tree !== flags.reviewedTreeOID) throw new Error("작업 트리가 최종 리뷰한 트리와 달라 합류 병합 커밋을 만들지 않았습니다. 다시 리뷰하세요.");
-    database.evidence.captureForCommit(database.getTopic(topic.id));
+    const evidenceInput = database.evidence.captureForCommit(topic);
     const oid = await git.writeMergeCommit(topic.worktreePath, tree, approved, message);
+    database.evidence.bindCommitInput(topic,evidenceInput,oid);
     const pending: PendingStageMerge = { oid, parent: deliveryBase, parents: approved, tree, paths: selectedPaths, message };
     if (idempotencyKey) database.annotateActionRequest(topic.id, "commit", idempotencyKey, { parent: deliveryBase, mergeCommit: oid });
     this.core.event(topic.id, "system", "system",

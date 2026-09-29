@@ -129,7 +129,8 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
     authorizeReview(request.headers); workflow.assertBudgetEditable(request.params.id);
     const input = EvidenceReviewInputSchema.parse(request.body);
     const topic = db.getTopic(request.params.id);
-    if (topic.state === "CLOSED") throw new Error("닫힌 주제는 검토할 수 없습니다.");
+    if (topic.state === "CLOSED" && !(db.getFlags(topic.id).committedOID && db.evidence.isFrozen(topic)))
+      throw new Error("확정 커밋이 있는 닫힌 단계의 보존된 근거만 재검토할 수 있습니다.");
     db.evidence.review(topic, input.digest, input.reason, input.plan);
     db.appendEvent({ topicId: topic.id, actor: "user", kind: "note", state: topic.state,
       body: `외부 원문 변경 영향 확인: ${input.reason}`, payload: { evidenceDigest: input.digest, planSHA256: topic.planSHA256 } });

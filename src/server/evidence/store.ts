@@ -180,8 +180,11 @@ export class EvidenceStore {
   freeze(topic: Binding, legacy = false): void {
     if (this.frozen(topic)) return;
     const key = stableJSON([topic.id,binding(topic)]);
-    const captured = this.db.prepare("SELECT record FROM evidence_commit_inputs WHERE binding=?").get(key);
-    const state = captured ? JSON.parse(String(captured.record)) : { ...this.topic(topic), catalog: this.catalog.state(topic.id) };
+    const pending = this.db.prepare("SELECT record FROM evidence_commit_inputs WHERE binding=?").get(key);
+    const input = pending ? JSON.parse(String(pending.record)) : null;
+    const committed = this.db.prepare("SELECT committed_oid FROM topics WHERE id=?").get(topic.id)?.committed_oid;
+    const captured = committed && input?.commitOID === committed ? input.state : null;
+    const state = captured ?? { ...this.topic(topic), catalog: this.catalog.state(topic.id) };
     // Legacy finalized stages keep their stored bodies; elapsed wall time is not a missing historical source.
     if (!captured && legacy) state.ready = state.sources.every((source: EvidenceSource) =>
       source.provider === "figma" || Boolean(this.sourceSnapshot(source)));
@@ -189,10 +192,20 @@ export class EvidenceStore {
   }
   isFrozen(topic: Binding): boolean { return this.frozen(topic) !== null; }
   catalogFor(topic: Binding): EvidenceCatalog { return this.frozen(topic)?.catalog ?? this.catalog.state(topic.id); }
-  captureForCommit(topic: Binding): void {
+  captureForCommit(topic: Binding): string {
     this.assertReady(topic);
+    const nonce = randomUUID();
     this.db.prepare("INSERT INTO evidence_commit_inputs VALUES (?,?) ON CONFLICT(binding) DO UPDATE SET record=excluded.record")
-      .run(stableJSON([topic.id,binding(topic)]),JSON.stringify({ ...this.topic(topic), catalog: this.catalogFor(topic) }));
+      .run(stableJSON([topic.id,binding(topic)]),JSON.stringify({ nonce, commitOID: null,
+        state: { ...this.topic(topic), catalog: this.catalogFor(topic) } }));
+    return nonce;
+  }
+  bindCommitInput(topic: Binding, nonce: string, commitOID: string): void {
+    const key = stableJSON([topic.id,binding(topic)]);
+    const row = this.db.prepare("SELECT record FROM evidence_commit_inputs WHERE binding=?").get(key);
+    const input = row ? JSON.parse(String(row.record)) : null;
+    if (input?.nonce !== nonce) fail("커밋 근거 체크포인트가 바뀌었습니다.");
+    this.db.prepare("UPDATE evidence_commit_inputs SET record=? WHERE binding=?").run(JSON.stringify({ ...input, commitOID }),key);
   }
   freezeFinalized(): void {
     for (const row of this.db.prepare("SELECT id,scope_generation,plan_epoch,plan_sha256 FROM topics WHERE state='CLOSED' OR committed_oid IS NOT NULL").all())

@@ -2091,3 +2091,21 @@ it("commit preserves the validated evidence when a shared source changes during 
     await expect(engine.push(topicId)).resolves.toBe(database.getFlags(topicId).committedOID);
   } finally { database.close(); }
 });
+
+it("closing after a failed commit freezes the subsequently reviewed evidence, not the failed attempt",async()=>{
+  const {database,engine,gitService,topicId}=await setupReadyToDeliver("failed-evidence-commit");
+  try {
+    const topic=database.getTopic(topicId);
+    const source=database.evidence.register(topicId,{url:"https://team.atlassian.net/browse/APP-1",label:"Policy",mode:"connector",intervalSeconds:300});
+    const ingest=(content:string)=>{const check=database.evidence.begin(source.id,true)!;database.evidence.ingest(source.id,{checkId:check.checkId,revision:content,units:[{id:"policy",kind:"issue",content}]});};
+    ingest("v1");database.evidence.review(topic,database.evidence.topic(topic).digest,"Original checked",topic);
+    const spy=vi.spyOn(gitService,"commit").mockRejectedValue(new Error("Git failed"));
+    try {await expect(engine.commit(topicId,"feature",["feature.txt"])).rejects.toThrow("Git failed");} finally {spy.mockRestore();}
+    ingest("v2");const latest=database.evidence.topic(topic);
+    database.evidence.review(topic,latest.digest,"New body checked",topic);
+    engine.close(topicId);
+    expect(database.getTopic(topicId).state).toBe("CLOSED");
+    expect(database.getFlags(topicId).committedOID).toBeNull();
+    expect(database.evidence.topic(database.getTopic(topicId))).toMatchObject({digest:latest.digest,reviewed:true,ready:true});
+  } finally {database.close();}
+});

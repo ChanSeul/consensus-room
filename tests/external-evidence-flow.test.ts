@@ -440,3 +440,21 @@ it.each([false,true])("frozen corpus uses committed hashes with an existing inde
   const entries=index.split("\n").map(line=>JSON.parse(line));
   expect(entries).toHaveLength(1);expect(JSON.parse(readFileSync(entries[0].path,"utf8")).content).toBe("initial");
 });
+
+it("the user can explicitly re-review migrated closed committed evidence through HTTP",async()=>{
+  const f=fixture();f.ingest("changed after historical approval");
+  const raw=new DatabaseSync(join(f.root,"room.sqlite"));
+  try {raw.prepare("UPDATE topics SET state='CLOSED',committed_oid=? WHERE id='t'").run("b".repeat(40));} finally {raw.close();}
+  f.database.evidence.freezeFinalized();const before=f.database.evidence.topic(f.database.getTopic("t"));
+  expect(before.reviewed).toBe(false);
+  const config=loadConfig({repositoryPath:f.root,dataDirectory:f.root,webDirectory:join(f.root,"no-web"),launchToken:"test-token",enforceBudgets:false});
+  const app=await buildApp({config,database:f.database,runner:f.runner,claude:f.adapter,codex:{...f.adapter,role:"codex"}});
+  const headers={"x-consensus-token":"test-token"},payload={digest:before.digest,plan:before.plan,reason:"Explicitly reviewed retained body"};
+  try {
+    const url="/api/topics/t/evidence/review";
+    expect((await app.inject({method:"POST",url,headers:{...headers,"x-consensus-actor":"mediator"},payload})).statusCode).toBe(403);
+    expect((await app.inject({method:"POST",url,headers,payload})).statusCode).toBe(200);
+    expect(f.database.getTopic("t").state).toBe("CLOSED");
+    expect(f.database.evidence.topic(f.database.getTopic("t"))).toMatchObject({digest:before.digest,reviewed:true,ready:true});
+  } finally {await app.close();dbs.splice(dbs.indexOf(f.database),1);}
+});
