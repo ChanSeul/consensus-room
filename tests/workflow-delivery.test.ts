@@ -2109,3 +2109,30 @@ it("closing after a failed commit freezes the subsequently reviewed evidence, no
     expect(database.evidence.topic(database.getTopic(topicId))).toMatchObject({digest:latest.digest,reviewed:true,ready:true});
   } finally {database.close();}
 });
+
+it.each(["changed","expired"])("interrupted commit recovery retains its request-bound evidence after %s cache",async(change)=>{
+  const f=await setupReadyToDeliver("evidence-recovery-"+change);let database=f.database;
+  let clock:ReturnType<typeof vi.spyOn>|undefined;
+  try {
+    const topic=database.getTopic(f.topicId);
+    const source=database.evidence.register(f.topicId,{url:"https://team.atlassian.net/browse/APP-1",label:"Policy",mode:"connector",intervalSeconds:300});
+    const ingest=(content:string)=>{const check=database.evidence.begin(source.id,true)!;database.evidence.ingest(source.id,{checkId:check.checkId,revision:content,units:[{id:"policy",kind:"issue",content}]});};
+    ingest("approved before commit");const before=database.evidence.topic(topic);
+    database.evidence.review(topic,before.digest,"Original checked",topic);
+    database.claimActionRequest(f.topicId,"commit","interrupted-evidence",{message:"feature",paths:["feature.txt"]});
+    const original=f.gitService.commit.bind(f.gitService);
+    const spy=vi.spyOn(f.gitService,"commit").mockImplementation(async(...args)=>{await original(...args);throw Error("Lost Git reply");});
+    try {await expect(f.engine.commit(f.topicId,"feature",["feature.txt"],"interrupted-evidence")).rejects.toThrow("Lost Git reply");} finally {spy.mockRestore();}
+    const oid=await f.gitService.head(f.worktree);
+    if(change==="changed")ingest("new unapproved shared body");
+    else clock=vi.spyOn(Date,"now").mockReturnValue(Date.now()+3_600_000);
+    database.close();database=new ConsensusDatabase(join(f.repository,"..","data","room.sqlite"));
+    database.recoverInterruptedDeliveryRequests();
+    const engine=new WorkflowEngine({...f.dependencies,database,artifacts:new ArtifactStore(join(f.repository,"..","data","topics"),database),git:f.gitService});
+    await engine.reconcileDelivery(f.topicId,{idempotencyKey:"interrupted-evidence",outcome:"succeeded",oid});
+    const state=database.evidence.topic(database.getTopic(f.topicId));
+    expect(state).toMatchObject({digest:before.digest,ready:true,reviewed:true});
+    expect(database.evidence.sourceSnapshot(state.sources[0])!.units[0].content).toBe("approved before commit");
+    await expect(engine.push(f.topicId)).resolves.toBe(oid);
+  } finally {clock?.mockRestore();database.close();}
+});

@@ -186,7 +186,7 @@ export class EvidenceStore {
     const captured = committed && input?.commitOID === committed ? input.state : null;
     const state = captured ?? { ...this.topic(topic), catalog: this.catalog.state(topic.id) };
     // Legacy finalized stages keep their stored bodies; elapsed wall time is not a missing historical source.
-    if (!captured && legacy) state.ready = state.sources.every((source: EvidenceSource) =>
+    if (!captured && (legacy || committed)) state.ready = state.sources.every((source: EvidenceSource) =>
       source.provider === "figma" || Boolean(this.sourceSnapshot(source)));
     this.db.prepare("INSERT OR IGNORE INTO evidence_frozen_topics VALUES (?,?)").run(key,JSON.stringify(state));
   }

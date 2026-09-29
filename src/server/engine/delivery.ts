@@ -2949,6 +2949,7 @@ export class DeliveryPipeline {
         this.core.dependencies.database.annotateActionRequest(topicId, "commit", idempotencyKey, { parent: deliveryBase });
       }
       const evidenceInput = this.core.dependencies.database.evidence.captureForCommit(topic);
+      if (idempotencyKey) this.core.dependencies.database.annotateActionRequest(topicId,"commit",idempotencyKey,{ evidenceNonce: evidenceInput });
       const oid = await this.core.dependencies.git.commit(topic.worktreePath, topic.branchName, message, paths);
       this.core.dependencies.database.evidence.bindCommitInput(topic,evidenceInput,oid);
       this.assertDeliverySnapshot(topic);
@@ -3025,6 +3026,7 @@ export class DeliveryPipeline {
     const tree = await git.workingTreeOID(topic.worktreePath);
     if (tree !== flags.reviewedTreeOID) throw new Error("작업 트리가 최종 리뷰한 트리와 달라 합류 병합 커밋을 만들지 않았습니다. 다시 리뷰하세요.");
     const evidenceInput = database.evidence.captureForCommit(topic);
+    if (idempotencyKey) database.annotateActionRequest(topic.id,"commit",idempotencyKey,{ parent: deliveryBase, evidenceNonce: evidenceInput });
     const oid = await git.writeMergeCommit(topic.worktreePath, tree, approved, message);
     database.evidence.bindCommitInput(topic,evidenceInput,oid);
     const pending: PendingStageMerge = { oid, parent: deliveryBase, parents: approved, tree, paths: selectedPaths, message };
@@ -3246,6 +3248,10 @@ export class DeliveryPipeline {
       throw new Error("확인하려는 전달 요청이 현재 복구 대상과 다릅니다.");
     }
     const action = recovery.action;
+    const bindEvidenceInput = (oid: string) => {
+      const nonce = recovery.annotation?.evidenceNonce;
+      if (typeof nonce === "string") this.core.dependencies.database.evidence.bindCommitInput(topic,nonce,oid);
+    };
     const startedGeneration = topic.scopeGeneration;
     // git 확인은 await를 여러 번 지난다. 기록 직전에 상태·세대·복구 대상이 그대로인지 다시 본다(감사 ②).
     const assertStillReconciling = () => {
@@ -3307,6 +3313,7 @@ export class DeliveryPipeline {
           // 이벤트가 없다 — 없을 때만 넣어 이 병합 커밋의 확정 이벤트가 정확히 하나가 되게 한다.
           const confirmed = this.core.dependencies.database.getScopedTimeline(topicId, topic.scopeGeneration)
             .some((event) => event.payload?.deliveryAction === "commit" && event.payload?.oid === head);
+          bindEvidenceInput(head);
           return this.core.transitionWith(topicId, "READY_TO_DELIVER", alreadyCommitted
             ? `확정 기록 뒤 요청 완료 전에 멈췄던 ${action}(합류 병합 커밋 ${head}) 결과를 사용자가 성공으로 확인했습니다.`
             : `중단됐던 ${action} 결과를 사용자가 성공으로 확인했습니다.`, {
@@ -3331,6 +3338,7 @@ export class DeliveryPipeline {
           throw new Error("복구한 커밋에 사용자가 고른 범위 밖 파일이 들어 있습니다.");
         }
         assertStillReconciling();
+        bindEvidenceInput(head);
         confirmedChanges = { committedOID: head, pushedOID: null };
       } else {
         if (flags.committedOID !== head) {
