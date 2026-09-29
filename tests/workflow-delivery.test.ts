@@ -2071,3 +2071,23 @@ describe("E3-4c host-review 39d21df9 F003·F004 — 세션별 수신 기록", ()
     room.database.close();
   });
 });
+
+
+it("commit preserves the validated evidence when a shared source changes during Git commit", async () => {
+  const {database,engine,gitService,topicId}=await setupReadyToDeliver("evidence-commit-race");
+  try {
+    const topic=database.getTopic(topicId);
+    const source=database.evidence.register(topicId,{url:"https://team.atlassian.net/browse/APP-1",label:"Policy",mode:"connector",intervalSeconds:300});
+    const ingest=(content:string)=>{const check=database.evidence.begin(source.id,true)!;database.evidence.ingest(source.id,{checkId:check.checkId,revision:content,units:[{id:"policy",kind:"issue",content}]});};
+    ingest("approved v1");
+    const before=database.evidence.topic(topic);
+    database.evidence.review(topic,before.digest,"Confirmed original policy",topic);
+    const original=gitService.commit.bind(gitService);
+    const spy=vi.spyOn(gitService,"commit").mockImplementation(async(...args)=>{ingest("unreviewed v2");return original(...args);});
+    try { await engine.commit(topicId,"feature",["feature.txt"]); } finally { spy.mockRestore(); }
+    const after=database.evidence.topic(database.getTopic(topicId));
+    expect(after).toMatchObject({digest:before.digest,ready:true,reviewed:true});
+    expect(database.evidence.sourceSnapshot(after.sources[0])!.units[0].content).toBe("approved v1");
+    await expect(engine.push(topicId)).resolves.toBe(database.getFlags(topicId).committedOID);
+  } finally { database.close(); }
+});

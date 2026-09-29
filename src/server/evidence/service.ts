@@ -75,22 +75,25 @@ export class EvidenceService {
   async prepareMediator(database: ConsensusDatabase, topicId: string, sessionId: string, pageBytes?: number): Promise<MediatorEvidenceResponse> {
     const start = database.getTopic(topicId);
     if (start.state === "CLOSED") throw new Error("닫힌 주제는 수집하지 않습니다.");
-    for (const root of this.store.catalog.forTopic(topicId).filter(root => root.status === "approved" && root.nextCheckAt <= Date.now())) await this.collect(root.id);
-    const deadline = Date.now() + 90_000;
-    for (const source of this.store.list(topicId)) {
-      if (this.store.catalog.managed(source.id)) continue;
-      if (Date.now() >= deadline) throw new Error("이번 수집 대기 시간이 끝났습니다. 완료된 자료는 보존했으니 다시 확인하세요.");
-      if (source.mode !== "rest") throw new Error("서버 REST 연결이 필요합니다. 연결 도구로 자동 수집하지 않습니다.");
-      if (this.connector.configured && !this.connector.configured(source)) throw new Error("서버 읽기 인증 설정이 필요합니다.");
-      await this.refresh(source.id);
+    const frozen = this.store.isFrozen(start);
+    if (!frozen) {
+      for (const root of this.store.catalog.forTopic(topicId).filter(root => root.status === "approved" && root.nextCheckAt <= Date.now())) await this.collect(root.id);
+      const deadline = Date.now() + 90_000;
+      for (const source of this.store.list(topicId)) {
+        if (this.store.catalog.managed(source.id)) continue;
+        if (Date.now() >= deadline) throw new Error("이번 수집 대기 시간이 끝났습니다. 완료된 자료는 보존했으니 다시 확인하세요.");
+        if (source.mode !== "rest") throw new Error("서버 REST 연결이 필요합니다. 연결 도구로 자동 수집하지 않습니다.");
+        if (this.connector.configured && !this.connector.configured(source)) throw new Error("서버 읽기 인증 설정이 필요합니다.");
+        await this.refresh(source.id);
+      }
     }
     const topic = database.getTopic(topicId);
     if (topic.scopeGeneration !== start.scopeGeneration || topic.state === "CLOSED") throw new Error("수집 중 작업 범위가 바뀌었습니다.");
     // An external lease or retry delay must not cause an overdue cache to be presented as newly checked.
-    if (this.store.list(topicId).some(source => source.mode !== "rest" || (!this.store.catalog.managed(source.id) && source.nextCheckAt <= Date.now()) || !this.store.fresh(source))) {
+    if (!frozen && this.store.list(topicId).some(source => source.mode !== "rest" || (!this.store.catalog.managed(source.id) && source.nextCheckAt <= Date.now()) || !this.store.fresh(source))) {
       throw new Error("원문 수집이 진행 중이거나 실패했습니다. 완료 후 다시 확인하세요.");
     }
-    const catalog = this.store.catalog.state(topicId);
+    const catalog = this.store.catalogFor(topic);
     if (catalog.roots.length) {
       this.store.assertReady(topic, false);
       const digest = this.store.topic(topic).digest;
@@ -198,7 +201,7 @@ export function withEvidence(adapter: AgentAdapter, database: ConsensusDatabase,
       for (const source of designSources) {
         // An old cache must never be presented as the current design. The link can still be queried directly.
         if (!database.evidence.fresh(source)) continue;
-        const snapshot = database.evidence.snapshot(source.id, source.contentHash ?? undefined);
+        const snapshot = database.evidence.sourceSnapshot(source);
         if (!snapshot) continue;
         const images: string[] = [];
         for (const hash of new Set(snapshot.units.flatMap(unit => unit.imageHash ? [unit.imageHash] : []))) {
@@ -224,13 +227,13 @@ export function withEvidence(adapter: AgentAdapter, database: ConsensusDatabase,
       database.evidence.measure(`runner:${topic.id}`, "deliveredBytes", Buffer.byteLength(evidenceText));
     }
     const sourceDigest = database.evidence.topic(topic).digest;
-    const catalog = database.evidence.catalog.state(topic.id);
+    const catalog = database.evidence.catalogFor(topic);
     let corpusGuidance = "";
     if (catalog.roots.length) {
       const directory = join(imageDirectory, "corpus", topic.id, sourceDigest);
       await mkdir(directory, { recursive: true, mode: 0o700 });
       const index: string[] = [];
-      for (const source of database.evidence.list(topic.id)) for (const unit of database.evidence.snapshot(source.id)?.units ?? []) {
+      for (const source of database.evidence.list(topic.id)) for (const unit of database.evidence.sourceSnapshot(source)?.units ?? []) {
         if (source.provider === "figma" && ["design", "render"].includes(unit.kind)) continue;
         const body = JSON.stringify({ source: source.url, ...unit });
         const path = join(directory, `${evidenceHash(body)}.json`);

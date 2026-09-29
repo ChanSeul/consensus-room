@@ -63,7 +63,7 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
   app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/search", async request => {
     const input = EvidenceSearchInputSchema.parse(request.body);
     const terms = input.query.toLocaleLowerCase().split(/\s+/).filter(Boolean);
-    const hits = db.evidence.list(request.params.id).flatMap(source => (db.evidence.snapshot(source.id)?.units ?? []).flatMap(unit => {
+    const hits = db.evidence.list(request.params.id).flatMap(source => (db.evidence.sourceSnapshot(source)?.units ?? []).flatMap(unit => {
       const haystack = `${source.label}\n${unit.id}\n${unit.content}`.toLocaleLowerCase();
       const positions = terms.map(term => haystack.indexOf(term)).filter(i => i >= 0);
       const bodyPositions=terms.map(term=>unit.content.toLocaleLowerCase().indexOf(term)).filter(i=>i>=0);
@@ -76,8 +76,9 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
   app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/read", async request => {
     const input = z.object({ sourceId: z.string(), unitId: z.string(), hash: z.string(), offset: z.number().int().nonnegative().default(0),
       limit: z.number().int().min(1).max(16000).default(8000) }).strict().parse(request.body);
-    if (!db.evidence.list(request.params.id).some(s => s.id === input.sourceId)) throw new Error("현재 승인된 근거가 아닙니다.");
-    const unit = db.evidence.snapshot(input.sourceId)?.units.find(u => u.id === input.unitId && u.contentHash === input.hash);
+    const source = db.evidence.list(request.params.id).find(s => s.id === input.sourceId);
+    if (!source) throw new Error("현재 승인된 근거가 아닙니다.");
+    const unit = db.evidence.sourceSnapshot(source)?.units.find(u => u.id === input.unitId && u.contentHash === input.hash);
     if (!unit) throw new Error("원문 버전이 바뀌었습니다. 다시 검색하세요.");
     const points = Array.from(unit.content), end = Math.min(points.length, input.offset + input.limit);
     return { ...unit, content: points.slice(input.offset, end).join(""), nextOffset: end < points.length ? end : null };

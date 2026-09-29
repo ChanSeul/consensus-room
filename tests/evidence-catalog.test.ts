@@ -229,3 +229,12 @@ it("HTML links resolve relative references and do not include closing quotes", (
   expect(links.map(l=>l.url)).toEqual(expect.arrayContaining(['https://example.com/policy','https://example.com/faq','https://example.net/doc']));
   expect(links.some(l=>l.url.includes("'"))).toBe(false);
 });
+
+it("Slack invalid_cursor responses restart while other HTTP 200 API failures preserve progress",async()=>{
+  const {db}=fixture();const root=db.evidence.catalog.add("a",input("https://team.slack.com/archives/C123"),true);
+  const source=db.evidence.get(root.sourceId);
+  for (const error of ["invalid_cursor","ratelimited"]) {
+    const request:typeof fetch=async()=>new Response(JSON.stringify({ok:false,error}),{status:200});
+    await expect(collectPage(source,JSON.stringify({stage:"messages",next:"expired"}),{},request,new AbortController().signal,async()=>({revision:"unused"}))).rejects.toMatchObject({restart:error==="invalid_cursor"});
+  }
+});

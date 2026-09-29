@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { ConsensusDatabase } from "../src/server/database";
+import { withEvidence } from "../src/server/evidence/service";
 import { ArtifactStore } from "../src/server/artifacts";
 import { GitService } from "../src/server/git";
 import { EngineCore } from "../src/server/engine/core";
@@ -392,4 +393,50 @@ it("only users approve roots, stale or running selections preserve the active so
   expect((await app.inject({method:"POST",url:`${route}/selection`,headers,payload:{...selection,version:catalog.version,action:"remove"}})).statusCode).toBe(200);
   expect(f.database.getTopic(f.topic.id)).toEqual(closed);
   await app.close();dbs.splice(dbs.indexOf(f.database),1);
+});
+
+
+it("frozen HTTP and mediator readers return the committed body after shared updates and expiration", async () => {
+  const f=fixture();f.database.updateTopic("t",{state:"READY_TO_DELIVER",committedOID:"b".repeat(40)});
+  const before=f.database.evidence.topic(f.database.getTopic("t"));f.ingest("new unapproved source");
+  const config=loadConfig({repositoryPath:f.root,dataDirectory:f.root,webDirectory:join(f.root,"no-web"),launchToken:"test-token",enforceBudgets:false});
+  const fetch=vi.fn(async()=>{throw Error("Frozen evidence must not refetch");});
+  const app=await buildApp({config,database:f.database,runner:f.runner,claude:f.adapter,codex:{...f.adapter,role:"codex"},evidenceConnector:{configured:()=>false,fetch}});
+  const headers={"x-consensus-token":"test-token"};
+  try {
+    const now=Date.now();vi.spyOn(Date,"now").mockReturnValue(now+3_600_000);
+    const search=await app.inject({method:"POST",url:"/api/topics/t/evidence/search",headers,payload:{query:"initial"}});
+    expect(search.json().total).toBe(1);const hit=search.json().hits[0];
+    const read=await app.inject({method:"POST",url:"/api/topics/t/evidence/read",headers,payload:{sourceId:hit.sourceId,unitId:hit.unitId,hash:hit.hash}});
+    expect(read.json().content).toBe("initial");
+    const batch=await app.inject({method:"POST",url:"/api/topics/t/evidence/mediator/batch",headers:{...headers,"x-consensus-actor":"mediator"},payload:{sessionId:"frozen"}});
+    expect(batch.statusCode).toBe(200);expect(batch.json().digest).toBe(before.digest);
+    expect(batch.json().changes[0].content).toBe("initial");expect(fetch).not.toHaveBeenCalled();
+  } finally {await app.close();dbs.splice(dbs.indexOf(f.database),1);}
+});
+
+it.each([false,true])("legacy committed evidence migrates without permanently freezing expiration or re-review: %s",(changed)=>{
+  const f=fixture();if(changed)f.ingest("changed before migration");const now=Date.now();vi.spyOn(Date,"now").mockReturnValue(now+3_600_000);
+  const raw=new DatabaseSync(join(f.root,"room.sqlite"));
+  try {raw.prepare("UPDATE topics SET committed_oid=?,state='READY_TO_DELIVER' WHERE id='t'").run("b".repeat(40));} finally {raw.close();}
+  f.database.evidence.freezeFinalized();
+  const topic=f.database.getTopic("t"),state=f.database.evidence.topic(topic);
+  expect(state).toMatchObject({ready:true,reviewed:!changed});
+  if(changed)f.database.evidence.review(topic,state.digest,"Explicitly rechecked migrated body",topic);
+  expect(()=>f.database.evidence.assertReady(topic)).not.toThrow();
+});
+
+it.each([false,true])("frozen corpus uses committed hashes with an existing index: %s",async(existingIndex)=>{
+  const f=fixture();f.database.evidence.catalog.add("t",{...sourceInput,scope:"topic",required:false},true);
+  f.database.updateTopic("t",{planSHA256:"a".repeat(64),state:"READY_TO_DELIVER"});
+  const topic=f.database.getTopic("t"),before=f.database.evidence.topic(topic);
+  f.database.evidence.review(topic,before.digest,"Original body checked",topic);
+  f.database.updateTopic("t",{committedOID:"b".repeat(40)});
+  const adapter=withEvidence(f.adapter,f.database,join(f.root,"images"));
+  if(existingIndex)await adapter.createSession({cwd:f.root,prompt:"Review"});
+  f.ingest("unapproved v2");
+  await adapter.createSession({cwd:f.root,prompt:"Review"});
+  const index=readFileSync(join(f.root,"images","corpus","t",before.digest,"index.jsonl"),"utf8");
+  const entries=index.split("\n").map(line=>JSON.parse(line));
+  expect(entries).toHaveLength(1);expect(JSON.parse(readFileSync(entries[0].path,"utf8")).content).toBe("initial");
 });

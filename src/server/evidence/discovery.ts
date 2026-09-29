@@ -97,7 +97,7 @@ export async function collectPage(source: EvidenceSource, rawCursor: string | nu
     const [workspace, channel] = source.resource.split("/");
     const slack = async (method: string, args: Record<string,string> = {}) => {
       const data = await json(`https://slack.com/api/${method}?${new URLSearchParams({ channel, ...args })}`, { Authorization: `Bearer ${credentials.slackToken}` });
-      if (!data.ok) throw new EvidenceFetchError("Slack 원문·답글 읽기에 실패했습니다. 연결과 접근 범위를 확인하세요.");
+      if (!data.ok) throw new EvidenceFetchError("Slack 원문·답글 읽기에 실패했습니다. 연결과 접근 범위를 확인하세요.", 300, data.error === "invalid_cursor");
       return data;
     };
     if (!source.selector && !cursor.stage) {
