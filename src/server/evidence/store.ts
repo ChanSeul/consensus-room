@@ -238,21 +238,28 @@ export class EvidenceStore {
   linkedTopics(sourceId: string): string[] {
     return this.db.prepare("SELECT id FROM topics").all().map(row => String(row.id)).filter(id => this.list(id).some(s => s.id === sourceId));
   }
-  useRest(sourceId: string): EvidenceSource {
-    this.db.exec("BEGIN IMMEDIATE");
+  useRest(sourceId: string): EvidenceSource { return this.useMode(sourceId, "rest"); }
+  useMode(sourceId: string, mode: "rest" | "connector"): EvidenceSource {
+    const ownsTransaction = !this.db.isTransaction;
+    if (ownsTransaction) this.db.exec("BEGIN IMMEDIATE");
     try {
       const source = this.get(sourceId);
       const row = this.db.prepare("SELECT lease_until FROM evidence_sources WHERE id=?").get(sourceId)!;
       if (Number(row.lease_until ?? 0) > this.clock()) fail("원문 수집 중에는 연결 방식을 바꿀 수 없습니다.");
-      const next: EvidenceSource = source.mode === "rest" ? source
-        : { ...source, mode: "rest", revision: null, checkedAt: null, nextCheckAt: source.error ? source.nextCheckAt : 0 };
+      const next: EvidenceSource = source.mode === mode ? source
+        : { ...source, mode, revision: null, checkedAt: null, nextCheckAt: source.error ? source.nextCheckAt : 0 };
       this.save(next);
-      this.db.exec("COMMIT"); return next;
-    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+      if (ownsTransaction) this.db.exec("COMMIT"); return next;
+    } catch (error) { if (ownsTransaction) this.db.exec("ROLLBACK"); throw error; }
   }
   measure(scope: string, name: string, value: number): void {
     this.db.prepare("INSERT INTO evidence_metrics(scope,name,value) VALUES (?,?,?) ON CONFLICT(scope,name) DO UPDATE SET value=value+excluded.value")
       .run(scope, name, value);
+  }
+  incompleteHostCapture(id: string, missing: string[]): EvidenceSource {
+    const source=this.get(id);
+    const next={...source,error:redactSecrets(`호스트 수집에서 읽지 못한 항목: ${missing.join("; ")}`).slice(0,500),nextCheckAt:0};
+    this.save(next); return next;
   }
   metrics(scope: string): Record<string, number> {
     return Object.fromEntries(this.db.prepare("SELECT name,value FROM evidence_metrics WHERE scope=?").all(scope).map(row => [String(row.name), Number(row.value)]));
@@ -414,16 +421,17 @@ export class EvidenceStore {
   }
   begin(id: string, force = false): EvidenceCheck | null {
     const now = this.clock();
-    this.db.exec("BEGIN IMMEDIATE");
+    const ownsTransaction = !this.db.isTransaction;
+    if (ownsTransaction) this.db.exec("BEGIN IMMEDIATE");
     try {
       const source = this.get(id);
       const row = this.db.prepare("SELECT lease_until FROM evidence_sources WHERE id=?").get(id)!;
-      if (Number(row.lease_until ?? 0) > now || ((!force || source.error) && source.nextCheckAt > now)) { this.db.exec("COMMIT"); return null; }
+      if (Number(row.lease_until ?? 0) > now || ((!force || source.error) && source.nextCheckAt > now)) { if (ownsTransaction) this.db.exec("COMMIT"); return null; }
       const checkId = randomUUID();
       this.db.prepare("UPDATE evidence_sources SET check_id=?,lease_until=? WHERE id=?").run(checkId, now + 240_000, id);
-      this.db.exec("COMMIT");
+      if (ownsTransaction) this.db.exec("COMMIT");
       return { source, checkId };
-    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    } catch (error) { if (ownsTransaction) this.db.exec("ROLLBACK"); throw error; }
   }
   private check(id: string, checkId: string): EvidenceSource {
     const row = this.db.prepare("SELECT check_id,lease_until FROM evidence_sources WHERE id=?").get(id);
@@ -451,7 +459,8 @@ export class EvidenceStore {
       return { ...unit, content, author, imageHash, contentHash: evidenceHash(stableJSON({ kind: unit.kind, content, author, imageHash })) };
     }).sort((a, b) => a.id.localeCompare(b.id));
     const contentHash = evidenceHash(stableJSON(units.map(u => [u.id, u.contentHash])));
-    this.db.exec("BEGIN IMMEDIATE");
+    const ownsTransaction = !this.db.isTransaction;
+    if (ownsTransaction) this.db.exec("BEGIN IMMEDIATE");
     try {
       const source = this.check(id, input.checkId);
       if (expectedGeneration !== undefined && expectedGeneration !== this.generation(id)) fail("다른 수집이 먼저 갱신한 원문입니다. 처음부터 다시 수집하세요.");
@@ -463,8 +472,8 @@ export class EvidenceStore {
       const next = { ...source, revision: input.revision, contentHash, checkedAt: this.clock(), error: null, nextCheckAt: this.clock() + source.intervalSeconds * 1000 };
       this.save(next);
       this.db.prepare("UPDATE evidence_sources SET check_id=NULL,lease_until=NULL WHERE id=?").run(id);
-      this.db.exec("COMMIT"); return next;
-    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+      if (ownsTransaction) this.db.exec("COMMIT"); return next;
+    } catch (error) { if (ownsTransaction) this.db.exec("ROLLBACK"); throw error; }
   }
   failed(id: string, checkId: string, error: string, retryAfterSeconds = 300): void {
     this.db.exec("BEGIN IMMEDIATE");

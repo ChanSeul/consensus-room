@@ -12,7 +12,115 @@ import type { EvidenceRootInput, EvidenceSource } from "../src/shared/externalEv
 // HTTP fixtures exercise pagination/comments/failure, never reproduce production calculations.
 // New contracts have no prior implementation to restore. Live auth and rendered UI remain separate.
 const cleanup: Array<() => void> = [];
+it("a complete host capture reaches the mediator without REST credentials; partial captures and stale reads do not", async () => {
+  const {db}=fixture();
+  const root=db.evidence.catalog.add("a",{...input("https://docs.google.com/spreadsheets/d/policy/edit"),scope:"group"},true);
+  const fetch=vi.fn(async()=>{throw new Error("No provider credentials or model calls needed");});
+  const service=new EvidenceService(db.evidence,{fetch});
+  const capture=(missing:string[])=>{
+    const source=db.evidence.get(root.sourceId);
+    return {version:db.evidence.catalog.version("a"),rootId:root.id,sourceId:root.sourceId,previousHash:source.contentHash,
+      previousCheckedAt:source.checkedAt,observedAt:Date.now(),revision:"export-v1",units:[{id:"A1",kind:"cells" as const,content:"Owner policy"}],missing};
+  };
+  try {
+    service.importHost("a",capture(["unread comments"]));
+    await expect(service.prepareMediator(db,"a","host-session")).rejects.toThrow();
+    service.importHost("a",capture([]));
+    const before=db.evidence.get(root.sourceId).contentHash;
+    const packet=await service.prepareMediator(db,"a","host-session");
+    expect(packet.corpus).toMatchObject({sources:1,units:1});
+    expect(db.evidence.catalog.state("a").coverage.ready).toBe(true);
+    const frozen=db.evidence.topic(db.getTopic("closed")).digest;
+    await service.poll();
+    expect(fetch).not.toHaveBeenCalled();
+    expect(db.evidence.get(root.sourceId).contentHash).toBe(before);
+    expect(db.evidence.topic(db.getTopic("closed")).digest).toBe(frozen);
+    const other=db.evidence.catalog.add("b",{...input("https://docs.google.com/spreadsheets/d/policy/edit"),scope:"group",mode:"connector"},true);
+    service.importHost("b",{...capture([]),rootId:other.id,version:db.evidence.catalog.version("b")});
+    service.importHost("a",capture(["comments became inaccessible"]));
+    expect(db.evidence.catalog.state("b").coverage.ready).toBe(false);
+    await expect(service.prepareMediator(db,"b","other-session")).rejects.toThrow();
+    expect(db.evidence.snapshot(root.sourceId)?.units[0].content).toBe("Owner policy");
+  } finally {await service.stop();}
+});
 afterEach(() => { cleanup.splice(0).forEach(f => f()); vi.useRealTimers(); });
+it("partial host recovery cannot renew an unread sibling in another completed root", async () => {
+  vi.useFakeTimers({toFake:["Date"]});
+  const {db}=fixture(), c=db.evidence.catalog;
+  const a=c.add("a",input("https://team.atlassian.net/browse/APP-1"),true);
+  const b=c.add("b",input("https://team.atlassian.net/browse/APP-1"),true);
+  const child="https://team.atlassian.net/browse/APP-2";
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw new Error("Host only");}});
+  const capture=(topic:string,rootId:string,url:string,missing:string[]=[])=>{
+    const source=c.state(topic).entries.find(e=>e.rootId===rootId && e.source.url===url)!.source;
+    return service.importHost(topic,{version:c.version(topic),rootId,sourceId:source.id,previousHash:source.contentHash,
+      previousCheckedAt:source.checkedAt,observedAt:Date.now(),revision:"browser",missing,
+      units:[{id:"body",kind:"issue",content:url.endsWith("APP-1")?`Root ${child}`:"Sibling policy"}]});
+  };
+  try {
+    capture("a",a.id,db.evidence.get(a.sourceId).url); capture("b",b.id,db.evidence.get(b.sourceId).url);
+    const sibling=capture("a",a.id,child); capture("b",b.id,child);
+    expect(c.state("b").coverage.ready).toBe(true);
+    vi.setSystemTime(Date.now()+1_900_000);
+    capture("a",a.id,db.evidence.get(a.sourceId).url,["comments missing"]);
+    capture("b",b.id,db.evidence.get(b.sourceId).url);
+    expect(c.state("b").coverage.ready).toBe(false);
+    expect(db.evidence.fresh(db.evidence.get(sibling.id))).toBe(false);
+    await expect(service.prepareMediator(db,"b","blocked")).rejects.toThrow();
+    capture("b",b.id,child);
+    expect((await service.prepareMediator(db,"b","recovered")).corpus).toMatchObject({sources:2,units:2});
+  } finally {await service.stop();}
+});
+it.each([false,true])("REST collection preserves host roots and rejects stale captures (host REST credentials: %s)", async hostConfigured => {
+  vi.useFakeTimers({toFake:["Date"]});
+  const {db}=fixture(),c=db.evidence.catalog;
+  const host=c.add("a",input("https://docs.google.com/spreadsheets/d/policy/edit"),true);
+  const rest=c.add("a",input("https://team.atlassian.net/browse/APP-1"),true);
+  const discover=vi.fn(async()=>({units:[{id:"issue",kind:"issue" as const,content:"Root"}],
+    links:[{url:db.evidence.get(host.sourceId).url,label:"Policy",unitId:"issue",relation:"link" as const}],cursor:null,revision:"rest-v1"}));
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw new Error("unused");},discover,configured:s=>s.provider==="jira" || hostConfigured});
+  try {
+    const source=service.importHost("a",{version:c.version("a"),rootId:host.id,sourceId:host.sourceId,previousHash:null,previousCheckedAt:null,
+      observedAt:Date.now(),revision:"host-v1",units:[{id:"A1",kind:"cells",content:"Policy"}],missing:[]});
+    await service.collect(rest.id);
+    expect(c.state("a").coverage.ready).toBe(true);
+    expect(db.evidence.get(host.sourceId)).toMatchObject({mode:"connector",checkedAt:source.checkedAt,contentHash:source.contentHash});
+    expect(discover).toHaveBeenCalledTimes(1);
+    vi.setSystemTime(Date.now()+1_900_000);
+    await service.collect(rest.id,true);
+    expect(c.state("a").coverage.ready).toBe(false);
+    expect(db.evidence.get(host.sourceId)).toMatchObject({mode:"connector",checkedAt:source.checkedAt,contentHash:source.contentHash});
+    expect(discover).toHaveBeenCalledTimes(2);
+  } finally {await service.stop();}
+});
+it("resuming REST pagination replaces old pages and links with the complete host capture", async () => {
+  // collect/importHost -> current catalog and collected units; a failed next page preserves the real cursor.
+  // The mediator consumes this catalog. Browser rendering and live authentication are outside this test.
+  const {db}=fixture(),c=db.evidence.catalog;
+  const host=c.add("a",input("https://docs.google.com/spreadsheets/d/policy/edit"),true);
+  const rest=c.add("a",input("https://team.atlassian.net/browse/APP-1"),true);
+  const removed="https://www.figma.com/design/old?node-id=1-2";
+  const discover=vi.fn(async (source:EvidenceSource,cursor:string|null)=>{
+    if (source.id===rest.sourceId) return {units:[{id:"issue",kind:"issue" as const,content:"Root"}],
+      links:[{url:db.evidence.get(host.sourceId).url,label:"Policy",unitId:"issue",relation:"link" as const}],cursor:null,revision:"r1"};
+    if (cursor) throw new EvidenceFetchError("Next page unavailable");
+    return {units:[{id:"old",kind:"cells" as const,content:removed}],
+      links:[{url:removed,label:"Old design",unitId:"old",relation:"link" as const}],cursor:"page-2",revision:"s1"};
+  });
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw new Error("unused");},discover,configured:()=>true});
+  try {
+    await service.collect(rest.id);
+    expect(c.next(rest.id)).toMatchObject({source:{id:host.sourceId},cursor:"page-2"});
+    service.importHost("a",{version:c.version("a"),rootId:host.id,sourceId:host.sourceId,previousHash:null,previousCheckedAt:null,
+      observedAt:Date.now(),revision:"host-v2",units:[{id:"current",kind:"cells",content:"Current policy without the old design"}],missing:[]});
+    const calls=discover.mock.calls.length;
+    await service.collect(rest.id);
+    expect(c.state("a").entries.some(e=>e.source.url===removed)).toBe(false);
+    expect(c.collected(rest.id,host.sourceId).units.map(u=>u.id)).toEqual(["current"]);
+    expect(c.state("a").coverage.ready).toBe(true);
+    expect(discover).toHaveBeenCalledTimes(calls);
+  } finally {await service.stop();}
+});
 function fixture() {
   const path = mkdtempSync(join(tmpdir(),"catalog-")); const db = new ConsensusDatabase(join(path,"db"));
   cleanup.push(() => { db.close(); rmSync(path,{recursive:true,force:true}); });

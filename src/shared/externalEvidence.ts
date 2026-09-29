@@ -28,6 +28,16 @@ export const EvidenceSnapshotInputSchema = z.object({
   units: z.array(EvidenceUnitSchema).max(5000),
 }).strict();
 export type EvidenceSnapshotInput = z.infer<typeof EvidenceSnapshotInputSchema>;
+export const EvidenceHostImportSchema = z.object({
+  version: z.string().regex(/^[a-f0-9]{64}$/), rootId: z.string().uuid(),
+  sourceId: z.string().regex(/^[a-f0-9]{64}$/),
+  previousHash: z.string().regex(/^[a-f0-9]{64}$/).nullable(), previousCheckedAt: z.number().int().nonnegative().nullable(),
+  observedAt: z.number().int().nonnegative(), revision: z.string().min(1).max(300),
+  units: EvidenceSnapshotInputSchema.shape.units,
+  // Missing comments/pages remain a collection failure, even when the captured cells are searchable.
+  missing: z.array(z.string().trim().min(1).max(200)).max(30),
+}).strict();
+export type EvidenceHostImport = z.infer<typeof EvidenceHostImportSchema>;
 export interface EvidenceUnit extends Omit<EvidenceUnitInput, "imageBase64"> { contentHash: string; imageHash?: string }
 export interface EvidenceSnapshot { sourceId: string; contentHash: string; units: EvidenceUnit[] }
 export interface EvidenceSource extends EvidenceSourceInput {

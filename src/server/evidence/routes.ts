@@ -1,10 +1,11 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { MediatorEvidenceBatchInputSchema, MediatorEvidenceAckSchema, EvidenceDependencySchema, EvidenceReviewInputSchema, EvidenceSnapshotInputSchema, EvidenceSourceInputSchema,
-  parseEvidenceSource, EvidenceRootInputSchema, EvidenceSelectionInputSchema, EvidenceSearchInputSchema } from "../../shared/externalEvidence.js";
+  parseEvidenceSource, EvidenceRootInputSchema, EvidenceSelectionInputSchema, EvidenceSearchInputSchema, EvidenceHostImportSchema } from "../../shared/externalEvidence.js";
 import type { ConsensusDatabase } from "../database.js";
 import type { WorkflowEngine } from "../workflow.js";
 import type { EvidenceService } from "./service.js";
+import { assertMediatorForAnyTopic } from "../mediation.js";
 
 export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDatabase, workflow: WorkflowEngine, service: EvidenceService,
   authorizeReview: (headers: Record<string, unknown>) => void): void {
@@ -24,6 +25,17 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
     }
   };
   app.get<{ Params: { id: string } }>("/api/topics/:id/evidence/catalog", async request => db.evidence.catalog.state(request.params.id));
+  app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/host-import", {bodyLimit:16_000_000}, async request => {
+    mediator(request.headers);
+    const input=EvidenceHostImportSchema.parse(request.body);
+    const root=db.evidence.catalog.forTopic(request.params.id).find(r=>r.id===input.rootId);
+    if (!root) throw Object.assign(new Error("이 작업에 연결된 루트가 아닙니다."),{statusCode:409});
+    const affected=[...new Set([...db.evidence.catalog.affected(root),...db.evidence.linkedTopics(root.sourceId),...db.evidence.linkedTopics(input.sourceId)])];
+    assertMediatorForAnyTopic(db.roles,request.headers,affected.filter(id=>db.getTopic(id).state!=="CLOSED"));
+    idle(affected);
+    service.importHost(request.params.id,input);
+    return db.evidence.catalog.state(request.params.id);
+  });
   app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/roots", async request => {
     const input = EvidenceRootInputSchema.parse(request.body), context = db.evidence.catalog.context(request.params.id);
     const scope = input.scope === "group" && !context.group ? "topic" : input.scope;
@@ -32,7 +44,7 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
     if (scope === "workspace") user(request.headers);
     const parsed = parseEvidenceSource(input);
     if (scope === "workspace" && parsed.provider === "jira") throw new Error("Jira 루트는 작업 그룹별로 지정하세요.");
-    const source = db.evidence.ensureSource({url:input.url,label:input.label,mode:input.mode,intervalSeconds:input.intervalSeconds});
+    const source = db.evidence.ensureSource({url:input.url,label:input.label,mode:input.mode,intervalSeconds:input.intervalSeconds},true);
     const existing = db.evidence.catalog.forTopic(request.params.id).find(root => root.scope === scope && root.sourceId === source.id && root.status !== "removed");
     if (existing) return existing;
     if (approved) { const result = await workflow.changeEvidenceSelection(ids,()=>db.evidence.catalog.add(request.params.id,input,true)); notifySelection(ids); return result; }

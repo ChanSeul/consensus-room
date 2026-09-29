@@ -44,7 +44,7 @@ def mediator_identity():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--launch-file", type=Path, default=Path.home() / "Library/Application Support/ConsensusRoom/consensus-room.url")
-    parser.add_argument("command", choices=["due", "claim", "snapshot", "unchanged", "failure", "attach", "status", "batch", "ack", "connections", "use-rest", "metrics"])
+    parser.add_argument("command", choices=["due", "claim", "snapshot", "unchanged", "failure", "attach", "status", "batch", "ack", "connections", "use-rest", "metrics", "host-import", "catalog"])
     parser.add_argument("--id", help="source ID, or topic ID for attach/status")
     parser.add_argument("--input", type=Path, help="JSON file (do not place secret credentials here)")
     parser.add_argument("--session", help="실제 중재자 세션 ID; batch/ack에 필수")
@@ -65,9 +65,11 @@ def main():
         "batch": f"/api/topics/{source_id}/evidence/mediator/batch",
         "ack": f"/api/topics/{source_id}/evidence/mediator/ack",
         "metrics": f"/api/topics/{source_id}/evidence/metrics",
+        "host-import": f"/api/topics/{source_id}/evidence/host-import",
+        "catalog": f"/api/topics/{source_id}/evidence/catalog",
     }[args.command]
     data = None
-    if args.command not in {"due", "status", "connections", "metrics"}:
+    if args.command not in {"due", "status", "connections", "metrics", "catalog"}:
         if args.command in {"claim", "use-rest"}:
             data = b"{}"
         elif args.command in {"batch", "ack"}:

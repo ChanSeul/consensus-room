@@ -170,7 +170,9 @@ it("uses mediator HTTP and CLI batches without model calls or implicit acknowled
     const url = "/api/topics/t/evidence/mediator/batch";
     expect((await app.inject({ method: "POST", url, payload: { sessionId: "s" } })).statusCode).toBe(401);
     expect((await app.inject({ method: "POST", url, headers, payload: { sessionId: "s" } })).statusCode).toBe(403);
-    expect((await app.inject({ method: "POST", url, headers: mediator, payload: { sessionId: "s" } })).statusCode).not.toBe(200);
+    const hostRead = await app.inject({ method: "POST", url, headers: mediator, payload: { sessionId: "s" } });
+    expect(hostRead.statusCode).toBe(200);
+    expect(hostRead.json().changes.map((unit: any) => unit.content)).toEqual(["initial"]);
     expect(fetch).not.toHaveBeenCalled();
     expect((await app.inject({ method: "POST", url: `/api/evidence/${f.source.id}/use-rest`, headers: mediator, payload: {} })).statusCode).toBe(403);
     const convert = () => app.inject({ method: "POST", url: `/api/evidence/${f.source.id}/use-rest`, headers, payload: {} });

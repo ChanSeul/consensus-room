@@ -1,7 +1,8 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { EVIDENCE_PAGE_BYTES } from "../../shared/externalEvidence.js";
-import type { EvidenceSource, EvidenceSnapshotInput, MediatorEvidenceBatch, MediatorEvidenceResponse } from "../../shared/externalEvidence.js";
+import type { EvidenceSource, EvidenceSnapshotInput, EvidenceHostImport, MediatorEvidenceBatch, MediatorEvidenceResponse } from "../../shared/externalEvidence.js";
+import { discoverLinks } from "./discovery.js";
 import type { ConsensusDatabase } from "../database.js";
 import type { AgentResult } from "../../shared/contracts.js";
 import type { AgentAdapter, SessionTurn } from "../types.js";
@@ -31,6 +32,8 @@ export class EvidenceService {
     for (const root of this.store.catalog.due()) await this.collect(root.id);
   }
   collect(rootId: string, force = false): Promise<void> {
+    const root=this.store.catalog.roots().find(r=>r.id===rootId);
+    if (root && this.store.get(root.sourceId).mode==="connector") return Promise.resolve();
     const key = `root:${rootId}`, existing = this.jobs.get(key); if (existing) return existing;
     if (force) this.store.catalog.requestRefresh(rootId);
     const job = this.collectRoot(rootId).finally(() => this.jobs.delete(key));
@@ -45,6 +48,15 @@ export class EvidenceService {
       const { root, source, cursor } = next;
       let checkId: string | null = null; let committing = false;
       try {
+        if (source.mode==="connector" && this.store.catalog.hostManaged(source.id)) {
+          const snapshot=this.store.sourceSnapshot(source);
+          if (!snapshot || !this.store.fresh(source)) throw new EvidenceFetchError("호스트에서 원문을 다시 수집하세요. 이전 자료는 보존했습니다.");
+          const units=snapshot.units.map(({contentHash: _hash,imageHash,...unit})=>({ ...unit,
+            ...(imageHash ? {imageBase64:this.store.image(imageHash).toString("base64")} : {}) }));
+          committing=true;
+          this.store.catalog.replacePages(root,source,cursor,{units,links:discoverLinks(units,source.url),revision:source.revision!});
+          continue;
+        }
         if (this.store.get(root.sourceId).mode !== "rest" || !this.connector.discover || this.connector.configured?.(source) === false)
           throw new EvidenceFetchError("자동 수집에는 호스트의 읽기 연결이 필요합니다.");
         if (source.mode !== "rest") this.store.useRest(source.id);
@@ -82,7 +94,7 @@ export class EvidenceService {
       for (const source of this.store.list(topicId)) {
         if (this.store.catalog.managed(source.id)) continue;
         if (Date.now() >= deadline) throw new Error("이번 수집 대기 시간이 끝났습니다. 완료된 자료는 보존했으니 다시 확인하세요.");
-        if (source.mode !== "rest") throw new Error("서버 REST 연결이 필요합니다. 연결 도구로 자동 수집하지 않습니다.");
+        if (source.mode !== "rest") continue;
         if (this.connector.configured && !this.connector.configured(source)) throw new Error("서버 읽기 인증 설정이 필요합니다.");
         await this.refresh(source.id);
       }
@@ -90,7 +102,7 @@ export class EvidenceService {
     const topic = database.getTopic(topicId);
     if (topic.scopeGeneration !== start.scopeGeneration || topic.state === "CLOSED") throw new Error("수집 중 작업 범위가 바뀌었습니다.");
     // An external lease or retry delay must not cause an overdue cache to be presented as newly checked.
-    if (!frozen && this.store.list(topicId).some(source => source.mode !== "rest" || (!this.store.catalog.managed(source.id) && source.nextCheckAt <= Date.now()) || !this.store.fresh(source))) {
+    if (!frozen && this.store.list(topicId).some(source => (!this.store.catalog.managed(source.id) && source.nextCheckAt <= Date.now()) || !this.store.fresh(source))) {
       throw new Error("원문 수집이 진행 중이거나 실패했습니다. 완료 후 다시 확인하세요.");
     }
     const catalog = this.store.catalogFor(topic);
@@ -160,6 +172,12 @@ export class EvidenceService {
   ingest(id: string, input: EvidenceSnapshotInput): EvidenceSource {
     const before = this.store.get(id); const after = this.store.ingest(id, input);
     if (before.contentHash !== after.contentHash) this.changed(after);
+    return after;
+  }
+  importHost(topicId: string, input: EvidenceHostImport): EvidenceSource {
+    const before=this.store.get(input.sourceId);
+    const after=this.store.catalog.importHostSnapshot(topicId,input,discoverLinks(input.units,before.url));
+    if (before.contentHash!==after.contentHash) this.changed(after);
     return after;
   }
 }

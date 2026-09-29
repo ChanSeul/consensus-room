@@ -33,12 +33,12 @@ export function EvidencePanel({ topicId, busy }: { topicId: string; busy: boolea
   return <details className="evidence-panel">
     <summary>원문 근거 {state ? `(${state.sources.length}) · ${!state.ready ? "원문 확인 필요" : state.reviewed ? "검토됨" : "변경 영향 확인 필요"}` : ""}</summary>
     <EvidenceCatalogPanel key={topicId} topicId={topicId} busy={busy || saving} />
-    <p>서버 수집에는 호스트의 읽기 인증 설정이 필요합니다. 원문이 바뀌면 변경된 내용만 전달합니다. 변경 감지가 요구사항 확정을 뜻하지는 않습니다.</p>
+    <p>에이전트가 로그인된 브라우저·연결 도구로 읽은 원문도 사용할 수 있습니다. 서버가 직접 수집할 때만 별도 읽기 인증이 필요합니다. 변경 감지가 요구사항 확정을 뜻하지는 않습니다.</p>
     {state?.sources.map(source => <div key={source.id}>
       <a href={source.url} target="_blank" rel="noreferrer">{source.label}</a>{" · "}
       {source.checkedAt ? new Date(source.checkedAt).toLocaleString() : "아직 확인하지 않음"}
       {state.connections?.filter(connection => connection.sourceId === source.id).map(connection => <span key={connection.sourceId}>
-        {connection.configured ? " · 서버 인증 설정 있음 (접근 성공은 마지막 수집 결과 확인)" : " · 서버 읽기 인증 설정 필요"}
+        {source.mode === "connector" ? " · 에이전트가 읽은 자료 (마지막 수집 결과 확인)" : connection.configured ? " · 서버 인증 설정 있음 (접근 성공은 마지막 수집 결과 확인)" : " · 서버 읽기 인증 설정 필요"}
         {` · 공유 주제 ${connection.sharedTopics}개`}
       </span>)}
       {source.error && <span role="status"> · {source.error}</span>}

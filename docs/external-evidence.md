@@ -59,6 +59,22 @@ Cloud ID가 있으면 Jira 요청만 `https://api.atlassian.com/ex/jira/{cloudId
 
 ## 설치된 연결 도구와 bridge
 
+로그인된 브라우저나 기존 연결 도구로 읽을 때 새 OAuth 앱을 만들 필요는 없다. 이 읽기 권한은
+별도 REST 서버에 자동 공유되지 않으며, 호스트가 읽은 결과를 다음 경로로 제출한다.
+
+루트 자료는 `evidence-bridge.py catalog --id TOPIC_ID`에서 현재 목록을 읽고,
+`evidence-bridge.py host-import --id TOPIC_ID --input capture.json`으로 제출한다.
+입력은 `version`, `rootId`, `sourceId`, `previousHash`, `previousCheckedAt`(catalog의 현재 값),
+`observedAt`(원문 확인을 끝낸 Unix 밀리초), `revision`, `units`, `missing` 배열이다.
+4분 안에 확인한 원문만 받으며 원문·목록 버전이나 읽기 잠금이 바뀌면 다시 수집한다.
+해당 루트는 호스트 수집 방식으로 전환되고 서버의 REST 폴링을 실행하지 않는다.
+이후 갱신도 호스트 세션이 담당한다. 토큰·쿠키·비밀번호는 이 입력에 넣지 않는다.
+
+셀·본문을 읽었지만 댓글·답글·페이지를 못 읽었으면 `missing`에 정확히 적는다. 받은 내용은 검색할 수 있게
+보존하지만 수집 완료와 계획 실행 조건은 충족하지 않는다. `missing: []`는 요청 범위 전체를 확인했을 때만 쓴다.
+원문에서 발견한 링크는 기존 승인 규칙을 따르며 외부 문서는 사람의 검수 전까지 모델 근거에 들어가지 않는다.
+숨김 시트나 과거 정책은 원문의 상태를 각 단위에 보존하고 현재 제품 결정으로 단정하지 않는다.
+
 `python3 scripts/evidence-bridge.py due`는 확인 주기가 지난 원문 메타데이터만 반환한다.
 호스트 세션의 반복 실행에서 다음 순서로 처리한다. REST 방식과 달리 connector 방식에는 이 호스트 실행이 필요하다.
 
@@ -105,18 +121,21 @@ Cloud ID가 있으면 Jira 요청만 `https://api.atlassian.com/ex/jira/{cloudId
 
 주기 확인은 REST 방식으로 등록한 원문을 서버 코드가 처리한다. 원문이 바뀌어도 Codex 세션을 깨우거나
 알림용 모델을 호출하지 않는다. 중재자는 다음 작업을 시작하거나 재개할 때만 변경분을 요청한다.
-기존 연결 도구로 전체 원문을 다시 받는 수집 비용까지 캐시가 없애는 것은 아니므로, 이 경로에서는
-connector 자료를 자동으로 읽지 않고 REST 연결 필요 상태를 반환한다.
+호스트가 브라우저·연결 도구로 수집해 가져온 최신 connector 자료도 배치에서 사용할 수 있다.
+같은 원문을 다른 작업에 연결할 때는 기존 수집 방식과 확인 주기를 재사용한다.
+서버가 connector 원문을 자동으로 다시 읽지는 않는다. 자료가 만료되거나 일부가 빠졌으면 호스트에서
+다시 수집해야 하며, REST 전환은 필수가 아니다. 기존 연결 도구의 원문 조회 비용 자체가 없어지는 것은 아니다.
 
-호스트에 위 환경변수로 읽기 인증을 설정한 뒤 `connections`로 설정 여부와 마지막 오류를 확인한다.
+서버 자동 수집을 선택하는 경우에만 위 환경변수로 읽기 인증을 설정한 뒤 `connections`로 설정 여부와 마지막 오류를 확인한다.
 설정 있음은 실제 접근 성공을 뜻하지 않는다. 읽기 인증은 모델 환경으로 전달되지 않는다.
-기존 자료는 `use-rest`로 전환한다. 원문 ID·스냅샷을 유지하며 공유 주제 모두에 적용된다.
+이때 기존 자료를 `use-rest`로 전환한다. 원문 ID·스냅샷을 유지하며 공유 주제 모두에 적용된다.
 첫 REST 수집은 이전 버전 번호로 조회를 생략하지 않고 선택 범위를 다시 읽는다. 이후에는 REST 캐시를 재사용한다.
 연결된 주제에 실행 중인 작업이 있거나 수집 잠금이 있으면 전환을 거부하고, 429 대기 시간을 유지한다.
 중재자 호출의 연결 전환은 기존 중재 위임 권한을 요구한다. 인증정보는 CLI 인자로 넣지 않는다.
 
 ```sh
 python3 scripts/evidence-bridge.py connections
+# 서버 자동 수집으로 바꾸기로 선택한 경우에만 실행한다.
 python3 scripts/evidence-bridge.py use-rest --id SOURCE_ID
 python3 scripts/evidence-bridge.py batch --id TOPIC_ID --session ACTUAL_MEDIATOR_SESSION_ID [--page-bytes BYTES]
 # 반환된 자료를 읽은 뒤에만 별도 실행한다. 조회 성공만으로 자동 확인하지 않는다.

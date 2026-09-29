@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import { EvidenceRootInputSchema, type EvidenceCatalog, type EvidenceDiscoveryPage, type EvidenceRoot,
+import { EvidenceRootInputSchema, type EvidenceHostImport, type EvidenceDiscoveryLink, type EvidenceCatalog, type EvidenceDiscoveryPage, type EvidenceRoot,
   type EvidenceRootInput, type EvidenceScope, type EvidenceSource, type EvidenceUnitInput } from "../../shared/externalEvidence.js";
 import { evidenceHash, stableJSON, type EvidenceStore } from "./store.js";
 
@@ -81,7 +81,7 @@ export class EvidenceCatalogStore {
   }
   addScoped(scope: EvidenceScope, owner: string, input: EvidenceRootInput, approved = false): EvidenceRoot {
     const { url, label, mode, intervalSeconds } = input;
-    const source = this.store.ensureSource({ url, label, mode, intervalSeconds });
+    const source = this.store.ensureSource({ url, label, mode, intervalSeconds },true);
     if (scope === "workspace" && source.provider === "jira") throw new Error("Jira 루트는 작업 그룹별로 지정하세요.");
     const existing = this.roots().find(r => r.scope === scope && r.owner === owner && r.sourceId === source.id && r.status !== "removed");
     if (existing) return existing;
@@ -186,6 +186,10 @@ export class EvidenceCatalogStore {
     return this.roots().some(root => root.status === "approved" && this.members(root.id).some(m => m.source_id === sourceId && m.state === "approved") &&
       this.affected(root).some(id => this.db.prepare("SELECT state FROM topics WHERE id=?").get(id)?.state !== "CLOSED"));
   }
+  hostManaged(sourceId: string): boolean {
+    return this.roots().some(root=>root.status==="approved" && this.store.get(root.sourceId).mode==="connector" &&
+      this.reachableMembers(root.id).some(m=>m.source_id===sourceId && m.state==="approved"));
+  }
   state(topicId: string): EvidenceCatalog {
     const roots = this.forTopic(topicId), active = roots.filter(r => r.status !== "removed");
     const entries = active.flatMap(root => this.reachableMembers(root.id).map(member => ({ rootId: root.id, source: this.store.get(member.source_id),
@@ -233,6 +237,45 @@ export class EvidenceCatalogStore {
     if (root.lastCompleteAt !== null && root.nextCheckAt <= this.clock()) this.resetCycle(root);
     const member = this.reachableMembers(root.id).find(m => m.state === "approved" && m.progress !== "complete");
     return member ? { root, source: this.store.get(member.source_id), cursor: member.cursor } : null;
+  }
+  importHostSnapshot(topicId: string, input: EvidenceHostImport, links: EvidenceDiscoveryLink[]): EvidenceSource {
+    return this.atomic(() => {
+      const root=this.forTopic(topicId).find(r=>r.id===input.rootId && r.status==="approved");
+      if (!root || this.version(topicId)!==input.version ||
+          !this.reachableMembers(root.id).some(m=>m.source_id===input.sourceId && m.state==="approved"))
+        conflict("현재 승인된 루트와 원문 버전으로 다시 수집하세요.");
+      const before=this.store.get(input.sourceId), now=this.clock();
+      if (before.contentHash!==input.previousHash || before.checkedAt!==input.previousCheckedAt ||
+          input.observedAt>now || now-input.observedAt>240_000 || input.observedAt<(before.checkedAt ?? 0))
+        conflict("원문이 갱신되었거나 수집 시간이 지났습니다. 다시 읽은 자료를 보내세요.");
+      this.store.useMode(root.sourceId,"connector");
+      this.store.useMode(before.id,"connector");
+      const check=this.store.begin(before.id,true);
+      if (!check) conflict("다른 수집이 진행 중이거나 재시도 대기 중입니다.");
+      if (root.lastCompleteAt!==null) this.resetCycle(root);
+      root.lastCompleteAt=null; root.scanStartedAt ??= input.observedAt; this.save(root);
+      // A host import replaces this source's complete captured range, never another source's pages.
+      this.db.prepare("UPDATE evidence_members SET cursor=NULL WHERE root_id=? AND source_id=?").run(root.id,before.id);
+      this.acceptPage(root,this.store.get(before.id),null,{units:input.units,links,cursor:null,revision:input.revision});
+      const after=this.store.ingest(before.id,{checkId:check.checkId,revision:input.revision,units:input.units});
+      if (input.missing.length) {
+        const partial=this.store.incompleteHostCapture(before.id,input.missing);
+        for (const linked of this.roots().filter(r=>r.status==="approved" && this.reachableMembers(r.id).some(m=>m.source_id===before.id && m.state==="approved"))) {
+          if (linked.lastCompleteAt!==null) this.resetCycle(linked);
+          this.failed(linked.id,before.id,partial.error!);
+        }
+        return partial;
+      }
+      this.complete(root.id); return after;
+    });
+  }
+  replacePages(root: EvidenceRoot, source: EvidenceSource, expectedCursor: string | null, page: Omit<EvidenceDiscoveryPage,"cursor">): void {
+    this.atomic(() => {
+      const member=this.members(root.id).find(m=>m.source_id===source.id && m.state==="approved");
+      if (!member || member.cursor!==expectedCursor) conflict("이전 수집 페이지입니다.");
+      this.db.prepare("UPDATE evidence_members SET cursor=NULL WHERE root_id=? AND source_id=?").run(root.id,source.id);
+      this.acceptPage(root,source,null,{...page,cursor:null});
+    });
   }
   acceptPage(root: EvidenceRoot, source: EvidenceSource, cursor: string | null, page: EvidenceDiscoveryPage, sourceGeneration = this.store.generation(source.id)): void {
     const current = this.roots().find(r => r.id === root.id);
