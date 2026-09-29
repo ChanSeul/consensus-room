@@ -520,7 +520,14 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
       (pausedBeforeAdoption && legacyUnadoptedReads))
       && record.lastResponse && PlanningStepSchema.safeParse(record.lastResponse.planningStep).success
       ? record.lastResponse : null;
-    docs.set("context:manifest", JSON.stringify(manifest));
+    const rootCatalog = database.evidence.catalog.state(topic.id);
+    if (rootCatalog.roots.length) {
+      docs.set("context:evidence-catalog", JSON.stringify({ sources:rootCatalog.coverage.sources,units:rootCatalog.coverage.units,
+        roots:rootCatalog.roots.filter(root=>root.status==="approved").map(root=>({url:root.source.url,label:root.source.label})),
+        search:"kind=search selector=evidence::literal; then kind=evidence selector from each match" }));
+      docs.set("context:manifest", JSON.stringify([...manifest.filter(item=>!item.id.startsWith("evidence:")),
+        {id:"context:evidence-catalog",hash:planningHash(docs.get("context:evidence-catalog")!),bytes:bytes(docs.get("context:evidence-catalog")!)}]));
+    } else docs.set("context:manifest", JSON.stringify(manifest));
     const reader = new PlanningReader(turn.cwd, tree, docs);
     const unadoptedFragmentProgress = record.fragments.some(f => !record.delivered.includes(f.id));
     if (keepSession && record.sessionId) {
@@ -893,7 +900,7 @@ Design references: ${bytes(designs) <= 2048 ? JSON.stringify(designs) : "Read ki
 Return planningStep on every response: draft, facts with refs to fragment IDs, contradictions, questions, requests, complete.
 Request at most ${LIMIT.requests} fragments using kind=file|search|evidence|memory|context|artifact|image, selector, question, offset.
 An image request selects one imageHash from an evidence unit (offset=0). Memory/wiki summaries are not independent product evidence.${allowedIndex ? ` Every wiki document you may read, including ones not in context:manifest, is listed in kind=memory selector=${ALLOWED_INDEX} (${allowedIndex.bytes} bytes, one JSON line per document); a listing is not the document, so read a listed path with kind=memory selector=<path> before citing it.` : ""}
-File selectors are snapshot-relative paths. Search selectors are path::literal. Source IDs appear in context:manifest; omit the kind prefix in selector. Only listed artifact paths are allowed.
+File selectors are snapshot-relative paths. Search selectors are path::literal; use evidence::literal to search the approved external corpus, then read matches with kind=evidence. Search snippets are not complete source reads. Source selectors appear in context:manifest or evidence search matches; omit the kind prefix in selector. Only listed artifact paths are allowed.
 Already delivered fragments are omitted. Only if compaction lost a needed fragment, set rereadReason explaining what must be recovered.
 Use returned nextOffset for continuation; omitted text is NOT absent evidence. Do not invent unseen requirements.
 Update the checkpoint, retaining contradictory evidence and unanswered questions. Set complete only when all questions are resolved.

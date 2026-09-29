@@ -370,3 +370,26 @@ it("마지막 응답과 원문 없는 주제의 batchId:null 응답도 요청한
     expect(fetch).not.toHaveBeenCalled();
   } finally { await app.close(); dbs.splice(dbs.indexOf(database), 1); }
 });
+
+it("only users approve roots, stale or running selections preserve the active source set, and closed history remains editable for future use", async () => {
+  const f=fixture(); const config=loadConfig({repositoryPath:f.root,dataDirectory:f.root,webDirectory:join(f.root,"no-web"),launchToken:"test-token",enforceBudgets:false});
+  const app=await buildApp({config,database:f.database,runner:f.runner,claude:f.adapter,codex:{...f.adapter,role:"codex"}});
+  const headers={"x-consensus-token":"test-token"}, mediator={...headers,"x-consensus-actor":"mediator"};
+  const route=`/api/topics/${f.topic.id}/evidence`;
+  const proposal=await app.inject({method:"POST",url:`${route}/roots`,headers:mediator,payload:{url:"https://team.atlassian.net/browse/APP-2",label:"Root",scope:"group",mode:"rest",intervalSeconds:900}});
+  expect(proposal.statusCode).toBe(200);expect(proposal.json().status).toBe("proposed");
+  let catalog=(await app.inject({method:"GET",url:`${route}/catalog`,headers})).json();
+  const selection={version:catalog.version,rootId:proposal.json().id,action:"approve"};
+  expect((await app.inject({method:"POST",url:`${route}/selection`,headers:mediator,payload:selection})).statusCode).toBe(403);
+  expect((await app.inject({method:"POST",url:`${route}/selection`,headers,payload:selection})).statusCode).toBe(200);
+  expect((await app.inject({method:"POST",url:`${route}/selection`,headers,payload:{...selection,action:"remove"}})).statusCode).toBe(409);
+  catalog=(await app.inject({method:"GET",url:`${route}/catalog`,headers})).json();
+  f.database.startAction({id:"busy",topicId:f.topic.id,kind:"test",status:"running",createdAt:new Date().toISOString(),finishedAt:null,error:null,pid:null,pgid:null,processExecutable:null,processCommand:null,processStartedAt:null});
+  expect((await app.inject({method:"POST",url:`${route}/selection`,headers,payload:{...selection,version:catalog.version,action:"remove"}})).statusCode).toBeGreaterThanOrEqual(400);
+  expect(f.database.evidence.catalog.version(f.topic.id)).toBe(catalog.version);
+  f.database.finishAction("busy","succeeded"); f.database.updateTopic(f.topic.id,{state:"CLOSED"});
+  const closed=f.database.getTopic(f.topic.id);
+  expect((await app.inject({method:"POST",url:`${route}/selection`,headers,payload:{...selection,version:catalog.version,action:"remove"}})).statusCode).toBe(200);
+  expect(f.database.getTopic(f.topic.id)).toEqual(closed);
+  await app.close();dbs.splice(dbs.indexOf(f.database),1);
+});

@@ -106,6 +106,8 @@ function makeEngine(errors: string[], clock: FakeClock) {
     planSHA256: null, approvedPlanSHA256: null, createdAt: "2026-09-07T00:00:00.000Z", updatedAt: "2026-09-07T00:00:00.000Z",
     lastError: null,
   });
+  database.revisions.configure("topic-1", 3, database.revisions.account("topic-1").version);
+  for (const scope of ["planning", "implementation"] as const) database.reviews.configure("topic-1", scope, 3, database.reviews.account("topic-1", scope).version);
   for (const role of ["claude", "codex"] as const) {
     database.upsertParticipant("topic-1", { role, sessionId: `${role}-session`, mode: "attached", acknowledgedPlanSHA256: null });
   }
@@ -365,6 +367,8 @@ describe("E3-4c 코드 리뷰 원장과 사용 한도 자동 재시도", () => {
       worktreePath: worktree, branchName: null, state: "AWAITING_USER_APPROVAL", scopeGeneration: 1, planRevision: 2, planSHA256,
       approvedPlanSHA256: planSHA256, createdAt: "2026-09-26T00:00:00.000Z", updatedAt: "2026-09-26T00:00:00.000Z", lastError: null,
     });
+  database.revisions.configure(topicId, 3, database.revisions.account(topicId).version);
+  for (const scope of ["planning", "implementation"] as const) database.reviews.configure(topicId, scope, 3, database.reviews.account(topicId, scope).version);
     for (const role of ["claude", "codex"] as const) {
       database.upsertParticipant(topicId, { role, sessionId: `${role}-plan-session`, mode: "attached", acknowledgedPlanSHA256: planSHA256 });
     }

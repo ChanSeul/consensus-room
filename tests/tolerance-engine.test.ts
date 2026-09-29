@@ -1234,6 +1234,7 @@ describe("Astra 리뷰 2026-09-14 — 수락 현재성·재판정·작업 id·�
 
   it("CF-03: 사용자 승인으로 연 3차 FIX 는 2차 완료 기록을 재사용하지 않고 실제 수정 턴을 돈다", async () => {
     const { worktree, database, artifacts, gitService, topicId } = await setup("cf03");
+    database.reviews.configure(topicId,"implementation",3,database.reviews.account(topicId,"implementation").version);
     const agreed: AgentResult["findings"][number] = { id: "F-1", title: "bug", severity: "MEDIUM", disposition: "AGREED_ACTION", rationale: "still broken", evidenceRefs: ["feature.txt"], requiresUserDecision: false };
     const resolved = { ...agreed, disposition: "RESOLVED_BY_FIX" as const };
     let fixes = 0, reviews = 0;

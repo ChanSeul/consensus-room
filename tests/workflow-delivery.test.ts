@@ -1476,6 +1476,7 @@ describe("E3-2-2b host-review 1차 보완(55f3795 F001~F003)", () => {
     const { reference, text } = room.references[0];
     const claude = new PagingClaude(room.worktree);
     const codex = legacyPausedReview(room.topicId);
+    room.database.reviews.configure(room.topicId,"implementation",3,room.database.reviews.account(room.topicId,"implementation").version);
     for (const id of ["pre-1", "pre-2"]) room.database.reviews.admit(room.topicId, id, "implementation");
     const engine = room.engine(claude, codex, true);
     engine.startImplementation(room.topicId);
@@ -1505,6 +1506,7 @@ describe("E3-2-2b host-review 1차 보완(55f3795 F001~F003)", () => {
     const { reference, text } = room.references[0];
     const claude = new PagingClaude(room.worktree);
     const codex = legacyPausedReview(room.topicId);
+    room.database.reviews.configure(room.topicId,"implementation",3,room.database.reviews.account(room.topicId,"implementation").version);
     for (const id of ["pre-1", "pre-2"]) room.database.reviews.admit(room.topicId, id, "implementation");
     const engine = room.engine(claude, codex, true);
     engine.startImplementation(room.topicId);

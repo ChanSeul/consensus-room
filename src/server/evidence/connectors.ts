@@ -1,17 +1,20 @@
-import type { EvidenceSnapshot, EvidenceSource, EvidenceUnitInput } from "../../shared/externalEvidence.js";
+import type { EvidenceSnapshot, EvidenceSource, EvidenceUnitInput, EvidenceDiscoveryPage } from "../../shared/externalEvidence.js";
+import { collectPage } from "./discovery.js";
 import { evidenceHash, stableJSON } from "./store.js";
 
 type JSONRecord = Record<string, any>;
 export interface EvidenceFetchResult { revision: string; units?: EvidenceUnitInput[]; unchanged?: boolean }
-export interface EvidenceConnector { configured?(source: EvidenceSource): boolean; fetch(source: EvidenceSource, previous: EvidenceSnapshot | null, signal: AbortSignal, onBytes?: (bytes: number) => void): Promise<EvidenceFetchResult> }
-export interface EvidenceCredentials { slackToken?: string; slackWorkspace?: string; jiraSite?: string; jiraEmail?: string; jiraToken?: string; figmaToken?: string }
-export class EvidenceFetchError extends Error { constructor(message: string, readonly retryAfterSeconds = 300) { super(message); } }
+export interface EvidenceConnector { configured?(source: EvidenceSource): boolean; fetch(source: EvidenceSource, previous: EvidenceSnapshot | null, signal: AbortSignal, onBytes?: (bytes: number) => void): Promise<EvidenceFetchResult>;
+  discover?(source: EvidenceSource, cursor: string | null, signal: AbortSignal): Promise<EvidenceDiscoveryPage> }
+export interface EvidenceCredentials { slackToken?: string; slackWorkspace?: string; jiraSite?: string; jiraEmail?: string; jiraToken?: string; figmaToken?: string; googleToken?: string }
+export class EvidenceFetchError extends Error { constructor(message: string, readonly retryAfterSeconds = 300, readonly restart = false) { super(message); } }
 
 // These credentials belong to the host collector. Never add them to a model process environment.
 export function evidenceCredentials(env = process.env): EvidenceCredentials {
   return { slackToken: env.CONSENSUS_EVIDENCE_SLACK_TOKEN, slackWorkspace: env.CONSENSUS_EVIDENCE_SLACK_WORKSPACE,
     jiraSite: env.CONSENSUS_EVIDENCE_JIRA_SITE, jiraEmail: env.CONSENSUS_EVIDENCE_JIRA_EMAIL,
-    jiraToken: env.CONSENSUS_EVIDENCE_JIRA_TOKEN, figmaToken: env.CONSENSUS_EVIDENCE_FIGMA_TOKEN };
+    jiraToken: env.CONSENSUS_EVIDENCE_JIRA_TOKEN, figmaToken: env.CONSENSUS_EVIDENCE_FIGMA_TOKEN,
+    googleToken: env.CONSENSUS_EVIDENCE_GOOGLE_TOKEN };
 }
 async function boundedBody(response: Response, limit: number, onBytes?: (bytes: number) => void): Promise<Buffer> {
   if (!response.body) throw new EvidenceFetchError("원문 응답이 비어 있습니다.");
@@ -30,9 +33,16 @@ export class RestEvidenceConnector implements EvidenceConnector {
   constructor(private readonly credentials: EvidenceCredentials, private readonly request: typeof fetch = fetch, private readonly onBytes?: (bytes: number) => void) {}
   configured(source: EvidenceSource): boolean {
     const c = this.credentials;
+    if (source.provider === "document") return true;
+    if (source.provider === "sheets") return Boolean(c.googleToken);
     if (source.provider === "slack") return Boolean(c.slackToken && c.slackWorkspace === source.resource.split("/")[0]);
-    if (source.provider === "jira") return Boolean(c.jiraEmail && c.jiraToken && c.jiraSite === `https://${source.resource.split("/")[0]}`);
+    if (source.provider === "jira" || source.provider === "confluence") return Boolean(c.jiraEmail && c.jiraToken && c.jiraSite === `https://${source.resource.split("/")[0]}`);
     return Boolean(c.figmaToken);
+  }
+  async discover(source: EvidenceSource, cursor: string | null, signal: AbortSignal): Promise<EvidenceDiscoveryPage> {
+    if (!this.configured(source)) throw new EvidenceFetchError("이 원문을 읽을 호스트 연결이 필요합니다.");
+    return collectPage(source, cursor, this.credentials, this.request, signal,
+      () => this.fetch(source, null, signal));
   }
   private async json(url: URL, headers: Record<string, string>, signal: AbortSignal): Promise<JSONRecord> {
     const response = await this.request(url, { headers, signal, redirect: "error" });
@@ -49,6 +59,7 @@ export class RestEvidenceConnector implements EvidenceConnector {
     const bounded = AbortSignal.any([signal, AbortSignal.timeout(90_000)]);
     if (source.provider === "slack") return reader.slack(source, bounded);
     if (source.provider === "jira") return reader.jira(source, previous, bounded);
+    if (source.provider !== "figma") throw new EvidenceFetchError("루트 수집을 사용해 문서의 모든 페이지를 확인하세요.");
     return reader.figma(source, previous, bounded);
   }
   private async slack(source: EvidenceSource, signal: AbortSignal): Promise<EvidenceFetchResult> {

@@ -1,0 +1,231 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, expect, it, vi } from "vitest";
+import { ConsensusDatabase } from "../src/server/database";
+import { EvidenceService } from "../src/server/evidence/service";
+import { collectPage, publicAddress, discoverLinks } from "../src/server/evidence/discovery";
+import { EvidenceFetchError } from "../src/server/evidence/connectors";
+import type { EvidenceRootInput, EvidenceSource } from "../src/shared/externalEvidence";
+
+// Public catalog selection -> actual gate, inherited sources and next-session binding.
+// HTTP fixtures exercise pagination/comments/failure, never reproduce production calculations.
+// New contracts have no prior implementation to restore. Live auth and rendered UI remain separate.
+const cleanup: Array<() => void> = [];
+afterEach(() => { cleanup.splice(0).forEach(f => f()); vi.useRealTimers(); });
+function fixture() {
+  const path = mkdtempSync(join(tmpdir(),"catalog-")); const db = new ConsensusDatabase(join(path,"db"));
+  cleanup.push(() => { db.close(); rmSync(path,{recursive:true,force:true}); });
+  const topic = (id: string) => db.createTopic({ id, slug:id, title:id, repositoryPath:path, worktreePath:path,
+    baseRef:"main", branchName:null, state:"DRAFT", scopeGeneration:1, planRevision:0, planSHA256:null,
+    approvedPlanSHA256:null, createdAt:new Date().toISOString(), updatedAt:new Date().toISOString(), lastError:null });
+  topic("a"); topic("b"); topic("closed");
+  const budget = { mode: "observe" as const };
+  for (const id of ["a","b"]) {
+    db.workGroups.create(`g-${id}`,{ title:id, goal:id, contracts:"separate roots", stages:[
+      {id:"first",kind:"work",title:"first",goal:"first",acceptance:"verified",dependsOn:[],budget},
+      {id:"closed",kind:"work",title:"closed",goal:"closed",acceptance:"verified",dependsOn:[],budget},
+      {id:"later",kind:"integration",title:"later",goal:"later",acceptance:"verified",dependsOn:["first","closed"],budget},
+    ]},path,"a".repeat(40));
+    db.workGroups.link(`g-${id}`,"first",id,"a".repeat(40));
+  }
+  db.workGroups.link("g-a","closed","closed","a".repeat(40)); db.updateTopic("closed",{state:"CLOSED"});
+  return {db,topic};
+}
+const input = (url: string, scope: EvidenceRootInput["scope"] = "group"): EvidenceRootInput => ({url,label:url,scope,required:true,mode:"rest",intervalSeconds:900});
+it("Jira roots belong to separate groups, inherit into new stages, and only explicit workspace documents are shared", () => {
+  const {db,topic} = fixture(); const catalog = db.evidence.catalog;
+  catalog.add("a",input("https://team.atlassian.net/browse/APP-1"),true);
+  catalog.add("b",input("https://team.atlassian.net/browse/APP-2"),true);
+  catalog.add("a",input("https://api.example.com/openapi.json","workspace"),true);
+  topic("next"); db.workGroups.link("g-a","later","next","a".repeat(40));
+  expect(db.evidence.list("next").map(s=>s.url)).toEqual(expect.arrayContaining(["https://team.atlassian.net/browse/APP-1","https://api.example.com/openapi.json"]));
+  expect(db.evidence.list("next").map(s=>s.url)).not.toContain("https://team.atlassian.net/browse/APP-2");
+  expect(()=>catalog.add("a",input("https://team.atlassian.net/browse/APP-3","workspace"),true)).toThrow("작업 그룹");
+  expect(db.getTopic("closed").state).toBe("CLOSED");
+});
+it("approval is versioned, removal starts fresh sessions and preserves snapshots and closed plans", () => {
+  const {db} = fixture(); const c = db.evidence.catalog;
+  const root = c.add("a",input("https://team.atlassian.net/browse/APP-1"));
+  expect(db.evidence.list("a")).toHaveLength(0);
+  expect(db.evidence.topic(db.getTopic("a")).ready).toBe(false);
+  const version = c.version("a"); c.select("a",{version,rootId:root.id,action:"approve"});
+  expect(()=>c.select("a",{version,rootId:root.id,action:"remove"})).toThrow("바뀌었습니다");
+  const check = db.evidence.begin(root.sourceId,true)!;
+  const snap = db.evidence.ingest(root.sourceId,{checkId:check.checkId,revision:"r",units:[{id:"body",kind:"issue",content:"historical"}]});
+  db.upsertParticipant("a",{role:"claude",sessionId:"old-session",mode:"created",acknowledgedPlanSHA256:null});
+  db.updateTopic("a",{planSHA256:"a".repeat(64),approvedPlanSHA256:"a".repeat(64),state:"AWAITING_USER_APPROVAL"});
+  db.addArtifact("a",{kind:"plan",revision:1,scopeGeneration:1,sha256:"a".repeat(64),path:"/historical-plan",createdAt:new Date().toISOString()});
+  expect(db.latestArtifact("a","plan")).not.toBeNull();
+  const closed = db.getTopic("closed");
+  c.select("a",{version:c.version("a"),rootId:root.id,action:"remove"});
+  expect(db.evidence.list("a")).toHaveLength(0);
+  expect(db.evidence.snapshot(root.sourceId,snap.contentHash!)!.units[0].content).toBe("historical");
+  expect(db.getTopic("a").planSHA256).toBeNull();
+  expect(db.latestArtifact("a","plan")).toBeNull();
+  expect(db.artifactsForScope("a","plan")).toEqual([]);
+  expect(db.latestArtifactRevision("a","plan")).toBe(1);
+  db.addArtifact("a",{kind:"plan",revision:2,scopeGeneration:1,sha256:"b".repeat(64),path:"/current-plan",createdAt:new Date().toISOString()});
+  expect(db.latestArtifact("a","plan")?.path).toBe("/current-plan");
+  expect(db.getTopic("a").participants[0].sessionId).toMatch(/^pending:/);
+  expect(db.getTopic("closed")).toEqual(closed);
+  expect(c.state("a").history[0].action).toBe("앞으로 사용할 근거에서 해제");
+});
+it("a durable frontier collects more than 64 children and requires human approval of newly discovered external documents", async () => {
+  const {db} = fixture(); const c = db.evidence.catalog;
+  const root = c.add("a",input("https://team.atlassian.net/browse/APP-1"),true);
+  const calls: string[] = [];
+  const service = new EvidenceService(db.evidence,{ configured:()=>true, fetch:async()=>{throw Error("not used");}, discover:async(source,cursor)=>{
+    calls.push(source.id+String(cursor));
+    return {revision:"r",cursor:null,units:[{id:"body",kind:"issue",content:source.resource}],links:source.id===root.sourceId ? [
+      ...Array.from({length:70},(_,n)=>({url:`https://team.atlassian.net/browse/APP-${n+2}`,label:`child ${n}`,unitId:"body",relation:"child" as const})),
+      {url:"https://docs.google.com/spreadsheets/d/policy/edit",label:"Policy",unitId:"body",relation:"link"},
+    ] : [{url:"https://team.atlassian.net/browse/APP-1",label:"cycle",unitId:"body",relation:"child"}]};
+  }});
+  await service.collect(root.id);
+  expect(c.state("a").coverage.ready).toBe(false);
+  for (let n=0;n<4;n++) await service.collect(root.id);
+  expect(new Set(calls).size).toBe(71); expect(calls).toHaveLength(71);
+  expect(db.evidence.list("a")).toHaveLength(71);
+  const candidate = c.state("a").entries.find(e=>e.state==="candidate")!;
+  expect(candidate.source.provider).toBe("sheets"); expect(c.state("a").coverage.ready).toBe(false);
+  c.select("a",{version:c.version("a"),rootId:root.id,sourceId:candidate.source.id,action:"accept"});
+  for (let n=0;n<5 && !c.state("a").coverage.ready;n++) await service.collect(root.id);
+  expect(c.state("a").coverage.ready).toBe(true);
+  const batch = await service.prepareMediator(db,"a","mediator-test");
+  expect(batch.changes).toEqual([]); expect(batch.batchId).toBeNull();
+  expect(batch.corpus).toMatchObject({sources:72});
+  expect(Buffer.byteLength(JSON.stringify(batch))).toBeLessThan(2000);
+  expect(db.evidence.packet(db.getTopic("a"),"claude").text).not.toContain("APP-2");
+  await service.stop();
+});
+it("Jira pages retain all comments and descendants, then reject a revision changed during collection", async () => {
+  const {db} = fixture(); const source = db.evidence.ensureSource({url:"https://team.atlassian.net/browse/APP-1",label:"Root",mode:"rest",intervalSeconds:900});
+  let changed = false; const paths: string[] = [];
+  const request = (async (raw: string) => {
+    const url = new URL(raw); paths.push(url.pathname+url.search);
+    const data = url.pathname.endsWith("/comment") ? { startAt:0,total:1,comments:[{id:"1",body:{text:"Policy https://docs.google.com/spreadsheets/d/policy/edit"},author:{displayName:"Owner"},updated:"r1"}] }
+      : url.pathname.endsWith("/search/jql") ? {isLast:true,issues:[{key:"APP-2",fields:{summary:"Child"}}]}
+      : url.pathname.endsWith("/remotelink") ? [] : {fields:{summary:"Root",updated:changed ? "r2" : "r1"}};
+    return Response.json(data);
+  }) as typeof fetch;
+  let cursor: string|null = null; const units: string[] = [], links: string[] = [];
+  do { const page = await collectPage(source,cursor,{},request,new AbortController().signal,async()=>({revision:"unused"}));
+    units.push(...page.units.map(u=>u.id)); links.push(...page.links.map(l=>l.url)); cursor=page.cursor;
+  } while(cursor);
+  expect(units).toContain("comment:1"); expect(links).toContain("https://team.atlassian.net/browse/APP-2");
+  expect(links).toContain("https://docs.google.com/spreadsheets/d/policy/edit");
+  changed=true;
+  await expect(collectPage(source,JSON.stringify({stage:"remote",updated:"r1"}),{},request,new AbortController().signal,async()=>({revision:"unused"}))).rejects.toThrow("바뀌었습니다");
+});
+it("OpenAPI reads operations and reusable schemas without admitting private network targets", async () => {
+  const {db}=fixture(); const source=db.evidence.ensureSource({url:"https://api.example.com/docs",label:"API",mode:"rest",intervalSeconds:900});
+  const spec={openapi:"3.1.0",info:{title:"API"},paths:{"/houses":{servers:[{url:"https://regional.example.com"}],get:{responses:{"200":{description:"ok"}}}},"/alias":{$ref:"#/components/pathItems/Shared"}},components:{schemas:{House:{type:"object"}}}};
+  const page=await collectPage(source,null,{},fetch,new AbortController().signal,async()=>({revision:"unused"}),async()=>`docs.apiDescriptionDocument = ${JSON.stringify(JSON.stringify(spec))};`);
+  expect(page.units.filter(u=>u.id.startsWith("api:get:"))).toHaveLength(1);
+  expect(page.units.some(u=>u.id.startsWith("path:") && u.content.includes('"$ref":"#/components/pathItems/Shared"'))).toBe(true);
+  expect(page.units.find(u=>u.id.startsWith("api:get:"))!.content).toContain("https://regional.example.com");
+  expect(page.units.filter(u=>u.id.startsWith("component:schemas:House"))).toHaveLength(1);
+  for(const address of ["127.0.0.1","10.0.0.1","169.254.169.254","172.16.0.1","192.168.1.1","::1"]) expect(publicAddress(address)).toBe(false);
+});
+it("Sheets walks every tab and retains notes, linked cells, comments and replies; denied comments do not complete", async () => {
+  const {db}=fixture(); const source=db.evidence.ensureSource({url:"https://docs.google.com/spreadsheets/d/policy/edit?gid=7",label:"Policy",mode:"rest",intervalSeconds:900});
+  let deny = false; const ranges: string[]=[];
+  const request=(async(raw:string)=>{
+    const url=new URL(raw);
+    if(url.pathname.endsWith("/comments")) return deny ? new Response("denied",{status:403}) : Response.json({comments:[{id:"c1",content:"Policy decision",replies:[{id:"r1",content:"Owner confirmation"}]}]});
+    if(url.hostname==="www.googleapis.com") return Response.json({version:"1"});
+    const range=url.searchParams.get("ranges");
+    if(range){ ranges.push(range); return Response.json({sheets:[{data:[{rowData:[{values:[{formattedValue:"Value",note:"Must verify",hyperlink:"https://example.com/policy"}]}]}]}]}); }
+    return Response.json({sheets:[{properties:{sheetId:7,title:"Policy",gridProperties:{rowCount:101,columnCount:2}}},{properties:{sheetId:8,title:"History",gridProperties:{rowCount:1,columnCount:1}}}]});
+  }) as typeof fetch;
+  let cursor:string|null=null; const contents:string[]=[];
+  do { const page=await collectPage(source,cursor,{},request,new AbortController().signal,async()=>({revision:"unused"}));contents.push(...page.units.map(u=>u.content));cursor=page.cursor; }while(cursor);
+  expect(ranges).toEqual(["'Policy'!A1:B100","'Policy'!A101:B101","'History'!A1:A1"]);
+  expect(contents.join("\n")).toContain("Must verify"); expect(contents.join("\n")).toContain("Owner confirmation");
+  deny=true;
+  await expect(collectPage(source,JSON.stringify({stage:"comments",version:"1"}),{},request,new AbortController().signal,async()=>({revision:"unused"}))).rejects.toThrow("403");
+});
+
+it("committed and closed stages keep their evidence while new stages receive future roots", () => {
+  const {db,topic}=fixture(),c=db.evidence.catalog;
+  const initial=db.evidence.topic(db.getTopic('closed'));
+  db.updateTopic('a',{state:'READY_TO_DELIVER',committedOID:'a'.repeat(40)});
+  const committed=db.getTopic('a'),before=db.evidence.topic(committed);
+  c.add('a',input('https://example.com/shared','workspace'),true);
+  expect(db.getTopic('a')).toEqual(committed);
+  expect(db.evidence.topic(db.getTopic('a'))).toEqual(before);
+  expect(db.evidence.topic(db.getTopic('closed'))).toEqual(initial);
+  topic('later');expect(db.evidence.list('later').map(s=>s.url)).toContain('https://example.com/shared');
+});
+
+it("replanning preserves finding ledgers and clears flags from the previous plan cycle", () => {
+  const {db}=fixture(),c=db.evidence.catalog;
+  db.updateTopic('a',{fixPassUsed:true,secondFixPassUsed:true,closeoutRevisionUsed:true});
+  for (const kind of ['implementation-notes','deferred-findings','plan']) db.addArtifact('a',{kind,revision:1,scopeGeneration:1,sha256:'a'.repeat(64),path:`/${kind}`,createdAt:new Date().toISOString()});
+  c.add('a',input('https://example.com/source'),true);
+  expect(db.latestArtifact('a','implementation-notes')?.path).toBe('/implementation-notes');
+  expect(db.latestArtifact('a','deferred-findings')?.path).toBe('/deferred-findings');
+  expect(db.latestArtifact('a','plan')).toBeNull();
+  expect(db.getFlags('a')).toMatchObject({fixPassUsed:false,secondFixPassUsed:false,closeoutRevisionUsed:false});
+});
+
+it("transient failures retain the cursor, no-op collection preserves dates, and force starts a new cycle", async () => {
+  const {db}=fixture(),c=db.evidence.catalog,root=c.add('a',input('https://example.com/source'),true);
+  const calls:Array<string|null>=[];let fail=true;
+  const service=new EvidenceService(db.evidence,{configured:()=>true,fetch:async()=>{throw Error('unused');},discover:async(_source,cursor)=>{
+    calls.push(cursor);if(cursor && fail){fail=false;throw new EvidenceFetchError('HTTP 429',300);}
+    return {revision:'1',units:[{id:cursor ?? 'first',kind:'document',content:cursor ?? 'first'}],links:[],cursor:cursor ? null : 'next'};
+  }});
+  await service.collect(root.id);expect(c.members(root.id)[0].cursor).toBe('next');
+  await service.collect(root.id);expect(calls).toEqual([null,'next','next']);
+  const complete=c.roots()[0];await service.collect(root.id);
+  expect(c.roots()[0].lastCompleteAt).toBe(complete.lastCompleteAt);expect(c.roots()[0].nextCheckAt).toBe(complete.nextCheckAt);
+  await service.collect(root.id,true);expect(calls.slice(-2)).toEqual([null,'next']);
+});
+
+it("a completed long scan remains consumable without rewriting individual read timestamps", async () => {
+  vi.useFakeTimers();vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+  const {db}=fixture(),c=db.evidence.catalog,root=c.add('a',input('https://team.atlassian.net/browse/APP-1'),true);
+  const service=new EvidenceService(db.evidence,{configured:()=>true,fetch:async()=>{throw Error('unused');},discover:async(source)=>{
+    vi.setSystemTime(Date.now()+60_000);
+    return {revision:'1',cursor:null,units:[{id:'body',kind:'issue',content:source.resource}],links:source.id===root.sourceId ? Array.from({length:35},(_,n)=>({url:`https://team.atlassian.net/browse/APP-${n+2}`,label:'child',unitId:'body',relation:'child' as const})) : []};
+  }});
+  await service.collect(root.id);const firstRead=db.evidence.get(root.sourceId).checkedAt;
+  for(let n=0;n<35;n++) await service.collect(root.id);expect(c.state('a').coverage.ready).toBe(true);
+  const packet=await service.prepareMediator(db,'a','session');expect(packet.corpus?.sources).toBe(36);
+  expect(db.evidence.get(root.sourceId).checkedAt).toBe(firstRead);
+  await expect(service.prepareMediator(db,'a','session',1)).rejects.toThrow('최소');
+});
+
+it("source leases prevent concurrent fetches and older multi-page scans cannot overwrite a newer snapshot", async () => {
+  const {db}=fixture(),c=db.evidence.catalog;
+  const a=c.add('a',input('https://example.com/shared'),true),b=c.add('b',input('https://example.com/shared'),true);
+  let release!:()=>void;let calls=0;const pending=new Promise<void>(r=>release=r);
+  const service=new EvidenceService(db.evidence,{configured:()=>true,fetch:async()=>{throw Error('unused');},discover:async()=>{
+    calls++;await pending;return {revision:'new',cursor:null,links:[],units:[{id:'body',kind:'document',content:'new'}]};
+  }});
+  const first=service.collect(a.id),second=service.collect(b.id);
+  try { expect(calls).toBe(1); } finally { release();await Promise.allSettled([first,second]); }
+  const oldReader=new EvidenceService(db.evidence,{configured:()=>true,fetch:async()=>{throw Error('unused');},discover:async(_s,cursor)=>{
+    const n=Number(cursor ?? '0');return {revision:'old',cursor:n<20 ? String(n+1):null,links:[],units:[{id:String(n),kind:'document',content:'old'}]};
+  }});
+  await oldReader.collect(a.id,true);
+  await service.collect(b.id);const newer=db.evidence.get(a.sourceId).contentHash;
+  await oldReader.collect(a.id);expect(db.evidence.get(a.sourceId).contentHash).toBe(newer);
+  expect(c.members(a.id)[0]).toMatchObject({progress:'failed',cursor:null});
+});
+
+it("existing connector-mode children are reused by an authorized REST root", async () => {
+  const {db}=fixture(),c=db.evidence.catalog;
+  const old=db.evidence.register('a',{url:'https://team.atlassian.net/browse/APP-2',label:'legacy',mode:'connector',intervalSeconds:900});db.evidence.detach('a',old.id);
+  const root=c.add('a',input('https://team.atlassian.net/browse/APP-1'),true);
+  const service=new EvidenceService(db.evidence,{configured:()=>true,fetch:async()=>{throw Error('unused');},discover:async(source)=>({revision:'1',cursor:null,units:[{id:'body',kind:'issue',content:source.resource}],links:source.id===root.sourceId ? [{url:old.url,label:'child',unitId:'body',relation:'child'}]:[]})});
+  await service.collect(root.id);expect(c.state('a').coverage.ready).toBe(true);expect(db.evidence.get(old.id).mode).toBe('rest');
+});
+
+it("HTML links resolve relative references and do not include closing quotes", () => {
+  const links=discoverLinks([{id:'page',kind:'document',content:`<a href='/policy'>Policy</a><a href="../faq">FAQ</a><a href='https://example.net/doc'>Doc</a>`}], 'https://example.com/docs/page');
+  expect(links.map(l=>l.url)).toEqual(expect.arrayContaining(['https://example.com/policy','https://example.com/faq','https://example.net/doc']));
+  expect(links.some(l=>l.url.includes("'"))).toBe(false);
+});

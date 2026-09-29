@@ -51,6 +51,14 @@ export class PlanningReader {
       const value = this.documents.get(`${request.kind}:${request.selector}`);
       if (value === undefined) throw new PlanningPaused("Requested source is not in the pinned manifest.");
       text = value;
+    } else if (request.kind === "search" && request.selector.startsWith("evidence::")) {
+      const needle = request.selector.slice("evidence::".length).trim().toLocaleLowerCase();
+      if (!needle) throw new PlanningPaused("Evidence search literal is empty.");
+      text = [...this.documents].filter(([key, body]) => key.startsWith("evidence:") && `${key}\n${body}`.toLocaleLowerCase().includes(needle))
+        .map(([key, body]) => {
+          const at = Math.max(0, body.toLocaleLowerCase().indexOf(needle) - 120);
+          return JSON.stringify({ selector: key.slice("evidence:".length), hash: planningHash(body), excerpt: body.slice(at, at + 800) });
+        }).join("\n");
     } else if (request.kind === "file") {
       safeSelector(request.selector);
       const path = posix.normalize(request.selector);

@@ -1,14 +1,17 @@
 import type { ReviewAllowance, ReviewScope } from "../shared/reviews";
+import { IterationLimitEditor } from "./IterationLimitEditor";
 export function ReviewPanel({
   accounts,
   paused,
   busy,
   onGrant,
+  onConfigure,
 }: {
   accounts: ReviewAllowance[];
   paused: ReviewScope | null;
   busy: boolean;
   onGrant: (scope: ReviewScope, version: number) => void;
+  onConfigure?: (scope: ReviewScope, limit: number | null, version: number) => void;
 }) {
   return (
     <section aria-label="리뷰 횟수" className="budget-panel">
@@ -21,15 +24,15 @@ export function ReviewPanel({
         <div key={a.scope}>
           <strong>
             {a.scope === "planning" ? "계획 검토" : "구현 리뷰"} · {a.used} /{" "}
-            {a.limit}회
+            {a.limit === null ? "제한 없음" : `${a.limit}회`}
           </strong>
           {a.historyIncomplete && (
             <p>
-              이전 기록이 불완전해 확인한 호출만 표시합니다. 다음 호출에는 추가
-              승인이 필요합니다.
+              이전 기록이 불완전해 확인한 호출만 표시합니다.
             </p>
           )}
-          {paused === a.scope && (
+          {onConfigure && <IterationLimitEditor label={a.scope === "planning" ? "계획 검토" : "구현 리뷰"} limit={a.limit} busy={busy} onSave={limit => onConfigure(a.scope, limit, a.version)} />}
+          {a.limit !== null && paused === a.scope && (
             <>
               <p>
                 리뷰를 멈추고 결과와 진행 상태를 보존했습니다. 토큰·시간 예산도

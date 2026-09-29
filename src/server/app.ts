@@ -1,3 +1,4 @@
+import { z } from "zod";
 import { BrainstormDecisionSchema, BrainstormInputSchema } from "../shared/brainstorm.js";
 import { PlanningMigrationSchema } from "../shared/planningControl.js";
 import {ReviewGrantInputSchema} from "../shared/reviews.js";
@@ -199,6 +200,17 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   });
 
   app.get("/api/health", async () => ({ ok: true }));
+  app.put<{ Params: { id: string } }>("/api/topics/:id/iteration-limits", async request => {
+    if (request.headers["x-consensus-actor"] === "mediator") throw Object.assign(new Error("횟수 설정은 사용자만 변경할 수 있습니다."), { statusCode: 403 });
+    workflow.assertBudgetEditable(request.params.id);
+    const input = z.object({ scope: z.enum(["planning", "implementation", "revision"]), limit: z.number().int().nonnegative().nullable(), version: z.number().int().positive() }).strict().parse(request.body);
+    const result = input.scope === "revision" ? database.revisions.configure(request.params.id, input.limit, input.version)
+      : database.reviews.configure(request.params.id, input.scope, input.limit, input.version);
+    const topic = database.getTopic(request.params.id);
+    database.appendEvent({ topicId: topic.id, actor: "user", kind: "note", state: topic.state,
+      body: `${input.scope === "revision" ? "계획 재작성" : input.scope === "planning" ? "계획 검토" : "구현 리뷰"} 한도: ${input.limit === null ? "제한 없음" : `${input.limit}회`}. 자동 재개하지 않습니다.`, payload: { iterationLimit: input } });
+    return result;
+  });
   registerEvidenceRoutes(app, database, workflow, evidence, headers => { callOrigin({ headers }, "evidence:review"); });
   app.get("/api/config", async () => ({
     repositoryPath: config.repositoryPath,

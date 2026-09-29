@@ -287,6 +287,7 @@ describe("E3-4c 코드 리뷰 원장 — 예산 래퍼의 예약·되돌림과 �
 
   it.each([true, false])("같은 원장의 읽기·판정·계약 교정은 리뷰 1회이고, 원장 없는 호출은 각각 센다(예산 적용: %s)", async (budgetsEnabled) => {
     const room = reviewRoom();
+    room.database.reviews.configure(identity.topicId,"implementation",3,room.database.reviews.account(identity.topicId,"implementation").version);
     const ledger = room.database.planning.openReviewLedger(identity);
     const wrapped = reviewer(room.database, budgetsEnabled);
     await wrapped.createSession(turn(room.root, "review-read", "ok", ledger.id));

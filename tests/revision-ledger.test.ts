@@ -4,10 +4,11 @@ import { RevisionLedger } from "../src/server/revisionLedger";
 import { BudgetLedger } from "../src/server/budgetLedger";
 function setup() {
   const db = new DatabaseSync(":memory:");
-  db.exec("CREATE TABLE topics(id TEXT PRIMARY KEY)");
+  db.exec("CREATE TABLE topics(id TEXT PRIMARY KEY,state TEXT DEFAULT 'CLOSED')");
   const budgets = new BudgetLedger(db),
     revisions = new RevisionLedger(db);
   revisions.initialize("t");
+  revisions.configure("t", 3, 1);
   return { db, budgets, revisions };
 }
 it("최초 계획만 제외하고 재계획·교정·개정을 합쳐 세 번에서 차단한다", () => {
@@ -19,10 +20,10 @@ it("최초 계획만 제외하고 재계획·교정·개정을 합쳐 세 번에
   revisions.admit("t", "replan", "plan");
   expect(revisions.account("t").used).toBe(3);
   expect(() => revisions.admit("t", "fourth", "revision")).toThrow("한도");
-  revisions.grant("t", "grant", 1);
-  revisions.grant("t", "grant", 1);
+  revisions.grant("t", "grant", 2);
+  revisions.grant("t", "grant", 2);
   expect(revisions.account("t").limit).toBe(4);
-  expect(() => revisions.grant("t", "other", 1)).toThrow("변경");
+  expect(() => revisions.grant("t", "other", 2)).toThrow("변경");
   revisions.admit("t", "fourth", "revision");
   expect(() => revisions.admit("t", "fifth", "repair")).toThrow();
   expect(new RevisionLedger(db).account("t").used).toBe(4);
@@ -66,7 +67,7 @@ it("토큰 예산 거절은 횟수를 쓰지 않고 횟수 거절은 실행 원�
 });
 it("기존 토픽의 불완전한 이력은 0회 여유를 주지 않고 확인한 호출만 보존한다", () => {
   const { db } = setup();
-  db.exec("INSERT INTO topics VALUES ('old')");
+  db.exec("INSERT INTO topics(id) VALUES ('old')");
   db.prepare("INSERT INTO budget_executions VALUES (?,?)").run(
     "old-call",
     JSON.stringify({

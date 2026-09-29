@@ -1,16 +1,18 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { EvidencePanel } from "../src/web/EvidencePanel";
 import { api } from "../src/web/api";
-import type { EvidenceTopicState } from "../src/shared/externalEvidence";
+import type { EvidenceTopicState, EvidenceCatalog } from "../src/shared/externalEvidence";
 
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks(); });
 const state = (ready = true): EvidenceTopicState => ({ plan: { scopeGeneration: 1, planEpoch: 1, planSHA256: "d".repeat(64) }, ready, reviewed: false, digest: "a".repeat(64), sources: [{
   id: "b".repeat(64), label: "Planning", url: "https://team.atlassian.net/browse/APP-1", mode: "connector", intervalSeconds: 900,
   provider: "jira", resource: "team.atlassian.net/APP-1", selector: "", revision: "r1", contentHash: "c".repeat(64), checkedAt: null, error: null, nextCheckAt: 0,
 }] });
+const catalog = (): EvidenceCatalog => ({ version: "a".repeat(64), groupId: "g", roots: [], entries: [], history: [], coverage: { sources: 0, units: 0, complete: 0, pending: 0, failed: 0, candidates: 0, ready: true } });
+beforeEach(() => { vi.spyOn(api, "evidenceCatalog").mockResolvedValue(catalog()); });
 function pending<T>() { let resolve!: (value: T) => void; let reject!: (error: Error) => void; const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; }); return { promise, resolve, reject }; }
 it("does not allow unverified content to be marked reviewed and preserves the reason after failure", async () => {
   vi.spyOn(api, "evidence").mockResolvedValue(state(false));
@@ -22,7 +24,7 @@ it("does not allow unverified content to be marked reviewed and preserves the re
   const loaded = pending<EvidenceTopicState>();
   vi.spyOn(api, "evidence").mockReturnValue(loaded.promise);
   render(<EvidencePanel topicId="t" busy={false} />);
-  fireEvent.click(screen.getByText(/Slack · Jira · Figma 근거/));
+  fireEvent.click(screen.getByText(/원문 근거/));
   expect(screen.queryByLabelText("원문 변경 영향")).not.toBeInTheDocument();
   // 초기 응답과 그에 따른 이유 초기화가 반영된 뒤 사용자의 입력을 시작한다.
   await act(async () => { loaded.resolve(state()); await loaded.promise; });
@@ -35,20 +37,21 @@ it("does not allow unverified content to be marked reviewed and preserves the re
   expect(review).toHaveBeenCalledWith("t", { digest: "a".repeat(64), plan: state().plan, reason: "Compared source and plan" });
 });
 it("registers once while pending and ignores an older poll that finishes after the mutation", async () => {
-  const old = pending<EvidenceTopicState>(); const write = pending<any>();
-  vi.spyOn(api, "evidence").mockReturnValueOnce(old.promise).mockResolvedValue(state());
-  const add = vi.spyOn(api, "addEvidence").mockReturnValue(write.promise);
+  const old = pending<EvidenceCatalog>(); const write = pending<any>();
+  vi.spyOn(api, "evidence").mockResolvedValue(state());
+  vi.spyOn(api, "evidenceCatalog").mockReturnValueOnce(old.promise).mockResolvedValue({ ...catalog(), coverage: { ...catalog().coverage, sources: 77 } });
+  const add = vi.spyOn(api, "addEvidenceRoot").mockReturnValue(write.promise);
   render(<EvidencePanel topicId="t" busy={false} />);
-  fireEvent.click(screen.getByText(/Slack · Jira · Figma 근거/));
-  fireEvent.change(screen.getByLabelText("원문 이름"), { target: { value: "Planning" } });
-  fireEvent.change(screen.getByLabelText("원문 링크"), { target: { value: "https://team.atlassian.net/browse/APP-1" } });
-  const button = screen.getByRole("button", { name: "원문 등록" });
+  fireEvent.click(screen.getByText(/원문 근거/));
+  fireEvent.change(screen.getByLabelText("탐색 루트 이름"), { target: { value: "Planning" } });
+  fireEvent.change(screen.getByLabelText("탐색 루트 링크"), { target: { value: "https://team.atlassian.net/browse/APP-1" } });
+  const button = screen.getByRole("button", { name: "루트와 탐색 범위 승인·추가" });
   fireEvent.click(button); fireEvent.click(button);
   expect(add).toHaveBeenCalledTimes(1); expect(button).toBeDisabled();
-  write.resolve(state().sources[0]); await screen.findByRole("link", { name: "Planning" });
-  old.resolve({ plan: state().plan, ready: true, reviewed: true, digest: "old", sources: [] });
-  await waitFor(() => expect(button).toBeEnabled());
-  expect(screen.getByRole("link", { name: "Planning" })).toBeInTheDocument();
+  write.resolve({}); await screen.findByText(/자료 77개/);
+  await act(async () => { old.resolve(catalog()); await old.promise; });
+  expect(screen.getByText(/자료 77개/)).toBeInTheDocument();
+  expect(add).toHaveBeenCalledWith("t", expect.objectContaining({ scope: "group", url: "https://team.atlassian.net/browse/APP-1" }));
 });
 
 it("clears the old review reason when polling detects a different plan", async () => {
@@ -58,7 +61,7 @@ it("clears the old review reason when polling detects a different plan", async (
   vi.spyOn(api, "evidence").mockReturnValueOnce(loaded.promise).mockResolvedValue(current);
   const review = vi.spyOn(api, "reviewEvidence").mockResolvedValue({});
   render(<EvidencePanel topicId="t" busy={false} />);
-  fireEvent.click(screen.getByText(/Slack · Jira · Figma 근거/));
+  fireEvent.click(screen.getByText(/원문 근거/));
   await act(async () => { loaded.resolve(state()); await loaded.promise; });
   const input = screen.getByLabelText("원문 변경 영향");
   fireEvent.change(input, { target: { value: "Reason for old plan" } });
@@ -76,9 +79,8 @@ it("shows connection setup and shared scope and explicitly converts a source to 
   vi.spyOn(api, "evidence").mockResolvedValue(current);
   const convert = vi.spyOn(api, "useRestEvidence").mockReturnValue(pendingChange.promise);
   render(<EvidencePanel topicId="t" busy={false} />);
-  fireEvent.click(screen.getByText(/Slack · Jira · Figma 근거/));
+  fireEvent.click(screen.getByText(/원문 근거/));
   expect(await screen.findByText(/서버 읽기 인증 설정 필요/)).toHaveTextContent("공유 주제 2개");
-  expect(screen.getByLabelText("원문 연결 방식")).toHaveValue("rest");
   const button = screen.getByRole("button", { name: "서버 수집으로 전환 (공유 주제 모두 적용)" });
   fireEvent.click(button); fireEvent.click(button); expect(convert).toHaveBeenCalledTimes(1);
   pendingChange.reject(new Error("읽기 인증 설정이 필요합니다."));

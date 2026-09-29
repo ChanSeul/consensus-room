@@ -61,6 +61,8 @@ function setup(role: "claude" | "codex" = "claude", executionInput = 100000, exe
     repositoryPath: repo, worktreePath: repo, baseRef: "HEAD", branchName: null,
     state: role === "claude" ? "CLAUDE_PLAN" : "CODEX_AUDIT", scopeGeneration: 1, planRevision: 0,
     planSHA256: null, approvedPlanSHA256: null, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), lastError: null });
+  database.revisions.configure(topic.id,3,database.revisions.account(topic.id).version);
+  for (const scope of ["planning","implementation"] as const) database.reviews.configure(topic.id,scope,3,database.reviews.account(topic.id,scope).version);
   if (enable) database.planning.enable(topic.id);
   database.budgets.configure(topic.id, { execution: { inputTokens: executionInput, outputTokens: 10000, durationMs: executionDuration },
     total: { inputTokens: 300000, outputTokens: 30000, durationMs: 300000 } }, "test");

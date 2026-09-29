@@ -5,7 +5,7 @@ export const ReviewAllowanceSchema = z.object({
   topicId: z.string(),
   scope: ReviewScopeSchema,
   used: z.number().int().nonnegative(),
-  limit: z.number().int().nonnegative(),
+  limit: z.number().int().nonnegative().nullable(),
   version: z.number().int().positive(),
   historyIncomplete: z.boolean(),
 });

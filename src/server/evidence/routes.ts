@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { MediatorEvidenceBatchInputSchema, MediatorEvidenceAckSchema, EvidenceDependencySchema, EvidenceReviewInputSchema, EvidenceSnapshotInputSchema, EvidenceSourceInputSchema } from "../../shared/externalEvidence.js";
+import { MediatorEvidenceBatchInputSchema, MediatorEvidenceAckSchema, EvidenceDependencySchema, EvidenceReviewInputSchema, EvidenceSnapshotInputSchema, EvidenceSourceInputSchema,
+  parseEvidenceSource, EvidenceRootInputSchema, EvidenceSelectionInputSchema, EvidenceSearchInputSchema } from "../../shared/externalEvidence.js";
 import type { ConsensusDatabase } from "../database.js";
 import type { WorkflowEngine } from "../workflow.js";
 import type { EvidenceService } from "./service.js";
@@ -10,6 +11,77 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
   const mediator = (headers: Record<string, unknown>) => {
     if (headers["x-consensus-actor"] !== "mediator") throw Object.assign(new Error("중재자 세션에서 호출하세요."), { statusCode: 403 });
   };
+  const user = (headers: Record<string, unknown>) => {
+    if (headers["x-consensus-actor"] === "mediator") throw Object.assign(new Error("근거 선택 승인은 사용자만 할 수 있습니다."), { statusCode: 403 });
+  };
+  const idle = (ids: string[]) => { for (const id of ids) workflow.assertBudgetEditable(id); };
+  const notifySelection = (ids: string[]) => {
+    for (const id of ids) {
+      const topic = db.getTopic(id); if (topic.state === "CLOSED" || db.getFlags(id).committedOID) continue;
+      db.appendEvent({topicId:id,actor:"user",kind:"note",state:topic.state,
+        body:"앞으로 사용할 근거 목록이 바뀌었습니다. 이전 계획과 인용은 과거 기록이며, 현재 승인된 근거로 다시 계획하고 확인하세요. 에이전트 세션도 새로 시작합니다.",
+        payload:{evidenceCatalogVersion:db.evidence.catalog.version(id),planEpoch:topic.planEpoch}});
+    }
+  };
+  app.get<{ Params: { id: string } }>("/api/topics/:id/evidence/catalog", async request => db.evidence.catalog.state(request.params.id));
+  app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/roots", async request => {
+    const input = EvidenceRootInputSchema.parse(request.body), context = db.evidence.catalog.context(request.params.id);
+    const scope = input.scope === "group" && !context.group ? "topic" : input.scope;
+    const ids = db.listTopics().filter(t => db.evidence.catalog.context(t.id)[scope] === context[scope]).map(t => t.id);
+    const approved = request.headers["x-consensus-actor"] !== "mediator";
+    if (scope === "workspace") user(request.headers);
+    const parsed = parseEvidenceSource(input);
+    if (scope === "workspace" && parsed.provider === "jira") throw new Error("Jira 루트는 작업 그룹별로 지정하세요.");
+    const source = db.evidence.ensureSource({url:input.url,label:input.label,mode:input.mode,intervalSeconds:input.intervalSeconds});
+    const existing = db.evidence.catalog.forTopic(request.params.id).find(root => root.scope === scope && root.sourceId === source.id && root.status !== "removed");
+    if (existing) return existing;
+    if (approved) { const result = await workflow.changeEvidenceSelection(ids,()=>db.evidence.catalog.add(request.params.id,input,true)); notifySelection(ids); return result; }
+    idle(ids); return db.evidence.catalog.add(request.params.id,input,false);
+  });
+  app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/selection", async request => {
+    user(request.headers);
+    const input = EvidenceSelectionInputSchema.parse(request.body);
+    const root = db.evidence.catalog.assertSelection(request.params.id,input);
+    await workflow.changeEvidenceSelection(db.evidence.catalog.affected(root),()=>db.evidence.catalog.select(request.params.id,input));
+    notifySelection(db.evidence.catalog.affected(root));
+    return db.evidence.catalog.state(request.params.id);
+  });
+  app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/selection-batch", async request => {
+    user(request.headers);
+    const input = z.object({ version:z.string(),rootId:z.string().uuid(),action:z.enum(["accept","reject"]),sourceIds:z.array(z.string()).min(1).max(200) }).strict().parse(request.body);
+    const root = db.evidence.catalog.assertSelection(request.params.id,{...input,sourceId:input.sourceIds[0]});
+    for (const sourceId of input.sourceIds) db.evidence.catalog.assertSelection(request.params.id,{...input,sourceId});
+    await workflow.changeEvidenceSelection(db.evidence.catalog.affected(root),()=>db.evidence.catalog.selectBatch(request.params.id,input));
+    notifySelection(db.evidence.catalog.affected(root));
+    return db.evidence.catalog.state(request.params.id);
+  });
+  app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/collect", async request => {
+    z.object({}).strict().parse(request.body ?? {});
+    for (const root of db.evidence.catalog.forTopic(request.params.id).filter(r => r.status === "approved")) await service.collect(root.id);
+    return db.evidence.catalog.state(request.params.id);
+  });
+  app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/search", async request => {
+    const input = EvidenceSearchInputSchema.parse(request.body);
+    const terms = input.query.toLocaleLowerCase().split(/\s+/).filter(Boolean);
+    const hits = db.evidence.list(request.params.id).flatMap(source => (db.evidence.snapshot(source.id)?.units ?? []).flatMap(unit => {
+      const haystack = `${source.label}\n${unit.id}\n${unit.content}`.toLocaleLowerCase();
+      const positions = terms.map(term => haystack.indexOf(term)).filter(i => i >= 0);
+      const bodyPositions=terms.map(term=>unit.content.toLocaleLowerCase().indexOf(term)).filter(i=>i>=0);
+      const start=bodyPositions.length ? Math.max(0,Math.min(...bodyPositions)-120) : 0;
+      return positions.length ? [{ sourceId: source.id, unitId: unit.id, hash: unit.contentHash, url: source.url, label: source.label,
+        excerpt: unit.content.slice(start,start+800), score: positions.length }] : [];
+    })).sort((a,b) => b.score - a.score || a.sourceId.localeCompare(b.sourceId) || a.unitId.localeCompare(b.unitId));
+    return { total: hits.length, hits: hits.slice(input.offset, input.offset + input.limit), nextOffset: input.offset + input.limit < hits.length ? input.offset + input.limit : null };
+  });
+  app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/read", async request => {
+    const input = z.object({ sourceId: z.string(), unitId: z.string(), hash: z.string(), offset: z.number().int().nonnegative().default(0),
+      limit: z.number().int().min(1).max(16000).default(8000) }).strict().parse(request.body);
+    if (!db.evidence.list(request.params.id).some(s => s.id === input.sourceId)) throw new Error("현재 승인된 근거가 아닙니다.");
+    const unit = db.evidence.snapshot(input.sourceId)?.units.find(u => u.id === input.unitId && u.contentHash === input.hash);
+    if (!unit) throw new Error("원문 버전이 바뀌었습니다. 다시 검색하세요.");
+    const points = Array.from(unit.content), end = Math.min(points.length, input.offset + input.limit);
+    return { ...unit, content: points.slice(input.offset, end).join(""), nextOffset: end < points.length ? end : null };
+  });
   app.get("/api/evidence/connections", async () => db.evidence.list().map(source => ({
     id: source.id, provider: source.provider, mode: source.mode, ...service.connection(source),
     topics: db.evidence.linkedTopics(source.id), metrics: db.evidence.metrics(source.id),
@@ -46,8 +118,11 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
   app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/sources", async request => {
     const topic = db.getTopic(request.params.id);
     workflow.assertBudgetEditable(topic.id);
-    if (topic.state === "CLOSED") throw new Error("닫힌 주제의 근거를 바꿀 수 없습니다.");
-    return db.evidence.register(topic.id, EvidenceSourceInputSchema.parse(request.body));
+    const input = EvidenceSourceInputSchema.parse(request.body);
+    // Compatibility for explicit user-provided single-source snapshots; recursive roots use /roots.
+    if (request.headers["x-consensus-actor"] !== "mediator") return db.evidence.register(topic.id, input);
+    const root = db.evidence.catalog.add(topic.id, { ...input, scope: "topic", required: true }, false);
+    return db.evidence.get(root.sourceId);
   });
   app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/review", async request => {
     authorizeReview(request.headers); workflow.assertBudgetEditable(request.params.id);
@@ -60,9 +135,13 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
     return db.evidence.topic(topic);
   });
   app.delete<{ Params: { id: string; sourceId: string } }>("/api/topics/:id/evidence/sources/:sourceId", async request => {
-    authorizeReview(request.headers); workflow.assertBudgetEditable(request.params.id);
+    user(request.headers); workflow.assertBudgetEditable(request.params.id);
     const topic = db.getTopic(request.params.id);
-    if (topic.state === "CLOSED") throw new Error("닫힌 주제의 근거는 해제할 수 없습니다.");
+    const roots = db.evidence.catalog.forTopic(topic.id).filter(r => r.sourceId === request.params.sourceId && r.status !== "removed");
+    for (const root of roots) {
+      await workflow.changeEvidenceSelection(db.evidence.catalog.affected(root),()=>db.evidence.catalog.select(topic.id, { version: db.evidence.catalog.version(topic.id), rootId: root.id, action: "remove" }));
+      notifySelection(db.evidence.catalog.affected(root));
+    }
     db.evidence.detach(topic.id, request.params.sourceId);
     return db.evidence.topic(topic);
   });
@@ -70,6 +149,8 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
   app.post<{ Params: { id: string } }>("/api/evidence/:id/check", async request => {
     const input = z.object({ force: z.boolean().default(false) }).strict().parse(request.body ?? {});
     const source = db.evidence.get(request.params.id);
+    const roots = db.evidence.catalog.roots().filter(r => r.status === "approved" && db.evidence.catalog.members(r.id).some(m => m.source_id === source.id && m.state === "approved"));
+    if (roots.length) { for (const root of roots) await service.collect(root.id,input.force); return { source: db.evidence.get(source.id), checkId: null }; }
     if (source.mode === "rest") { await service.refresh(source.id, input.force); return { source: db.evidence.get(source.id), checkId: null }; }
     return db.evidence.begin(source.id, input.force) ?? { source: db.evidence.get(source.id), checkId: null };
   });

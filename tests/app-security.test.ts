@@ -223,6 +223,8 @@ function draftTopic(
     updatedAt: "2026-08-23T00:00:00.000Z",
     lastError: null,
   });
+  database.revisions.configure(id,3,database.revisions.account(id).version);
+  for(const scope of ["planning","implementation"] as const) database.reviews.configure(id,scope,3,database.reviews.account(id,scope).version);
 }
 
 describe("로컬 API 접속 토큰", () => {
@@ -667,12 +669,12 @@ it("재작성 승인은 1회만 늘리고 실제 호출을 재개하며 중복·
   const unauthorized=await app.inject({method:"POST",url:"/api/topics/revisions/actions/revision-resume",payload:{version:1}});
   expect(unauthorized.statusCode).toBe(401);
   expect((await post("revision-resume",{version:1,limit:100},"invalid")).statusCode).toBeGreaterThanOrEqual(400);
-  const grant=await post("revision-resume",{version:1},"grant");expect(grant.statusCode).toBe(200);
+  const grant=await post("revision-resume",{version:2},"grant");expect(grant.statusCode).toBe(200);
   await vi.waitFor(()=>expect(database.runningAction("revisions")).toBeNull());
   expect(adapterCalls,database.getTopic("revisions").lastError ?? JSON.stringify(grant.json())).toEqual(["claude"]);
-  expect(database.revisions.account("revisions")).toMatchObject({used:4,limit:4,version:2});
-  expect((await post("revision-resume",{version:1},"grant")).statusCode).toBe(200);
-  expect((await post("revision-resume",{version:1},"stale")).statusCode).toBeGreaterThanOrEqual(400);
+  expect(database.revisions.account("revisions")).toMatchObject({used:4,limit:4,version:3});
+  expect((await post("revision-resume",{version:2},"grant")).statusCode).toBe(200);
+  expect((await post("revision-resume",{version:2},"stale")).statusCode).toBeGreaterThanOrEqual(400);
   expect(adapterCalls).toHaveLength(1);
   const budgetGrant=await post("budget-resume",{version:1,policy:{...policy,execution:{...policy.execution,inputTokens:2000}}},"budget");
   expect(budgetGrant.statusCode).toBe(200);expect(budgetGrant.json().resumeBlocked).toContain("재작성");
@@ -689,7 +691,7 @@ it("재작성 승인 후 명시한 토큰 예산이 소진됐으면 승인만 �
   database.budgets.observe("both-cap",{inputTokens:1},1,true);
   database.revisions.admit("both","initial","plan");
   for(const id of ["a","b","c"])database.revisions.admit("both",id,"revision");
-  const grant=await app.inject({method:"POST",url:"/api/topics/both/actions/revision-resume",payload:{version:1},headers:{"x-consensus-token":"launch-token-for-test","idempotency-key":"grant"}});
+  const grant=await app.inject({method:"POST",url:"/api/topics/both/actions/revision-resume",payload:{version:2},headers:{"x-consensus-token":"launch-token-for-test","idempotency-key":"grant"}});
   expect(grant.statusCode).toBe(200);expect(grant.json().resumeBlocked).toContain("예산");
   expect(database.revisions.account("both")).toMatchObject({used:3,limit:4});expect(adapterCalls).toHaveLength(0);
  } finally {await app.close();}
@@ -797,7 +799,7 @@ it.each(["held","closed","stale"])("budget resume checks the existing %s review 
   if(kind==="held") {expect(response.json().resumeBlocked).toBeUndefined();expect(database.latestAction(topic.id)).not.toBeNull();}
   else {expect(response.json().resumeBlocked).toContain("리뷰");expect(database.latestAction(topic.id)).toBeNull();}
   await vi.waitFor(()=>expect(database.runningAction(topic.id)).toBeNull());
-  expect(database.reviews.account(topic.id,"implementation")).toMatchObject({used:3,limit:3,version:1});
+  expect(database.reviews.account(topic.id,"implementation")).toMatchObject({used:3,limit:3,version:2});
  } finally {await app.close();}
 });
 
@@ -809,11 +811,11 @@ it("리뷰 1회 승인은 지정된 검토만 늘리고 예산 부족 시 재개
   database.budgets.start({id:"review-cap",accounts:["review"],startedAt:0,stage:"CODEX_REVIEW",role:"codex",model:"test",effort:"test"});
   database.budgets.observe("review-cap",{inputTokens:1},1,true);
   for(const id of ["a","b","c"])database.reviews.admit("review",id,"implementation");
-  const post=(scope:string,key:string)=>app.inject({method:"POST",url:"/api/topics/review/actions/review-resume",payload:{scope,version:1},headers:{"x-consensus-token":"launch-token-for-test","idempotency-key":key}});
+  const post=(scope:string,key:string)=>app.inject({method:"POST",url:"/api/topics/review/actions/review-resume",payload:{scope,version:2},headers:{"x-consensus-token":"launch-token-for-test","idempotency-key":key}});
   expect((await post("planning","wrong")).statusCode).toBeGreaterThanOrEqual(400);
   const result=await post("implementation","grant");expect(result.statusCode).toBe(200);expect(result.json().resumeBlocked).toContain("예산");
   expect((await post("implementation","grant")).statusCode).toBe(200);
-  expect(database.reviews.account("review","implementation")).toMatchObject({used:3,limit:4,version:2});
+  expect(database.reviews.account("review","implementation")).toMatchObject({used:3,limit:4,version:3});
   expect(database.reviews.account("review","planning")).toMatchObject({used:0,limit:3});expect(adapterCalls).toHaveLength(0);
  } finally {await app.close();}
 });

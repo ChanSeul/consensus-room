@@ -81,6 +81,8 @@ export class ConsensusDatabase {
     this.revisions = new RevisionLedger(this.db);
     this.reviews = new ReviewLedger(this.db);
     this.roles = new RoleRegistry(this.db);
+    this.evidence.freezeFinalized();
+    this.evidence.catalog.migrateLegacy();
   }
 
   close(): void {
@@ -592,7 +594,9 @@ export class ConsensusDatabase {
     const values = entries.map(([key, value]) => key === "fixPassUsed" ? (value ? 1 : 0) : value) as SqlValue[];
     this.db.prepare(`UPDATE topics SET ${assignments.join(", ")}, updated_at = ? WHERE id = ?`)
       .run(...values, now(), id);
-    return this.getTopic(id);
+    const result = this.getTopic(id);
+    if (changes.state === "CLOSED" || changes.committedOID) this.evidence.freeze(result);
+    return result;
   }
 
   updateAgentSettings(
@@ -1005,7 +1009,10 @@ export class ConsensusDatabase {
     const generation = scopeGeneration ?? this.getTopic(topicId).scopeGeneration;
     const row = this.db.prepare(`
       SELECT kind, revision, scope_generation, sha256, path, created_at FROM artifacts
-      WHERE topic_id = ? AND kind = ? AND scope_generation = ? ORDER BY revision DESC LIMIT 1
+      WHERE topic_id = ? AND kind = ? AND scope_generation = ?
+        AND (kind IN ('implementation-notes','deferred-findings','tool-tree-baseline') OR id > COALESCE((SELECT artifact_id FROM evidence_artifact_boundaries b
+          WHERE b.topic_id=artifacts.topic_id AND b.scope_generation=artifacts.scope_generation),0))
+      ORDER BY revision DESC LIMIT 1
     `).get(topicId, kind, generation) as Record<string, unknown> | undefined;
     return row ? {
       kind: String(row.kind), revision: Number(row.revision), sha256: String(row.sha256),
@@ -1025,7 +1032,10 @@ export class ConsensusDatabase {
     const generation = scopeGeneration ?? this.getTopic(topicId).scopeGeneration;
     const rows = this.db.prepare(`
       SELECT kind, revision, scope_generation, sha256, path, created_at FROM artifacts
-      WHERE topic_id = ? AND kind = ? AND scope_generation = ? ORDER BY revision DESC
+      WHERE topic_id = ? AND kind = ? AND scope_generation = ?
+        AND (kind IN ('implementation-notes','deferred-findings','tool-tree-baseline') OR id > COALESCE((SELECT artifact_id FROM evidence_artifact_boundaries b
+          WHERE b.topic_id=artifacts.topic_id AND b.scope_generation=artifacts.scope_generation),0))
+      ORDER BY revision DESC
     `).all(topicId, kind, generation) as Array<Record<string, unknown>>;
     return rows.map((row) => ({
       kind: String(row.kind), revision: Number(row.revision), scopeGeneration: Number(row.scope_generation),

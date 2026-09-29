@@ -1,4 +1,5 @@
 import { executionHistory } from "./executionHistory.js";
+import { migrateUnlimitedIterations, validateIterationLimit } from "./iterationLimits.js";
 import type { DatabaseSync } from "node:sqlite";
 import {
   reviewScope,
@@ -56,6 +57,7 @@ export class ReviewLedger {
           });
         });
       }
+    migrateUnlimitedIterations(db, "review_allowances");
   }
   initialize(topicId: string): void {
     for (const scope of ["planning", "implementation"] as const) {
@@ -65,7 +67,7 @@ export class ReviewLedger {
         topicId,
         scope,
         used: 0,
-        limit: 3,
+        limit: null,
         version: 1,
         historyIncomplete: false,
       });
@@ -89,7 +91,7 @@ export class ReviewLedger {
   }
   assertAvailable(topicId: string, scope: ReviewScope): void {
     const a = this.account(topicId, scope);
-    if (a.used >= a.limit) throw new ReviewBlocked(topicId, scope);
+    if (a.limit !== null && a.used >= a.limit) throw new ReviewBlocked(topicId, scope);
   }
   reserve(topicId: string, id: string, scope: ReviewScope): void {
     const old = this.db
@@ -143,7 +145,7 @@ export class ReviewLedger {
       const a = this.account(topicId, scope);
       if (a.version !== version)
         throw new Error("리뷰 한도가 변경됐습니다. 새로 확인하세요.");
-      if (a.used < a.limit)
+      if (a.limit === null || a.used < a.limit)
         throw new Error("아직 사용할 리뷰 횟수가 남아 있습니다.");
       a.limit = a.used + 1;
       a.version++;
@@ -160,6 +162,14 @@ export class ReviewLedger {
         "INSERT INTO review_allowances VALUES (?,?,?) ON CONFLICT(topic_id,scope) DO UPDATE SET record_json=excluded.record_json",
       )
       .run(a.topicId, a.scope, JSON.stringify(a));
+  }
+  configure(topicId: string, scope: ReviewScope, limit: number | null, version: number): ReviewAllowance {
+    validateIterationLimit(limit);
+    return this.transaction(() => {
+      const a = this.account(topicId, scope);
+      if (a.version !== version) throw new Error("리뷰 설정이 바뀌었습니다. 다시 확인하세요.");
+      a.limit = limit; a.version++; this.save(a); return a;
+    });
   }
   private transaction<T>(work: () => T): T {
     this.db.exec("BEGIN IMMEDIATE");

@@ -7,14 +7,14 @@ export const EvidenceSourceInputSchema = z.object({
   intervalSeconds: z.number().int().min(300).max(86400).default(900),
 }).strict();
 export type EvidenceSourceInput = z.infer<typeof EvidenceSourceInputSchema>;
-export type EvidenceProvider = "slack" | "jira" | "figma";
+export type EvidenceProvider = "slack" | "jira" | "figma" | "sheets" | "confluence" | "document";
 export type EvidenceStatus = "current" | "changed" | "unavailable" | "missing";
 export const EvidenceDependencySchema = z.object({ sourceId: z.string().regex(/^[a-f0-9]{64}$/), contentHash: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
 export type EvidenceDependency = z.infer<typeof EvidenceDependencySchema>;
 
 export const EvidenceUnitSchema = z.object({
   id: z.string().min(1).max(200),
-  kind: z.enum(["issue", "comment", "message", "design", "render"]),
+  kind: z.enum(["issue", "comment", "message", "design", "render", "document", "cells", "api"]),
   // Source text is data, never an instruction or a confirmed product decision.
   content: z.string().max(160_000),
   author: z.string().max(200).optional(),
@@ -57,10 +57,51 @@ export interface EvidenceTopicState {
   connections?: Array<{ sourceId: string; configured: boolean; sharedTopics: number }>;
 }
 
+export const EvidenceScopeSchema = z.enum(["workspace", "group", "topic"]);
+export type EvidenceScope = z.infer<typeof EvidenceScopeSchema>;
+export const EvidenceRootInputSchema = EvidenceSourceInputSchema.extend({
+  scope: EvidenceScopeSchema.default("group"),
+  required: z.boolean().default(true),
+}).strict();
+export type EvidenceRootInput = z.infer<typeof EvidenceRootInputSchema>;
+export interface EvidenceRoot {
+  id: string; scope: EvidenceScope; owner: string; sourceId: string; required: boolean;
+  status: "proposed" | "approved" | "removed"; version: number; createdAt: number;
+  approvedAt: number | null; lastCompleteAt: number | null; nextCheckAt: number; scanStartedAt?: number;
+}
+export interface EvidenceDiscoveryLink { url: string; label: string; unitId: string; relation: "child" | "link" }
+export interface EvidenceDiscoveryPage {
+  units: EvidenceUnitInput[]; links: EvidenceDiscoveryLink[]; cursor: string | null; revision: string;
+}
+export interface EvidenceCatalogEntry {
+  rootId: string; source: EvidenceSource; state: "approved" | "candidate" | "rejected";
+  progress: "pending" | "reading" | "complete" | "failed"; error: string | null;
+  discoveredFrom: Array<{ sourceId: string; unitId: string; relation: string }>;
+}
+export interface EvidenceCatalog {
+  version: string; groupId: string | null; roots: Array<EvidenceRoot & { source: EvidenceSource }>;
+  unresolvedLinks?: Array<{ rootId: string; id: string; url: string; error: string }>;
+  entries: EvidenceCatalogEntry[]; history: Array<{ at: number; action: string; url: string; scope: EvidenceScope }>;
+  coverage: { sources: number; units: number; complete: number; pending: number; failed: number; candidates: number; ready: boolean };
+}
+export const EvidenceSelectionInputSchema = z.object({
+  version: z.string().regex(/^[a-f0-9]{64}$/), rootId: z.string().uuid(),
+  action: z.enum(["approve", "remove", "accept", "reject", "dismiss"]), sourceId: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+}).strict();
+export const EvidenceSearchInputSchema = z.object({
+  query: z.string().trim().min(1).max(500), offset: z.number().int().nonnegative().default(0),
+  limit: z.number().int().min(1).max(50).default(20),
+}).strict();
+export interface EvidenceSearchHit { sourceId: string; unitId: string; hash: string; url: string; label: string; excerpt: string }
+
 // URL query fragments and display names are not resource identity. Reject credentials and arbitrary hosts.
 export function parseEvidenceSource(input: EvidenceSourceInput): Pick<EvidenceSource, "provider" | "resource" | "selector" | "url"> {
   const url = new URL(input.url);
   if (url.protocol !== "https:" || url.username || url.password || url.port) throw new Error("HTTPS 원문 링크만 등록할 수 있습니다.");
+  if (/\.(?:slack\.com|atlassian\.net|figma\.com)\./.test(url.hostname)) throw new Error("원문 서비스 주소가 올바르지 않습니다.");
+  const channel = /^\/archives\/([CG][A-Z0-9]+)\/?$/.exec(url.pathname);
+  if (url.hostname.endsWith(".slack.com") && channel) return { provider: "slack", resource: `${url.hostname}/${channel[1]}`,
+    selector: "", url: `https://${url.hostname}/archives/${channel[1]}` };
   const slack = /^\/archives\/([CG][A-Z0-9]+)\/p(\d{10})(\d{6})\/?$/.exec(url.pathname);
   if (url.hostname.endsWith(".slack.com") && slack) {
     const thread = url.searchParams.get("thread_ts") ?? `${slack[2]}.${slack[3]}`;
@@ -78,7 +119,17 @@ export function parseEvidenceSource(input: EvidenceSourceInput): Pick<EvidenceSo
     return { provider: "figma", resource: figma[1], selector: node,
       url: `https://www.figma.com/design/${figma[1]}?node-id=${node.replace(":", "-")}` };
   }
-  throw new Error("Slack 스레드, Jira 이슈, Figma 노드 링크를 입력하세요. Figma는 node-id가 필요합니다.");
+  const sheet = /^\/spreadsheets\/d\/([a-zA-Z0-9_-]+)(?:\/.*)?$/.exec(url.pathname);
+  if (url.hostname === "docs.google.com" && sheet) return { provider: "sheets", resource: sheet[1], selector: "",
+    url: `https://docs.google.com/spreadsheets/d/${sheet[1]}/edit${url.searchParams.has("gid") ? `?gid=${url.searchParams.get("gid")}` : ""}` };
+  const page = /^\/wiki\/spaces\/[^/]+\/pages\/(\d+)(?:\/.*)?$/.exec(url.pathname);
+  if (url.hostname.endsWith(".atlassian.net") && page) return { provider: "confluence", resource: `${url.hostname}/${page[1]}`, selector: "", url: url.href };
+  if (["figma.com", "www.figma.com"].includes(url.hostname)) throw new Error("Figma는 작업할 페이지·노드의 node-id가 필요합니다.");
+  if (url.hostname.endsWith(".slack.com") || url.hostname.endsWith(".atlassian.net")) throw new Error("지원하는 채널·스레드·이슈·문서 주소를 입력하세요.");
+  if (!url.hostname.includes(".") || /^(localhost|127\.|0\.|169\.254\.|10\.|192\.168\.|\[)/.test(url.hostname) || url.hostname.endsWith(".local"))
+    throw new Error("공개 HTTPS 문서 주소를 입력하세요.");
+  url.hash = "";
+  return { provider: "document", resource: url.href, selector: "", url: url.href };
 }
 
 // 근거 한 쪽의 최대 크기(E3-1). 쪽 크기는 소비처가 실제로 받는 포장(중재자 응답 본문·러너 근거 블록)의 UTF-8 바이트다.
@@ -108,6 +159,7 @@ export interface MediatorEvidenceBatch {
   nextCursor: EvidenceCursor | null;
 }
 export interface MediatorEvidenceResponse extends MediatorEvidenceBatch {
+  corpus?: { sources: number; units: number; search: string; read: string; guidance: string };
   currentDigest: string;
   superseded: boolean;
 }

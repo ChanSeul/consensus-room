@@ -602,8 +602,10 @@ export function App() {
                 onSubmit={(action,body)=>void run(action,async()=>{ const result=await api.runAction(selected.id,action,body as Record<string,unknown>);const next=await api.getActivity(selected.id);if(selectedTopicRef.current===selected.id)setActivity(next);return result; })}/>}
               {activity?.revisionAllowance && <RevisionPanel account={activity.revisionAllowance} paused={activity.revisionPaused ?? false}
                 busy={Boolean(busyAction) || activity.runningAction}
+                onConfigure={(limit,version)=>void run("revision-limit",async()=>{await api.configureIterations(selected.id,"revision",limit,version);const next=await api.getActivity(selected.id);if(selectedTopicRef.current===selected.id)setActivity(next);})}
                 onGrant={()=>void run("revision-resume",async()=>{const result=await api.runAction(selected.id,"revision-resume",{version:activity.revisionAllowance!.version});const next=await api.getActivity(selected.id);if(selectedTopicRef.current===selected.id)setActivity(next);return result;})}/>}
               {activity?.reviewAllowances && <ReviewPanel accounts={activity.reviewAllowances} paused={activity.reviewPaused??null}
+                onConfigure={(scope,limit,version)=>void run("review-limit",async()=>{await api.configureIterations(selected.id,scope,limit,version);const next=await api.getActivity(selected.id);if(selectedTopicRef.current===selected.id)setActivity(next);})}
                 busy={Boolean(busyAction) || activity.runningAction} onGrant={(scope,version)=>void run("review-resume",async()=>{const result=await api.runAction(selected.id,"review-resume",{scope,version});const next=await api.getActivity(selected.id);if(selectedTopicRef.current===selected.id)setActivity(next);return result;})}/>}
               {activity?.planningProgress && <section className="panel" aria-label="계획 조사 진행">
                 <h3>계획 조사 {activity.planningProgress.round}회 · {activity.planningProgress.finalized ? "최종 결과 저장" : "중간 결과 저장"}</h3>

@@ -1,11 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import type { EvidenceTopicState } from "../shared/externalEvidence";
+import { EvidenceCatalogPanel } from "./EvidenceCatalogPanel";
 import { api } from "./api";
 
 export function EvidencePanel({ topicId, busy }: { topicId: string; busy: boolean }) {
   const [state, setState] = useState<EvidenceTopicState | null>(null);
-  const [url, setURL] = useState(""); const [label, setLabel] = useState("");
-  const [mode, setMode] = useState<"connector" | "rest">("rest");
   const [reason, setReason] = useState(""); const [error, setError] = useState(""); const [saving, setSaving] = useState(false);
   const requestVersion = useRef(0); const mutating = useRef(false); const mounted = useRef(true);
   useEffect(() => { setReason(""); }, [state?.digest, state?.plan.scopeGeneration, state?.plan.planEpoch, state?.plan.planSHA256]);
@@ -32,7 +31,8 @@ export function EvidencePanel({ topicId, busy }: { topicId: string; busy: boolea
     finally { mutating.current = false; if (mounted.current) setSaving(false); }
   };
   return <details className="evidence-panel">
-    <summary>Slack · Jira · Figma 근거 {state ? `(${state.sources.length}) · ${!state.ready ? "원문 확인 필요" : state.reviewed ? "검토됨" : "변경 영향 확인 필요"}` : ""}</summary>
+    <summary>원문 근거 {state ? `(${state.sources.length}) · ${!state.ready ? "원문 확인 필요" : state.reviewed ? "검토됨" : "변경 영향 확인 필요"}` : ""}</summary>
+    <EvidenceCatalogPanel key={topicId} topicId={topicId} busy={busy || saving} />
     <p>서버 수집에는 호스트의 읽기 인증 설정이 필요합니다. 원문이 바뀌면 변경된 내용만 전달합니다. 변경 감지가 요구사항 확정을 뜻하지는 않습니다.</p>
     {state?.sources.map(source => <div key={source.id}>
       <a href={source.url} target="_blank" rel="noreferrer">{source.label}</a>{" · "}
@@ -44,14 +44,6 @@ export function EvidencePanel({ topicId, busy }: { topicId: string; busy: boolea
       {source.error && <span role="status"> · {source.error}</span>}
       {source.mode === "rest" ? <button disabled={busy || saving} onClick={() => void run(() => api.checkEvidence(source.id))}>원문 갱신</button> : <span> · 호스트 연결로 확인 <button disabled={busy || saving} onClick={() => void run(() => api.useRestEvidence(source.id))}>서버 수집으로 전환 (공유 주제 모두 적용)</button></span>}
     </div>)}
-    <form onSubmit={event => { event.preventDefault(); void run(() => api.addEvidence(topicId, { url, label, mode, intervalSeconds: 900 })); }}>
-      <input aria-label="원문 이름" placeholder="기획·디자인·백엔드 자료 이름" value={label} onChange={event => setLabel(event.target.value)} required />
-      <input aria-label="원문 링크" type="url" placeholder="Slack 스레드 / Jira 이슈 / Figma 노드 링크" value={url} onChange={event => setURL(event.target.value)} required />
-      <select aria-label="원문 연결 방식" value={mode} onChange={event => setMode(event.target.value as typeof mode)}>
-        <option value="connector">Codex·중재자 연결 도구로 수집</option><option value="rest">서버에서 주기적으로 확인</option>
-      </select>
-      <button disabled={busy || saving}>원문 등록</button>
-    </form>
     {state && state.sources.length > 0 && !state.reviewed && <form onSubmit={event => {
       event.preventDefault(); void run(() => api.reviewEvidence(topicId, { digest: state.digest, plan: state.plan, reason }));
     }}>

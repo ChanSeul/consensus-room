@@ -305,6 +305,20 @@ export class WorkflowEngine {
     }
   }
 
+  async changeEvidenceSelection<T>(topicIds: string[], change: () => T): Promise<T> {
+    const ids = [...new Set(topicIds)];
+    for (const id of ids) this.core.assertNoActiveWork(id);
+    for (const id of ids) this.core.scopeChangeActive.add(id);
+    const db=this.core.dependencies.database,versions=new Map(ids.map(id=>[id,db.evidence.catalog.version(id)]));
+    try {
+      const mutable=ids.map(id=>db.getTopic(id)).filter(topic=>topic.state!=="CLOSED" && !db.getFlags(topic.id).committedOID);
+      for (const topic of mutable) await this.core.dependencies.artifacts.clearCurrentAliases(topic.id);
+      if (ids.some(id=>db.evidence.catalog.version(id)!==versions.get(id)))
+        throw Object.assign(new Error("근거 목록이 바뀌었습니다. 다시 확인하세요."),{statusCode:409});
+      for (const topic of mutable) this.core.diagnoses.staleOnReplan(topic);
+      return change();
+    } finally { for (const id of ids) this.core.scopeChangeActive.delete(id); }
+  }
   assertBudgetEditable(topicId: string): void { this.core.assertNoActiveWork(topicId); }
 
   private brainstormPreconditions(topicId: string): Topic {
@@ -629,13 +643,13 @@ export class WorkflowEngine {
     const scope=reviewScope(db.getFlags(topicId).resumeState??"");
     if(!scope)return null;
     const account=db.reviews.account(topicId,scope);
-    return account.used>=account.limit?scope:null;
+    return account.limit !== null && account.used>=account.limit?scope:null;
   }
 
   revisionPaused(topicId: string): boolean {
     const db=this.core.dependencies.database, topic=db.getTopic(topicId);
     const account=db.revisions.account(topicId);
-    if(account.used<account.limit)return false;
+    if(account.limit === null || account.used<account.limit)return false;
     const interruption=db.getTimeline(topicId).filter(e=>e.scopeGeneration===topic.scopeGeneration && e.actor==="system" && e.payload?.resumeState).at(-1);
     if(topic.state==="USER_DECISION_REQUIRED" && interruption?.payload?.revisionPause===true)return true;
     if(topic.state==="USER_DECISION_REQUIRED" && !interruption?.payload?.budgetPause)return false;

@@ -353,6 +353,8 @@ async function room(label: string, steps: Step[], options: { autonomy?: "on" | "
     branchName: null, state: "AWAITING_USER_APPROVAL", scopeGeneration: 1, planRevision: 2, planSHA256, approvedPlanSHA256: planSHA256,
     createdAt: timestamp, updatedAt: timestamp, lastError: null,
   });
+  database.revisions.configure(topicId, 3, database.revisions.account(topicId).version);
+  for (const scope of ["planning", "implementation"] as const) database.reviews.configure(topicId, scope, 3, database.reviews.account(topicId, scope).version);
   for (const role of ["claude", "codex"] as const) {
     database.upsertParticipant(topicId, { role, sessionId: `${role}-plan-session`, mode: "attached", acknowledgedPlanSHA256: planSHA256 });
   }
@@ -1643,7 +1645,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     r.database.close();
   });
 
-  it("승인 대기 중 메시지로 일어나는 전체 재계획도 진행 중인 계획 변경 진단을 먼저 재확인(stale)으로 돌린다 — 새 계획 주기로 넘기지 않고, 계획 단계에서도 수정 불필요 정정으로 닫힌다(2026-09-15 감사 #2)", { timeout: 60_000 }, async () => {
+  it.each(["message", "evidence-root"] as const)("%s 재계획은 이전 진단을 먼저 재확인 상태로 돌리고 새 계획에 적용하지 않는다", { timeout: 60_000 }, async (trigger) => {
     const r = await room("message-replan-stale", [], { codex: "planning" });
     r.claude["steps"].push(
       askingTurn(r.worktree),
@@ -1678,7 +1680,10 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     const sequenceBefore = r.database.getTimeline(r.topicId).at(-1)!.sequence;
 
     // 승인 대기 중 메모 — 계획 확인·승인을 취소하는 전체 재계획(계획 주기 +1, DRAFT)이다. 러너 턴은 열지 않는다.
-    expect((await r.call("POST", `/api/topics/${r.topicId}/messages`, { kind: "note", body: "배포 조건을 하나 더 적습니다." })).status).toBe(200);
+    const changed = trigger === "message"
+      ? await r.call("POST", `/api/topics/${r.topicId}/messages`, { kind: "note", body: "배포 조건을 하나 더 적습니다." })
+      : await r.call("POST", `/api/topics/${r.topicId}/evidence/roots`, {url:"https://example.com/policy",label:"Policy",scope:"topic",mode:"rest",intervalSeconds:900});
+    expect(changed.status).toBe(200);
     const after = r.database.getTopic(r.topicId);
     expect(after.state).toBe("DRAFT");
     expect(after.planEpoch).toBe(before.planEpoch + 1);
@@ -3085,7 +3090,8 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     await r.idle("USER_DECISION_REQUIRED");
     expect((await r.call("POST", `/api/topics/${r.topicId}/diagnoses`, planDiagnosis(), { mediator: true })).status).toBe(201);
     // 앞선 재작성 2회를 원장에 모사한다 — 남은 1회를 DG-1 개정 턴이 쓰면 교정 재제출은 한도에 걸린다.
-    for (let used = 0; r.database.revisions.account(r.topicId).limit - r.database.revisions.account(r.topicId).used > 1; used += 1) {
+    r.database.revisions.configure(r.topicId, 3, r.database.revisions.account(r.topicId).version);
+    for (let used = 0; 3 - r.database.revisions.account(r.topicId).used > 1; used += 1) {
       r.database.revisions.admit(r.topicId, `prior-rewrite-${used}`, "revision");
     }
     expect((await r.call("POST", `/api/topics/${r.topicId}/diagnoses/DG-1/apply`, undefined, { mediator: true })).status).toBe(200);
@@ -3276,8 +3282,9 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     await r.idle("USER_DECISION_REQUIRED");
     openId = requestIdsIn(r.database.getTopic(r.topicId).lastError ?? "")[0];
     // 전제: 계획 재작성 한도 소진(정상 흐름이면 앞선 재작성들의 몫) — 원장의 공개 연산(admit)으로 소비한다.
+    r.database.revisions.configure(r.topicId, 3, r.database.revisions.account(r.topicId).version);
     let account = r.database.revisions.account(r.topicId);
-    for (let n = 0; account.used < account.limit; n += 1) {
+    for (let n = 0; account.used < 3; n += 1) {
       r.database.revisions.admit(r.topicId, `exhaust-${n}`, "revision");
       account = r.database.revisions.account(r.topicId);
     }

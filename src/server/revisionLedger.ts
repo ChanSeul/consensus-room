@@ -1,4 +1,5 @@
 import { executionHistory } from "./executionHistory.js";
+import { migrateUnlimitedIterations, validateIterationLimit } from "./iterationLimits.js";
 import type { DatabaseSync } from "node:sqlite";
 import type { RevisionAllowance, RewriteKind } from "../shared/revisions.js";
 
@@ -59,6 +60,7 @@ export class RevisionLedger {
         });
       });
     }
+    migrateUnlimitedIterations(db, "revision_allowances");
   }
   initialize(topicId: string): void {
     if (
@@ -70,7 +72,7 @@ export class RevisionLedger {
     this.save({
       topicId,
       used: 0,
-      limit: 3,
+      limit: null,
       firstPlanUsed: false,
       historyIncomplete: false,
       startedAt: new Date().toISOString(),
@@ -87,7 +89,7 @@ export class RevisionLedger {
   assertAvailable(topicId: string, kind: RewriteKind): void {
     const a = this.account(topicId);
     if (kind === "plan" && !a.firstPlanUsed && !a.historyIncomplete) return;
-    if (a.used >= a.limit) throw new RevisionBlocked(topicId);
+    if (a.limit !== null && a.used >= a.limit) throw new RevisionBlocked(topicId);
   }
   // Called in the same transaction as the budget execution reservation; no await or nested transaction.
   reserve(topicId: string, executionId: string, kind: RewriteKind): void {
@@ -150,7 +152,7 @@ export class RevisionLedger {
       const a = this.account(topicId);
       if (a.version !== expectedVersion)
         throw new Error("재작성 한도가 변경됐습니다. 새로 확인하세요.");
-      if (a.used < a.limit)
+      if (a.limit === null || a.used < a.limit)
         throw new Error("아직 사용할 재작성 횟수가 남아 있습니다.");
       a.limit = a.used + 1;
       a.version++;
@@ -167,6 +169,14 @@ export class RevisionLedger {
         "INSERT INTO revision_allowances VALUES (?,?) ON CONFLICT(topic_id) DO UPDATE SET record_json=excluded.record_json",
       )
       .run(a.topicId, JSON.stringify(a));
+  }
+  configure(topicId: string, limit: number | null, version: number): RevisionAllowance {
+    validateIterationLimit(limit);
+    return this.transaction(() => {
+      const a = this.account(topicId);
+      if (a.version !== version) throw new Error("재작성 설정이 바뀌었습니다. 다시 확인하세요.");
+      a.limit = limit; a.version++; this.save(a); return a;
+    });
   }
   private transaction<T>(work: () => T): T {
     this.db.exec("BEGIN IMMEDIATE");

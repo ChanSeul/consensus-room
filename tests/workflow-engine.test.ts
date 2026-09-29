@@ -74,6 +74,8 @@ function makeEngine(
     updatedAt: "2026-08-23T00:00:00.000Z",
     lastError: null,
   });
+  database.revisions.configure("topic-1", 3, database.revisions.account("topic-1").version);
+  for (const scope of ["planning", "implementation"] as const) database.reviews.configure("topic-1", scope, 3, database.reviews.account("topic-1", scope).version);
   for (const role of ["claude", "codex"] as const) {
     database.upsertParticipant("topic-1", {
       role,
@@ -157,6 +159,8 @@ describe("범위 세대", () => {
       updatedAt: "2026-08-23T00:00:00.000Z",
       lastError: null,
     });
+  database.revisions.configure("topic-1", 3, database.revisions.account("topic-1").version);
+  for (const scope of ["planning", "implementation"] as const) database.reviews.configure("topic-1", scope, 3, database.reviews.account("topic-1", scope).version);
     for (const role of ["claude", "codex"] as const) {
       database.upsertParticipant("topic-1", {
         role,
@@ -298,7 +302,7 @@ describe("범위 세대", () => {
     engine.startPlan("topic-1");
     await waitForActionCompletion(database, "topic-1");
     expect(engine.reviewPaused("topic-1")).toBe("planning");
-    database.reviews.grant("topic-1","planning","scope-review-grant",1);
+    database.reviews.grant("topic-1","planning","scope-review-grant",2);
     engine.retry("topic-1");
     await waitForActionCompletion(database,"topic-1");
     expect(database.getTopic("topic-1").state).toBe("AWAITING_USER_APPROVAL");
@@ -651,6 +655,8 @@ describe("가짜 에이전트 전체 계획 왕복", () => {
       updatedAt: "2026-08-23T00:00:00.000Z",
       lastError: null,
     });
+  database.revisions.configure("topic-1", 3, database.revisions.account("topic-1").version);
+  for (const scope of ["planning", "implementation"] as const) database.reviews.configure("topic-1", scope, 3, database.reviews.account("topic-1", scope).version);
     const firstPlan = validPlan("첫 계획");
     const revisedPlan = validPlan("검토를 반영한 계획 token=secret-value");
     const storedRevisedPlan = `${redactSecrets(revisedPlan).trim()}\n`;
@@ -959,6 +965,8 @@ describe("가짜 에이전트 전체 계획 왕복", () => {
       updatedAt: "2026-08-23T00:00:00.000Z",
       lastError: null,
     });
+  database.revisions.configure("topic-1", 3, database.revisions.account("topic-1").version);
+  for (const scope of ["planning", "implementation"] as const) database.reviews.configure("topic-1", scope, 3, database.reviews.account("topic-1", scope).version);
     for (const role of ["claude", "codex"] as const) {
       database.upsertParticipant("topic-1", {
         role,
@@ -1466,6 +1474,8 @@ function makePlanningEngine(input: {
     updatedAt: "2026-08-23T00:00:00.000Z",
     lastError: null,
   });
+  database.revisions.configure("topic-1", 3, database.revisions.account("topic-1").version);
+  for (const scope of ["planning", "implementation"] as const) database.reviews.configure("topic-1", scope, 3, database.reviews.account("topic-1", scope).version);
   for (const role of ["claude", "codex"] as const) {
     database.upsertParticipant("topic-1", {
       role,
@@ -1547,6 +1557,8 @@ async function makeReviewRecovery(input: {
     updatedAt: "2026-08-23T00:00:00.000Z",
     lastError: "재시도 준비",
   });
+  database.revisions.configure("topic-1", 3, database.revisions.account("topic-1").version);
+  for (const scope of ["planning", "implementation"] as const) database.reviews.configure("topic-1", scope, 3, database.reviews.account("topic-1", scope).version);
   database.updateTopic("topic-1", { resumeState: input.resumeState });
   for (const role of ["claude", "codex"] as const) {
     database.upsertParticipant("topic-1", {
@@ -2031,6 +2043,8 @@ describe("구현 기준 HEAD 고정", () => {
       approvedPlanSHA256: planSHA256,
       createdAt: "2026-08-30T00:00:00.000Z", updatedAt: "2026-08-30T00:00:00.000Z", lastError: "재시도 준비",
     });
+  database.revisions.configure("topic-1", 3, database.revisions.account("topic-1").version);
+  for (const scope of ["planning", "implementation"] as const) database.reviews.configure("topic-1", scope, 3, database.reviews.account("topic-1", scope).version);
     database.updateTopic("topic-1", {
       resumeState: "IMPLEMENTING",
       implementationBaseOID: "a".repeat(40), // 브랜치 생성 시점에 고정된 기준
@@ -2107,6 +2121,8 @@ async function makePlanningRecovery(
     updatedAt: "2026-08-29T00:00:00.000Z",
     lastError: "재시도 준비",
   });
+  database.revisions.configure("topic-1", 3, database.revisions.account("topic-1").version);
+  for (const scope of ["planning", "implementation"] as const) database.reviews.configure("topic-1", scope, 3, database.reviews.account("topic-1", scope).version);
   database.updateTopic("topic-1", { resumeState });
   for (const role of ["claude", "codex"] as const) {
     database.upsertParticipant("topic-1", {
@@ -2334,6 +2350,16 @@ describe("최종 리뷰 신규 쟁점의 사용자 결정 소비", () => {
 
     expect(database.getTopic("topic-1").state).toBe("READY_TO_DELIVER");
     expect(await artifacts.readLatest("topic-1", "deferred-findings")).toContain("F-DEFER");
+    // The advisory notice is emitted independently after the delivery action has ended.
+    await new Promise<void>((resolve, reject) => {
+      if (database.getTimeline("topic-1").some(event => Array.isArray(event.payload.deferredForDelivery))) { resolve(); return; }
+      const cleanup = () => { clearTimeout(timer); database.events.off("topic:topic-1", listener); };
+      const listener = (event: { payload: Record<string, unknown> }) => {
+        if (Array.isArray(event.payload.deferredForDelivery)) { cleanup(); resolve(); }
+      };
+      const timer = setTimeout(() => { cleanup(); reject(new Error("후속 목록 안내 이벤트가 도착하지 않았습니다.")); }, 2000);
+      database.events.on("topic:topic-1", listener);
+    });
     const notice = database.getTimeline("topic-1").find((event) =>
       Array.isArray(event.payload.deferredForDelivery));
     expect(notice?.payload.deferredForDelivery).toContain("F-DEFER");
@@ -2484,6 +2510,8 @@ function makeGatedPlanningEngine(claude: AgentAdapter, codex: AgentAdapter) {
     planSHA256: null, approvedPlanSHA256: null, createdAt: "2026-08-23T00:00:00.000Z",
     updatedAt: "2026-08-23T00:00:00.000Z", lastError: null,
   });
+  database.revisions.configure("topic-1", 3, database.revisions.account("topic-1").version);
+  for (const scope of ["planning", "implementation"] as const) database.reviews.configure("topic-1", scope, 3, database.reviews.account("topic-1", scope).version);
   for (const role of ["claude", "codex"] as const) {
     database.upsertParticipant("topic-1", { role, sessionId: `${role}-session`, mode: "attached", acknowledgedPlanSHA256: null });
   }
@@ -2691,6 +2719,8 @@ describe("닫힌 주제 빌드 트리 정리(archive)", () => {
       planSHA256: null, approvedPlanSHA256: null, createdAt: "2026-08-23T00:00:00.000Z",
       updatedAt: "2026-08-23T00:00:00.000Z", lastError: null,
     });
+  database.revisions.configure("topic-1", 3, database.revisions.account("topic-1").version);
+  for (const scope of ["planning", "implementation"] as const) database.reviews.configure("topic-1", scope, 3, database.reviews.account("topic-1", scope).version);
     const engine = new WorkflowEngine({
       database, artifacts: new ArtifactStore(join(root, "topics"), database),
       git: new GitService({ run: async () => { throw new Error("사용하지 않습니다."); } }),
@@ -3018,7 +3048,7 @@ describe("종결 확인의 새 쟁점 → 개정 2회차", () => {
     await waitForActionCompletion(database, "topic-1");
 
     expect(engine.reviewPaused("topic-1")).toBe("planning");
-    database.reviews.grant("topic-1","planning","extra-closeout",1);
+    database.reviews.grant("topic-1","planning","extra-closeout",2);
     engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");
 
     // 첫 계획 턴이 아니라 C-NEW-2 만 담은 추가 개정 턴이 돌았고(4번째), 종결 3회차 통과 뒤 ACK 턴(5번째)까지 갔다.
@@ -4011,7 +4041,7 @@ describe("개정 2회차 뒤 종결 확인의 처분 되돌림 — 결정 뒤 �
     await waitForActionCompletion(database, "topic-1");
 
     expect(engine.reviewPaused("topic-1")).toBe("planning");
-    database.reviews.grant("topic-1","planning","regression-closeout",1);
+    database.reviews.grant("topic-1","planning","regression-closeout",2);
     engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");
 
     const topic = database.getTopic("topic-1");
@@ -4138,7 +4168,7 @@ it("네 번째 계획 검토를 차단하고 1회 승인 뒤 저장된 계획으
  expect(database.getTopic("topic-1"),database.getTopic("topic-1").lastError??"").toMatchObject({state:"USER_DECISION_REQUIRED",planSHA256,planEpoch:epoch});
  expect(database.getFlags("topic-1").resumeState).toBe("CODEX_AUDIT");
  expect(()=>engine.retry("topic-1")).toThrow("한도");
- database.reviews.grant("topic-1","planning","allow",1);
+ database.reviews.grant("topic-1","planning","allow",2);
  engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");
  expect(database.reviews.account("topic-1","planning").used).toBe(4);
  expect(database.getTopic("topic-1")).toMatchObject({state:"FAILED",planSHA256,planEpoch:epoch});
@@ -4244,7 +4274,7 @@ it("한도로 멈춘 개정 교정은 재시작 뒤 원본 세션에서 교정�
  expect(database.getTopic("topic-1").state).toBe("USER_DECISION_REQUIRED");expect(claude.calls).toHaveLength(1);
  expect(await artifacts.readLatest("topic-1","pending-contract-repair")).toContain("claude-created-session");
  const restarted=new WorkflowEngine({database,artifacts,claude,codex,git:new GitService(new RecordingGitRunner())});
- database.revisions.grant("topic-1","one-more",1);restarted.retry("topic-1");await waitForActionCompletion(database,"topic-1");
+ database.revisions.grant("topic-1","one-more",2);restarted.retry("topic-1");await waitForActionCompletion(database,"topic-1");
  expect(claude.calls).toHaveLength(2);expect(claude.turns[1]).toMatchObject({sessionId:"claude-created-session",planningWrite:"repair"});
  expect(claude.calls[1]).toContain("서버 기계 검사");expect(database.revisions.account("topic-1").used).toBe(4);
  expect(await artifacts.readLatest("topic-1","claude-revision")).toContain("종류 교정");database.close();
@@ -4259,7 +4289,7 @@ it("최초 계획 교정 재개는 epoch를 바꾸거나 계획 호출을 다시
  const epoch=database.getTopic("topic-1").planEpoch;
  engine.startPlan("topic-1");await waitForActionCompletion(database,"topic-1");
  expect(database.getTopic("topic-1").state).toBe("USER_DECISION_REQUIRED");
- database.revisions.grant("topic-1","more",1);engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");
+ database.revisions.grant("topic-1","more",2);engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");
  expect(claude.calls).toHaveLength(2);expect(claude.turns[1]).toMatchObject({sessionId:"claude-session",planningWrite:"repair"});
  expect(database.getTopic("topic-1").planEpoch).toBe(epoch);database.close();
 });
@@ -4289,7 +4319,7 @@ it("부분 교정 한도 중단도 원본과 같은 세션을 복구해 부분 �
  });
  run(new EngineCore(dependencies));await waitForActionCompletion(database,"topic-1");
  expect(database.getTopic("topic-1").state).toBe("USER_DECISION_REQUIRED");expect(calls).toEqual(["create"]);
- database.revisions.grant("topic-1","allow",1);database.updateTopic("topic-1",{state:"CLAUDE_PLAN"});
+ database.revisions.grant("topic-1","allow",2);database.updateTopic("topic-1",{state:"CLAUDE_PLAN"});
  run(new EngineCore(dependencies));await waitForActionCompletion(database,"topic-1");
  expect(calls).toEqual(["create","repair:partial-session"]);expect(checked?.planMarkdown,database.getTopic("topic-1").lastError??"").toBe(original.replace('"rules":[],','"rules":[]'));
  expect(database.revisions.account("topic-1").used).toBe(4);database.close();
@@ -4680,7 +4710,7 @@ it("원문 변경 뒤 교정 대기를 재개하면 옛 응답 대신 새 계획
  run(new EngineCore(dependencies));await waitForActionCompletion(database,"topic-1");
  expect(database.getTopic("topic-1").state).toBe("USER_DECISION_REQUIRED");expect(calls).toEqual(["create"]);
  ingest("new decision");
- database.revisions.grant("topic-1","allow",1);database.updateTopic("topic-1",{state:"CLAUDE_PLAN"});
+ database.revisions.grant("topic-1","allow",2);database.updateTopic("topic-1",{state:"CLAUDE_PLAN"});
  run(new EngineCore(dependencies));await waitForActionCompletion(database,"topic-1");
  expect(calls).toEqual(["create","create"]);
  expect(checked?.planMarkdown,database.getTopic("topic-1").lastError??"").toBe(updated);
