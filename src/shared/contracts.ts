@@ -49,8 +49,7 @@ const AgentModelSchema = z.string().trim().min(1).max(120).regex(
 export const AgentExecutionSettingsSchema = z.object({
   model: AgentModelSchema,
   effort: AgentEffortSchema,
-  // 단계별 분리: 계획 수렴(adversarial 왕복)과 구현이 다른 모델을 쓸 수 있다 — 사용자 관행이
-  // 플랜/설계=Fable, 구현=Opus라서다(2026-08-31). 없으면 모든 단계가 위 model/effort를 쓴다.
+  // 계획과 구현에 서로 다른 모델을 지정할 수 있다. 없으면 모든 단계가 위 model/effort를 쓴다.
   implementation: z.object({ model: AgentModelSchema, effort: AgentEffortSchema }).optional(),
 });
 export type AgentExecutionSettings = z.infer<typeof AgentExecutionSettingsSchema>;
@@ -62,7 +61,7 @@ export const AgentSettingsSchema = z.object({
 export type AgentSettings = z.infer<typeof AgentSettingsSchema>;
 
 export const DEFAULT_AGENT_SETTINGS: AgentSettings = {
-  claude: { model: "fable", effort: "xhigh", implementation: { model: "opus", effort: "xhigh" } },
+  claude: { model: "claude-opus-5-5", effort: "max", implementation: { model: "claude-sonnet-5-5", effort: "xhigh" } },
   // 2026-09-07 사용자 지시: codex 감사 모델 gpt-6-astra · 추론 xhigh. 속도 티어는 붙이지 않는다
   // (2026-09-06 에 priority 를 뺐다 — 사용량이 더 빨리 소모된다).
   codex: { model: "gpt-6-astra", effort: "xhigh" },

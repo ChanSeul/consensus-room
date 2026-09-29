@@ -154,7 +154,12 @@ export class ClaudeAdapter implements AgentAdapter {
   ): Promise<CommandResult> {
     // 역할 정책(turnPolicy.ts)을 이 CLI 의 인자·설정으로 변환만 한다. 표현할 수 없는 정책은 조용히 바꾸지 않고 실행 전에 거부한다.
     // 하위 에이전트 팬아웃은 Workflow 로만 낸다 — Task 는 중첩 증식을 막을 수 없어 열지 않는다(위 주석).
-    const { policy, protocolOnly, options: providerOptions } = resolveSupportedTurn("claude", turn);
+    const { job, policy, protocolOnly, options: providerOptions } = resolveSupportedTurn("claude", turn);
+    // Legacy calls without job cannot distinguish planner ACK from implementation confirmation.
+    // Enable the default only for an explicit planner role; explicit profile selection still works.
+    const advisorModel = job.role === "planner" && (turn.job || providerOptions.advisorModel !== undefined)
+      ? providerOptions.advisorModel === undefined ? "fable" : providerOptions.advisorModel
+      : null;
     const workspace = resolve(turn.cwd);
     const actionTemp = await mkdtemp(join(tmpdir(), "consensus-room-claude-"));
     try {
@@ -178,6 +183,7 @@ export class ClaudeAdapter implements AgentAdapter {
         "-p",
         "--model", executionSettings.model,
         "--effort", executionSettings.effort,
+        ...(advisorModel ? ["--advisor", advisorModel] : []),
         // --safe-mode는 쓰지 않는다. 관리형 플러그인 스킬까지 죽이기 때문이다(실측). safe-mode가 끄던 유입원은
         // 개별 격리가 대체하며 각각 실측으로 확인했다: 사용자·프로젝트 스킬과 hooks·커스텀 설정은 빈
         // --setting-sources가 차단(사용자 스킬 5종 미노출 확인), CLAUDE.md는 미유입 확인(서버 주입이 대신 담당),
@@ -259,6 +265,8 @@ export class ClaudeAdapter implements AgentAdapter {
         TMPDIR: actionTemp,
         XDG_CACHE_HOME: join(actionTemp, "cache"),
         CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
+        // Resumed planner sessions must not carry an advisor into implementation or review.
+        ...(advisorModel ? {} : { CLAUDE_CODE_DISABLE_ADVISOR_TOOL: "1" }),
       });
       const metrics = new ExecutionMetrics("claude", Buffer.byteLength(stdin, "utf8"), executionSettings.model, executionSettings.effort, !newSession, startedAt);
       const requestedSession = sessionArgs[1];

@@ -16,7 +16,7 @@ import { jobOfTurn, PROVIDER_COMPACTION } from "./adapters/turnPolicy.js";
 import { AgentRunError, SessionIdentityMismatch } from "./adapters/resultParser.js";
 import { legacyBinding, sameBinding, type SessionBinding } from "./turnRouting.js";
 import { planningHash, planningKey, recoverableFinalizedFirstPlan } from "./planningStore.js";
-import { InvalidPlanningOffset, PlanningReader } from "./planningReader.js";
+import { InvalidPlanningOffset, PlanningDirectoryRead, PlanningReader } from "./planningReader.js";
 import { ProjectMemoryReader } from "./projectMemory.js";
 import { readAppliedInstructions } from "./projectInstructions.js";
 import { UserFileAccessBlocked } from "./userFileReader.js";
@@ -628,7 +628,7 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
         let fragment: PlanningFragment;
         try { fragment = database.planning.fragment(cacheKey) ?? await reader.read(request); }
         catch (error) {
-          if (!(error instanceof InvalidPlanningOffset)) throw error;
+          if (!(error instanceof InvalidPlanningOffset) && !(error instanceof PlanningDirectoryRead)) throw error;
           if (readErrors.some(entry => entry.request.kind === request.kind && entry.request.selector === request.selector &&
               entry.request.offset === request.offset)) continue;
           const entry = { request, message: error.message };
@@ -986,9 +986,11 @@ Checkpoint must fit ${LIMIT.checkpointBytes} UTF-8 bytes. Final result must sati
         const stepMetrics: PlanningMetrics = {};
         let callStarted = false;
         const observed = new Set<string>();
+        let lastUsageIncomplete = false;
         let sourceIndex: number | undefined;
         const sourceRound = record.round + 1;
         const onUsage = (usage: TurnUsage) => {
+          lastUsageIncomplete = usage.completeness === "partial";
           if (usage.sourceUsage) {
             sourceIndex ??= sourceTurns.length;
             sourceTurns[sourceIndex] = { executionId: usage.executionId, sessionId: record.sessionId,
@@ -1082,7 +1084,7 @@ Checkpoint must fit ${LIMIT.checkpointBytes} UTF-8 bytes. Final result must sati
         } finally {
           // 관측된 세션 유실 형태는 모델 턴이 없다(Claude num_turns=0, Codex 대화 파일 조회 실패) — 사용량 누락으로 세지 않는다.
           const noModelTurn = failure instanceof AgentRunError && failure.code === "session-missing";
-          if (!noModelTurn && !["inputTokens", "outputTokens", "durationMs"].every(k => observed.has(k)) && callStarted) record.usageIncomplete = true;
+          if (!noModelTurn && (lastUsageIncomplete || !["inputTokens", "outputTokens", "durationMs"].every(k => observed.has(k))) && callStarted) record.usageIncomplete = true;
           save();
         }
         if (failure) {

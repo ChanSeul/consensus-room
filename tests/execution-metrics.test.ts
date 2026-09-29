@@ -1,3 +1,4 @@
+import advisorFixture from "./fixtures/claude-advisor-usage.json";
 import { describe, expect, it } from "vitest";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -198,4 +199,65 @@ it("불일치 진단의 CLI 원본에는 final이 실제로 준 필드만 보관
   expect(usage).toMatchObject({ inputTokens: 61, cachedInputTokens: 20, outputTokens: 3, completeness: "partial" });
   expect(usage.sourceUsage?.cli).toEqual({ inputTokens: 11, outputTokens: 3 });
   expect(usage.sourceUsage?.claudeStream).toEqual({ inputTokens: 60, cachedInputTokens: 20, outputTokens: 15 });
+});
+
+
+describe("advisor usage", () => {
+  it.each([false, true])("counts streamed advisor usage once and reconciles final totals (baseline=%s)", baseline => {
+    const meter = new ExecutionMetrics("claude", 1, "claude-opus-5-5", "max", !baseline, Date.now());
+    if (baseline) meter.setClaudeBaseline({ sessionId: "same", modelUsage: {}, totalCostUSD: 0, totalAPIDuration: 0 });
+    meter.observe({ type: "stream_event", event: { type: "message_start", message: { id: "m1", usage: {
+      input_tokens: 100, cache_read_input_tokens: 20, cache_creation_input_tokens: 0, output_tokens: 0,
+    } } } });
+    const delta = { type: "stream_event", event: { type: "message_delta", usage: { output_tokens: 7, iterations: [
+      { type: "message", input_tokens: 100, cache_read_input_tokens: 20, output_tokens: 7 },
+      { type: "advisor_message", model: "fable", input_tokens: 40, cache_read_input_tokens: 5,
+        cache_creation_input_tokens: 0, output_tokens: 9 },
+    ] } } };
+    meter.observe(delta);
+    meter.observe(delta);
+    const partial = meter.snapshot({ toolDurationMs: 0, toolCalls: 0 }, "final");
+    expect(partial).toMatchObject({ inputTokens: 165, cachedInputTokens: 25, outputTokens: 16,
+      lastRequestInputTokens: 120, completeness: "partial" });
+    expect(exceededLimits(partial, { inputTokens: 150 })).not.toHaveLength(0);
+    meter.observe({ type: "result", session_id: "same", usage: {
+      input_tokens: 100, cache_read_input_tokens: 20, cache_creation_input_tokens: 0, output_tokens: 7,
+    }, modelUsage: {
+      opus: { inputTokens: 100, cacheReadInputTokens: 20, cacheCreationInputTokens: 0, outputTokens: 7 },
+      fable: { inputTokens: 40, cacheReadInputTokens: 5, cacheCreationInputTokens: 0, outputTokens: 9 },
+    }, total_cost_usd: 0.4, duration_api_ms: 200 });
+    const final = meter.snapshot({ toolDurationMs: 0, toolCalls: 0 }, "final");
+    expect(final).toMatchObject({ inputTokens: 165, cachedInputTokens: 25, outputTokens: 16,
+      completeness: baseline ? "complete" : "partial" });
+    expect(final.costUSD).toBe(baseline ? 0.4 : undefined);
+  });
+});
+
+it("keeps raw CLI usage distinct from corrected advisor observations", () => {
+  const meter = new ExecutionMetrics("claude", 1, "claude-opus-5-5", "max", false, Date.now());
+  meter.observe({ type: "stream_event", event: { type: "message_start", message: { id: "m", usage: {
+    input_tokens: 100, cache_read_input_tokens: 20, cache_creation_input_tokens: 30, output_tokens: 0,
+  } } } });
+  meter.observe({ type: "stream_event", event: { type: "message_delta", usage: { output_tokens: 7, iterations: [
+    { type: "advisor_message", input_tokens: 40, cache_read_input_tokens: 5, output_tokens: 9 },
+  ] } } });
+  meter.observe({ type: "result", usage: { input_tokens: 11, output_tokens: 3 } });
+  const usage = meter.snapshot({ toolDurationMs: 0, toolCalls: 0 }, "final");
+  expect(usage.sourceUsage?.cli).toEqual({ inputTokens: 11, outputTokens: 3 });
+  expect(usage).toMatchObject({ inputTokens: 195, cachedInputTokens: 25, outputTokens: 16, completeness: "partial" });
+});
+
+it("reconciles captured CLI advisor execution and disabled resume without rebilling the previous turn", () => {
+  let baseline = { sessionId: advisorFixture.runs[0].events.at(-1)!.session_id!, modelUsage: {}, totalCostUSD: 0, totalAPIDuration: 0 };
+  const totals = [[9754, 2543, 652], [2167, 0, 178]];
+  for (const [index, run] of advisorFixture.runs.entries()) {
+    const meter = new ExecutionMetrics("claude", 1, "test", "max", index > 0, Date.now());
+    meter.setClaudeBaseline(baseline);
+    for (const event of run.events) meter.observe(event);
+    const usage = meter.snapshot({ toolDurationMs: 0, toolCalls: 0 }, "final");
+    expect([usage.inputTokens, usage.cachedInputTokens, usage.outputTokens]).toEqual(totals[index]);
+    expect(usage.completeness).toBe("complete");
+    const result = run.events.at(-1)!;
+    baseline = { sessionId: result.session_id!, modelUsage: result.modelUsage!, totalCostUSD: result.total_cost_usd!, totalAPIDuration: result.duration_api_ms! };
+  }
 });

@@ -16,7 +16,10 @@ const IdentifierSchema = z.string().trim().min(1).max(120).regex(/^[A-Za-z0-9][A
 export const PROVIDER_OPTION_SCHEMAS = {
   // ultracode: 하위 에이전트 팬아웃(Workflow)을 연 턴에서 오케스트레이션 모드를 켤지. 없으면 켠다(E2c 이전 동작). 팬아웃이 닫힌 턴에는 적용되지 않는다 —
   // 엔진 정책이 닫은 것이라 다른 설정으로 대체하는 것이 아니다.
-  claude: z.object({ ultracode: z.boolean().optional() }).strict(),
+  claude: z.object({ ultracode: z.boolean().optional(),
+    // Planner 전용 서버 advisor. null은 명시적 비활성화이며 추론 강도 옵션은 CLI가 지원하지 않는다.
+    advisorModel: IdentifierSchema.nullable().optional(),
+  }).strict(),
   codex: z.object({}).strict(),
 } as const;
 

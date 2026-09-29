@@ -2,7 +2,7 @@ import { AgentExecutionSettingsSchema, type AgentExecutionSettings, type Routing
 import { isPlanRevision } from "../shared/diagnoses.js";
 import { appliedExecutionSettings } from "../shared/execution.js";
 import { providerOptionsProblem, TURN_OPERATIONS, turnFlags, type AgentProfile, type RoleAssignment, type TurnJob, type TurnRole } from "../shared/roles.js";
-import { providerSupport, turnPolicy } from "./adapters/turnPolicy.js";
+import { providerRoleOptionsProblem, providerSupport, turnPolicy } from "./adapters/turnPolicy.js";
 import type { ConsensusDatabase } from "./database.js";
 import type { ParticipantRole } from "./types.js";
 
@@ -135,7 +135,7 @@ export function designReadRequested(database: ConsensusDatabase, topicId: string
 // 팬아웃이 없어 검토자 턴도 Claude 로 표현할 수 있다. planningControl 은 호출자가 래퍼와 같은 식(guardedPlanning.planningControlApplies)으로 계산해 넘긴다.
 export function routeSupport(route: TurnRoute, planningControl: boolean, figmaRequested = false): string | null {
   const flags = turnFlags(route.job);
-  return providerSupport(route.provider, turnPolicy(route.job, { protocolOnly: flags.protocolOnly, planningControl, figmaRequested }));
+  return providerRoleOptionsProblem(route.provider, route.job, route.options) ?? providerSupport(route.provider, turnPolicy(route.job, { protocolOnly: flags.protocolOnly, planningControl, figmaRequested }));
 }
 
 // 프로필 역할 적합성(plan §2.5 "프로필 조회·검증", E2c) — 이 프로필을 배정하면 역할·작업마다 실행할 수 있는지와 사유. 경로 판정과 같은 함수(설정 스키마·
@@ -152,9 +152,9 @@ export function profileSuitability(profile: AgentProfile): ProfileSuitability {
     (TURN_OPERATIONS[role] as readonly string[]).map(operation => {
       const job = { role, operation } as TurnJob;
       const flags = turnFlags(job);
-      const reason = problem ?? providerSupport(profile.provider, turnPolicy(job, { protocolOnly: flags.protocolOnly }));
+      const reason = problem ?? providerRoleOptionsProblem(profile.provider, job, profile.options) ?? providerSupport(profile.provider, turnPolicy(job, { protocolOnly: flags.protocolOnly }));
       const withDesignSources = flags.implementation
-        ? problem ?? providerSupport(profile.provider, turnPolicy(job, { protocolOnly: flags.protocolOnly, figmaRequested: true }))
+        ? problem ?? providerRoleOptionsProblem(profile.provider, job, profile.options) ?? providerSupport(profile.provider, turnPolicy(job, { protocolOnly: flags.protocolOnly, figmaRequested: true }))
         : null;
       return { job, reason, withDesignSources };
     }));

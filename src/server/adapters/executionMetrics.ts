@@ -122,6 +122,7 @@ export class ExecutionMetrics {
   private readonly claudeInputTotals: Record<string, number> = {};
   private activeClaudeMessage?: string;
   private sawClaudeDelta = false;
+  private sawClaudeAdvisor = false;
   private readonly claudeMessages = new Map<string, Record<string, number>>();
   private totals: Partial<Pick<TurnUsage, "inputTokens" | "cachedInputTokens" | "outputTokens">> = {};
   private metadata: Partial<Pick<TurnUsage, "costUSD" | "modelTurns" | "apiDurationMs">> = {};
@@ -177,6 +178,20 @@ export class ExecutionMetrics {
         const value = number(usage[key]);
         if (value !== undefined && value >= 0) next[key] = Math.max(next[key] ?? 0, value);
       }
+      // API top-level usage excludes advisor iterations. Keep their counters separate so they
+      // affect the budget but not the main model's context-window/compaction measurements.
+      const advisors = Array.isArray(usage.iterations)
+        ? usage.iterations.map(record).filter(item => item?.type === "advisor_message") : [];
+      if (advisors.length) {
+        this.sawClaudeAdvisor = true;
+        for (const key of ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens"]) {
+          const values = advisors.map(item => number(item?.[key]));
+          if (values.every(value => value !== undefined && Number.isSafeInteger(value) && value >= 0)) {
+            const sum = values.reduce<number>((total, value) => total + value!, 0);
+            if (Number.isSafeInteger(sum)) next[`advisor_${key}`] = Math.max(next[`advisor_${key}`] ?? 0, sum);
+          }
+        }
+      }
       for (const key of ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]) {
         if (next[key] !== undefined) this.claudeInputTotals[key] = (this.claudeInputTotals[key] ?? 0) + next[key] - (previous?.[key] ?? 0);
       }
@@ -193,9 +208,10 @@ export class ExecutionMetrics {
         const delta = keys.reduce((sum, key) => sum + (next[key] ?? 0) - (previous?.[key] ?? 0), 0);
         this.totals[target] = (this.totals[target] ?? 0) + delta;
       };
-      addDelta("inputTokens", ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]);
-      addDelta("cachedInputTokens", ["cache_read_input_tokens"]);
-      addDelta("outputTokens", ["output_tokens"]);
+      addDelta("inputTokens", ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
+        "advisor_input_tokens", "advisor_cache_read_input_tokens", "advisor_cache_creation_input_tokens"]);
+      addDelta("cachedInputTokens", ["cache_read_input_tokens", "advisor_cache_read_input_tokens"]);
+      addDelta("outputTokens", ["output_tokens", "advisor_output_tokens"]);
       return;
     }
     if (this.seen.has(eventID(event))) return;
@@ -216,6 +232,11 @@ export class ExecutionMetrics {
       const created = number(usage.cache_creation_input_tokens);
       const output = number(usage.output_tokens);
       this.finalUsageComplete = (plain !== undefined || cached !== undefined || created !== undefined) && output !== undefined;
+      const cli = {
+        ...(plain === undefined && cached === undefined && created === undefined ? {} : { inputTokens: (plain ?? 0) + (cached ?? 0) + (created ?? 0) }),
+        ...(cached === undefined ? {} : { cachedInputTokens: cached }),
+        ...(output === undefined ? {} : { outputTokens: output }),
+      };
       const inputParts = { ...this.claudeInputTotals };
       for (const key of ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]) {
         const value = number(usage[key]);
@@ -236,11 +257,6 @@ export class ExecutionMetrics {
           .some((key) => streamed[key] !== undefined && this.totals[key] !== undefined && streamed[key]! > this.totals[key]!);
         if (mismatch) {
           this.finalUsageComplete = false;
-          const cli = {
-            ...(plain === undefined && cached === undefined && created === undefined ? {} : { inputTokens: (plain ?? 0) + (cached ?? 0) + (created ?? 0) }),
-            ...(cached === undefined ? {} : { cachedInputTokens: cached }),
-            ...(output === undefined ? {} : { outputTokens: output }),
-          };
           this.reconciliation = { cli, claudeStream: streamed, status: "mismatch" };
         }
       }
@@ -250,7 +266,7 @@ export class ExecutionMetrics {
       const coversObserved = sessionDelta && (["inputTokens", "cachedInputTokens", "outputTokens"] as const).every(key =>
         sessionDelta[key] !== undefined && sessionDelta[key]! >= Math.max(streamed[key] ?? 0, this.totals[key] ?? 0));
       if (coversObserved) {
-        this.reconciliation = { cli: { ...this.totals }, claudeStream: streamed, claudeSession: sessionDelta, status: "matched" };
+        this.reconciliation = { cli, claudeStream: streamed, claudeSession: sessionDelta, status: "matched" };
         this.totals = { inputTokens: sessionDelta.inputTokens, cachedInputTokens: sessionDelta.cachedInputTokens, outputTokens: sessionDelta.outputTokens };
         this.metadata = { ...this.metadata, costUSD: sessionDelta.costUSD, apiDurationMs: sessionDelta.apiDurationMs };
         this.finalUsageComplete = true;
@@ -260,10 +276,21 @@ export class ExecutionMetrics {
         delete this.metadata.apiDurationMs;
         if (this.claudeCompacted || this.claudeBaseline) {
           this.finalUsageComplete = false;
-          this.reconciliation = { cli: { ...this.totals }, claudeStream: streamed, status: "unavailable" };
+          this.reconciliation = { cli, claudeStream: streamed, status: "unavailable" };
           for (const key of ["inputTokens", "cachedInputTokens", "outputTokens"] as const) {
             if (streamed[key] !== undefined) this.totals[key] = Math.max(this.totals[key] ?? 0, streamed[key]!);
           }
+        }
+      }
+      // Without a verified session delta, never let executor-only final usage erase observed
+      // advisor tokens, and never claim that partial observations are a complete billable total.
+      if (this.sawClaudeAdvisor && !coversObserved) {
+        this.finalUsageComplete = false;
+        this.reconciliation = { cli, claudeStream: streamed, status: "unavailable" };
+        delete this.metadata.costUSD;
+        delete this.metadata.apiDurationMs;
+        for (const key of ["inputTokens", "cachedInputTokens", "outputTokens"] as const) {
+          if (streamed[key] !== undefined) this.totals[key] = Math.max(this.totals[key] ?? 0, streamed[key]!);
         }
       }
       this.internalRequests = number(event.num_turns) ?? this.claudeAssistantRequests;

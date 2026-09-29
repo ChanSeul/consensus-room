@@ -5,9 +5,12 @@ import { PLANNING_LIMITS, PlanningPaused, type PlanningFragment, type PlanningRe
 import { planningHash } from "./planningStore.js";
 
 const execute = promisify(execFile);
-// Only a malformed byte offset is correctable by the planner. Snapshot/access failures remain hard stops.
+// Malformed offsets and directory-as-file requests are correctable. Access failures remain hard stops.
 export class InvalidPlanningOffset extends PlanningPaused {
   constructor() { super("Invalid UTF-8 continuation offset; reuse the returned nextOffset, or start at offset 0. Do not guess byte offsets."); }
+}
+export class PlanningDirectoryRead extends PlanningPaused {
+  constructor() { super("Requested path is a directory, not file evidence. Request a regular file inside it or use a path::literal search."); }
 }
 export function utf8Slice(text: string, offset: number, limit: number): { text: string; next: number | null } {
   const bytes = Buffer.from(text);
@@ -51,8 +54,15 @@ export class PlanningReader {
     } else if (request.kind === "file") {
       safeSelector(request.selector);
       const path = posix.normalize(request.selector);
-      const entry = await this.git(["ls-tree", this.tree, "--", path]);
-      if (!/^100[0-7]{3} blob [a-f0-9]+\t/.test(entry) || entry.trimEnd().split("\t").at(-1) !== path) {
+      const lookupPath = path.replace(/\/$/, "");
+      if (lookupPath === ".") throw new PlanningDirectoryRead();
+      const entries = (await this.git(["ls-tree", "-z", this.tree, "--", lookupPath])).split("\0");
+      const entry = entries.length === 2 && entries[1] === "" ? entries[0]! : "";
+      const entryPath = entry.slice(entry.indexOf("\t") + 1);
+      if (/^040000 tree [a-f0-9]+\t/.test(entry) && entryPath === lookupPath) {
+        throw new PlanningDirectoryRead();
+      }
+      if (!/^100[0-7]{3} blob [a-f0-9]+\t/.test(entry) || entryPath !== path) {
         throw new PlanningPaused("Only regular files in the pinned tree may be read.");
       }
       text = await this.git(["show", `${this.tree}:${path}`]);

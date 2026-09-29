@@ -477,8 +477,8 @@ class EditingClaude implements AgentAdapter {
   // 계획 이력이 구현 비용의 대부분이었다). 계획 세션을 만드는 경로가 아님은 implementation 플래그로 판별한다.
   async createSession(turn: Omit<SessionTurn, "sessionId">) {
     expect(turn.implementation).toBe(true);
-    // 단계별 분리: 계획은 fable, 구현은 implementation 오버라이드(opus)를 받아야 한다(2026-08-31).
-    expect(turn.settings).toEqual({ model: "opus", effort: "xhigh" });
+    // 계획 설정과 별개로 구현은 승인된 기본값 Sonnet 5.5를 받아야 한다.
+    expect(turn.settings).toEqual({ model: "claude-sonnet-5-5", effort: "xhigh" });
     expect(turn.cwd).toBe(this.worktree);
     this.implementationTurns += 1;
     writeFileSync(join(this.worktree, "feature.txt"), "첫 구현\n");
@@ -804,7 +804,7 @@ describe("구현 턴 계약 위반", () => {
     expect(claude.correctionPrompts.length).toBe(1);
     expect(claude.correctionPrompts[0]).toContain("거부 사유");
     // kind 불일치는 표기 위반이라 교정 재제출은 구현 모델 그대로, 추론만 low 로 내린다(2026-09-07 제안 ③).
-    expect(claude.correctionSettings[0]).toEqual({ model: "opus", effort: "low" });
+    expect(claude.correctionSettings[0]).toEqual({ model: "claude-sonnet-5-5", effort: "low" });
     expect(database.getTimeline(topicId).some((event) => event.body.includes("표기 교정 — 추론 low"))).toBe(true);
     database.close();
   });

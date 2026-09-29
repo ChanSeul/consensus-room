@@ -1014,6 +1014,56 @@ it("reads dirty snapshot content, rejects symlinks/credential paths and paginate
 // Public boundary: guarded adapter -> pinned reader -> next model prompt -> accepted plan.
 // Reproduces the invalid-offset stop with real git/SQLite; the model double corrects its request,
 // or interrupts/repeats it. No UI, native-provider behavior or production deployment is claimed.
+describe("directory planning read recovery", () => {
+  it.each([{ interrupted: false, deferred: false, selector: "Sources" },
+    { interrupted: true, deferred: false, selector: "Sources/" },
+    { interrupted: false, deferred: false, selector: "." },
+    { interrupted: false, deferred: false, selector: "./" },
+    { interrupted: false, deferred: false, selector: "한글" },
+    { interrupted: false, deferred: true, selector: "Sources" }])(
+    "corrects a directory request ($selector, interrupted=$interrupted, deferred=$deferred) without treating it as evidence", async ({ interrupted, deferred, selector }) => {
+    const { repo, database, git } = setup();
+    mkdirSync(join(repo, "Sources"));
+    mkdirSync(join(repo, "한글"));
+    writeFileSync(join(repo, "한글", "파일.swift"), "let korean = true");
+    writeFileSync(join(repo, "Sources", "form.swift"), "let form = true");
+    const fake = scripted(async (turn, n) => {
+      if (n === 1) return { ...answer(step({ requests: [
+        { kind: "file", selector, question: "Read form", offset: 0 },
+      ] })), ...(deferred ? { requestedUserDecision: "Proceed?" } : {}) };
+      if (interrupted && n === 2) throw new Error("Interrupted directory correction");
+      if (n === (interrupted ? 3 : 2)) {
+        if (deferred) {
+          expect(turn.prompt).toContain("Sources changed");
+          expect(database.planning.latest("topic")!.deferredReads).toBeUndefined();
+        } else {
+          expect(turn.prompt).toContain("Read request errors:");
+          expect(turn.prompt).toContain("directory");
+        }
+        expect(JSON.parse(turn.prompt.split("Fragments: ").at(-1)!)).toEqual([]);
+        return answer(step({ requests: [
+          { kind: "file", selector: "Sources/form.swift", question: "Read form", offset: 0 },
+        ] }));
+      }
+      const fragments = JSON.parse(turn.prompt.split("Fragments: ").at(-1)!) as PlanningFragment[];
+      expect(fragments.map(fragment => fragment.content)).toEqual(["let form = true"]);
+      return answer(step({ questions: [], complete: true,
+        facts: [{ statement: "Read the form file", refs: [fragments[0].id] }] }));
+    });
+    const adapter = guardedPlanning(fake.adapter, database, git);
+    if (deferred) {
+      await adapter.createSession({ cwd: repo, prompt: "Plan" });
+      database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CLAUDE_PLAN", body: "Proceed" });
+    }
+    if (interrupted) await expect(adapter.createSession({ cwd: repo, prompt: "Plan" }))
+      .rejects.toThrow("Interrupted directory correction");
+    const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+    expect(result.result.planMarkdown).toBe("Final navigation plan");
+    expect(database.planning.latest("topic")!.finalized).toBe(true);
+    expect(fake.calls).toHaveLength(interrupted ? 4 : 3);
+  });
+});
+
 describe("invalid planning read offsets", () => {
   it.each([1, 100_000])("lets the model correct offset %i without a new decision or attempt", async offset => {
     const { repo, database, git } = setup();
@@ -1173,7 +1223,7 @@ describe("invalid planning read offsets", () => {
     expect(database.planning.latest("topic")).toMatchObject({ id: paused.id, admissionId: paused.admissionId, finalized: true });
   });
 
-  it.each([".env", "../outside", "link.swift", "missing.swift"])("keeps %s as a hard failure", async selector => {
+  it.each([".env", "../outside", "link.swift", "missing.swift", "form.swift/"])("keeps %s as a hard failure", async selector => {
     const { repo, database, git } = setup();
     writeFileSync(join(repo, "form.swift"), "한글🙂");
     symlinkSync("form.swift", join(repo, "link.swift"));
@@ -4724,4 +4774,27 @@ it("preserves each internal Codex comparison through guarded planning into execu
       { executionId: "inner-1", sessionId: "session-1", sourceUsage: { cli: { inputTokens: 1001, outputTokens: 201 }, codexHome: { inputTokens: 100, outputTokens: 20 } } },
       { executionId: "inner-2", sessionId: "session-1", sourceUsage: { cli: { inputTokens: 1002, outputTokens: 202 }, codexHome: { inputTokens: 100, outputTokens: 20 } } },
     ] } });
+});
+
+// The last provider report, not just populated counters, governs permission to buy another call.
+it.each([false, true])("stops incomplete advisor usage before another call (reconciled=%s)", async reconciled => {
+  const { repo, database, git } = setup();
+  const fake = scripted(async (turn, n) => {
+    if (n === 1) {
+      turn.onUsage?.({ inputTokens: 100, outputTokens: 20, durationMs: 30, recordKind: "progress", completeness: "partial" });
+      if (reconciled) turn.onUsage?.({ inputTokens: 110, outputTokens: 25, durationMs: 35, recordKind: "final", completeness: "complete" });
+      return answer(step({ requests: [{ kind: "file", selector: "form.swift", question: "Read", offset: 0 }] }));
+    }
+    return answer(step({ questions: [], complete: true }));
+  });
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  if (reconciled) {
+    await adapter.createSession({ cwd: repo, prompt: "Plan" });
+    expect(fake.calls).toHaveLength(2);
+  } else {
+    await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Usage is incomplete");
+    await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Usage is incomplete");
+    expect(fake.calls).toHaveLength(1);
+    expect(database.planning.latest("topic")?.usageIncomplete).toBe(true);
+  }
 });

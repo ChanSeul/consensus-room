@@ -21,14 +21,14 @@ afterEach(() => {
 
 describe("설정 초기화에서 구현 모델 보존", () => {
   it.each([
-    [undefined, undefined, "fable", "xhigh"],
+    [undefined, undefined, "claude-opus-5-5", "max"],
     ["claude-opus-5-5", "high", "claude-opus-5-5", "high"],
-  ])("계획 환경변수 %s/%s와 별개로 구현은 opus를 쓴다", (model, effort, expectedModel, expectedEffort) => {
+  ])("계획 환경변수 %s/%s와 별개로 구현은 Sonnet 5.5를 쓴다", (model, effort, expectedModel, expectedEffort) => {
     vi.stubEnv("CONSENSUS_ROOM_CLAUDE_MODEL", model);
     vi.stubEnv("CONSENSUS_ROOM_CLAUDE_EFFORT", effort);
     const settings = loadConfig({ dataDirectory: tmpdir() }).defaultAgentSettings.claude;
     expect(appliedExecutionSettings(settings, false)).toEqual({ model: expectedModel, effort: expectedEffort });
-    expect(appliedExecutionSettings(settings, true)).toEqual({ model: "opus", effort: "xhigh" });
+    expect(appliedExecutionSettings(settings, true)).toEqual({ model: "claude-sonnet-5-5", effort: "xhigh" });
   });
 
   it("명시적으로 주어진 설정에는 기본 구현 모델을 추가하지 않는다", () => {

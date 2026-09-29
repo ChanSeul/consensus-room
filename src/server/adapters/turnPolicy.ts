@@ -110,6 +110,12 @@ export function providerSupport(provider: "claude" | "codex", policy: TurnPolicy
   return null;
 }
 
+// Profile routing and adapters must reject incompatible options before allocating a session.
+export function providerRoleOptionsProblem(provider: "claude" | "codex", job: TurnJob, options: Readonly<Record<string, unknown>>): string | null {
+  return provider === "claude" && job.role !== "planner" && options.advisorModel
+    ? "Claude advisorModel is supported only for planner turns." : null;
+}
+
 // 승인 경로만 쓰기의 경로 검증(엔진 개편 E2e-3) — 두 어댑터 입구(resolveSupportedTurn)가 부르는 한 곳이다. 런타임 CLI 도 서비스 → 어댑터로 여기를
 // 지나므로 같은 사유로 공급자 실행 전에 거부된다. 경로는 작업 폴더 안의 절대 경로이고, 작업 폴더 아래에 심볼릭 링크가 없어야 한다(아직 없는 파일은 있는
 // 조상까지) — 공급자 CLI 는 링크가 든 쓰기 루트를 받지 않고, 링크는 쓰기 범위를 작업 폴더 밖으로 넓힌다. 작업 폴더 자체는 기존 쓰기 턴이다.
@@ -272,9 +278,10 @@ export function resolveTurn(provider: "claude" | "codex", turn: Omit<SessionTurn
 export function resolveSupportedTurn<P extends "claude" | "codex">(provider: P, turn: Omit<SessionTurn, "sessionId">):
   ResolvedTurn & { options: ProviderOptions<P> } {
   const resolved = resolveTurn(provider, turn);
-  const reason = providerSupport(provider, resolved.policy);
+  const options = parseProviderOptions(provider, turn.providerOptions);
+  const reason = providerRoleOptionsProblem(provider, resolved.job, options) ?? providerSupport(provider, resolved.policy);
   if (reason) throw new Error(`${reason}(job ${resolved.job.role}/${resolved.job.operation}).`);
   const scope = writeScopeProblem(turn.cwd, turn.writablePaths, resolved.policy);
   if (scope) throw new Error(scope);
-  return { ...resolved, options: parseProviderOptions(provider, turn.providerOptions) };
+  return { ...resolved, options };
 }
