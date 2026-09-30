@@ -70,7 +70,7 @@ Cloud ID가 있으면 Jira 요청만 `https://api.atlassian.com/ex/jira/{cloudId
 화면의 **수집 이어가기**도 이 목록을 표시한다. 이 버튼 자체가 호스트 에이전트의 읽기 작업을 예약하지는 않는다.
 `host-plan --id TOPIC_ID --limit 50`은 승인된 원문 중 확인이 필요한 자료만 메타데이터로 반환한다.
 `nextCursor`가 있으면 `--cursor NEXT_CURSOR`로 다음 목록을 읽는다. 수집 완료로 앞 항목이 사라져도 남은 항목을 건너뛰지 않는다.
-응답의 `version`이 바뀌면 승인 범위가 달라졌으므로 커서 없이 목록을 다시 조회한다. 본문이 없으며 목록 조회만으로 수집이나 승인이 완료되지는 않는다.
+`host-import` 또는 다음 목록 응답의 `version`이 바뀌면 커서 없이 목록을 다시 조회한다. 같은 사이트의 하위 티켓처럼 자동으로 탐색하는 새 원문도 목록 버전을 바꾼다. 완료한 원문은 다시 읽지 않고 새로 추가된 자료를 확인한다. 본문이 없으며 목록 조회만으로 수집이나 승인이 완료되지는 않는다.
 기존에 설정한 REST 수집은 유지한다. 연결되지 않은 앱은 로그인된 브라우저로 읽을 수 있지만, 인증 오류를 완료로 처리하지 않는다.
 입력은 `version`, `rootId`, `sourceId`, `previousHash`, `previousCheckedAt`(catalog의 현재 값),
 `observedAt`(원문 확인을 끝낸 Unix 밀리초), `revision`, `units`, `missing` 배열이다.

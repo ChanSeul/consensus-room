@@ -157,6 +157,28 @@ it("keeps the next unread source reachable after the preceding host page is impo
     expect(next.nextCursor).toBeNull();
   } finally {await service.stop();}
 });
+it("changes the host list version when an import discovers an approved child before its cursor", async () => {
+  // The host compares the import/list version and restarts metadata paging when discovery changes the work list.
+  const {db}=fixture(),c=db.evidence.catalog;
+  for (const key of ["APP-1","APP-2"]) c.add("a",{...input(`https://team.atlassian.net/browse/${key}`),mode:"connector"},true);
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("Host only");}});
+  try {
+    const first=service.hostPlan("a",undefined,1),read=first.requests[0];
+    const child=Array.from({length:100},(_,n)=>db.evidence.ensureSource({
+      url:`https://team.atlassian.net/browse/APP-${n+3}`,label:"Child",mode:"connector",intervalSeconds:900},true)).find(source=>source.id<read.sourceId)!;
+    expect(child).toBeDefined();
+    service.importHost("a",{version:first.version,rootId:read.rootId,sourceId:read.sourceId,previousHash:null,
+      previousCheckedAt:null,observedAt:Date.now(),revision:"host",units:[{id:"body",kind:"issue",content:`Child: ${child.url}`}],missing:[]});
+    const resumed=service.hostPlan("a",first.nextCursor!,1);
+    expect(resumed.version).not.toBe(first.version);
+    const restarted=service.hostPlan("a",undefined,1);
+    expect(restarted.requests[0].sourceId).toBe(child.id);
+    service.importHost("a",{version:restarted.version,rootId:read.rootId,sourceId:child.id,previousHash:null,
+      previousCheckedAt:null,observedAt:Date.now(),revision:"child",units:[{id:"body",kind:"issue",content:"Child body"}],missing:[]});
+    expect(service.hostPlan("a").requests.map(request=>request.sourceId)).not.toContain(child.id);
+    expect(service.hostPlan("a").version).toBe(restarted.version);
+  } finally {await service.stop();}
+});
 it("app read plans contain only approved metadata and imports remain incomplete when comments are missing", async () => {
   const {db} = fixture(), c = db.evidence.catalog;
   const root = c.add("a",{...input("https://team.atlassian.net/browse/APP-1"),mode:"connector"},true);

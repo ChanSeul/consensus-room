@@ -120,10 +120,10 @@ export function parseEvidenceSource(input: EvidenceSourceInput): Pick<EvidenceSo
   const url = new URL(input.url);
   if (url.protocol !== "https:" || url.username || url.password || url.port) throw new Error("HTTPS 원문 링크만 등록할 수 있습니다.");
   if (/\.(?:slack\.com|atlassian\.net|figma\.com)\./.test(url.hostname)) throw new Error("원문 서비스 주소가 올바르지 않습니다.");
-  const channel = /^\/archives\/([CG][A-Z0-9]+)\/?$/.exec(url.pathname);
+  const channel = /^\/archives\/([CGD][A-Z0-9]+)\/?$/.exec(url.pathname);
   if (url.hostname.endsWith(".slack.com") && channel) return { provider: "slack", resource: `${url.hostname}/${channel[1]}`,
     selector: "", url: `https://${url.hostname}/archives/${channel[1]}` };
-  const slack = /^\/archives\/([CG][A-Z0-9]+)\/p(\d{10})(\d{6})\/?$/.exec(url.pathname);
+  const slack = /^\/archives\/([CGD][A-Z0-9]+)\/p(\d{10})(\d{6})\/?$/.exec(url.pathname);
   if (url.hostname.endsWith(".slack.com") && slack) {
     const thread = url.searchParams.get("thread_ts") ?? `${slack[2]}.${slack[3]}`;
     if (!/^\d{10}\.\d{6}$/.test(thread)) throw new Error("Slack 스레드 주소가 올바르지 않습니다.");

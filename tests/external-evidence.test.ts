@@ -33,6 +33,17 @@ const unit = (id: string, content: string): EvidenceUnitInput => ({ id, kind: "m
 const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lWQAAAAASUVORK5CYII=";
 
 describe("source identity and persistent content cache", () => {
+  it("registers direct message roots and normalizes their threads without broadening accepted Slack addresses", () => {
+    const {db,topic}=setup();
+    const url="https://team.slack.com/archives/D123";
+    const root=db.evidence.register(topic.id,{...sourceInput,url});
+    expect(root).toMatchObject({provider:"slack",resource:"team.slack.com/D123",selector:"",url});
+    const thread=db.evidence.register(topic.id,{...sourceInput,url:`${url}/p1789709010013729?thread_ts=1789709010.013729`});
+    expect(thread).toMatchObject({provider:"slack",resource:root.resource,selector:"1789709010.013729"});
+    expect(thread.id).not.toBe(root.id);
+    for (const invalid of ["https://team.slack.com/archives/U123","https://team.slack.com/archives/D123/pbad",
+      "https://team.slack.com.evil.test/archives/D123"]) expect(()=>parseEvidenceSource({...sourceInput,url:invalid})).toThrow();
+  });
   it("normalizes link variants and isolates different resources", () => {
     const { db, topic, source } = setup();
     const again = db.evidence.register(topic.id, { ...sourceInput, url: `${sourceInput.url}?thread_ts=1789709010.013729&cid=C123` });

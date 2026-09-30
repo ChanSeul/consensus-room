@@ -307,7 +307,8 @@ export class EvidenceCatalogStore {
         const added = this.db.prepare("INSERT OR IGNORE INTO evidence_members VALUES (?,?,?,'pending',NULL,NULL)")
           .run(root.id, child.id, automatic ? "approved" : "candidate");
         if (automatic) this.reuseApproval(child.id,current);
-        if (added.changes && !automatic) { current.version++; this.audit(current, "새 연결 자료 검수 대기", child.id); }
+        // Approved discoveries change host paging too: their IDs may precede a cursor already handed out.
+        if (added.changes) { current.version++; this.audit(current, automatic ? "승인된 탐색 범위에서 새 원문 발견" : "새 연결 자료 검수 대기", child.id); }
         this.db.prepare("INSERT OR IGNORE INTO evidence_discovery_edges VALUES (?,?,?,?,?)").run(root.id, child.id, source.id, link.unitId, link.relation);
       }
       this.db.prepare("UPDATE evidence_members SET cursor=?,progress=?,error=NULL WHERE root_id=? AND source_id=?")
