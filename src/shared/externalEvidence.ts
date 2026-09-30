@@ -101,7 +101,7 @@ export interface EvidenceHostRead {
   integration: string; requiredReads: string[];
 }
 export interface EvidenceHostPlan {
-  version: string; requests: EvidenceHostRead[]; total: number; nextOffset: number | null;
+  version: string; requests: EvidenceHostRead[]; total: number; nextCursor: string | null;
   pendingReview: number;
 }
 export interface EvidenceCollectionResult extends EvidenceCatalog { hostPlan: EvidenceHostPlan }

@@ -7,7 +7,7 @@ Figma 파일 전체 대신 실제 작업할 화면을 node-id로 지정한다. �
 ## 연결 방식
 
 1. **Codex·중재자 연결 도구로 수집**: 호스트 세션이 이미 연결한 Slack·Atlassian·Figma 도구로 읽고 로컬 bridge에 결과를 넘긴다.
-   새 루트는 이 방식을 기본으로 선택한다. 공개 API 문서는 인증 없이 서버에서 읽는다.
+   새 루트는 이 방식을 기본으로 선택한다. 공개 API 문서는 서버 직접 수집을 선택해 인증 없이 읽을 수 있다.
    앱에 연결한 OAuth 정보가 별도 REST 서버에 자동 공유되지는 않는다. 토큰 파일을 찾아 복사하지 않는다.
 2. **서버에서 주기적으로 확인**: 서버에 읽기 자격증명이 명시적으로 설정된 경우 REST 수집기가 기본 15분마다 확인한다.
    서버 시작 시 주기가 지난 자료부터 확인하고 종료 시 요청을 취소한다. 닫힌 주제만 연결한 자료는 확인하지 않는다.
@@ -68,8 +68,9 @@ Cloud ID가 있으면 Jira 요청만 `https://api.atlassian.com/ex/jira/{cloudId
 `evidence-bridge.py host-import --id TOPIC_ID --input capture.json`으로 제출한다.
 `collect --id TOPIC_ID`는 재사용할 수 있는 공유 스냅샷을 먼저 반영하고, 응답의 `hostPlan`에 호스트가 읽을 자료를 반환한다.
 화면의 **수집 이어가기**도 이 목록을 표시한다. 이 버튼 자체가 호스트 에이전트의 읽기 작업을 예약하지는 않는다.
-`host-plan --id TOPIC_ID --offset 0 --limit 50`은 승인된 원문 중 확인이 필요한 자료만 메타데이터로 반환한다.
-`nextOffset`이 있으면 다음 목록을 이어서 읽는다. 본문이 없으며 목록 조회만으로 원문 수집이나 링크 승인이 완료되지는 않는다.
+`host-plan --id TOPIC_ID --limit 50`은 승인된 원문 중 확인이 필요한 자료만 메타데이터로 반환한다.
+`nextCursor`가 있으면 `--cursor NEXT_CURSOR`로 다음 목록을 읽는다. 수집 완료로 앞 항목이 사라져도 남은 항목을 건너뛰지 않는다.
+응답의 `version`이 바뀌면 승인 범위가 달라졌으므로 커서 없이 목록을 다시 조회한다. 본문이 없으며 목록 조회만으로 수집이나 승인이 완료되지는 않는다.
 기존에 설정한 REST 수집은 유지한다. 연결되지 않은 앱은 로그인된 브라우저로 읽을 수 있지만, 인증 오류를 완료로 처리하지 않는다.
 입력은 `version`, `rootId`, `sourceId`, `previousHash`, `previousCheckedAt`(catalog의 현재 값),
 `observedAt`(원문 확인을 끝낸 Unix 밀리초), `revision`, `units`, `missing` 배열이다.
@@ -114,7 +115,7 @@ Codex 구현 턴은 기존 Codex 인증으로 공식 App Server의 `app/installe
 디자인 관측은 댓글까지 포함한 전체 원문 수집 완료나 최신 버전 확인을 대신하지 않는다.
 
 2026-09-30 CLI 0.159.0에서 실제 `exec`와 같은 세션의 `exec resume`이 각각 공식 Figma 읽기를 한 번 호출했고,
-각 응답이 호스트에 저장됨을 확인했다. 별도 테스트는 승인되지 않은 파일·쓰기 요청 거부, 저장 실패, 인증 미연결, 취소를 확인한다.
+각 응답이 호스트에 저장됨을 확인했다. Private 검증 기록은 `docs/engine-rework/native-figma-proof.json`에 보존한다. 별도 테스트는 승인되지 않은 파일·쓰기 요청 거부, 저장 실패, 인증 미연결, 취소를 확인한다.
 
 ## LLM 위키와의 연결
 

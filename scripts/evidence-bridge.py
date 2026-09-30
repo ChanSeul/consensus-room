@@ -50,12 +50,12 @@ def main():
     parser.add_argument("--session", help="실제 중재자 세션 ID; batch/ack에 필수")
     parser.add_argument("--batch", help="읽기를 마친 batchId; ack에 필수")
     parser.add_argument("--page-bytes", type=int, help="batch 한 쪽의 최대 바이트(1~240000). 이 출력 전체(끝 개행 제외)가 이 크기 이하다")
-    parser.add_argument("--offset", type=int, default=0, help="host-plan metadata page offset")
+    parser.add_argument("--cursor", help="host-plan nextCursor source ID")
     parser.add_argument("--limit", type=int, default=50, help="host-plan metadata page size (1~50)")
     args = parser.parse_args()
     identity = mediator_identity()
-    if args.offset < 0 or not 1 <= args.limit <= 50:
-        parser.error("host-plan offset must be nonnegative and limit must be 1~50")
+    if (args.cursor is not None and not re.fullmatch(r"[a-f0-9]{64}", args.cursor)) or not 1 <= args.limit <= 50:
+        parser.error("host-plan cursor must be a source ID and limit must be 1~50")
     base, token = connection(args.launch_file)
     if args.command not in {"due", "connections"} and not args.id:
         parser.error("--id is required")
@@ -71,7 +71,7 @@ def main():
         "metrics": f"/api/topics/{source_id}/evidence/metrics",
         "host-import": f"/api/topics/{source_id}/evidence/host-import",
         "catalog": f"/api/topics/{source_id}/evidence/catalog",
-        "host-plan": f"/api/topics/{source_id}/evidence/host-plan?offset={args.offset}&limit={args.limit}",
+        "host-plan": f"/api/topics/{source_id}/evidence/host-plan?limit={args.limit}" + (f"&cursor={args.cursor}" if args.cursor else ""),
         "collect": f"/api/topics/{source_id}/evidence/collect",
     }[args.command]
     data = None

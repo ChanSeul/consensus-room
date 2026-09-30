@@ -82,7 +82,7 @@ export class EvidenceService {
   connection(source: EvidenceSource): { configured: boolean; error: string | null } {
     return { configured: this.connector.configured?.(source) ?? false, error: source.error };
   }
-  hostPlan(topicId: string, offset = 0, limit = 50): EvidenceHostPlan {
+  hostPlan(topicId: string, cursor?: string, limit = 50): EvidenceHostPlan {
     const catalog = this.store.catalog.state(topicId), now = Date.now();
     const integrations = { jira: "Atlassian Rovo", confluence: "Atlassian Rovo", slack: "Slack", figma: "Figma",
       sheets: "Google Drive", document: "Browser" };
@@ -105,9 +105,11 @@ export class EvidenceService {
       provider: entry.source.provider, resource: entry.source.resource, selector: entry.source.selector,
       previousHash: entry.source.contentHash, previousCheckedAt: entry.source.checkedAt,
       integration: integrations[entry.source.provider], requiredReads: reads[entry.source.provider] });
-    const requests = [...unique.values()];
-    return { version: catalog.version, requests: requests.slice(offset, offset + limit), total: requests.length,
-      nextOffset: offset + limit < requests.length ? offset + limit : null, pendingReview: catalog.coverage.candidates };
+    const requests = [...unique.values()].sort((a, b) => a.sourceId.localeCompare(b.sourceId));
+    const remaining = cursor ? requests.filter(request => request.sourceId > cursor) : requests;
+    const page = remaining.slice(0, limit);
+    return { version: catalog.version, requests: page, total: requests.length,
+      nextCursor: remaining.length > limit ? page.at(-1)!.sourceId : null, pendingReview: catalog.coverage.candidates };
   }
   async prepareMediator(database: ConsensusDatabase, topicId: string, sessionId: string, pageBytes?: number): Promise<MediatorEvidenceResponse> {
     const start = database.getTopic(topicId);

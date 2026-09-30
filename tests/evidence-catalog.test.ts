@@ -141,6 +141,22 @@ function fixture() {
   return {db,topic};
 }
 const input = (url: string, scope: EvidenceRootInput["scope"] = "group"): EvidenceRootInput => ({url,label:url,scope,required:true,mode:"rest",intervalSeconds:900});
+it("keeps the next unread source reachable after the preceding host page is imported", async () => {
+  // host-plan -> host-import -> cursor resume is the host collector's public contract.
+  // Restoring the old offset would skip the remaining independent root; no model or live auth is used.
+  const {db}=fixture(),c=db.evidence.catalog;
+  for (const key of ["APP-1","APP-2"]) c.add("a",{...input(`https://team.atlassian.net/browse/${key}`),mode:"connector"},true);
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("Host only");}});
+  try {
+    const first=service.hostPlan("a",undefined,1),read=first.requests[0];
+    expect(first.nextCursor).not.toBeNull();
+    service.importHost("a",{version:first.version,rootId:read.rootId,sourceId:read.sourceId,previousHash:null,
+      previousCheckedAt:null,observedAt:Date.now(),revision:"host",units:[{id:"body",kind:"issue",content:"Root body"}],missing:[]});
+    const next=service.hostPlan("a",first.nextCursor!,1);
+    expect(next.requests).toHaveLength(1); expect(next.requests[0].sourceId).not.toBe(read.sourceId);
+    expect(next.nextCursor).toBeNull();
+  } finally {await service.stop();}
+});
 it("app read plans contain only approved metadata and imports remain incomplete when comments are missing", async () => {
   const {db} = fixture(), c = db.evidence.catalog;
   const root = c.add("a",{...input("https://team.atlassian.net/browse/APP-1"),mode:"connector"},true);

@@ -57,7 +57,7 @@ it("registers once while pending and ignores an older poll that finishes after t
 it("shows the app reader's next work after collection instead of silently completing", async () => {
   vi.spyOn(api, "evidence").mockResolvedValue(state(false));
   const collect = vi.spyOn(api, "collectEvidence").mockResolvedValue({ ...catalog(), hostPlan: {
-    version: catalog().version, total: 1, nextOffset: null, pendingReview: 2,
+    version: catalog().version, total: 1, nextCursor: null, pendingReview: 2,
     requests: [{ rootId: "root", sourceId: "b".repeat(64), url: sourceURL, label: "Planning",
       provider: "jira", resource: "team.atlassian.net/APP-1", selector: "", previousHash: null, previousCheckedAt: null,
       integration: "Atlassian Rovo", requiredReads: ["이슈 본문·전체 댓글", "모든 하위·연결 티켓과 외부 링크"] }],
@@ -67,7 +67,20 @@ it("shows the app reader's next work after collection instead of silently comple
   fireEvent.click(await screen.findByRole("button", { name: "수집 이어가기" }));
   expect(await screen.findByRole("complementary", { name: "앱 연결로 읽을 자료" })).toHaveTextContent("앱 연결로 읽을 원문 1개 · 링크 검수 대기 2개");
   expect(screen.getByRole("complementary")).toHaveTextContent("전체 댓글");
+  expect(screen.getByRole("complementary")).toHaveTextContent("채팅에 원문 수집을 요청하세요");
   expect(collect).toHaveBeenCalledExactlyOnceWith("t");
+});
+it.each(["connector", "rest"] as const)("preserves the user's %s selection for login-protected general documents", async mode => {
+  vi.spyOn(api,"evidence").mockResolvedValue(state(false));
+  const add=vi.spyOn(api,"addEvidenceRoot").mockResolvedValue({});
+  render(<EvidencePanel topicId="t" busy={false} />);
+  fireEvent.click(screen.getByText(/원문 근거/));
+  await screen.findByRole("button",{name:"수집 이어가기"});
+  fireEvent.change(screen.getByLabelText("탐색 루트 이름"),{target:{value:"Private policy"}});
+  fireEvent.change(screen.getByLabelText("탐색 루트 링크"),{target:{value:"https://docs.google.com/document/d/private/edit"}});
+  fireEvent.change(screen.getByLabelText("원문 수집 방법"),{target:{value:mode}});
+  fireEvent.click(screen.getByRole("button",{name:"루트와 탐색 범위 승인·추가"}));
+  expect(add).toHaveBeenCalledWith("t",expect.objectContaining({mode,url:"https://docs.google.com/document/d/private/edit"}));
 });
 const sourceURL = "https://team.atlassian.net/browse/APP-1";
 

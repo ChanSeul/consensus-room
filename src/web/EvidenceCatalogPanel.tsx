@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { parseEvidenceSource, type EvidenceCatalog, type EvidenceHostPlan, type EvidenceScope } from "../shared/externalEvidence";
+import { type EvidenceCatalog, type EvidenceHostPlan, type EvidenceScope } from "../shared/externalEvidence";
 import { api } from "./api";
 
 const scopes = { group: "이 작업 그룹과 이후 단계", topic: "이 주제만", workspace: "이 저장소의 모든 작업" };
@@ -46,10 +46,10 @@ export function EvidenceCatalogPanel({ topicId, busy }: { topicId: string; busy:
       }}>수집 이어가기</button>
       {hostPlan && hostPlan.version === catalog.version && <aside aria-label="앱 연결로 읽을 자료">
         <p role="status">앱 연결로 읽을 원문 {hostPlan.total}개 · 링크 검수 대기 {hostPlan.pendingReview}개</p>
-        <p>에이전트가 기존 앱 연결로 읽어 공유 근거에 저장합니다. 연결이 없으면 로그인된 브라우저를 사용하며, 읽지 못한 댓글·화면은 누락으로 기록합니다.</p>
+        <p>이 버튼은 수집할 목록을 표시합니다. 이 작업을 맡은 Codex·Claude 채팅에 원문 수집을 요청하세요. 연결 도구나 로그인된 브라우저로 읽은 내용을 공유 근거에 저장합니다.</p>
         {hostPlan.requests.map(read => <p key={read.sourceId}><a href={read.url} target="_blank" rel="noreferrer">{read.label}</a>
           {` · ${read.integration} · ${read.requiredReads.join(" / ")}`}</p>)}
-        {hostPlan.nextOffset !== null && <p>나머지 원문은 에이전트가 다음 목록에서 이어서 읽습니다.</p>}
+        {hostPlan.nextCursor !== null && <p>목록에 더 많은 원문이 있습니다. 수집 요청에 다음 목록도 포함해 달라고 알려 주세요.</p>}
       </aside>}
       {catalog.roots.filter(r => r.status !== "removed").map(root => <article key={root.id}>
         <a href={root.source.url} target="_blank" rel="noreferrer">{root.source.label}</a> · {scopes[root.scope]} · {root.status === "approved" ? "사용자 승인됨" : "루트 검수 대기"}
@@ -81,9 +81,7 @@ export function EvidenceCatalogPanel({ topicId, busy }: { topicId: string; busy:
       </details>
     </>}
     <form onSubmit={e => { e.preventDefault(); void run(() => {
-      const input = { url, label, scope, mode, intervalSeconds: 900, required: true };
-      // Public documentation needs no service account. The default app route applies to authenticated services.
-      return api.addEvidenceRoot(topicId, { ...input, mode: parseEvidenceSource(input).provider === "document" ? "rest" : mode });
+      return api.addEvidenceRoot(topicId, { url, label, scope, mode, intervalSeconds: 900, required: true });
     }); }}>
       <input aria-label="탐색 루트 이름" required value={label} onChange={e => setLabel(e.target.value)} placeholder="작업 기획 / 정책서 / 백엔드" />
       <input aria-label="탐색 루트 링크" required type="url" value={url} onChange={e => setURL(e.target.value)} placeholder="Jira 루트·Slack 채널·정책서·API 문서" />

@@ -26,9 +26,9 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
   };
   app.get<{ Params: { id: string } }>("/api/topics/:id/evidence/catalog", async request => db.evidence.catalog.state(request.params.id));
   app.get<{ Params: { id: string } }>("/api/topics/:id/evidence/host-plan", async request => {
-    const input = z.object({ offset: z.coerce.number().int().nonnegative().default(0),
+    const input = z.object({ cursor: z.string().regex(/^[a-f0-9]{64}$/).optional(),
       limit: z.coerce.number().int().min(1).max(50).default(50) }).strict().parse(request.query);
-    return service.hostPlan(request.params.id, input.offset, input.limit);
+    return service.hostPlan(request.params.id, input.cursor, input.limit);
   });
   app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/host-import", {bodyLimit:16_000_000}, async request => {
     mediator(request.headers);
