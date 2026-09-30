@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { EVIDENCE_PAGE_BYTES } from "../../shared/externalEvidence.js";
-import type { EvidenceSource, EvidenceSnapshotInput, EvidenceHostImport, EvidenceHostPlan, MediatorEvidenceBatch, MediatorEvidenceResponse } from "../../shared/externalEvidence.js";
+import type { EvidenceDiscoveryLink, EvidenceSource, EvidenceSnapshotInput, EvidenceHostImport, EvidenceHostPlan, MediatorEvidenceBatch, MediatorEvidenceResponse } from "../../shared/externalEvidence.js";
 import { discoverLinks } from "./discovery.js";
 import type { ConsensusDatabase } from "../database.js";
 import type { AgentResult } from "../../shared/contracts.js";
@@ -14,63 +14,94 @@ export class EvidenceService {
   private timer?: ReturnType<typeof setInterval>;
   private readonly jobs = new Map<string, Promise<void>>();
   private readonly abort = new AbortController();
+  private polling = false;
+  private readonly collectedThisPoll = new Map<string, { key: string; links: EvidenceDiscoveryLink[] }>();
+  onIdle: () => void = () => {};
+  canPublish: (topicId: string) => boolean = () => true;
+
   constructor(readonly store: EvidenceStore, private readonly connector: EvidenceConnector,
-    private readonly changed: (source: EvidenceSource) => void = () => undefined, private readonly imageDirectory?: string) {}
+    private readonly changed: (source: EvidenceSource) => void = () => undefined, private readonly imageDirectory?: string, private readonly native?: EvidenceConnector) {}
   start(): void {
     if (this.timer) return;
     const poll = () => { void this.poll().catch(() => console.warn("[evidence] 원문 확인을 마치지 못했습니다. 다음 주기에 다시 확인합니다.")); };
     this.timer = setInterval(poll, 30_000); this.timer.unref();
     poll();
   }
-  async stop(): Promise<void> { clearInterval(this.timer); this.abort.abort(); await Promise.allSettled(this.jobs.values()); }
+  async stop(): Promise<void> { clearInterval(this.timer); this.abort.abort(); await this.native?.close?.(); await Promise.allSettled(this.jobs.values()); }
   async poll(): Promise<void> {
-    // Bounded parallelism: each iteration waits for one source; manual requests share the same lease.
-    for (const source of this.store.activeSources()) {
-      if (this.abort.signal.aborted) return;
-      if (source.mode === "rest" && !this.store.catalog.managed(source.id)) await this.refresh(source.id);
-    }
-    for (const root of this.store.catalog.due()) await this.collect(root.id);
+    if (this.polling || this.abort.signal.aborted) return;
+    this.polling = true;
+    this.collectedThisPoll.clear();
+    try {
+      this.onIdle();
+      // Bounded parallelism: each iteration waits for one source; manual requests share the same lease.
+      for (const source of this.store.activeSources()) {
+        if (this.abort.signal.aborted) return;
+        if (source.mode === "rest" && !this.store.catalog.managed(source.id)) await this.refresh(source.id);
+      }
+      for (const root of this.store.catalog.due()) await this.collect(root.id);
+      if (!this.abort.signal.aborted) this.onIdle();
+    } finally { this.polling = false; }
   }
   collect(rootId: string, force = false): Promise<void> {
     const key = `root:${rootId}`, existing = this.jobs.get(key); if (existing) return existing;
+    if (!this.polling && !this.jobs.size) this.collectedThisPoll.clear();
     if (force) this.store.catalog.requestRefresh(rootId);
-    const job = this.collectRoot(rootId).finally(() => this.jobs.delete(key));
+    const job = this.collectRoot(rootId, force).finally(() => this.jobs.delete(key));
     this.jobs.set(key, job); return job;
   }
-  private async collectRoot(rootId: string): Promise<void> {
+  private async collectRoot(rootId: string, force = false): Promise<void> {
     // Each page is persistent. A scheduling slice is not a limit on the reachable corpus.
     const deadline = Date.now() + 20_000;
     for (let count = 0; count < 20 && Date.now() < deadline && !this.abort.signal.aborted; count++) {
+      const owner = this.store.catalog.roots().find(root => root.id === rootId);
+      if (!owner || this.store.catalog.affected(owner).some(id => !this.canPublish(id))) return;
       const next = this.store.catalog.next(rootId);
       if (!next) { this.store.catalog.complete(rootId); return; }
       const { root, source, cursor } = next;
+      const publishable = () => this.store.catalog.affected(root).every(id => this.canPublish(id)) && this.store.linkedTopics(source.id).every(id => this.canPublish(id));
+      if (!publishable()) return;
+      const reader = source.mode === "connector" ? (this.native ?? this.connector) : this.connector;
       let checkId: string | null = null; let committing = false;
       try {
-        if (source.mode==="connector" && this.store.catalog.hostManaged(source.id)) {
+        if (source.mode==="connector" && this.store.catalog.hostManaged(source.id) &&
+          (!this.native || (!force && cursor === null && source.collection?.status !== "error" && source.collection?.connectionKey &&
+            this.collectedThisPoll.get(source.id)?.key === `${source.collection.connectionKey}:${source.contentHash}` && !source.error))) {
           const snapshot=this.store.sourceSnapshot(source);
           if (!snapshot || !this.store.fresh(source)) throw new EvidenceFetchError("호스트에서 원문을 다시 수집하세요. 이전 자료는 보존했습니다.");
           const units=snapshot.units.map(({contentHash: _hash,imageHash,...unit})=>({ ...unit,
             ...(imageHash ? {imageBase64:this.store.image(imageHash).toString("base64")} : {}) }));
           committing=true;
-          this.store.catalog.replacePages(root,source,cursor,{units,links:discoverLinks(units,source.url),revision:source.revision!});
+          this.store.catalog.replacePages(root,source,cursor,{units,links:this.collectedThisPoll.get(source.id)?.links ?? discoverLinks(units,source.url),revision:source.revision!});
           continue;
         }
-        if (this.store.get(root.sourceId).mode !== "rest" || !this.connector.discover || this.connector.configured?.(source) === false)
+        if (!reader?.discover || reader.configured?.(source) === false)
           throw new EvidenceFetchError("자동 수집에는 호스트의 읽기 연결이 필요합니다.");
-        if (source.mode !== "rest") this.store.useRest(source.id);
+        if (source.mode === "connector" && !this.native) {
+          if (this.store.get(root.sourceId).mode !== "rest") throw new EvidenceFetchError("등록된 MCP 읽기 연결이 없습니다.");
+          this.store.useRest(source.id);
+        }
         const check = this.store.begin(source.id,true); if (!check) return;
         checkId=check.checkId;
         const generation=this.store.generation(source.id);
-        const page = await this.connector.discover(source, cursor, this.abort.signal);
+        this.store.recordCollection(source.id, { status: "reading" });
+        const page = await reader.discover(source, cursor, this.abort.signal);
+        if (!publishable()) return;
+        if (page.connectionKey && source.collection?.connectionKey && page.connectionKey !== source.collection.connectionKey && !page.accountConfirmed)
+          throw new EvidenceFetchError("MCP 연결 계정이 바뀌었습니다. 로컬 연결 설정에서 사용할 계정을 확인하세요.", 300, true);
         committing=true;
         this.store.catalog.acceptPage(root, source, cursor, page, generation);
         if (page.cursor === null) {
           const data = this.store.catalog.collected(root.id, source.id), before = this.store.get(source.id);
           const after = this.store.ingest(source.id, { revision:data.revision,units:data.units,checkId }, true,data.generation);
+          this.store.recordCollection(source.id, { status: before.contentHash === after.contentHash ? "unchanged" : "collected", checkedAt: after.checkedAt!, connectionKey: page.connectionKey, missing: page.missing, error: undefined });
+          if (page.connectionKey) this.collectedThisPoll.set(source.id, { key: `${page.connectionKey}:${after.contentHash}`, links: data.links });
+          this.store.measure(source.id, before.contentHash === after.contentHash ? "unchangedCollections" : "changedCollections", 1);
           if (before.contentHash !== after.contentHash) this.changed(after);
         }
       } catch (error) {
         if (this.abort.signal.aborted) return;
+        this.store.recordCollection(source.id, { status: "error", error: error instanceof Error ? error.message.slice(0, 500) : "수집 실패" });
         this.store.catalog.failed(rootId, source.id, error instanceof EvidenceFetchError ? error.message : "원문 수집이 중단됐습니다. 이전 자료는 보존했습니다.",
           error instanceof EvidenceFetchError ? error.retryAfterSeconds : 300,
           committing || (error instanceof EvidenceFetchError && error.restart));
@@ -80,7 +111,7 @@ export class EvidenceService {
     this.store.catalog.complete(rootId);
   }
   connection(source: EvidenceSource): { configured: boolean; error: string | null } {
-    return { configured: this.connector.configured?.(source) ?? false, error: source.error };
+    return { configured: (source.mode === "connector" ? (this.native ?? this.connector) : this.connector)?.configured?.(source) ?? false, error: source.collection?.error ?? source.error };
   }
   hostPlan(topicId: string, cursor?: string, limit = 50): EvidenceHostPlan {
     const catalog = this.store.catalog.state(topicId), now = Date.now();
@@ -171,15 +202,18 @@ export class EvidenceService {
   }
   private async fetch(id: string, force: boolean): Promise<void> {
     const source = this.store.get(id);
-    if (source.mode !== "rest" || this.abort.signal.aborted) return;
+    if (source.mode !== "rest" || this.abort.signal.aborted || this.store.linkedTopics(id).some(topic => !this.canPublish(topic))) return;
     const check = this.store.begin(id, force); if (!check) return;
     this.store.measure(id, "fetchAttempts", 1);
+    this.store.recordCollection(id, { status: "reading" });
     try {
       const previous = this.store.snapshot(id);
       const result = await this.connector.fetch(check.source, previous, this.abort.signal, bytes => this.store.measure(id, "receivedBytes", bytes));
-      if (this.abort.signal.aborted) return;
+      if (this.abort.signal.aborted || this.store.linkedTopics(id).some(topic => !this.canPublish(topic))) return;
       if (result.unchanged && check.source.contentHash) {
-        this.store.unchanged(id, check.checkId, check.source.contentHash, result.revision); return;
+        this.store.unchanged(id, check.checkId, check.source.contentHash, result.revision);
+        this.store.recordCollection(id, { status: "unchanged", checkedAt: this.store.get(id).checkedAt!, error: undefined });
+        this.store.measure(id, "unchangedCollections", 1); return;
       }
       if (!result.units) throw new EvidenceFetchError("원문을 받지 못했습니다.");
       const units = result.units.map(unit => {
@@ -190,11 +224,16 @@ export class EvidenceService {
         }
         return unit;
       });
-      this.ingest(id, { checkId: check.checkId, revision: result.revision, units });
+      const after = this.ingest(id, { checkId: check.checkId, revision: result.revision, units });
+      this.store.recordCollection(id, { status: source.contentHash === after.contentHash ? "unchanged" : "collected", checkedAt: after.checkedAt!, error: undefined });
+      this.store.measure(id, source.contentHash === after.contentHash ? "unchangedCollections" : "changedCollections", 1);
     } catch (error) {
       // HTTP bodies and credentials must not enter diagnostics. A provider error is already bounded.
-      try { this.store.failed(id, check.checkId, error instanceof EvidenceFetchError ? error.message : "원문 수집에 실패했습니다. 이전 캐시를 최신으로 처리하지 않습니다.", error instanceof EvidenceFetchError ? error.retryAfterSeconds : 300); } catch { /* A newer lease owns this source. */ }
-    }
+      try {
+        this.store.failed(id, check.checkId, error instanceof EvidenceFetchError ? error.message : "원문 수집에 실패했습니다. 이전 캐시를 최신으로 처리하지 않습니다.", error instanceof EvidenceFetchError ? error.retryAfterSeconds : 300);
+        this.store.recordCollection(id, { status: "error", error: this.store.get(id).error ?? "수집 실패" });
+      } catch { /* A newer lease owns this source. */ }
+    } finally { this.store.releaseCheck(id, check.checkId); }
   }
   ingest(id: string, input: EvidenceSnapshotInput): EvidenceSource {
     const before = this.store.get(id); const after = this.store.ingest(id, input);
@@ -215,6 +254,8 @@ export function withEvidence(adapter: AgentAdapter, database: ConsensusDatabase,
   const run = async <T>(turn: Omit<SessionTurn, "sessionId"> | SessionTurn, invoke: (enriched: typeof turn) => Promise<T>, session: (result: T) => string): Promise<T> => {
     const topic = database.listTopics().find(topic => topic.worktreePath === turn.cwd);
     if (!topic || turn.protocolOnly || turn.planningControl) return invoke(turn);
+    // Impact review already carries the exact diff and a local cache; do not inject a fresh session full-corpus page.
+    if (turn.evidenceAssessment) return invoke({ ...turn, evidenceManaged: true, figmaReadEnabled: false });
     // 한 턴에 근거 한 쪽을 싣는다(E3-1). 쪽 크기는 바뀐 PNG 경로 줄까지 포함한 근거 블록의 바이트다. 새로 전달할 항목이 없으면 블록은 비어 있지만,
     // 원문이 연결된 주제의 턴은 계속 근거 관리 턴이다(웹 조회 차단·로컬 PNG 읽기·Figma 안내). 원문도 삭제 알림도 없을 때만 그대로 부른다.
     const imagePath = (hash: string) => join(imageDirectory, `${hash}.png`);

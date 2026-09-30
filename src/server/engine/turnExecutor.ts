@@ -20,7 +20,7 @@ import type { EngineCore } from "./core.js";
 import { HandledWorkflowInterruption } from "./core.js";
 
 export type TurnPurpose = "턴" | "계약 교정 재제출" | "프로토콜 확인" | "계속 진행 턴" | "허용 오차 교정" | "완료 확인" | "계획 교정" | "복구 세션 계획 확인"
-  | "리뷰 읽기";
+  | "리뷰 읽기" | "근거 영향 검토";
 
 export interface TurnExpectation {
   evidenceDigest?: string;
@@ -129,6 +129,7 @@ export class TurnExecutor {
         this.refuse(request, "host-sandbox", `${request.purpose} 을 열지 않습니다 — 서버 프로세스가 macOS 샌드박스 안에서 실행 중이라 러너 Bash·Codex 세션이 중첩 샌드박스를 만들지 못합니다(${host.detail}). 샌드박스 밖(사용자 터미널)에서 서버를 재시작한 뒤 retry 하세요.`);
       }
       const evidence = db.evidence.topic(current);
+      if (request.route.job.operation === "evidence-assessment" && (!evidence.ready || evidence.digest !== request.evidenceDigest || current.planEpoch !== expected.planEpoch || current.planSHA256 !== expected.planSHA256 || this.core.newUserInputSince(topic, request.inputSequence))) throw new Error("영향 검토의 원문 또는 계획이 바뀌었습니다.");
       if (!evidence.ready || evidence.digest !== request.evidenceDigest || (write && !evidence.reviewed)) {
         this.core.interrupt(topic.id, "BLOCKED_ON_EVIDENCE", "외부 근거가 바뀌었거나 확인이 필요합니다. 원문을 갱신하고 현재 계획에 미치는 영향을 확인하세요.", expected.state, { externalEvidence: true });
         throw new HandledWorkflowInterruption();
@@ -202,6 +203,7 @@ export class TurnExecutor {
       prompt: request.prompt, freshSessionPrompt: request.freshSessionPrompt, cwd: request.topic.worktreePath, signal: request.signal,
       inputSequence: request.inputSequence,
       timelineDelivery: request.timelineDelivery,
+      ...(flags.evidenceAssessment ? { evidenceAssessment: true } : {}),
       job: request.route.job, binding: bindingOf(request.route), implementation: flags.implementation,
       // 코드 리뷰 원장 ID(E3-4c) — core.turn 을 지나는 최종 판정 호출도 경로로만 실어 오므로 여기서 턴에 옮긴다. 없는 턴에는 키를 두지 않는다.
       ...(request.route.reviewLedger ? { reviewLedger: request.route.reviewLedger } : {}),
@@ -296,6 +298,10 @@ export class TurnExecutor {
     this.core.assertCurrent(topic.id, signal, expected.scopeGeneration, expected.state);
     const current = this.core.dependencies.database.getTopic(topic.id);
     const evidence = this.core.dependencies.database.evidence.topic(current);
+    if (request.route.job.operation === "evidence-assessment") {
+      if (!evidence.ready || evidence.digest !== request.evidenceDigest || current.planEpoch !== expected.planEpoch || current.planSHA256 !== expected.planSHA256 || this.core.newUserInputSince(topic, request.inputSequence)) throw new Error("영향 검토 중 원문 또는 계획이 바뀌었습니다.");
+      return;
+    }
     if (!evidence.ready || evidence.digest !== request.evidenceDigest) {
       await this.core.preserveInterruptedResult(topic, request.route.seat, result, signal, "원문 확인 상태가 바뀌어 이전 근거로 만든 결과를 보존만 합니다.");
       this.core.interrupt(topic.id, "BLOCKED_ON_EVIDENCE", "외부 근거가 실행 중 바뀌었습니다. 변경 영향을 확인한 뒤 재개하세요.", expected.state, { externalEvidence: true });

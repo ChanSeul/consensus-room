@@ -303,7 +303,8 @@ export class EvidenceCatalogStore {
         }
         const origin = this.store.get(root.sourceId);
         const automatic = this.approvedElsewhere(child.id,current) || (origin.provider === "jira" && child.provider === "jira" && origin.resource.split("/")[0] === child.resource.split("/")[0]) ||
-          (origin.provider === "slack" && child.provider === "slack" && origin.resource === child.resource);
+          (origin.provider === "slack" && child.provider === "slack" && origin.resource === child.resource) ||
+          (origin.provider === "confluence" && child.provider === "confluence" && link.relation === "child" && origin.resource.split("/")[0] === child.resource.split("/")[0]);
         const added = this.db.prepare("INSERT OR IGNORE INTO evidence_members VALUES (?,?,?,'pending',NULL,NULL)")
           .run(root.id, child.id, automatic ? "approved" : "candidate");
         if (automatic) this.reuseApproval(child.id,current);
@@ -316,7 +317,7 @@ export class EvidenceCatalogStore {
       this.save(current);
     });
   }
-  collected(rootId: string, sourceId: string): { units: EvidenceUnitInput[]; revision: string; generation: number } {
+  collected(rootId: string, sourceId: string): { links: EvidenceDiscoveryPage["links"]; units: EvidenceUnitInput[]; revision: string; generation: number } {
     const pages = this.db.prepare("SELECT record FROM evidence_collection_pages WHERE root_id=? AND source_id=? ORDER BY rowid").all(rootId, sourceId)
       .map(r => JSON.parse(String(r.record)) as EvidenceDiscoveryPage);
     const units = new Map<string, EvidenceUnitInput>();
@@ -325,7 +326,7 @@ export class EvidenceCatalogStore {
       if (old && stableJSON(old) !== stableJSON(unit)) throw new Error("수집 중 같은 항목의 내용이 바뀌었습니다.");
       units.set(unit.id, unit);
     }
-    return { units: [...units.values()], revision: evidenceHash(stableJSON(pages.map(p => p.revision))), generation:Number(this.db.prepare("SELECT version FROM evidence_collection_versions WHERE root_id=? AND source_id=?").get(rootId,sourceId)?.version ?? 0) };
+    return { links: pages.flatMap(page => page.links), units: [...units.values()], revision: evidenceHash(stableJSON(pages.map(p => p.revision))), generation:Number(this.db.prepare("SELECT version FROM evidence_collection_versions WHERE root_id=? AND source_id=?").get(rootId,sourceId)?.version ?? 0) };
   }
   complete(rootId: string): void {
     const root = this.roots().find(r => r.id === rootId)!;

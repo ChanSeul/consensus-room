@@ -110,7 +110,7 @@ it("shows connection setup and shared scope and explicitly converts a source to 
   const convert = vi.spyOn(api, "useRestEvidence").mockReturnValue(pendingChange.promise);
   render(<EvidencePanel topicId="t" busy={false} />);
   fireEvent.click(screen.getByText(/원문 근거/));
-  expect(await screen.findByText(/에이전트가 읽은 자료/)).toHaveTextContent("공유 주제 2개");
+  expect(await screen.findByText(/MCP 읽기 연결/)).toHaveTextContent("공유 주제 2개");
   expect(screen.queryByText(/서버 읽기 인증 설정 필요/)).not.toBeInTheDocument();
   const button = screen.getByRole("button", { name: "서버 수집으로 전환 (공유 주제 모두 적용)" });
   fireEvent.click(button); fireEvent.click(button); expect(convert).toHaveBeenCalledTimes(1);

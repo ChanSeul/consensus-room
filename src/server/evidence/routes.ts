@@ -110,7 +110,7 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
     const source = db.evidence.get(request.params.id);
     for (const topicId of db.evidence.linkedTopics(source.id)) workflow.assertBudgetEditable(topicId);
     if (!db.evidence.activeSources().some(item => item.id === source.id)) throw new Error("열린 주제에 연결된 원문만 전환할 수 있습니다.");
-    if (!service.connection(source).configured) throw new Error("서버의 읽기 인증 설정이 필요합니다.");
+    if (!service.connection({ ...source, mode: "rest" }).configured) throw new Error("서버의 읽기 인증 설정이 필요합니다.");
     return db.evidence.useRest(source.id);
   });
   app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/mediator/batch", async request => {
@@ -130,7 +130,9 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
   });
   app.get<{ Params: { id: string } }>("/api/topics/:id/evidence", async request => {
     const state = db.evidence.topic(db.getTopic(request.params.id));
-    return { ...state, connections: state.sources.map(source => ({ sourceId: source.id, configured: service.connection(source).configured,
+    const collectionMetrics = { ...db.evidence.metrics(`assessment:${request.params.id}`) };
+    for (const source of state.sources) for (const [name, value] of Object.entries(db.evidence.metrics(source.id))) collectionMetrics[name] = (collectionMetrics[name] ?? 0) + value;
+    return { ...state, assessments: db.evidence.automation.jobs(request.params.id).filter(job => job.status !== "superseded" && job.binding === JSON.stringify([state.plan.scopeGeneration, state.plan.planEpoch, state.plan.planSHA256])).slice(0, 20), collectionMetrics, connections: state.sources.map(source => ({ sourceId: source.id, configured: service.connection(source).configured,
       sharedTopics: db.evidence.linkedTopics(source.id).length })) };
   });
   app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/sources", async request => {

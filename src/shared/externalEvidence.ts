@@ -44,6 +44,8 @@ export interface EvidenceSource extends EvidenceSourceInput {
   id: string; provider: EvidenceProvider; resource: string; selector: string;
   revision: string | null; contentHash: string | null; checkedAt: number | null;
   error: string | null; nextCheckAt: number;
+  collection?: { status: "reading" | "collected" | "unchanged" | "error"; missing?: string[]; connectionKey?: string; checkedAt?: number; error?: string };
+
 }
 export interface EvidenceCheck { source: EvidenceSource; checkId: string }
 export const EvidencePlanBindingSchema = z.object({
@@ -58,7 +60,18 @@ export const EvidenceReviewInputSchema = z.object({
   reason: z.string().trim().min(1).max(2000),
 }).strict();
 export type EvidenceReviewInput = z.infer<typeof EvidenceReviewInputSchema>;
+export interface EvidenceAssessment {
+  id: string; topicId: string; binding: string; digest: string;
+  changes: Array<{ sourceId: string; before: string; after: string | null }>;
+  target: Record<string, string | null>;
+  status: "pending" | "running" | "complete" | "failed" | "superseded";
+  createdAt: number; actionId?: string; finishedAt?: number;
+  outcome?: "no-impact" | "replan" | "decision"; summary?: string;
+}
 export interface EvidenceTopicState {
+  assessments?: EvidenceAssessment[];
+  collectionMetrics?: Record<string, number>;
+
   digest: string;
   plan: EvidencePlanBinding;
   reviewed: boolean;
@@ -82,6 +95,7 @@ export interface EvidenceRoot {
 export interface EvidenceDiscoveryLink { url: string; label: string; unitId: string; relation: "child" | "link" }
 export interface EvidenceDiscoveryPage {
   units: EvidenceUnitInput[]; links: EvidenceDiscoveryLink[]; cursor: string | null; revision: string;
+  connectionKey?: string; accountConfirmed?: boolean; missing?: string[];
 }
 export interface EvidenceCatalogEntry {
   rootId: string; source: EvidenceSource; state: "approved" | "candidate" | "rejected";
@@ -143,7 +157,8 @@ export function parseEvidenceSource(input: EvidenceSourceInput): Pick<EvidenceSo
   const sheet = /^\/spreadsheets\/d\/([a-zA-Z0-9_-]+)(?:\/.*)?$/.exec(url.pathname);
   if (url.hostname === "docs.google.com" && sheet) return { provider: "sheets", resource: sheet[1], selector: "",
     url: `https://docs.google.com/spreadsheets/d/${sheet[1]}/edit${url.searchParams.has("gid") ? `?gid=${url.searchParams.get("gid")}` : ""}` };
-  const page = /^\/wiki\/spaces\/[^/]+\/pages\/(\d+)(?:\/.*)?$/.exec(url.pathname);
+  const page = /^\/wiki\/(?:spaces\/[^/]+\/)?pages\/(\d+)(?:\/.*)?$/.exec(url.pathname)
+    ?? (url.pathname === "/wiki/pages/viewpage.action" && /^\d+$/.test(url.searchParams.get("pageId") ?? "") ? ["", url.searchParams.get("pageId")!] : null);
   if (url.hostname.endsWith(".atlassian.net") && page) return { provider: "confluence", resource: `${url.hostname}/${page[1]}`, selector: "", url: url.href };
   if (["figma.com", "www.figma.com"].includes(url.hostname)) throw new Error("Figma는 작업할 페이지·노드의 node-id가 필요합니다.");
   if (url.hostname.endsWith(".slack.com") || url.hostname.endsWith(".atlassian.net")) throw new Error("지원하는 채널·스레드·이슈·문서 주소를 입력하세요.");

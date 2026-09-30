@@ -2,12 +2,13 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
+import { nativeApps } from "../src/server/adapters/nativeApps";
 import { nativeFigma } from "../src/server/adapters/nativeFigma";
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
-function fixture(callable = true) {
+function fixture(callable = true, text = "original node") {
   const root = mkdtempSync(join(tmpdir(), "native-figma-test-")); roots.push(root);
   const command = join(root, "app-server");
   const log = join(root, "calls.jsonl");
@@ -27,7 +28,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
   'figma.get_screenshot':{name:'figma.get_screenshot',inputSchema:{type:'object'},annotations:{readOnlyHint:false}},
   'figma.delete_file':{name:'figma.delete_file',inputSchema:{type:'object'},annotations:{readOnlyHint:false}}
  }}]};
- if(message.method==='mcpServer/tool/call')result={content:[{type:'text',text:'original node'}],structuredContent:{version:7}};
+ if(message.method==='mcpServer/tool/call')result={content:[{type:'text',text:${JSON.stringify(text)}}],structuredContent:{version:7}};
  console.log(JSON.stringify({id:message.id,result}));
 });
 `); chmodSync(command, 0o700);
@@ -85,4 +86,15 @@ it("cancels the transport and rejects further reads", async () => {
   controller.abort(); await bridge.close();
   expect(() => bridge.assertCaptured()).toThrow("취소");
   await expect(fetch(bridge.url, { method: "POST" })).rejects.toThrow();
+});
+
+it("preserves Unicode line separators inside a model-free MCP response",async()=>{
+  const text="Policy\u2028Hidden-tab note\u2029Formula";
+  const {root,command,log,auth}=fixture(true,text);
+  const client=await nativeApps(command,auth,root,{connector_68df038e0ba48191908c8434991bbac2:["figma.get_metadata"]});
+  try{
+    expect((await client.call("figma.get_metadata",{fileKey:"Approved",nodeId:"1:2"})).content[0].text).toBe(text);
+    const requests=readFileSync(log,"utf8").trim().split("\n").map(line=>JSON.parse(line));
+    expect(requests.some(request=>request.method==="turn/start")).toBe(false);
+  }finally{await client.close();}
 });

@@ -77,6 +77,7 @@ export function probeNestedSandbox(options: { run?: SandboxProbeRun; platform?: 
 
 export interface AppDependencies {
   evidenceConnector?: EvidenceConnector;
+  nativeEvidenceConnector?: EvidenceConnector;
   config?: ServerConfig;
   database?: ConsensusDatabase;
   runner: CommandRunner;
@@ -104,7 +105,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
         body: `외부 원문 변경 감지: ${source.label}. 변경이 요구사항에 미치는 영향은 재확인이 필요합니다.`,
         payload: { sourceId: source.id, contentHash: source.contentHash } });
     }
-  }, join(config.dataDirectory, "evidence-images"));
+  }, join(config.dataDirectory, "evidence-images"), dependencies.nativeEvidenceConnector);
   // 러너 제어 경로 감시(E2c)는 CLI 실행에 가장 가까운 층이다 — 증거·계획 제어 래퍼가 여는 모든 턴(내부 재시도 포함)의 앞뒤를 같은 방식으로 본다.
   const workflow = new WorkflowEngine({
     database,
@@ -119,6 +120,8 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     maintenanceLockPath: join(config.dataDirectory, "maintenance.lock"),
     hostSandbox: dependencies.hostSandbox,
   });
+  evidence.onIdle = () => workflow.pollEvidenceAssessments();
+  evidence.canPublish = topicId => workflow.canPublishEvidence(topicId);
   // 중재 세션의 호출은 헤더 x-consensus-actor: mediator 로 구분한다. 결정·승인·실행·인도 류는 위임 스위치(mediation-autonomy.json)가
   // on 일 때만 받는다(off 면 403) — "중재자가 사용자와 같은 인증으로 무엇이든 부른다" 를 닫는다(2026-09-14 Codex 감사 D03).
   const delegationPath = join(config.dataDirectory, "mediation-autonomy.json");
@@ -708,7 +711,6 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   // 실수로 띄우면 포트 바인드에서 먼저 죽어야지, 첫 서버의 정상 작업을 회수(=강제 종료)하고
   // 죽으면 안 된다(2026-08-31 Codex 지적: 부팅 회수가 bind보다 먼저라 소유권 없이 남의 작업을 죽임).
   app.addHook("onListen", async () => {
-    evidence.start();
     await verifications.recoverExpired();
     await new ProcessSupervisor().recover(database.runningActions());
     database.recoverInterruptedActions();
@@ -716,6 +718,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     database.recoverInterruptedDeliveryRequests();
     database.recoverInterruptedGlobalRequests();
     const restored = workflow.restoreScheduledRetries();
+    evidence.start();
     if (restored > 0) process.stdout.write(`시작: 사용 한도로 멈춘 주제 ${restored}건의 자동 재시도 예약을 복원했습니다.\n`);
   });
 

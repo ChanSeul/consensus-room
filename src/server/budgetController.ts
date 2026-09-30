@@ -39,9 +39,9 @@ export class BudgetController {
     // 재작성·리뷰 한도는 공급자 이름이 아니라 턴의 job 역할로 집계한다 — 계획자·검토자가 다른 공급자로 배정돼도 한도가 빠지지 않게(E2b).
     // role(공급자)은 세션 귀속이라 체크포인트 대조·키·예산 원장에는 그대로 쓴다.
     const job=jobOfTurn(role as "claude"|"codex",turn);
-    const kind:RewriteKind|undefined=job.role==="planner" && ["CLAUDE_PLAN","CLAUDE_REVISION"].includes(ctx.stage)
+    const kind:RewriteKind|undefined=job.role==="planner" && job.operation!=="evidence-assessment" && ["CLAUDE_PLAN","CLAUDE_REVISION"].includes(ctx.stage)
       ? turn.planningWrite ?? (ctx.stage==="CLAUDE_PLAN"?"plan":"revision") : undefined;
-    const review=job.role==="reviewer"?reviewScope(ctx.stage):undefined;
+    const review=job.operation==="evidence-assessment"?"planning":job.role==="reviewer"?reviewScope(ctx.stage):undefined;
     const guarded = this.database ? planningControlApplies(this.database, ctx.topicId, ctx.stage, turn) : false;
     const latest = guarded ? this.database!.planning.latest(ctx.topicId) : null;
     const topic = guarded ? this.database!.getTopic(ctx.topicId) : null;

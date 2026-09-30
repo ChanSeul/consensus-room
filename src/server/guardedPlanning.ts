@@ -68,13 +68,13 @@ function attemptAccounting(previous: BoundCheckpoint): Partial<BoundCheckpoint> 
 }
 // 계획 제어(planningControl)가 이 턴에 붙는가 — 이 래퍼·예산 래퍼(budgetController)·실행 전 경로 판정(turnRouting.ts)이 같은 식을 쓴다.
 export function planningControlApplies(database: ConsensusDatabase, topicId: string, stage: string,
-  turn: { implementation?: boolean; protocolOnly?: boolean }): boolean {
-  return database.planning.enabled(topicId) && GUARDED_STAGES.has(stage) && !turn.implementation && !turn.protocolOnly;
+  turn: { implementation?: boolean; protocolOnly?: boolean; evidenceAssessment?: boolean }): boolean {
+  return database.planning.enabled(topicId) && GUARDED_STAGES.has(stage) && !turn.implementation && !turn.protocolOnly && !turn.evidenceAssessment;
 }
 // 타임라인 참조 모드(E3-2-2a)가 이 턴에 붙는가 — 계획 제어가 실제로 적용되고 세션을 유지하는(검토자 역할 또는 연속성 v2 계획자) 턴만. 비유지(v1) 계획자는
 // 라운드마다 새 세션이라 서로 다른 세션의 구간을 합쳐 완독이라 할 수 없다 — 기존 렌더를 그대로 쓴다. 엔진(planning.ts)과 이 래퍼가 같은 식을 쓴다.
 export function timelineReferencesApply(database: ConsensusDatabase, topicId: string, stage: string,
-  turn: { implementation?: boolean; protocolOnly?: boolean }, jobRole: string): boolean {
+  turn: { implementation?: boolean; protocolOnly?: boolean; evidenceAssessment?: boolean }, jobRole: string): boolean {
   return planningControlApplies(database, topicId, stage, turn) && (jobRole === "reviewer" || database.planning.continuityEnabled(topicId));
 }
 const carriesTimeline = (delivery: TimelineDelivery | undefined) => Boolean(delivery?.prompt || delivery?.fresh);

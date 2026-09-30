@@ -438,7 +438,7 @@ export class ConsensusDatabase {
 
   recoverInterruptedActions(): void {
     const interrupted = this.db.prepare(`
-      SELECT actions.id, actions.topic_id, topics.state,
+      SELECT actions.id, actions.topic_id, actions.kind, topics.state,
         actions.pid, actions.pgid, actions.process_command
       FROM actions JOIN topics ON topics.id = actions.topic_id
       WHERE actions.status = 'running'
@@ -447,6 +447,11 @@ export class ConsensusDatabase {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       for (const row of interrupted) {
+        if (row.kind === "evidence-assessment") {
+          this.db.prepare("UPDATE actions SET status = 'cancelled', finished_at = ?, error = ? WHERE id = ?")
+            .run(timestamp, "서버 재시작으로 영향 검토가 중단되었습니다.", row.id as SqlValue);
+          continue;
+        }
         if (this.actionReachedWaitingState(String(row.topic_id), String(row.id), String(row.state) as WorkflowState)) {
           this.db.prepare("UPDATE actions SET status = 'succeeded', finished_at = ?, error = NULL WHERE id = ?")
             .run(timestamp, row.id as SqlValue);

@@ -1,3 +1,4 @@
+import { EvidenceAssessmentPipeline } from "./engine/evidenceAssessment.js";
 import type { PlanningMigration } from "../shared/planningControl.js";
 import {reviewScope,type ReviewScope} from "../shared/reviews.js";
 import { assertToleranceWidening, normalizeToleranceBlocks, parseTolerancePolicy, replaceToleranceBlock, TolerancePolicySchema } from "../shared/tolerance.js";
@@ -141,6 +142,12 @@ export class WorkflowEngine {
     this.usageLimitRetry = new UsageLimitRetryScheduler(this.core, (topicId) => this.retry(topicId), dependencies.clock);
     this.core.failureObserver = (topicId, message) => this.usageLimitRetry.consider(topicId, message);
     this.core.actionObserver = (topicId) => this.usageLimitRetry.cancel(topicId);
+  }
+
+  pollEvidenceAssessments(): void { new EvidenceAssessmentPipeline(this.core).poll(); }
+
+  canPublishEvidence(topicId: string): boolean {
+    try { this.core.assertNoActiveWork(topicId); return true; } catch { return false; }
   }
 
   // 재시작 뒤 FAILED 주제의 사용 한도 예약을 복원한다(listen 성공 뒤 호출). 복원한 건수를 돌려준다.

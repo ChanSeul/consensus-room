@@ -200,7 +200,7 @@ export function currentSeatJobs(database: ConsensusDatabase, topic: Topic): { au
 // 리뷰(review·final-review — delivery.confirmReviewAnswers·runReviewOnce, 모델·추론 설정을 낮추지 않고 그대로 쓴다), 설계자·검토자의 계획 교정·계약 교정은
 // 그 역할이 지금 여는 작업(core 의 plan-repair·contract-correction). 확인(ack)은 엔진이 따로 경로를 정하는 독립 작업이다. 부속 턴이 아니면 null.
 const INHERITING_OPERATIONS: Readonly<Record<TurnRole, readonly string[]>> = {
-  planner: ["plan-repair", "contract-correction"],
+  planner: ["evidence-assessment", "plan-repair", "contract-correction"],
   reviewer: ["answer-confirmation", "review-read", "plan-repair", "contract-correction"],
   implementer: ["continue", "completion-confirmation", "tolerance-correction", "contract-correction"],
 };
@@ -208,6 +208,7 @@ const INHERITING_OPERATIONS: Readonly<Record<TurnRole, readonly string[]>> = {
 function inheritedParent(job: TurnJob, current: { author: TurnJob; reviewer: TurnJob }): TurnJob | null {
   if (!INHERITING_OPERATIONS[job.role].includes(job.operation)) return null;
   if (job.role === "implementer") return current.author.role === "implementer" ? current.author : implementerJob("implement");
+  if (job.operation === "evidence-assessment") return plannerJob("plan");
   if (job.role === "planner") return current.author.role === "planner" && current.author.operation !== "ack" ? current.author : plannerJob("plan");
   if (job.operation === "answer-confirmation" || job.operation === "review-read") {
     return current.reviewer.operation === "final-review" ? reviewerJob("final-review") : reviewerJob("review");

@@ -4,7 +4,7 @@ import { evidenceHash, stableJSON } from "./store.js";
 
 type JSONRecord = Record<string, any>;
 export interface EvidenceFetchResult { revision: string; units?: EvidenceUnitInput[]; unchanged?: boolean }
-export interface EvidenceConnector { configured?(source: EvidenceSource): boolean; fetch(source: EvidenceSource, previous: EvidenceSnapshot | null, signal: AbortSignal, onBytes?: (bytes: number) => void): Promise<EvidenceFetchResult>;
+export interface EvidenceConnector { close?(): Promise<void>; configured?(source: EvidenceSource): boolean; fetch(source: EvidenceSource, previous: EvidenceSnapshot | null, signal: AbortSignal, onBytes?: (bytes: number) => void): Promise<EvidenceFetchResult>;
   discover?(source: EvidenceSource, cursor: string | null, signal: AbortSignal): Promise<EvidenceDiscoveryPage> }
 export interface EvidenceCredentials { slackToken?: string; slackWorkspace?: string; jiraSite?: string; jiraCloudId?: string; jiraEmail?: string; jiraToken?: string; figmaToken?: string; googleToken?: string }
 export class EvidenceFetchError extends Error { constructor(message: string, readonly retryAfterSeconds = 300, readonly restart = false) { super(message); } }

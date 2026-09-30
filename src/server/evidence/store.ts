@@ -6,6 +6,7 @@ import { EVIDENCE_PAGE_BYTES, EvidenceSnapshotInputSchema, EvidenceSourceInputSc
   type EvidenceUnit, type EvidenceCatalog } from "../../shared/externalEvidence.js";
 import type { Topic } from "../../shared/contracts.js";
 import { redactSecrets } from "../../shared/workflow.js";
+import { EvidenceAutomationStore } from "./automation.js";
 import { EvidenceCatalogStore } from "./catalog.js";
 
 export const evidenceHash = (value: string | Uint8Array): string => createHash("sha256").update(value).digest("hex");
@@ -123,6 +124,7 @@ const sliceRange = ({ entry, end, total }: PageSlice): { range?: EvidenceRange }
 
 export class EvidenceStore {
   readonly catalog: EvidenceCatalogStore;
+  readonly automation: EvidenceAutomationStore;
   constructor(private readonly db: DatabaseSync, private readonly clock = () => Date.now()) {
     db.exec(`
       CREATE TABLE IF NOT EXISTS evidence_sources(id TEXT PRIMARY KEY, record TEXT NOT NULL, check_id TEXT, lease_until INTEGER);
@@ -150,12 +152,17 @@ export class EvidenceStore {
       CREATE TABLE IF NOT EXISTS evidence_mediator_legacy(consumer TEXT PRIMARY KEY);
     `);
     this.catalog = new EvidenceCatalogStore(db, this, clock);
+    this.automation = new EvidenceAutomationStore(db);
   }
   private save(source: EvidenceSource): void { this.db.prepare("UPDATE evidence_sources SET record=? WHERE id=?").run(JSON.stringify(source), source.id); }
   get(id: string): EvidenceSource {
     const row = this.db.prepare("SELECT record FROM evidence_sources WHERE id=?").get(id);
     if (!row) throw Object.assign(new Error("등록된 원문이 없습니다."), { statusCode: 404 });
     return JSON.parse(String(row.record));
+  }
+  recordCollection(id: string, collection: NonNullable<EvidenceSource["collection"]>): void {
+    const source = this.get(id);
+    this.save({ ...source, collection: { ...source.collection, ...collection } });
   }
   register(topicId: string, raw: EvidenceSourceInput): EvidenceSource {
     const existing = this.ensureSource(raw);

@@ -240,6 +240,11 @@ export class EngineCore {
       if (!this.isCurrentAction(topicId, actionId, scopeGeneration)) return;
       this.dependencies.database.finishAction(actionId, "succeeded");
     }).catch((error: unknown) => {
+      if (kind === "evidence-assessment") {
+        this.dependencies.database.finishAction(actionId, controller.signal.aborted ? "cancelled" : "failed",
+          redactSecrets(error instanceof Error ? error.message : String(error)));
+        return;
+      }
       if (error instanceof PlanningPaused && this.isCurrentAction(topicId, actionId, scopeGeneration)) {
         const topic = this.dependencies.database.getTopic(topicId);
         this.dependencies.database.finishAction(actionId, "cancelled", error.message);

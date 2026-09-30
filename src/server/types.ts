@@ -119,6 +119,7 @@ export interface SessionTurn {
   // 프로토콜 확인 전용 턴. 저장소를 읽거나 명령을 실행할 필요가 없는데 도구를 열어 두면 에이전트가
   // 스스로 파일 해시를 계산하는 등 탐색을 시작해 출력 토큰만 쓴다(2026-08-29 ACK 턴 실측: output 19,975).
   protocolOnly?: boolean;
+  evidenceAssessment?: boolean;
   // plan 권한 모드로 돌릴지. 쓰기 차단은 이미 두 층이 독립으로 담당한다 — --tools에서 Edit/Write를 빼고,
   // sandbox가 계획 턴에 denyWrite:[workspace]로 Edit·Write·Bash 세 경로를 모두 막는다. 그래서 plan 모드는
   // 세 번째 중복 방벽이고, 얹히는 "탐색 후 승인 요청" 지침은 비대화형(-p) 개정 턴의 계약과 어긋난다.

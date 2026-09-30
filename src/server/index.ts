@@ -7,6 +7,10 @@ import { SpawnCommandRunner } from "./processRunner.js";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { NativeAppReader } from "./evidence/nativeReader.js";
+import { NativeEvidenceConnector } from "./evidence/nativeConnector.js";
+import { resolveCodexExecutable } from "./adapters/codex.js";
+
 const config = loadConfig();
 const runner = new SpawnCommandRunner();
 const database = new ConsensusDatabase(config.databasePath);
@@ -21,6 +25,7 @@ const app = await buildApp({
   database,
   runner,
   hostSandbox,
+  nativeEvidenceConnector: new NativeEvidenceConnector(new NativeAppReader(config.dataDirectory, resolveCodexExecutable()), id => database.evidence.measure(id, "toolCalls", 1)),
   ...createRuntimeAdapters(runner, {
     dataDirectory: config.dataDirectory,
     memoryDirectory: config.memoryDirectory,

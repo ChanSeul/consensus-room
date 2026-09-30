@@ -97,7 +97,7 @@ export const MEDIATOR_VERSION_HEADER = "x-consensus-mediator-version";
 // 엔진은 모든 모델 턴에 job 을 명시하고, 쓰기 접근·구현 모델 선택·프로토콜 전용 여부는 호출자가 따로 적지 않고 job 에서 유도한다(turnFlags).
 // review-read(E3-4c): 한 리뷰 호출의 쪽 예산을 넘는 필수 타임라인 구간을 판정 전에 나눠 싣는 읽기 호출 — 판정(REVIEW·FINAL_REVIEW)은 하지 않고 ACK 만 답한다.
 export const TURN_OPERATIONS = {
-  planner: ["brainstorm", "plan", "diagnosis-revision", "revision", "ack", "plan-repair", "contract-correction"],
+  planner: ["evidence-assessment", "brainstorm", "plan", "diagnosis-revision", "revision", "ack", "plan-repair", "contract-correction"],
   reviewer: ["brainstorm", "audit", "closeout", "review", "final-review", "answer-confirmation", "review-read", "ack", "plan-repair", "contract-correction"],
   implementer: ["implement", "fix", "continue", "tolerance-correction", "completion-confirmation", "contract-correction"],
 } as const;
@@ -117,8 +117,8 @@ export function turnAccess(job: TurnJob): TurnAccess {
 }
 
 // 엔진 턴 요청·SessionTurn 에 싣는 파생 값. implementationModel: 주제의 구현 전용 모델(있으면)을 쓴다 — 구현자의 모든 턴(완료 확인 포함).
-export interface TurnFlags { write: boolean; implementation: boolean; protocolOnly: boolean; implementationModel: boolean }
+export interface TurnFlags { evidenceAssessment?: boolean; write: boolean; implementation: boolean; protocolOnly: boolean; implementationModel: boolean }
 export function turnFlags(job: TurnJob): TurnFlags {
   const access = turnAccess(job);
-  return { write: access === "write", implementation: access === "write", protocolOnly: access === "none", implementationModel: job.role === "implementer" };
+  return { ...(job.operation === "evidence-assessment" ? { evidenceAssessment: true } : {}), write: access === "write", implementation: access === "write", protocolOnly: access === "none", implementationModel: job.role === "implementer" };
 }

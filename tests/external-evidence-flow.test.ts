@@ -1,3 +1,4 @@
+import { EvidenceAssessmentPipeline } from "../src/server/engine/evidenceAssessment";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { execFile } from "node:child_process";
@@ -6,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { ConsensusDatabase } from "../src/server/database";
-import { withEvidence } from "../src/server/evidence/service";
+import { EvidenceService, withEvidence } from "../src/server/evidence/service";
 import { ArtifactStore } from "../src/server/artifacts";
 import { GitService } from "../src/server/git";
 import { EngineCore } from "../src/server/engine/core";
@@ -481,4 +482,50 @@ it("the user can explicitly re-review migrated closed committed evidence through
     expect(f.database.getTopic("t").state).toBe("CLOSED");
     expect(f.database.evidence.topic(f.database.getTopic("t"))).toMatchObject({digest:before.digest,reviewed:true,ready:true});
   } finally {await app.close();dbs.splice(dbs.indexOf(f.database),1);}
+});
+
+
+it("queues changes during work, reviews once when idle, and never approves or resumes stopped topics", async()=>{
+  const f=fixture();
+  const plan=await f.dependencies.artifacts.write("t","plan",1,"Current approved plan");
+  f.database.updateTopic("t",{planSHA256:plan.sha256,approvedPlanSHA256:plan.sha256});
+  const core=new EngineCore(f.dependencies), pipeline=new EvidenceAssessmentPipeline(core);
+  f.adapter.createSession=vi.fn(async turn=>{
+    await turn.beforeSpawn?.(); turn.admitSync?.();
+    return {sessionId:"impact",result:{kind:"EVIDENCE_NO_IMPACT" as const,summary:"No change to the current plan",planEdits:[],findings:[],evidenceRefs:[]}};
+  });
+  // EngineCore has wrapped the supplied adapter already; use the existing mutable adapter entry.
+  pipeline.poll(); expect(core.active.size).toBe(0);
+  let release!:()=>void; const pending=new Promise<void>(resolve=>{release=resolve;});
+  core.startAction("t","existing",async()=>pending);
+  f.ingest("Changed policy"); pipeline.poll();
+  expect(f.database.evidence.automation.jobs("t")[0].status).toBe("pending");
+  expect(f.adapter.createSession).not.toHaveBeenCalled();
+  release(); await core.active.get("t")!.completion;
+  pipeline.poll(); const running=core.active.get("t"); expect(running).toBeDefined(); await running!.completion;
+  expect(f.database.evidence.automation.jobs("t")[0]).toMatchObject({status:"complete",outcome:"no-impact"});
+  expect(f.database.evidence.topic(f.database.getTopic("t")).reviewed).toBe(false);
+  pipeline.poll(); expect(f.adapter.createSession).toHaveBeenCalledTimes(1);
+  f.database.updateTopic("t",{state:"USER_DECISION_REQUIRED"}); f.ingest("Another change"); pipeline.poll();
+  expect(f.database.evidence.automation.jobs("t")[0].status).toBe("pending");
+  expect(f.adapter.createSession).toHaveBeenCalledTimes(1); expect(f.database.getTopic("t").state).toBe("USER_DECISION_REQUIRED");
+});
+
+it.each([true,false])("keeps child baselines while a collection slice temporarily hides its links (required=%s)",async(required)=>{
+  const f=fixture();
+  const root=f.database.evidence.catalog.add("t",{...sourceInput,scope:"topic",required},true);
+  f.database.updateTopic("t",{state:"USER_DECISION_REQUIRED",planSHA256:"a".repeat(64)});
+  let sliced=false,child="Original child";
+  const service=new EvidenceService(f.database.evidence,{fetch:async()=>{throw Error("unused");}},()=>{},undefined,{configured:()=>true,fetch:async()=>{throw Error("unused");},discover:async(source,cursor)=>{
+    if(source.id!==root.sourceId)return {units:[{id:"body",kind:"issue",content:child}],links:[],cursor:null,revision:"child",connectionKey:"account"};
+    const n=Number(cursor??0),end=!sliced||n===20;
+    return {units:n===0?[{id:"body",kind:"issue",content:"Parent"}]:[],links:end?[{url:"https://team.atlassian.net/browse/APP-2",label:"Child",unitId:"body",relation:"child"}]:[],cursor:end?null:String(n+1),revision:"parent",connectionKey:"account"};
+  }});
+  const pipeline=new EvidenceAssessmentPipeline(new EngineCore(f.dependencies));
+  try{
+    await service.collect(root.id);expect(f.database.evidence.topic(f.database.getTopic("t")).ready).toBe(true);pipeline.poll();expect(f.database.evidence.automation.jobs("t")).toHaveLength(0);
+    sliced=true;child="Changed child";await service.collect(root.id,true);expect(f.database.evidence.topic(f.database.getTopic("t")).ready).toBe(!required);pipeline.poll();expect(f.database.evidence.automation.jobs("t")).toHaveLength(0);
+    await service.collect(root.id);expect(f.database.evidence.topic(f.database.getTopic("t")).ready).toBe(true);pipeline.poll();
+    expect(f.database.evidence.automation.jobs("t")[0]).toMatchObject({status:"pending",changes:[{sourceId:f.database.evidence.list("t").find(s=>s.resource.endsWith("APP-2"))!.id}]});
+  }finally{await service.stop();}
 });

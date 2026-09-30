@@ -680,7 +680,7 @@ async function findInstructionPaths(workspace: string): Promise<string[]> {
 // ~/.local/bin)에 있으면 sandbox-exec가 "Operation not permitted"로 죽는다(2026-08-29 실측:
 // ~/.local/bin/codex는 실패, 같은 config로 /Applications/ChatGPT.app/.../codex는 성공).
 // 그래서 실제 경로로 풀어서 실행하고, 그 경로를 profile의 읽기 허용에도 넣는다.
-function resolveCodexExecutable(): string {
+export function resolveCodexExecutable(): string {
   const found = (() => {
     try {
       return execFileSync("/usr/bin/which", ["codex"], {

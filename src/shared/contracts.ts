@@ -151,6 +151,7 @@ export const PlanRepairJsonSchema = {
 export const AgentResultSchema = z.object({
   planningStep: PlanningStepSchema.optional(),
   kind: z.enum([
+    "EVIDENCE_NO_IMPACT", "EVIDENCE_REPLAN", "EVIDENCE_NEEDS_DECISION",
     "BRAINSTORM",
     "PLAN",
     "AUDIT",
