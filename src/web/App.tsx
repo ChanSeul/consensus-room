@@ -597,24 +597,6 @@ export function App() {
                 onSession={(role) => setDialog(role)}
                 onAction={(action, body) => void run(action, () => api.runAction(selected.id, action, body))}
               />
-              {activity && <BudgetPanel account={activity.budget ?? null} busy={Boolean(busyAction) || activity.runningAction}
-                recoveryRequired={activity.budgetRecoveryRequired ?? false}
-                onSubmit={(action,body)=>void run(action,async()=>{ const result=await api.runAction(selected.id,action,body as Record<string,unknown>);const next=await api.getActivity(selected.id);if(selectedTopicRef.current===selected.id)setActivity(next);return result; })}/>}
-              {activity?.revisionAllowance && <RevisionPanel account={activity.revisionAllowance} paused={activity.revisionPaused ?? false}
-                busy={Boolean(busyAction) || activity.runningAction}
-                onConfigure={(limit,version)=>void run("revision-limit",async()=>{await api.configureIterations(selected.id,"revision",limit,version);const next=await api.getActivity(selected.id);if(selectedTopicRef.current===selected.id)setActivity(next);})}
-                onGrant={()=>void run("revision-resume",async()=>{const result=await api.runAction(selected.id,"revision-resume",{version:activity.revisionAllowance!.version});const next=await api.getActivity(selected.id);if(selectedTopicRef.current===selected.id)setActivity(next);return result;})}/>}
-              {activity?.reviewAllowances && <ReviewPanel accounts={activity.reviewAllowances} paused={activity.reviewPaused??null}
-                onConfigure={(scope,limit,version)=>void run("review-limit",async()=>{await api.configureIterations(selected.id,scope,limit,version);const next=await api.getActivity(selected.id);if(selectedTopicRef.current===selected.id)setActivity(next);})}
-                busy={Boolean(busyAction) || activity.runningAction} onGrant={(scope,version)=>void run("review-resume",async()=>{const result=await api.runAction(selected.id,"review-resume",{scope,version});const next=await api.getActivity(selected.id);if(selectedTopicRef.current===selected.id)setActivity(next);return result;})}/>}
-              {activity?.planningProgress && <section className="panel" aria-label="계획 조사 진행">
-                <h3>계획 조사 {activity.planningProgress.round}회 · {activity.planningProgress.finalized ? "최종 결과 저장" : "중간 결과 저장"}</h3>
-                <p>누적 입력 {activity.planningProgress.usage.inputTokens.toLocaleString()} 토큰 · 캐시 읽기 {activity.planningProgress.usage.cachedInputTokens.toLocaleString()} 토큰</p>
-                <p>누적 입력은 현재 문맥 크기나 과금액이 아닙니다.</p>
-                <p>관측한 요청별 최대 입력: {activity.planningProgress.peakRequestInputTokens?.toLocaleString() ?? "측정값 없음"} · 전달한 텍스트 {activity.planningProgress.injectedBytes.toLocaleString()}바이트</p>
-                <p>전달한 자료 {activity.planningProgress.deliveredFragments}개 · 남은 질문 {activity.planningProgress.questions.length}개</p>
-                {activity.planningProgress.stopped && <p role="status">{activity.planningProgress.stopped}</p>}
-              </section>}
               <Timeline events={detail.timeline} />
               <MessageComposer
                 disabled={Boolean(busyAction) || selected.state === "CLOSED"}
@@ -643,7 +625,26 @@ export function App() {
               closedStagePush={stageDelivery?.topicId === selected.id && stageDelivery.closedPush}
               onAction={(action, body) => void run(action, () => api.runAction(selected.id, action, body))}
               onDelivery={(action) => setDialog(action)}
-            />
+            >
+              {activity && <BudgetPanel account={activity.budget ?? null} busy={Boolean(busyAction) || activity.runningAction}
+                recoveryRequired={activity.budgetRecoveryRequired ?? false}
+                onSubmit={(action,body)=>void run(action,async()=>{ const result=await api.runAction(selected.id,action,body as Record<string,unknown>);const next=await api.getActivity(selected.id);if(selectedTopicRef.current===selected.id)setActivity(next);return result; })}/>}
+              {activity?.revisionAllowance && <RevisionPanel account={activity.revisionAllowance} paused={activity.revisionPaused ?? false}
+                busy={Boolean(busyAction) || activity.runningAction}
+                onConfigure={(limit,version)=>void run("revision-limit",async()=>{await api.configureIterations(selected.id,"revision",limit,version);const next=await api.getActivity(selected.id);if(selectedTopicRef.current===selected.id)setActivity(next);})}
+                onGrant={()=>void run("revision-resume",async()=>{const result=await api.runAction(selected.id,"revision-resume",{version:activity.revisionAllowance!.version});const next=await api.getActivity(selected.id);if(selectedTopicRef.current===selected.id)setActivity(next);return result;})}/>}
+              {activity?.reviewAllowances && <ReviewPanel accounts={activity.reviewAllowances} paused={activity.reviewPaused??null}
+                onConfigure={(scope,limit,version)=>void run("review-limit",async()=>{await api.configureIterations(selected.id,scope,limit,version);const next=await api.getActivity(selected.id);if(selectedTopicRef.current===selected.id)setActivity(next);})}
+                busy={Boolean(busyAction) || activity.runningAction} onGrant={(scope,version)=>void run("review-resume",async()=>{const result=await api.runAction(selected.id,"review-resume",{scope,version});const next=await api.getActivity(selected.id);if(selectedTopicRef.current===selected.id)setActivity(next);return result;})}/>}
+              {activity?.planningProgress && <section className="panel" aria-label="계획 조사 진행">
+                <h3>계획 조사 {activity.planningProgress.round}회 · {activity.planningProgress.finalized ? "최종 결과 저장" : "중간 결과 저장"}</h3>
+                <p>누적 입력 {activity.planningProgress.usage.inputTokens.toLocaleString()} 토큰 · 캐시 읽기 {activity.planningProgress.usage.cachedInputTokens.toLocaleString()} 토큰</p>
+                <p>누적 입력은 현재 문맥 크기나 과금액이 아닙니다.</p>
+                <p>관측한 요청별 최대 입력: {activity.planningProgress.peakRequestInputTokens?.toLocaleString() ?? "측정값 없음"} · 전달한 텍스트 {activity.planningProgress.injectedBytes.toLocaleString()}바이트</p>
+                <p>전달한 자료 {activity.planningProgress.deliveredFragments}개 · 남은 질문 {activity.planningProgress.questions.length}개</p>
+                {activity.planningProgress.stopped && <p role="status">{activity.planningProgress.stopped}</p>}
+              </section>}
+            </Inspector>
           ) : (
             <EmptyPanel>
               <strong>계획과 근거</strong>
@@ -882,6 +883,7 @@ function Inspector({
   closedStagePush,
   onAction,
   onDelivery,
+  children,
 }: {
   evidenceBusy: boolean;
   budgetPaused: boolean;
@@ -893,6 +895,7 @@ function Inspector({
   closedStagePush: boolean;
   onAction: (action: string, body?: Record<string, unknown>) => void;
   onDelivery: (action: "commit" | "push") => void;
+  children: ReactNode;
 }) {
   const { topic } = detail;
   const claude = participantFor(topic, "claude");
@@ -914,14 +917,15 @@ function Inspector({
   return (
     <div className="inspector-scroll">
       <EvidencePanel key={topic.id} topicId={topic.id} busy={evidenceBusy} />
-      <section className="inspector-section plan-section">
-        <div className="section-heading">
-          <div>
-            <p className="eyebrow">PLAN</p>
-            <h3>합의 계획</h3>
-          </div>
+      <details className="inspector-section execution-details">
+        <summary>사용량·횟수 설정·계획 조사 기록</summary>
+        {children}
+      </details>
+      <details className="inspector-section plan-section">
+        <summary className="section-heading">
+          <span>합의 계획</span>
           <span className="revision-pill">{topic.planRevision}판</span>
-        </div>
+        </summary>
         <div className="hash-row">
           <span>SHA-256</span>
           <code title={topic.planSHA256 ?? ""}>{shortHash(topic.planSHA256)}</code>
@@ -956,13 +960,13 @@ function Inspector({
             </div>
           </div>
         )}
-      </section>
+      </details>
 
-      <section className="inspector-section">
-        <div className="section-heading">
-          <div><p className="eyebrow">FINDINGS</p><h3>검토 쟁점</h3></div>
+      <details className="inspector-section findings-section">
+        <summary className="section-heading">
+          <span>검토 쟁점</span>
           <span className="count-pill">{findings.length}</span>
-        </div>
+        </summary>
         {findings.length === 0 ? <p className="muted-copy">아직 분류된 쟁점이 없습니다.</p> : (
           <div className="finding-list">
             {findings.map((finding) => (
@@ -978,7 +982,7 @@ function Inspector({
             ))}
           </div>
         )}
-      </section>
+      </details>
 
       {(detail.implementationReport || detail.codexReview) && (
         <section className="inspector-section">

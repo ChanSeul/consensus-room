@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { type EvidenceCatalog, type EvidenceHostPlan, type EvidenceScope } from "../shared/externalEvidence";
 import { api } from "./api";
+import { EvidencePlatforms } from "./EvidencePlatforms";
 
 const scopes = { group: "이 작업 그룹과 이후 단계", topic: "이 주제만", workspace: "이 저장소의 모든 작업" };
 const progress = { pending: "수집 대기", reading: "수집 중", complete: "수집 완료", failed: "수집 실패" };
@@ -47,11 +48,11 @@ export function EvidenceCatalogPanel({ topicId, busy }: { topicId: string; busy:
       {hostPlan && hostPlan.version === catalog.version && <aside aria-label="앱 연결로 읽을 자료">
         <p role="status">앱 연결로 읽을 원문 {hostPlan.total}개 · 링크 검수 대기 {hostPlan.pendingReview}개</p>
         <p>이 버튼은 수집할 목록을 표시합니다. 이 작업을 맡은 Codex·Claude 채팅에 원문 수집을 요청하세요. 연결 도구나 로그인된 브라우저로 읽은 내용을 공유 근거에 저장합니다.</p>
-        {hostPlan.requests.map(read => <p key={read.sourceId}><a href={read.url} target="_blank" rel="noreferrer">{read.label}</a>
-          {` · ${read.integration} · ${read.requiredReads.join(" / ")}`}</p>)}
+        <EvidencePlatforms items={hostPlan.requests} provider={read => read.provider}>{read => <p key={read.sourceId}><a href={read.url} target="_blank" rel="noreferrer">{read.label}</a>
+          {` · ${read.integration} · ${read.requiredReads.join(" / ")}`}</p>}</EvidencePlatforms>
         {hostPlan.nextCursor !== null && <p>목록에 더 많은 원문이 있습니다. 수집 요청에 다음 목록도 포함해 달라고 알려 주세요.</p>}
       </aside>}
-      {catalog.roots.filter(r => r.status !== "removed").map(root => <article key={root.id}>
+      <EvidencePlatforms items={catalog.roots.filter(r => r.status !== "removed")} provider={root => root.source.provider}>{root => <article key={root.id}>
         <a href={root.source.url} target="_blank" rel="noreferrer">{root.source.label}</a> · {scopes[root.scope]} · {root.status === "approved" ? "사용자 승인됨" : "루트 검수 대기"}
         <p>{root.source.url}</p>
         {root.scanStartedAt !== undefined && <small>이번 수집 시작 {new Date(root.scanStartedAt).toLocaleString()} · {root.lastCompleteAt === null ? "수집 중" : `완료 ${new Date(root.lastCompleteAt).toLocaleString()}`} (각 원문의 조회 시각은 서로 다를 수 있습니다.)</small>}
@@ -60,7 +61,7 @@ export function EvidenceCatalogPanel({ topicId, busy }: { topicId: string; busy:
         <details><summary>연결 자료와 수집 상태</summary>
           {catalog.entries.some(e => e.rootId === root.id && e.state === "candidate") && <button disabled={busy || saving}
             onClick={() => void run(() => api.selectEvidenceBatch(topicId,catalog.version,root.id,catalog.entries.filter(e=>e.rootId===root.id && e.state==="candidate").slice(0,200).map(e=>e.source.id)))}>아래 검수 대기 자료를 확인했고 사용 승인 (최대 200개)</button>}
-          {catalog.entries.filter(e => e.rootId === root.id).map(entry => <div key={entry.source.id}>
+          <EvidencePlatforms items={catalog.entries.filter(e => e.rootId === root.id)} provider={entry => entry.source.provider}>{entry => <div key={entry.source.id}>
             <a href={entry.source.url} target="_blank" rel="noreferrer">{entry.source.label}</a> · {entry.state === "candidate" ? "검수 대기" : entry.state === "rejected" ? "제외됨" : progress[entry.progress]}
             <p>{entry.source.url}{entry.source.selector ? ` · 선택 위치 ${entry.source.selector}` : ""}</p>
             {entry.discoveredFrom.map((from, i) => <small key={i}>발견 위치: {catalog.entries.find(e => e.source.id === from.sourceId)?.source.label ?? from.sourceId} / {from.unitId} </small>)}
@@ -69,13 +70,14 @@ export function EvidenceCatalogPanel({ topicId, busy }: { topicId: string; busy:
               {entry.state !== "approved" && <button disabled={busy || saving} onClick={() => select(root.id,"accept",entry.source.id)}>사용 승인</button>}
               {entry.state !== "rejected" && <button disabled={busy || saving} onClick={() => select(root.id,"reject",entry.source.id)}>이 루트에서 제외</button>}
             </>}
-          </div>)}
+          </div>}</EvidencePlatforms>
         </details>
-      </article>)}
-      {(catalog.unresolvedLinks ?? []).map(link => <p key={`${link.rootId}:${link.id}`} role="alert">
+      </article>}</EvidencePlatforms>
+      {(catalog.unresolvedLinks?.length ?? 0) > 0 && <details><summary>수집할 수 없는 링크 ({catalog.unresolvedLinks!.length})</summary>
+      {catalog.unresolvedLinks!.map(link => <p key={`${link.rootId}:${link.id}`} role="alert">
         {link.error} <a href={link.url} target="_blank" rel="noreferrer">{link.url}</a>
         <button disabled={busy || saving} onClick={() => select(link.rootId,"dismiss",link.id)}>이 링크를 탐색 범위에서 제외</button>
-      </p>)}
+      </p>)}</details>}
       <details><summary>이전 링크와 검수 기록 ({catalog.history.length})</summary>
         {catalog.history.map((entry, index) => <p key={index}>{new Date(entry.at).toLocaleString()} · {entry.action} · <a href={entry.url} target="_blank" rel="noreferrer">{entry.url}</a></p>)}
       </details>

@@ -261,3 +261,12 @@ h3 { font-size: 17px; }
 .evidence-panel input, .evidence-panel select { width: 100%; min-width: 0; padding: 8px; border: 1px solid var(--line-strong); border-radius: 7px; color: var(--text); background: var(--bg); }
 .evidence-panel button { padding: 7px 10px; border: 1px solid var(--line-strong); border-radius: 7px; color: var(--text); background: var(--panel-raised); cursor: pointer; }
 .evidence-panel p[role="alert"] { color: var(--red); }
+.evidence-platform { margin: 12px 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.evidence-platform > summary { padding: 9px 12px; color: var(--text); background: var(--panel-raised); font-weight: 600; }
+.evidence-platform > summary span { margin-left: 6px; color: var(--muted); font-size: 12px; font-weight: 400; }
+.evidence-platform-items { padding: 0 12px; overflow-wrap: anywhere; }
+.evidence-platform-items > article, .evidence-platform-items > div { padding: 12px 0; }
+.evidence-platform-items > article + article, .evidence-platform-items > div + div { border-top: 1px solid var(--line); }
+.execution-details > summary { cursor: pointer; font-size: 13px; color: var(--muted); }
+.inspector-section > summary.section-heading { display: list-item; cursor: pointer; font-weight: 600; }
+.inspector-section > summary.section-heading > .revision-pill, .inspector-section > summary.section-heading > .count-pill { float: right; }

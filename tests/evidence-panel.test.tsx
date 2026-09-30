@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { EvidencePanel } from "../src/web/EvidencePanel";
 import { api } from "../src/web/api";
@@ -117,4 +117,35 @@ it("shows connection setup and shared scope and explicitly converts a source to 
   pendingChange.reject(new Error("읽기 인증 설정이 필요합니다."));
   expect(await screen.findByRole("alert")).toHaveTextContent("읽기 인증 설정");
   expect(button).toBeEnabled();
+});
+
+// Public boundary: opening evidence shows every platform and keeps a discovered link's selection tied to its root.
+// Existing cases cover failed mutations and pending input; pixel layout is verified in the browser separately.
+it("groups roots and cross-platform discoveries without changing which root receives the selection", async () => {
+  const jira = state().sources[0];
+  const figma = { ...jira, id: "f".repeat(64), provider: "figma" as const, label: "Design", url: "https://www.figma.com/design/design?node-id=1-2" };
+  const sheet = { ...jira, id: "e".repeat(64), provider: "sheets" as const, label: "Policy", url: "https://docs.google.com/spreadsheets/d/policy/edit" };
+  const backend = { ...jira, id: "c".repeat(64), provider: "document" as const, label: "API", url: "https://example.com/docs/api" };
+  const roots = [jira, figma, sheet, backend].map((source, index) => ({
+    id: `root-${index}`, sourceId: source.id, source, scope: "group" as const, owner: "g", status: "approved" as const,
+    required: true, version: 1, createdAt: 0, approvedAt: 0, lastCompleteAt: 0, nextCheckAt: 0,
+  }));
+  const candidate = { ...figma, id: "a".repeat(64), label: "Linked design" };
+  vi.spyOn(api, "evidence").mockResolvedValue({ ...state(), sources: [jira, figma, sheet, backend] });
+  vi.spyOn(api, "evidenceCatalog").mockResolvedValue({ ...catalog(), roots, entries: [{
+    rootId: roots[0].id, source: candidate, state: "candidate", progress: "pending", error: null, discoveredFrom: [],
+  }] });
+  const select = vi.spyOn(api, "selectEvidence").mockResolvedValue(catalog());
+  render(<EvidencePanel topicId="t" busy={false} />);
+  fireEvent.click(screen.getByText(/원문 근거/));
+  const scope = await screen.findByRole("region", { name: "근거 탐색 범위" });
+  for (const [platform, label] of [["Jira", "Planning"], ["Figma", "Design"], ["Google Sheets", "Policy"], ["Backend API·웹 문서", "API"]]) {
+    const groups = within(scope).getAllByRole("group", { name: `${platform} 자료` });
+    expect(groups.some(group => within(group).queryByRole("link", { name: label }))).toBe(true);
+  }
+  expect(within(scope).queryByRole("group", { name: "Confluence 자료" })).not.toBeInTheDocument();
+  fireEvent.click(within(scope).getAllByText("연결 자료와 수집 상태")[0]);
+  const linked = await within(scope).findByRole("link", { name: "Linked design" });
+  fireEvent.click(within(linked.parentElement!).getByRole("button", { name: "이 루트에서 제외" }));
+  await waitFor(() => expect(select).toHaveBeenCalledExactlyOnceWith("t", catalog().version, "root-0", "reject", candidate.id));
 });
