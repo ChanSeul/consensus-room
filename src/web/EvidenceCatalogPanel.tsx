@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { EvidenceCatalog, EvidenceScope } from "../shared/externalEvidence";
+import { parseEvidenceSource, type EvidenceCatalog, type EvidenceHostPlan, type EvidenceScope } from "../shared/externalEvidence";
 import { api } from "./api";
 
 const scopes = { group: "이 작업 그룹과 이후 단계", topic: "이 주제만", workspace: "이 저장소의 모든 작업" };
@@ -9,10 +9,12 @@ export function EvidenceCatalogPanel({ topicId, busy }: { topicId: string; busy:
   const [error, setError] = useState(""); const [saving, setSaving] = useState(false);
   const [url, setURL] = useState(""); const [label, setLabel] = useState("");
   const [scope, setScope] = useState<EvidenceScope>("group");
+  const [mode, setMode] = useState<"connector" | "rest">("connector");
+  const [hostPlan, setHostPlan] = useState<EvidenceHostPlan | null>(null);
   const generation = useRef(0); const requests = useRef(0); const pending = useRef(false);
   useEffect(() => {
     const current = ++generation.current; let loading = false;
-    setCatalog(null); setError("");
+    setCatalog(null); setHostPlan(null); setError("");
     const load = async () => {
       if (loading || pending.current) return; loading = true;
       const requestId = ++requests.current;
@@ -38,7 +40,17 @@ export function EvidenceCatalogPanel({ topicId, busy }: { topicId: string; busy:
     <p>링크를 해제하면 다음 계획과 세션에서 제외합니다. 과거 원문·인용·완료 결과는 보존하며, 진행 중 턴이 끝난 뒤 변경할 수 있습니다.</p>
     {catalog && <>
       <p role="status">자료 {catalog.coverage.sources}개 · 원문 조각 {catalog.coverage.units}개 · 수집 완료 {catalog.coverage.complete} · 대기/진행 {catalog.coverage.pending} · 실패 {catalog.coverage.failed} · 검수 대기 {catalog.coverage.candidates} · {catalog.coverage.ready ? "필수 범위 수집 완료" : "필수 범위 미완료"}</p>
-      <button disabled={busy || saving} onClick={() => void run(() => api.collectEvidence(topicId))}>수집 이어가기</button>
+      <button disabled={busy || saving} onClick={() => {
+        const current = generation.current;
+        void run(async () => { const result = await api.collectEvidence(topicId); if (current === generation.current) setHostPlan(result.hostPlan); });
+      }}>수집 이어가기</button>
+      {hostPlan && hostPlan.version === catalog.version && <aside aria-label="앱 연결로 읽을 자료">
+        <p role="status">앱 연결로 읽을 원문 {hostPlan.total}개 · 링크 검수 대기 {hostPlan.pendingReview}개</p>
+        <p>에이전트가 기존 앱 연결로 읽어 공유 근거에 저장합니다. 연결이 없으면 로그인된 브라우저를 사용하며, 읽지 못한 댓글·화면은 누락으로 기록합니다.</p>
+        {hostPlan.requests.map(read => <p key={read.sourceId}><a href={read.url} target="_blank" rel="noreferrer">{read.label}</a>
+          {` · ${read.integration} · ${read.requiredReads.join(" / ")}`}</p>)}
+        {hostPlan.nextOffset !== null && <p>나머지 원문은 에이전트가 다음 목록에서 이어서 읽습니다.</p>}
+      </aside>}
       {catalog.roots.filter(r => r.status !== "removed").map(root => <article key={root.id}>
         <a href={root.source.url} target="_blank" rel="noreferrer">{root.source.label}</a> · {scopes[root.scope]} · {root.status === "approved" ? "사용자 승인됨" : "루트 검수 대기"}
         <p>{root.source.url}</p>
@@ -68,11 +80,18 @@ export function EvidenceCatalogPanel({ topicId, busy }: { topicId: string; busy:
         {catalog.history.map((entry, index) => <p key={index}>{new Date(entry.at).toLocaleString()} · {entry.action} · <a href={entry.url} target="_blank" rel="noreferrer">{entry.url}</a></p>)}
       </details>
     </>}
-    <form onSubmit={e => { e.preventDefault(); void run(() => api.addEvidenceRoot(topicId, { url, label, scope, mode: "rest", intervalSeconds: 900, required: true })); }}>
+    <form onSubmit={e => { e.preventDefault(); void run(() => {
+      const input = { url, label, scope, mode, intervalSeconds: 900, required: true };
+      // Public documentation needs no service account. The default app route applies to authenticated services.
+      return api.addEvidenceRoot(topicId, { ...input, mode: parseEvidenceSource(input).provider === "document" ? "rest" : mode });
+    }); }}>
       <input aria-label="탐색 루트 이름" required value={label} onChange={e => setLabel(e.target.value)} placeholder="작업 기획 / 정책서 / 백엔드" />
       <input aria-label="탐색 루트 링크" required type="url" value={url} onChange={e => setURL(e.target.value)} placeholder="Jira 루트·Slack 채널·정책서·API 문서" />
       <select aria-label="근거 적용 범위" value={scope} onChange={e => setScope(e.target.value as EvidenceScope)}>
         <option value="group">이 작업 그룹 (독립 주제면 이 주제)</option><option value="topic">이 주제만</option><option value="workspace">저장소 공통 자료</option>
+      </select>
+      <select aria-label="원문 수집 방법" value={mode} onChange={e => setMode(e.target.value as "connector" | "rest")}>
+        <option value="connector">앱 연결·기존 로그인으로 읽기 (기본)</option><option value="rest">서버 직접 수집 (읽기 인증 필요)</option>
       </select>
       <button disabled={busy || saving}>루트와 탐색 범위 승인·추가</button>
     </form>

@@ -25,6 +25,11 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
     }
   };
   app.get<{ Params: { id: string } }>("/api/topics/:id/evidence/catalog", async request => db.evidence.catalog.state(request.params.id));
+  app.get<{ Params: { id: string } }>("/api/topics/:id/evidence/host-plan", async request => {
+    const input = z.object({ offset: z.coerce.number().int().nonnegative().default(0),
+      limit: z.coerce.number().int().min(1).max(50).default(50) }).strict().parse(request.query);
+    return service.hostPlan(request.params.id, input.offset, input.limit);
+  });
   app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/host-import", {bodyLimit:16_000_000}, async request => {
     mediator(request.headers);
     const input=EvidenceHostImportSchema.parse(request.body);
@@ -70,7 +75,7 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
   app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/collect", async request => {
     z.object({}).strict().parse(request.body ?? {});
     for (const root of db.evidence.catalog.forTopic(request.params.id).filter(r => r.status === "approved")) await service.collect(root.id);
-    return db.evidence.catalog.state(request.params.id);
+    return { ...db.evidence.catalog.state(request.params.id), hostPlan: service.hostPlan(request.params.id) };
   });
   app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/search", async request => {
     const input = EvidenceSearchInputSchema.parse(request.body);

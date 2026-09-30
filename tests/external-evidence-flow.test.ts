@@ -20,6 +20,28 @@ import type { AgentAdapter, CommandRunner } from "../src/server/types";
 const roots: string[] = []; const dbs: ConsensusDatabase[] = [];
 afterEach(() => { vi.restoreAllMocks(); for (const db of dbs.splice(0)) { try { db.close(); } catch {} } for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 const sourceInput = { url: "https://team.atlassian.net/browse/APP-1", label: "Feature", mode: "connector" as const, intervalSeconds: 300 };
+it("HTTP collection returns approved app work, bounds pages, and never invokes a model", async () => {
+  const f=fixture(); f.database.updateTopic("t",{state:"DRAFT"});
+  const config=loadConfig({repositoryPath:f.root,dataDirectory:f.root,webDirectory:join(f.root,"no-web"),launchToken:"test-token",enforceBudgets:false});
+  const app=await buildApp({config,database:f.database,runner:f.runner,claude:f.adapter,codex:{...f.adapter,role:"codex"},
+    evidenceConnector:{configured:()=>false,fetch:async()=>{throw Error("Existing app reader only");}}});
+  const headers={"x-consensus-token":"test-token"};
+  try {
+    const add=await app.inject({method:"POST",url:"/api/topics/t/evidence/roots",headers,payload:{
+      url:"https://www.figma.com/design/approved?node-id=1-2",label:"Current design",scope:"topic",mode:"connector"}});
+    expect(add.statusCode).toBe(200);
+    const proposal=await app.inject({method:"POST",url:"/api/topics/t/evidence/roots",headers:{...headers,"x-consensus-actor":"mediator"},payload:{
+      url:"https://www.figma.com/design/candidate?node-id=3-4",label:"Unverified design",scope:"topic",mode:"connector"}});
+    expect(proposal.statusCode).toBe(200);
+    const result=await app.inject({method:"POST",url:"/api/topics/t/evidence/collect",headers,payload:{}});
+    expect(result.statusCode).toBe(200);
+    expect(result.json().hostPlan.requests).toEqual(expect.arrayContaining([expect.objectContaining({provider:"figma",resource:"approved",selector:"1:2"})]));
+    expect(result.json().hostPlan.requests.some((r:any)=>r.resource==="candidate")).toBe(false);
+    expect((await app.inject({method:"GET",url:"/api/topics/t/evidence/host-plan?limit=1",headers})).json().requests).toHaveLength(1);
+    expect((await app.inject({method:"GET",url:"/api/topics/t/evidence/host-plan?limit=100",headers})).statusCode).toBe(400);
+    expect(f.adapter.createSession).not.toHaveBeenCalled();
+  } finally {await app.close();dbs.splice(dbs.indexOf(f.database),1);}
+});
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "evidence-flow-")); roots.push(root);
   const database = new ConsensusDatabase(join(root, "room.sqlite")); dbs.push(database);

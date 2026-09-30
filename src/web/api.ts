@@ -1,5 +1,5 @@
 import type { WorkGroup, WorkGroupInput, WorkGroupView } from "../shared/workGroups";
-import type { EvidenceCatalog, EvidenceRootInput, EvidenceSourceInput, EvidenceSource, EvidenceTopicState, EvidenceReviewInput } from "../shared/externalEvidence";
+import type { EvidenceCatalog, EvidenceCollectionResult, EvidenceRootInput, EvidenceSourceInput, EvidenceSource, EvidenceTopicState, EvidenceReviewInput } from "../shared/externalEvidence";
 import type { BudgetAccount } from "../shared/budgets";
 import type {
   ActionResponse,
@@ -100,7 +100,7 @@ export const api = {
   addEvidenceRoot: (id: string, input: EvidenceRootInput) => request(`/topics/${id}/evidence/roots`, { method: "POST", body: JSON.stringify(input) }),
   selectEvidence: (id: string, version: string, rootId: string, action: "approve" | "remove" | "accept" | "reject" | "dismiss", sourceId?: string) => request<EvidenceCatalog>(`/topics/${id}/evidence/selection`, { method: "POST", body: JSON.stringify({ version, rootId, action, sourceId }) }),
   selectEvidenceBatch: (id:string,version:string,rootId:string,sourceIds:string[]) => request<EvidenceCatalog>(`/topics/${id}/evidence/selection-batch`, {method:"POST",body:JSON.stringify({version,rootId,sourceIds,action:"accept"})}),
-  collectEvidence: (id: string) => request<EvidenceCatalog>(`/topics/${id}/evidence/collect`, { method: "POST", body: "{}" }),
+  collectEvidence: (id: string) => request<EvidenceCollectionResult>(`/topics/${id}/evidence/collect`, { method: "POST", body: "{}" }),
   evidence: (id: string) => request<EvidenceTopicState>(`/topics/${encodeURIComponent(id)}/evidence`),
   addEvidence: (id: string, input: EvidenceSourceInput) => request<EvidenceSource>(`/topics/${encodeURIComponent(id)}/evidence/sources`, { method: "POST", body: JSON.stringify(input) }),
   useRestEvidence: (id: string) => request(`/evidence/${encodeURIComponent(id)}/use-rest`, { method: "POST", body: "{}" }),

@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { EVIDENCE_PAGE_BYTES } from "../../shared/externalEvidence.js";
-import type { EvidenceSource, EvidenceSnapshotInput, EvidenceHostImport, MediatorEvidenceBatch, MediatorEvidenceResponse } from "../../shared/externalEvidence.js";
+import type { EvidenceSource, EvidenceSnapshotInput, EvidenceHostImport, EvidenceHostPlan, MediatorEvidenceBatch, MediatorEvidenceResponse } from "../../shared/externalEvidence.js";
 import { discoverLinks } from "./discovery.js";
 import type { ConsensusDatabase } from "../database.js";
 import type { AgentResult } from "../../shared/contracts.js";
@@ -32,8 +32,6 @@ export class EvidenceService {
     for (const root of this.store.catalog.due()) await this.collect(root.id);
   }
   collect(rootId: string, force = false): Promise<void> {
-    const root=this.store.catalog.roots().find(r=>r.id===rootId);
-    if (root && this.store.get(root.sourceId).mode==="connector") return Promise.resolve();
     const key = `root:${rootId}`, existing = this.jobs.get(key); if (existing) return existing;
     if (force) this.store.catalog.requestRefresh(rootId);
     const job = this.collectRoot(rootId).finally(() => this.jobs.delete(key));
@@ -83,6 +81,33 @@ export class EvidenceService {
   }
   connection(source: EvidenceSource): { configured: boolean; error: string | null } {
     return { configured: this.connector.configured?.(source) ?? false, error: source.error };
+  }
+  hostPlan(topicId: string, offset = 0, limit = 50): EvidenceHostPlan {
+    const catalog = this.store.catalog.state(topicId), now = Date.now();
+    const integrations = { jira: "Atlassian Rovo", confluence: "Atlassian Rovo", slack: "Slack", figma: "Figma",
+      sheets: "Google Drive", document: "Browser" };
+    const reads = {
+      jira: ["이슈 본문·전체 댓글", "모든 하위·연결 티켓과 외부 링크"],
+      confluence: ["본문·하위 페이지", "전체 본문 댓글·인라인 댓글과 답글"],
+      slack: ["채널의 모든 메시지 또는 지정 스레드", "모든 답글·첨부와 원문 링크"],
+      figma: ["지정 노드의 디자인 정보(get_design_context)", "필요한 화면 이미지·변수와 댓글"],
+      sheets: ["모든 시트의 셀·수식·하이퍼링크", "숨김 시트와 전체 댓글"],
+      document: ["본문·연결 문서", "API 문서이면 실제 OpenAPI 명세"],
+    };
+    const unique = new Map<string, EvidenceHostPlan["requests"][number]>();
+    for (const entry of catalog.entries.filter(entry => {
+      const root = catalog.roots.find(root => root.id === entry.rootId);
+      if (!root || root.status !== "approved" || entry.state !== "approved") return false;
+      // A configured REST root keeps its selected transport. Existing host captures and unavailable REST readers use app connections.
+      if (root.source.mode === "rest" && entry.source.mode === "rest" && this.connection(entry.source).configured) return false;
+      return entry.progress !== "complete" || !this.store.fresh(entry.source) || root.nextCheckAt <= now;
+    })) if (!unique.has(entry.source.id)) unique.set(entry.source.id, { rootId: entry.rootId, sourceId: entry.source.id, url: entry.source.url, label: entry.source.label,
+      provider: entry.source.provider, resource: entry.source.resource, selector: entry.source.selector,
+      previousHash: entry.source.contentHash, previousCheckedAt: entry.source.checkedAt,
+      integration: integrations[entry.source.provider], requiredReads: reads[entry.source.provider] });
+    const requests = [...unique.values()];
+    return { version: catalog.version, requests: requests.slice(offset, offset + limit), total: requests.length,
+      nextOffset: offset + limit < requests.length ? offset + limit : null, pendingReview: catalog.coverage.candidates };
   }
   async prepareMediator(database: ConsensusDatabase, topicId: string, sessionId: string, pageBytes?: number): Promise<MediatorEvidenceResponse> {
     const start = database.getTopic(topicId);
@@ -279,6 +304,7 @@ export function withEvidence(adapter: AgentAdapter, database: ConsensusDatabase,
     const result = await invoke({ ...turn,
       onFigmaRequest: turn.implementation ? request => database.evidence.designRequest(topic, request) : undefined,
       onFigmaResult: turn.implementation ? capture : undefined, evidenceManaged: true, figmaReadEnabled: Boolean(turn.implementation && designSources.length),
+      figmaFileKeys: designSources.map(source => source.resource),
       prompt: `${turn.prompt}${evidenceText ? `\n\n${evidenceText}` : ""}${corpusGuidance}${pendingReads.length && designAccess ? `\nUncaptured design reads from a prior attempt. Repeat these reads before completing: ${JSON.stringify(pendingReads)}` : ""}`,
       readablePaths: [...turn.readablePaths ?? [], ...designPaths, ...packet.availableImages.map(hash => join(imageDirectory, `${hash}.png`))] });
     const current = database.getTopic(topic.id);

@@ -94,6 +94,17 @@ export interface EvidenceCatalog {
   entries: EvidenceCatalogEntry[]; history: Array<{ at: number; action: string; url: string; scope: EvidenceScope }>;
   coverage: { sources: number; units: number; complete: number; pending: number; failed: number; candidates: number; ready: boolean };
 }
+// A collection request contains metadata only. It does not grant source selection or claim a successful read.
+export interface EvidenceHostRead {
+  rootId: string; sourceId: string; url: string; label: string; provider: EvidenceProvider;
+  resource: string; selector: string; previousHash: string | null; previousCheckedAt: number | null;
+  integration: string; requiredReads: string[];
+}
+export interface EvidenceHostPlan {
+  version: string; requests: EvidenceHostRead[]; total: number; nextOffset: number | null;
+  pendingReview: number;
+}
+export interface EvidenceCollectionResult extends EvidenceCatalog { hostPlan: EvidenceHostPlan }
 export const EvidenceSelectionInputSchema = z.object({
   version: z.string().regex(/^[a-f0-9]{64}$/), rootId: z.string().uuid(),
   action: z.enum(["approve", "remove", "accept", "reject", "dismiss"]), sourceId: z.string().regex(/^[a-f0-9]{64}$/).optional(),

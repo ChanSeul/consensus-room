@@ -60,7 +60,8 @@ export function turnPolicy(job: TurnJob, shape: TurnShape): TurnPolicy {
 // 이름 분기가 아니다). 값은 실제 CLI 로 확인한 동작만 true 로 둔다 — 가짜 어댑터 테스트는 근거가 아니다.
 // - Claude: 쓰기·쓰기 턴 팬아웃(Workflow)·웹·Figma 는 기존 실측. 읽기 턴 팬아웃은 E2c C2 에서 Workflow 허용·ultracode 를 쓰기 접근에서 떼어 연다 —
 //   하위 에이전트가 부모의 --tools 상한을 물려받는 것은 기존 실측이고, 읽기 턴 Workflow 호출·하위 에이전트 쓰기 차단의 실제 CLI 확인은 E2c.md C2 기록.
-// - Codex: 쓰기는 E2c-codex-write.md 실측(실제 exec → exec resume). 관측 가능한 Figma MCP 연결은 아직 없다. 호스트 격리 입력은 E2e-1 변환(관리형 홈에
+// - Codex: 쓰기는 E2c-codex-write.md 실측(실제 exec → exec resume). Figma는 공식 App Server 읽기를 관측하는 호스트 MCP 연결이다(docs/external-evidence.md).
+//   호스트 격리 입력은 E2e-1 변환(관리형 홈에
 //   인증·설정만, project_doc_max_bytes=0, --ignore-rules)과 호스트 실제 CLI 확인(E2e.md)이 근거다.
 // - Claude 의 호스트 격리 입력 변환은 아직 없다 — 실행 전에 거부한다(E2e.md "이번에 하지 않는 것").
 // - 승인 경로만 쓰기(E2e-3): Codex 는 권한 프로필의 경로별 write·deny 로 표현한다(자동 수정 인계가 쓰던 경계, 실제 CLI 확인은 E2e.md E2e-3).
@@ -84,7 +85,7 @@ export interface ProviderCapabilities {
 
 export const PROVIDER_CAPABILITIES: Readonly<Record<"claude" | "codex", Readonly<ProviderCapabilities>>> = {
   claude: { write: true, writeFanout: true, readFanout: true, web: true, figma: true, isolatedInput: false, scopedWrite: false },
-  codex: { write: true, writeFanout: true, readFanout: true, web: true, figma: false, isolatedInput: true, scopedWrite: true },
+  codex: { write: true, writeFanout: true, readFanout: true, web: true, figma: true, isolatedInput: true, scopedWrite: true },
 };
 
 // 공급자 문맥 압축(E3-3a 복구 절차 2단계) — 확인된 기능만 쓴다. 호스트가 호출 단위로 부를 수 있는 압축은 두 공급자 모두 없다. Claude 는 CLI 자동 압축

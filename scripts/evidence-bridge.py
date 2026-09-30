@@ -44,14 +44,18 @@ def mediator_identity():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--launch-file", type=Path, default=Path.home() / "Library/Application Support/ConsensusRoom/consensus-room.url")
-    parser.add_argument("command", choices=["due", "claim", "snapshot", "unchanged", "failure", "attach", "status", "batch", "ack", "connections", "use-rest", "metrics", "host-import", "catalog"])
+    parser.add_argument("command", choices=["due", "claim", "snapshot", "unchanged", "failure", "attach", "status", "batch", "ack", "connections", "use-rest", "metrics", "host-import", "host-plan", "catalog", "collect"])
     parser.add_argument("--id", help="source ID, or topic ID for attach/status")
     parser.add_argument("--input", type=Path, help="JSON file (do not place secret credentials here)")
     parser.add_argument("--session", help="실제 중재자 세션 ID; batch/ack에 필수")
     parser.add_argument("--batch", help="읽기를 마친 batchId; ack에 필수")
     parser.add_argument("--page-bytes", type=int, help="batch 한 쪽의 최대 바이트(1~240000). 이 출력 전체(끝 개행 제외)가 이 크기 이하다")
+    parser.add_argument("--offset", type=int, default=0, help="host-plan metadata page offset")
+    parser.add_argument("--limit", type=int, default=50, help="host-plan metadata page size (1~50)")
     args = parser.parse_args()
     identity = mediator_identity()
+    if args.offset < 0 or not 1 <= args.limit <= 50:
+        parser.error("host-plan offset must be nonnegative and limit must be 1~50")
     base, token = connection(args.launch_file)
     if args.command not in {"due", "connections"} and not args.id:
         parser.error("--id is required")
@@ -67,10 +71,12 @@ def main():
         "metrics": f"/api/topics/{source_id}/evidence/metrics",
         "host-import": f"/api/topics/{source_id}/evidence/host-import",
         "catalog": f"/api/topics/{source_id}/evidence/catalog",
+        "host-plan": f"/api/topics/{source_id}/evidence/host-plan?offset={args.offset}&limit={args.limit}",
+        "collect": f"/api/topics/{source_id}/evidence/collect",
     }[args.command]
     data = None
-    if args.command not in {"due", "status", "connections", "metrics", "catalog"}:
-        if args.command in {"claim", "use-rest"}:
+    if args.command not in {"due", "status", "connections", "metrics", "catalog", "host-plan"}:
+        if args.command in {"claim", "use-rest", "collect"}:
             data = b"{}"
         elif args.command in {"batch", "ack"}:
             if not args.session or (args.command == "ack" and not args.batch):

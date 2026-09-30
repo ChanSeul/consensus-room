@@ -141,6 +141,38 @@ function fixture() {
   return {db,topic};
 }
 const input = (url: string, scope: EvidenceRootInput["scope"] = "group"): EvidenceRootInput => ({url,label:url,scope,required:true,mode:"rest",intervalSeconds:900});
+it("app read plans contain only approved metadata and imports remain incomplete when comments are missing", async () => {
+  const {db} = fixture(), c = db.evidence.catalog;
+  const root = c.add("a",{...input("https://team.atlassian.net/browse/APP-1"),mode:"connector"},true);
+  c.add("a",{...input("https://www.figma.com/design/design?node-id=1-2"),mode:"connector"},false);
+  const fetch = vi.fn(async()=>{throw new Error("Existing app connection owns reads");});
+  const service = new EvidenceService(db.evidence,{fetch,configured:()=>false});
+  try {
+    const plan = service.hostPlan("a");
+    expect(plan.total).toBe(1); expect(plan.pendingReview).toBe(1);
+    expect(plan.requests[0]).toMatchObject({rootId:root.id,provider:"jira",integration:"Atlassian Rovo",previousHash:null});
+    expect(JSON.stringify(plan)).not.toContain("content\"");
+    const source=service.importHost("a",{version:plan.version,rootId:root.id,sourceId:root.sourceId,
+      previousHash:null,previousCheckedAt:null,observedAt:Date.now(),revision:"native-app",
+      units:[{id:"issue",kind:"issue",content:"Actual issue body"}],missing:["comments unavailable"]});
+    expect(c.state("a").coverage.ready).toBe(false); expect(service.hostPlan("a").total).toBe(1);
+    expect(db.evidence.snapshot(source.id)?.units[0].content).toBe("Actual issue body");
+    expect(fetch).not.toHaveBeenCalled();
+  } finally {await service.stop();}
+});
+it("connector collection reuses a fresh shared capture without reading the same source again", async () => {
+  const {db}=fixture(),c=db.evidence.catalog;
+  const root=c.add("a",{...input("https://team.atlassian.net/browse/APP-1"),mode:"connector"},true);
+  const shared=c.add("a",{...input("https://team.atlassian.net/browse/APP-1","topic"),mode:"connector"},true);
+  const service=new EvidenceService(db.evidence,{fetch:vi.fn(async()=>{throw Error("No reread");})});
+  try {
+    service.importHost("a",{version:c.version("a"),rootId:root.id,sourceId:root.sourceId,previousHash:null,previousCheckedAt:null,
+      observedAt:Date.now(),revision:"app",units:[{id:"issue",kind:"issue",content:"Shared actual body"}],missing:[]});
+    expect(service.hostPlan("a").total).toBe(1);
+    await service.collect(shared.id);
+    expect(c.state("a").coverage.ready).toBe(true); expect(service.hostPlan("a").total).toBe(0);
+  } finally {await service.stop();}
+});
 it("Jira roots belong to separate groups, inherit into new stages, and only explicit workspace documents are shared", () => {
   const {db,topic} = fixture(); const catalog = db.evidence.catalog;
   catalog.add("a",input("https://team.atlassian.net/browse/APP-1"),true);

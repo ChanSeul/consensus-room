@@ -343,7 +343,7 @@ describe("에이전트별 권한 경계", () => {
     expect(runner.calls[0].args.slice(0, 3)).toEqual(["--strict-config", "-a", "never"]);
   });
 
-  it("관리형 CODEX_HOME의 config.toml에는 MCP·notify·plugins·설정출처 항목이 없다", async () => {
+  it("관리형 CODEX_HOME은 확장 설정을 물려받지 않고 앱·플러그인을 차단한다", async () => {
     const runner = new RecordingRunner(successfulResult([
       { type: "thread.started", thread_id: "codex-thread-1" },
       planResult,
@@ -354,9 +354,10 @@ describe("에이전트별 권한 경계", () => {
 
     const configPath = join(adapter.managedHomeFor("/tmp"), "config.toml");
     const content = readFileSync(configPath, "utf8");
-    for (const section of ["mcp_servers", "notify", "plugins", "marketplaces", "shell_environment_policy"]) {
+    for (const section of ["mcp_servers", "notify", "[plugins", "marketplaces", "shell_environment_policy"]) {
       expect(content).not.toContain(section);
     }
+    expect(content).toContain("apps = false"); expect(content).toContain("plugins = false");
     expect(content).toContain('default_permissions = "consensus-review"');
     expect(content).toContain('[permissions.consensus-review.filesystem]');
     expect(content).not.toContain('sandbox_mode = "read-only"');

@@ -51,8 +51,25 @@ it("registers once while pending and ignores an older poll that finishes after t
   write.resolve({}); await screen.findByText(/자료 77개/);
   await act(async () => { old.resolve(catalog()); await old.promise; });
   expect(screen.getByText(/자료 77개/)).toBeInTheDocument();
-  expect(add).toHaveBeenCalledWith("t", expect.objectContaining({ scope: "group", url: "https://team.atlassian.net/browse/APP-1" }));
+  expect(add).toHaveBeenCalledWith("t", expect.objectContaining({ scope: "group", mode: "connector", url: "https://team.atlassian.net/browse/APP-1" }));
 });
+
+it("shows the app reader's next work after collection instead of silently completing", async () => {
+  vi.spyOn(api, "evidence").mockResolvedValue(state(false));
+  const collect = vi.spyOn(api, "collectEvidence").mockResolvedValue({ ...catalog(), hostPlan: {
+    version: catalog().version, total: 1, nextOffset: null, pendingReview: 2,
+    requests: [{ rootId: "root", sourceId: "b".repeat(64), url: sourceURL, label: "Planning",
+      provider: "jira", resource: "team.atlassian.net/APP-1", selector: "", previousHash: null, previousCheckedAt: null,
+      integration: "Atlassian Rovo", requiredReads: ["이슈 본문·전체 댓글", "모든 하위·연결 티켓과 외부 링크"] }],
+  } });
+  render(<EvidencePanel topicId="t" busy={false} />);
+  fireEvent.click(screen.getByText(/원문 근거/));
+  fireEvent.click(await screen.findByRole("button", { name: "수집 이어가기" }));
+  expect(await screen.findByRole("complementary", { name: "앱 연결로 읽을 자료" })).toHaveTextContent("앱 연결로 읽을 원문 1개 · 링크 검수 대기 2개");
+  expect(screen.getByRole("complementary")).toHaveTextContent("전체 댓글");
+  expect(collect).toHaveBeenCalledExactlyOnceWith("t");
+});
+const sourceURL = "https://team.atlassian.net/browse/APP-1";
 
 it("clears the old review reason when polling detects a different plan", async () => {
   vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });

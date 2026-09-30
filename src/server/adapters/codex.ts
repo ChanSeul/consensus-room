@@ -20,6 +20,7 @@ import { agentRunError, parseAgentResult, parseStructuredResult, SessionIdentity
 import { codexHomeUsage, ExecutionMetrics } from "./executionMetrics.js";
 import { createToolTimeMeter } from "./toolTime.js";
 import { resolveSupportedTurn, runnerControlPaths, type TurnPolicy } from "./turnPolicy.js";
+import { nativeFigma, NATIVE_FIGMA_READS } from "./nativeFigma.js";
 
 export interface CodexAdapterOptions {
   memoryReaderOptions?: MemoryReaderOptions;
@@ -56,8 +57,8 @@ interface CodexPermissionBoundary {
   writablePaths?: readonly string[];
 }
 
-// 관리형 CODEX_HOME에 매 턴 덮어쓰는 최소 설정. mcp_servers/notify/plugins/marketplaces/shell_environment_policy
-// 섹션이 "없다"는 것이 이 파일의 목적이다. 구형 sandbox_mode는 읽을 수 있는 경로를 좁히지 못하므로 쓰지 않고,
+// 관리형 CODEX_HOME에 매 턴 덮어쓰는 최소 설정. 사용자 mcp_servers/notify/plugins/marketplaces/shell_environment_policy를
+// 물려받지 않는다. 승인된 Figma만 턴별 호스트 MCP로 연결한다. 구형 sandbox_mode는 읽을 수 있는 경로를 좁히지 못하므로 쓰지 않고,
 // permission profile이 worktree·Git metadata·검토된 skill만 읽게 한다.
 // 모델과 추론 강도는 이 파일에 복사하지 않고 각 CLI 호출의 명시 인자로 전달한다.
 const MANAGED_CONFIG_HEADER = [
@@ -103,6 +104,8 @@ function managedConfigBody(boundary: CodexPermissionBoundary): string {
     // (host-review F004, CLI 0.155 `codex features list` 실효값: multi_agent=true, multi_agent_v2=false).
     ...(!boundary.fanout ? ["multi_agent"] : []),
     ...(boundary.isolated ? ["memories", "plugins", "apps", "skill_search"] : []),
+    // Apps are available only through the scoped, observed host transport below. Remote plugin state must not expose unobserved tools.
+    "apps", "plugins",
   ].filter((feature, index, all) => all.indexOf(feature) === index);
   const deniedPaths = uniquePaths([join(boundary.topicHome, "auth.json"), boundary.managedAuthPath, boundary.sourceAuthPath, ...gitMetadata]);
   return [
@@ -335,7 +338,13 @@ export class CodexAdapter implements AgentAdapter {
     if (turn.planningControl && Buffer.byteLength(stdin) > turn.planningControl.maxPromptBytes) {
       throw new PlanningPaused("Final planning input including mandatory instructions exceeds its byte limit.");
     }
-    return this.run(turn, commandArgs, newSession, topicHome, stdin, this.codexHome, {});
+    if (!policy.figma) return this.run(turn, commandArgs, newSession, topicHome, stdin, this.codexHome, {});
+    const figma = await nativeFigma(resolveCodexExecutable(), join(this.codexHome, "auth.json"), turn.cwd, turn);
+    try {
+      const mcp = ["-c", `mcp_servers.figma-native.url=${JSON.stringify(figma.url)}`, "-c", `mcp_servers.figma-native.enabled_tools=${JSON.stringify(NATIVE_FIGMA_READS)}`];
+      const result = await this.run(turn, [...mcp, ...commandArgs], newSession, topicHome, stdin, this.codexHome, {});
+      figma.assertCaptured(); return result;
+    } finally { await figma.close(); }
   }
 
   // 준비가 끝난 턴의 실행 — 사용량 관측·세션 알림·실패 판정. usageHome 은 세션 기록 원본이 있는 홈이다(격리 홈은 자기 안에 둔다).
