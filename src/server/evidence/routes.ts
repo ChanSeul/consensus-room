@@ -5,7 +5,6 @@ import { MediatorEvidenceBatchInputSchema, MediatorEvidenceAckSchema, EvidenceDe
 import type { ConsensusDatabase } from "../database.js";
 import type { WorkflowEngine } from "../workflow.js";
 import type { EvidenceService } from "./service.js";
-import { discoverLinks } from "./discovery.js";
 import { assertMediatorForAnyTopic } from "../mediation.js";
 
 export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDatabase, workflow: WorkflowEngine, service: EvidenceService,
@@ -47,13 +46,13 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
     const input=EvidenceHostImportSchema.parse(request.body);
     const root=db.evidence.catalog.forTopic(request.params.id).find(r=>r.id===input.rootId);
     if (!root) throw Object.assign(new Error("이 작업에 연결된 루트가 아닙니다."),{statusCode:409});
-    const links = discoverLinks(input.units,db.evidence.get(input.sourceId).url);
     await workflow.publishEvidence(() => {
-      const selected = db.evidence.catalog.discoveryApprovalAffected(root,links);
       const guarded = [...new Set([...db.evidence.catalog.affected(root),...db.evidence.linkedTopics(root.sourceId),...db.evidence.linkedTopics(input.sourceId)])];
-      assertMediatorForAnyTopic(db.roles,request.headers,[...guarded,...selected].filter(id=>db.getTopic(id).state!=="CLOSED"));
-      return {selected,guarded};
-    },()=>service.importHost(request.params.id,input));
+      assertMediatorForAnyTopic(db.roles,request.headers,guarded.filter(id=>db.getTopic(id).state!=="CLOSED"));
+      return guarded;
+    },()=>service.importHost(request.params.id,input), ids => {
+      assertMediatorForAnyTopic(db.roles,request.headers,ids.filter(id=>db.getTopic(id).state!=="CLOSED"));
+    });
     return db.evidence.catalog.state(request.params.id);
   });
   app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/roots", async request => {

@@ -332,21 +332,25 @@ export class WorkflowEngine {
       return change();
     } finally { for (const id of ids) this.core.scopeChangeActive.delete(id); }
   }
-  async publishEvidence<T>(resolve: () => { selected: string[]; guarded: string[] }, publish: () => T): Promise<T> {
-    // Resolve and publish synchronously under the same admission boundary. Unlike a manual selection,
-    // rejected collection input must not clear current aliases or invalidate applied diagnoses.
-    const { selected, guarded } = resolve(), ids = [...new Set([...selected, ...guarded])];
-    try { for (const id of ids) this.core.assertNoActiveWork(id); }
-    catch { throw Object.assign(new EvidenceAdmissionExpired("근거 소비 작업이 실행 중입니다. 유휴 상태에서 다시 수집하세요."), { statusCode:409 }); }
-    for (const id of ids) this.core.scopeChangeActive.add(id);
+  async publishEvidence<T>(guarded: () => string[], publish: () => T, authorize: (ids: string[]) => void = () => {}): Promise<T> {
+    const db = this.core.dependencies.database, ids = new Set<string>();
+    const admit = (candidates: string[]) => {
+      const added = [...new Set(candidates)].filter(id => !ids.has(id));
+      try { for (const id of added) this.core.assertNoActiveWork(id); }
+      catch { throw Object.assign(new EvidenceAdmissionExpired("근거 소비 작업이 실행 중입니다. 유휴 상태에서 다시 수집하세요."), { statusCode:409 }); }
+      for (const id of added) { ids.add(id); this.core.scopeChangeActive.add(id); }
+    };
     try {
-      const db = this.core.dependencies.database;
-      const mutable = [...new Set(selected)].map(id => db.getTopic(id)).filter(topic => topic.state !== "CLOSED" && !db.getFlags(topic.id).committedOID);
-      const result = publish();
-      // The catalog transaction establishes the authoritative artifact boundary before human aliases
-      // are removed (the same database-first ordering as ArtifactStore.write).
-      for (const topic of mutable) this.core.diagnoses.staleOnReplan(topic);
-      for (const topic of mutable) await this.core.dependencies.artifacts.clearCurrentAliases(topic.id);
+      admit(guarded());
+      const before = new Map<string, Topic>();
+      const {result,changed,effects} = db.evidence.catalog.publish(publish, changed => { authorize(changed); admit(changed); },
+        id => before.set(id,db.getTopic(id)));
+      // Only committed, actually invalidated consumers need diagnosis/alias cleanup. The DB
+      // artifact boundary is authoritative; locks remain held while human copies are removed.
+      for (const id of changed) this.core.diagnoses.staleOnReplan(before.get(id)!);
+      try {
+        for (const id of changed) await this.core.dependencies.artifacts.clearCurrentAliases(id);
+      } finally { for (const effect of effects) effect(); }
       return result;
     } finally { for (const id of ids) this.core.scopeChangeActive.delete(id); }
   }

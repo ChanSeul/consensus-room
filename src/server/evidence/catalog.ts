@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import { parseEvidenceSource, EvidenceRootInputSchema, type EvidenceHostImport, type EvidenceDiscoveryLink, type EvidenceCatalog, type EvidenceDiscoveryPage, type EvidenceRoot,
+import { EvidenceRootInputSchema, type EvidenceHostImport, type EvidenceDiscoveryLink, type EvidenceCatalog, type EvidenceDiscoveryPage, type EvidenceRoot,
   type EvidenceRootInput, type EvidenceScope, type EvidenceSource, type EvidenceUnitInput } from "../../shared/externalEvidence.js";
 import { evidenceHash, stableJSON, type EvidenceStore } from "./store.js";
 import type { WorkGroup } from "../../shared/workGroups.js";
@@ -14,6 +14,9 @@ interface Member {
 // Roots belong to a group (or one standalone topic), never to the last visited topic.
 // Only explicitly configured workspace roots cross group boundaries.
 export class EvidenceCatalogStore {
+  private publicationChanges?: Set<string>;
+  private publicationEffects?: Array<() => void>;
+  private beforePublicationInvalidation?: (id: string) => void;
   constructor(private readonly db: DatabaseSync, private readonly store: EvidenceStore, private readonly clock: () => number) {
     db.exec(`
       CREATE TABLE IF NOT EXISTS evidence_roots(id TEXT PRIMARY KEY, record TEXT NOT NULL);
@@ -74,6 +77,8 @@ export class EvidenceCatalogStore {
   private invalidateTopics(ids: string[]): void {
     for (const id of ids) {
       if (this.db.prepare("SELECT 1 FROM topics WHERE id=? AND (state='CLOSED' OR committed_oid IS NOT NULL)").get(id)) continue;
+      if (!this.publicationChanges?.has(id)) this.beforePublicationInvalidation?.(id);
+      this.publicationChanges?.add(id);
       this.db.prepare(`INSERT INTO evidence_artifact_boundaries
         SELECT id,scope_generation,COALESCE((SELECT MAX(a.id) FROM artifacts a WHERE a.topic_id=topics.id),0) FROM topics WHERE id=?
         ON CONFLICT(topic_id,scope_generation) DO UPDATE SET artifact_id=excluded.artifact_id`).run(id);
@@ -184,8 +189,8 @@ export class EvidenceCatalogStore {
   members(rootId: string): Member[] {
     return this.db.prepare("SELECT * FROM evidence_members WHERE root_id=? ORDER BY rowid").all(rootId) as unknown as Member[];
   }
-  private reachableMembers(rootId: string, knownRoot?: EvidenceRoot): Member[] {
-    const root = knownRoot ?? this.roots().find(r => r.id === rootId); if (!root) return [];
+  private reachableMembers(rootId: string): Member[] {
+    const root = this.roots().find(r => r.id === rootId); if (!root) return [];
     const members = this.members(rootId), byId = new Map(members.map(m=>[m.source_id,m]));
     const visible = new Set([root.sourceId]);
     const edges = this.db.prepare("SELECT parent_id,source_id FROM evidence_discovery_edges WHERE root_id=?").all(rootId);
@@ -210,40 +215,35 @@ export class EvidenceCatalogStore {
       this.members(root.id).some(m => m.source_id === sourceId && m.state === "candidate"))
       .flatMap(root => this.affected(root)))];
   }
-  private automaticallyApproved(child: Pick<EvidenceSource, "id" | "provider" | "resource">, root: EvidenceRoot, link: EvidenceDiscoveryLink,
-    approved?: ReadonlySet<string>, origin = this.store.get(root.sourceId)): boolean {
-    return (approved ? approved.has(child.id) : this.approvedElsewhere(child.id,root)) ||
+  private automaticallyApproved(child: Pick<EvidenceSource, "id" | "provider" | "resource">, root: EvidenceRoot, link: EvidenceDiscoveryLink): boolean {
+    const origin = this.store.get(root.sourceId);
+    return this.approvedElsewhere(child.id,root) ||
       (origin.provider === "jira" && child.provider === "jira" && origin.resource.split("/")[0] === child.resource.split("/")[0]) ||
       (origin.provider === "slack" && child.provider === "slack" && origin.resource === child.resource) ||
       (origin.provider === "confluence" && child.provider === "confluence" && link.relation === "child" && origin.resource.split("/")[0] === child.resource.split("/")[0]);
   }
-  discoveryApprovalAffected(root: EvidenceRoot, links: EvidenceDiscoveryLink[]): string[] {
-    // Only candidate members of *other* roots can change via reuseApproval. Read the catalog once,
-    // then join links in memory; pages with no propagation candidates need no graph traversal.
-    const roots = this.roots().filter(other => other.status === "approved");
-    const targets = new Map(roots.filter(other => other.id !== root.id && this.sharesApproval(root,other)).map(other => [other.id,other]));
-    const candidates = new Map<string, Set<string>>();
-    for (const row of this.db.prepare("SELECT root_id,source_id FROM evidence_members WHERE state='candidate'").all()) {
-      const rootId=String(row.root_id), sourceId=String(row.source_id);
-      if (!targets.has(rootId)) continue;
-      const owners=candidates.get(sourceId) ?? new Set<string>(); owners.add(rootId); candidates.set(sourceId,owners);
-    }
-    if (!candidates.size) return [];
-    const relevant: Array<{id:string; parsed:ReturnType<typeof parseEvidenceSource>; link:EvidenceDiscoveryLink}> = [];
-    for (const link of links) {
-      let parsed: ReturnType<typeof parseEvidenceSource>;
-      try { parsed = parseEvidenceSource({url:link.url,label:link.label.slice(0,160) || link.url.slice(0,160),mode:"connector",intervalSeconds:900}); }
-      catch { continue; }
-      const id = evidenceHash(stableJSON([parsed.provider,parsed.resource,parsed.selector]));
-      if (candidates.has(id)) relevant.push({id,parsed,link});
-    }
-    if (!relevant.length) return [];
-    const approved = new Set(roots.filter(other => this.sharesApproval(other,root))
-      .flatMap(other => this.reachableMembers(other.id,other).filter(m=>m.state==="approved").map(m=>m.source_id)));
-    const origin=this.store.get(root.sourceId), affectedRoots=new Set<string>();
-    for (const {id,parsed,link} of relevant) if (this.automaticallyApproved({...parsed,id},root,link,approved,origin))
-      for (const rootId of candidates.get(id)!) affectedRoots.add(rootId);
-    return [...new Set([...affectedRoots].flatMap(id=>this.affected(targets.get(id)!)))];
+  afterPublication(effect: () => void): void {
+    if (this.publicationEffects) this.publicationEffects.push(effect);
+    else effect();
+  }
+  publish<T>(change: () => T, admit: (changed: string[]) => void, beforeInvalidate?: (id: string) => void): { result: T; changed: string[]; effects: Array<() => void> } {
+    const previous = this.publicationChanges, previousEffects = this.publicationEffects, changed = new Set<string>(), effects: Array<() => void> = [];
+    const previousBefore = this.beforePublicationInvalidation;
+    this.publicationChanges = changed;
+    this.publicationEffects = effects;
+    this.beforePublicationInvalidation = beforeInvalidate;
+    try {
+      return this.atomic(() => {
+        const result = change();
+        const ids = [...changed];
+        // Admission is synchronous and precedes COMMIT. A busy actual consumer rolls back the
+        // entire page/ingest transaction; predicted graph membership is never a mutation receipt.
+        admit(ids);
+        if (previous) for (const id of ids) previous.add(id);
+        if (previousEffects) previousEffects.push(...effects);
+        return {result,changed:ids,effects:previousEffects ? [] : effects};
+      });
+    } finally { this.publicationChanges = previous; this.publicationEffects = previousEffects; this.beforePublicationInvalidation = previousBefore; }
   }
   private reuseApproval(sourceId: string, from: EvidenceRoot): void {
     for (const other of this.roots()) {

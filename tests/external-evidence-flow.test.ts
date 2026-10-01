@@ -682,7 +682,7 @@ it.each(["host", "native", "cached"] as const)("%s 수집 승인 전파는 optio
     expect(db.getTopic("t").approvedPlanSHA256).toBe("f".repeat(64));
     expect(clear).not.toHaveBeenCalledWith("t");
     if (mode==="native") {
-      expect(c.members(collecting.id).find(m=>m.source_id===collecting.sourceId)?.cursor).toBe("next-page");
+      expect(c.members(collecting.id).find(m=>m.source_id===collecting.sourceId)?.cursor,JSON.stringify(db.evidence.get(collecting.sourceId).collection)).toBe("next-page");
       expect(c.roots().find(r=>r.id===collecting.id)?.nextCheckAt).toBe(0);
       expect(db.evidence.get(collecting.sourceId).collection).toBeUndefined();
     }
@@ -696,7 +696,7 @@ it.each(["host", "native", "cached"] as const)("%s 수집 승인 전파는 optio
       expect(c.state("t").entries.find(e=>e.source.url===url)?.state).toBe("candidate");
     }
     if (mode!=="native") c.requestRefresh(collecting.id);
-    expect((await request()).statusCode).toBe(200);
+    const result=await request(); expect(result.statusCode,result.body).toBe(200);
     expect(c.state("t").entries.find(e=>e.source.url===url)?.state).toBe("approved");
     expect(db.getTopic("t").approvedPlanSHA256).toBeNull();
     expect(clear).toHaveBeenCalledWith("t");
@@ -751,7 +751,7 @@ it("같은 루트의 candidate를 child로 재발견해도 실제 승인 변경�
   const connector={configured:()=>true,fetch:async()=>{throw Error("unused");},discover:async()=>({revision:"r2",cursor:null,units:[],links:[{...link,relation:"child" as const}]})};
   const service=new EvidenceService(db.evidence,connector,undefined,undefined,connector);
   service.canPublish=id=>engine.canPublishEvidence(id);
-  service.publishSelection=(selected,publish,guarded)=>engine.publishEvidence(()=>({selected:selected(),guarded:guarded?.() ?? []}),publish);
+  service.publishSelection=(guarded,publish)=>engine.publishEvidence(guarded,publish);
   const stale=vi.spyOn(DiagnosisService.prototype,"staleOnReplan");
   try {
     await service.collect(root.id);
@@ -760,4 +760,79 @@ it("같은 루트의 candidate를 child로 재발견해도 실제 승인 변경�
     expect(readFileSync(join(f.root,"topics/t/plan.md"),"utf8")).toBe("unchanged plan");
     expect(stale).not.toHaveBeenCalled();
   } finally {await service.stop();}
+});
+
+
+it.each(["refreshed-graph", "invalid-last-page"] as const)("%s 수집은 변경되지 않은 다른 단계의 계획과 별칭을 보존한다", async mode => {
+  const f=fixture(),db=f.database,c=db.evidence.catalog;
+  db.evidence.detach("t",f.source.id);
+  db.updateTopic("t",{state:"DRAFT"});
+  db.createTopic({...f.topic,id:"u",slug:"u",state:"DRAFT"});
+  const groupId="11111111-1111-4111-8111-111111111114";
+  db.workGroups.create(groupId,{title:"Form",goal:"Form",contracts:"Scope",stages:[
+    {id:"ui",kind:"work",title:"UI",goal:"Layout",acceptance:"Verified",dependsOn:[]},
+    {id:"all",kind:"integration",title:"All",goal:"All",acceptance:"Verified",dependsOn:["ui"]},
+  ]},f.root,"a".repeat(40));
+  const selected=c.addScoped("group",groupId,{url:"https://www.figma.com/design/rollback?node-id=1-2",label:"Optional",scope:"group",required:false,mode:"connector",intervalSeconds:900},true);
+  const collecting=c.addScoped("group",groupId,{url:mode==="refreshed-graph" ? "https://team.atlassian.net/wiki/spaces/APP/pages/123/Parent" : sourceInput.url,label:"Collector",scope:"group",required:true,mode:"connector",intervalSeconds:900},true);
+  const group=db.workGroups.get(groupId);
+  db.workGroups.revise(groupId,{title:group.title,goal:group.goal,contracts:group.contracts,stages:group.stages.map(s=>({...s,evidenceRootIds:[s.id==="ui" ? selected.id : collecting.id]}))},group.version);
+  db.workGroups.link(groupId,"ui","t","a".repeat(40));
+  db.workGroups.link(groupId,"all","u","a".repeat(40));
+  const url=mode==="refreshed-graph" ? "https://docs.google.com/spreadsheets/d/refresh-policy/edit" : "https://team.atlassian.net/browse/APP-2";
+  const link={url,label:"policy",unitId:"body",relation:"link" as const};
+  const current=()=>c.roots().find(r=>r.id===collecting.id)!;
+  if (mode==="refreshed-graph") {
+    c.acceptPage(current(),db.evidence.get(collecting.sourceId),null,{revision:"seed",cursor:null,units:[],links:[link]});
+    const child=c.members(collecting.id).find(m=>m.source_id!==collecting.sourceId)!;
+    c.select("u",{version:c.version("u"),rootId:collecting.id,sourceId:child.source_id,action:"accept"});
+  }
+  c.acceptPage(current(),db.evidence.get(collecting.sourceId),null,{revision:"page1",cursor:"next",units:[{id:"body",kind:"issue",content:"first page"}],links:[]});
+  c.acceptPage(selected,db.evidence.get(selected.sourceId),null,{revision:"candidate",cursor:null,units:[],links:[link]});
+  if (mode==="refreshed-graph") {
+    c.acceptPage(current(),db.evidence.get(collecting.sourceId),"next",{revision:"page2",cursor:null,units:[],links:[link]});
+    c.requestRefresh(collecting.id);
+  }
+  db.updateTopic("t",{state:"AWAITING_USER_APPROVAL",planSHA256:"f".repeat(64),approvedPlanSHA256:"f".repeat(64)});
+  await f.dependencies.artifacts.write("t","plan",1,"preserved plan");
+  const config=loadConfig({repositoryPath:f.root,dataDirectory:f.root,webDirectory:join(f.root,"no-web"),launchToken:"test-token",enforceBudgets:false});
+  const connector={configured:()=>true,fetch:async()=>{throw Error("unused");},discover:async(source:any)=>({revision:"new",cursor:null,units:[{id:"body",kind:"issue" as const,content:"different last page"}],links:source.id===collecting.sourceId ? [link] : []})};
+  const app=await buildApp({config,database:db,runner:f.runner,claude:f.adapter,codex:{...f.adapter,role:"codex"},nativeEvidenceConnector:connector});
+  const stale=vi.spyOn(DiagnosisService.prototype,"staleOnReplan");
+  const originalHash=db.evidence.get(collecting.sourceId).contentHash;
+  try {
+    const response=await app.inject({method:"POST",url:"/api/topics/u/evidence/collect",headers:{"x-consensus-token":"test-token","x-consensus-actor":"mediator"},payload:{}});
+    expect(response.statusCode).toBe(200);
+    expect(c.state("t").entries.find(e=>e.source.url===url)?.state).toBe("candidate");
+    expect(db.getTopic("t").approvedPlanSHA256).toBe("f".repeat(64));
+    expect(readFileSync(join(f.root,"topics/t/plan.md"),"utf8")).toBe("preserved plan");
+    expect(stale).not.toHaveBeenCalled();
+    if (mode==="invalid-last-page") {
+      expect(db.evidence.get(collecting.sourceId).collection?.status).toBe("error");
+      expect(db.evidence.get(collecting.sourceId).contentHash).toBe(originalHash);
+    }
+  } finally {await app.close();dbs.splice(dbs.indexOf(db),1);}
+});
+
+
+it("후보 없는 workspace 빈 페이지 수집은 루트별 전체 작업 탐색을 반복하지 않는다", async () => {
+  const f=fixture(),db=f.database,c=db.evidence.catalog;
+  db.evidence.detach("t",f.source.id);
+  db.updateTopic("t",{state:"DRAFT"});
+  for (let i=1;i<20;i++) {
+    db.createTopic({...f.topic,id:`empty-${i}`,slug:`empty-${i}`,state:"DRAFT"});
+    c.add(`empty-${i}`,{url:`https://team.atlassian.net/browse/EMPTY-${i}`,label:"Other",scope:"topic",required:false,mode:"connector",intervalSeconds:900},true);
+  }
+  const root=c.add("t",{url:"https://docs.google.com/spreadsheets/d/empty-workspace/edit",label:"Workspace",scope:"workspace",required:false,mode:"connector",intervalSeconds:900},true);
+  const config=loadConfig({repositoryPath:f.root,dataDirectory:f.root,webDirectory:join(f.root,"no-web"),launchToken:"test-token",enforceBudgets:false});
+  const connector={configured:()=>true,fetch:async()=>{throw Error("unused");},discover:async()=>({revision:"empty",cursor:null,units:[],links:[]})};
+  const app=await buildApp({config,database:db,runner:f.runner,claude:f.adapter,codex:{...f.adapter,role:"codex"},nativeEvidenceConnector:connector});
+  const prepare=vi.spyOn(DatabaseSync.prototype,"prepare");
+  try {
+    const response=await app.inject({method:"POST",url:"/api/topics/t/evidence/collect",headers:{"x-consensus-token":"test-token","x-consensus-actor":"mediator"},payload:{}});
+    expect(response.statusCode).toBe(200);
+    const queries=prepare.mock.calls.length;
+    expect(c.roots().find(r=>r.id===root.id)?.lastCompleteAt).not.toBeNull();
+    expect(queries).toBeLessThan(3000);
+  } finally {prepare.mockRestore();await app.close();dbs.splice(dbs.indexOf(db),1);}
 });

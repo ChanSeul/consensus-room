@@ -21,9 +21,14 @@ export class EvidenceService {
   private readonly collectedThisPoll = new Map<string, { key: string; links: EvidenceDiscoveryLink[] }>();
   onIdle: () => void = () => {};
   canPublish: (topicId: string) => boolean = () => true;
-  publishSelection: <T>(affected: () => string[], change: () => T, guarded?: () => string[]) => Promise<T> = async (affected, change, guarded = () => []) => {
-    if ([...affected(), ...guarded()].some(id => !this.canPublish(id))) throw new EvidenceAdmissionExpired("승인 전파 대상에서 작업이 실행 중입니다.");
-    return change();
+  publishSelection: <T>(guarded: () => string[], change: () => T) => Promise<T> = async (guarded, change) => {
+    const admit = (ids: string[]) => {
+      if (ids.some(id => !this.canPublish(id))) throw new EvidenceAdmissionExpired("근거 소비 작업이 실행 중입니다.");
+    };
+    admit(guarded());
+    const {result,effects} = this.store.catalog.publish(change,admit);
+    for (const effect of effects) effect();
+    return result;
   };
 
   constructor(readonly store: EvidenceStore, private readonly connector: EvidenceConnector,
@@ -92,11 +97,11 @@ export class EvidenceService {
           const units=snapshot.units.map(({contentHash: _hash,imageHash,...unit})=>({ ...unit,
             ...(imageHash ? {imageBase64:this.store.image(imageHash).toString("base64")} : {}) }));
           const links = this.collectedThisPoll.get(source.id)?.links ?? discoverLinks(units,source.url);
-          await this.publishSelection(() => this.store.catalog.discoveryApprovalAffected(root,links), () => {
+          await this.publishSelection(guarded, () => {
             if (this.abort.signal.aborted) throw new EvidenceAdmissionExpired();
             committing=true;
             this.store.catalog.replacePages(root,source,cursor,{units,links,revision:source.revision!});
-          }, guarded);
+          });
           continue;
         }
         if (!reader?.discover || reader.configured?.(source) === false)
@@ -115,7 +120,7 @@ export class EvidenceService {
         if (this.abort.signal.aborted || !publishable()) return;
         if (page.connectionKey && source.collection?.connectionKey && page.connectionKey !== source.collection.connectionKey && !page.accountConfirmed)
           throw new EvidenceFetchError("MCP 연결 계정이 바뀌었습니다. 로컬 연결 설정에서 사용할 계정을 확인하세요.", 300, true);
-        await this.publishSelection(() => this.store.catalog.discoveryApprovalAffected(root,page.links), () => {
+        await this.publishSelection(guarded, () => {
           if (this.abort.signal.aborted) throw new EvidenceAdmissionExpired();
           committing=true;
           this.store.catalog.acceptPage(root, source, cursor, page, generation);
@@ -123,11 +128,11 @@ export class EvidenceService {
             const data = this.store.catalog.collected(root.id, source.id), before = this.store.get(source.id);
             const after = this.store.ingest(source.id, { revision:data.revision,units:data.units,checkId:check.checkId }, true,data.generation);
             this.store.recordCollection(source.id, { status: before.contentHash === after.contentHash ? "unchanged" : "collected", checkedAt: after.checkedAt!, connectionKey: page.connectionKey, missing: page.missing, error: undefined });
-            if (page.connectionKey) this.collectedThisPoll.set(source.id, { key: `${page.connectionKey}:${after.contentHash}`, links: data.links });
+            if (page.connectionKey) this.store.catalog.afterPublication(() => this.collectedThisPoll.set(source.id, { key: `${page.connectionKey}:${after.contentHash}`, links: data.links }));
             this.store.measure(source.id, before.contentHash === after.contentHash ? "unchangedCollections" : "changedCollections", 1);
-            if (before.contentHash !== after.contentHash) this.changed(after);
+            if (before.contentHash !== after.contentHash) this.store.catalog.afterPublication(() => this.changed(after));
           }
-        }, guarded);
+        });
       } catch (error) {
         if (this.abort.signal.aborted || error instanceof EvidenceAdmissionExpired) return;
         this.store.recordCollection(source.id, { status: "error", error: error instanceof Error ? error.message.slice(0, 500) : "수집 실패" });
@@ -273,13 +278,13 @@ export class EvidenceService {
   }
   ingest(id: string, input: EvidenceSnapshotInput): EvidenceSource {
     const before = this.store.get(id); const after = this.store.ingest(id, input);
-    if (before.contentHash !== after.contentHash) this.changed(after);
+    if (before.contentHash !== after.contentHash) this.store.catalog.afterPublication(() => this.changed(after));
     return after;
   }
   importHost(topicId: string, input: EvidenceHostImport): EvidenceSource {
     const before=this.store.get(input.sourceId);
     const after=this.store.catalog.importHostSnapshot(topicId,input,discoverLinks(input.units,before.url));
-    if (before.contentHash!==after.contentHash) this.changed(after);
+    if (before.contentHash!==after.contentHash) this.store.catalog.afterPublication(() => this.changed(after));
     return after;
   }
 }
