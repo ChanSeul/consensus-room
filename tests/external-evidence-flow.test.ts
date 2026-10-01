@@ -420,6 +420,53 @@ it("only users approve roots, stale or running selections preserve the active so
   await app.close();dbs.splice(dbs.indexOf(f.database),1);
 });
 
+it("connects a standalone topic to its registered group evidence through the idle user API without changing completed stages", async () => {
+  const f=fixture(); f.database.updateTopic("t",{state:"DRAFT"});
+  const groupId="11111111-1111-4111-8111-111111111111", foreignId="22222222-2222-4222-8222-222222222222";
+  const definition={title:"Listing registration",goal:"Listing form",contracts:"Registered policy and designs",stages:[
+    {id:"first",kind:"work" as const,title:"First",goal:"Form",acceptance:"Verified",dependsOn:[],budget:{mode:"observe" as const}},
+    {id:"last",kind:"integration" as const,title:"Integration",goal:"Complete",acceptance:"Verified",dependsOn:["first"],budget:{mode:"observe" as const}},
+  ]};
+  f.database.workGroups.create(groupId,definition,f.root,"a".repeat(40));
+  f.database.workGroups.create(foreignId,definition,join(f.root,"other-repo"),"a".repeat(40));
+  f.database.createTopic({...f.topic,id:"completed",slug:"completed",state:"CLOSED"});
+  f.database.workGroups.link(groupId,"first","completed","a".repeat(40));
+  const c=f.database.evidence.catalog;
+  const urls=["https://docs.google.com/spreadsheets/d/policy/edit",...Array.from({length:9},(_,i)=>`https://www.figma.com/design/listing?node-id=${i+1}-2`)];
+  urls.forEach(url=>c.addScoped("group",groupId,{url,label:url,scope:"group",required:true,mode:"connector",intervalSeconds:900},true));
+  const completed=f.database.getTopic("completed"),group=f.database.workGroups.get(groupId);
+  const config=loadConfig({repositoryPath:f.root,dataDirectory:f.root,webDirectory:join(f.root,"no-web"),launchToken:"test-token",enforceBudgets:false});
+  const app=await buildApp({config,database:f.database,runner:f.runner,claude:f.adapter,codex:{...f.adapter,role:"codex"}});
+  const headers={"x-consensus-token":"test-token"},route="/api/topics/t/evidence";
+  const catalog=async()=>(await app.inject({method:"GET",url:`${route}/catalog`,headers})).json();
+  const select=async(groupId:string|null,version:string,actor?:string)=>app.inject({method:"POST",url:`${route}/group`,
+    headers:{...headers,...(actor?{"x-consensus-actor":actor}:{})},payload:{groupId,version}});
+  try {
+    expect((await app.inject({method:"GET",url:route,headers})).json().sources.map((s:any)=>s.url)).toEqual([sourceInput.url]);
+    const before=await catalog();
+    expect(before.groups.map((g:any)=>g.id)).toEqual([groupId]);
+    expect((await select(groupId,before.version,"mediator")).statusCode).toBe(403);
+    expect((await select(foreignId,before.version)).statusCode).toBe(409);
+    f.database.startAction({id:"busy",topicId:"t",kind:"test",status:"running",createdAt:new Date().toISOString(),finishedAt:null,error:null,
+      pid:null,pgid:null,processExecutable:null,processCommand:null,processStartedAt:null});
+    expect((await select(groupId,before.version)).statusCode).toBeGreaterThanOrEqual(400);
+    expect((await catalog()).groupId).toBeNull();
+    f.database.finishAction("busy","succeeded");
+    expect((await select(groupId,before.version)).statusCode).toBe(200);
+    const connected=(await app.inject({method:"GET",url:route,headers})).json();
+    expect(connected.sources.map((s:any)=>s.url).sort()).toEqual([sourceInput.url,...urls].sort());
+    expect(f.database.getTopic("t").planSHA256).toBeNull();
+    expect(f.database.getTopic("completed")).toEqual(completed);
+    expect(f.database.workGroups.get(groupId)).toEqual(group);
+    expect((await select(null,before.version)).statusCode).toBe(409);
+    expect((await catalog()).groupId).toBe(groupId);
+    expect((await select(null,(await catalog()).version)).statusCode).toBe(200);
+    expect((await app.inject({method:"GET",url:route,headers})).json().sources.map((s:any)=>s.url)).toEqual([sourceInput.url]);
+    expect((await app.inject({method:"POST",url:"/api/topics/completed/evidence/group",headers,
+      payload:{groupId:null,version:c.version("completed")}})).statusCode).toBe(409);
+  } finally {await app.close();dbs.splice(dbs.indexOf(f.database),1);}
+});
+
 
 it("frozen HTTP and mediator readers return the committed body after shared updates and expiration", async () => {
   const f=fixture();f.database.updateTopic("t",{state:"READY_TO_DELIVER",committedOID:"b".repeat(40)});

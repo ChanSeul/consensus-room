@@ -25,6 +25,17 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
     }
   };
   app.get<{ Params: { id: string } }>("/api/topics/:id/evidence/catalog", async request => db.evidence.catalog.state(request.params.id));
+  app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/group", async request => {
+    user(request.headers);
+    const input=z.object({version:z.string().regex(/^[a-f0-9]{64}$/),groupId:z.string().uuid().nullable()}).strict().parse(request.body);
+    db.evidence.catalog.assertGroup(request.params.id,input);
+    if (db.evidence.catalog.context(request.params.id).group === input.groupId) return db.evidence.catalog.state(request.params.id);
+    await workflow.changeEvidenceSelection([request.params.id],()=>db.evidence.catalog.selectGroup(request.params.id,input));
+    notifySelection([request.params.id]);
+    db.appendEvent({topicId:request.params.id,actor:"user",kind:"note",state:db.getTopic(request.params.id).state,
+      body:input.groupId ? "등록된 작업 그룹의 근거를 이 주제에 연결했습니다." : "이 주제의 근거 묶음 연결을 해제했습니다.",payload:{evidenceGroupId:input.groupId}});
+    return db.evidence.catalog.state(request.params.id);
+  });
   app.get<{ Params: { id: string } }>("/api/topics/:id/evidence/host-plan", async request => {
     const input = z.object({ cursor: z.string().regex(/^[a-f0-9]{64}$/).optional(),
       limit: z.coerce.number().int().min(1).max(50).default(50) }).strict().parse(request.query);

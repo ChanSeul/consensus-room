@@ -13,6 +13,47 @@ const state = (ready = true): EvidenceTopicState => ({ plan: { scopeGeneration: 
 }] });
 const catalog = (): EvidenceCatalog => ({ version: "a".repeat(64), groupId: "g", roots: [], entries: [], history: [], coverage: { sources: 0, units: 0, complete: 0, pending: 0, failed: 0, candidates: 0, ready: true } });
 beforeEach(() => { vi.spyOn(api, "evidenceCatalog").mockResolvedValue(catalog()); });
+it("places separately registered Jira descendants under their parent root instead of showing six peers", async () => {
+  vi.spyOn(api,"evidence").mockResolvedValue({...state(),sources:[]});
+  const labels=["Root Jira","Form policy","Photo policy","Draft policy","Backend form","Backend draft"];
+  const sources=labels.map((label,i)=>({...state().sources[0],id:String(i+1).repeat(64),label,url:`https://team.atlassian.net/browse/APP-${i+1}`}));
+  const roots=sources.map((source,i)=>({id:`root-${i}`,sourceId:source.id,source,scope:"group" as const,owner:"g",required:true,
+    status:"approved" as const,version:1,createdAt:0,approvedAt:0,lastCompleteAt:0,nextCheckAt:0}));
+  const parents=[null,0,0,0,1,3];
+  vi.spyOn(api,"evidenceCatalog").mockResolvedValue({...catalog(),roots,entries:sources.map((source,i)=>({
+    rootId:"root-0",source:{...source,label:`Collected ${source.label}`},state:"approved" as const,progress:"complete" as const,error:null,
+    discoveredFrom:parents[i]===null?[]:[{sourceId:sources[parents[i]!].id,unitId:"parent",relation:"child"}],
+  }))});
+  render(<EvidencePanel topicId="t" busy={false}/>);
+  const parent=(await screen.findByRole("link",{name:"Root Jira"})).closest("article")!;
+  expect(within(parent).getByRole("link",{name:"Form policy"})).toBeInTheDocument();
+  const form=within(parent).getByRole("link",{name:"Form policy"}).closest("article")!;
+  expect(within(form).getByRole("link",{name:"Backend form"})).toBeInTheDocument();
+  const draft=within(parent).getByRole("link",{name:"Draft policy"}).closest("article")!;
+  expect(within(draft).getByRole("link",{name:"Backend draft"})).toBeInTheDocument();
+});
+it("labels draft sources as task inputs and lets an idle standalone topic select its registered evidence group", async () => {
+  const draft={...state(),plan:{...state().plan,planSHA256:null}};
+  vi.spyOn(api,"evidence").mockResolvedValue(draft);
+  const groupId="11111111-1111-4111-8111-111111111111";
+  vi.spyOn(api,"evidenceCatalog").mockResolvedValue({...catalog(),groupId:null,groups:[{id:groupId,title:"Listing registration"}],groupLocked:false});
+  const selection= pending<EvidenceCatalog>();
+  const select=vi.spyOn(api,"selectEvidenceGroup").mockReturnValue(selection.promise);
+  render(<EvidencePanel topicId="t" busy={false}/>);
+  expect(await screen.findByRole("heading",{name:"이 작업에서 사용할 원문"})).toBeInTheDocument();
+  expect(screen.queryByRole("heading",{name:"현재 계획에 연결된 원문"})).not.toBeInTheDocument();
+  const groups=screen.getByRole("combobox",{name:"이 작업에 연결된 근거 묶음"});
+  fireEvent.change(groups,{target:{value:groupId}});
+  expect(groups).toBeDisabled();
+  fireEvent.change(groups,{target:{value:groupId}});
+  expect(select).toHaveBeenCalledExactlyOnceWith("t",catalog().version,groupId);
+  await act(async()=>{selection.reject(new Error("Topic started a turn"));await selection.promise.catch(()=>{});});
+  expect(await screen.findByRole("alert")).toHaveTextContent("Topic started a turn");
+  expect(groups).toBeEnabled();
+  select.mockResolvedValue(catalog());
+  fireEvent.change(groups,{target:{value:groupId}});
+  await waitFor(()=>expect(select).toHaveBeenCalledTimes(2));
+});
 function pending<T>() { let resolve!: (value: T) => void; let reject!: (error: Error) => void; const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; }); return { promise, resolve, reject }; }
 it("does not allow unverified content to be marked reviewed and preserves the reason after failure", async () => {
   vi.spyOn(api, "evidence").mockResolvedValue(state(false));

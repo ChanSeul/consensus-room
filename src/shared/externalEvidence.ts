@@ -104,6 +104,7 @@ export interface EvidenceCatalogEntry {
 }
 export interface EvidenceCatalog {
   version: string; groupId: string | null; roots: Array<EvidenceRoot & { source: EvidenceSource }>;
+  groups?: Array<{ id: string; title: string }>; groupLocked?: boolean;
   unresolvedLinks?: Array<{ rootId: string; id: string; url: string; error: string }>;
   entries: EvidenceCatalogEntry[]; history: Array<{ at: number; action: string; url: string; scope: EvidenceScope }>;
   coverage: { sources: number; units: number; complete: number; pending: number; failed: number; candidates: number; ready: boolean };

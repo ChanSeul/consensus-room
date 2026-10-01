@@ -1,10 +1,27 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { type EvidenceCatalog, type EvidenceHostPlan, type EvidenceScope } from "../shared/externalEvidence";
 import { api } from "./api";
 import { EvidencePlatforms } from "./EvidencePlatforms";
 
 const scopes = { group: "이 작업 그룹과 이후 단계", topic: "이 주제만", workspace: "이 저장소의 모든 작업" };
 const progress = { pending: "수집 대기", reading: "수집 중", complete: "수집 완료", failed: "수집 실패" };
+type CatalogRoot = EvidenceCatalog["roots"][number];
+interface RootNode { root: CatalogRoot; children: RootNode[] }
+function rootHierarchy(catalog: EvidenceCatalog): RootNode[] {
+  const nodes=catalog.roots.filter(root=>root.status!=="removed").map(root=>({root,children:[] as RootNode[]}));
+  const parents=new Map<RootNode,RootNode>();
+  for (const node of nodes.filter(n=>n.root.source.provider==="jira")) {
+    const parentIds=catalog.entries.filter(e=>e.source.id===node.root.sourceId && e.state!=="rejected")
+      .flatMap(e=>e.discoveredFrom.filter(from=>from.relation==="child").map(from=>from.sourceId));
+    const parent=nodes.find(n=>n!==node && n.root.source.provider==="jira" && n.root.sourceId!==node.root.sourceId && parentIds.includes(n.root.sourceId));
+    if (!parent) continue;
+    let ancestor:RootNode|undefined=parent;
+    while (ancestor && ancestor!==node) ancestor=parents.get(ancestor);
+    if (!ancestor) parents.set(node,parent);
+  }
+  for (const [node,parent] of parents) parent.children.push(node);
+  return nodes.filter(node=>!parents.has(node));
+}
 export function EvidenceCatalogPanel({ topicId, busy }: { topicId: string; busy: boolean }) {
   const [catalog, setCatalog] = useState<EvidenceCatalog | null>(null);
   const [error, setError] = useState(""); const [saving, setSaving] = useState(false);
@@ -35,11 +52,43 @@ export function EvidenceCatalogPanel({ topicId, busy }: { topicId: string; busy:
   };
   const select = (rootId: string, action: "approve" | "remove" | "accept" | "reject" | "dismiss", sourceId?: string) =>
     void run(() => api.selectEvidence(topicId, catalog!.version, rootId, action, sourceId));
+  const renderRoot=({root,children}:RootNode):ReactNode=><article key={root.id}>
+    <a href={root.source.url} target="_blank" rel="noreferrer">{root.source.label}</a> · {scopes[root.scope]} · {root.status === "approved" ? "사용자 승인됨" : "루트 검수 대기"}
+    <p>{root.source.url}</p>
+    {root.source.error && <p role="alert">{root.source.error}</p>}
+    {root.scanStartedAt !== undefined && <small>이번 수집 시작 {new Date(root.scanStartedAt).toLocaleString()} · {root.lastCompleteAt === null ? "수집 중" : `완료 ${new Date(root.lastCompleteAt).toLocaleString()}`} (각 원문의 조회 시각은 서로 다를 수 있습니다.)</small>}
+    {root.status === "proposed" && <button disabled={busy || saving} onClick={() => select(root.id,"approve")}>이 루트와 탐색 범위 승인</button>}
+    <button disabled={busy || saving} onClick={() => select(root.id,"remove")}>앞으로 사용하지 않기</button>
+    {children.length>0 && <details className="evidence-root-children" open>
+      <summary>하위 Jira 탐색 시작점 {children.length}개</summary>
+      {children.map(renderRoot)}
+    </details>}
+    <details><summary>연결 자료와 수집 상태</summary>
+      {catalog!.entries.some(e => e.rootId === root.id && e.state === "candidate") && <button disabled={busy || saving}
+        onClick={() => void run(() => api.selectEvidenceBatch(topicId,catalog!.version,root.id,catalog!.entries.filter(e=>e.rootId===root.id && e.state==="candidate").slice(0,200).map(e=>e.source.id)))}>아래 검수 대기 자료를 확인했고 사용 승인 (최대 200개)</button>}
+      <EvidencePlatforms items={catalog!.entries.filter(e => e.rootId === root.id)} provider={entry => entry.source.provider}>{entry => <div key={entry.source.id}>
+        <a href={entry.source.url} target="_blank" rel="noreferrer">{entry.source.label}</a> · {entry.state === "candidate" ? "검수 대기" : entry.state === "rejected" ? "제외됨" : progress[entry.progress]}
+        <p>{entry.source.url}{entry.source.selector ? ` · 선택 위치 ${entry.source.selector}` : ""}</p>
+        {entry.discoveredFrom.map((from, i) => <small key={i}>발견 위치: {catalog!.entries.find(e => e.source.id === from.sourceId)?.source.label ?? from.sourceId} / {from.unitId} </small>)}
+        {entry.error && <p role="alert">{entry.error}</p>}
+        {entry.source.id !== root.sourceId && <>
+          {entry.state !== "approved" && <button disabled={busy || saving} onClick={() => select(root.id,"accept",entry.source.id)}>사용 승인</button>}
+          {entry.state !== "rejected" && <button disabled={busy || saving} onClick={() => select(root.id,"reject",entry.source.id)}>이 루트에서 제외</button>}
+        </>}
+      </div>}</EvidencePlatforms>
+    </details>
+  </article>;
   return <section aria-label="근거 탐색 범위">
     <h3>탐색할 루트와 사람의 검수</h3>
-    <p>Jira 루트는 작업마다 지정합니다. 승인한 Jira의 하위·연결 티켓과 Slack 채널의 답글을 모두 탐색합니다. 새 외부 문서와 Figma 노드는 아래에서 검수합니다.</p>
+    <p>Jira 루트는 작업마다 지정합니다. 저장소 공통 Slack 채널에서는 이 작업의 승인된 원문을 참조한 스레드만 사용합니다. 작업에 직접 등록한 채널과 스레드는 지정한 범위 전체를 탐색합니다.</p>
     <p>링크를 해제하면 다음 계획과 세션에서 제외합니다. 과거 원문·인용·완료 결과는 보존하며, 진행 중 턴이 끝난 뒤 변경할 수 있습니다.</p>
     {catalog && <>
+      {(catalog.groups?.length ?? 0) > 0 && <label>이 작업에 연결된 근거 묶음 <select aria-label="이 작업에 연결된 근거 묶음"
+        value={catalog.groupId ?? ""} disabled={busy || saving || catalog.groupLocked}
+        onChange={event=>void run(()=>api.selectEvidenceGroup(topicId,catalog.version,event.target.value || null))}>
+        <option value="">이 주제에 직접 등록한 자료</option>
+        {catalog.groups!.map(group=><option key={group.id} value={group.id}>{group.title}</option>)}
+      </select></label>}
       <p role="status">자료 {catalog.coverage.sources}개 · 원문 조각 {catalog.coverage.units}개 · 수집 완료 {catalog.coverage.complete} · 대기/진행 {catalog.coverage.pending} · 실패 {catalog.coverage.failed} · 검수 대기 {catalog.coverage.candidates} · {catalog.coverage.ready ? "필수 범위 수집 완료" : "필수 범위 미완료"}</p>
       <button disabled={busy || saving} onClick={() => {
         const current = generation.current;
@@ -52,35 +101,7 @@ export function EvidenceCatalogPanel({ topicId, busy }: { topicId: string; busy:
           {` · ${read.integration} · ${read.requiredReads.join(" / ")}`}</p>}</EvidencePlatforms>
         {hostPlan.nextCursor !== null && <p>목록에 더 많은 원문이 있습니다. 수집 요청에 다음 목록도 포함해 달라고 알려 주세요.</p>}
       </aside>}
-      <EvidencePlatforms items={catalog.roots.filter(r => r.status !== "removed")} provider={root => root.source.provider}>{root => <article key={root.id}>
-        <a href={root.source.url} target="_blank" rel="noreferrer">{root.source.label}</a> · {scopes[root.scope]} · {root.status === "approved" ? "사용자 승인됨" : "루트 검수 대기"}
-        <p>{root.source.url}</p>
-        {root.scanStartedAt !== undefined && <small>이번 수집 시작 {new Date(root.scanStartedAt).toLocaleString()} · {root.lastCompleteAt === null ? "수집 중" : `완료 ${new Date(root.lastCompleteAt).toLocaleString()}`} (각 원문의 조회 시각은 서로 다를 수 있습니다.)</small>}
-        {root.status === "proposed" && <button disabled={busy || saving} onClick={() => select(root.id,"approve")}>이 루트와 탐색 범위 승인</button>}
-        <button disabled={busy || saving} onClick={() => select(root.id,"remove")}>앞으로 사용하지 않기</button>
-        <details><summary>연결 자료와 수집 상태</summary>
-          {catalog.entries.some(e => e.rootId === root.id && e.state === "candidate") && <button disabled={busy || saving}
-            onClick={() => void run(() => api.selectEvidenceBatch(topicId,catalog.version,root.id,catalog.entries.filter(e=>e.rootId===root.id && e.state==="candidate").slice(0,200).map(e=>e.source.id)))}>아래 검수 대기 자료를 확인했고 사용 승인 (최대 200개)</button>}
-          <EvidencePlatforms items={catalog.entries.filter(e => e.rootId === root.id)} provider={entry => entry.source.provider}>{entry => <div key={entry.source.id}>
-            <a href={entry.source.url} target="_blank" rel="noreferrer">{entry.source.label}</a> · {entry.state === "candidate" ? "검수 대기" : entry.state === "rejected" ? "제외됨" : progress[entry.progress]}
-            <p>{entry.source.url}{entry.source.selector ? ` · 선택 위치 ${entry.source.selector}` : ""}</p>
-            {entry.discoveredFrom.map((from, i) => <small key={i}>발견 위치: {catalog.entries.find(e => e.source.id === from.sourceId)?.source.label ?? from.sourceId} / {from.unitId} </small>)}
-            {entry.error && <p role="alert">{entry.error}</p>}
-            {entry.source.id !== root.sourceId && <>
-              {entry.state !== "approved" && <button disabled={busy || saving} onClick={() => select(root.id,"accept",entry.source.id)}>사용 승인</button>}
-              {entry.state !== "rejected" && <button disabled={busy || saving} onClick={() => select(root.id,"reject",entry.source.id)}>이 루트에서 제외</button>}
-            </>}
-          </div>}</EvidencePlatforms>
-        </details>
-      </article>}</EvidencePlatforms>
-      {(catalog.unresolvedLinks?.length ?? 0) > 0 && <details><summary>수집할 수 없는 링크 ({catalog.unresolvedLinks!.length})</summary>
-      {catalog.unresolvedLinks!.map(link => <p key={`${link.rootId}:${link.id}`} role="alert">
-        {link.error} <a href={link.url} target="_blank" rel="noreferrer">{link.url}</a>
-        <button disabled={busy || saving} onClick={() => select(link.rootId,"dismiss",link.id)}>이 링크를 탐색 범위에서 제외</button>
-      </p>)}</details>}
-      <details><summary>이전 링크와 검수 기록 ({catalog.history.length})</summary>
-        {catalog.history.map((entry, index) => <p key={index}>{new Date(entry.at).toLocaleString()} · {entry.action} · <a href={entry.url} target="_blank" rel="noreferrer">{entry.url}</a></p>)}
-      </details>
+      <EvidencePlatforms items={rootHierarchy(catalog)} provider={node=>node.root.source.provider}>{renderRoot}</EvidencePlatforms>
     </>}
     <form onSubmit={e => { e.preventDefault(); void run(() => {
       return api.addEvidenceRoot(topicId, { url, label, scope, mode, intervalSeconds: 900, required: true });

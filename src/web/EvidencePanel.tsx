@@ -35,8 +35,8 @@ export function EvidencePanel({ topicId, busy }: { topicId: string; busy: boolea
     <h3>원문 근거 {state ? `(${state.sources.length}) · ${!state.ready ? "원문 확인 필요" : state.reviewed ? "검토됨" : "변경 영향 확인 필요"}` : ""}</h3>
     <EvidenceCatalogPanel key={topicId} topicId={topicId} busy={busy || saving} />
     <p>연결된 읽기 도구로 원문을 수집하고 로컬에서 비교합니다. 변경이 있을 때만 실행 가능한 유휴 작업에서 AI가 영향을 검토합니다. 원문 변경이나 자동 검토로 계획을 승인하지 않습니다.</p>
-    {state && state.sources.length > 0 && <section aria-label="현재 계획에 연결된 원문">
-    <h3>현재 계획에 연결된 원문</h3>
+    {state && state.sources.length > 0 && <section aria-label={state.plan.planSHA256 ? "현재 계획에 연결된 원문" : "이 작업에서 사용할 원문"}>
+    <h3>{state.plan.planSHA256 ? "현재 계획에 연결된 원문" : "이 작업에서 사용할 원문"}</h3>
     <EvidencePlatforms items={state.sources} provider={source => source.provider}>{source => <div key={source.id}>
       <a href={source.url} target="_blank" rel="noreferrer">{source.label}</a>{" · "}
       {source.checkedAt ? new Date(source.checkedAt).toLocaleString() : "아직 확인하지 않음"}

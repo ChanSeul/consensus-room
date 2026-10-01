@@ -118,12 +118,12 @@ export class EvidenceService {
     const integrations = { jira: "Atlassian Rovo", confluence: "Atlassian Rovo", slack: "Slack", figma: "Figma",
       sheets: "Google Drive", document: "Browser" };
     const reads = {
-      jira: ["이슈 본문·전체 댓글", "모든 하위·연결 티켓과 외부 링크"],
+      jira: ["이슈 본문·전체 댓글", "하위·연결 티켓과 승인된 외부 자료"],
       confluence: ["본문·하위 페이지", "전체 본문 댓글·인라인 댓글과 답글"],
       slack: ["채널의 모든 메시지 또는 지정 스레드", "모든 답글·첨부와 원문 링크"],
       figma: ["지정 노드의 디자인 정보(get_design_context)", "필요한 화면 이미지·변수와 댓글"],
       sheets: ["모든 시트의 셀·수식·하이퍼링크", "숨김 시트와 전체 댓글"],
-      document: ["본문·연결 문서", "API 문서이면 실제 OpenAPI 명세"],
+      document: ["본문·승인된 연결 문서", "API 문서이면 실제 OpenAPI 명세"],
     };
     const unique = new Map<string, EvidenceHostPlan["requests"][number]>();
     for (const entry of catalog.entries.filter(entry => {

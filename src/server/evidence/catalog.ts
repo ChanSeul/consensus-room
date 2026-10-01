@@ -32,6 +32,8 @@ export class EvidenceCatalogStore {
         version INTEGER NOT NULL,PRIMARY KEY(root_id,source_id));
       CREATE TABLE IF NOT EXISTS evidence_artifact_boundaries(topic_id TEXT NOT NULL,scope_generation INTEGER NOT NULL,
         artifact_id INTEGER NOT NULL,PRIMARY KEY(topic_id,scope_generation));
+      CREATE TABLE IF NOT EXISTS evidence_group_topics(topic_id TEXT PRIMARY KEY REFERENCES topics(id) ON DELETE CASCADE,
+        group_id TEXT NOT NULL REFERENCES work_groups(id));
     `);
   }
   roots(): EvidenceRoot[] {
@@ -41,7 +43,9 @@ export class EvidenceCatalogStore {
     const topic = this.db.prepare("SELECT repository_path FROM topics WHERE id=?").get(topicId);
     if (!topic) throw new Error("작업이 없습니다.");
     const groups = this.db.prepare("SELECT record_json FROM work_groups").all().map(r => JSON.parse(String(r.record_json)));
-    const group = groups.find(g => Object.values(g.links as Record<string, { topicId: string }>).some(link => link.topicId === topicId));
+    const binding = this.db.prepare("SELECT group_id FROM evidence_group_topics WHERE topic_id=?").get(topicId);
+    const group = groups.find(g => Object.values(g.links as Record<string, { topicId: string }>).some(link => link.topicId === topicId))
+      ?? groups.find(g => g.id === binding?.group_id && g.repositoryPath === topic.repository_path);
     return { workspace: String(topic.repository_path), group: group?.id ?? null, topic: topicId };
   }
   forTopic(topicId: string): EvidenceRoot[] {
@@ -60,7 +64,10 @@ export class EvidenceCatalogStore {
       .run(root.scope, root.owner, this.clock(), action, this.store.get(sourceId).url);
   }
   private invalidate(root: EvidenceRoot): void {
-    for (const id of this.affected(root)) {
+    this.invalidateTopics(this.affected(root));
+  }
+  private invalidateTopics(ids: string[]): void {
+    for (const id of ids) {
       if (this.db.prepare("SELECT 1 FROM topics WHERE id=? AND (state='CLOSED' OR committed_oid IS NOT NULL)").get(id)) continue;
       this.db.prepare(`INSERT INTO evidence_artifact_boundaries
         SELECT id,scope_generation,COALESCE((SELECT MAX(a.id) FROM artifacts a WHERE a.topic_id=topics.id),0) FROM topics WHERE id=?
@@ -97,7 +104,28 @@ export class EvidenceCatalogStore {
     return root;
   }
   version(topicId: string): string {
-    return evidenceHash(stableJSON(this.forTopic(topicId).map(r => [r.id, r.version, r.status])));
+    return evidenceHash(stableJSON(["task-linked-workspace-slack-v2",this.context(topicId).group,
+      this.forTopic(topicId).map(r => [r.id, r.version, r.status])]));
+  }
+  assertGroup(topicId: string, input: { version: string; groupId: string | null }): void {
+    if (input.version !== this.version(topicId)) conflict("근거 목록이 바뀌었습니다. 다시 확인하세요.");
+    if (this.db.prepare("SELECT 1 FROM topics WHERE id=? AND (state='CLOSED' OR committed_oid IS NOT NULL)").get(topicId))
+      conflict("완료한 작업의 근거 묶음은 바꿀 수 없습니다.");
+    const groups = this.db.prepare("SELECT record_json FROM work_groups").all().map(r => JSON.parse(String(r.record_json)));
+    if (groups.some(g => Object.values(g.links as Record<string,{topicId:string}>).some(link=>link.topicId===topicId)))
+      conflict("단계 토픽은 소속 작업 그룹의 근거를 사용합니다.");
+    if (input.groupId !== null && !groups.some(g=>g.id===input.groupId && g.repositoryPath===this.context(topicId).workspace))
+      conflict("같은 저장소의 작업 그룹을 선택하세요.");
+  }
+  selectGroup(topicId: string, input: { version: string; groupId: string | null }): void {
+    this.assertGroup(topicId,input);
+    if (this.context(topicId).group === input.groupId) return;
+    this.atomic(() => {
+      if (input.groupId === null) this.db.prepare("DELETE FROM evidence_group_topics WHERE topic_id=?").run(topicId);
+      else this.db.prepare("INSERT INTO evidence_group_topics VALUES (?,?) ON CONFLICT(topic_id) DO UPDATE SET group_id=excluded.group_id")
+        .run(topicId,input.groupId);
+      this.invalidateTopics([topicId]);
+    });
   }
   assertSelection(topicId: string, input: { version: string; rootId: string; action: string; sourceId?: string }): EvidenceRoot {
     if (input.version !== this.version(topicId)) conflict("근거 목록이 바뀌었습니다. 다시 확인하세요.");
@@ -179,8 +207,28 @@ export class EvidenceCatalogStore {
     }
   }
   sourceIds(topicId: string): string[] {
-    return [...new Set(this.forTopic(topicId).filter(r => r.status === "approved")
-      .flatMap(r => this.reachableMembers(r.id).filter(m => m.state === "approved").map(m => m.source_id)))];
+    const roots=this.forTopic(topicId),members=this.topicMembers(topicId,roots);
+    return [...new Set(roots.filter(r => r.status === "approved")
+      .flatMap(r => members.get(r.id)!.filter(m => m.state === "approved").map(m => m.source_id)))];
+  }
+  private topicMembers(topicId: string, roots: EvidenceRoot[]): Map<string,Member[]> {
+    const members=new Map(roots.map(root=>[root.id,this.reachableMembers(root.id)]));
+    const anchors=new Set(roots.filter(root=>root.scope!=="workspace" && root.status==="approved")
+      .flatMap(root=>members.get(root.id)!.filter(m=>m.state==="approved").map(m=>m.source_id)));
+    for (const row of this.db.prepare("SELECT source_id FROM evidence_topics WHERE topic_id=?").all(topicId)) anchors.add(String(row.source_id));
+    for (const root of roots) {
+      const origin=this.store.get(root.sourceId);
+      if (root.scope!=="workspace" || origin.provider!=="slack" || origin.selector) continue;
+      // A common channel is a discovery index. Its full feed never becomes a task's corpus.
+      // Retain threads linked to an explicitly selected source; channel collection remains required.
+      const relevant=new Set(this.db.prepare("SELECT source_id,parent_id FROM evidence_discovery_edges WHERE root_id=?").all(root.id)
+        .filter(edge=>anchors.has(String(edge.source_id))).map(edge=>String(edge.parent_id)));
+      members.set(root.id,members.get(root.id)!.filter(member=>{
+        const source=this.store.get(member.source_id);
+        return source.provider==="slack" && Boolean(source.selector) && (relevant.has(source.id) || anchors.has(source.id));
+      }));
+    }
+    return members;
   }
   managed(sourceId: string): boolean {
     return this.roots().some(root => root.status === "approved" && this.members(root.id).some(m => m.source_id === sourceId && m.state === "approved") &&
@@ -191,27 +239,30 @@ export class EvidenceCatalogStore {
       this.reachableMembers(root.id).some(m=>m.source_id===sourceId && m.state==="approved"));
   }
   state(topicId: string): EvidenceCatalog {
-    const roots = this.forTopic(topicId), active = roots.filter(r => r.status !== "removed");
-    const entries = active.flatMap(root => this.reachableMembers(root.id).map(member => ({ rootId: root.id, source: this.store.get(member.source_id),
+    const roots = this.forTopic(topicId), active = roots.filter(r => r.status !== "removed"),members=this.topicMembers(topicId,roots);
+    const entries = active.flatMap(root => members.get(root.id)!.map(member => ({ rootId: root.id, source: this.store.get(member.source_id),
       state: member.state, progress: member.progress, error: member.error,
       discoveredFrom: this.db.prepare("SELECT parent_id,unit_id,relation FROM evidence_discovery_edges WHERE root_id=? AND source_id=?")
         .all(root.id, member.source_id).map(r => ({ sourceId: String(r.parent_id), unitId: String(r.unit_id), relation: String(r.relation) })) })));
     const approved = entries.filter(e => e.state === "approved");
     const candidates = entries.filter(e => e.state === "candidate").length + active.filter(r => r.status === "proposed").length;
-    const unresolvedLinks = active.flatMap(root => this.db.prepare("SELECT id,url,error FROM evidence_unresolved_links WHERE root_id=? AND dismissed=0").all(root.id)
-      .map(row => ({rootId:root.id,id:String(row.id),url:String(row.url),error:String(row.error)})));
     const coverage = { sources: new Set(approved.map(e => e.source.id)).size,
       units: [...new Set(approved.map(e => e.source.id))].reduce((sum, id) => sum + (this.store.snapshot(id)?.units.length ?? 0), 0),
       complete: approved.filter(e => e.progress === "complete").length,
       pending: approved.filter(e => ["pending", "reading"].includes(e.progress)).length,
-      failed: approved.filter(e => e.progress === "failed").length + unresolvedLinks.length, candidates,
-      ready: unresolvedLinks.length === 0 && active.filter(r => r.required).every(r => r.status === "approved" && r.lastCompleteAt !== null && this.clock() <= r.lastCompleteAt + this.store.get(r.sourceId).intervalSeconds * 2000 &&
-        this.reachableMembers(r.id).filter(m => m.state !== "rejected").every(m => m.state === "approved" && m.progress === "complete")) };
+      failed: approved.filter(e => e.progress === "failed").length, candidates,
+      ready: active.filter(r => r.required).every(r => r.status === "approved" && r.lastCompleteAt !== null && this.clock() <= r.lastCompleteAt + this.store.get(r.sourceId).intervalSeconds * 2000 &&
+        [...members.get(r.id)!,...this.members(r.id).filter(m=>m.source_id===r.sourceId)]
+          .filter(m => m.state !== "rejected").every(m => m.state === "approved" && m.progress === "complete")) };
     const context = this.context(topicId);
     const history = this.db.prepare("SELECT scope,owner,at,action,url FROM evidence_catalog_history ORDER BY id DESC").all()
       .filter(row => row.owner === context[row.scope as EvidenceScope]).map(r => ({ scope: r.scope as EvidenceScope,
         at: Number(r.at), action: String(r.action), url: String(r.url) }));
-    return { version: this.version(topicId), groupId: context.group, roots: roots.map(r => ({ ...r, source: this.store.get(r.sourceId) })), entries, history, unresolvedLinks, coverage };
+    const groups=this.db.prepare("SELECT record_json FROM work_groups").all().map(r=>JSON.parse(String(r.record_json)));
+    const groupLocked=Boolean(this.db.prepare("SELECT 1 FROM topics WHERE id=? AND (state='CLOSED' OR committed_oid IS NOT NULL)").get(topicId))
+      || groups.some(g=>Object.values(g.links as Record<string,{topicId:string}>).some(link=>link.topicId===topicId));
+    return { version: this.version(topicId), groupId: context.group, groups:groups.filter(g=>g.repositoryPath===context.workspace).map(g=>({id:String(g.id),title:String(g.title)})),
+      groupLocked, roots: roots.map(r => ({ ...r, source: this.store.get(r.sourceId) })), entries, history, unresolvedLinks: [], coverage };
   }
   due(): EvidenceRoot[] {
     return this.roots().filter(root => root.status === "approved" && root.nextCheckAt <= this.clock() &&
@@ -296,9 +347,8 @@ export class EvidenceCatalogStore {
         let child: EvidenceSource;
         try { child = this.store.ensureSource({ url: link.url, label: link.label.slice(0, 160) || link.url.slice(0, 160), mode: source.mode, intervalSeconds: source.intervalSeconds }, true); }
         catch {
-          const inserted = this.db.prepare("INSERT OR IGNORE INTO evidence_unresolved_links(root_id,id,url,error) VALUES (?,?,?,?)")
-            .run(root.id,evidenceHash(link.url),link.url,"자동으로 읽을 수 없는 링크입니다. 올바른 주소를 추가하거나 탐색 범위에서 제외하세요.");
-          if (inserted.changes) current.version++;
+          // An incidental reference is not selected evidence. Preserve it in the captured page,
+          // without creating a collection requirement for unsupported navigation or prototype URLs.
           continue;
         }
         const origin = this.store.get(root.sourceId);

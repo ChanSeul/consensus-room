@@ -265,6 +265,8 @@ h3 { font-size: 17px; }
 .evidence-platform > summary { padding: 9px 12px; color: var(--text); background: var(--panel-raised); font-weight: 600; }
 .evidence-platform > summary span { margin-left: 6px; color: var(--muted); font-size: 12px; font-weight: 400; }
 .evidence-platform-items { padding: 0 12px; overflow-wrap: anywhere; }
+.evidence-root-children { margin: 12px 0 12px 12px; padding-left: 12px; border-left: 2px solid var(--line-strong); }
+.evidence-root-children > article { margin-top: 12px; }
 .evidence-platform-items > article, .evidence-platform-items > div { padding: 12px 0; }
 .evidence-platform-items > article + article, .evidence-platform-items > div + div { border-top: 1px solid var(--line); }
 .execution-details > summary { cursor: pointer; font-size: 13px; color: var(--muted); }

@@ -141,6 +141,73 @@ function fixture() {
   return {db,topic};
 }
 const input = (url: string, scope: EvidenceRootInput["scope"] = "group"): EvidenceRootInput => ({url,label:url,scope,required:true,mode:"rest",intervalSeconds:900});
+it("does not require unsupported links found in an original, while a selected original's missing comments still block collection", async () => {
+  // Host import -> catalog/host plan -> mediator. Incidental URLs are not selected evidence.
+  // The original body retains these references; an incomplete approved source still blocks its consumers.
+  const {db}=fixture(),c=db.evidence.catalog;
+  const root=c.add("a",input("https://team.atlassian.net/browse/APP-1"),true);
+  const content=["Policy body", "https://team.atlassian.net/jira/people/team/team-id",
+    "https://cityplan.example.com:442/popup_request.asp", "https://www.figma.com/make/prototype/"].join("\n");
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("Host captures only");}});
+  const capture=(missing:string[]=[])=>{
+    const source=db.evidence.get(root.sourceId);
+    return service.importHost("a",{version:c.version("a"),rootId:root.id,sourceId:source.id,previousHash:source.contentHash,
+      previousCheckedAt:source.checkedAt,observedAt:Date.now(),revision:"host",missing,units:[{id:"body",kind:"issue",content}]});
+  };
+  try {
+    capture();
+    expect(c.state("a").coverage).toMatchObject({sources:1,failed:0,candidates:0,ready:true});
+    expect(c.state("a").unresolvedLinks ?? []).toEqual([]);
+    expect(service.hostPlan("a").requests).toEqual([]);
+    expect(db.evidence.snapshot(root.sourceId)?.units[0].content).toBe(content);
+    expect((await service.prepareMediator(db,"a","incidental-links")).corpus).toMatchObject({sources:1,units:1});
+    capture(["Comments unavailable"]);
+    expect(c.state("a").coverage).toMatchObject({failed:1,ready:false});
+    expect(service.hostPlan("a").requests.map(read=>read.sourceId)).toEqual([root.sourceId]);
+    await expect(service.prepareMediator(db,"a","missing-selected-comments")).rejects.toThrow();
+    capture();
+    expect(c.state("a").coverage.ready).toBe(true);
+  } finally {await service.stop();}
+});
+it("uses only task-linked notification threads from a workspace channel in the catalog and mediator corpus", async () => {
+  // Public host imports -> task source list/catalog -> mediator input. Exact Jira links distinguish APP-1 from APP-10.
+  const {db}=fixture(),c=db.evidence.catalog;
+  const a=c.add("a",input("https://team.atlassian.net/browse/APP-1"),true);
+  const b=c.add("b",input("https://team.atlassian.net/browse/APP-2"),true);
+  const channel=c.add("a",input("https://team.slack.com/archives/D01","workspace"),true);
+  const threads=["1790000000000001","1790000000000002","1790000000000003","1790000000000004"]
+    .map(ts=>`https://team.slack.com/archives/D01/p${ts}`);
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("Host captures only");}});
+  const capture=(topic:string,rootId:string,url:string,content:string,missing:string[]=[])=>{
+    const source=c.state(topic).entries.find(e=>e.rootId===rootId && e.source.url===url)?.source
+      ?? db.evidence.list().find(s=>s.url===url)!;
+    return service.importHost(topic,{version:c.version(topic),rootId,sourceId:source.id,previousHash:source.contentHash,
+      previousCheckedAt:source.checkedAt,observedAt:Date.now(),revision:"host",missing,units:[{id:"body",kind:"message",content}]});
+  };
+  try {
+    capture("a",a.id,db.evidence.get(a.sourceId).url,"Task A policy");
+    capture("b",b.id,db.evidence.get(b.sourceId).url,"Task B policy");
+    capture("a",channel.id,db.evidence.get(channel.sourceId).url,threads.join("\n"));
+    const bodies=["https://team.atlassian.net/browse/APP-1","https://team.atlassian.net/browse/APP-2",
+      "https://team.atlassian.net/browse/APP-10","Unrelated notification"];
+    threads.forEach((url,i)=>capture("a",channel.id,url,bodies[i]));
+    expect(db.evidence.list("a").map(s=>s.url).sort()).toEqual([db.evidence.get(a.sourceId).url,threads[0]].sort());
+    expect(db.evidence.list("b").map(s=>s.url).sort()).toEqual([db.evidence.get(b.sourceId).url,threads[1]].sort());
+    expect(c.state("a").entries.filter(e=>e.rootId===channel.id).map(e=>e.source.url)).toEqual([threads[0]]);
+    expect(c.state("a").coverage.ready).toBe(true);
+    expect((await service.prepareMediator(db,"a","scoped-notifications")).corpus).toMatchObject({sources:2,units:2});
+    capture("a",channel.id,threads[0],bodies[0],["Thread replies unavailable"]);
+    expect(c.state("a").coverage.ready).toBe(false);
+    await expect(service.prepareMediator(db,"a","unread-notifications")).rejects.toThrow();
+    capture("a",channel.id,threads[0],bodies[0]);
+    expect(c.state("a").coverage.ready).toBe(false);
+    capture("a",channel.id,db.evidence.get(channel.sourceId).url,threads.join("\n"));
+    threads.slice(1).forEach((url,i)=>capture("a",channel.id,url,bodies[i+1]));
+    expect(c.state("a").coverage.ready).toBe(true);
+    c.select("a",{version:c.version("a"),rootId:a.id,action:"remove"});
+    expect(db.evidence.list("a")).toEqual([]);
+  } finally {await service.stop();}
+});
 it("keeps the next unread source reachable after the preceding host page is imported", async () => {
   // host-plan -> host-import -> cursor resume is the host collector's public contract.
   // Restoring the old offset would skip the remaining independent root; no model or live auth is used.

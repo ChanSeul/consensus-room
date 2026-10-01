@@ -97,6 +97,7 @@ function unwrapTopics(payload: Topic[] | { topics: Topic[] }): Topic[] {
 export const api = {
   configureIterations: (id: string, scope: "planning" | "implementation" | "revision", limit: number | null, version: number) => request(`/topics/${id}/iteration-limits`, { method: "PUT", body: JSON.stringify({ scope, limit, version }) }),
   evidenceCatalog: (id: string) => request<EvidenceCatalog>(`/topics/${id}/evidence/catalog`),
+  selectEvidenceGroup: (id: string, version: string, groupId: string | null) => request<EvidenceCatalog>(`/topics/${id}/evidence/group`, {method:"POST",body:JSON.stringify({version,groupId})}),
   addEvidenceRoot: (id: string, input: EvidenceRootInput) => request(`/topics/${id}/evidence/roots`, { method: "POST", body: JSON.stringify(input) }),
   selectEvidence: (id: string, version: string, rootId: string, action: "approve" | "remove" | "accept" | "reject" | "dismiss", sourceId?: string) => request<EvidenceCatalog>(`/topics/${id}/evidence/selection`, { method: "POST", body: JSON.stringify({ version, rootId, action, sourceId }) }),
   selectEvidenceBatch: (id:string,version:string,rootId:string,sourceIds:string[]) => request<EvidenceCatalog>(`/topics/${id}/evidence/selection-batch`, {method:"POST",body:JSON.stringify({version,rootId,sourceIds,action:"accept"})}),
