@@ -320,21 +320,25 @@ function workTimeline(events: readonly TimelineEvent[], push: TimelinePush | und
 
 // 어댑터가 매 턴 프롬프트 앞에 붙인다. 개방된 도구의 사용 규칙은 프롬프트가 아니라 sandbox가 강제하지만,
 // 스킬 문서와 하위 에이전트처럼 "읽기는 열고 실행은 재검사"인 경계는 모델에게도 알려야 오작동이 줄어든다.
-// 프로젝트 지시문(CLAUDE.md·AGENTS.md)을 주입한 뒤 붙이는 우선순위 규칙. 원본 지시문은 사람이 IDE 에서 쓰는 전제라
-// 방의 게이트 계약과 충돌하는 조항이 있고, 홈 아래 참조 문서·훅은 러너 샌드박스에서 접근 불가다(2026-09-02 실측).
+// Assignment permissions govern the worker view and unmarked legacy project rules alike.
 export const PROJECT_INSTRUCTION_PRECEDENCE_NOTE = [
-  "프로젝트 지시문 적용 규칙 — 이 방의 계획·게이트·결정문이 프로젝트 지시문보다 우선한다:",
-  "1. 빌드·테스트·시뮬레이터 실행 여부와 검증 범위는 방의 계획과 게이트를 따른다. 프로젝트 지시문의 \"요청 없이 xcodebuild 금지\"·\"빌드 후 시뮬레이터 설치·실행·로그 확인\" 조항은 이 방에서 적용하지 않는다.",
-  "2. 커밋·push·stash 는 방 계약대로 전부 하지 않는다.",
-  "3. 홈 디렉터리(~/.claude/…, iCloud) 아래의 참조 문서 경로와 훅 ack 명령은 이 샌드박스에서 읽거나 실행할 수 없다 — 시도하지 않는다. 필요한 메모리는 방이 프롬프트에 직접 넣는다.",
-  "4. Xcode 탭·IPA 출력·CI 배포·릴리스 브랜치 동기화 조항은 이 방과 무관하다.",
-  "5. 그 밖의 조항(코드 스타일, 근본 해결·이연 금지, 절대 금지 사항, SwiftUI 방침, 분석·비교 방침, 응답 언어)은 그대로 따른다.",
+  "프로젝트 지시문 적용 규칙: 배정된 작업의 승인 범위·권한·검증 계약이 일반 워크플로 기본값보다 우선합니다.",
+  "프로젝트의 코드·제품·근거 계약을 따르세요. 필요한 참조만 읽고, 허용되지 않은 경로·훅은 실행하지 말고 필요한 자료를 보고하세요.",
+  "커밋·push·stash·배포와 실행 설정 변경은 호출자가 담당합니다. 배정된 작업과 결과 보고만 수행하세요.",
 ].join("\n");
 
+const ENGINE_DEFECT_DEFER_POLICY = "Consensus Room 엔진 결함은 engineDefects 배열에 key·title·재현 evidence·workaround로 보고하고 토픽 작업을 계속하세요. 엔진을 직접 수정하지 마세요. 원본 토픽 CLOSED 후 서버가 후속 수정·host-review를 실행합니다. 엔진 문제를 제품 결함 findings와 섞지 말고, 실제로 막힌 작업이나 실패는 그대로 보고하세요.";
+
 export const EXECUTION_POLICY_NOTE = [
-  "실행 규칙: 스킬 문서는 읽고 참고할 수 있지만, 스킬이 지시하는 셸·MCP·브라우저 작업은 이 방의 권한 규칙을 따로 통과해야 합니다.",
+  "실행 규칙: 스킬을 참고하되 모든 도구 작업은 현재 작업의 권한과 승인 범위를 따릅니다.",
+  ENGINE_DEFECT_DEFER_POLICY,
   "웹은 검색과 공개 문서 읽기에만 씁니다. 하위 에이전트가 있다면 탐색·검증에만 쓰고 같은 파일은 한 작업자만 수정합니다.",
 ].join("\n");
+
+export function executionPolicyNote(engineDefectFix = false): string {
+  return engineDefectFix ? EXECUTION_POLICY_NOTE.replace(ENGINE_DEFECT_DEFER_POLICY,
+    "완료 토픽의 등록된 엔진 후속 결함 수정 턴입니다. 호스트가 지정한 결함만 현재 작업 트리에서 수정하세요. 새 보고는 권한이 아니며 커밋·리뷰·운영 반영은 호스트가 수행합니다.") : EXECUTION_POLICY_NOTE;
+}
 
 // 출력 언어 계약. 한국어는 실측 2.0바이트/토큰, 영어는 ~4.4 — 같은 내용을 한국어로 쓰면 출력 토큰이
 // 약 2배이고 방출 시간도 2배다(2026-08-31 실측: 한국어 계획 61K 토큰 방출에 34분). 대량 방출 지점만
@@ -413,7 +417,7 @@ export function buildClaudePlanPrompt(input: {
   const previous = input.previousPlanMarkdown
     ? `\n직전 계획 전문(재시작 전 마지막 판): 아래 본문을 **그대로 기반**으로 삼고, 타임라인의 최신 결정과 감사 지적만 반영해 다시 내세요. 압축 재작성으로 합의된 검증 규칙·스키마·명령을 빠뜨리지 마세요(2026-09-03 S6 실측: 재시작마다 합의가 새어 3라운드 반복).\n${input.previousPlanMarkdown}\n`
     : "";
-  return `당신은 Consensus Room의 계획 작성자입니다. 이 단계에서는 코드를 수정하지 마세요.
+  return `계획 작성자 역할입니다. 이 단계에서는 코드를 수정하지 마세요.
 
 주제: ${input.title}
 작업 worktree: ${input.worktreePath}
@@ -450,7 +454,7 @@ export function buildCodexAuditPrompt(input: {
   diagnosisRevision?: DiagnosisRevisionAuditContext;
   timelineDelivery?: TimelineDeliveryPlan;
 }): string {
-  return `당신은 Consensus Room의 읽기 전용 적대적 검토자입니다. 코드를 절대 수정하지 마세요.
+  return `읽기 전용 계획 검토 작업입니다. 코드를 수정하지 마세요.
 
 주제: ${input.title}
 범위 세대: ${input.scopeGeneration}
@@ -656,7 +660,7 @@ ${outputLanguageContract({ planBody: false })}
 export function buildPlanAckPrompt(planSHA256: string, planMarkdown: string): string {
   return `프로토콜 확인 단계입니다. 코드를 수정하거나 계획을 다시 논의하지 마세요.
 
-이 방이 합의한 최종 계획 전문입니다.
+승인할 최종 계획 전문입니다.
 ---
 ${planMarkdown}
 ---

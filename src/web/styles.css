@@ -252,7 +252,7 @@ h3 { font-size: 17px; }
 .work-groups input, .work-groups textarea { width: 100%; min-width: 0; }
 .work-groups fieldset { min-width: 0; }
 .work-groups button { margin-block: 4px; }
-.evidence-panel { padding: 12px 20px; border-bottom: 1px solid var(--line); font-size: 13px; line-height: 1.5; max-height: 42vh; min-height: 45px; overflow-y: auto; }
+.evidence-panel { padding: 12px 20px; border-bottom: 1px solid var(--line); font-size: 13px; line-height: 1.5; max-height: 72vh; min-height: 45px; overflow-y: auto; }
 .evidence-panel summary { cursor: pointer; color: var(--green); }
 .evidence-panel p { margin: 10px 0; color: var(--muted); }
 .evidence-panel > div { margin: 8px 0; overflow-wrap: anywhere; }

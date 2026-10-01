@@ -215,6 +215,22 @@ describe("이벤트 원장과 재시작 복구", () => {
     reopened.close();
   });
 
+  it("완료 토픽의 중단된 엔진 후속 action은 성공으로 복구하지 않고 원본 완료 상태를 보존한다", () => {
+    const { database, path } = openDatabase();
+    database.createTopic({ ...topic(), state: "CLOSED" });
+    const defect = database.engineDefects.enqueue("topic-1", { key: "crash", title: "crash", evidence: "observed crash", workaround: "" });
+    database.engineDefects.save({ ...defect, status: "reviewing", actionId: "action-1", head: "fixed-head" });
+    database.startAction(runningAction("action-1", "engine-defect"));
+    database.recoverInterruptedActions();
+    database.engineDefects.recover();
+    const records = new DatabaseSync(path);
+    expect(records.prepare("SELECT status FROM actions WHERE id=?").get("action-1")?.status).toBe("cancelled");
+    records.close();
+    expect(database.getTopic("topic-1").state).toBe("CLOSED");
+    expect(database.engineDefects.get(defect.id)).toMatchObject({ status: "blocked", head: "fixed-head" });
+    database.close();
+  });
+
   it("중단된 CLI 작업을 재시작 뒤 성공으로 바꾸지 않는다", () => {
     const { database, path } = openDatabase();
     database.createTopic(topic());

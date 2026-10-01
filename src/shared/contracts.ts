@@ -1,3 +1,5 @@
+import agentDefaults from "./agent-defaults.json";
+import { EngineDefectReportSchema } from "./engineDefects.js";
 import {ReviewAllowanceSchema,ReviewScopeSchema} from "./reviews.js";
 import { type BudgetAccount } from "./budgets.js";
 import { RevisionAllowanceSchema } from "./revisions.js";
@@ -60,12 +62,7 @@ export const AgentSettingsSchema = z.object({
 });
 export type AgentSettings = z.infer<typeof AgentSettingsSchema>;
 
-export const DEFAULT_AGENT_SETTINGS: AgentSettings = {
-  claude: { model: "claude-opus-5-5", effort: "max", implementation: { model: "claude-sonnet-5-5", effort: "xhigh" } },
-  // 2026-09-07 사용자 지시: codex 감사 모델 gpt-6-astra · 추론 xhigh. 속도 티어는 붙이지 않는다
-  // (2026-09-06 에 priority 를 뺐다 — 사용량이 더 빨리 소모된다).
-  codex: { model: "gpt-6-astra", effort: "xhigh" },
-};
+export const DEFAULT_AGENT_SETTINGS: AgentSettings = AgentSettingsSchema.parse(agentDefaults);
 
 export const MESSAGE_KINDS = [
   "note",
@@ -169,6 +166,7 @@ export const AgentResultSchema = z.object({
   planLineEdits: PlanLineEditsSchema.optional(),
   planSHA256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   findings: z.array(FindingSchema).default([]),
+  engineDefects: z.array(EngineDefectReportSchema).max(50).optional(),
   evidenceRefs: z.array(z.string()).default([]),
   requestedUserDecision: z.string().min(1).optional(),
   // 2026-09-14 Codex 감사 D01: 완료 판단을 요청 필드 유무(프롬프트 해석)에만 맡기지 않는다. 구현·수정 결과가 명시하는 진행 상태 —
@@ -460,11 +458,15 @@ export const AgentResultJsonSchema = {
   additionalProperties: false,
   required: [
     "kind", "summary", "planMarkdown", "planEdits", "planLineEdits", "planSHA256",
-    "findings", "evidenceRefs", "requestedUserDecision", "memoryUpdates", "toleranceLedger",
+    "findings", "engineDefects", "evidenceRefs", "requestedUserDecision", "memoryUpdates", "toleranceLedger",
     "status", "remainingSteps", "resolvesRequestedDecision", "resolvedRequestId", "resolvedRequestIds", "reviewDecisionAnswers", "decisionAssessments",
   ],
   properties: {
     kind: { enum: AgentResultSchema.shape.kind.options },
+    engineDefects: { anyOf: [{ type: "array", maxItems: 50, items: {
+      type: "object", additionalProperties: false, required: ["key", "title", "evidence", "workaround"],
+      properties: { key: { type: "string" }, title: { type: "string" }, evidence: { type: "string" }, workaround: { type: "string" } },
+    } }, { type: "null" }] },
     summary: { type: "string" },
     planMarkdown: { anyOf: [{ type: "string" }, { type: "null" }] },
     planEdits: {

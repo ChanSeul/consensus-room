@@ -52,11 +52,14 @@ function codexAdapter(
 
 class RecordingRunner implements CommandRunner {
   readonly calls: CommandSpec[] = [];
+  readonly instructions: string[] = [];
 
   constructor(private readonly result: CommandResult) {}
 
   async run(spec: CommandSpec): Promise<CommandResult> {
     this.calls.push(spec);
+    const config = spec.args.find(arg => arg.startsWith("developer_instructions="));
+    this.instructions.push(config ? JSON.parse(config.slice("developer_instructions=".length)) : spec.stdin ?? "");
     return this.result;
   }
 }
@@ -73,6 +76,91 @@ function successfulResult(jsonLines: unknown[]): CommandResult {
 function memoryDocument(name: string, body: string): string {
   return `---\nname: ${name}\ndescription: 테스트 메모리\nmetadata:\n  platform: shared\n  type: reference\n---\n\n${body}\n`;
 }
+
+describe("project worker context", () => {
+  it.each(["claude", "codex"] as const)("%s resumes with current worker rules and suppresses unchanged delivery", async provider => {
+    const cwd = mkdtempSync(join(tmpdir(), "worker-context-"));
+    temporaryDirectories.push(cwd);
+    const file = join(cwd, provider === "claude" ? "CLAUDE.md" : "AGENTS.md");
+    const boundary = "<!-- interactive-session-only: operator workflow -->";
+    writeFileSync(file, `KEEP_PRODUCT_CONTRACT\n${boundary}\nPRIVATE_OPERATOR_RESTART\n`);
+    const runner = new RecordingRunner(successfulResult([{ type: "thread.started", thread_id: "worker-thread" }, planResult]));
+    const plugin = mkdtempSync(join(tmpdir(), "worker-instruction-plugin-"));
+    temporaryDirectories.push(plugin);
+    const adapter = provider === "claude" ? new ClaudeAdapter(runner, undefined, { managedPluginDirectory: plugin }) : codexAdapter(runner).adapter;
+    // A controlled planner first starts the session without native instruction flags.
+    const planned = await adapter.createSession({ cwd, prompt: "HOST_REQUIRED_INSTRUCTIONS", planningControl: {
+      admissionId: "plan", maxPromptBytes: 65536, instructionsProvided: true,
+    } });
+    await adapter.resumeTurn({ cwd, prompt: "Implement approved task", sessionId: planned.sessionId, implementation: true });
+    writeFileSync(file, `KEEP_UPDATED_PRODUCT_CONTRACT\n${boundary}\nPRIVATE_OPERATOR_DEPLOY\n`);
+    const usage: TurnUsage[] = [];
+    await adapter.resumeTurn({ cwd, prompt: "Continue approved task", sessionId: planned.sessionId, implementation: true,
+      onUsage: item => usage.push(item) });
+    expect(runner.instructions[1]).toContain("KEEP_PRODUCT_CONTRACT");
+    expect(runner.instructions[2]).toContain("KEEP_UPDATED_PRODUCT_CONTRACT");
+    expect(runner.instructions[2]).not.toContain("KEEP_PRODUCT_CONTRACT");
+    expect(runner.instructions.join("\n")).not.toContain("PRIVATE_OPERATOR_");
+    expect(runner.calls.every(call => call.cwd === cwd)).toBe(true);
+    expect(runner.calls[0].args).not.toContain("--append-system-prompt-file");
+    expect(usage.at(-1)?.inputBytes).toBe(Buffer.byteLength((provider === "codex" ? runner.instructions[2] : "") + runner.calls[2].stdin!));
+    if (provider === "claude") {
+      for (const call of runner.calls.slice(1)) {
+        expect(call.args[call.args.indexOf("--setting-sources") + 1]).toBe("");
+        expect(call.args).not.toContain("--system-prompt-snapshot");
+        expect(call.args).not.toContain("--append-system-prompt-file");
+      }
+      // A new adapter/process reuses the host-owned delivery receipt.
+      const reopened = new ClaudeAdapter(runner, undefined, { managedPluginDirectory: plugin });
+      await reopened.resumeTurn({ cwd, prompt: "Continue unchanged task", sessionId: planned.sessionId, implementation: true });
+      expect(runner.calls[3].stdin).toBe("Continue unchanged task");
+    } else {
+      const config = readFileSync(join((adapter as CodexAdapter).managedHomeFor(cwd), "config.toml"), "utf8");
+      expect(config).toContain("project_doc_max_bytes = 0");
+      expect(config).not.toContain("shell_tool = false");
+      expect(runner.calls.every(call => !call.stdin?.includes("PRODUCT_CONTRACT"))).toBe(true);
+    }
+  });
+
+  it.each(["failure", "compaction"])("Claude does not reuse delivery after %s", async reason => {
+    const cwd = mkdtempSync(join(tmpdir(), "worker-delivery-retry-")); temporaryDirectories.push(cwd);
+    writeFileSync(join(cwd, "CLAUDE.md"), "REQUIRED_WORKER_RULE");
+    const calls: CommandSpec[] = [];
+    const runner: CommandRunner = { run: async spec => {
+      calls.push(spec);
+      if (calls.length === 1 && reason === "failure") return { exitCode: 1, stdout: "", stderr: "interrupted", jsonLines: [] };
+      return successfulResult(calls.length === 1 ? [{ type: "system", subtype: "compact_boundary" }, planResult] : [planResult]);
+    } };
+    const adapter = new ClaudeAdapter(runner);
+    let sessionId = "";
+    const start = adapter.createSession({ cwd, prompt: "Work", onSessionCreated: id => { sessionId = id; } });
+    if (reason === "failure") await expect(start).rejects.toThrow(); else await start;
+    await adapter.resumeTurn({ cwd, prompt: "Continue", sessionId });
+    await adapter.resumeTurn({ cwd, prompt: "Continue unchanged", sessionId });
+    expect(calls[1].stdin).toContain("REQUIRED_WORKER_RULE");
+    expect(calls[2].stdin).toBe("Continue unchanged");
+  });
+
+  it("Claude forgets a prior receipt when compaction streams before interruption", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "worker-stream-compaction-")); temporaryDirectories.push(cwd);
+    writeFileSync(join(cwd, "CLAUDE.md"), "REQUIRED_WORKER_RULE");
+    const calls: CommandSpec[] = [];
+    const runner: CommandRunner = { run: async spec => {
+      calls.push(spec);
+      if (calls.length === 2) {
+        spec.onJSONLine?.({ type: "system", subtype: "compact_boundary" }, Date.now());
+        throw new Error("interrupted after compaction");
+      }
+      return successfulResult([planResult]);
+    } };
+    const adapter = new ClaudeAdapter(runner);
+    const { sessionId } = await adapter.createSession({ cwd, prompt: "Work" });
+    await expect(adapter.resumeTurn({ cwd, prompt: "Continue", sessionId })).rejects.toThrow("interrupted");
+    await adapter.resumeTurn({ cwd, prompt: "Retry", sessionId });
+    expect(calls[1].stdin).toBe("Continue");
+    expect(calls[2].stdin).toContain("REQUIRED_WORKER_RULE");
+  });
+});
 
 describe("에이전트별 권한 경계", () => {
   it.each(["shared", "topic"].flatMap(location => ["normal", "compaction", "after-compaction"].map(scope => ({ location, scope }))))("charges all requests from the $location home with $scope CLI counters", async ({ location, scope }) => {
@@ -317,13 +405,14 @@ describe("에이전트별 권한 경계", () => {
 
     // 2026-09-06 사용자 지시로 service_tier="priority" 를 뺐다(prolite 플랜 사용량 보호) — 기본(normal) 티어는 키를 넘기지 않는다.
     // 모델·추론은 정본(DEFAULT_AGENT_SETTINGS)에서 읽는다 — 리터럴로 박으면 기본값을 바꿀 때마다 이 단정이 어긋난다.
-    expect(runner.calls[0].args.slice(0, 12)).toEqual([
+    const executionArgs = runner.calls[0].args.filter((arg, index, all) => !arg.startsWith("developer_instructions=") && !(arg === "-c" && all[index + 1]?.startsWith("developer_instructions=")));
+    expect(executionArgs.slice(0, 12)).toEqual([
       "--strict-config", "-a", "never",
       "-m", DEFAULT_AGENT_SETTINGS.codex.model, "-c", `model_reasoning_effort="${DEFAULT_AGENT_SETTINGS.codex.effort}"`,
       "exec", "resume", "codex-thread-1", "--json", "--output-schema",
     ]);
     expect(runner.calls[0].args.at(-1)).toBe("-");
-    expect(runner.calls[0].stdin).toContain("실행 규칙:");
+    expect(runner.instructions[0]).toContain("실행 규칙:");
     expect(runner.calls[0].stdin?.endsWith("수정 계획을 다시 검토해 주세요.")).toBe(true);
   });
 
@@ -825,7 +914,7 @@ describe("에이전트별 권한 경계", () => {
       // 구현 턴은 빌드 의존성 호스트만 allowlist로 연다(2026-08-31 — 전면 개방 아님).
       network: { deniedDomains: [], allowedDomains: expect.arrayContaining(["github.com"]) },
     });
-    expect(runner.calls[0].stdin).toContain("실행 규칙:");
+    expect(runner.instructions[0]).toContain("실행 규칙:");
     expect((runner.calls[0].stdin)?.endsWith("승인한 계획만 구현해 주세요.")).toBe(true);
     expect(args).not.toContain("승인한 계획만 구현해 주세요.");
     expect(created.result.kind).toBe("IMPLEMENTATION");
@@ -902,7 +991,7 @@ describe("에이전트별 권한 경계", () => {
 
     await adapter.createSession({ prompt: "계획을 작성해 주세요.", cwd: worktree });
 
-    const stdin = runner.calls[0].stdin ?? "";
+    const stdin = runner.instructions[0] + (runner.calls[0].stdin ?? "");
     expect(stdin).toContain("적용되는 지시문 시작: 작업 저장소 CLAUDE.md");
     expect(stdin).toContain("indent 2칸");
     // 전역 CLAUDE.md는 이 머신에 실제로 있으므로 함께 주입된다. 홈 읽기 차단은 그대로다.
@@ -1466,7 +1555,7 @@ describe("프로젝트 지시문 — worktree 에 없으면 원본 저장소에�
 
     await adapter.createSession({ prompt: "계획을 작성해 주세요.", cwd: worktree });
 
-    const stdin = runner.calls[0].stdin ?? "";
+    const stdin = runner.instructions[0] + (runner.calls[0].stdin ?? "");
     expect(stdin).toContain("원본 저장소 규칙 마커 ALPHA");
     expect(stdin).toContain("작업 저장소 CLAUDE.md (원본 저장소 사본 — worktree 에는 gitignored 라 없음)");
     expect(stdin).toContain("프로젝트 지시문 적용 규칙");
@@ -1483,7 +1572,7 @@ describe("프로젝트 지시문 — worktree 에 없으면 원본 저장소에�
 
     await adapter.createSession({ prompt: "계획을 작성해 주세요.", cwd: worktree });
 
-    const stdin = runner.calls[0].stdin ?? "";
+    const stdin = runner.instructions[0] + (runner.calls[0].stdin ?? "");
     expect(stdin).toContain("worktree 규칙 마커 BETA");
     expect(stdin).not.toContain("마커 ALPHA");
     expect(stdin).toContain("적용되는 지시문 시작: 작업 저장소 CLAUDE.md\n");
@@ -1502,7 +1591,7 @@ describe("프로젝트 지시문 — worktree 에 없으면 원본 저장소에�
     expect(stdin).not.toContain("프로젝트 지시문 적용 규칙");
   });
 
-  it("Codex: worktree 에 AGENTS.md 가 없으면 원본 저장소 AGENTS.md 를 stdin 에 넣고, 있으면 CLI 가 읽으므로 넣지 않는다", async () => {
+  it("Codex: project context prefers the worktree and falls back to the repository without instruction messages", async () => {
     const { repository, worktree } = instructionFixture();
     const runner = new RecordingRunner(successfulResult([
       { type: "thread.started", thread_id: "codex-thread-1" },
@@ -1511,17 +1600,18 @@ describe("프로젝트 지시문 — worktree 에 없으면 원본 저장소에�
     const { adapter } = codexAdapter(runner, { repositoryPath: repository });
 
     await adapter.createSession({ prompt: "계획을 감사하세요.", cwd: worktree });
-    const missing = runner.calls[0].stdin ?? "";
+    const missing = runner.instructions[0] + (runner.calls[0].stdin ?? "");
     expect(missing).toContain("원본 저장소 규칙 마커 GAMMA");
     expect(missing).toContain("프로젝트 지시문 적용 규칙");
     expect(missing.endsWith("계획을 감사하세요.")).toBe(true);
 
     writeFileSync(join(worktree, "AGENTS.md"), "# AGENTS.md\n- worktree 규칙 마커 DELTA\n");
     await adapter.createSession({ prompt: "다시 감사하세요.", cwd: worktree });
-    const present = runner.calls[1].stdin ?? "";
+    const present = runner.instructions[1] + (runner.calls[1].stdin ?? "");
     expect(present).not.toContain("마커 GAMMA");
-    expect(present).not.toContain("마커 DELTA");
-    expect(present).not.toContain("프로젝트 지시문 적용 규칙");
+    expect(present).toContain("마커 DELTA");
+    expect(present).toContain("프로젝트 지시문 적용 규칙");
+    expect(runner.calls.every(call => !call.stdin?.includes("마커"))).toBe(true);
   });
 });
 
@@ -1572,7 +1662,7 @@ describe("프로토콜 확인 턴의 지시문 생략과 턴 사용량 통지", 
     expect(ack).not.toContain("프로젝트 지시문 적용 규칙");
     expect(ack.endsWith("해시를 확인하세요.")).toBe(true);
     // 대조군: 일반 턴은 그대로 싣는다 — 생략이 protocolOnly 에만 걸려야 한다.
-    expect(runner.calls[1].stdin ?? "").toContain("마커 ALPHA");
+    expect(runner.instructions[1]).toContain("마커 ALPHA");
   });
 
   it("Codex: protocolOnly 턴에는 AGENTS.md 블록이 없고 일반 턴에는 있다", async () => {
@@ -1590,7 +1680,7 @@ describe("프로토콜 확인 턴의 지시문 생략과 턴 사용량 통지", 
     expect(ack).not.toContain("마커 GAMMA");
     expect(ack).not.toContain("적용되는 지시문 시작");
     expect(ack.endsWith("해시를 확인하세요.")).toBe(true);
-    expect(runner.calls[1].stdin ?? "").toContain("마커 GAMMA");
+    expect(runner.instructions[1]).toContain("마커 GAMMA");
   });
 
   it("Codex: turn.completed 의 토큰 수를 onUsage 로 알린다", async () => {
@@ -1878,7 +1968,7 @@ it.each([
     const config = readFileSync(join(adapter.managedHomeFor(cwd), "config.toml"), "utf8");
     expect(/^multi_agent = false$/m.test(config)).toBe(entry.closed);
     expect(config).toContain(`[features.multi_agent_v2]\nenabled = ${!entry.closed}`);
-    expect(/^project_doc_max_bytes = 0$/m.test(config)).toBe(entry.toolsClosed);
+    expect(/^project_doc_max_bytes = 0$/m.test(config)).toBe(true);
     expect(/^shell_tool = false$/m.test(config)).toBe(entry.toolsClosed);
     if (process.env.CONSENSUS_CODEX_SANDBOX_TEST) {
       const spec = runner.calls[0];

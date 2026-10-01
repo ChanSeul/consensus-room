@@ -235,7 +235,9 @@ it("uses only task-linked notification threads from a workspace channel in the c
   try {
     capture("a",a.id,db.evidence.get(a.sourceId).url,"Task A policy");
     capture("b",b.id,db.evidence.get(b.sourceId).url,"Task B policy");
+    expect(service.hostPlan("a").requests.map(r => r.sourceId)).toContain(channel.sourceId);
     capture("a",channel.id,db.evidence.get(channel.sourceId).url,threads.join("\n"));
+    expect(service.hostPlan("a").requests.map(r => r.url)).toEqual(expect.arrayContaining(threads));
     const bodies=["https://team.atlassian.net/browse/APP-1","https://team.atlassian.net/browse/APP-2",
       "https://team.atlassian.net/browse/APP-10","Unrelated notification"];
     threads.forEach((url,i)=>capture("a",channel.id,url,bodies[i]));
@@ -531,4 +533,29 @@ it("Slack invalid_cursor responses restart while other HTTP 200 API failures pre
     const request:typeof fetch=async()=>new Response(JSON.stringify({ok:false,error}),{status:200});
     await expect(collectPage(source,JSON.stringify({stage:"messages",next:"expired"}),{},request,new AbortController().signal,async()=>({revision:"unused"}))).rejects.toMatchObject({restart:error==="invalid_cursor"});
   }
+});
+
+it("새 루트의 승인 재사용은 선택된 기존 루트의 계획도 무효화한다", async () => {
+  const {db,topic}=fixture(),c=db.evidence.catalog;
+  const selected=c.add("a",input("https://team.atlassian.net/browse/APP-1"),true);
+  const group=db.workGroups.get("g-a");
+  db.workGroups.revise(group.id,{title:group.title,goal:group.goal,contracts:group.contracts,stages:group.stages.map(stage=>stage.id==="later"
+    ? {...stage,evidenceRootIds:[selected.id]} : stage)},group.version);
+  topic("ui"); db.workGroups.link(group.id,"later","ui","a".repeat(40));
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("host only");}});
+  const source=db.evidence.get(selected.sourceId);
+  const url="https://docs.google.com/spreadsheets/d/new-policy/edit";
+  try {
+    service.importHost("a",{version:c.version("a"),rootId:selected.id,sourceId:source.id,previousHash:source.contentHash,
+      previousCheckedAt:source.checkedAt,observedAt:Date.now(),revision:"r",missing:[],units:[{id:"body",kind:"issue",content:url}]});
+    const candidate=c.state("ui").entries.find(e=>e.source.url===url)!;
+    expect(candidate.state).toBe("candidate");
+    db.updateTopic("ui",{state:"AWAITING_USER_APPROVAL",planSHA256:"f".repeat(64),approvedPlanSHA256:"f".repeat(64)});
+    const before=db.getTopic("ui");
+    expect(c.approvalAffected(candidate.source.id,"group","g-a")).toContain("ui");
+    c.add("a",input(url),true);
+    expect(c.state("ui").entries.find(e=>e.source.id===candidate.source.id)?.state).toBe("approved");
+    expect(db.getTopic("ui").approvedPlanSHA256).toBeNull();
+    expect(db.getTopic("ui").planEpoch).toBe(before.planEpoch+1);
+  } finally {await service.stop();}
 });

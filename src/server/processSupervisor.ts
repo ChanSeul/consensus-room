@@ -40,6 +40,7 @@ export class ProcessSupervisor {
   constructor(
     private readonly control: ProcessControl = systemProcessControl,
     private readonly reporter: ProcessRecoveryReporter = writeRecoveryReport,
+    private readonly engineReviewExecutable?: string,
   ) {}
 
   async recover(actions: readonly ActionRecord[]): Promise<void> {
@@ -56,7 +57,8 @@ export class ProcessSupervisor {
     // 남는다. 문자열 전체 비교는 그 행을 전부 ineligible로 만들어 재시작 회수가 무력화된다(감사 ⑤).
     // basename만 보는 것은 isSameProcess가 command line·시작 시각까지 대조하므로 안전하다.
     const executableName = processExecutable ? basename(processExecutable) : "";
-    if (executableName !== "claude" && executableName !== "codex") {
+    if (executableName !== "claude" && executableName !== "codex" &&
+        !(action.kind === "engine-defect" && this.engineReviewExecutable && processExecutable === this.engineReviewExecutable)) {
       this.report({ outcome: "ineligible", action, observed: null, detail: `허용한 CLI가 아닙니다: ${processExecutable}` });
       return;
     }

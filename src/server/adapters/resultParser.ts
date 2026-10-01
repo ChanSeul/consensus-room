@@ -10,6 +10,7 @@ import type { AgentRunErrorCode } from "../../shared/planningControl.js";
 // memoryUpdates[].expectedSHA256처럼 null 자체가 유효한 값인 필드는 건드리지 않으므로 재귀로 훑지 않는다.
 const OPTIONAL_KEYS = [
   "planningStep",
+  "engineDefects",
   "planMarkdown", "planEdits", "planLineEdits", "planSHA256", "requestedUserDecision", "memoryUpdates", "findings", "evidenceRefs",
   "toleranceLedger", "status", "remainingSteps", "resolvesRequestedDecision", "resolvedRequestId", "resolvedRequestIds", "reviewDecisionAnswers", "decisionAssessments",
 ] as const;

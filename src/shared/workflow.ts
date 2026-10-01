@@ -364,7 +364,7 @@ export function salvageResultFields(raw: unknown, kind: AgentResult["kind"]): Ag
 // 이 감사 경계에서만 (원래 ID, 원문 제목)의 유일한 대응을 만든다. 제목까지 같으면 추측하지 않는다.
 export function auditFindingIdentity(source: readonly Finding[]): {
   findings: Finding[];
-  normalize: (response: readonly Finding[]) => Finding[];
+  normalize: (response: readonly Finding[], enforceUnique?: boolean) => Finding[];
 } {
   const counts = new Map<string, number>();
   for (const f of source) counts.set(f.id, (counts.get(f.id) ?? 0) + 1);
@@ -383,7 +383,7 @@ export function auditFindingIdentity(source: readonly Finding[]): {
   const canonical = new Map(findings.map(f => [f.id, f]));
   return {
     findings,
-    normalize: response => {
+    normalize: (response, enforceUnique = true) => {
       const normalized = response.map(f => {
         const id = aliases.get(f.title);
         if (id) {
@@ -395,7 +395,7 @@ export function auditFindingIdentity(source: readonly Finding[]): {
         if ((counts.get(f.id) ?? 0) > 1) throw new Error(`중복 지적의 원문 제목을 보존해야 합니다: ${f.id}`);
         return f;
       });
-      uniqueFindingIDs(normalized, "감사 응답");
+      if (enforceUnique) uniqueFindingIDs(normalized, "감사 응답");
       return normalized;
     },
   };

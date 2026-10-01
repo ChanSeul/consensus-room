@@ -63,6 +63,7 @@ export class BudgetController {
     const reserve=()=>{if(kind)this.revisions?.reserve(ctx.topicId,admissionId,kind);if(review)this.reviews?.reserve(ctx.topicId,admissionId,review);};
     const execution=this.ledger.start({id,accounts:ctx.accounts,stage:ctx.stage,role,model:turn.settings?.model??"unknown",
       effort:turn.settings?.effort??"unknown",startedAt,dispatchStarted:false},reserve);
+    turn.onBudgetExecution?.(id);
     const boundedAccounts = ctx.accounts.map(id => this.ledger.account(id)!).flatMap(account =>
       hasBudgetLimits(account.policy) ? [{ used: account.used, policy: account.policy }] : []);
     const executionBudget = execution.limit ? Object.fromEntries(BUDGET_KEYS.map(key => [key, Math.min(execution.limit![key],
@@ -70,10 +71,12 @@ export class BudgetController {
     const controller=new AbortController();
     const observed=zeroBudget();
     let failure:unknown; let partial:unknown; let sessionId = (turn as SessionTurn).sessionId;
+    let finalUsage=false;
     let spawned=false;   // 프로세스가 실제로 떴는가 — 안 떴으면 리뷰·재작성 예약을 되돌린다
     const abort=()=>controller.abort(turn.signal?.reason);
     if(turn.signal?.aborted) abort(); else turn.signal?.addEventListener("abort",abort,{once:true});
     const observe=(usage:Parameters<NonNullable<SessionTurn["onUsage"]>>[0])=> {
+      if (usage.recordKind === "final" && usage.completeness === "complete" && [usage.inputTokens, usage.outputTokens].every(value => typeof value === "number" && Number.isFinite(value) && value >= 0)) finalUsage = true;
       for(const key of BUDGET_KEYS) {
         const value=usage[key];
         if(value!==undefined && Number.isFinite(value) && value>=0) observed[key]=Math.max(observed[key],value);
@@ -113,7 +116,8 @@ export class BudgetController {
       throw failure??error;
     } finally {
       clearInterval(timer);turn.signal?.removeEventListener("abort",abort);
-      this.ledger.observe(id,{...observed,durationMs:Date.now()-startedAt},Date.now(),true);
+      this.ledger.observe(id,{...observed,durationMs:Date.now()-startedAt},Date.now(),
+        !turn.requiresFinalUsage || finalUsage || !this.ledger.execution(id).dispatchStarted);
     }
   }
 }

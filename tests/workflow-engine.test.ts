@@ -4805,3 +4805,26 @@ describe("계획 원문의 충돌 ID 복구", () => {
     database.close();
   });
 });
+
+
+it("감사 계약 교정은 원본·교정의 충돌 ID를 병합 전에 맞춘다", async () => {
+  const source = [finding("TODO-2", "first: 앱바", { disposition: "AGREED_ACTION" }),
+    finding("TODO-2", "second: 지도", { disposition: "AGREED_ACTION" }),
+    finding("KEEP", "반드시 판단할 지적", { disposition: "AGREED_ACTION" })];
+  const { database, engine, artifacts, codex } = makePlanningEngine({
+    slug: "audit-merge-id",
+    claudeResults: [{ kind: "PLAN", summary: "계획", planMarkdown: validPlan("기존 계획"), findings: source, evidenceRefs: [] }],
+    codexResults: [
+      { kind: "AUDIT", summary: "누락", findings: source.slice(0, 2), evidenceRefs: [] },
+      { kind: "AUDIT", summary: "교정", requestedUserDecision: "제품 결정", findings: source.map((f,i) => i < 2 ? { ...f, id: `CORRECTED-${i}` } : f), evidenceRefs: [] },
+    ],
+  });
+  engine.startPlan("topic-1");
+  await waitForActionCompletion(database, "topic-1");
+  expect(database.getTopic("topic-1").state, database.getTopic("topic-1").lastError ?? "").toBe("USER_DECISION_REQUIRED");
+  const audit = JSON.parse((await artifacts.readLatest("topic-1", "audit"))!);
+  expect(audit.findings).toHaveLength(3);
+  expect(new Set(audit.findings.map((f: { id: string }) => f.id)).size).toBe(3);
+  expect(codex.calls).toHaveLength(2);
+  database.close();
+});

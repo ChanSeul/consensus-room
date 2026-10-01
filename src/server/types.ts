@@ -114,6 +114,8 @@ export interface SessionTurn {
   beforeSpawn?: () => void | Promise<void>;
   admitSync?: () => void;
   implementation?: boolean;
+  // Host-only authority for a registered, completed-topic engine follow-up.
+  engineDefectFix?: boolean;
   // 서버가 지정하는 계획 작성 호출의 종류. 재작성 횟수 집계에 사용한다.
   planningWrite?: import("../shared/revisions.js").RewriteKind;
   // 프로토콜 확인 전용 턴. 저장소를 읽거나 명령을 실행할 필요가 없는데 도구를 열어 두면 에이전트가
@@ -133,6 +135,9 @@ export interface SessionTurn {
   // 턴이 쓴 토큰·시간을 알린다(codex `turn.completed` / claude `result` 이벤트에서 읽음). 기록 전용 —
   // 관찰자가 던져도 턴 결과는 유지된다(adapters/usage.ts notifyUsage).
   onUsage?: (usage: TurnUsage) => void;
+  // Strict external review accounting: keep dispatched executions unfinished until verified final usage is reconciled.
+  requiresFinalUsage?: boolean;
+  onBudgetExecution?: (id: string) => void;
   onInterruptedOutput?: CommandSpec["onInterruptedOutput"];
   // 모든 값이 기본 미설정인 실행별 관찰 한도. 한도는 중단이 아닌 경고에만 쓴다.
   limits?: ExecutionLimits;

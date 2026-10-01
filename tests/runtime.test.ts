@@ -82,7 +82,7 @@ describe("runtime CLI 요청과 이벤트 계약", () => {
         expect(config).toContain('default_permissions = "consensus-review"');
       } else {
         expect(config).not.toContain("shell_tool = false");
-        expect(config).not.toContain("project_doc_max_bytes = 0");
+        expect(config).toContain("project_doc_max_bytes = 0");
         expect(config).toContain('default_permissions = "consensus-implement"');
       }
       expect(spec.args).toContain('model_reasoning_effort="medium"');

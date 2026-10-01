@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { EVIDENCE_PAGE_BYTES } from "../../shared/externalEvidence.js";
 import type { EvidenceDiscoveryLink, EvidenceSource, EvidenceSnapshotInput, EvidenceHostImport, EvidenceHostPlan, MediatorEvidenceBatch, MediatorEvidenceResponse } from "../../shared/externalEvidence.js";
+import { EvidenceAdmissionExpired, EvidenceScheduler, evidenceGroup } from "./scheduler.js";
 import { discoverLinks } from "./discovery.js";
 import type { ConsensusDatabase } from "../database.js";
 import type { AgentResult } from "../../shared/contracts.js";
@@ -12,9 +13,11 @@ import { evidenceHash, type EvidenceStore } from "./store.js";
 
 export class EvidenceService {
   private timer?: ReturnType<typeof setInterval>;
+  private readonly nativeCollections = new Map<string, Promise<void>>();
   private readonly jobs = new Map<string, Promise<void>>();
   private readonly abort = new AbortController();
   private polling = false;
+  private readonly scheduler = new EvidenceScheduler();
   private readonly collectedThisPoll = new Map<string, { key: string; links: EvidenceDiscoveryLink[] }>();
   onIdle: () => void = () => {};
   canPublish: (topicId: string) => boolean = () => true;
@@ -34,12 +37,10 @@ export class EvidenceService {
     this.collectedThisPoll.clear();
     try {
       this.onIdle();
-      // Bounded parallelism: each iteration waits for one source; manual requests share the same lease.
-      for (const source of this.store.activeSources()) {
-        if (this.abort.signal.aborted) return;
-        if (source.mode === "rest" && !this.store.catalog.managed(source.id)) await this.refresh(source.id);
-      }
-      for (const root of this.store.catalog.due()) await this.collect(root.id);
+      await Promise.all([
+        ...this.store.activeSources().filter(source => source.mode === "rest" && !this.store.catalog.managed(source.id)).map(source => this.refresh(source.id)),
+        ...this.store.catalog.due().map(root => this.collect(root.id)),
+      ]);
       if (!this.abort.signal.aborted) this.onIdle();
     } finally { this.polling = false; }
   }
@@ -47,7 +48,14 @@ export class EvidenceService {
     const key = `root:${rootId}`, existing = this.jobs.get(key); if (existing) return existing;
     if (!this.polling && !this.jobs.size) this.collectedThisPoll.clear();
     if (force) this.store.catalog.requestRefresh(rootId);
-    const job = this.collectRoot(rootId, force).finally(() => this.jobs.delete(key));
+    const rootSource = this.store.catalog.roots().find(root => root.id === rootId)?.sourceId;
+    const sourceId = rootSource && this.store.get(rootSource).mode === "connector" ? rootSource : undefined;
+    const previous = sourceId ? this.nativeCollections.get(sourceId) : undefined;
+    const job = (previous ? previous.then(() => this.collectRoot(rootId, force)) : this.collectRoot(rootId, force)).finally(() => {
+      this.jobs.delete(key);
+      if (sourceId && this.nativeCollections.get(sourceId) === job) this.nativeCollections.delete(sourceId);
+    });
+    if (sourceId) this.nativeCollections.set(sourceId, job);
     this.jobs.set(key, job); return job;
   }
   private async collectRoot(rootId: string, force = false): Promise<void> {
@@ -64,9 +72,16 @@ export class EvidenceService {
       const reader = source.mode === "connector" ? (this.native ?? this.connector) : this.connector;
       let checkId: string | null = null; let committing = false;
       try {
-        if (source.mode==="connector" && this.store.catalog.hostManaged(source.id) &&
+        if (source.mode === "connector" && this.store.catalog.hostManaged(source.id) &&
           (!this.native || (!force && cursor === null && source.collection?.status !== "error" && source.collection?.connectionKey &&
             this.collectedThisPoll.get(source.id)?.key === `${source.collection.connectionKey}:${source.contentHash}` && !source.error))) {
+          if (source.mode === "connector" && this.native && source.collection?.connectionKey) {
+            const validate = (this.native as EvidenceConnector & { validateCachedSource?: (source: EvidenceSource, key: string, signal: AbortSignal) => Promise<void> }).validateCachedSource;
+            if (validate) await this.scheduler.run(evidenceGroup(source), this.abort.signal,
+              () => validate.call(this.native, source, source.collection!.connectionKey!, this.abort.signal), deadline,
+              ms => this.measureWait(source, ms));
+            if (this.abort.signal.aborted || !publishable()) return;
+          }
           const snapshot=this.store.sourceSnapshot(source);
           if (!snapshot || !this.store.fresh(source)) throw new EvidenceFetchError("호스트에서 원문을 다시 수집하세요. 이전 자료는 보존했습니다.");
           const units=snapshot.units.map(({contentHash: _hash,imageHash,...unit})=>({ ...unit,
@@ -85,8 +100,10 @@ export class EvidenceService {
         checkId=check.checkId;
         const generation=this.store.generation(source.id);
         this.store.recordCollection(source.id, { status: "reading" });
-        const page = await reader.discover(source, cursor, this.abort.signal);
-        if (!publishable()) return;
+        const page = await this.scheduler.run(evidenceGroup(source), this.abort.signal,
+          () => reader.discover!(source, cursor, this.abort.signal), deadline,
+          ms => this.measureWait(source, ms));
+        if (this.abort.signal.aborted || !publishable()) return;
         if (page.connectionKey && source.collection?.connectionKey && page.connectionKey !== source.collection.connectionKey && !page.accountConfirmed)
           throw new EvidenceFetchError("MCP 연결 계정이 바뀌었습니다. 로컬 연결 설정에서 사용할 계정을 확인하세요.", 300, true);
         committing=true;
@@ -100,7 +117,7 @@ export class EvidenceService {
           if (before.contentHash !== after.contentHash) this.changed(after);
         }
       } catch (error) {
-        if (this.abort.signal.aborted) return;
+        if (this.abort.signal.aborted || error instanceof EvidenceAdmissionExpired) return;
         this.store.recordCollection(source.id, { status: "error", error: error instanceof Error ? error.message.slice(0, 500) : "수집 실패" });
         this.store.catalog.failed(rootId, source.id, error instanceof EvidenceFetchError ? error.message : "원문 수집이 중단됐습니다. 이전 자료는 보존했습니다.",
           error instanceof EvidenceFetchError ? error.retryAfterSeconds : 300,
@@ -110,11 +127,15 @@ export class EvidenceService {
     }
     this.store.catalog.complete(rootId);
   }
+  private measureWait(source: EvidenceSource, ms: number): void {
+    this.store.measure(source.id, "queuedWaitMs", ms);
+    this.store.measure(`collection:${evidenceGroup(source)}`, "queuedWaitMs", ms);
+  }
   connection(source: EvidenceSource): { configured: boolean; error: string | null } {
     return { configured: (source.mode === "connector" ? (this.native ?? this.connector) : this.connector)?.configured?.(source) ?? false, error: source.collection?.error ?? source.error };
   }
   hostPlan(topicId: string, cursor?: string, limit = 50): EvidenceHostPlan {
-    const catalog = this.store.catalog.state(topicId), now = Date.now();
+    const catalog = this.store.catalog.state(topicId, { collection: true }), now = Date.now();
     const integrations = { jira: "Atlassian Rovo", confluence: "Atlassian Rovo", slack: "Slack", figma: "Figma",
       sheets: "Google Drive", document: "Browser" };
     const reads = {
@@ -147,15 +168,10 @@ export class EvidenceService {
     if (start.state === "CLOSED") throw new Error("닫힌 주제는 수집하지 않습니다.");
     const frozen = this.store.isFrozen(start);
     if (!frozen) {
-      for (const root of this.store.catalog.forTopic(topicId).filter(root => root.status === "approved" && root.nextCheckAt <= Date.now())) await this.collect(root.id);
-      const deadline = Date.now() + 90_000;
-      for (const source of this.store.list(topicId)) {
-        if (this.store.catalog.managed(source.id)) continue;
-        if (Date.now() >= deadline) throw new Error("이번 수집 대기 시간이 끝났습니다. 완료된 자료는 보존했으니 다시 확인하세요.");
-        if (source.mode !== "rest") continue;
-        if (this.connector.configured && !this.connector.configured(source)) throw new Error("서버 읽기 인증 설정이 필요합니다.");
-        await this.refresh(source.id);
-      }
+      const roots = this.store.catalog.forTopic(topicId).filter(root => root.status === "approved" && root.nextCheckAt <= Date.now());
+      const sources = this.store.list(topicId).filter(source => !this.store.catalog.managed(source.id) && source.mode === "rest");
+      if (sources.some(source => this.connector.configured && !this.connector.configured(source))) throw new Error("서버 읽기 인증 설정이 필요합니다.");
+      await Promise.all([...roots.map(root => this.collect(root.id)), ...sources.map(source => this.refresh(source.id))]);
     }
     const topic = database.getTopic(topicId);
     if (topic.scopeGeneration !== start.scopeGeneration || topic.state === "CLOSED") throw new Error("수집 중 작업 범위가 바뀌었습니다.");
@@ -208,7 +224,9 @@ export class EvidenceService {
     this.store.recordCollection(id, { status: "reading" });
     try {
       const previous = this.store.snapshot(id);
-      const result = await this.connector.fetch(check.source, previous, this.abort.signal, bytes => this.store.measure(id, "receivedBytes", bytes));
+      const result = await this.scheduler.run(evidenceGroup(source), this.abort.signal,
+        () => this.connector.fetch(check.source, previous, this.abort.signal, bytes => this.store.measure(id, "receivedBytes", bytes)),
+        undefined, ms => this.measureWait(source, ms));
       if (this.abort.signal.aborted || this.store.linkedTopics(id).some(topic => !this.canPublish(topic))) return;
       if (result.unchanged && check.source.contentHash) {
         this.store.unchanged(id, check.checkId, check.source.contentHash, result.revision);
@@ -228,6 +246,7 @@ export class EvidenceService {
       this.store.recordCollection(id, { status: source.contentHash === after.contentHash ? "unchanged" : "collected", checkedAt: after.checkedAt!, error: undefined });
       this.store.measure(id, source.contentHash === after.contentHash ? "unchangedCollections" : "changedCollections", 1);
     } catch (error) {
+      if (this.abort.signal.aborted) return;
       // HTTP bodies and credentials must not enter diagnostics. A provider error is already bounded.
       try {
         this.store.failed(id, check.checkId, error instanceof EvidenceFetchError ? error.message : "원문 수집에 실패했습니다. 이전 캐시를 최신으로 처리하지 않습니다.", error instanceof EvidenceFetchError ? error.retryAfterSeconds : 300);

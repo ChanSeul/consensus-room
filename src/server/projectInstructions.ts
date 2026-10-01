@@ -5,10 +5,25 @@ import { redactSecrets } from "../shared/workflow.js";
 
 export const INSTRUCTION_FILE_LIMIT_BYTES = 32_000;
 
-// 프로젝트 지시문(CLAUDE.md·AGENTS.md)은 sample-ios 에서 gitignored 라 토픽 worktree 체크아웃에 **존재하지 않는다**
-// (2026-09-02 실측: S1.1~S5.2 의 모든 에이전트가 전역 지시문만 받았다). worktree 에 파일이 없으면 원본 저장소의
-// 파일을 대신 읽는다 — 항상 현재 내용이고 worktree 마다 복사할 필요가 없다. 원본 지시문에는 방 계약과 충돌하는
-// 조항(요청 없이 빌드 금지·시뮬 실행·훅 ack·홈 경로 참조)이 있으므로 주입 뒤에 우선순위 규칙을 붙인다.
+// Authors opt into a worker view; unmarked project rules remain intact.
+// Only a standalone HTML comment is a boundary, not examples mentioning the marker.
+export function workerInstructionText(raw: string): string {
+  const lines = raw.split(/\r?\n/);
+  let fence: { character: string; length: number } | undefined;
+  for (const [index, line] of lines.entries()) {
+    const delimiter = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (delimiter) {
+      if (!fence) fence = { character: delimiter[1][0], length: delimiter[1].length };
+      else if (delimiter[1][0] === fence.character && delimiter[1].length >= fence.length && !delimiter[2].trim()) fence = undefined;
+      continue;
+    }
+    if (!fence && /^<!-- interactive-session-only(?::[^\r\n]*)? -->\s*$/.test(line)) return lines.slice(0, index).join("\n").trimEnd();
+  }
+  return raw;
+}
+
+// Ignored project instructions may be absent from a topic worktree. Read the original
+// repository only in that case, then apply the same worker view and task precedence.
 export interface AppliedInstructionInput {
   strict?: boolean;
   // Guarded planning delivers the complete text through its required input queue when needed.
@@ -18,9 +33,9 @@ export interface AppliedInstructionInput {
   fileName: string;
   // 원본 저장소. worktree 에 파일이 없을 때만 쓴다.
   repositoryPath?: string | null;
-  // 전역 지시문 경로. Claude 는 CLI 탐색을 꺼 두었으므로 서버가 넣고, Codex 는 CLI 가 직접 읽으므로 null.
+  // Provider-specific global rules; native discovery is disabled in both managed adapters.
   globalPath?: string | null;
-  // worktree 에 파일이 있을 때 그 내용을 stdin 에 넣을지. Codex 는 cwd 의 AGENTS.md 를 CLI 가 직접 읽으므로 false.
+  // Include the worktree body in the host-managed instruction context.
   injectWorkspaceFile: boolean;
 }
 
@@ -47,6 +62,8 @@ export async function readAppliedInstructions(input: AppliedInstructionInput): P
 
 function instructionBlock(label: string, raw: string | null, strict = false, chunked = false): string | null {
   if (!raw) return null;
+  raw = workerInstructionText(raw);
+  if (!raw.trim()) return null;
   if (!chunked && strict && Buffer.byteLength(raw) > INSTRUCTION_FILE_LIMIT_BYTES) {
     throw new Error("Mandatory instruction file exceeds the planning limit; it must not be silently truncated.");
   }

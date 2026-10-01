@@ -4,12 +4,27 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
 import { readUserFile, readMemoryFile, resolveUserPath, UserFileAccessBlocked } from "../src/server/userFileReader";
-import { readAppliedInstructions } from "../src/server/projectInstructions";
+import { readAppliedInstructions, workerInstructionText } from "../src/server/projectInstructions";
 import { ProjectMemoryReader } from "../src/server/projectMemory";
 
 const roots: string[] = [];
 const root = () => { const path = mkdtempSync(join(tmpdir(), "user-file-read-")); roots.push(path); return path; };
 afterEach(() => { for (const path of roots.splice(0)) rmSync(path, { recursive: true, force: true }); });
+
+it("filters explicitly marked operator instructions before bounds and preserves Codex override precedence", async () => {
+  const dir = root(), global = join(dir, "global-AGENTS.md");
+  writeFileSync(global, "REQUIRED_GLOBAL\n<!-- interactive-session-only: local workflow -->\n" + "x".repeat(40000));
+  writeFileSync(join(dir, "AGENTS.md"), "BASE_RULE");
+  writeFileSync(join(dir, "AGENTS.override.md"), "OVERRIDE_RULE\n<!-- interactive-session-only: local workflow -->\nOPERATOR_RULE");
+  const result = await readAppliedInstructions({ workspace: dir, fileName: "AGENTS.md", globalPath: global,
+    injectWorkspaceFile: true, strict: true });
+  expect(result.blocks.join("\n")).toContain("REQUIRED_GLOBAL");
+  expect(result.blocks.join("\n")).toContain("OVERRIDE_RULE");
+  expect(result.blocks.join("\n")).not.toContain("BASE_RULE");
+  expect(result.blocks.join("\n")).not.toContain("OPERATOR_RULE");
+  expect(workerInstructionText('Reference `<!-- interactive-session-only: example -->`\nUNMARKED_RULE')).toContain("UNMARKED_RULE");
+  expect(workerInstructionText('```html\n<!-- interactive-session-only: example -->\n```\nUNMARKED_RULE')).toContain("UNMARKED_RULE");
+});
 
 // Public reader -> real filesystem -> prompt/memory consumers. FIFO reproduces a blocked open;
 // resolving this Promise requires the child to close. This does not claim to grant TCC access.

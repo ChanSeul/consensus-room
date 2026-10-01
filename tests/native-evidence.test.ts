@@ -174,3 +174,54 @@ it("discovers complete URLs before splitting long MCP text",async()=>{
   const page=await new NativeEvidenceConnector(reader).discover(source,null,new AbortController().signal);
   expect(page.units.length).toBeGreaterThan(1);expect(page.links.map(link=>link.url)).toEqual([url]);
 });
+
+function collectionLatch<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(done => { resolve = done; }); return { promise, resolve }; }
+it("manual and background reads overlap unrelated providers while source requests share one collection", async () => {
+  const {db,topic,root}=fixture(), held=collectionLatch<void>(), sheetStarted=collectionLatch<void>(), slackStarted=collectionLatch<void>();
+  const slack=db.evidence.catalog.add(topic.id,{url:"https://team.slack.com/archives/C123/p1234567890123456",label:"Slack",mode:"connector",scope:"topic",required:true,intervalSeconds:900},true);
+  const calls=vi.fn(async(source)=> {
+    if(source.provider==="sheets") { sheetStarted.resolve(); await held.promise; }
+    else slackStarted.resolve();
+    return {units:[{id:"body",kind:"document" as const,content:"policy"}],links:[],cursor:null,revision:"v1"};
+  });
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("unused");}},()=>{},undefined,{fetch:async()=>{throw Error("unused");},discover:calls});
+  const manual=service.collect(root.id), duplicate=service.collect(root.id);
+  try {
+    expect(duplicate).toBe(manual); await sheetStarted.promise;
+    const poll=service.poll(); await slackStarted.promise;
+    expect(calls).toHaveBeenCalledTimes(2);
+    held.resolve(); await Promise.all([manual,poll]);
+    expect(db.evidence.snapshot(root.sourceId)?.units[0].content).toBe("policy");
+  } finally {held.resolve(); await service.stop();}
+});
+it("a cancelled late page preserves the previous snapshot and never notifies model work", async()=>{
+  const {db,root}=fixture(), started=collectionLatch<void>(), held=collectionLatch<void>();
+  const check=db.evidence.begin(root.sourceId,true)!;
+  db.evidence.ingest(root.sourceId,{checkId:check.checkId,revision:"old",units:[{id:"body",kind:"document",content:"old"}]});
+  const hash=db.evidence.get(root.sourceId).contentHash, changed=vi.fn();
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("unused");}},changed,undefined,{fetch:async()=>{throw Error("unused");},discover:async()=>{
+    started.resolve(); await held.promise;
+    return {units:[{id:"body",kind:"document",content:"new"}],links:[],cursor:null,revision:"new"};
+  }});
+  const collect=service.collect(root.id,true);
+  await started.promise; const stopped=service.stop(); held.resolve(); await Promise.all([collect,stopped]);
+  expect(db.evidence.get(root.sourceId).contentHash).toBe(hash); expect(changed).not.toHaveBeenCalled();
+  expect(db.evidence.catalog.members(root.id)[0].progress).not.toBe("complete");
+});
+it("rejects binding changes during a pending final page and retains the completed old snapshot",async()=>{
+  const {db,root}=fixture(); let link="link_work", pending=false;
+  const started=collectionLatch<void>(), held=collectionLatch<void>();
+  const reader:AppReader={config:async()=>({googleDriveLinkId:link}),close:async()=>{},call:async(_p,name)=>{
+    if(name.endsWith("metadata")) return {sheets:[{properties:{sheetId:1,title:"Policy",gridProperties:{rowCount:1,columnCount:1}}}]};
+    if(name.endsWith("cells")) return {sheets:[{properties:{sheetId:1},data:[]}]};
+    if(pending){started.resolve();await held.promise;}
+    return {comments:[{id:"c",content:pending?"new":"old"}]};
+  }};
+  const changed=vi.fn(), service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("unused");}},changed,undefined,new NativeEvidenceConnector(reader));
+  try {
+    await service.collect(root.id); const hash=db.evidence.get(root.sourceId).contentHash;
+    pending=true; const collect=service.collect(root.id,true);await started.promise;link="link_other";held.resolve();await collect;
+    expect(db.evidence.get(root.sourceId).contentHash).toBe(hash);expect(changed).toHaveBeenCalledTimes(1);
+    expect(db.evidence.get(root.sourceId).collection?.status).toBe("error");
+  }finally{held.resolve();await service.stop();}
+});

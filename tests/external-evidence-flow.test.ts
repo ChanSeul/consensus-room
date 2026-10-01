@@ -67,6 +67,41 @@ it("registering an unrelated group root preserves a running scoped stage and its
     expect(clear).not.toHaveBeenCalled();
   } finally {f.database.finishAction("busy","succeeded");await app.close();dbs.splice(dbs.indexOf(f.database),1);}
 });
+it("승인을 전파하는 새 루트는 실행 중 선택 단계를 보호하고 유휴 때 승인을 무효화한다", async () => {
+  const f=fixture(),c=f.database.evidence.catalog;
+  const selected=c.add("t",{url:"https://www.figma.com/design/form?node-id=1-2",label:"Selected",scope:"topic",required:true,mode:"connector",intervalSeconds:900},true);
+  const groupId="11111111-1111-4111-8111-111111111111";
+  f.database.workGroups.create(groupId,{title:"Form",goal:"Form",contracts:"Scope",stages:[
+    {id:"ui",kind:"work",title:"UI",goal:"Layout",acceptance:"Verified",dependsOn:[],evidenceRootIds:[selected.id]},
+    {id:"all",kind:"integration",title:"All",goal:"All",acceptance:"Verified",dependsOn:["ui"]},
+  ]},f.root,"a".repeat(40));
+  f.database.workGroups.link(groupId,"ui","t","a".repeat(40));
+  const url="https://docs.google.com/spreadsheets/d/policy/edit";
+  const service=new EvidenceService(f.database.evidence,{fetch:async()=>{throw Error("host only");}});
+  const source=f.database.evidence.get(selected.sourceId);
+  service.importHost("t",{version:c.version("t"),rootId:selected.id,sourceId:source.id,previousHash:source.contentHash,
+    previousCheckedAt:source.checkedAt,observedAt:Date.now(),revision:"r",missing:[],units:[{id:"body",kind:"design",content:url}]});
+  await service.stop();
+  const config=loadConfig({repositoryPath:f.root,dataDirectory:f.root,webDirectory:join(f.root,"no-web"),launchToken:"test-token",enforceBudgets:false});
+  const app=await buildApp({config,database:f.database,runner:f.runner,claude:f.adapter,codex:{...f.adapter,role:"codex"}});
+  f.database.updateTopic("t",{state:"AWAITING_USER_APPROVAL",planSHA256:"f".repeat(64),approvedPlanSHA256:"f".repeat(64)});
+  f.database.startAction({id:"busy",topicId:"t",kind:"test",status:"running",createdAt:new Date().toISOString(),finishedAt:null,error:null,
+    pid:null,pgid:null,processExecutable:null,processCommand:null,processStartedAt:null});
+  const clear=vi.spyOn(ArtifactStore.prototype,"clearCurrentAliases");
+  const request={method:"POST" as const,url:"/api/topics/t/evidence/roots",headers:{"x-consensus-token":"test-token"},payload:{
+    url,label:"Approved policy",scope:"workspace",required:true,mode:"connector",intervalSeconds:900}};
+  try {
+    const blocked = await app.inject(request);
+    expect(blocked.statusCode).toBe(500);
+    expect(blocked.json().error).toContain("이미 실행 중인 작업");
+    expect(c.state("t").entries.find(e=>e.source.url===url)?.state).toBe("candidate");
+    expect(clear).not.toHaveBeenCalled();
+    f.database.finishAction("busy","succeeded");
+    expect((await app.inject(request)).statusCode).toBe(200);
+    expect(clear).toHaveBeenCalledWith("t");
+    expect(f.database.getTopic("t").approvedPlanSHA256).toBeNull();
+  } finally {f.database.finishAction("busy","succeeded");await app.close();dbs.splice(dbs.indexOf(f.database),1);}
+});
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "evidence-flow-")); roots.push(root);
   const database = new ConsensusDatabase(join(root, "room.sqlite")); dbs.push(database);

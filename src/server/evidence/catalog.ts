@@ -197,7 +197,7 @@ export class EvidenceCatalogStore {
     }
     return members.filter(m=>visible.has(m.source_id));
   }
-  private sharesApproval(from: EvidenceRoot, to: EvidenceRoot): boolean {
+  private sharesApproval(from: Pick<EvidenceRoot, "scope" | "owner">, to: EvidenceRoot): boolean {
     if (from.scope === to.scope && from.owner === to.owner) return true;
     return from.scope === "workspace" && this.affected(to).some(id => this.context(id).workspace === from.owner);
   }
@@ -205,11 +205,16 @@ export class EvidenceCatalogStore {
     return this.roots().some(root => root.status === "approved" && this.sharesApproval(root,target) &&
       this.reachableMembers(root.id).some(member => member.source_id === sourceId && member.state === "approved"));
   }
+  approvalAffected(sourceId: string, scope: EvidenceScope, owner: string): string[] {
+    return [...new Set(this.roots().filter(root => root.status === "approved" && this.sharesApproval({ scope, owner }, root) &&
+      this.members(root.id).some(m => m.source_id === sourceId && m.state === "candidate"))
+      .flatMap(root => this.affected(root)))];
+  }
   private reuseApproval(sourceId: string, from: EvidenceRoot): void {
     for (const other of this.roots()) {
       if (other.id === from.id || other.status !== "approved" || !this.sharesApproval(from,other)) continue;
       const changed = this.db.prepare("UPDATE evidence_members SET state='approved' WHERE root_id=? AND source_id=? AND state='candidate'").run(other.id,sourceId);
-      if (changed.changes) { other.version++; this.resetCycle(other); this.audit(other,"같은 작업 범위에서 승인한 자료 재사용",sourceId); }
+      if (changed.changes) { other.version++; this.resetCycle(other); this.audit(other,"같은 작업 범위에서 승인한 자료 재사용",sourceId); this.invalidate(other); }
     }
   }
   sourceIds(topicId: string): string[] {
@@ -244,9 +249,10 @@ export class EvidenceCatalogStore {
     return this.roots().some(root=>root.status==="approved" && this.store.get(root.sourceId).mode==="connector" &&
       this.reachableMembers(root.id).some(m=>m.source_id===sourceId && m.state==="approved"));
   }
-  state(topicId: string): EvidenceCatalog {
+  state(topicId: string, options: { collection?: boolean } = {}): EvidenceCatalog {
     const context = this.context(topicId);
-    const roots = this.forTopic(topicId), active = roots.filter(r => r.status !== "removed"),members=this.topicMembers(topicId,roots);
+    const roots = this.forTopic(topicId), active = roots.filter(r => r.status !== "removed");
+    const members = options.collection ? new Map(roots.map(root => [root.id, this.reachableMembers(root.id)])) : this.topicMembers(topicId,roots);
     const entries = active.flatMap(root => members.get(root.id)!.map(member => ({ rootId: root.id, source: this.store.get(member.source_id),
       state: member.state, progress: member.progress, error: member.error,
       discoveredFrom: this.db.prepare("SELECT parent_id,unit_id,relation FROM evidence_discovery_edges WHERE root_id=? AND source_id=?")

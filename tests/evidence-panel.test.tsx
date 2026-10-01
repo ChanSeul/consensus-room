@@ -190,3 +190,38 @@ it("groups roots and cross-platform discoveries without changing which root rece
   fireEvent.click(within(linked.parentElement!).getByRole("button", { name: "이 루트에서 제외" }));
   await waitFor(() => expect(select).toHaveBeenCalledExactlyOnceWith("t", catalog().version, "root-0", "reject", candidate.id));
 });
+
+it("keeps a closed plan's source links in collapsed history without live source controls", async () => {
+  vi.spyOn(api, "evidence").mockResolvedValue(state());
+  const convert = vi.spyOn(api, "useRestEvidence");
+  const review = vi.spyOn(api, "reviewEvidence");
+  render(<EvidencePanel topicId="t" busy={false} archived />);
+  const history = await screen.findByRole("group", { name: "완료 당시 참고 링크" });
+  expect(history).not.toHaveAttribute("open");
+  expect(screen.queryByRole("region", { name: "현재 계획에 연결된 원문" })).not.toBeInTheDocument();
+  expect(screen.queryByLabelText("원문 변경 영향")).not.toBeInTheDocument();
+  fireEvent.click(within(history).getByText("완료 당시 참고 링크 (1개)"));
+  expect(within(history).getByRole("link", { name: "Planning" })).toHaveAttribute("href", sourceURL);
+  expect(within(history).queryByRole("button")).not.toBeInTheDocument();
+  expect(convert).not.toHaveBeenCalled();
+  expect(review).not.toHaveBeenCalled();
+});
+
+it("allows an unpushed closed stage to review its preserved sources separately from future links", async () => {
+  vi.spyOn(api, "evidence").mockResolvedValue(state());
+  const review = vi.spyOn(api, "reviewEvidence").mockResolvedValue({});
+  const add = vi.spyOn(api, "addEvidenceRoot").mockResolvedValue({});
+  render(<EvidencePanel topicId="t" busy={false} archived archivedReviewRequired />);
+  const history = await screen.findByRole("group", { name: "완료 당시 참고 링크" });
+  expect(history).toHaveTextContent("전달 전 재검토 필요");
+  fireEvent.click(within(history).getByText(/완료 당시 참고 링크 \(1개\)/));
+  fireEvent.change(within(history).getByLabelText("완료 당시 근거 검토"), { target: { value: "Compared preserved sources and completed plan" } });
+  fireEvent.click(within(history).getByRole("button", { name: "완료 당시 근거 검토 완료" }));
+  await waitFor(() => expect(review).toHaveBeenCalledExactlyOnceWith("t", { digest: state().digest, plan: state().plan, reason: "Compared preserved sources and completed plan" }));
+  await waitFor(() => expect(screen.getByRole("button", { name: "루트와 탐색 범위 승인·추가" })).toBeEnabled());
+  fireEvent.change(screen.getByLabelText("탐색 루트 이름"), { target: { value: "Future plan" } });
+  fireEvent.change(screen.getByLabelText("탐색 루트 링크"), { target: { value: sourceURL } });
+  fireEvent.click(screen.getByRole("button", { name: "루트와 탐색 범위 승인·추가" }));
+  await waitFor(() => expect(add).toHaveBeenCalledExactlyOnceWith("t", expect.objectContaining({ label: "Future plan" })));
+  expect(within(history).getByRole("link", { name: "Planning" })).toHaveAttribute("href", sourceURL);
+});

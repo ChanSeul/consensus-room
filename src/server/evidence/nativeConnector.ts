@@ -1,7 +1,7 @@
 import type { EvidenceDiscoveryLink, EvidenceDiscoveryPage, EvidenceSource, EvidenceUnitInput } from "../../shared/externalEvidence.js";
 import { EvidenceFetchError, type EvidenceConnector } from "./connectors.js";
 import { discoverLinks } from "./discovery.js";
-import { appData, type AppProvider, type AppReader } from "./nativeReader.js";
+import { appData, readerIdentity, validateReaderIdentity, type AppProvider, type AppReader, type ReaderIdentity } from "./nativeReader.js";
 import { evidenceHash, stableJSON } from "./store.js";
 
 type Data = Record<string, any>;
@@ -25,30 +25,42 @@ function normalized(value: any): any {
   return Object.fromEntries(Object.entries(value).filter(([key]) => !["self", "avatarUrls", "avatarUrl", "iconUrl", "_links", "updated", "modifiedTime", "fetchedAt"].includes(key)).map(([key, item]) => [key, normalized(item)]));
 }
 export class NativeEvidenceConnector implements EvidenceConnector {
+  private readonly completedIdentities = new Map<string, ReaderIdentity>();
   constructor(private readonly reader: AppReader, private readonly onCall: (sourceId: string) => void = () => {}) {}
   configured(source: EvidenceSource): boolean { return source.provider !== "document"; }
   async fetch(): Promise<never> { throw new EvidenceFetchError("MCP 원문은 페이지별 루트 수집으로 읽으세요."); }
+  async validateCachedSource(source: EvidenceSource, connectionKey: string, signal: AbortSignal): Promise<void> {
+    const provider: AppProvider = source.provider === "jira" || source.provider === "confluence" ? "atlassian" : source.provider as AppProvider;
+    const identity = await readerIdentity(this.reader, provider, signal, () => this.onCall(source.id));
+    await validateReaderIdentity(this.reader, provider, identity, signal);
+    const previous = this.completedIdentities.get(source.id);
+    if (previous && previous.generation !== identity.generation) throw new EvidenceFetchError("수집 중 연결 계정이 바뀌었습니다. 전체 원문을 다시 확인해야 합니다.", 300, true);
+    if (evidenceHash(stableJSON([provider, identity.account])) !== connectionKey) throw new EvidenceFetchError("MCP 연결 계정이 바뀌었습니다. 전체 원문을 다시 확인하세요.", 300, true);
+  }
   async close(): Promise<void> { await this.reader.close(); }
   async discover(source: EvidenceSource, raw: string | null, signal: AbortSignal): Promise<EvidenceDiscoveryPage> {
+    try { return await this.discoverPage(source, raw, signal); }
+    catch (error) {
+      const provider = source.provider === "jira" || source.provider === "confluence" ? "atlassian" : source.provider as AppProvider;
+      this.completedIdentities.delete(source.id); this.reader.invalidateIdentity?.(provider); throw error;
+    }
+  }
+  private async discoverPage(source: EvidenceSource, raw: string | null, signal: AbortSignal): Promise<EvidenceDiscoveryPage> {
     const cursor: Data = raw ? JSON.parse(raw) : {};
     const provider: AppProvider = source.provider === "jira" || source.provider === "confluence" ? "atlassian" : source.provider as AppProvider;
     if (!this.configured(source)) throw new EvidenceFetchError("이 문서는 등록된 MCP 수집기를 지원하지 않습니다.");
-    const config = await this.reader.config();
+    const identity = await readerIdentity(this.reader, provider, signal, () => this.onCall(source.id));
+    const { config, account } = identity;
     const call = async (name: string, args: Data, rawResult = false) => {
       this.onCall(source.id);
       const result = await this.reader.call(provider, name, args, signal);
+      await validateReaderIdentity(this.reader, provider, identity, signal);
       return rawResult ? result as Data : appData(result);
     };
-    const account = provider === "sheets" ? config.googleDriveLinkId : await (async () => {
-      const identity = await call(provider === "slack" ? "slack.slack_read_user_profile" : provider === "figma" ? "figma.whoami" : "atlassian_rovo.atlassianUserInfo", {});
-      const who = identity.whoami ?? identity;
-      return who.accountId ?? who.id ?? who.email ?? who.user?.id ?? who.profile?.email ?? who.user?.profile?.email ?? (typeof who.result === "string" ? /^User ID: (\S+)/m.exec(who.result)?.[1] : undefined);
-    })();
-    if (typeof account !== "string" || !account) throw new EvidenceFetchError("수집할 연결 계정을 확인하세요. Google Drive는 evidence-apps.json에 googleDriveLinkId가 필요합니다.");
-    if (config.accountIds?.[provider] && config.accountIds[provider] !== account) throw new EvidenceFetchError("설정된 계정과 MCP 연결 계정이 다릅니다.");
     const connectionKey = evidenceHash(stableJSON([provider, account]));
-    if (cursor.connectionKey && cursor.connectionKey !== connectionKey) throw new EvidenceFetchError("수집 중 연결 계정이 바뀌었습니다. 전체 원문을 다시 확인해야 합니다.", 300, true);
-    const page = (units: EvidenceUnitInput[], next: Data | null = null, links: EvidenceDiscoveryLink[] = []): EvidenceDiscoveryPage => {
+    if ((cursor.connectionKey && cursor.connectionKey !== connectionKey) || (cursor.identityGeneration && cursor.identityGeneration !== identity.generation)) throw new EvidenceFetchError("수집 중 연결 계정이 바뀌었습니다. 전체 원문을 다시 확인해야 합니다.", 300, true);
+    const page = async (units: EvidenceUnitInput[], next: Data | null = null, links: EvidenceDiscoveryLink[] = []): Promise<EvidenceDiscoveryPage> => {
+      await validateReaderIdentity(this.reader, provider, identity, signal);
       const discovered = discoverLinks(units, source.url);
       const chunks = units.flatMap(item => {
         const points = Array.from(item.content);
@@ -57,7 +69,8 @@ export class NativeEvidenceConnector implements EvidenceConnector {
         for (let offset = 0; offset < points.length; offset += 60_000) result.push({ ...item, id: `${item.id.slice(0,110)}:${offset}`, content: points.slice(offset, offset + 60_000).join("") });
         return result;
       });
-      return { units: chunks, links: [...links, ...discovered], cursor: next ? JSON.stringify({ ...next, connectionKey }) : null,
+      if (next === null) this.completedIdentities.set(source.id, identity);
+      return { units: chunks, links: [...links, ...discovered], cursor: next ? JSON.stringify({ ...next, connectionKey, identityGeneration: identity.generation }) : null,
         revision: evidenceHash(stableJSON(chunks)), ...(provider === "figma" ? { missing: ["현재 Figma 읽기 도구는 댓글을 제공하지 않습니다."] } : {}), connectionKey, accountConfirmed: Boolean(provider === "sheets" || config.accountIds?.[provider]) };
     };
     if (provider === "sheets") {

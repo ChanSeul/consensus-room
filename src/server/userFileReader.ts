@@ -17,7 +17,7 @@ export interface InstructionFiles { global: string | null; project: string | nul
 // No shell, altered permissions, or inherited Node hooks; a stuck child is killed and reaped.
 const worker = String.raw`
 const fs = require('node:fs/promises');
-const { dirname } = require('node:path');
+const { dirname, basename, join } = require('node:path');
 const input = JSON.parse(process.argv[1]);
 // A parent crash must not leave a blocked reader forever. Async filesystem I/O keeps this
 // watchdog runnable; SIGKILL also terminates libuv work that process.exit cannot drain.
@@ -40,11 +40,20 @@ async function memory(path) {
   let value;
   if (input.operation === 'instructions') {
     const text = path => optional(path, p => fs.readFile(p, 'utf8'));
-    const global = input.globalPath ? await text(input.globalPath) : null;
-    const exists = await optional(input.workspacePath, p => fs.realpath(p));
+    // Match Codex's override precedence even when native discovery is disabled.
+    const instruction = async path => {
+      if (basename(path) === 'AGENTS.md') {
+        const override = await text(join(dirname(path), 'AGENTS.override.md'));
+        if (override && override.trim()) return override;
+      }
+      return text(path);
+    };
+    const global = input.globalPath ? await instruction(input.globalPath) : null;
+    const workspace = input.injectWorkspaceFile ? await instruction(input.workspacePath)
+      : await optional(input.workspacePath, p => fs.realpath(p));
     let project = null, source = null;
-    if (exists && input.injectWorkspaceFile) { project = await text(input.workspacePath); source = 'workspace'; }
-    else if (!exists && input.repositoryPath) { project = await text(input.repositoryPath); source = 'repository'; }
+    if (workspace !== null && input.injectWorkspaceFile) { project = workspace; source = 'workspace'; }
+    else if (workspace === null && input.repositoryPath) { project = await instruction(input.repositoryPath); source = 'repository'; }
     value = JSON.stringify({ global, project, source: project ? source : null });
   } else if (input.operation === 'resolve') value = await fs.realpath(input.path);
   else if (input.operation === 'memory') value = await memory(input.path);

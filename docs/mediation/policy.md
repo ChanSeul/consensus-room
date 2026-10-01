@@ -97,3 +97,31 @@ S12 인도에서 실행 순서·임시 브랜치 보존까지 사용자 질문 7
 - 스위치 정본: `~/Library/Application Support/ConsensusRoom/mediation-autonomy.json`(`mediation_autonomy.sh on|off|status`, 없으면 off). 결정 지점마다 다시 읽는다. off 면 러너의 `requestedUserDecision` 을 사용자에게 **원문 그대로** 띄우고 답만 decision 으로 게시한다.
 - off 에서도 유지되는 권한 2가지: ① **효율 상시 최적화** — 타임라인 `claude/codex 턴 사용량`(입력·캐시·출력·초·$)을 단계·역할별로 재고, 한 번에 한 변경씩 전·후를 같은 축으로 대조해 점진 개선(효과 없으면 되돌림). ② **Claude↔Codex 피드백 루프 유지보수** — 엔진 상태 기계·러너 spawn/resume·세션 id·모델 슬러그·폴러·`cr_api.sh`·mediator 스크립트·DB 를 점검·수리·재시작.
 - 경계(중재자 가정): 코드 수정·재시작은 **실행 중인 턴이 없을 때만**(재시작은 진행 중 턴을 죽인다). 이 저장소 로컬 커밋은 포함, 원격 push 는 제외. 상태 전이·승인·증거 판정 규칙을 바꾸는 변경은 off 에서 사용자 확인 후.
+
+## 엔진 결함의 후속 처리 (2026-10-01 사용자 지시)
+
+토픽 중 발견한 엔진 결함은 재현 근거·영향·토픽·임시 대응을 To-do에 기록하고 토픽을 계속한다.
+토픽 완료 후 엔진 결함을 수정하고, 고정 커밋에 host-review를 실행한다. 이 후속 리뷰만 승인됐으며
+단순 설정·문서·UI 변경에 자동 리뷰를 다시 붙이지 않는다. host-review의 평상시 OFF는 유지하고
+후속 리뷰 실행 시 `--engine-defect-job ID`로 등록 작업에만 예외를 적용한다. 전역 OFF 값은 변경하지 않는다. 운영 반영은 실행 중 턴이 없을 때 조율한다.
+실제로 진행 불가능한 단계와 실패는 그대로 기록한다. To-do 이관을 통과·완료로 기록하지 않는다.
+커밋은 자동, 푸시는 명시적 사용자 요청 때만 수행한다.
+
+### 자동 엔진 결함 큐
+
+에이전트 결과의 `engineDefects`(key/title/evidence/workaround)는 서버가 SQLite 원장에 자동 등록한다.
+중재자의 직접 등록은 `POST /api/topics/:id/engine-defects`, 조회는 `GET /api/engine-defects`다.
+직접 등록의 재현 근거가 바뀌면 별도 key를 사용한다. 동일 보고는 중복 등록하지 않는다.
+
+서버는 모델 없는 10초 주기로 To-do를 확인한다. 원본 토픽 CLOSED·서버 action 0·유지보수 잠금 없음일 때
+격리 작업 트리에서 Codex로 수정한다. 열린 토픽·사용자 결정 대기·예산 정지는 종료로 취급하지 않는다.
+원본 토픽과 작업 묶음의 예산을 유지한다. 고정 커밋에 host-review를 실행하고 실제 passed와 동일 head를
+확인해야 정본에 fast-forward로 합류한다. 워커는 푸시·운영 재시작을 하지 않는다.
+
+상태는 todo → executing → reviewing → passed이며 실패는 blocked다. 실패·서버 중단 시 작업 트리와
+커밋을 보존한다. `POST /api/engine-defects/:id/retry`는 사용자만 호출할 수 있다. 예산·리뷰 한도를
+초기화하지 않으며 고정 커밋이 있으면 수정 모델을 다시 호출하지 않고 같은 후보의 리뷰를 재개한다.
+정본이 달라졌거나 기존 잠금이 남으면 자동 덮어쓰기·잠금 삭제를 하지 않는다.
+
+host-review의 `--engine-defect-job`은 등록 row reviewing·원본 CLOSED·동일 head·engine 저장소 경로·
+단독 engine-defect action을 검증한 경우에만 OFF 예외를 허용한다. 일반 설정 변경·pre-push에는 적용하지 않는다.

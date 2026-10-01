@@ -616,7 +616,7 @@ export function App() {
         <aside className={`inspector-pane mobile-${mobilePanel}`}>
           {selected && detail ? (
             <Inspector
-              evidenceBusy={Boolean(busyAction) || Boolean(activity?.runningAction) || selected.state === "CLOSED"}
+              evidenceBusy={Boolean(busyAction) || Boolean(activity?.runningAction)}
               budgetPaused={Boolean(activity?.budget?.pause || activity?.budgetRecoveryRequired || activity?.revisionPaused || activity?.reviewPaused)}
               detail={detail}
               findings={findings}
@@ -916,7 +916,8 @@ function Inspector({
 
   return (
     <div className="inspector-scroll">
-      <EvidencePanel key={topic.id} topicId={topic.id} busy={evidenceBusy} />
+      <EvidencePanel key={topic.id} topicId={topic.id} busy={evidenceBusy} archived={topic.state === "CLOSED"}
+        archivedReviewRequired={closedStagePush} />
       <details className="inspector-section execution-details">
         <summary>사용량·횟수 설정·계획 조사 기록</summary>
         {children}
@@ -992,8 +993,8 @@ function Inspector({
         </section>
       )}
 
-      <section className="inspector-section">
-        <div className="section-heading"><div><p className="eyebrow">CONTEXT</p><h3>실행 정보</h3></div></div>
+      <details className="inspector-section context-section">
+        <summary className="section-heading"><span>실행 정보</span></summary>
         <dl className="context-list">
           {detail.routing ? <RoutingRows routing={detail.routing} /> : (
             <>
@@ -1005,7 +1006,7 @@ function Inspector({
           <div><dt>브랜치</dt><dd>{topic.branchName ?? "구현 승인 뒤 생성"}</dd></div>
           <div><dt>작업 디렉터리</dt><dd>{topic.worktreePath}</dd></div>
         </dl>
-      </section>
+      </details>
 
       <section className="inspector-section">
         <div className="section-heading"><div><p className="eyebrow">EVIDENCE</p><h3>근거</h3></div><span className="count-pill">{evidence.length}</span></div>

@@ -548,6 +548,25 @@ it("keeps every requested body and citation in the same review session near the 
   expect(fake.calls[1]).toMatchObject({ sessionId: "session-1" });
 });
 
+it("does not invalidate required planning inputs when only interactive instructions change", async () => {
+  const { repo, database, git } = setup("codex");
+  const file = join(repo, "AGENTS.md"), boundary = "<!-- interactive-session-only: operator workflow -->";
+  writeFileSync(join(repo, ".git/info/exclude"), "AGENTS.md\n");
+  writeFileSync(file, `REQUIRED_WORKER_RULE\n${boundary}\nOLD_OPERATOR_WORKFLOW\n`);
+  const fake = scripted(async (turn, n) => {
+    expect(turn.prompt).not.toContain("OPERATOR_WORKFLOW");
+    if (n === 1) {
+      writeFileSync(file, `REQUIRED_WORKER_RULE\n${boundary}\nNEW_OPERATOR_WORKFLOW\n`);
+      return answer(step({ requests: [{ kind: "file", selector: "form.swift", question: "Check step", offset: 0 }] }));
+    }
+    expect(turn.planningControl?.instructionsInSession).toBe(true);
+    return answer(step({ questions: [], complete: true }));
+  }, "codex");
+  const wrapped = guardedPlanning(fake.adapter, database, git);
+  expect((await wrapped.createSession({ cwd: repo, prompt: "Plan existing navigation" })).result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls).toHaveLength(2);
+});
+
 it("resends changed instructions when a resumed call stopped before delivering them", async () => {
   const { repo, database, git } = setup("codex");
   writeFileSync(join(repo, "AGENTS.md"), "Original rule\n");

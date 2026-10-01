@@ -1,8 +1,8 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { PlanningPaused } from "../../shared/planningControl.js";
 import { readdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import {
@@ -80,6 +80,37 @@ export class ClaudeAdapter implements AgentAdapter {
   readonly role = "claude" as const;
 
   private readonly memory: ProjectMemoryReader | null;
+  private readonly instructionReceipts = new Map<string, string>();
+
+  private instructionReceiptPath(key: string): string | null {
+    return this.options.managedPluginDirectory
+      ? join(this.options.managedPluginDirectory, "instruction-receipts", `${key}.sha256`) : null;
+  }
+
+  private async instructionsDelivered(key: string, hash: string): Promise<boolean> {
+    const path = this.instructionReceiptPath(key);
+    if (!path) return this.instructionReceipts.get(key) === hash;
+    const recorded = await readFile(path, "utf8").catch(error => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    });
+    return recorded === hash;
+  }
+
+  private async recordInstructions(key: string, hash: string): Promise<void> {
+    const path = this.instructionReceiptPath(key);
+    if (!path) { this.instructionReceipts.set(key, hash); return; }
+    await mkdir(join(this.options.managedPluginDirectory!, "instruction-receipts"), { recursive: true });
+    const temporary = `${path}.${randomUUID()}.tmp`;
+    await writeFile(temporary, hash, { mode: 0o600 });
+    await rename(temporary, path);
+  }
+
+  private async forgetInstructions(key: string): Promise<void> {
+    this.instructionReceipts.delete(key);
+    const path = this.instructionReceiptPath(key);
+    if (path) await rm(path, { force: true });
+  }
 
   constructor(
     private readonly runner: CommandRunner,
@@ -247,7 +278,14 @@ export class ClaudeAdapter implements AgentAdapter {
       const enriched = injectMemory
         ? await this.memory!.buildPrompt(turn.prompt, this.role, turn.signal)
         : turn.planningControl ? turn.prompt : await this.withMemoryManifest(turn, protocolOnly);
-      const stdin = [EXECUTION_POLICY_NOTE, ...instructions, enriched].join("\n\n");
+      const controlled = protocolOnly || Boolean(turn.planningControl);
+      const instructionText = [EXECUTION_POLICY_NOTE, ...instructions].join("\n\n");
+      const instructionHash = createHash("sha256").update(instructionText).digest("hex");
+      const receiptKey = createHash("sha256").update(JSON.stringify([workspace, sessionArgs[1]])).digest("hex");
+      // Keep Claude's system snapshot unchanged (including preserved thinking). Ordinary turns
+      // deliver worker rules once, or after their content changes. Controlled planning owns its receipts.
+      const deliverInstructions = controlled || newSession || !await this.instructionsDelivered(receiptKey, instructionHash);
+      const stdin = deliverInstructions ? [instructionText, enriched].join("\n\n") : enriched;
       if (turn.planningControl && Buffer.byteLength(stdin) > turn.planningControl.maxPromptBytes) {
         throw new PlanningPaused("Final planning input including mandatory instructions exceeds its byte limit.");
       }
@@ -278,6 +316,11 @@ export class ClaudeAdapter implements AgentAdapter {
         : await readClaudeUsageBaseline(resolve(workspace, environment.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "projects"), requestedSession));
       const designCalls = new Map<string, { tool: string; input: unknown; content?: unknown; received: boolean; error: boolean; delivered: boolean }>();
       let designCaptureError: unknown;
+      let instructionContextCompacted = false;
+      const observeInstructionContext = (value: unknown) => {
+        const event = value as { type?: string; subtype?: string } | null;
+        if (event?.type === "system" && event.subtype === "compact_boundary") instructionContextCompacted = true;
+      };
       const observeDesign = (value: unknown) => {
         const event = value as { type?: string; message?: { content?: Array<Record<string, unknown>> } } | null;
         if (!event || !Array.isArray(event.message?.content)) return;
@@ -322,14 +365,14 @@ export class ClaudeAdapter implements AgentAdapter {
         onInterruptedOutput: turn.onInterruptedOutput,
         command: "claude", args, cwd: workspace, stdin: transport,
         signal: turn.signal, onSpawn: turn.onProcessSpawn,
-        onJSONLine: (value, at) => { toolTime.observe(value, at); metrics.observe(value); observeDesign(value); },
+        onJSONLine: (value, at) => { toolTime.observe(value, at); metrics.observe(value); observeDesign(value); observeInstructionContext(value); },
         // stream-json 의 마지막 줄은 {"type":"result"} 다. 그 뒤 2분 안에 프로세스가 안 끝나면 hang 으로 보고 정리한다.
         finalResultTimeoutMs: FINAL_RESULT_TIMEOUT_MS,
         isFinalResult: (value) => typeof value === "object" && value !== null && (value as { type?: unknown }).type === "result",
         environment,
       });
       // 테스트용 runner가 onJSONLine을 생략해도 최종 버퍼를 한 번 관찰한다.
-      for (const value of output.jsonLines) { metrics.observe(value); observeDesign(value); }
+      for (const value of output.jsonLines) { metrics.observe(value); observeDesign(value); observeInstructionContext(value); }
       recordFinal();
       if (output.exitCode !== 0) {
         throw agentRunError("claude", output.exitCode, output.stderr, output.stdout);
@@ -342,10 +385,14 @@ export class ClaudeAdapter implements AgentAdapter {
           throw new Error("Figma response was not captured; implementation cannot be accepted without shared design evidence.");
         }
       }
+      if (!instructionContextCompacted && !controlled && deliverInstructions && !isZeroTurnResult(output.jsonLines) && !turn.signal?.aborted) {
+        await this.recordInstructions(receiptKey, instructionHash);
+      }
       return output;
       } finally {
         clearInterval(progressTimer);
         recordFinal();
+        if (instructionContextCompacted) await this.forgetInstructions(receiptKey);
       }
     } finally {
       await figmaCapture?.close();

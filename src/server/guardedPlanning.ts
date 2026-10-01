@@ -355,7 +355,7 @@ export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDataba
     const readInstructions = () => readAppliedInstructions({ workspace: turn.cwd, repositoryPath: topic.repositoryPath,
       strict: true, chunkedDelivery: keepSession, signal: turn.signal,
       fileName: adapter.role === "claude" ? "CLAUDE.md" : "AGENTS.md", injectWorkspaceFile: true,
-      globalPath: adapter.role === "claude" ? join(homedir(), ".claude", "CLAUDE.md") : join(homedir(), ".codex", "AGENTS.md") });
+      globalPath: adapter.role === "claude" ? join(homedir(), ".claude", "CLAUDE.md") : join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), "AGENTS.md") });
     const instructions = await readInstructions()
       .catch(error => { turn.signal?.throwIfAborted(); return pause(error instanceof Error ? error.message : String(error)); });
     const instructionHash = planningHash(instructions.blocks.join("\n"));

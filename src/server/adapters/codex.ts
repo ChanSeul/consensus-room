@@ -11,7 +11,7 @@ import {
   DEFAULT_AGENT_SETTINGS,
   type AgentResult,
 } from "../../shared/contracts.js";
-import { EXECUTION_POLICY_NOTE } from "../../shared/prompts.js";
+import { executionPolicyNote } from "../../shared/prompts.js";
 import { readAppliedInstructions } from "../projectInstructions.js";
 import type { AgentAdapter, CommandRunner, CreatedSession, OutputSchema, SessionTurn } from "../types.js";
 import { agentEnvironment } from "../security.js";
@@ -114,8 +114,8 @@ function managedConfigBody(boundary: CodexPermissionBoundary): string {
     // 웹 차단은 최상위 web_search 다 — [tools] web_search=false 만으로는 웹 도구(web__run)가 남았다(2026-09-25 호스트 실제 CLI 탐침, CLI 0.155:
     // "Set `web_search` to live/indexed/cached/disabled at the top level"). 최상위 키라 표보다 앞에 둔다.
     ...(!boundary.web ? ['web_search = "disabled"'] : []),
-    // 하위 에이전트를 끈 일반 계획 턴에도 프로젝트 지침은 필요하다. 문서 차단은 도구 차단·격리 입력에만 적용한다.
-    ...(boundary.toolsDisabled || boundary.isolated ? ["project_doc_max_bytes = 0"] : []),
+    // A single scoped instruction source prevents native discovery from restoring interactive-only rules.
+    "project_doc_max_bytes = 0",
     ...(disabledFeatures.length ? ["[features]", ...disabledFeatures.map(feature => `${feature} = false`)] : []),
     // 격리 턴의 skill 차단 — 내장(.system) skill 을 끄고 skill 목록을 싣지 않는다. 사용자 skill 은 발견 경로($HOME/.agents/skills)를 격리 HOME 으로
     // 없앤다(prepareIsolatedHome). 근거: codex debug prompt-input 실측(E2e.md "격리 입력 실측").
@@ -331,18 +331,24 @@ export class CodexAdapter implements AgentAdapter {
       : await readAppliedInstructions({
         strict: Boolean(turn.planningControl), signal: turn.signal,
         workspace: turn.cwd, fileName: "AGENTS.md", repositoryPath: this.options.repositoryPath ?? null,
-        globalPath: turn.planningControl ? join(homedir(), ".codex", "AGENTS.md") : null,
-        injectWorkspaceFile: Boolean(turn.planningControl),
+        globalPath: join(this.userCodexHome(), "AGENTS.md"),
+        injectWorkspaceFile: true,
       });
-    const stdin = [EXECUTION_POLICY_NOTE, ...instructions, enriched].join("\n\n");
+    // Config instructions are session context, not another user message on every resume.
+    // Controlled input remains in the host's measured/required fragment queue.
+    const controlled = protocolOnly || Boolean(turn.planningControl);
+    const systemInstructions = controlled ? "" : [executionPolicyNote(turn.engineDefectFix), ...instructions].join("\n\n");
+    if (!controlled) commandArgs = ["-c", `developer_instructions=${tomlString(systemInstructions)}`, ...commandArgs];
+    const instructionBytes = Buffer.byteLength(systemInstructions, "utf8");
+    const stdin = controlled ? [executionPolicyNote(turn.engineDefectFix), ...instructions, enriched].join("\n\n") : enriched;
     if (turn.planningControl && Buffer.byteLength(stdin) > turn.planningControl.maxPromptBytes) {
       throw new PlanningPaused("Final planning input including mandatory instructions exceeds its byte limit.");
     }
-    if (!policy.figma) return this.run(turn, commandArgs, newSession, topicHome, stdin, this.codexHome, {});
+    if (!policy.figma) return this.run(turn, commandArgs, newSession, topicHome, stdin, this.codexHome, {}, instructionBytes);
     const figma = await nativeFigma(resolveCodexExecutable(), join(this.codexHome, "auth.json"), turn.cwd, turn);
     try {
       const mcp = ["-c", `mcp_servers.figma-native.url=${JSON.stringify(figma.url)}`, "-c", `mcp_servers.figma-native.enabled_tools=${JSON.stringify(NATIVE_FIGMA_READS)}`];
-      const result = await this.run(turn, [...mcp, ...commandArgs], newSession, topicHome, stdin, this.codexHome, {});
+      const result = await this.run(turn, [...mcp, ...commandArgs], newSession, topicHome, stdin, this.codexHome, {}, instructionBytes);
       figma.assertCaptured(); return result;
     } finally { await figma.close(); }
   }
@@ -356,11 +362,12 @@ export class CodexAdapter implements AgentAdapter {
     stdin: string,
     usageHome: string,
     environment: NodeJS.ProcessEnv,
+    instructionBytes = 0,
   ) {
     const executionSettings = turn.settings ?? DEFAULT_AGENT_SETTINGS.codex;
     const startedAt = Date.now();
     const toolTime = createToolTimeMeter("codex");
-    const metrics = new ExecutionMetrics("codex", Buffer.byteLength(stdin, "utf8"), executionSettings.model, executionSettings.effort, !newSession, startedAt);
+    const metrics = new ExecutionMetrics("codex", Buffer.byteLength(stdin, "utf8") + instructionBytes, executionSettings.model, executionSettings.effort, !newSession, startedAt);
     // 재개 턴의 실제 공급자 세션(E2e-2 host-review F001) — 재개 스트림의 thread.started 는 요청 ID 와 같은 문자열이어야 한다. 다른 ID·ID 없음·
     // null·숫자·빈 문자열이면 그 응답은 이 세션의 결과가 아니다. thread.started 이벤트 자체가 없으면(전환 전 운영 도구와 같은 조건) 요청 세션으로 둔다.
     const requestedSessionId = !newSession && "sessionId" in turn ? turn.sessionId : undefined;

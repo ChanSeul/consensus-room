@@ -36,6 +36,20 @@ describe("재시작 프로세스 감독", () => {
     expect(signals).toEqual([{ pid: 4201, pgid: 4201, signal: "SIGTERM" }]);
   });
 
+  it("엔진 후속 action의 승인된 host-review 경로만 회수한다", async () => {
+    const executable = "/approved/review-tools/host-review";
+    for (const [kind, path, permitted] of [["engine-defect", executable, true], ["engine-defect", "/other/host-review", false], ["claude-plan", executable, false]] as const) {
+      const identity = { pgid: 4201, commandLine: `${path} ensure`, startedAt: "Sun Aug 23 14:00:00 2026" };
+      let running = true;
+      const signals: NodeJS.Signals[] = [];
+      const control: ProcessControl = { inspect: () => running ? identity : null,
+        terminateGroup: (_pid, _pgid, signal) => { signals.push(signal); running = false; }, wait: async () => {} };
+      const action = { ...actionFor(identity), kind, processExecutable: path };
+      await new ProcessSupervisor(control, undefined, executable).recover([action]);
+      expect(signals).toEqual(permitted ? ["SIGTERM"] : []);
+    }
+  });
+
   it("시작 시각이 다른 PID는 재사용된 프로세스로 보고 종료하지 않는다", async () => {
     const recorded: ProcessIdentity = {
       pgid: 4201,

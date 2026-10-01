@@ -1,5 +1,7 @@
 import {ReviewBlocked} from "../reviewLedger.js";
 import { existsSync, readFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { assertEngineRepositoryAvailable } from "../engineRepositoryLock.js";
 import {reviewScope} from "../../shared/reviews.js";
 import { RevisionBlocked } from "../revisionLedger.js";
 import type { RewriteKind } from "../../shared/revisions.js";
@@ -12,7 +14,7 @@ import { applyPlanLineEdits, applyPlanRepair, planRepairPrompt, repairablePlan }
 // WorkflowEngine 분해(2026-08-31): 상태 전환·세션·산출물·메모리·전달이 한 클래스(1,504줄)에 있어
 // 순서 결함이 반복된다는 Codex 진단에 따른 분리. EngineCore는 공유 상태와 횡단 프리미티브만 갖는다 —
 // 흐름(계획 수렴·구현 전달)은 PlanningPipeline·DeliveryPipeline이, 공개 API는 WorkflowEngine 파사드가 갖는다.
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { ZodError } from "zod";
 import { ToleranceFormatError } from "../../shared/tolerance.js";
 import {
@@ -61,7 +63,7 @@ import { DiagnosisService } from "./diagnoses.js";
 // (2026-09-07 Codex 자기 최적화 제안 ③). 쟁점 누락·처분 규칙 위반은 판단이 섞이므로 여기 속하지 않는다.
 // 파싱 직후·검사 직전에 결과를 손질하는 함수. carried 가 있으면 enforceResultContract 가 **최종 검사 뒤** 마지막 적용의 승계 id 를
 // 턴당 1회 이벤트로 남긴다(2026-09-13 Codex 지적 3: 검사 전에 "재제출 없음" 을 적으면 바로 뒤 교정이 그 기록을 거짓으로 만든다).
-export type ResultNormalizer = ((result: AgentResult) => AgentResult) & { carried?: () => readonly string[]; label?: string };
+export type ResultNormalizer = ((result: AgentResult) => AgentResult) & { carried?: () => readonly string[]; label?: string; beforeMerge?: (result: AgentResult) => AgentResult };
 
 function normalized(normalize: ResultNormalizer | undefined, result: AgentResult): AgentResult {
   return normalize ? normalize(result) : result;
@@ -305,6 +307,9 @@ export class EngineCore {
       throw new Error("이 주제에서 이미 실행 중인 작업이 있습니다.");
     }
     this.assertNoMaintenanceLock(options.maintenanceOwner);
+    if (this.dependencies.maintenanceLockPath) {
+      assertEngineRepositoryAvailable(dirname(this.dependencies.maintenanceLockPath), this.dependencies.database.getTopic(topicId).repositoryPath);
+    }
   }
 
   // 중재자가 도구 트리·서버를 교체하는 동안(next-stop.sh) 새 실행을 시작하지 않는다 — 유휴 확인과 교체 사이의 경쟁을 막는 공유 잠금.
@@ -441,6 +446,10 @@ export class EngineCore {
         writeGuards: options.writeGuards,
       });
       accepted = true;
+      for (const defect of checked.engineDefects ?? []) {
+        const key = createHash("sha256").update(JSON.stringify(defect)).digest("hex");
+        this.dependencies.database.engineDefects.enqueue(topic.id, { ...defect, key });
+      }
       if(pending)await this.writeArtifact(topic,"pending-contract-repair",this.latestSequence(topic.id)+1,"null",signal);
       return checked;
     } catch(error) {
@@ -624,7 +633,10 @@ export class EngineCore {
       return parsedCorrection;
     }
     const salvaged = salvageResultFields(raw, parsedCorrection.kind);
-    const merged = mergeCorrectionResult(salvaged, parsedCorrection);
+    const merged = mergeCorrectionResult(
+      context.normalize?.beforeMerge?.(salvaged) ?? salvaged,
+      context.normalize?.beforeMerge?.(parsedCorrection) ?? parsedCorrection,
+    );
     if (merged.preserved.length > 0) {
       this.event(topic.id, "system", "system", `계약 교정 재제출에 원본의 유효한 필드를 병합했습니다(서버 보존): ${merged.preserved.join(" · ")}`,
         { correctionPreserved: merged.preserved });

@@ -1,5 +1,6 @@
 import { ReviewLedger } from "./reviewLedger.js";
 import { RoleRegistry } from "./roleAssignments.js";
+import { EngineDefectStore } from "./engineDefects.js";
 import { PlanningStore } from "./planningStore.js";
 import { RevisionLedger } from "./revisionLedger.js";
 import { WorkGroups } from "./workGroups.js";
@@ -66,6 +67,7 @@ export class ConsensusDatabase {
   readonly evidence: EvidenceStore;
   readonly planning: PlanningStore;
   readonly roles: RoleRegistry;
+  readonly engineDefects: EngineDefectStore;
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true });
@@ -81,6 +83,7 @@ export class ConsensusDatabase {
     this.revisions = new RevisionLedger(this.db);
     this.reviews = new ReviewLedger(this.db);
     this.roles = new RoleRegistry(this.db);
+    this.engineDefects = new EngineDefectStore(this.db);
     this.evidence.freezeFinalized();
     this.evidence.catalog.migrateLegacy();
   }
@@ -447,6 +450,14 @@ export class ConsensusDatabase {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       for (const row of interrupted) {
+        if (row.kind === "engine-defect") {
+          const defect = this.engineDefects.list(String(row.topic_id)).find(item => item.actionId === row.id);
+          const receipt = defect?.review as { status?: string; head?: string } | undefined;
+          const passed = defect?.status === "passed" && Boolean(defect.head) && receipt?.status === "passed" && receipt.head === defect.head;
+          this.db.prepare("UPDATE actions SET status = ?, finished_at = ?, error = ? WHERE id = ?")
+            .run(passed ? "succeeded" : "cancelled", timestamp, passed ? null : "서버 재시작으로 엔진 후속 작업이 중단되었습니다.", row.id as SqlValue);
+          continue;
+        }
         if (row.kind === "evidence-assessment") {
           this.db.prepare("UPDATE actions SET status = 'cancelled', finished_at = ?, error = ? WHERE id = ?")
             .run(timestamp, "서버 재시작으로 영향 검토가 중단되었습니다.", row.id as SqlValue);

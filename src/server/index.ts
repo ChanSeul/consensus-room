@@ -4,8 +4,9 @@ import { ConsensusDatabase } from "./database.js";
 import type { MemoryReaderOptions } from "./projectMemory.js";
 import { loadConfig } from "./config.js";
 import { SpawnCommandRunner } from "./processRunner.js";
-import { writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { writeFileSync, renameSync, existsSync, readFileSync, unlinkSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { systemProcessControl } from "./processSupervisor.js";
 
 import { NativeAppReader } from "./evidence/nativeReader.js";
 import { NativeEvidenceConnector } from "./evidence/nativeConnector.js";
@@ -25,7 +26,8 @@ const app = await buildApp({
   database,
   runner,
   hostSandbox,
-  nativeEvidenceConnector: new NativeEvidenceConnector(new NativeAppReader(config.dataDirectory, resolveCodexExecutable()), id => database.evidence.measure(id, "toolCalls", 1)),
+  nativeEvidenceConnector: new NativeEvidenceConnector(new NativeAppReader(config.dataDirectory, resolveCodexExecutable(), undefined,
+    (provider, metric, value) => database.evidence.measure(`identity:${provider}`, metric, value)), id => database.evidence.measure(id, "toolCalls", 1)),
   ...createRuntimeAdapters(runner, {
     dataDirectory: config.dataDirectory,
     memoryDirectory: config.memoryDirectory,
@@ -41,7 +43,23 @@ const app = await buildApp({
   }),
 });
 
+const registry = join(config.dataDirectory, "server-process.json");
+const identity = systemProcessControl.inspect(process.pid);
+if (!identity) throw new Error("서버 프로세스 신원을 기록할 수 없습니다.");
+app.addHook("onClose", async () => {
+  if (existsSync(registry)) {
+    try {
+      const owner = JSON.parse(readFileSync(registry, "utf8"));
+      if (owner.pid === process.pid && owner.startedAt === identity.startedAt) unlinkSync(registry);
+    } catch { /* Leave an unrecognized process registry for the operator. */ }
+  }
+});
 await app.listen({ host: config.host, port: config.port });
+const registryTemporary = `${registry}.${process.pid}.tmp`;
+writeFileSync(registryTemporary, JSON.stringify({ pid: process.pid, ...identity,
+  executable: process.execPath, repositoryPath: resolve(import.meta.dirname, "../.."),
+  dataDirectory: resolve(config.dataDirectory) }), { mode: 0o600 });
+renameSync(registryTemporary, registry);
 const launchURL = `http://${config.host}:${config.port}/?token=${config.launchToken}`;
 // 토큰이 재시작마다 바뀌므로, 사용자가 세션에 묻지 않고 브라우저를 열 수 있게 현재 URL을 고정 위치에 남긴다.
 writeFileSync(join(config.dataDirectory, "consensus-room.url"), `${launchURL}\n`, { mode: 0o600 });

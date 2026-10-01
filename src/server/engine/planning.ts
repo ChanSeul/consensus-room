@@ -460,7 +460,8 @@ export class PlanningPipeline {
     const carry = this.core.carryForwardNormalizer(identity.findings, "Codex audit", { forReview: true });
     const normalize = Object.assign(
       (result: AgentResult) => carry({ ...result, findings: identity.normalize(result.findings) }),
-      { carried: carry.carried, label: carry.label },
+      { carried: carry.carried, label: carry.label,
+        beforeMerge: (result: AgentResult) => ({ ...result, findings: identity.normalize(result.findings, false) }) },
     );
     let topic = this.core.transition(topicId, "CODEX_AUDIT", "Codex가 계획을 읽기 전용으로 감사합니다.");
     const auditRoute = this.core.route(topic, { role: "reviewer", operation: "audit" });

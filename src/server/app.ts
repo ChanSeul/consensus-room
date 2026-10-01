@@ -34,6 +34,7 @@ import {
 import { ArtifactStore } from "./artifacts.js";
 import { loadConfig, type ServerConfig } from "./config.js";
 import { ConsensusDatabase } from "./database.js";
+import { EngineDefectInput, EngineDefectWorker } from "./engineDefects.js";
 import { GitService } from "./git.js";
 import { redactRecord, safeError } from "./security.js";
 import { redactSecrets } from "../shared/workflow.js";
@@ -121,6 +122,8 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     hostSandbox: dependencies.hostSandbox,
   });
   evidence.onIdle = () => workflow.pollEvidenceAssessments();
+  const engineDefects = new EngineDefectWorker(database, dependencies.runner, guardRunnerControl(dependencies.codex),
+    config.dataDirectory, resolve(import.meta.dirname, "../.."), dependencies.hostSandbox?.kind !== "unavailable");
   evidence.canPublish = topicId => workflow.canPublishEvidence(topicId);
   // 중재 세션의 호출은 헤더 x-consensus-actor: mediator 로 구분한다. 결정·승인·실행·인도 류는 위임 스위치(mediation-autonomy.json)가
   // on 일 때만 받는다(off 면 403) — "중재자가 사용자와 같은 인증으로 무엇이든 부른다" 를 닫는다(2026-09-14 Codex 감사 D03).
@@ -343,6 +346,23 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
 
   // 역할·프로필·배정(엔진 개편 E1). 프로필은 불변, 배정 변경은 사용자 전용(위임 스위치와 같은 규칙) + 기대 버전.
   app.get("/api/agent-profiles", async () => database.roles.profiles());
+  app.get("/api/engine-defects", async () => database.engineDefects.list());
+  app.post<{ Params: { id: string } }>("/api/topics/:id/engine-defects", async request => {
+    const topic = database.getTopic(request.params.id);
+    const row = database.engineDefects.enqueue(topic.id, EngineDefectInput.parse(redactRecord(EngineDefectInput.parse(request.body))));
+    database.appendEvent({ topicId: topic.id, actor: "system", kind: "system", state: topic.state,
+      body: `엔진 결함 To-do 보관: ${row.title}. 토픽 완료 후 처리합니다.`, payload: { engineDefectId: row.id } });
+    return row;
+  });
+  app.post<{ Params: { id: string } }>("/api/engine-defects/:id/retry", async request => {
+    if (request.headers["x-consensus-actor"] === "mediator") {
+      throw Object.assign(new Error("중단된 엔진 결함 재개는 사용자만 요청할 수 있습니다."), { statusCode: 403 });
+    }
+    const row = database.engineDefects.get(request.params.id);
+    if (row.status !== "blocked") throw Object.assign(new Error("blocked 작업만 재개할 수 있습니다."), { statusCode: 409 });
+    database.engineDefects.save({ ...row, status: "todo", error: undefined });
+    return database.engineDefects.get(row.id);
+  });
   // 프로필 역할 적합성(plan §2.5 "프로필 조회·검증", E2c) — 배정하면 역할·작업마다 실행할 수 있는지와 사유. 경로 판정과 같은 함수로 계산한다.
   app.get<{ Params: { id: string } }>("/api/agent-profiles/:id/suitability", async (request) => {
     const profile = database.roles.profile(request.params.id);
@@ -712,19 +732,21 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   // 죽으면 안 된다(2026-08-31 Codex 지적: 부팅 회수가 bind보다 먼저라 소유권 없이 남의 작업을 죽임).
   app.addHook("onListen", async () => {
     await verifications.recoverExpired();
-    await new ProcessSupervisor().recover(database.runningActions());
+    await new ProcessSupervisor(undefined, undefined, join(config.dataDirectory, "review-tools", "host-review")).recover(database.runningActions());
     database.recoverInterruptedActions();
     database.recoverInterruptedNonDeliveryRequests();
     database.recoverInterruptedDeliveryRequests();
     database.recoverInterruptedGlobalRequests();
     const restored = workflow.restoreScheduledRetries();
     evidence.start();
+    engineDefects.start();
     if (restored > 0) process.stdout.write(`시작: 사용 한도로 멈춘 주제 ${restored}건의 자동 재시도 예약을 복원했습니다.\n`);
   });
 
   // 종료 순서: 새 요청 차단(shuttingDown) → 실행 중 에이전트 중단·원장 마감 → DB 닫기. DB 만 닫으면 에이전트 프로세스가
   // 고아로 남고 원장이 running 인 채 재시작 회수에 기대야 했다(2026-09-07 Codex 제안 ②).
   app.addHook("onClose", async () => {
+    await engineDefects.stop();
     await evidence.stop();
     const stopped = await workflow.shutdown();
     if (stopped > 0) process.stdout.write(`종료: 실행 중이던 action ${stopped}건을 중단하고 원장을 마감했습니다.\n`);

@@ -17,7 +17,7 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
   };
   const idle = (ids: string[]) => { for (const id of ids) workflow.assertBudgetEditable(id); };
   const notifySelection = (ids: string[]) => {
-    for (const id of ids) {
+    for (const id of new Set(ids)) {
       const topic = db.getTopic(id); if (topic.state === "CLOSED" || db.getFlags(id).committedOID) continue;
       db.appendEvent({topicId:id,actor:"user",kind:"note",state:topic.state,
         body:"앞으로 사용할 근거 목록이 바뀌었습니다. 이전 계획과 인용은 과거 기록이며, 현재 승인된 근거로 다시 계획하고 확인하세요. 에이전트 세션도 새로 시작합니다.",
@@ -67,6 +67,7 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
     const source = db.evidence.ensureSource({url:input.url,label:input.label,mode:input.mode,intervalSeconds:input.intervalSeconds},true);
     const existing = db.evidence.catalog.forTopic(request.params.id).find(root => root.scope === scope && root.sourceId === source.id && root.status !== "removed");
     if (existing) return existing;
+    if (approved) ids.push(...db.evidence.catalog.approvalAffected(source.id, scope, context[scope]!));
     if (approved) { const result = await workflow.changeEvidenceSelection(ids,()=>db.evidence.catalog.add(request.params.id,input,true)); notifySelection(ids); return result; }
     idle(ids); return db.evidence.catalog.add(request.params.id,input,false);
   });
@@ -74,8 +75,11 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
     user(request.headers);
     const input = EvidenceSelectionInputSchema.parse(request.body);
     const root = db.evidence.catalog.assertSelection(request.params.id,input);
-    await workflow.changeEvidenceSelection(db.evidence.catalog.affected(root),()=>db.evidence.catalog.select(request.params.id,input));
-    notifySelection(db.evidence.catalog.affected(root));
+    const ids = db.evidence.catalog.affected(root);
+    if (input.action === "approve" || input.action === "accept") ids.push(...db.evidence.catalog.approvalAffected(
+      input.action === "approve" ? root.sourceId : input.sourceId!, root.scope, root.owner));
+    await workflow.changeEvidenceSelection(ids,()=>db.evidence.catalog.select(request.params.id,input));
+    notifySelection(ids);
     return db.evidence.catalog.state(request.params.id);
   });
   app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/selection-batch", async request => {
@@ -83,8 +87,10 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
     const input = z.object({ version:z.string(),rootId:z.string().uuid(),action:z.enum(["accept","reject"]),sourceIds:z.array(z.string()).min(1).max(200) }).strict().parse(request.body);
     const root = db.evidence.catalog.assertSelection(request.params.id,{...input,sourceId:input.sourceIds[0]});
     for (const sourceId of input.sourceIds) db.evidence.catalog.assertSelection(request.params.id,{...input,sourceId});
-    await workflow.changeEvidenceSelection(db.evidence.catalog.affected(root),()=>db.evidence.catalog.selectBatch(request.params.id,input));
-    notifySelection(db.evidence.catalog.affected(root));
+    const ids = db.evidence.catalog.affected(root);
+    if (input.action === "accept") for (const id of input.sourceIds) ids.push(...db.evidence.catalog.approvalAffected(id, root.scope, root.owner));
+    await workflow.changeEvidenceSelection(ids,()=>db.evidence.catalog.selectBatch(request.params.id,input));
+    notifySelection(ids);
     return db.evidence.catalog.state(request.params.id);
   });
   app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/collect", async request => {

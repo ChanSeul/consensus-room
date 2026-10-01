@@ -1,6 +1,6 @@
 import { ArtifactStore } from "../src/server/artifacts";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -12,6 +12,37 @@ import { SpawnCommandRunner } from "../src/server/processRunner";
 import type { AgentAdapter, CommandRunner } from "../src/server/types";
 
 const temporaryDirectories: string[] = [];
+
+it("engine repository lock refuses that repository while another project remains admitted", async () => {
+  const { app, database, root } = await makeApp(undefined, undefined, { gitRepository: true });
+  try {
+    const product = join(root, "product"); mkdirSync(product);
+    execFileSync("git", ["init", "-q", product]);
+    draftTopic(database, "engine-locked", { repositoryPath: root, worktreePath: root });
+    draftTopic(database, "product-free", { repositoryPath: product, worktreePath: root });
+    writeFileSync(join(root, "engine-work.lock"), JSON.stringify({ id: "engine-fix", repository: realpathSync(join(root, ".git")) }));
+    const request = (id: string) => app.inject({ method: "POST", url: `/api/topics/${id}/actions/tool-tree-rebaseline`,
+      headers: { "x-consensus-token": "launch-token-for-test", "idempotency-key": id }, payload: { reason: "tools updated" } });
+    const blocked = await request("engine-locked");
+    expect(blocked.statusCode).toBeGreaterThanOrEqual(400);
+    expect(blocked.json().error).toContain("엔진 저장소 후속 작업");
+    expect((await request("product-free")).statusCode).toBe(200);
+  } finally { await app.close(); }
+});
+
+it("records mediator engine defect To-dos with delegation off while retaining authentication", async () => {
+  const { app, database } = await makeApp();
+  draftTopic(database, "engine-report");
+  const url = "/api/topics/engine-report/engine-defects";
+  const payload = { key: "observed", title: "Engine error", evidence: "Observed failure", workaround: "Continue topic" };
+  expect((await app.inject({ method: "POST", url, payload })).statusCode).toBe(401);
+  const result = await app.inject({ method: "POST", url, payload,
+    headers: { "x-consensus-token": "launch-token-for-test", "x-consensus-actor": "mediator" } });
+  expect(result.statusCode).toBe(200);
+  expect(database.engineDefects.list("engine-report")).toHaveLength(1);
+  expect(database.getTopic("engine-report").state).toBe("DRAFT");
+  await app.close();
+});
 
 it("requires authentication and an idempotency key to opt an idle topic into controlled planning", async () => {
   const { app, database } = await makeApp();
