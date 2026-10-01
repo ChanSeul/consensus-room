@@ -15,6 +15,7 @@ import { applyInfo, diagnosisFinding, type DiagnosisRecord } from "../../shared/
 import {
   assertDispositionsResolved,
   assertFindingCoverage,
+  auditFindingIdentity,
   assertPlanContract,
   bothAgentsAcknowledged,
   classifyCloseout,
@@ -454,6 +455,13 @@ export class PlanningPipeline {
     storedFirstPlan: { markdown: string; sha256: string },
     signal: AbortSignal,
   ): Promise<void> {
+    const identity = auditFindingIdentity(claudePlan.findings);
+    claudePlan = { ...claudePlan, findings: identity.findings };
+    const carry = this.core.carryForwardNormalizer(identity.findings, "Codex audit", { forReview: true });
+    const normalize = Object.assign(
+      (result: AgentResult) => carry({ ...result, findings: identity.normalize(result.findings) }),
+      { carried: carry.carried, label: carry.label },
+    );
     let topic = this.core.transition(topicId, "CODEX_AUDIT", "Codex가 계획을 읽기 전용으로 감사합니다.");
     const auditRoute = this.core.route(topic, { role: "reviewer", operation: "audit" });
     const auditMode = this.referenceMode(topic, auditRoute);
@@ -482,7 +490,7 @@ export class PlanningPipeline {
       freshSessionPrompt: context.full ? auditPrompt(context.full.text, context.full.timeline, "full", fullAuditDelivery) : undefined,
       ...(auditDelivery ? { timelineDelivery: { prompt: auditDelivery, fresh: fullAuditDelivery } } : {}),
       readablePaths: [...context.readablePaths, ...(revisionContext?.paths ?? []), ...(deferredFindingsPath ? [deferredFindingsPath] : [])],
-      normalize: this.core.carryForwardNormalizer(claudePlan.findings, "Codex audit", { forReview: true }),
+      normalize,
       check: (r) => {
         this.core.assertKind(r, "AUDIT");
         assertFindingCoverage(claudePlan.findings, r.findings, "Codex audit");

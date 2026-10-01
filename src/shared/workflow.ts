@@ -360,6 +360,47 @@ export function salvageResultFields(raw: unknown, kind: AgentResult["kind"]): Ag
   };
 }
 
+// 구형 계획은 서로 다른 출처의 TODO 번호를 중복 저장했다. 저장 원문은 바꾸지 않고
+// 이 감사 경계에서만 (원래 ID, 원문 제목)의 유일한 대응을 만든다. 제목까지 같으면 추측하지 않는다.
+export function auditFindingIdentity(source: readonly Finding[]): {
+  findings: Finding[];
+  normalize: (response: readonly Finding[]) => Finding[];
+} {
+  const counts = new Map<string, number>();
+  for (const f of source) counts.set(f.id, (counts.get(f.id) ?? 0) + 1);
+  const collisions = source.filter(f => counts.get(f.id)! > 1);
+  const titles = new Set<string>();
+  for (const f of collisions) {
+    if (titles.has(f.title) || source.filter(item => item.title === f.title).length !== 1) {
+      throw new Error(`중복 지적의 원문 제목으로 출처를 구분할 수 없습니다: ${f.id}`);
+    }
+    titles.add(f.title);
+  }
+  const aliases = new Map(collisions.map(f => [f.title,
+    `${f.id}@${createHash("sha256").update(JSON.stringify([f.id, f.title])).digest("hex")}`]));
+  const findings = source.map(f => aliases.has(f.title) ? { ...f, id: aliases.get(f.title)! } : f);
+  uniqueFindingIDs(findings, "감사 입력");
+  const canonical = new Map(findings.map(f => [f.id, f]));
+  return {
+    findings,
+    normalize: response => {
+      const normalized = response.map(f => {
+        const id = aliases.get(f.title);
+        if (id) {
+          const existing = canonical.get(f.id);
+          if (existing && existing.id !== id) throw new Error(`교정 지적 ID가 다른 원문을 가리킵니다: ${f.id}`);
+          return { ...f, id };
+        }
+        // 충돌했던 번호만으로는 어떤 원문에 대한 처분인지 증명할 수 없다.
+        if ((counts.get(f.id) ?? 0) > 1) throw new Error(`중복 지적의 원문 제목을 보존해야 합니다: ${f.id}`);
+        return f;
+      });
+      uniqueFindingIDs(normalized, "감사 응답");
+      return normalized;
+    },
+  };
+}
+
 export function assertFindingCoverage(
   source: readonly Finding[],
   response: readonly Finding[],

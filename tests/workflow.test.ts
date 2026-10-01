@@ -21,6 +21,7 @@ import {
   assertImplementationGate,
   assertDispositionsResolved,
   assertFindingCoverage,
+  auditFindingIdentity,
   assertFixDispositionAllowed,
   assertPlanContract,
   assertTransition,
@@ -1093,5 +1094,33 @@ describe("mergeCorrectionResult — resolvesRequestedDecision / salvageResultFie
     ];
     expect(Object.fromEntries(cases.map(([body]) => [body, [...overruleDirectiveIDs(body)].sort()])))
       .toEqual(Object.fromEntries(cases.map(([body, expected]) => [body, [...expected].sort()])));
+  });
+});
+
+
+describe("충돌 지적의 감사 입력 식별", () => {
+  const source = [finding({ id: "TODO-2", title: "first topic: app bar" }), finding({ id: "TODO-2", title: "second topic: map" })];
+  it("원본·처분을 보존하고 순서와 무관한 식별자로 누락을 검출한다", () => {
+    const identity = auditFindingIdentity(source);
+    expect(identity.findings.map(f => f.id)).toEqual(auditFindingIdentity([...source].reverse()).findings.reverse().map(f => f.id));
+    expect(source.map(f => f.id)).toEqual(["TODO-2", "TODO-2"]);
+    const response = identity.normalize([{ ...source[0], id: "CORRECTED", disposition: "REFUTED" }]);
+    expect(response[0].disposition).toBe("REFUTED");
+    expect(() => assertFindingCoverage(identity.findings, response, "audit")).toThrow("누락");
+    const carried = carryForwardFindings(identity.findings, response, { forReview: true });
+    expect(carried.findings).toHaveLength(1); // 미합의 action을 settled로 바꾸거나 자동 승계하지 않는다.
+  });
+  it("구분할 수 없는 원문·중복 응답·다른 지적 ID의 탈취를 거부한다", () => {
+    expect(() => auditFindingIdentity([source[0], source[0]])).toThrow("구분");
+    const identity = auditFindingIdentity(source);
+    expect(() => identity.normalize([source[0], source[0]])).toThrow("중복");
+    expect(() => identity.normalize([{ ...source[0], title: "알 수 없는 출처" }])).toThrow("원문 제목");
+    expect(() => identity.normalize([{ ...source[0], id: identity.findings[1].id }])).toThrow("다른 원문");
+  });
+  it("정상 ID는 제목·처분 수정과 신규 finding을 그대로 유지한다", () => {
+    const identity = auditFindingIdentity([finding()]);
+    const response = [finding({ title: "감사에서 구체화" }), finding({ id: "NEW" })];
+    expect(identity.normalize(response)).toEqual(response);
+    expect(newFindingIDs(identity.findings, response, "audit")).toEqual(["NEW"]);
   });
 });

@@ -4779,3 +4779,29 @@ it.each((["IMPLEMENTING", "CLAUDE_FIX"] as const).flatMap(stage =>
  expect(database.getTopic("topic-1").state,database.getTopic("topic-1").lastError??"").toBe("READY_TO_DELIVER");
  database.close();
 });
+
+
+describe("계획 원문의 충돌 ID 복구", () => {
+  it("출처별 제목을 보존한 교정 감사 응답을 재계획 없이 채택한다", async () => {
+    const source = [
+      finding("TODO-2", "TODO-2 (first): 기존 앱바", { disposition: "AGREED_ACTION" }),
+      finding("TODO-2", "TODO-2 (second): 지도 선택", { disposition: "AGREED_ACTION" }),
+    ];
+    const { database, engine, artifacts, claude, codex } = makePlanningEngine({
+      slug: "duplicate-source-id",
+      claudeResults: [{ kind: "PLAN", summary: "원본 계획", planMarkdown: validPlan("기존 계획"), findings: source, evidenceRefs: [] }],
+      codexResults: [{ kind: "AUDIT", summary: "감사 보존", requestedUserDecision: "별도 제품 결정",
+        findings: source.map((f, i) => ({ ...f, id: `CORRECTED-${i}` })), evidenceRefs: [] }],
+    });
+    engine.startPlan("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+    expect(database.getTopic("topic-1").state, database.getTopic("topic-1").lastError ?? "").toBe("USER_DECISION_REQUIRED");
+    const audit = JSON.parse((await artifacts.readLatest("topic-1", "audit"))!);
+    expect(audit.findings.map((f: { title: string }) => f.title)).toEqual(source.map(f => f.title));
+    expect(new Set(audit.findings.map((f: { id: string }) => f.id)).size).toBe(2);
+    expect(JSON.parse((await artifacts.readLatest("topic-1", "claude-plan"))!).findings).toEqual(source);
+    expect(claude.calls).toHaveLength(1);
+    expect(codex.calls).toHaveLength(1);
+    database.close();
+  });
+});
