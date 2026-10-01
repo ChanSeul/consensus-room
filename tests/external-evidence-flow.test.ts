@@ -836,3 +836,26 @@ it("후보 없는 workspace 빈 페이지 수집은 루트별 전체 작업 탐�
     expect(queries).toBeLessThan(3000);
   } finally {prepare.mockRestore();await app.close();dbs.splice(dbs.indexOf(db),1);}
 });
+
+
+it("승인 전파 없는 host-import는 전역과 다른 현재 토픽 중재자를 허용한다", async () => {
+  const f=fixture(),db=f.database,c=db.evidence.catalog;
+  db.evidence.detach("t",f.source.id);
+  db.updateTopic("t",{state:"DRAFT"});
+  const root=c.add("t",{url:"https://www.figma.com/design/localmediator?node-id=1-2",label:"Topic source",scope:"topic",required:true,mode:"connector",intervalSeconds:900},true);
+  const assignment={role:"mediator" as const,operation:"",profileId:null,sessionId:null,note:"",expectedVersion:0};
+  const global=db.roles.assign({...assignment,scope:"global",participant:"global-mediator"});
+  const local=db.roles.assign({...assignment,scope:"topic:t",participant:"topic-mediator"});
+  const config=loadConfig({repositoryPath:f.root,dataDirectory:f.root,webDirectory:join(f.root,"no-web"),launchToken:"test-token",enforceBudgets:false});
+  const app=await buildApp({config,database:db,runner:f.runner,claude:f.adapter,codex:{...f.adapter,role:"codex"}});
+  const request=(participant:string,version:number)=>app.inject({method:"POST",url:"/api/topics/t/evidence/host-import",
+    headers:{"x-consensus-token":"test-token","x-consensus-actor":"mediator","x-consensus-mediator":participant,"x-consensus-mediator-version":String(version)},
+    payload:{version:c.version("t"),rootId:root.id,sourceId:root.sourceId,previousHash:null,previousCheckedAt:null,observedAt:Date.now(),revision:"r1",missing:[],units:[{id:"body",kind:"design",content:"No linked sources"}]}});
+  try {
+    expect((await request(global.participant,global.version)).statusCode).toBe(409);
+    expect(db.evidence.get(root.sourceId).contentHash).toBeNull();
+    const accepted=await request(local.participant,local.version);
+    expect(accepted.statusCode,accepted.body).toBe(200);
+    expect(db.evidence.snapshot(root.sourceId)?.units[0].content).toBe("No linked sources");
+  } finally {await app.close();dbs.splice(dbs.indexOf(db),1);}
+});

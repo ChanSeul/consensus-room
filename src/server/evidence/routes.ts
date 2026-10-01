@@ -51,7 +51,8 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
       assertMediatorForAnyTopic(db.roles,request.headers,guarded.filter(id=>db.getTopic(id).state!=="CLOSED"));
       return guarded;
     },()=>service.importHost(request.params.id,input), ids => {
-      assertMediatorForAnyTopic(db.roles,request.headers,ids.filter(id=>db.getTopic(id).state!=="CLOSED"));
+      const changed = ids.filter(id=>db.getTopic(id).state!=="CLOSED");
+      if (changed.length) assertMediatorForAnyTopic(db.roles,request.headers,changed);
     });
     return db.evidence.catalog.state(request.params.id);
   });
