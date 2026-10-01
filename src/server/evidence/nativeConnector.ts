@@ -41,8 +41,9 @@ export class NativeEvidenceConnector implements EvidenceConnector {
   async discover(source: EvidenceSource, raw: string | null, signal: AbortSignal): Promise<EvidenceDiscoveryPage> {
     try { return await this.discoverPage(source, raw, signal); }
     catch (error) {
-      const provider = source.provider === "jira" || source.provider === "confluence" ? "atlassian" : source.provider as AppProvider;
-      this.completedIdentities.delete(source.id); this.reader.invalidateIdentity?.(provider); throw error;
+      // Reader transport/identity failures invalidate their own generation. A stale root cursor or
+      // malformed page must not invalidate fresh cursors belonging to other roots of that provider.
+      this.completedIdentities.delete(source.id); throw error;
     }
   }
   private async discoverPage(source: EvidenceSource, raw: string | null, signal: AbortSignal): Promise<EvidenceDiscoveryPage> {
@@ -89,7 +90,8 @@ export class NativeEvidenceConnector implements EvidenceConnector {
         const range = `'${sheet.title.replaceAll("'", "''")}'!${column(cursor.col + 1)}${cursor.row + 1}:${column(colEnd)}${rowEnd}`;
         const data = await call("google_drive.get_spreadsheet_cells", { ...args, ranges: [range], cell_fields: "userEnteredValue,effectiveValue,formattedValue,note,hyperlink,textFormatRuns,dataValidation" });
         const returned = requireArray(data.sheets, "셀").find(value => value.properties?.sheetId === sheet.sheetId);
-        if (!returned || !Array.isArray(returned.data)) throw new EvidenceFetchError("요청한 시트 범위의 응답이 없습니다.");
+        if (!returned) throw new EvidenceFetchError("시트 구성이 바뀌었습니다. 전체 원문을 다시 확인해야 합니다.", 300, true);
+        if (!Array.isArray(returned.data)) throw new EvidenceFetchError("요청한 시트 범위의 응답이 없습니다.");
         const units: EvidenceUnitInput[] = [];
         for (const grid of returned.data) for (const [r, row] of (grid.rowData ?? []).entries()) for (const [c, cell] of (row.values ?? []).entries()) {
           if (Object.keys(cell).length) units.push(unit(`${sheet.sheetId}:${(grid.startRow ?? cursor.row) + r}:${(grid.startColumn ?? cursor.col) + c}`, "cells", cell));

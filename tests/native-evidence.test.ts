@@ -225,3 +225,43 @@ it("rejects binding changes during a pending final page and retains the complete
     expect(db.evidence.get(root.sourceId).collection?.status).toBe("error");
   }finally{held.resolve();await service.stop();}
 });
+
+it("rejects an old root cursor without invalidating another root's fresh identity", async () => {
+  const {db,root}=fixture();
+  const source=db.evidence.get(root.sourceId), signal=new AbortController().signal;
+  let generation=0;
+  const reader:AppReader={
+    config:async()=>({googleDriveLinkId:"link_work"}),close:async()=>{},
+    identity:async()=>({account:"link_work",config:{googleDriveLinkId:"link_work"},generation:String(generation)}),
+    validateIdentity:async(_provider,identity)=>{if(identity.generation!==String(generation)) throw Error("stale identity");},
+    invalidateIdentity:()=>{generation++;},
+    call:async(_provider,name)=> name.endsWith("metadata")
+      ? {sheets:[{properties:{sheetId:1,title:"Policy",gridProperties:{rowCount:1,columnCount:1}}}]}
+      : {sheets:[{properties:{sheetId:1},data:[{rowData:[{values:[{formattedValue:"current"}]}]}]}]},
+  };
+  const connector=new NativeEvidenceConnector(reader);
+  const old=await connector.discover(source,null,signal);
+  generation++; // A real connection transition invalidates the old cursor.
+  const fresh=await connector.discover({...source,id:"another-root"},null,signal);
+  await expect(connector.discover(source,old.cursor,signal)).rejects.toThrow("계정이 바뀌었습니다");
+  const continued=await connector.discover({...source,id:"another-root"},fresh.cursor,signal);
+  expect(continued.units.some(unit=>unit.content.includes("current"))).toBe(true);
+});
+
+it("automatically restarts only the root whose sheet metadata became obsolete", async () => {
+  const {db,root}=fixture(); let metadataReads=0;
+  const reader:AppReader={config:async()=>({googleDriveLinkId:"link_work"}),close:async()=>{},call:async(_p,name)=>{
+    if(name.endsWith("metadata")) return {sheets:[{properties:{sheetId:++metadataReads===1?1:2,title:"Policy",gridProperties:{rowCount:1,columnCount:1}}}]};
+    if(name.endsWith("cells")) return {sheets:[{properties:{sheetId:2},data:[{rowData:[{values:[{formattedValue:"replacement tab"}]}]}]}]};
+    return {comments:[],nextPageToken:null};
+  }};
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("No REST");}},()=>{},undefined,new NativeEvidenceConnector(reader));
+  try {
+    await service.collect(root.id);
+    expect(db.evidence.get(root.sourceId).collection?.status).toBe("error");
+    expect(db.evidence.snapshot(root.sourceId)).toBeNull();
+    await service.collect(root.id);
+    expect(db.evidence.get(root.sourceId).collection?.status).toBe("collected");
+    expect(db.evidence.snapshot(root.sourceId)?.units.some(unit=>unit.content.includes("replacement tab"))).toBe(true);
+  } finally {await service.stop();}
+});
