@@ -141,6 +141,54 @@ function fixture() {
   return {db,topic};
 }
 const input = (url: string, scope: EvidenceRootInput["scope"] = "group"): EvidenceRootInput => ({url,label:url,scope,required:true,mode:"rest",intervalSeconds:900});
+it("a scoped stage consumes only its selected roots; failed and expired selected originals still stop its mediator", async () => {
+  // Group revision/link -> catalog -> actual mediator packet/readiness. Restore the old inheritance to see RED.
+  // Live OAuth and Figma pixels are not proved by these captured source fixtures.
+  vi.useFakeTimers({toFake:["Date"]});
+  const {db,topic}=fixture(),c=db.evidence.catalog;
+  const selected=["1-2","3-4"].map(node=>c.add("a",input(`https://www.figma.com/design/form?node-id=${node}`),true));
+  const unrelated=c.add("a",input("https://team.atlassian.net/browse/APP-1"),true);
+  c.add("a",input("https://team.slack.com/archives/C123","workspace"),true);
+  const group=db.workGroups.get("g-a");
+  db.workGroups.revise(group.id,{title:group.title,goal:group.goal,contracts:group.contracts,stages:group.stages.map(stage=>stage.id==="later"
+    ? {...stage,evidenceRootIds:selected.map(root=>root.id)} : stage)},group.version);
+  topic("ui"); db.workGroups.link(group.id,"later","ui","a".repeat(40));
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("Host captures only");}});
+  const capture=(root:typeof unrelated,missing:string[]=[])=>{
+    const source=db.evidence.get(root.sourceId);
+    return service.importHost("a",{version:c.version("a"),rootId:root.id,sourceId:source.id,previousHash:source.contentHash,
+      previousCheckedAt:source.checkedAt,observedAt:Date.now(),revision:"captured-v1",missing,
+      units:[{id:"body",kind:source.provider==="figma"?"design":"issue",content:source.url}]});
+  };
+  try {
+    selected.forEach(root=>capture(root)); capture(unrelated,["unread comments"]);
+    expect(db.evidence.list("ui").map(source=>source.id).sort()).toEqual(selected.map(root=>root.sourceId).sort());
+    expect(c.state("a").coverage.ready).toBe(false);
+    expect(await service.prepareMediator(db,"ui","scoped-session")).toMatchObject({corpus:{sources:2}});
+    const binding=db.getTopic("ui"),digest=db.evidence.topic(binding).digest;
+    c.add("a",input("https://team.atlassian.net/browse/APP-2"),true);
+    expect(db.getTopic("ui").planEpoch).toBe(binding.planEpoch);
+    expect(db.evidence.topic(db.getTopic("ui")).digest).toBe(digest);
+    capture(selected[0],["selected node contents unread"]);
+    expect(db.evidence.topic(db.getTopic("ui")).ready).toBe(false);
+    await expect(service.prepareMediator(db,"ui","failed-session")).rejects.toThrow();
+    capture(selected[0]);
+    expect(db.evidence.topic(db.getTopic("ui")).ready).toBe(true);
+    vi.setSystemTime(Date.now()+1_900_000);
+    expect(db.evidence.topic(db.getTopic("ui")).ready).toBe(false);
+    await expect(service.prepareMediator(db,"ui","expired-session")).rejects.toThrow();
+  } finally {await service.stop();}
+});
+it.each(["missing","proposed","removed"])("a stage cannot treat a %s selected root as an empty successful corpus", state => {
+  const {db,topic}=fixture(),c=db.evidence.catalog;
+  const root=c.add("a",input("https://www.figma.com/design/form?node-id=1-2"));
+  if (state==="removed") c.select("a",{version:c.version("a"),rootId:root.id,action:"remove"});
+  const group=db.workGroups.get("g-a"),rootId=state==="missing"?"ffffffff-ffff-4fff-8fff-ffffffffffff":root.id;
+  db.workGroups.revise(group.id,{title:group.title,goal:group.goal,contracts:group.contracts,stages:group.stages.map(stage=>stage.id==="later"
+    ? {...stage,evidenceRootIds:[rootId]} : stage)},group.version);
+  topic("ui"); db.workGroups.link(group.id,"later","ui","a".repeat(40));
+  expect(db.evidence.topic(db.getTopic("ui")).ready).toBe(false);
+});
 it("does not require unsupported links found in an original, while a selected original's missing comments still block collection", async () => {
   // Host import -> catalog/host plan -> mediator. Incidental URLs are not selected evidence.
   // The original body retains these references; an incomplete approved source still blocks its consumers.

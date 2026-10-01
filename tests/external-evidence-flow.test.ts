@@ -43,6 +43,30 @@ it("HTTP collection returns approved app work, bounds pages, and never invokes a
     expect(f.adapter.createSession).not.toHaveBeenCalled();
   } finally {await app.close();dbs.splice(dbs.indexOf(f.database),1);}
 });
+it("registering an unrelated group root preserves a running scoped stage and its current artifact aliases", async () => {
+  const f=fixture(),c=f.database.evidence.catalog;
+  const root=c.add("t",{url:"https://www.figma.com/design/form?node-id=1-2",label:"Selected",scope:"topic",required:true,mode:"connector",intervalSeconds:900},true);
+  const groupId="11111111-1111-4111-8111-111111111111";
+  f.database.workGroups.create(groupId,{title:"Form",goal:"Form",contracts:"Keep approved scopes",stages:[
+    {id:"ui",kind:"work",title:"UI",goal:"Layout",acceptance:"Verified",dependsOn:[],evidenceRootIds:[root.id]},
+    {id:"all",kind:"integration",title:"All",goal:"All",acceptance:"Verified",dependsOn:["ui"]},
+  ]},f.root,"a".repeat(40));
+  f.database.workGroups.link(groupId,"ui","t","a".repeat(40));
+  const config=loadConfig({repositoryPath:f.root,dataDirectory:f.root,webDirectory:join(f.root,"no-web"),launchToken:"test-token",enforceBudgets:false});
+  const app=await buildApp({config,database:f.database,runner:f.runner,claude:f.adapter,codex:{...f.adapter,role:"codex"}});
+  const before=f.database.getTopic("t"),version=c.version("t");
+  f.database.startAction({id:"busy",topicId:"t",kind:"test",status:"running",createdAt:new Date().toISOString(),finishedAt:null,error:null,
+    pid:null,pgid:null,processExecutable:null,processCommand:null,processStartedAt:null});
+  const clear=vi.spyOn(ArtifactStore.prototype,"clearCurrentAliases");
+  try {
+    const response=await app.inject({method:"POST",url:"/api/topics/t/evidence/roots",headers:{"x-consensus-token":"test-token"},payload:{
+      url:"https://team.atlassian.net/browse/APP-2",label:"Future server stage",scope:"group",required:true,mode:"connector",intervalSeconds:900}});
+    expect(response.statusCode).toBe(200); expect(response.json().status).toBe("approved");
+    expect(f.database.getTopic("t")).toEqual(before);
+    expect(c.version("t")).toBe(version);
+    expect(clear).not.toHaveBeenCalled();
+  } finally {f.database.finishAction("busy","succeeded");await app.close();dbs.splice(dbs.indexOf(f.database),1);}
+});
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "evidence-flow-")); roots.push(root);
   const database = new ConsensusDatabase(join(root, "room.sqlite")); dbs.push(database);

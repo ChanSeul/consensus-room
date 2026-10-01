@@ -55,7 +55,11 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
   app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/roots", async request => {
     const input = EvidenceRootInputSchema.parse(request.body), context = db.evidence.catalog.context(request.params.id);
     const scope = input.scope === "group" && !context.group ? "topic" : input.scope;
-    const ids = db.listTopics().filter(t => db.evidence.catalog.context(t.id)[scope] === context[scope]).map(t => t.id);
+    // A newly registered root is outside an explicitly scoped stage until its group revision selects it.
+    const ids = db.listTopics().filter(t => {
+      const target = db.evidence.catalog.context(t.id);
+      return target[scope] === context[scope] && target.evidenceRootIds === undefined;
+    }).map(t => t.id);
     const approved = request.headers["x-consensus-actor"] !== "mediator";
     if (scope === "workspace") user(request.headers);
     const parsed = parseEvidenceSource(input);

@@ -32,6 +32,9 @@ export const WorkStageSchema = z
     goal: z.string().trim().min(1),
     acceptance: z.string().trim().min(1).optional(),
     dependsOn: z.array(z.string()).default([]),
+    // 지정한 단계만 승인된 근거 루트의 부분집합을 사용한다. 미지정 단계는 기존 상속 범위를 유지한다.
+    evidenceRootIds: z.array(z.string().uuid()).min(1).max(200)
+      .refine(ids => new Set(ids).size === ids.length, "단계 근거 루트 ID는 중복될 수 없습니다.").optional(),
     budget: BudgetPolicySchema.optional(),
     // 이 단계가 끝나면 쓸 수 있게 되는 완결 결과(v4). 개정으로 새로 생기는 단계에는 필수다.
     outcome: z.string().trim().min(1).optional(),

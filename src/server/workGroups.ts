@@ -40,7 +40,7 @@ export interface StageContext {
   goal: string;
   contracts: string;
   stage: { id: string; kind: WorkStage["kind"]; title: string; goal: string; acceptance?: string; outcome?: string; separation?: StageSeparation;
-    checklist?: string[] };
+    checklist?: string[]; evidenceRootIds?: string[] };
   questions: Array<{ id: string; text: string; blocksStart: boolean; resolution?: string }>;
   priorResults: StageContextResult[];
   mergeTargets: Array<{ stageId: string; result?: StageContextResult }>;
@@ -451,6 +451,7 @@ export function buildStageContext(group: WorkGroup, stageId: string): StageConte
     contracts: group.contracts,
     // 자기 단계 체크리스트는 계획 입력이다(F008) — 연결 뒤에는 개정으로 바꿀 수 없으므로(shapeOf) 연결 단계의 해시를 흔들지 않는다.
     stage: compact({ id: stage.id, kind: stage.kind, title: stage.title, goal: stage.goal, acceptance: stage.acceptance, outcome: stage.outcome,
+      evidenceRootIds: stage.evidenceRootIds ? [...stage.evidenceRootIds] : undefined,
       separation: stage.separation ? compact({ ...stage.separation }) as StageSeparation : undefined,
       checklist: stage.checklist?.length ? [...stage.checklist] : undefined }) as StageContext["stage"],
     questions: (group.questions ?? []).filter((q) => q.stageId === null || q.stageId === stageId)
@@ -490,6 +491,7 @@ export function renderContext(context: StageContext, legacyPrior: PriorLine[] = 
     `이번 목표: ${stage.goal}`,
     `완료 조건: ${stage.acceptance ?? "(정하지 않음)"}`,
   ];
+  if (stage.evidenceRootIds) lines.push(`이 단계의 근거 루트: ${stage.evidenceRootIds.join(", ")}`);
   if (stage.outcome !== undefined) lines.push(`단계 결과(outcome): ${stage.outcome}`);
   if (stage.separation)
     lines.push(`분리 근거(${stage.separation.basis} — ${BASIS_LABEL[stage.separation.basis]}): ${stage.separation.detail}${

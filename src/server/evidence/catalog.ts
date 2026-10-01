@@ -3,6 +3,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { EvidenceRootInputSchema, type EvidenceHostImport, type EvidenceDiscoveryLink, type EvidenceCatalog, type EvidenceDiscoveryPage, type EvidenceRoot,
   type EvidenceRootInput, type EvidenceScope, type EvidenceSource, type EvidenceUnitInput } from "../../shared/externalEvidence.js";
 import { evidenceHash, stableJSON, type EvidenceStore } from "./store.js";
+import type { WorkGroup } from "../../shared/workGroups.js";
 
 function conflict(message: string): never { throw Object.assign(new Error(message), { statusCode: 409 }); }
 interface Member {
@@ -39,22 +40,26 @@ export class EvidenceCatalogStore {
   roots(): EvidenceRoot[] {
     return this.db.prepare("SELECT record FROM evidence_roots ORDER BY rowid").all().map(r => JSON.parse(String(r.record)));
   }
-  context(topicId: string): { workspace: string; group: string | null; topic: string } {
+  context(topicId: string): { workspace: string; group: string | null; topic: string; evidenceRootIds?: string[] } {
     const topic = this.db.prepare("SELECT repository_path FROM topics WHERE id=?").get(topicId);
     if (!topic) throw new Error("작업이 없습니다.");
-    const groups = this.db.prepare("SELECT record_json FROM work_groups").all().map(r => JSON.parse(String(r.record_json)));
+    const groups: WorkGroup[] = this.db.prepare("SELECT record_json FROM work_groups").all().map(r => JSON.parse(String(r.record_json)));
     const binding = this.db.prepare("SELECT group_id FROM evidence_group_topics WHERE topic_id=?").get(topicId);
     const group = groups.find(g => Object.values(g.links as Record<string, { topicId: string }>).some(link => link.topicId === topicId))
       ?? groups.find(g => g.id === binding?.group_id && g.repositoryPath === topic.repository_path);
-    return { workspace: String(topic.repository_path), group: group?.id ?? null, topic: topicId };
+    const stageId = group && Object.entries(group.links).find(([, link]) => link.topicId === topicId)?.[0];
+    const evidenceRootIds = stageId ? group!.stages.find(stage => stage.id === stageId)?.evidenceRootIds : undefined;
+    return { workspace: String(topic.repository_path), group: group?.id ?? null, topic: topicId,
+      ...(evidenceRootIds === undefined ? {} : { evidenceRootIds }) };
   }
   forTopic(topicId: string): EvidenceRoot[] {
     const context = this.context(topicId);
-    return this.roots().filter(root => root.owner === context[root.scope]);
+    return this.roots().filter(root => root.owner === context[root.scope] &&
+      (context.evidenceRootIds === undefined || context.evidenceRootIds.includes(root.id)));
   }
   affected(root: EvidenceRoot): string[] {
     return this.db.prepare("SELECT id FROM topics").all().map(r => String(r.id))
-      .filter(id => this.context(id)[root.scope] === root.owner);
+      .filter(id => this.forTopic(id).some(selected => selected.id === root.id));
   }
   private save(root: EvidenceRoot): void {
     this.db.prepare("INSERT INTO evidence_roots VALUES (?,?) ON CONFLICT(id) DO UPDATE SET record=excluded.record").run(root.id, JSON.stringify(root));
@@ -105,7 +110,8 @@ export class EvidenceCatalogStore {
   }
   version(topicId: string): string {
     return evidenceHash(stableJSON(["task-linked-workspace-slack-v2",this.context(topicId).group,
-      this.forTopic(topicId).map(r => [r.id, r.version, r.status])]));
+      this.forTopic(topicId).map(r => [r.id, r.version, r.status]),
+      ...(this.context(topicId).evidenceRootIds === undefined ? [] : [this.context(topicId).evidenceRootIds])]));
   }
   assertGroup(topicId: string, input: { version: string; groupId: string | null }): void {
     if (input.version !== this.version(topicId)) conflict("근거 목록이 바뀌었습니다. 다시 확인하세요.");
@@ -239,6 +245,7 @@ export class EvidenceCatalogStore {
       this.reachableMembers(root.id).some(m=>m.source_id===sourceId && m.state==="approved"));
   }
   state(topicId: string): EvidenceCatalog {
+    const context = this.context(topicId);
     const roots = this.forTopic(topicId), active = roots.filter(r => r.status !== "removed"),members=this.topicMembers(topicId,roots);
     const entries = active.flatMap(root => members.get(root.id)!.map(member => ({ rootId: root.id, source: this.store.get(member.source_id),
       state: member.state, progress: member.progress, error: member.error,
@@ -251,10 +258,11 @@ export class EvidenceCatalogStore {
       complete: approved.filter(e => e.progress === "complete").length,
       pending: approved.filter(e => ["pending", "reading"].includes(e.progress)).length,
       failed: approved.filter(e => e.progress === "failed").length, candidates,
-      ready: active.filter(r => r.required).every(r => r.status === "approved" && r.lastCompleteAt !== null && this.clock() <= r.lastCompleteAt + this.store.get(r.sourceId).intervalSeconds * 2000 &&
+      ready: (context.evidenceRootIds === undefined || (context.evidenceRootIds.length > 0 &&
+        context.evidenceRootIds.every(id => roots.some(root => root.id === id && root.status === "approved")))) &&
+        active.filter(r => r.required).every(r => r.status === "approved" && r.lastCompleteAt !== null && this.clock() <= r.lastCompleteAt + this.store.get(r.sourceId).intervalSeconds * 2000 &&
         [...members.get(r.id)!,...this.members(r.id).filter(m=>m.source_id===r.sourceId)]
           .filter(m => m.state !== "rejected").every(m => m.state === "approved" && m.progress === "complete")) };
-    const context = this.context(topicId);
     const history = this.db.prepare("SELECT scope,owner,at,action,url FROM evidence_catalog_history ORDER BY id DESC").all()
       .filter(row => row.owner === context[row.scope as EvidenceScope]).map(r => ({ scope: r.scope as EvidenceScope,
         at: Number(r.at), action: String(r.action), url: String(r.url) }));
