@@ -312,15 +312,20 @@ export class WorkflowEngine {
     }
   }
 
-  async changeEvidenceSelection<T>(topicIds: string[], change: () => T): Promise<T> {
-    const ids = [...new Set(topicIds)];
+  async changeEvidenceSelection<T>(topicIds: string[] | (() => string[]), change: () => T, guardedIds: () => string[] = () => []): Promise<T> {
+    const resolveIds = () => [...new Set(typeof topicIds === "function" ? topicIds() : topicIds)];
+    const selected = resolveIds();
+    const ids = [...new Set([...selected, ...guardedIds()])];
     for (const id of ids) this.core.assertNoActiveWork(id);
     for (const id of ids) this.core.scopeChangeActive.add(id);
     const db=this.core.dependencies.database,versions=new Map(ids.map(id=>[id,db.evidence.catalog.version(id)]));
     try {
-      const mutable=ids.map(id=>db.getTopic(id)).filter(topic=>topic.state!=="CLOSED" && !db.getFlags(topic.id).committedOID);
+      const mutable=selected.map(id=>db.getTopic(id)).filter(topic=>topic.state!=="CLOSED" && !db.getFlags(topic.id).committedOID);
       for (const topic of mutable) await this.core.dependencies.artifacts.clearCurrentAliases(topic.id);
-      if (ids.some(id=>db.evidence.catalog.version(id)!==versions.get(id)))
+      const currentSelected = resolveIds(), currentIds = [...new Set([...currentSelected, ...guardedIds()])];
+      if (currentSelected.length !== selected.length || currentSelected.some(id => !selected.includes(id)) ||
+          currentIds.length !== ids.length || currentIds.some(id => !versions.has(id)) ||
+          ids.some(id=>db.evidence.catalog.version(id)!==versions.get(id)))
         throw Object.assign(new Error("근거 목록이 바뀌었습니다. 다시 확인하세요."),{statusCode:409});
       for (const topic of mutable) this.core.diagnoses.staleOnReplan(topic);
       return change();

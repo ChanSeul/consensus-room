@@ -63,7 +63,7 @@ import { DiagnosisService } from "./diagnoses.js";
 // (2026-09-07 Codex 자기 최적화 제안 ③). 쟁점 누락·처분 규칙 위반은 판단이 섞이므로 여기 속하지 않는다.
 // 파싱 직후·검사 직전에 결과를 손질하는 함수. carried 가 있으면 enforceResultContract 가 **최종 검사 뒤** 마지막 적용의 승계 id 를
 // 턴당 1회 이벤트로 남긴다(2026-09-13 Codex 지적 3: 검사 전에 "재제출 없음" 을 적으면 바로 뒤 교정이 그 기록을 거짓으로 만든다).
-export type ResultNormalizer = ((result: AgentResult) => AgentResult) & { carried?: () => readonly string[]; label?: string; beforeMerge?: (result: AgentResult) => AgentResult };
+export type ResultNormalizer = ((result: AgentResult) => AgentResult) & { carried?: () => readonly string[]; label?: string; beforeMerge?: (result: AgentResult, salvaged?: boolean) => AgentResult };
 
 function normalized(normalize: ResultNormalizer | undefined, result: AgentResult): AgentResult {
   return normalize ? normalize(result) : result;
@@ -634,7 +634,7 @@ export class EngineCore {
     }
     const salvaged = salvageResultFields(raw, parsedCorrection.kind);
     const merged = mergeCorrectionResult(
-      context.normalize?.beforeMerge?.(salvaged) ?? salvaged,
+      context.normalize?.beforeMerge?.(salvaged, true) ?? salvaged,
       context.normalize?.beforeMerge?.(parsedCorrection) ?? parsedCorrection,
     );
     if (merged.preserved.length > 0) {

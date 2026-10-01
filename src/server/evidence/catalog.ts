@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import { EvidenceRootInputSchema, type EvidenceHostImport, type EvidenceDiscoveryLink, type EvidenceCatalog, type EvidenceDiscoveryPage, type EvidenceRoot,
+import { parseEvidenceSource, EvidenceRootInputSchema, type EvidenceHostImport, type EvidenceDiscoveryLink, type EvidenceCatalog, type EvidenceDiscoveryPage, type EvidenceRoot,
   type EvidenceRootInput, type EvidenceScope, type EvidenceSource, type EvidenceUnitInput } from "../../shared/externalEvidence.js";
 import { evidenceHash, stableJSON, type EvidenceStore } from "./store.js";
 import type { WorkGroup } from "../../shared/workGroups.js";
@@ -210,6 +210,25 @@ export class EvidenceCatalogStore {
       this.members(root.id).some(m => m.source_id === sourceId && m.state === "candidate"))
       .flatMap(root => this.affected(root)))];
   }
+  private automaticallyApproved(child: Pick<EvidenceSource, "id" | "provider" | "resource">, root: EvidenceRoot, link: EvidenceDiscoveryLink): boolean {
+    const origin = this.store.get(root.sourceId);
+    return this.approvedElsewhere(child.id,root) ||
+      (origin.provider === "jira" && child.provider === "jira" && origin.resource.split("/")[0] === child.resource.split("/")[0]) ||
+      (origin.provider === "slack" && child.provider === "slack" && origin.resource === child.resource) ||
+      (origin.provider === "confluence" && child.provider === "confluence" && link.relation === "child" && origin.resource.split("/")[0] === child.resource.split("/")[0]);
+  }
+  discoveryApprovalAffected(root: EvidenceRoot, links: EvidenceDiscoveryLink[]): string[] {
+    const ids = new Set<string>();
+    for (const link of links) {
+      let parsed: ReturnType<typeof parseEvidenceSource>;
+      try { parsed = parseEvidenceSource({url:link.url,label:link.label.slice(0,160) || link.url.slice(0,160),mode:"connector",intervalSeconds:900}); }
+      catch { continue; }
+      const id = evidenceHash(stableJSON([parsed.provider,parsed.resource,parsed.selector]));
+      if (this.automaticallyApproved({...parsed,id},root,link))
+        for (const topic of this.approvalAffected(id,root.scope,root.owner)) ids.add(topic);
+    }
+    return [...ids];
+  }
   private reuseApproval(sourceId: string, from: EvidenceRoot): void {
     for (const other of this.roots()) {
       if (other.id === from.id || other.status !== "approved" || !this.sharesApproval(from,other)) continue;
@@ -365,10 +384,7 @@ export class EvidenceCatalogStore {
           // without creating a collection requirement for unsupported navigation or prototype URLs.
           continue;
         }
-        const origin = this.store.get(root.sourceId);
-        const automatic = this.approvedElsewhere(child.id,current) || (origin.provider === "jira" && child.provider === "jira" && origin.resource.split("/")[0] === child.resource.split("/")[0]) ||
-          (origin.provider === "slack" && child.provider === "slack" && origin.resource === child.resource) ||
-          (origin.provider === "confluence" && child.provider === "confluence" && link.relation === "child" && origin.resource.split("/")[0] === child.resource.split("/")[0]);
+        const automatic = this.automaticallyApproved(child,current,link);
         const added = this.db.prepare("INSERT OR IGNORE INTO evidence_members VALUES (?,?,?,'pending',NULL,NULL)")
           .run(root.id, child.id, automatic ? "approved" : "candidate");
         if (automatic) this.reuseApproval(child.id,current);

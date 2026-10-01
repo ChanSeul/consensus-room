@@ -4828,3 +4828,26 @@ it("감사 계약 교정은 원본·교정의 충돌 ID를 병합 전에 맞춘�
   expect(codex.calls).toHaveLength(2);
   database.close();
 });
+
+
+it("감사 교정은 다른 원문 ID를 잘못 붙인 원본을 정상 교정 항목으로 대체한다", async () => {
+  const source = [finding("TODO-2", "first: 앱바", { disposition: "AGREED_ACTION" }),
+    finding("TODO-2", "second: 지도", { disposition: "AGREED_ACTION" })];
+  const { auditFindingIdentity } = await import("../src/shared/workflow");
+  const canonical = auditFindingIdentity(source).findings;
+  const { database, engine, artifacts, codex } = makePlanningEngine({
+    slug: "audit-replace-invalid-id",
+    claudeResults: [{ kind: "PLAN", summary: "계획", planMarkdown: validPlan("기존 계획"), findings: source, evidenceRefs: [] }],
+    codexResults: [
+      { kind: "AUDIT", summary: "잘못된 식별자", findings: [{...canonical[0],id:canonical[1].id}], evidenceRefs: [] },
+      { kind: "AUDIT", summary: "교정", requestedUserDecision: "제품 결정", findings: canonical, evidenceRefs: [] },
+    ],
+  });
+  engine.startPlan("topic-1");
+  await waitForActionCompletion(database, "topic-1");
+  expect(database.getTopic("topic-1").state, database.getTopic("topic-1").lastError ?? "").toBe("USER_DECISION_REQUIRED");
+  const audit = JSON.parse((await artifacts.readLatest("topic-1", "audit"))!);
+  expect(audit.findings).toEqual(canonical);
+  expect(codex.calls).toHaveLength(2);
+  database.close();
+});

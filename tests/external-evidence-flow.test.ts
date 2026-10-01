@@ -635,3 +635,86 @@ it.each([true,false])("keeps child baselines while a collection slice temporaril
     expect(f.database.evidence.automation.jobs("t")[0]).toMatchObject({status:"pending",changes:[{sourceId:f.database.evidence.list("t").find(s=>s.resource.endsWith("APP-2"))!.id}]});
   }finally{await service.stop();}
 });
+
+it.each(["host", "native", "cached"] as const)("%s 수집 승인 전파는 optional 루트의 실행과 현재 별칭을 보호한다", async mode => {
+  const f=fixture(), db=f.database, c=db.evidence.catalog;
+  db.evidence.detach("t",f.source.id);
+  db.updateTopic("t",{state:"DRAFT"});
+  db.createTopic({...f.topic,id:"u",slug:"u",state:"DRAFT"});
+  const groupId="11111111-1111-4111-8111-111111111112";
+  db.workGroups.create(groupId,{title:"Form",goal:"Form",contracts:"Scope",stages:[
+    {id:"ui",kind:"work",title:"UI",goal:"Layout",acceptance:"Verified",dependsOn:[]},
+    {id:"all",kind:"integration",title:"All",goal:"All",acceptance:"Verified",dependsOn:["ui"]},
+  ]},f.root,"a".repeat(40));
+  const selected=c.addScoped("group",groupId,{url:"https://www.figma.com/design/form?node-id=1-2",label:"Optional",scope:"group",required:false,mode:"connector",intervalSeconds:900},true);
+  const collecting=c.addScoped("group",groupId,{...sourceInput,scope:"group",required:true},true);
+  const group=db.workGroups.get(groupId);
+  db.workGroups.revise(groupId,{title:group.title,goal:group.goal,contracts:group.contracts,stages:group.stages.map(s=>({...s,evidenceRootIds:[s.id==="ui" ? selected.id : collecting.id]}))},group.version);
+  db.workGroups.link(groupId,"ui","t","a".repeat(40));
+  db.workGroups.link(groupId,"all","u","a".repeat(40));
+  const url="https://team.atlassian.net/browse/APP-2";
+  const seed=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("host only");}});
+  seed.importHost("t",{version:c.version("t"),rootId:selected.id,sourceId:selected.sourceId,previousHash:null,
+    previousCheckedAt:null,observedAt:Date.now(),revision:"r",missing:[],units:[{id:"body",kind:"design",content:url}]});
+  await seed.stop();
+  f.ingest(url);
+  const config=loadConfig({repositoryPath:f.root,dataDirectory:f.root,webDirectory:join(f.root,"no-web"),launchToken:"test-token",enforceBudgets:false});
+  const connector={configured:()=>true,fetch:async()=>{throw Error("unused");},discover:async(source:any)=>({revision:"r2",cursor:null,units:[{id:"body",kind:"issue" as const,content:source.id===collecting.sourceId ? url : "child"}],links:source.id===collecting.sourceId ? [{url,label:"child",unitId:"body",relation:"child" as const}]:[]})};
+  const app=await buildApp({config,database:db,runner:f.runner,claude:f.adapter,codex:{...f.adapter,role:"codex"},...(mode==="native" ? {nativeEvidenceConnector:connector} : {})});
+  db.updateTopic("t",{state:"AWAITING_USER_APPROVAL",planSHA256:"f".repeat(64),approvedPlanSHA256:"f".repeat(64)});
+  db.startAction({id:"busy-discovery",topicId:"t",kind:"test",status:"running",createdAt:new Date().toISOString(),finishedAt:null,error:null,pid:null,pgid:null,processExecutable:null,processCommand:null,processStartedAt:null});
+  const clear=vi.spyOn(ArtifactStore.prototype,"clearCurrentAliases");
+  const request=async()=>{
+    const source=db.evidence.get(collecting.sourceId);
+    return app.inject({method:"POST",url:`/api/topics/u/evidence/${mode==="host" ? "host-import" : "collect"}`,
+      headers:{"x-consensus-token":"test-token","x-consensus-actor":"mediator"},payload:mode==="host" ? {
+        version:c.version("u"),rootId:collecting.id,sourceId:source.id,previousHash:source.contentHash,
+        previousCheckedAt:source.checkedAt,observedAt:Date.now(),revision:"r2",missing:[],units:[{id:"body",kind:"issue",content:url}],
+      } : {}});
+  };
+  try {
+    await request();
+    expect(c.state("t").entries.find(e=>e.source.url===url)?.state).toBe("candidate");
+    expect(db.getTopic("t").approvedPlanSHA256).toBe("f".repeat(64));
+    expect(clear).not.toHaveBeenCalledWith("t");
+    db.finishAction("busy-discovery","succeeded");
+    c.requestRefresh(collecting.id);
+    expect((await request()).statusCode).toBe(200);
+    expect(c.state("t").entries.find(e=>e.source.url===url)?.state).toBe("approved");
+    expect(db.getTopic("t").approvedPlanSHA256).toBeNull();
+    expect(clear).toHaveBeenCalledWith("t");
+  } finally {db.finishAction("busy-discovery","succeeded");await app.close();dbs.splice(dbs.indexOf(db),1);}
+});
+
+it("승인 별칭 정리 대기 중 새 소비자가 생기면 최종 변경을 거부한다", async () => {
+  const f=fixture(),db=f.database,c=db.evidence.catalog;
+  db.updateTopic("t",{state:"DRAFT"});
+  db.createTopic({...f.topic,id:"u",slug:"u",state:"DRAFT"});
+  const selected=c.add("u",{url:"https://www.figma.com/design/race?node-id=1-2",label:"Selected",scope:"topic",required:false,mode:"connector",intervalSeconds:900},true);
+  const groupId="11111111-1111-4111-8111-111111111113";
+  db.workGroups.create(groupId,{title:"Scoped",goal:"Scoped",contracts:"Scope",stages:[
+    {id:"ui",kind:"work",title:"UI",goal:"Layout",acceptance:"Verified",dependsOn:[],evidenceRootIds:[selected.id]},
+    {id:"all",kind:"integration",title:"All",goal:"All",acceptance:"Verified",dependsOn:["ui"]},
+  ]},f.root,"a".repeat(40));
+  db.workGroups.link(groupId,"ui","u","a".repeat(40));
+  const url="https://docs.google.com/spreadsheets/d/race-policy/edit";
+  const config=loadConfig({repositoryPath:f.root,dataDirectory:f.root,webDirectory:join(f.root,"no-web"),launchToken:"test-token",enforceBudgets:false});
+  const app=await buildApp({config,database:db,runner:f.runner,claude:f.adapter,codex:{...f.adapter,role:"codex"}});
+  const original=ArtifactStore.prototype.clearCurrentAliases;
+  let injected=false;
+  vi.spyOn(ArtifactStore.prototype,"clearCurrentAliases").mockImplementation(async function(this: ArtifactStore, id){
+    await original.call(this,id);
+    if (!injected) {
+      injected=true;
+      c.acceptPage(selected,db.evidence.get(selected.sourceId),null,{revision:"new",cursor:null,units:[],links:[{url,label:"policy",unitId:"body",relation:"link"}]});
+      db.updateTopic("u",{state:"AWAITING_USER_APPROVAL",planSHA256:"f".repeat(64),approvedPlanSHA256:"f".repeat(64)});
+    }
+  });
+  try {
+    const response=await app.inject({method:"POST",url:"/api/topics/t/evidence/roots",headers:{"x-consensus-token":"test-token"},payload:{url,label:"Policy",scope:"workspace",required:true,mode:"connector",intervalSeconds:900}});
+    expect(response.statusCode).toBe(409);
+    expect(c.roots().some(r=>r.scope==="workspace")).toBe(false);
+    expect(c.state("u").entries.find(e=>e.source.url===url)?.state).toBe("candidate");
+    expect(db.getTopic("u").approvedPlanSHA256).toBe("f".repeat(64));
+  } finally {await app.close();dbs.splice(dbs.indexOf(db),1);}
+});

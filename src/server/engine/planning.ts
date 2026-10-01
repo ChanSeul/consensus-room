@@ -461,7 +461,12 @@ export class PlanningPipeline {
     const normalize = Object.assign(
       (result: AgentResult) => carry({ ...result, findings: identity.normalize(result.findings) }),
       { carried: carry.carried, label: carry.label,
-        beforeMerge: (result: AgentResult) => ({ ...result, findings: identity.normalize(result.findings, false) }) },
+        beforeMerge: (result: AgentResult, salvaged = false) => ({ ...result, findings: salvaged
+          ? result.findings.map(finding => {
+            // A malformed original can be replaced by a valid corrected item with this ID.
+            // Preserve failures verbatim; any unreplaced invalid item still fails final normalization.
+            try { return identity.normalize([finding], false)[0]; } catch { return finding; }
+          }) : identity.normalize(result.findings, false) }) },
     );
     let topic = this.core.transition(topicId, "CODEX_AUDIT", "Codex가 계획을 읽기 전용으로 감사합니다.");
     const auditRoute = this.core.route(topic, { role: "reviewer", operation: "audit" });

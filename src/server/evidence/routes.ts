@@ -5,6 +5,7 @@ import { MediatorEvidenceBatchInputSchema, MediatorEvidenceAckSchema, EvidenceDe
 import type { ConsensusDatabase } from "../database.js";
 import type { WorkflowEngine } from "../workflow.js";
 import type { EvidenceService } from "./service.js";
+import { discoverLinks } from "./discovery.js";
 import { assertMediatorForAnyTopic } from "../mediation.js";
 
 export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDatabase, workflow: WorkflowEngine, service: EvidenceService,
@@ -46,17 +47,21 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
     const input=EvidenceHostImportSchema.parse(request.body);
     const root=db.evidence.catalog.forTopic(request.params.id).find(r=>r.id===input.rootId);
     if (!root) throw Object.assign(new Error("이 작업에 연결된 루트가 아닙니다."),{statusCode:409});
-    const affected=[...new Set([...db.evidence.catalog.affected(root),...db.evidence.linkedTopics(root.sourceId),...db.evidence.linkedTopics(input.sourceId)])];
-    assertMediatorForAnyTopic(db.roles,request.headers,affected.filter(id=>db.getTopic(id).state!=="CLOSED"));
-    idle(affected);
-    service.importHost(request.params.id,input);
+    const links = discoverLinks(input.units,db.evidence.get(input.sourceId).url);
+    const affected = () => db.evidence.catalog.discoveryApprovalAffected(root,links);
+    const guarded = () => {
+      const ids = [...new Set([...db.evidence.catalog.affected(root),...db.evidence.linkedTopics(root.sourceId),...db.evidence.linkedTopics(input.sourceId)])];
+      assertMediatorForAnyTopic(db.roles,request.headers,[...ids,...affected()].filter(id=>db.getTopic(id).state!=="CLOSED"));
+      return ids;
+    };
+    await workflow.changeEvidenceSelection(affected,()=>service.importHost(request.params.id,input),guarded);
     return db.evidence.catalog.state(request.params.id);
   });
   app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/roots", async request => {
     const input = EvidenceRootInputSchema.parse(request.body), context = db.evidence.catalog.context(request.params.id);
     const scope = input.scope === "group" && !context.group ? "topic" : input.scope;
     // A newly registered root is outside an explicitly scoped stage until its group revision selects it.
-    const ids = db.listTopics().filter(t => {
+    const baseAffected = () => db.listTopics().filter(t => {
       const target = db.evidence.catalog.context(t.id);
       return target[scope] === context[scope] && target.evidenceRootIds === undefined;
     }).map(t => t.id);
@@ -67,18 +72,18 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
     const source = db.evidence.ensureSource({url:input.url,label:input.label,mode:input.mode,intervalSeconds:input.intervalSeconds},true);
     const existing = db.evidence.catalog.forTopic(request.params.id).find(root => root.scope === scope && root.sourceId === source.id && root.status !== "removed");
     if (existing) return existing;
-    if (approved) ids.push(...db.evidence.catalog.approvalAffected(source.id, scope, context[scope]!));
-    if (approved) { const result = await workflow.changeEvidenceSelection(ids,()=>db.evidence.catalog.add(request.params.id,input,true)); notifySelection(ids); return result; }
-    idle(ids); return db.evidence.catalog.add(request.params.id,input,false);
+    const affected = () => [...baseAffected(),...db.evidence.catalog.approvalAffected(source.id, scope, context[scope]!)];
+    if (approved) { const changed = affected(); const result = await workflow.changeEvidenceSelection(affected,()=>db.evidence.catalog.add(request.params.id,input,true)); notifySelection(changed); return result; }
+    idle(baseAffected()); return db.evidence.catalog.add(request.params.id,input,false);
   });
   app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/selection", async request => {
     user(request.headers);
     const input = EvidenceSelectionInputSchema.parse(request.body);
     const root = db.evidence.catalog.assertSelection(request.params.id,input);
-    const ids = db.evidence.catalog.affected(root);
-    if (input.action === "approve" || input.action === "accept") ids.push(...db.evidence.catalog.approvalAffected(
-      input.action === "approve" ? root.sourceId : input.sourceId!, root.scope, root.owner));
-    await workflow.changeEvidenceSelection(ids,()=>db.evidence.catalog.select(request.params.id,input));
+    const affected = () => [...db.evidence.catalog.affected(root),...(input.action === "approve" || input.action === "accept"
+      ? db.evidence.catalog.approvalAffected(input.action === "approve" ? root.sourceId : input.sourceId!, root.scope, root.owner) : [])];
+    const ids = affected();
+    await workflow.changeEvidenceSelection(affected,()=>db.evidence.catalog.select(request.params.id,input));
     notifySelection(ids);
     return db.evidence.catalog.state(request.params.id);
   });
@@ -87,9 +92,10 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
     const input = z.object({ version:z.string(),rootId:z.string().uuid(),action:z.enum(["accept","reject"]),sourceIds:z.array(z.string()).min(1).max(200) }).strict().parse(request.body);
     const root = db.evidence.catalog.assertSelection(request.params.id,{...input,sourceId:input.sourceIds[0]});
     for (const sourceId of input.sourceIds) db.evidence.catalog.assertSelection(request.params.id,{...input,sourceId});
-    const ids = db.evidence.catalog.affected(root);
-    if (input.action === "accept") for (const id of input.sourceIds) ids.push(...db.evidence.catalog.approvalAffected(id, root.scope, root.owner));
-    await workflow.changeEvidenceSelection(ids,()=>db.evidence.catalog.selectBatch(request.params.id,input));
+    const affected = () => [...db.evidence.catalog.affected(root),...(input.action === "accept"
+      ? input.sourceIds.flatMap(id => db.evidence.catalog.approvalAffected(id, root.scope, root.owner)) : [])];
+    const ids = affected();
+    await workflow.changeEvidenceSelection(affected,()=>db.evidence.catalog.selectBatch(request.params.id,input));
     notifySelection(ids);
     return db.evidence.catalog.state(request.params.id);
   });
