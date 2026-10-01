@@ -1,3 +1,4 @@
+import { EvidenceAdmissionExpired } from "./evidence/scheduler.js";
 import { EvidenceAssessmentPipeline } from "./engine/evidenceAssessment.js";
 import type { PlanningMigration } from "../shared/planningControl.js";
 import {reviewScope,type ReviewScope} from "../shared/reviews.js";
@@ -329,6 +330,24 @@ export class WorkflowEngine {
         throw Object.assign(new Error("근거 목록이 바뀌었습니다. 다시 확인하세요."),{statusCode:409});
       for (const topic of mutable) this.core.diagnoses.staleOnReplan(topic);
       return change();
+    } finally { for (const id of ids) this.core.scopeChangeActive.delete(id); }
+  }
+  async publishEvidence<T>(resolve: () => { selected: string[]; guarded: string[] }, publish: () => T): Promise<T> {
+    // Resolve and publish synchronously under the same admission boundary. Unlike a manual selection,
+    // rejected collection input must not clear current aliases or invalidate applied diagnoses.
+    const { selected, guarded } = resolve(), ids = [...new Set([...selected, ...guarded])];
+    try { for (const id of ids) this.core.assertNoActiveWork(id); }
+    catch { throw Object.assign(new EvidenceAdmissionExpired("근거 소비 작업이 실행 중입니다. 유휴 상태에서 다시 수집하세요."), { statusCode:409 }); }
+    for (const id of ids) this.core.scopeChangeActive.add(id);
+    try {
+      const db = this.core.dependencies.database;
+      const mutable = [...new Set(selected)].map(id => db.getTopic(id)).filter(topic => topic.state !== "CLOSED" && !db.getFlags(topic.id).committedOID);
+      const result = publish();
+      // The catalog transaction establishes the authoritative artifact boundary before human aliases
+      // are removed (the same database-first ordering as ArtifactStore.write).
+      for (const topic of mutable) this.core.diagnoses.staleOnReplan(topic);
+      for (const topic of mutable) await this.core.dependencies.artifacts.clearCurrentAliases(topic.id);
+      return result;
     } finally { for (const id of ids) this.core.scopeChangeActive.delete(id); }
   }
   assertBudgetEditable(topicId: string): void { this.core.assertNoActiveWork(topicId); }

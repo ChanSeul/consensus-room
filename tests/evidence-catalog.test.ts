@@ -1,3 +1,4 @@
+import { DatabaseSync } from "node:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -558,4 +559,18 @@ it("새 루트의 승인 재사용은 선택된 기존 루트의 계획도 무�
     expect(db.getTopic("ui").approvedPlanSHA256).toBeNull();
     expect(db.getTopic("ui").planEpoch).toBe(before.planEpoch+1);
   } finally {await service.stop();}
+});
+
+
+it("승인 전파 사전 계산은 전파 후보 없는 100링크·20루트에서 링크당 DB 조회를 하지 않는다", () => {
+  const {db}=fixture(),c=db.evidence.catalog;
+  const roots=Array.from({length:20},(_,i)=>c.add("a",input(`https://team.atlassian.net/browse/ROOT-${i+1}`),true));
+  for (const root of roots) c.acceptPage(root,db.evidence.get(root.sourceId),null,{revision:"seed",cursor:null,units:[],
+    links:Array.from({length:100},(_,i)=>({url:`https://team.atlassian.net/browse/MEMBER-${i+1}`,label:"member",unitId:"body",relation:"child" as const}))});
+  const links=Array.from({length:100},(_,i)=>({url:`https://team.atlassian.net/browse/NEW-${i+1}`,label:"new",unitId:"body",relation:"child" as const}));
+  const prepare=vi.spyOn(DatabaseSync.prototype,"prepare");
+  try {
+    expect(c.discoveryApprovalAffected(c.roots().find(r=>r.id===roots[0].id)!,links)).toEqual([]);
+    expect(prepare.mock.calls.length).toBeLessThanOrEqual(5);
+  } finally {prepare.mockRestore();}
 });

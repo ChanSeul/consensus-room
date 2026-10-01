@@ -184,8 +184,8 @@ export class EvidenceCatalogStore {
   members(rootId: string): Member[] {
     return this.db.prepare("SELECT * FROM evidence_members WHERE root_id=? ORDER BY rowid").all(rootId) as unknown as Member[];
   }
-  private reachableMembers(rootId: string): Member[] {
-    const root = this.roots().find(r => r.id === rootId); if (!root) return [];
+  private reachableMembers(rootId: string, knownRoot?: EvidenceRoot): Member[] {
+    const root = knownRoot ?? this.roots().find(r => r.id === rootId); if (!root) return [];
     const members = this.members(rootId), byId = new Map(members.map(m=>[m.source_id,m]));
     const visible = new Set([root.sourceId]);
     const edges = this.db.prepare("SELECT parent_id,source_id FROM evidence_discovery_edges WHERE root_id=?").all(rootId);
@@ -210,24 +210,40 @@ export class EvidenceCatalogStore {
       this.members(root.id).some(m => m.source_id === sourceId && m.state === "candidate"))
       .flatMap(root => this.affected(root)))];
   }
-  private automaticallyApproved(child: Pick<EvidenceSource, "id" | "provider" | "resource">, root: EvidenceRoot, link: EvidenceDiscoveryLink): boolean {
-    const origin = this.store.get(root.sourceId);
-    return this.approvedElsewhere(child.id,root) ||
+  private automaticallyApproved(child: Pick<EvidenceSource, "id" | "provider" | "resource">, root: EvidenceRoot, link: EvidenceDiscoveryLink,
+    approved?: ReadonlySet<string>, origin = this.store.get(root.sourceId)): boolean {
+    return (approved ? approved.has(child.id) : this.approvedElsewhere(child.id,root)) ||
       (origin.provider === "jira" && child.provider === "jira" && origin.resource.split("/")[0] === child.resource.split("/")[0]) ||
       (origin.provider === "slack" && child.provider === "slack" && origin.resource === child.resource) ||
       (origin.provider === "confluence" && child.provider === "confluence" && link.relation === "child" && origin.resource.split("/")[0] === child.resource.split("/")[0]);
   }
   discoveryApprovalAffected(root: EvidenceRoot, links: EvidenceDiscoveryLink[]): string[] {
-    const ids = new Set<string>();
+    // Only candidate members of *other* roots can change via reuseApproval. Read the catalog once,
+    // then join links in memory; pages with no propagation candidates need no graph traversal.
+    const roots = this.roots().filter(other => other.status === "approved");
+    const targets = new Map(roots.filter(other => other.id !== root.id && this.sharesApproval(root,other)).map(other => [other.id,other]));
+    const candidates = new Map<string, Set<string>>();
+    for (const row of this.db.prepare("SELECT root_id,source_id FROM evidence_members WHERE state='candidate'").all()) {
+      const rootId=String(row.root_id), sourceId=String(row.source_id);
+      if (!targets.has(rootId)) continue;
+      const owners=candidates.get(sourceId) ?? new Set<string>(); owners.add(rootId); candidates.set(sourceId,owners);
+    }
+    if (!candidates.size) return [];
+    const relevant: Array<{id:string; parsed:ReturnType<typeof parseEvidenceSource>; link:EvidenceDiscoveryLink}> = [];
     for (const link of links) {
       let parsed: ReturnType<typeof parseEvidenceSource>;
       try { parsed = parseEvidenceSource({url:link.url,label:link.label.slice(0,160) || link.url.slice(0,160),mode:"connector",intervalSeconds:900}); }
       catch { continue; }
       const id = evidenceHash(stableJSON([parsed.provider,parsed.resource,parsed.selector]));
-      if (this.automaticallyApproved({...parsed,id},root,link))
-        for (const topic of this.approvalAffected(id,root.scope,root.owner)) ids.add(topic);
+      if (candidates.has(id)) relevant.push({id,parsed,link});
     }
-    return [...ids];
+    if (!relevant.length) return [];
+    const approved = new Set(roots.filter(other => this.sharesApproval(other,root))
+      .flatMap(other => this.reachableMembers(other.id,other).filter(m=>m.state==="approved").map(m=>m.source_id)));
+    const origin=this.store.get(root.sourceId), affectedRoots=new Set<string>();
+    for (const {id,parsed,link} of relevant) if (this.automaticallyApproved({...parsed,id},root,link,approved,origin))
+      for (const rootId of candidates.get(id)!) affectedRoots.add(rootId);
+    return [...new Set([...affectedRoots].flatMap(id=>this.affected(targets.get(id)!)))];
   }
   private reuseApproval(sourceId: string, from: EvidenceRoot): void {
     for (const other of this.roots()) {

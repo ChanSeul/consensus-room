@@ -164,6 +164,12 @@ export class EvidenceStore {
     const source = this.get(id);
     this.save({ ...source, collection: { ...source.collection, ...collection } });
   }
+  restoreCollection(id: string, checkId: string, collection: EvidenceSource["collection"]): void {
+    const row = this.db.prepare("SELECT check_id FROM evidence_sources WHERE id=?").get(id);
+    if (row?.check_id !== checkId) return;
+    const source = this.get(id);
+    if (source.collection?.status === "reading") this.save({...source,collection});
+  }
   register(topicId: string, raw: EvidenceSourceInput): EvidenceSource {
     const existing = this.ensureSource(raw);
     if (this.list(topicId).length >= 64 && !this.list(topicId).some(source => source.id === existing.id)) throw new Error("한 주제에는 최대 64개 원문을 연결할 수 있습니다.");

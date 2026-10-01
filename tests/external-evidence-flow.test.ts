@@ -1,3 +1,4 @@
+import { DiagnosisService } from "../src/server/engine/diagnoses";
 import { EvidenceAssessmentPipeline } from "../src/server/engine/evidenceAssessment";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
@@ -658,18 +659,21 @@ it.each(["host", "native", "cached"] as const)("%s 수집 승인 전파는 optio
     previousCheckedAt:null,observedAt:Date.now(),revision:"r",missing:[],units:[{id:"body",kind:"design",content:url}]});
   await seed.stop();
   f.ingest(url);
+  if (mode==="native") c.acceptPage(collecting,db.evidence.get(collecting.sourceId),null,{revision:"page-1",cursor:"next-page",units:[{id:"first",kind:"issue",content:"already read"}],links:[]});
   const config=loadConfig({repositoryPath:f.root,dataDirectory:f.root,webDirectory:join(f.root,"no-web"),launchToken:"test-token",enforceBudgets:false});
   const connector={configured:()=>true,fetch:async()=>{throw Error("unused");},discover:async(source:any)=>({revision:"r2",cursor:null,units:[{id:"body",kind:"issue" as const,content:source.id===collecting.sourceId ? url : "child"}],links:source.id===collecting.sourceId ? [{url,label:"child",unitId:"body",relation:"child" as const}]:[]})};
   const app=await buildApp({config,database:db,runner:f.runner,claude:f.adapter,codex:{...f.adapter,role:"codex"},...(mode==="native" ? {nativeEvidenceConnector:connector} : {})});
   db.updateTopic("t",{state:"AWAITING_USER_APPROVAL",planSHA256:"f".repeat(64),approvedPlanSHA256:"f".repeat(64)});
   db.startAction({id:"busy-discovery",topicId:"t",kind:"test",status:"running",createdAt:new Date().toISOString(),finishedAt:null,error:null,pid:null,pgid:null,processExecutable:null,processCommand:null,processStartedAt:null});
   const clear=vi.spyOn(ArtifactStore.prototype,"clearCurrentAliases");
-  const request=async()=>{
+  const stale=vi.spyOn(DiagnosisService.prototype,"staleOnReplan");
+  await new ArtifactStore(join(f.root,"topics"),db).write("t","plan",1,"approved plan alias");
+  const request=async(overrides:Record<string,unknown>={})=>{
     const source=db.evidence.get(collecting.sourceId);
     return app.inject({method:"POST",url:`/api/topics/u/evidence/${mode==="host" ? "host-import" : "collect"}`,
       headers:{"x-consensus-token":"test-token","x-consensus-actor":"mediator"},payload:mode==="host" ? {
         version:c.version("u"),rootId:collecting.id,sourceId:source.id,previousHash:source.contentHash,
-        previousCheckedAt:source.checkedAt,observedAt:Date.now(),revision:"r2",missing:[],units:[{id:"body",kind:"issue",content:url}],
+        previousCheckedAt:source.checkedAt,observedAt:Date.now(),revision:"r2",missing:[],units:[{id:"body",kind:"issue",content:url}],...overrides,
       } : {}});
   };
   try {
@@ -677,8 +681,21 @@ it.each(["host", "native", "cached"] as const)("%s 수집 승인 전파는 optio
     expect(c.state("t").entries.find(e=>e.source.url===url)?.state).toBe("candidate");
     expect(db.getTopic("t").approvedPlanSHA256).toBe("f".repeat(64));
     expect(clear).not.toHaveBeenCalledWith("t");
+    if (mode==="native") {
+      expect(c.members(collecting.id).find(m=>m.source_id===collecting.sourceId)?.cursor).toBe("next-page");
+      expect(c.roots().find(r=>r.id===collecting.id)?.nextCheckAt).toBe(0);
+      expect(db.evidence.get(collecting.sourceId).collection).toBeUndefined();
+    }
     db.finishAction("busy-discovery","succeeded");
-    c.requestRefresh(collecting.id);
+    if (mode==="host") for (const invalid of [{version:"0".repeat(64)},{previousHash:"0".repeat(64)},
+      {units:[{id:"dup",kind:"issue",content:url},{id:"dup",kind:"issue",content:url}]}]) {
+      expect((await request(invalid)).statusCode).toBeGreaterThanOrEqual(400);
+      expect(clear).not.toHaveBeenCalledWith("t");
+      expect(stale).not.toHaveBeenCalled();
+      expect(readFileSync(join(f.root,"topics/t/plan.md"),"utf8")).toBe("approved plan alias");
+      expect(c.state("t").entries.find(e=>e.source.url===url)?.state).toBe("candidate");
+    }
+    if (mode!=="native") c.requestRefresh(collecting.id);
     expect((await request()).statusCode).toBe(200);
     expect(c.state("t").entries.find(e=>e.source.url===url)?.state).toBe("approved");
     expect(db.getTopic("t").approvedPlanSHA256).toBeNull();
@@ -717,4 +734,30 @@ it("승인 별칭 정리 대기 중 새 소비자가 생기면 최종 변경을 
     expect(c.state("u").entries.find(e=>e.source.url===url)?.state).toBe("candidate");
     expect(db.getTopic("u").approvedPlanSHA256).toBe("f".repeat(64));
   } finally {await app.close();dbs.splice(dbs.indexOf(db),1);}
+});
+
+
+it("같은 루트의 candidate를 child로 재발견해도 실제 승인 변경이 없으면 현재 계획을 보존한다", async () => {
+  const f=fixture(),db=f.database,c=db.evidence.catalog;
+  db.updateTopic("t",{state:"DRAFT"});
+  const root=c.add("t",{url:"https://team.atlassian.net/wiki/spaces/APP/pages/123/Parent",label:"Optional",scope:"topic",required:false,mode:"connector",intervalSeconds:900},true);
+  const url="https://team.atlassian.net/wiki/spaces/APP/pages/456/Child";
+  const link={url,label:"child",unitId:"body",relation:"link" as const};
+  c.acceptPage(root,db.evidence.get(root.sourceId),null,{revision:"r1",cursor:null,units:[],links:[link]});
+  c.requestRefresh(root.id);
+  db.updateTopic("t",{state:"AWAITING_USER_APPROVAL",planSHA256:"f".repeat(64),approvedPlanSHA256:"f".repeat(64)});
+  await f.dependencies.artifacts.write("t","plan",1,"unchanged plan");
+  const engine=new WorkflowEngine(f.dependencies);
+  const connector={configured:()=>true,fetch:async()=>{throw Error("unused");},discover:async()=>({revision:"r2",cursor:null,units:[],links:[{...link,relation:"child" as const}]})};
+  const service=new EvidenceService(db.evidence,connector,undefined,undefined,connector);
+  service.canPublish=id=>engine.canPublishEvidence(id);
+  service.publishSelection=(selected,publish,guarded)=>engine.publishEvidence(()=>({selected:selected(),guarded:guarded?.() ?? []}),publish);
+  const stale=vi.spyOn(DiagnosisService.prototype,"staleOnReplan");
+  try {
+    await service.collect(root.id);
+    expect(c.state("t").entries.find(e=>e.source.url===url)?.state).toBe("candidate");
+    expect(db.getTopic("t").approvedPlanSHA256).toBe("f".repeat(64));
+    expect(readFileSync(join(f.root,"topics/t/plan.md"),"utf8")).toBe("unchanged plan");
+    expect(stale).not.toHaveBeenCalled();
+  } finally {await service.stop();}
 });

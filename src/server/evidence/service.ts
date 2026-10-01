@@ -21,8 +21,8 @@ export class EvidenceService {
   private readonly collectedThisPoll = new Map<string, { key: string; links: EvidenceDiscoveryLink[] }>();
   onIdle: () => void = () => {};
   canPublish: (topicId: string) => boolean = () => true;
-  changeSelection: <T>(affected: () => string[], change: () => T, guarded?: () => string[]) => Promise<T> = async (affected, change, guarded = () => []) => {
-    if ([...affected(), ...guarded()].some(id => !this.canPublish(id))) throw new Error("승인 전파 대상에서 작업이 실행 중입니다.");
+  publishSelection: <T>(affected: () => string[], change: () => T, guarded?: () => string[]) => Promise<T> = async (affected, change, guarded = () => []) => {
+    if ([...affected(), ...guarded()].some(id => !this.canPublish(id))) throw new EvidenceAdmissionExpired("승인 전파 대상에서 작업이 실행 중입니다.");
     return change();
   };
 
@@ -91,10 +91,10 @@ export class EvidenceService {
           if (!snapshot || !this.store.fresh(source)) throw new EvidenceFetchError("호스트에서 원문을 다시 수집하세요. 이전 자료는 보존했습니다.");
           const units=snapshot.units.map(({contentHash: _hash,imageHash,...unit})=>({ ...unit,
             ...(imageHash ? {imageBase64:this.store.image(imageHash).toString("base64")} : {}) }));
-          committing=true;
           const links = this.collectedThisPoll.get(source.id)?.links ?? discoverLinks(units,source.url);
-          await this.changeSelection(() => this.store.catalog.discoveryApprovalAffected(root,links), () => {
+          await this.publishSelection(() => this.store.catalog.discoveryApprovalAffected(root,links), () => {
             if (this.abort.signal.aborted) throw new EvidenceAdmissionExpired();
+            committing=true;
             this.store.catalog.replacePages(root,source,cursor,{units,links,revision:source.revision!});
           }, guarded);
           continue;
@@ -115,9 +115,9 @@ export class EvidenceService {
         if (this.abort.signal.aborted || !publishable()) return;
         if (page.connectionKey && source.collection?.connectionKey && page.connectionKey !== source.collection.connectionKey && !page.accountConfirmed)
           throw new EvidenceFetchError("MCP 연결 계정이 바뀌었습니다. 로컬 연결 설정에서 사용할 계정을 확인하세요.", 300, true);
-        committing=true;
-        await this.changeSelection(() => this.store.catalog.discoveryApprovalAffected(root,page.links), () => {
+        await this.publishSelection(() => this.store.catalog.discoveryApprovalAffected(root,page.links), () => {
           if (this.abort.signal.aborted) throw new EvidenceAdmissionExpired();
+          committing=true;
           this.store.catalog.acceptPage(root, source, cursor, page, generation);
           if (page.cursor === null) {
             const data = this.store.catalog.collected(root.id, source.id), before = this.store.get(source.id);
@@ -135,7 +135,12 @@ export class EvidenceService {
           error instanceof EvidenceFetchError ? error.retryAfterSeconds : 300,
           committing || (error instanceof EvidenceFetchError && error.restart));
         return;
-      } finally { if (checkId) this.store.releaseCheck(source.id,checkId); }
+      } finally {
+        if (checkId) {
+          this.store.restoreCollection(source.id,checkId,source.collection);
+          this.store.releaseCheck(source.id,checkId);
+        }
+      }
     }
     this.store.catalog.complete(rootId);
   }

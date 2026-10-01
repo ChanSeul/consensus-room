@@ -125,7 +125,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   const engineDefects = new EngineDefectWorker(database, dependencies.runner, guardRunnerControl(dependencies.codex),
     config.dataDirectory, resolve(import.meta.dirname, "../.."), dependencies.hostSandbox?.kind !== "unavailable");
   evidence.canPublish = topicId => workflow.canPublishEvidence(topicId);
-  evidence.changeSelection = (affected, change, guarded) => workflow.changeEvidenceSelection(affected, change, guarded);
+  evidence.publishSelection = (affected, change, guarded) => workflow.publishEvidence(() => ({selected:affected(),guarded:guarded?.() ?? []}), change);
   // 중재 세션의 호출은 헤더 x-consensus-actor: mediator 로 구분한다. 결정·승인·실행·인도 류는 위임 스위치(mediation-autonomy.json)가
   // on 일 때만 받는다(off 면 403) — "중재자가 사용자와 같은 인증으로 무엇이든 부른다" 를 닫는다(2026-09-14 Codex 감사 D03).
   const delegationPath = join(config.dataDirectory, "mediation-autonomy.json");

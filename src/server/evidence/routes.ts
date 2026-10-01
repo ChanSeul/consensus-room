@@ -48,13 +48,12 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
     const root=db.evidence.catalog.forTopic(request.params.id).find(r=>r.id===input.rootId);
     if (!root) throw Object.assign(new Error("이 작업에 연결된 루트가 아닙니다."),{statusCode:409});
     const links = discoverLinks(input.units,db.evidence.get(input.sourceId).url);
-    const affected = () => db.evidence.catalog.discoveryApprovalAffected(root,links);
-    const guarded = () => {
-      const ids = [...new Set([...db.evidence.catalog.affected(root),...db.evidence.linkedTopics(root.sourceId),...db.evidence.linkedTopics(input.sourceId)])];
-      assertMediatorForAnyTopic(db.roles,request.headers,[...ids,...affected()].filter(id=>db.getTopic(id).state!=="CLOSED"));
-      return ids;
-    };
-    await workflow.changeEvidenceSelection(affected,()=>service.importHost(request.params.id,input),guarded);
+    await workflow.publishEvidence(() => {
+      const selected = db.evidence.catalog.discoveryApprovalAffected(root,links);
+      const guarded = [...new Set([...db.evidence.catalog.affected(root),...db.evidence.linkedTopics(root.sourceId),...db.evidence.linkedTopics(input.sourceId)])];
+      assertMediatorForAnyTopic(db.roles,request.headers,[...guarded,...selected].filter(id=>db.getTopic(id).state!=="CLOSED"));
+      return {selected,guarded};
+    },()=>service.importHost(request.params.id,input));
     return db.evidence.catalog.state(request.params.id);
   });
   app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/roots", async request => {
