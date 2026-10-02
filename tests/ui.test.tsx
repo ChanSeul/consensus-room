@@ -50,6 +50,7 @@ describe("방 화면의 비동기 결과", () => {
     expect(screen.queryByRole("combobox", { name: "메시지 종류" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "보내기" })).not.toBeInTheDocument();
     expect(screen.queryByRole("switch", { name: "자율중재 위임" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "긴 작업을 단계로 나누기" })).not.toBeInTheDocument();
   });
 
   it("늦게 끝난 전체 조회가 먼저 받은 SSE 메시지를 지우지 않는다", async () => {

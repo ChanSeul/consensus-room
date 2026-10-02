@@ -10,7 +10,7 @@ import type { Topic } from "../src/shared/contracts";
 import type { WorkGroupView } from "../src/shared/workGroups";
 
 // 엔진 개편 E4 — 작업 묶음 패널: 대략 단계·준비/선택 가능 단계·재계획 대기와 재적용·단계별 전달(커밋·푸시 분리)과 묶음 전달·미정 질문·막힌 단계 옆 선택 착수,
-// 대략 단계를 허용하는 생성 폼, 미착수 단계의 완료 조건·예산 준비(host-review F010), 닫힌 단계 push(F002). 목록 뷰의 파생 필드는 서버가 계산한다(여기서는 api 대역으로 준다).
+// 미착수 단계의 완료 조건·예산 준비(host-review F010), 닫힌 단계 push(F002). 목록 뷰의 파생 필드는 서버가 계산한다(여기서는 api 대역으로 준다).
 
 const budget = {
   execution: { inputTokens: 10, outputTokens: 10, durationMs: 60000 },
@@ -142,36 +142,6 @@ describe("작업 묶음 패널", () => {
     await screen.findByText(/묶음 전달 완료/);
     expect(second.container.textContent).not.toContain("전달 전)");
     expect(item(second.container, "통합 검증")).toContain("커밋 zzzzzzz · 푸시 zzzzzzz");
-  });
-
-  it.each(["explicit", "observe"])("생성 폼은 %s 예산과 완료 조건을 비운 대략 단계를 보낸다", async mode => {
-    vi.spyOn(api, "listWorkGroups").mockResolvedValue([]);
-    const create = vi.spyOn(api, "createWorkGroup").mockResolvedValue(view());
-    const { container } = render(<WorkGroupsPanel onTopic={vi.fn()} />);
-    fireEvent.click(screen.getByText("긴 작업을 단계로 나누기"));
-    const field = (name: string, value: string) =>
-      fireEvent.change(container.querySelector(`[name=${name}]`)!, { target: { value } });
-    field("title", "새 묶음");
-    field("goal", "새 목표");
-    field("contracts", "새 계약");
-    field("title0", "대략 단계");
-    field("goal0", "나중에 정할 목표");
-    field("goal1", "통합 목표");
-    field("acceptance1", "통합 완료 조건");
-    if (mode === "explicit") for (const [name, value] of [["input", "10"], ["output", "20"], ["minutes", "1"], ["totalInput", "100"], ["totalOutput", "200"], ["totalMinutes", "10"]])
-      field(name, value);
-    expect(container.querySelector("form")!.checkValidity()).toBe(true);
-    fireEvent.submit(container.querySelector("form")!);
-    await waitFor(() => expect(create).toHaveBeenCalledTimes(1));
-    const input = create.mock.calls[0][0];
-    expect(input.stages[0]).toEqual({ id: "stage-1", kind: "work", title: "대략 단계", goal: "나중에 정할 목표", dependsOn: [] });
-    expect(input.stages[1]).toEqual({
-      id: "stage-2", kind: "integration", title: "전체 통합 검증", goal: "통합 목표", dependsOn: ["stage-1"], acceptance: "통합 완료 조건",
-      budget: mode === "observe" ? { mode: "observe" } : {
-        execution: { inputTokens: 10, outputTokens: 20, durationMs: 60000 },
-        total: { inputTokens: 100, outputTokens: 200, durationMs: 600000 },
-      },
-    });
   });
 });
 

@@ -106,7 +106,6 @@ export const api = {
   checkEvidence: (id: string) => request(`/evidence/${encodeURIComponent(id)}/check`, { method: "POST", body: JSON.stringify({ force: true }) }),
   reviewEvidence: (id: string, input: EvidenceReviewInput) => request(`/topics/${encodeURIComponent(id)}/evidence/review`, { method: "POST", body: JSON.stringify(input) }),
   listWorkGroups:()=>request<WorkGroupView[]>("/work-groups"),
-  createWorkGroup:(input:WorkGroupInput)=>request<WorkGroup>("/work-groups",{method:"POST",body:JSON.stringify(input)}),
   // stageId 가 있으면 막힌 단계 옆 독립 준비 단계를 골라 연다(선택 착수), 없으면 기본 규칙(첫 준비 단계).
   nextWorkStage:(id:string,stageId?:string)=>request<Topic>(`/work-groups/${id}/next`,{method:"POST",body:JSON.stringify(stageId===undefined?{}:{stageId})}),
   reviseWorkGroup:(id:string,input:WorkGroupInput,version:number)=>request<WorkGroup>(`/work-groups/${id}/revise`,{method:"POST",body:JSON.stringify({input,version})}),

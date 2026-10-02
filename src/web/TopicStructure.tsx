@@ -8,7 +8,7 @@ export function EntryGuide() {
     <div className="entry-options">{Object.entries(ENTRY_COPY).map(([mode, copy], index) =>
       <article key={mode}><span className="entry-number">0{index + 1}</span><h3>{copy.label}</h3>
         <p>{copy.description}</p><small>{copy.steps.join(" → ")}</small></article>)}</div>
-    <p className="hierarchy-note">Root → Sub → 하위 Sub로 큰 그림을 나눕니다. 관리 주제는 Goal과 진행률을 모으고, 말단 주제에서 계획·구현합니다.</p>
+    <p className="hierarchy-note">큰 그림을 먼저 정하고 Root → Sub → 하위 Sub로 나눕니다. 현재 말단 주제만 상세 계획·구현·검증하고, 그 결과로 다음 단계를 구체화합니다. 관리 주제는 Goal과 진행률을 모읍니다.</p>
   </section>;
 }
 

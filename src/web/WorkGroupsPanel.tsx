@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useState } from "react";
 import type { WorkGroupInput, WorkGroupView } from "../shared/workGroups";
 import { hasBudgetLimits, OBSERVE_USAGE } from "../shared/budgets";
 import { BudgetPanel } from "./BudgetPanel";
@@ -89,9 +89,7 @@ export function WorkGroupsPanel({
 }: {
   onTopic: (id: string) => void;
 }) {
-  const [groups, setGroups] = useState<WorkGroupView[]>([]),
-    [open, setOpen] = useState(false),
-    [count, setCount] = useState(2);
+  const [groups, setGroups] = useState<WorkGroupView[]>([]);
   const [busy, setBusy] = useState(false),
     [error, setError] = useState("");
   const refresh = async () => setGroups(await api.listWorkGroups());
@@ -130,117 +128,10 @@ export function WorkGroupsPanel({
       const topic = await api.nextWorkStage(groupId, stageId);
       onTopic(topic.id);
     });
-  const create = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const f = new FormData(event.currentTarget),
-      text = (name: string) => String(f.get(name) ?? "");
-    const vector = {
-      inputTokens: Number(f.get("input")),
-      outputTokens: Number(f.get("output")),
-      durationMs: Number(f.get("minutes")) * 60000,
-    };
-    const total = {
-      inputTokens: Number(f.get("totalInput")),
-      outputTokens: Number(f.get("totalOutput")),
-      durationMs: Number(f.get("totalMinutes")) * 60000,
-    };
-    const input: WorkGroupInput = {
-      title: text("title"),
-      goal: text("goal"),
-      contracts: text("contracts"),
-      stages: Array.from({ length: count }, (_, i) => {
-        // 완료 조건을 비운 단계는 대략 단계다 — 완료 조건이 정해지기 전에는 열지 않는다.
-        const acceptance = text(`acceptance${i}`).trim();
-        return {
-          id: `stage-${i + 1}`,
-          kind: i === count - 1 ? ("integration" as const) : ("work" as const),
-          title: text(`title${i}`),
-          goal: text(`goal${i}`),
-          dependsOn: i ? [`stage-${i}`] : [],
-          ...(acceptance
-            ? { acceptance, budget: BUDGET_FIELDS.every(([name]) => !text(name).trim()) ? OBSERVE_USAGE : { execution: vector, total } }
-            : {}),
-        };
-      }),
-    };
-    void perform(async () => {
-      await api.createWorkGroup(input);
-      setOpen(false);
-    });
-  };
+  if (groups.length === 0 && !error) return null;
   return (
     <section className="work-groups" aria-label="단계별 작업">
-      <button onClick={() => setOpen(!open)}>긴 작업을 단계로 나누기</button>
       {error && <p role="alert">{error}</p>}
-      {open && (
-        <form onSubmit={create}>
-          <p>
-            각 단계의 계획을 승인한 뒤 구현합니다. 마지막 단계는 전체 통합
-            검증입니다. 완료 조건을 비운 단계는 대략 단계로 두고, 완료 조건과
-            검증 방법이 정해진 뒤에 엽니다.
-          </p>
-          <label>
-            작업 이름
-            <input name="title" required />
-          </label>
-          <label>
-            전체 목표
-            <textarea name="goal" required />
-          </label>
-          <label>
-            모든 단계가 지킬 계약
-            <textarea name="contracts" required />
-          </label>
-          <label>
-            단계 수
-            <input
-              type="number"
-              min="2"
-              max="20"
-              value={count}
-              onChange={(e) =>
-                setCount(Math.max(2, Math.min(20, Number(e.target.value))))
-              }
-            />
-          </label>
-          {Array.from({ length: count }, (_, i) => (
-            <fieldset key={i}>
-              <legend>
-                {i + 1}단계{i === count - 1 ? " · 전체 통합 검증" : ""}
-              </legend>
-              <label>
-                이름
-                <input
-                  name={`title${i}`}
-                  required
-                  defaultValue={i === count - 1 ? "전체 통합 검증" : ""}
-                />
-              </label>
-              <label>
-                목표
-                <textarea name={`goal${i}`} required />
-              </label>
-              <label>
-                완료 조건(비우면 대략 단계)
-                <textarea name={`acceptance${i}`} />
-              </label>
-            </fieldset>
-          ))}
-          <fieldset>
-            <legend>각 단계의 예산</legend>
-            <p>
-              기본은 한도 없이 사용량만 기록합니다. 상한을 원하면 여섯 칸을 모두 입력하세요. 입력한 한도는 완료 조건을 적은 단계에 적용됩니다.
-            </p>
-            {BUDGET_FIELDS.map(([name, label]) => (
-              <label key={name}>
-                {label}
-                <input name={name} type="number" min="1" step="1" />
-              </label>
-            ))}
-          </fieldset>
-          <button disabled={busy}>작업 묶음 만들기</button>
-        </form>
-      )}
       {groups.map((group) => {
         const integration = group.stages.at(-1)!;
         const verified = group.stageStates[integration.id] === "CLOSED";
