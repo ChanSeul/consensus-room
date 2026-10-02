@@ -87,7 +87,12 @@ export function PipelineEditor({ topicId, topicIds, canCreate, title, goal, onDo
         try { await api.createWorkGroup(input, topicId, pending.pendingCreation); }
         catch (error) {
           const status = error instanceof ApiError && error.detail && typeof error.detail === "object" && "status" in error.detail ? error.detail.status : null;
-          if (error instanceof ApiError && error.status < 500 && status !== "running" && status !== "unknown") {
+          // A retry may fail before ledger lookup (authentication or input parsing), even if the first request succeeded.
+          // Only a recorded failure resolves an earlier unknown outcome; first-attempt rejections remain editable.
+          const recordedFailure = error instanceof ApiError && error.status === 409 && status === "failed";
+          const firstAttemptRejected = !draft.pendingCreation && error instanceof ApiError && error.status < 500
+            && status !== "running" && status !== "unknown" && status !== "succeeded";
+          if (recordedFailure || firstAttemptRejected) {
             const editable = { groupId:null,version:0,input }; setDraft(editable);
             try { window.localStorage.setItem(key,JSON.stringify(editable)); } catch { /* The saved request remains safe to retry. */ }
           }

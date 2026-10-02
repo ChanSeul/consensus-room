@@ -7,16 +7,32 @@ export function graphRecords(db: DatabaseSync, topicId: string) {
     json_extract(record_json,'$.stage') AS stage, json_extract(record_json,'$.updatedAt') AS at
     FROM planning_checkpoints WHERE topic_id=?`).all(topicId);
   const events = db.prepare(`SELECT json_extract(payload_json,'$.sessionId') AS sessionId,
-    json_extract(payload_json,'$.role') AS seat, json_extract(payload_json,'$.provider') AS provider,
+    NULL AS seat, json_extract(payload_json,'$.role') AS actorRole, json_extract(payload_json,'$.provider') AS provider,
     json_extract(payload_json,'$.route.provider') AS routeProvider, state, created_at AS at
     FROM timeline_events WHERE topic_id=? AND json_type(payload_json,'$.sessionId')='text'
     UNION ALL SELECT json_extract(payload_json,'$.sessionRebound.previous.sessionId'),
-      json_extract(payload_json,'$.sessionRebound.seat'), json_extract(payload_json,'$.sessionRebound.previous.binding.provider'), NULL, state, created_at
+      json_extract(payload_json,'$.sessionRebound.seat'), NULL, json_extract(payload_json,'$.sessionRebound.previous.binding.provider'), NULL, state, created_at
       FROM timeline_events WHERE topic_id=? AND json_type(payload_json,'$.sessionRebound.previous.sessionId')='text'
-    UNION ALL SELECT prior.value, prior.key,
+    UNION ALL SELECT prior.value, prior.key, NULL,
       json_extract(e.payload_json,'$.previousBindings.' || prior.key || '.provider'), NULL, e.state, e.created_at
       FROM timeline_events e,json_each(e.payload_json,'$.previousSessions') prior WHERE e.topic_id=? AND prior.type='text'
-    ORDER BY at`).all(topicId, topicId, topicId);
+    UNION ALL SELECT json_extract(payload_json,'$.workSessionRecovery.from'), 'implementation', NULL, NULL, NULL, state, created_at
+      FROM timeline_events WHERE topic_id=? AND json_type(payload_json,'$.workSessionRecovery.from')='text'
+    ORDER BY at`).all(topicId, topicId, topicId, topicId);
+  // The primary key starts with topic_id. Project only session metadata from the
+  // current and retained previous lineage, never error text, prompts or baselines.
+  const recoverySessions = db.prepare(`WITH lineages AS (
+    SELECT job_role,record_json AS record FROM planning_recovery_lineages WHERE topic_id=?
+    UNION ALL SELECT job_role,json_extract(record_json,'$.previous') FROM planning_recovery_lineages
+      WHERE topic_id=? AND json_type(record_json,'$.previous')='object'
+  ) SELECT session.value AS sessionId,job_role AS seat,
+      json_extract(recovery.value,'$.contract.binding.provider') AS provider,0 AS priority
+    FROM lineages,json_each(record,'$.recoveries') recovery,
+      json_each(json_array(json_extract(recovery.value,'$.fromSession'),json_extract(recovery.value,'$.toSession'))) session
+    WHERE session.type='text'
+    UNION ALL SELECT session.value,job_role,NULL,1 FROM lineages,json_each(record,'$.sessions') session
+      WHERE session.type='text'
+    ORDER BY priority`).all(topicId, topicId);
   const receiptsByConsumer = new Map<string, {consumer:string;sourceId:string;units:number;partialChars:number;mediator:boolean;linkOnly:boolean}>();
   for (const table of ["evidence_receipts", "evidence_mediator_unit_receipts", "evidence_link_receipts", "evidence_mediator_source_receipts", "evidence_receipt_progress", "evidence_mediator_progress"]) {
     const progress = table.endsWith("progress"), linkOnly = table.includes("link") || table.includes("source_receipts");
@@ -47,5 +63,5 @@ export function graphRecords(db: DatabaseSync, topicId: string) {
     json_extract(m.record_json,'$.sourceRole') AS sourceRole,
     json_extract(record_json,'$.reason') AS reason,json_extract(record_json,'$.deliveries') AS deliveries
     FROM mediator_interrupts m JOIN topics t ON t.id=m.topic_id WHERE m.topic_id=? ORDER BY m.rowid DESC LIMIT 100`).all(topicId);
-  return { checkpoints, events, receipts, fragments, active, interrupts };
+  return { checkpoints, events, recoverySessions, receipts, fragments, active, interrupts };
 }

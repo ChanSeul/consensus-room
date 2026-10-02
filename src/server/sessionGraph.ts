@@ -9,6 +9,7 @@ import { readHostReviewGraph } from "./hostReviewGraph.js";
 import { redactSecrets } from "../shared/workflow.js";
 
 const text = (value: unknown): string | null => typeof value === "string" && value ? value : null;
+const sessionId = (value: unknown): string | null => { const id = text(value); return id?.startsWith("pending:") ? null : id; };
 const hash = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 24);
 const stageRole = (stage: string): GraphRole => /IMPLEMENT|CLAUDE_FIX/.test(stage) ? "runner"
   : /FINAL_REVIEW|CODEX_REVIEW/.test(stage) ? "reviewer" : /AUDIT|CLOSEOUT/.test(stage) ? "plan-reviewer" : "planner";
@@ -35,6 +36,7 @@ export function buildSessionGraph(db: ConsensusDatabase, topicId: string, host: 
     if (topic.parentTopicId && ids.has(topic.parentTopicId)) edge(`topic:${topic.parentTopicId}`, topicNode, "hierarchy", "하위 주제");
     const sessions = new Map<string, GraphNode[]>(), current: Partial<Record<GraphRole, GraphNode>> = {};
     const session = (sid: string | null, role: GraphRole, provider: string | null, historical: boolean) => {
+      sid = sessionId(sid);
       const id = sid ? `session:${lane}:${provider ?? "unknown"}:${sid}` : `role:${lane}:${role}`;
       const node = add({ id, kind: "session", topicId: lane, lane, label: GRAPH_ROLES[role], subtitle: provider ?? "공급자 기록 없음", role,
         status: sid ? "idle" : "unconnected", historical, sessionId: sid, provider,
@@ -56,9 +58,10 @@ export function buildSessionGraph(db: ConsensusDatabase, topicId: string, host: 
     }
     for (const seat of routing.sessions) {
       const discussion = topic.state.startsWith("BRAINSTORM");
-      if (topic.topicKind === "group" && !discussion && !seat.sessionId) continue;
-      if (topic.topicKind === "group" && discussion && ["implementation", "code-review"].includes(seat.seat) && !seat.sessionId) continue;
-      const role = seatRole[seat.seat], node = session(seat.sessionId, role, seat.binding?.provider ?? null, topic.topicKind === "group" && !discussion); current[role] = node;
+      const sid = sessionId(seat.sessionId);
+      if (topic.topicKind === "group" && !discussion && !sid) continue;
+      if (topic.topicKind === "group" && discussion && ["implementation", "code-review"].includes(seat.seat) && !sid) continue;
+      const role = seatRole[seat.seat], node = session(sid, role, seat.binding?.provider ?? null, topic.topicKind === "group" && !discussion); current[role] = node;
       const fallback = roleJob[seat.seat];
       const currentJob = seat.seat === "author" || seat.seat === "implementation" ? routing.current.author : routing.current.reviewer;
       const seatOperations = seat.seat === "plan-review" ? ["audit", "closeout", "brainstorm", "ack"] : seat.seat === "code-review" ? ["review", "final-review", "review-read", "contract-correction"] : null;
@@ -77,14 +80,22 @@ export function buildSessionGraph(db: ConsensusDatabase, topicId: string, host: 
       const found = sessions.get(sid);
       return found?.length === 1 ? found[0] : session(sid, role, provider, true);
     };
+    for (const recovery of records.recoverySessions) {
+      const sid = sessionId(recovery.sessionId); if (!sid) continue;
+      const role: GraphRole = recovery.seat === "implementer" ? "runner" : recovery.seat === "code-review" ? "reviewer"
+        : recovery.seat === "reviewer" ? "plan-reviewer" : "planner";
+      knownSession(sid, role, text(recovery.provider));
+    }
     for (const event of records.events) {
-      const sid = text(event.sessionId); if (!sid || sid.startsWith("pending:")) continue;
+      const sid = sessionId(event.sessionId); if (!sid) continue;
       const role: GraphRole = event.seat === "implementation" ? "runner" : event.seat === "code-review" ? "reviewer"
-        : event.seat === "codex" || event.seat === "plan-review" ? "plan-reviewer" : event.seat === "claude" || event.seat === "author" ? "planner" : stageRole(String(event.state));
+        : event.seat === "codex" || event.seat === "plan-review" ? "plan-reviewer" : event.seat === "claude" || event.seat === "author" ? "planner"
+        : event.actorRole === "codex" && !/CODEX_REVIEW|CODEX_FINAL_REVIEW/.test(String(event.state)) ? "plan-reviewer"
+        : stageRole(String(event.state));
       knownSession(sid, role, text(event.routeProvider) ?? text(event.provider));
     }
     for (const checkpoint of records.checkpoints) {
-      const all = [...(checkpoint.sessions ? JSON.parse(String(checkpoint.sessions)) as string[] : []), text(checkpoint.sessionId)].filter((id): id is string => Boolean(id));
+      const all = [...(checkpoint.sessions ? JSON.parse(String(checkpoint.sessions)) as string[] : []), checkpoint.sessionId].map(sessionId).filter((id): id is string => Boolean(id));
       for (const sid of all) knownSession(sid, stageRole(String(checkpoint.stage)));
     }
     const sourceNode = (sourceId: string) => {

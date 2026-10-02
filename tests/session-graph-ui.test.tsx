@@ -108,3 +108,50 @@ it("does not dispatch a new creation when its retry identity cannot be persisted
   expect(create).not.toHaveBeenCalled();
   expect(screen.getByRole("textbox",{name:"작업 목표"})).toBeEnabled();
 });
+
+it.each([401,400])("preserves an unknown creation across a pre-ledger %i response and authenticated reload",async(status)=>{
+  const {pipelineInput}=await import("../src/web/PipelineEditor");
+  window.localStorage.setItem("consensus:pipeline-draft:r",JSON.stringify({groupId:null,version:0,input:pipelineInput(pipeline())}));
+  vi.spyOn(api,"listWorkGroups").mockResolvedValue([]);
+  const requests:{key:string;body:string}[]=[],ledger=new Map<string,WorkGroupView>();let creations=0;
+  vi.spyOn(globalThis,"fetch").mockImplementation(async(_url,init)=>{
+    const key=new Headers(init?.headers).get("idempotency-key")!,body=String(init?.body);
+    requests.push({key,body});
+    if(requests.length===2)return new Response(JSON.stringify({error:"before ledger lookup"}),{status,headers:{"content-type":"application/json"}});
+    if(!ledger.has(key)){ledger.set(key,{...pipeline(),id:`created-${++creations}`});}
+    if(requests.length===1)throw new TypeError("creation response lost");
+    return new Response(JSON.stringify(ledger.get(key)),{status:201,headers:{"content-type":"application/json"}});
+  });
+  const onDone=vi.fn(),show=()=>render(<PipelineEditor topicId="r" topicIds={["r"]} canCreate title="Root" goal="Goal" onDone={onDone}/>);
+  let view=show();fireEvent.click(await screen.findByRole("button",{name:"실행에 적용"}));await screen.findByText(/creation response lost/);
+  fireEvent.click(screen.getByRole("button",{name:"실행에 적용"}));await screen.findByText(/before ledger lookup/);
+  expect.soft(screen.getByRole("textbox",{name:"이름"})).toBeDisabled();
+  view.unmount();view=show();
+  fireEvent.click(await screen.findByRole("button",{name:"실행에 적용"}));await waitFor(()=>expect(onDone).toHaveBeenCalledOnce());
+  expect(creations).toBe(1);
+  expect(requests).toHaveLength(3);expect(requests[1]).toEqual(requests[0]);expect(requests[2]).toEqual(requests[0]);
+  expect(window.localStorage.getItem("consensus:pipeline-draft:r")).toBeNull();
+});
+
+it("allows corrected input after a first rejection or a ledger-confirmed failure",async()=>{
+  const {pipelineInput}=await import("../src/web/PipelineEditor");
+  window.localStorage.setItem("consensus:pipeline-draft:r",JSON.stringify({groupId:null,version:0,input:pipelineInput(pipeline())}));
+  vi.spyOn(api,"listWorkGroups").mockResolvedValue([]);
+  const response=(status:number,body:unknown)=>new Response(JSON.stringify(body),{status,headers:{"content-type":"application/json"}});
+  const fetch=vi.spyOn(globalThis,"fetch").mockResolvedValueOnce(response(400,{error:"invalid creation input"}))
+    .mockRejectedValueOnce(new TypeError("outcome unknown"))
+    .mockResolvedValueOnce(response(409,{error:"recorded creation failure",status:"failed"}))
+    .mockResolvedValueOnce(response(201,pipeline()));
+  const onDone=vi.fn();render(<PipelineEditor topicId="r" topicIds={["r"]} canCreate title="Root" goal="Goal" onDone={onDone}/>);
+  fireEvent.click(await screen.findByRole("button",{name:"실행에 적용"}));await screen.findByText(/invalid creation input/);
+  expect(screen.getByRole("textbox",{name:"이름"})).toBeEnabled();
+  fireEvent.change(screen.getByRole("textbox",{name:"이름"}),{target:{value:"수정한 파이프라인"}});
+  fireEvent.click(screen.getByRole("button",{name:"실행에 적용"}));await screen.findByText(/outcome unknown/);
+  fireEvent.click(screen.getByRole("button",{name:"실행에 적용"}));await screen.findByText(/recorded creation failure/);
+  expect(screen.getByRole("textbox",{name:"이름"})).toBeEnabled();
+  fireEvent.change(screen.getByRole("textbox",{name:"이름"}),{target:{value:"최종 파이프라인"}});
+  fireEvent.click(screen.getByRole("button",{name:"실행에 적용"}));await waitFor(()=>expect(onDone).toHaveBeenCalledOnce());
+  const requests=fetch.mock.calls.map(([,init])=>({key:new Headers(init?.headers).get("idempotency-key"),body:JSON.parse(String(init?.body))}));
+  expect(requests[0].key).not.toBe(requests[1].key);expect(requests[1]).toEqual(requests[2]);expect(requests[2].key).not.toBe(requests[3].key);
+  expect(requests[1].body.title).toBe("수정한 파이프라인");expect(requests[3].body.title).toBe("최종 파이프라인");
+});

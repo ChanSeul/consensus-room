@@ -8,6 +8,9 @@ import { buildApp } from "../src/server/app";
 import { loadConfig } from "../src/server/config";
 import { buildSessionGraph } from "../src/server/sessionGraph";
 import { readHostReviewGraph } from "../src/server/hostReviewGraph";
+import { WorkflowEngine } from "../src/server/workflow";
+import { ArtifactStore } from "../src/server/artifacts";
+import { GitService } from "../src/server/git";
 import type { SessionGraph } from "../src/shared/sessionGraph";
 import { DEFAULT_AGENT_SETTINGS } from "../src/shared/contracts";
 
@@ -22,6 +25,34 @@ function fixture() {
   const graph = (id: string) => buildSessionGraph(db,id,{nodes:[],edges:[],warning:"Host-review 미연결"});
   return {db,topic,graph,root,path};
 }
+it("retains sessions from the stored previous recovery lineage without timeline events", () => {
+  const f=fixture();f.topic("t");f.topic("outside");
+  const old=f.db.planning.recoveryLineage("t","implementer",{kind:"approval",revision:1,sha256:"old"});
+  old.sessions=["original-work"];
+  f.db.planning.saveRecoveryLineage("t","implementer",old);
+  const next=f.db.planning.recoveryLineage("t","implementer",{kind:"implementation",revision:2,sha256:"next"});
+  next.sessions=["later-work"];
+  f.db.planning.saveRecoveryLineage("t","implementer",next);
+  f.db.planning.saveRecoveryLineage("outside","implementer",{anchor:null,sessions:["unrelated-work"],recoveries:[]});
+  const graph=f.graph("t");
+  for (const id of ["original-work","later-work"]) expect(graph.nodes.find(node=>node.sessionId===id)).toMatchObject({role:"runner",historical:true});
+  expect(graph.nodes.some(node=>node.sessionId==="unrelated-work")).toBe(false);
+});
+
+it.each([false,true])("shows newly attached pending seats as unconnected (management: %s)", async group => {
+  const f=fixture();f.topic("t",null,group);
+  if(group) f.db.updateTopic("t",{state:"BRAINSTORM_READY"});
+  const unexpected=async()=>{throw new Error("No model or Git call is needed to attach a new seat");};
+  const engine=new WorkflowEngine({database:f.db,artifacts:new ArtifactStore(join(f.root,"artifacts"),f.db),git:new GitService({run:unexpected}),
+    claude:{role:"claude",validateExistingSession:async()=>true,createSession:unexpected,resumeTurn:unexpected},
+    codex:{role:"codex",validateExistingSession:async()=>true,createSession:unexpected,resumeTurn:unexpected}});
+  cleanups.push(()=>engine.shutdown().then(()=>{}));
+  for(const role of ["claude","codex"] as const) await engine.attachParticipant("t",role,{mode:"new"});
+  expect(f.db.getTopic("t").participants.every(participant=>participant.sessionId.startsWith("pending:"))).toBe(true);
+  const graph=f.graph("t");
+  for(const role of ["planner","plan-reviewer"]) expect(graph.nodes.find(node=>node.role===role)).toMatchObject({sessionId:null,status:"unconnected",historical:false});
+  expect(JSON.stringify(graph)).not.toContain("pending:");
+});
 it("scopes descendants, distinguishes actual source delivery, and keeps role settings provider-neutral", () => {
   const f=fixture();f.topic("root",null,true);const child=f.topic("child","root");f.topic("outside");
   f.db.upsertParticipant(child.id,{role:"claude",sessionId:"author-session",mode:"attached",acknowledgedPlanSHA256:null});
