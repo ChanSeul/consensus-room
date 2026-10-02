@@ -25,7 +25,7 @@ it("selects a session's actual details, reveals history on demand and filters so
   const view=render(<SessionGraph topicId="t" onSelect={onSelect} onEdit={vi.fn()} />);
   fireEvent.click(await screen.findByRole("button",{name:"러너 · 진행 중 · run-id"}));expect(onSelect).toHaveBeenLastCalledWith(graph.nodes[0],true);
   const hostNode=screen.getByRole("button",{name:/engine-review · 진행 중/});
-  expect(parseFloat(hostNode.style.top)).toBeLessThan(parseFloat(screen.getByRole("button",{name:/러너 · 진행 중/}).style.top));
+  expect(parseFloat(hostNode.style.top)).toBeGreaterThan(parseFloat(screen.getByRole("button",{name:/러너 · 진행 중/}).style.top));
   fireEvent.change(screen.getByRole("combobox",{name:"그래프 주제 범위"}),{target:{value:"t"}});
   expect(hostNode).toBeInTheDocument();expect(screen.getByRole("button",{name:/러너 · 진행 중/})).toBeInTheDocument();
   fireEvent.change(screen.getByRole("combobox",{name:"그래프 주제 범위"}),{target:{value:"host"}});
@@ -263,16 +263,47 @@ it("requires an explicit common choice before replacing mixed operation settings
 });
 
 it("groups communication labels sharing an anchor without dropping their full details or state colors",async()=>{
-  vi.spyOn(api,"sessionGraph").mockResolvedValue({...graph,nodes:[{...graph.nodes[0],id:"topic",kind:"topic",label:"주제"},graph.nodes[0]],edges:[
+  vi.spyOn(api,"sessionGraph").mockResolvedValue({...graph,nodes:[{...graph.nodes[0],id:"topic",kind:"topic",label:"주제"},graph.nodes[0],{...graph.nodes[0],id:"second",label:"다른 러너"}],edges:[
     {id:"old-request",from:"topic",to:"run",kind:"communication",status:"acknowledged",label:"첫 요청 확인",detail:"첫 요청 원문"},
-    {id:"new-request",from:"topic",to:"run",kind:"communication",status:"waiting",label:"추가 요청 대기",detail:"추가 요청 원문"},
+    {id:"new-request",from:"topic",to:"second",kind:"communication",status:"waiting",label:"추가 요청 대기",detail:"추가 요청 원문"},
   ]});
   const view=render(<SessionGraph topicId="t" onSelect={vi.fn()} onEdit={vi.fn()}/>);
-  await screen.findByRole("button",{name:/러너 · 진행 중/});
+  await screen.findByRole("button",{name:/^러너 · 진행 중/});
   const labels=view.container.querySelectorAll(".edge-communication text");
   expect(labels).toHaveLength(1);expect(labels[0]).toHaveTextContent("통신 2");
   expect(labels[0].querySelector("title")).toHaveTextContent("첫 요청 원문");expect(labels[0].querySelector("title")).toHaveTextContent("추가 요청 원문");
   expect(view.container.querySelector(".edge-acknowledged path")).toBeInTheDocument();expect(view.container.querySelector(".edge-waiting path")).toBeInTheDocument();
+  view.rerender(<SessionGraph topicId="t" selectedNodeId="second" onSelect={vi.fn()} onEdit={vi.fn()}/>);
+  expect(labels[0].closest("g")).toHaveClass("highlighted");expect(view.container.querySelector(".edge-acknowledged")).toHaveClass("dimmed");
+});
+
+it("routes nested hierarchy outside content with one trunk per parent and hides only unassigned verifier placeholders",async()=>{
+  const topic=(id:string):Graph["nodes"][number]=>({...graph.nodes[0],id,kind:"topic",lane:id,label:id});
+  const verifier:Graph["nodes"][number]={...graph.nodes[0],id:"empty-verifier",role:"verifier",label:"미배정 검증자",sessionId:null,details:[{label:"현재 배정",value:"배정 없음"}]};
+  const assigned={...verifier,id:"assigned",label:"외부 검증자",details:[{label:"현재 배정",value:"user · v1"}]};
+  const nodes=[topic("root"),topic("child"),topic("grandchild"),topic("sibling"),{...graph.nodes[2],lane:"root"},verifier,assigned,
+    {...verifier,id:"recorded",label:"기록 검증자",sessionId:"actual"},{...verifier,id:"historical",label:"이전 검증자",historical:true}];
+  vi.spyOn(api,"sessionGraph").mockResolvedValue({...graph,nodes,lanes:[{id:"root",title:"Root"},{id:"child",title:"Sub"},{id:"grandchild",title:"Nested"},{id:"sibling",title:"Sibling"},...graph.lanes],edges:[
+    {id:"a",from:"root",to:"child",kind:"hierarchy",label:"하위 주제"},{id:"b",from:"root",to:"sibling",kind:"hierarchy",label:"하위 주제"},{id:"c",from:"child",to:"grandchild",kind:"hierarchy",label:"하위 주제"},
+  ]});
+  const view=render(<SessionGraph topicId="t" selectedNodeId="grandchild" onSelect={vi.fn()} onEdit={vi.fn()}/>);
+  const root=await screen.findByRole("button",{name:/^root ·/});
+  const trunks=[...view.container.querySelectorAll(".hierarchy-trunk")];expect(trunks).toHaveLength(2);
+  const xs=trunks.map(path=>Number(path.getAttribute("d")!.split(" H ")[1].split(" ")[0]));
+  expect(new Set(xs).size).toBe(2);for(const x of xs)expect(x).toBeLessThan(parseFloat(root.style.left));
+  expect(view.container.querySelectorAll(".hierarchy-branch")).toHaveLength(3);
+  const childInput=view.container.querySelector(".hierarchy-branch")!;
+  const childOutput=trunks[1];
+  expect(Number(childInput.getAttribute("d")!.split(" ")[2])).toBeLessThan(Number(childOutput.getAttribute("d")!.split(" ")[2]));
+  expect(view.container.querySelectorAll(".edge-hierarchy.highlighted .hierarchy-trunk")).toHaveLength(1);
+  expect(view.container.querySelector(".graph-source-group")).toHaveStyle({left:root.style.left});
+  expect(view.container.querySelector(".graph-lane")).toHaveStyle({left:root.style.left});
+  expect(screen.queryByRole("button",{name:/미배정 검증자/})).not.toBeInTheDocument();
+  expect(screen.getByRole("button",{name:/외부 검증자/})).toBeInTheDocument();expect(screen.getByRole("button",{name:/기록 검증자/})).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("checkbox",{name:"이전 세션"}));expect(screen.getByRole("button",{name:/이전 검증자/})).toBeInTheDocument();
+  fireEvent.change(screen.getByRole("combobox",{name:"그래프 주제 범위"}),{target:{value:"child"}});
+  expect(view.container.querySelector(".hierarchy-trunk")).not.toBeInTheDocument();
+  view.unmount();render(<GraphInspector node={assigned} currentTopicId="t"/>);expect(screen.getByText(/이 서버는 검증자 모델을 자동 실행하지 않습니다/)).toBeInTheDocument();
 });
 
 it("renders multicolor source marks and dims unrelated edges while keeping compact communication labels in the gap",async()=>{

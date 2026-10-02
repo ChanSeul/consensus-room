@@ -69,6 +69,8 @@
 @media (max-width:700px) { .graph-toolbar select { max-width:145px; }.graph-legend { flex-basis:100%; font-size:9px; }.center-navigation { padding:0 12px; }.graph-toolbar { padding:8px; } }
 .graph-toolbar button { border:1px solid #414a58; border-radius:5px; background:#272e38; color:#d6dfe8; padding:6px 10px; cursor:pointer; font-size:11px; }
 .graph-edge text { fill:var(--edge-color); font-size:11px; paint-order:stroke; stroke:#171a20; stroke-width:5px; }
+.communication-label text { fill:#cbd5e1; }
+.edge-hierarchy path { stroke-linejoin:round; }
 .edge-communication { --edge-color:#8da7ff; }
 .edge-communication path { stroke-width:2.5; }
 .edge-acknowledged { --edge-color:#54cba7; }.edge-waiting,.edge-unknown { --edge-color:#e4b663; }.edge-failed { --edge-color:#ef8383; }

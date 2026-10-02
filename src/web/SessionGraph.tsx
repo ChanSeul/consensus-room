@@ -26,13 +26,13 @@ function isSwiftFileSource(node: GraphNode): boolean {
   });
 }
 
-export function layoutGraph(nodes: GraphNode[], lanes: Graph["lanes"], expanded = new Set<string>(), searching = false, selectedNodeId?: string) {
+export function layoutGraph(nodes: GraphNode[], lanes: Graph["lanes"], expanded = new Set<string>(), searching = false, selectedNodeId?: string, edges: Graph["edges"] = []) {
   const positions = new Map<string, { x: number; y: number }>(), sections: Array<{ id: string; title: string; y: number }> = [];
   const sourceGroups: Array<{ id: string; title: string; nodes: GraphNode[]; y: number; expanded: boolean }> = [];
   const columnOf = (node: GraphNode) => COLUMN[node.kind === "session" ? node.role ?? "session" : node.kind];
   const columns = [...new Set(nodes.filter(node => node.kind !== "source").map(columnOf))].sort((a,b) => a-b);
   let y = 30, width = Math.max(780, columns.length * (WIDTH + GAP) + 20);
-  for (const lane of [...lanes].sort((a, b) => Number(b.id === "host") - Number(a.id === "host"))) {
+  for (const lane of [...lanes].sort((a, b) => Number(a.id === "host") - Number(b.id === "host"))) {
     const items = nodes.filter(node => node.lane === lane.id); if (!items.length) continue;
     sections.push({ ...lane, y }); y += 48;
     const rows = new Map<number, number>();
@@ -58,7 +58,24 @@ export function layoutGraph(nodes: GraphNode[], lanes: Graph["lanes"], expanded 
     }
     y += 40;
   }
-  return { positions, sections, sourceGroups, width, height: Math.max(450, y) };
+  const children = new Map<string, Graph["edges"]>();
+  for (const edge of edges) {
+    if (edge.kind !== "hierarchy" || !positions.has(edge.from) || !positions.has(edge.to)) continue;
+    const group = children.get(edge.from); if (group) group.push(edge); else children.set(edge.from, [edge]);
+  }
+  const tracks: number[] = [];
+  const hierarchy = [...children].map(([from, branches]) => {
+    const ys = [positions.get(from)!.y + HEIGHT * 2 / 3, ...branches.map(edge => positions.get(edge.to)!.y + HEIGHT / 3)];
+    return { from, branches, top: Math.min(...ys), bottom: Math.max(...ys), x: 0 };
+  }).sort((a,b) => a.top-b.top || b.bottom-a.bottom);
+  for (const group of hierarchy) {
+    let track = tracks.findIndex(end => end + 12 < group.top);
+    if (track < 0) track = tracks.length;
+    tracks[track] = group.bottom; group.x = 40 + track * 24;
+  }
+  const gutter = tracks.length ? tracks.length * 24 + 16 : 0;
+  for (const position of positions.values()) position.x += gutter;
+  return { positions, sections, sourceGroups, hierarchy, contentLeft: 40 + gutter, width: width + gutter, height: Math.max(450, y) };
 }
 
 export function SessionGraph({ topicId, selectedNodeId, onSelect, onEdit, onEvidence, refreshVersion = 0 }: { refreshVersion?: number; topicId: string; selectedNodeId?: string; onSelect: (node: GraphNode | null, reveal?: boolean) => void; onEdit: () => void; onEvidence?: () => void }) {
@@ -121,10 +138,11 @@ export function SessionGraph({ topicId, selectedNodeId, onSelect, onEdit, onEvid
   const nodes = useMemo(() => {
     if (!graph) return [];
     const needle = query.trim().toLocaleLowerCase();
-    return graph.nodes.filter(node => !isSwiftFileSource(node) && (history || !node.historical) && (sources || node.kind !== "source") && (lane === "all" || lane === node.lane || node.lane === "host")
+    return graph.nodes.filter(node => !(node.kind === "session" && node.role === "verifier" && !node.sessionId && !node.historical && !node.environment && node.details.some(item => item.label === "현재 배정" && item.value === "배정 없음"))
+      && !isSwiftFileSource(node) && (history || !node.historical) && (sources || node.kind !== "source") && (lane === "all" || lane === node.lane || node.lane === "host")
       && (!needle || `${node.label} ${node.subtitle} ${node.sessionId ?? ""}`.toLocaleLowerCase().includes(needle)));
   }, [graph, history, sources, query, lane]);
-  const layout = useMemo(() => layoutGraph(nodes, graph?.lanes ?? [], expandedSources, Boolean(query.trim()), selectedNodeId), [nodes, graph?.lanes, expandedSources, query, selectedNodeId]);
+  const layout = useMemo(() => layoutGraph(nodes, graph?.lanes ?? [], expandedSources, Boolean(query.trim()), selectedNodeId, graph?.edges), [nodes, graph, expandedSources, query, selectedNodeId]);
   const edges = useMemo(() => graph?.edges.filter(edge => layout.positions.has(edge.from) && layout.positions.has(edge.to)) ?? [], [graph, layout]);
   const communicationGroups = useMemo(() => {
     const groups = new Map<string, typeof edges>();
@@ -162,9 +180,19 @@ export function SessionGraph({ topicId, selectedNodeId, onSelect, onEdit, onEvid
       <div className="graph-viewport" ref={viewport} onPointerDown={down} onPointerMove={move} onPointerUp={() => { drag.current = null; }} onPointerCancel={() => { drag.current = null; }} tabIndex={0} aria-label="그래프 캔버스">
         <div style={{ width: layout.width * zoom, height: layout.height * zoom }}>
           <div className="graph-world" style={{ width: layout.width, height: layout.height, transform: `scale(${zoom})` }}>
-            {layout.sections.map(section => <div className="graph-lane" key={section.id} style={{ top: section.y, width: layout.width - 80 }}>{section.title}</div>)}
+            {layout.sections.map(section => <div className="graph-lane" key={section.id} style={{ left: layout.contentLeft, top: section.y, width: layout.width - layout.contentLeft - 40 }}>{section.title}</div>)}
             <svg className="graph-lines" width={layout.width} height={layout.height} aria-hidden="true">
-              {edges.map(edge => {
+              {layout.hierarchy.map(group => {
+                const parent = layout.positions.get(group.from)!;
+                const highlighted = group.from === selectedNodeId || group.branches.some(edge => edge.to === selectedNodeId);
+                return <g key={group.from} className="graph-hierarchy">
+                  <g className={`graph-edge edge-hierarchy${highlighted ? " highlighted" : selectedNodeId ? " dimmed" : ""}`}><title>하위 주제 연결</title><path className="hierarchy-trunk" d={`M ${parent.x} ${parent.y + HEIGHT * 2 / 3} H ${group.x} M ${group.x} ${group.top} V ${group.bottom}`} /></g>
+                  {group.branches.map(edge => { const child = layout.positions.get(edge.to)!; const active = edge.from === selectedNodeId || edge.to === selectedNodeId;
+                    return <g key={edge.id} className={`graph-edge edge-hierarchy${active ? " highlighted" : selectedNodeId ? " dimmed" : ""}`}><title>{edge.label}</title><path className="hierarchy-branch" d={`M ${group.x} ${child.y + HEIGHT / 3} H ${child.x}`} /><circle cx={child.x} cy={child.y + HEIGHT / 3} r={4} /></g>;
+                  })}
+                </g>;
+              })}
+              {edges.filter(edge => edge.kind !== "hierarchy").map(edge => {
                 const a = layout.positions.get(edge.from)!, b = layout.positions.get(edge.to)!, across = b.x > a.x;
                 const x1 = a.x + (across ? WIDTH : WIDTH / 2), y1 = a.y + (across ? HEIGHT / 2 : HEIGHT);
                 const x2 = b.x + (across ? 0 : WIDTH / 2), y2 = b.y + (across ? HEIGHT / 2 : 0);
@@ -173,10 +201,17 @@ export function SessionGraph({ topicId, selectedNodeId, onSelect, onEdit, onEvid
                 const communicationLabel = edge.status ? {waiting:"대기",sending:"전송중",sent:"전송됨",acknowledged:"확인됨",failed:"실패",unknown:"미확인"}[edge.status] : "통신";
                 const communicationGroup = communicationGroups.get(`${edge.from}:${across}`);
                 const grouped = communicationGroup && communicationGroup.length > 1;
-                return <g key={edge.id} className={`graph-edge edge-${edge.kind} edge-${edge.status ?? "none"}${highlighted ? " highlighted" : selectedNodeId ? " dimmed" : ""}`}><title>{edge.label}{edge.detail ? ` · ${edge.detail}` : ""}</title><path d={path} /><circle cx={x2} cy={y2} r={4} />{edge.kind === "communication" && communicationGroup?.[0].id === edge.id && <text x={across ? a.x + WIDTH + GAP/2 : a.x + WIDTH/2} y={across ? a.y + HEIGHT/2-10 : a.y-6} textAnchor="middle" style={grouped ? { fill: "#cbd5e1" } : undefined}>{grouped ? `통신 ${communicationGroup.length}` : communicationLabel}{grouped && <title>{communicationGroup.map(item => `${item.label}${item.detail ? ` · ${item.detail}` : ""}`).join("\n")}</title>}</text>}</g>;
+                return <g key={edge.id} className={`graph-edge edge-${edge.kind} edge-${edge.status ?? "none"}${highlighted ? " highlighted" : selectedNodeId ? " dimmed" : ""}`}><title>{edge.label}{edge.detail ? ` · ${edge.detail}` : ""}</title><path d={path} /><circle cx={x2} cy={y2} r={4} />{edge.kind === "communication" && !grouped && <text x={across ? a.x + WIDTH + GAP/2 : a.x + WIDTH/2} y={across ? a.y + HEIGHT/2-10 : a.y-6} textAnchor="middle">{communicationLabel}</text>}</g>;
+              })}
+              {[...communicationGroups].filter(([, group]) => group.length > 1).map(([key, group]) => {
+                const a = layout.positions.get(group[0].from)!, across = layout.positions.get(group[0].to)!.x > a.x;
+                const highlighted = group.some(edge => edge.from === selectedNodeId || edge.to === selectedNodeId);
+                return <g key={key} className={`graph-edge edge-communication communication-label${highlighted ? " highlighted" : selectedNodeId ? " dimmed" : ""}`}>
+                  <text x={across ? a.x + WIDTH + GAP/2 : a.x + WIDTH/2} y={across ? a.y + HEIGHT/2-10 : a.y-6} textAnchor="middle">통신 {group.length}<title>{group.map(edge => `${edge.label}${edge.detail ? ` · ${edge.detail}` : ""}`).join("\n")}</title></text>
+                </g>;
               })}
             </svg>
-            {layout.sourceGroups.map(group => <button key={group.id} className="graph-source-group" style={{left:40, top:group.y}}
+            {layout.sourceGroups.map(group => <button key={group.id} className="graph-source-group" style={{left:layout.contentLeft, top:group.y}}
               aria-expanded={group.expanded} disabled={group.nodes.length <= SOURCE_COLUMNS || Boolean(query.trim())}
               onClick={() => { if (group.expanded && group.nodes.some(node => node.id === selectedNodeId)) onSelect(null); setExpandedSources(current => { const next = new Set(current); if (group.expanded) next.delete(group.id); else next.add(group.id); return next; }); }}>
               <PlatformIcon node={group.nodes[0]} /><strong>{group.title}</strong><span>원문 {group.nodes.length}개</span><span>{group.expanded ? "▾" : "▸ 펼치기"}</span>
@@ -218,6 +253,7 @@ export function GraphInspector({ node, currentTopicId, onTopic, onEvidence, onSe
     {jobSettings.length > 0 && <details className="graph-job-settings"><summary>작업별 설정</summary><dl>{jobSettings.map(item => <div key={item.label}><dt>{item.label}</dt><dd>{item.value}</dd></div>)}</dl></details>}
     {safeUrl && <a className="graph-link" href={safeUrl} target="_blank" rel="noreferrer">원문 열기 ↗</a>}
     {node.kind === "session" && <>
+      {node.role === "verifier" && <p className="graph-notice">검증자는 외부에서 배정한 역할입니다. 이 서버는 검증자 모델을 자동 실행하지 않습니다.</p>}
       <details className="node-spawn-record" open><summary>실행 당시 환경</summary>
         {node.environment ? <><p>실제 프로세스 실행 때 기록한 값입니다. 현재 설정으로 과거 값을 대체하지 않습니다.</p><dl>
           <div><dt>기록 시각</dt><dd>{node.environment.spawnedAt}</dd></div>
