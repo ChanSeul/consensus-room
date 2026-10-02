@@ -1,3 +1,4 @@
+import { isTopicGroup } from "../../shared/topicStructure.js";
 import {ReviewBlocked} from "../reviewLedger.js";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
@@ -224,6 +225,10 @@ export class EngineCore {
   startAction(topicId: string, kind: string, work: (signal: AbortSignal) => Promise<void>, requestedActionId?: string): string {
     this.assertNotShuttingDown();
     this.assertNoActiveWork(topicId);
+    const topic = this.dependencies.database.getTopic(topicId);
+    if (isTopicGroup(topic) && !["brainstorm", "brainstorm-plan", "brainstorm-close"].includes(kind)
+      && !(kind === "retry" && this.dependencies.database.getFlags(topicId).resumeState === "BRAINSTORMING"))
+      throw conflict("관리 주제에서는 실행할 수 없습니다. 말단 주제에서 작업을 시작하세요.");
     const actionId = requestedActionId ?? randomUUID();
     if (this.dependencies.database.getAction(actionId)) throw conflict("같은 Idempotency-Key로 이미 요청한 action입니다.");
     const controller = new AbortController();

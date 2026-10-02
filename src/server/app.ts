@@ -1,9 +1,12 @@
+import { registerInterruptRoutes, interruptStatus } from "./mediation/interruptRoutes.js";
 import { z } from "zod";
+import { SetTopicGoalSchema } from "../shared/topicStructure.js";
+import { parseEvidenceSource } from "../shared/externalEvidence.js";
+import { assertTopicParent } from "./topicStructure.js";
 import { BrainstormDecisionSchema, BrainstormInputSchema } from "../shared/brainstorm.js";
 import { PlanningMigrationSchema } from "../shared/planningControl.js";
 import {ReviewGrantInputSchema} from "../shared/reviews.js";
 import { DIAGNOSIS_ID_PATTERN, DiagnosisInputSchema } from "../shared/diagnoses.js";
-import { readFileSync } from "node:fs";
 import {
   ToolTreeRebaselineInputSchema,
   ResumeImplementationInputSchema, AmendToleranceInputSchema } from "../shared/contracts.js";
@@ -43,7 +46,7 @@ import {
   type CallOrigin, type HostSandboxStatus, WorkflowEngine } from "./workflow.js";
 import { ProcessSupervisor } from "./processSupervisor.js";
 import { ProjectMemoryStore } from "./memoryStore.js";
-import { readMediationAutonomy, writeMediationAutonomy } from "./mediationAutonomy.js";
+import { readMediationAutonomy } from "./mediationAutonomy.js";
 import { assertMediatorAssignment, assertMediatorForAnyTopic, DEFAULT_MEDIATION_POLICY_PATH, readMediationPolicy } from "./mediation.js";
 import { AgentProfileInputSchema, AgentRoleSchema, AssignmentScopeSchema, RoleAssignmentInputSchema, turnFlags, type MediatorIdentity } from "../shared/roles.js";
 import { scanWorktreeActivity } from "./activity.js";
@@ -126,18 +129,11 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     config.dataDirectory, resolve(import.meta.dirname, "../.."), dependencies.hostSandbox?.kind !== "unavailable");
   evidence.canPublish = topicId => workflow.canPublishEvidence(topicId);
   evidence.publishSelection = (guarded, change) => workflow.publishEvidence(guarded, change);
-  // 중재 세션의 호출은 헤더 x-consensus-actor: mediator 로 구분한다. 결정·승인·실행·인도 류는 위임 스위치(mediation-autonomy.json)가
-  // on 일 때만 받는다(off 면 403) — "중재자가 사용자와 같은 인증으로 무엇이든 부른다" 를 닫는다(2026-09-14 Codex 감사 D03).
-  const delegationPath = join(config.dataDirectory, "mediation-autonomy.json");
+  // 자율중재는 항상 ON이다. 요청 인증·현재 중재자 배정·각 액션의 승인/상태 검사는 별도로 유지한다.
   const DELEGATED_ACTIONS = new Set(["brainstorm-plan", "brainstorm-close", "approve", "implement", "tool-tree-rebaseline", "commit", "push", "close", "review-resume", "revision-resume", "budget-configure", "budget-resume", "amend-tolerance", "resume-implementation", "reconcile-delivery", "discard-orphan-commit"]);
-  const callOrigin = (request: { headers: Record<string, unknown> }, subject: string): CallOrigin | undefined => {
+  const callOrigin = (request: { headers: Record<string, unknown> }): CallOrigin | undefined => {
     if (request.headers["x-consensus-actor"] !== "mediator") return undefined;
-    let doc: { autonomy?: string; set_at?: string } = {};
-    try { doc = JSON.parse(readFileSync(delegationPath, "utf8")) as { autonomy?: string; set_at?: string }; } catch { doc = {}; }
-    if (doc.autonomy !== "on") {
-      throw Object.assign(new Error(`중재자 위임이 off 입니다 — ${subject} 는 사용자 승인이 필요합니다(mediation_autonomy.sh on).`), { statusCode: 403 });
-    }
-    return mediatorOrigin(request, doc.set_at ?? null);
+    return mediatorOrigin(request, null);
   };
   // 수락된 중재자 요청의 배정 신원(전역 preHandler 가 확인해 둔 값)과 호출 시점의 공통 정책 버전을 기록한다(엔진 개편 E1).
   const mediatorIdentities = new WeakMap<object, MediatorIdentity | null>();
@@ -188,12 +184,15 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     if (request.headers["x-consensus-actor"] !== "mediator") return;
     const route = request.routeOptions.url ?? "";
     const id = (request.params as { id?: string }).id;
+    const parentId = route === "/api/topics" && typeof (request.body as { parentTopicId?: unknown } | null)?.parentTopicId === "string"
+      ? (request.body as { parentTopicId: string }).parentTopicId : null;
     // 토픽 경로는 그 토픽의 적용 배정(토픽 → 전역)과 대조한다. 원문 id 경로(/api/evidence/:id/*, 연결 토픽의 근거 상태)와 작업 묶음 경로
     // (/api/work-groups/:id/*)는 여러 토픽이 함께 쓰는 리소스다 — 영향받는 진행 중(닫히지 않은) 토픽 중 하나의 현재 배정과 같으면 수락한다
     // (host-review a7a9ce86 F-002: 토픽마다 중재자가 다르면 모두와 같을 수 없다). 영향 토픽이 없거나 조회할 수 없으면 전역 배정으로 판정한다.
     // 공유 리소스 요청이 특정 토픽을 직접 바꾸는 효과(묶음 예산 뒤 자동 재시도)는 핸들러가 그 토픽 배정으로 다시 판정한다.
     let identity: MediatorIdentity | null;
     if (id && route.startsWith("/api/topics/:id")) identity = assertMediatorAssignment(database.roles, request.headers, id);
+    else if (parentId) identity = assertMediatorAssignment(database.roles, request.headers, parentId);
     else {
       let linked: string[] = [];
       if (id && route.startsWith("/api/evidence/:id/")) linked = database.evidence.linkedTopics(id);
@@ -218,7 +217,8 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       body: `${input.scope === "revision" ? "계획 재작성" : input.scope === "planning" ? "계획 검토" : "구현 리뷰"} 한도: ${input.limit === null ? "제한 없음" : `${input.limit}회`}. 자동 재개하지 않습니다.`, payload: { iterationLimit: input } });
     return result;
   });
-  registerEvidenceRoutes(app, database, workflow, evidence, headers => { callOrigin({ headers }, "evidence:review"); });
+  registerInterruptRoutes(app, database);
+  registerEvidenceRoutes(app, database, workflow, evidence, headers => { callOrigin({ headers }); });
   app.get("/api/config", async () => ({
     repositoryPath: config.repositoryPath,
     memoryDirectory: config.memoryDirectory,
@@ -244,13 +244,13 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   });
   // 본문 stageId 가 있으면 막힌 단계 옆 독립 준비 단계를 골라 연다(E4-6). 없으면 기본 규칙(한 번에 한 단계, 첫 준비 단계).
   app.post<{Params:{id:string}}>("/api/work-groups/:id/next",async(request,reply)=>{
-    callOrigin(request, "work-group:next");
+    callOrigin(request);
     const requested=(request.body as {stageId?:unknown}|undefined)?.stageId;
     if(requested!==undefined&&(typeof requested!=="string"||!requested))throw Object.assign(new Error("stageId 는 단계 ID 문자열이어야 합니다."),{statusCode:400});
     return runIdempotent(request,reply,globalLedger(database,`work-group:next:${request.params.id}`),201,key=>workGroups.next(request.params.id,(plannedTopicId,worktreePath)=>database.annotateGlobalRequest(`work-group:next:${request.params.id}`,key,{plannedTopicId,worktreePath}),requested));
   });
   app.post<{Params:{id:string}}>("/api/work-groups/:id/budget",async(request,reply)=>{
-    callOrigin(request, "work-group:budget");
+    callOrigin(request);
     const body=BudgetResumeInputSchema.parse(request.body);
     return runIdempotent(request,reply,globalLedger(database,`work-group:budget:${request.params.id}`),200,key=>{
       const group=database.workGroups.get(request.params.id);
@@ -333,19 +333,18 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       () => verifications.complete(request.params.id, request.params.runId, input), createHash("sha256").update(JSON.stringify(input)).digest("hex"));
   });
 
-  // 자율 중재 위임 스위치 — 웹 토글과 셸 스크립트가 같은 파일(`mediation-autonomy.json`)을 공유한다.
-  app.get("/api/mediation-autonomy", async () => readMediationAutonomy(config.dataDirectory));
+  // 상태 조회와 기존 on 요청은 호환 유지한다. OFF 요청은 거부하고 예전 설정 파일은 수정하지 않는다.
+  app.get("/api/mediation-autonomy", async () => readMediationAutonomy());
   app.post("/api/mediation-autonomy", async (request, reply) => {
-    // 위임 변경은 사용자 권한이다 — 중재자 호출(헤더)은 OFF 를 스스로 ON 으로 바꿀 수 없다(F07).
     if (request.headers["x-consensus-actor"] === "mediator") {
-      throw Object.assign(new Error("위임 스위치는 사용자만 바꿀 수 있습니다(중재자 호출 거부)."), { statusCode: 403 });
+      throw Object.assign(new Error("자율중재는 항상 ON이며 중재자가 변경할 수 없습니다."), { statusCode: 403 });
     }
-    const input = UpdateMediationAutonomyInputSchema.parse(request.body);
-    return runIdempotent(request, reply, globalLedger(database, "mediation-autonomy:set"), 200, () =>
-      writeMediationAutonomy(config.dataDirectory, { autonomy: input.autonomy, note: input.note, setBy: "web" }));
+    UpdateMediationAutonomyInputSchema.parse(request.body);
+    // 이전 토글 요청의 멱등 응답(OFF 포함)을 재생하지 않도록 새 정책의 원장을 쓴다.
+    return runIdempotent(request, reply, globalLedger(database, "mediation-autonomy:always-on"), 200, () => readMediationAutonomy());
   });
 
-  // 역할·프로필·배정(엔진 개편 E1). 프로필은 불변, 배정 변경은 사용자 전용(위임 스위치와 같은 규칙) + 기대 버전.
+  // 역할·프로필·배정(엔진 개편 E1). 프로필은 불변, 배정 변경은 사용자 전용 + 기대 버전.
   app.get("/api/agent-profiles", async () => database.roles.profiles());
   app.get("/api/engine-defects", async () => database.engineDefects.list());
   app.post<{ Params: { id: string } }>("/api/topics/:id/engine-defects", async request => {
@@ -394,6 +393,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
           body: `${input.role} 배정 v${assignment.version}: ${assignment.participant}${assignment.profileId ? `(${assignment.profileId})` : ""}${assignment.note ? ` — ${assignment.note}` : ""}`,
           payload: { roleAssignment: assignment } });
       }
+      database.events.emit("mediation-change");
       return assignment;
     });
   });
@@ -403,7 +403,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     if (topic) database.getTopic(topic);
     const assignment = database.roles.effective(topic ?? null, "mediator");
     return {
-      autonomy: readMediationAutonomy(config.dataDirectory),
+      autonomy: readMediationAutonomy(),
       assignment,
       profile: assignment?.profileId ? database.roles.profile(assignment.profileId) : null,
       policy: readMediationPolicy(DEFAULT_MEDIATION_POLICY_PATH),
@@ -412,40 +412,66 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
 
   app.post("/api/topics", async (request, reply) => {
     const input = CreateTopicInputSchema.parse(request.body);
+    const entryInput = input.entry ?? (input.startMode === "brainstorm" ? { mode: "brainstorm" as const } : { mode: "goal" as const, goal: input.title });
+    if (input.entry && (request.body as { startMode?: string }).startMode
+      && input.startMode !== (entryInput.mode === "brainstorm" ? "brainstorm" : "plan"))
+      throw Object.assign(new Error("entry와 startMode가 서로 다릅니다."), { statusCode: 400 });
+    // 외부 부작용(worktree) 전에 URL과 부모 계약을 확인한다.
+    if (entryInput.mode === "sources") entryInput.sources.forEach(parseEvidenceSource);
+    assertTopicParent(database, input.parentTopicId);
+    if (input.parentTopicId && request.headers["x-consensus-actor"] === "mediator")
+      assertMediatorAssignment(database.roles, request.headers, input.parentTopicId);
     // 주제는 아직 topic_id가 없어 전역 원장을 쓴다. claim이 worktree 생성보다 앞이어야 중복 요청이 worktree를 두 번 만들지 않는다.
     return runIdempotent(request, reply, globalLedger(database, "topic:create"), 201, async (idempotencyKey) => {
       const id = randomUUID();
       const safeTitle = redactSecrets(input.title);
       const slug = makeSlug(safeTitle);
       const repositoryPath = config.repositoryPath;
-      const worktreePath = resolve(config.worktreesDirectory, `${slug}-${id.slice(0, 8)}`);
+      const worktreePath = input.topicKind === "group" ? repositoryPath : resolve(config.worktreesDirectory, `${slug}-${id.slice(0, 8)}`);
       // 부작용 전에 계획을 원장에 남긴다. 서버가 도중에 죽어도 재시작 복구가 topic 존재 여부로 완료를 판정한다.
       database.annotateGlobalRequest("topic:create", idempotencyKey, { plannedTopicId: id, worktreePath });
-      await git.createDetachedWorktree(repositoryPath, worktreePath, input.baseRef);
+      if (input.topicKind !== "group") await git.createDetachedWorktree(repositoryPath, worktreePath, input.baseRef);
       const timestamp = new Date().toISOString();
       // 토픽 행(재작성·리뷰 원장 초기화 포함)과 계획 정책 활성화는 한 transaction 으로 확정한다(E5 host-review F001). 따로 확정하면 그 사이 중단이
       // 정책 0 토픽을 남기고, 재기동 복구가 토픽 존재만으로 요청을 성공으로 확정해 같은 멱등 키 재전송도 그 성공을 재생했다. 단계 토픽 생성과 같은
       // 도구다(workGroups.atomic — 같은 연결의 BEGIN IMMEDIATE). worktree 생성(비동기 외부 부작용)은 이 transaction 밖, 앞에서 끝난다.
       const topic = database.workGroups.atomic(() => {
+        assertTopicParent(database, input.parentTopicId);
+        if (input.parentTopicId && request.headers["x-consensus-actor"] === "mediator")
+          assertMediatorAssignment(database.roles, request.headers, input.parentTopicId);
         const created = database.createTopic({
+          topicKind: input.topicKind ?? "task", parentTopicId: input.parentTopicId ?? null,
+          workEntry: { mode: entryInput.mode, goal: entryInput.mode === "goal" ? redactSecrets(entryInput.goal) : null, sourceIds: [], evidenceDigest: null },
           id, slug, title: safeTitle, repositoryPath, baseRef: input.baseRef, worktreePath,
           branchPrefix: input.branchPrefix,
           requestedBranchName: input.requestedBranchName,
           predecessorTopicId: input.predecessorTopicId,
-          branchName: null, state: input.startMode === "brainstorm" ? "BRAINSTORM_READY" : "DRAFT", scopeGeneration: 1, planRevision: 0,
+          branchName: null, state: entryInput.mode === "brainstorm" ? "BRAINSTORM_READY" : "DRAFT", scopeGeneration: 1, planRevision: 0,
           planSHA256: null, approvedPlanSHA256: null, createdAt: timestamp, updatedAt: timestamp, lastError: null,
           agentSettings: config.defaultAgentSettings,
         });
-        if (config.guardedPlanning) database.planning.enable(created.id);
+        if (config.guardedPlanning && input.topicKind !== "group") database.planning.enable(created.id);
+        if (entryInput.mode === "sources") {
+          const sourceIds = entryInput.sources.map(source => database.evidence.catalog.add(created.id,
+            { ...source, scope: "topic", required: true }, request.headers["x-consensus-actor"] !== "mediator").sourceId);
+          return database.updateTopic(created.id, { workEntry: { ...created.workEntry!, sourceIds: [...new Set(sourceIds)] } });
+        }
         return created;
       });
       database.appendEvent({
         topicId: id, actor: "system", kind: "system", state: topic.state,
-        body: "주제 전용 detached worktree를 만들었습니다.",
+        body: input.topicKind === "group" ? "큰 그림과 하위 주제를 관리할 주제를 만들었습니다." : "주제 전용 detached worktree를 만들었습니다.",
         payload: { worktreePath, baseRef: input.baseRef, requestKey: idempotencyKey },
       });
       return topic;
     });
+  });
+
+  app.post<{ Params: { id: string } }>("/api/topics/:id/goal", async (request, reply) => {
+    const input = SetTopicGoalSchema.parse(request.body);
+    const origin = callOrigin(request);
+    return runIdempotent(request, reply, actionLedger(database, request.params.id, "goal:set"), 200,
+      () => workflow.setGoal(request.params.id, input, origin), createHash("sha256").update(JSON.stringify(input)).digest("hex"));
   });
 
   // SSE 이벤트가 올 때마다 클라이언트가 상세를 다시 읽는다. git status는 그중 가장 비싼 부분이라
@@ -487,7 +513,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     const info = await workflow.resumeInfo(request.params.id);
     const assignment = database.roles.effective(info.topicId, "mediator");
     const policy = readMediationPolicy(DEFAULT_MEDIATION_POLICY_PATH);
-    return { ...info, mediation: { assignment, autonomy: readMediationAutonomy(config.dataDirectory).autonomy, policyVersion: policy.version } };
+    return { ...info, mediation: { assignment, interrupt: interruptStatus(database, info.topicId), autonomy: readMediationAutonomy().autonomy, policyVersion: policy.version } };
   });
 
   // 러너 생존 표시: 작업 트리 최근 변경 + 실행 중 액션 여부. 스캔은 10초 캐시(큰 트리 반복 스캔 방지).
@@ -506,6 +532,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     }
     return {
       state: topic.state,
+      mediationInterrupt: interruptStatus(database, topic.id),
       runningAction: database.runningAction(topic.id) !== null,
       executionUsage: database.getExecutionUsage(topic.id),
       ...activity,
@@ -525,7 +552,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   app.get<{ Params: { id: string } }>("/api/topics/:id/diagnoses", async (request) => ({ diagnoses: workflow.listDiagnoses(request.params.id) }));
 
   app.post<{ Params: { id: string } }>("/api/topics/:id/diagnoses", async (request, reply) => {
-    const origin = callOrigin(request, "diagnosis:register");
+    const origin = callOrigin(request);
     const input = DiagnosisInputSchema.parse(request.body);
     return runIdempotent(request, reply, actionLedger(database, request.params.id, "diagnosis:register"), 201,
       (idempotencyKey) => workflow.registerDiagnosis(request.params.id, input, idempotencyKey, origin));
@@ -535,7 +562,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     const topicId = request.params.id;
     const diagnosisId = request.params.diagnosisId;
     if (!DIAGNOSIS_ID_PATTERN.test(diagnosisId)) throw Object.assign(new Error("진단 id 형식(DG-n)이 아닙니다."), { statusCode: 400 });
-    const origin = callOrigin(request, "diagnosis:apply");
+    const origin = callOrigin(request);
     const action = `diagnosis:apply:${diagnosisId}`;
     changedPathsCache.delete(topicId);
     return runIdempotent(request, reply, actionLedger(database, topicId, action), 200, async (idempotencyKey) => {
@@ -562,14 +589,14 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   });
 
   app.post<{ Params: { id: string } }>("/api/topics/:id/planning-control/migration", async (request, reply) => {
-    const origin = callOrigin(request, "planning:migrate");
+    const origin = callOrigin(request);
     const input = PlanningMigrationSchema.parse(request.body);
     return runIdempotent(request, reply, actionLedger(database, request.params.id, "planning:migrate"), 200,
       key => workflow.migrateInterruptedPlanning(request.params.id, input, key, origin));
   });
 
   app.post<{ Params: { id: string } }>("/api/topics/:id/planning-control", async (request, reply) => {
-    callOrigin(request, "planning:enable");
+    callOrigin(request);
     workflow.assertBudgetEditable(request.params.id);
     return runIdempotent(request, reply, actionLedger(database, request.params.id, "planning:enable"), 200, () => {
       database.planning.enable(request.params.id);
@@ -585,7 +612,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     const mediatorHeader = request.headers["x-consensus-actor"] === "mediator";
     const origin = input.kind === "note" || input.kind === "evidence"
       ? (mediatorHeader ? mediatorOrigin(request, null) : undefined)
-      : callOrigin(request, `message:${input.kind}`);
+      : callOrigin(request);
     return runIdempotent(request, reply, ledger, 200, (idempotencyKey) => input.kind === "scope_change"
       ? workflow.handleScopeChange(request.params.id, input.body, idempotencyKey, origin)
       : workflow.postMessage(request.params.id, input.kind, input.body, idempotencyKey, origin));
@@ -596,7 +623,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     const action = request.params.action;
     // 커밋·되돌리기 등 worktree를 바꾸는 action 뒤에는 목록이 즉시 갱신돼야 한다.
     changedPathsCache.delete(topicId);
-    const origin = DELEGATED_ACTIONS.has(action) ? callOrigin(request, `action:${action}`) : undefined;
+    const origin = DELEGATED_ACTIONS.has(action) ? callOrigin(request) : undefined;
     return runIdempotent(request, reply, actionLedger(database, topicId, action), 200, async (idempotencyKey) => {
       const actionId = requestActionId(topicId, action, idempotencyKey);
       if (origin) {
@@ -738,6 +765,10 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     database.recoverInterruptedNonDeliveryRequests();
     database.recoverInterruptedDeliveryRequests();
     database.recoverInterruptedGlobalRequests();
+    for (const topic of database.listTopics()) {
+      const event = database.getTimeline(topic.id).findLast(event => event.actor === "system" && event.state === topic.state && event.scopeGeneration === topic.scopeGeneration);
+      if (event) database.interrupts.observe(topic, event, database.getFlags(topic.id).resumeState);
+    }
     const restored = workflow.restoreScheduledRetries();
     evidence.start();
     engineDefects.start();

@@ -664,13 +664,13 @@ describe("중재자 진단 — 저장·조회·동일 계획 재개(1단계)", (
     r.database.close();
   });
 
-  it("위임이 꺼져 있으면 중재자 호출의 등록·적용은 403 이고 조회는 된다. 등록 가능한 상태가 아니면 거부한다", { timeout: 30_000 }, async () => {
+  it("예전 OFF 파일과 무관하게 진단의 상태·존재 조건을 검사한다", { timeout: 30_000 }, async () => {
     const r = await room("delegation", [], { autonomy: "off" });
     const draftRegister = await r.call("POST", `/api/topics/${r.topicId}/diagnoses`, fixDiagnosis());
     expect(draftRegister.status).toBe(409);
     expect(String(draftRegister.body.error)).toContain("멈춘 상태");
-    expect((await r.call("POST", `/api/topics/${r.topicId}/diagnoses`, fixDiagnosis(), { mediator: true })).status).toBe(403);
-    expect((await r.call("POST", `/api/topics/${r.topicId}/diagnoses/DG-1/apply`, undefined, { mediator: true })).status).toBe(403);
+    expect((await r.call("POST", `/api/topics/${r.topicId}/diagnoses`, fixDiagnosis(), { mediator: true })).status).toBe(409);
+    expect((await r.call("POST", `/api/topics/${r.topicId}/diagnoses/DG-1/apply`, undefined, { mediator: true })).status).toBe(404);
     expect((await r.call("GET", `/api/topics/${r.topicId}/diagnoses`)).status).toBe(200);
     r.database.close();
   });

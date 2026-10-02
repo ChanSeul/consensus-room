@@ -30,7 +30,7 @@ it("engine repository lock refuses that repository while another project remains
   } finally { await app.close(); }
 });
 
-it("records mediator engine defect To-dos with delegation off while retaining authentication", async () => {
+it("records mediator engine defect To-dos without a delegation file while retaining authentication", async () => {
   const { app, database } = await makeApp();
   draftTopic(database, "engine-report");
   const url = "/api/topics/engine-report/engine-defects";
@@ -113,7 +113,7 @@ it("previews and atomically migrates a verified interrupted plan without grantin
   await app.close();
 });
 
-it.each(["missing-session", "saved-plan", "tampered-output", "wrong-session", "wrong-epoch", "mediator-off", "wrong-worktree", "implementation"])(
+it.each(["missing-session", "saved-plan", "tampered-output", "wrong-session", "wrong-epoch", "stale-mediator", "wrong-worktree", "implementation"])(
   "refuses migration for %s without changing the policy", async reason => {
     const { app, database, request, store, artifact } = await migrationFixture(async () => reason !== "missing-session");
     if (reason === "saved-plan") await store.write("migrate", "claude-plan", 1, "saved response before planSHA assignment");
@@ -122,8 +122,10 @@ it.each(["missing-session", "saved-plan", "tampered-output", "wrong-session", "w
     if (reason === "wrong-epoch") request.payload.planEpoch++;
     if (reason === "wrong-worktree") database.updateTopic("migrate", { worktreePath: "/tmp/another-worktree" });
     if (reason === "implementation") database.updateTopic("migrate", { implementationSessionId: request.payload.sessionId });
+    if (reason === "stale-mediator") database.roles.assign({ scope: "global", role: "mediator", participant: "current-mediator",
+      profileId: null, sessionId: null, note: "", operation: "", expectedVersion: 0 });
     const response = await app.inject({ ...request, headers: { ...request.headers,
-      ...(reason === "mediator-off" ? { "x-consensus-actor": "mediator" } : {}) } });
+      ...(reason === "stale-mediator" ? { "x-consensus-actor": "mediator" } : {}) } });
     expect(response.statusCode).toBeGreaterThanOrEqual(400);
     expect(database.planning.policyVersion("migrate")).toBe(0);
     await app.close();
@@ -852,31 +854,27 @@ it("리뷰 1회 승인은 지정된 검토만 늘리고 예산 부족 시 재개
 });
 
 
-// 2026-09-14 Codex 후속 F07 — 위임 스위치는 사용자만, 증거 게시는 OFF 에서도, 중재자 결정의 origin 보존.
+// 2026-10-02: 자율중재는 항상 ON. 인증·배정·상태 검사와 중재자 origin은 보존한다.
 describe("Codex 후속 F07 — 중재자 권한 경계", () => {
   const token = { "x-consensus-token": "launch-token-for-test" };
-  it("OFF 상태에서 중재자 헤더로 위임을 ON 으로 바꿀 수 없다(403)", async () => {
+  it("자율중재 OFF 요청과 중재자 설정 요청을 거부한다", async () => {
     const { app } = await makeApp();
     try {
       const off = await app.inject({ method: "POST", url: "/api/mediation-autonomy", headers: { ...token, "idempotency-key": "f07-off" }, payload: { autonomy: "off", note: "audit" } });
-      expect(off.statusCode).toBe(200);
+      expect(off.statusCode).toBe(400);
       const enabled = await app.inject({ method: "POST", url: "/api/mediation-autonomy", headers: { ...token, "x-consensus-actor": "mediator", "idempotency-key": "f07-self" }, payload: { autonomy: "on", note: "self" } });
       expect(enabled.statusCode).toBe(403);
       const view = await app.inject({ method: "GET", url: "/api/mediation-autonomy", headers: token });
-      expect(view.json().autonomy).toBe("off");
+      expect(view.json().autonomy).toBe("on");
     } finally { await app.close(); }
   });
-  it("OFF 에서도 증거 게시는 되고 결정 대행은 403 이며, ON 중재자 결정은 origin 을 남긴다", async () => {
+  it("설정 파일 없이 중재자 증거·결정을 받고 origin을 남긴다", async () => {
     const { app, database } = await makeApp();
     try {
       draftTopic(database, "f07-topic");
       const headers = { ...token, "x-consensus-actor": "mediator" };
-      await app.inject({ method: "POST", url: "/api/mediation-autonomy", headers: { ...token, "idempotency-key": "f07-off2" }, payload: { autonomy: "off", note: "audit" } });
       const evidence = await app.inject({ method: "POST", url: "/api/topics/f07-topic/messages", headers: { ...headers, "idempotency-key": "f07-ev" }, payload: { kind: "evidence", body: "측정 결과 게시" } });
       expect(evidence.statusCode).toBe(200);
-      const decisionOff = await app.inject({ method: "POST", url: "/api/topics/f07-topic/messages", headers: { ...headers, "idempotency-key": "f07-dec-off" }, payload: { kind: "decision", body: "대행 결정" } });
-      expect(decisionOff.statusCode).toBe(403);
-      await app.inject({ method: "POST", url: "/api/mediation-autonomy", headers: { ...token, "idempotency-key": "f07-on" }, payload: { autonomy: "on", note: "user" } });
       database.updateTopic("f07-topic", { state: "USER_DECISION_REQUIRED" });
       const decisionOn = await app.inject({ method: "POST", url: "/api/topics/f07-topic/messages", headers: { ...headers, "idempotency-key": "f07-dec-on" }, payload: { kind: "decision", body: "위임 결정" } });
       expect(decisionOn.statusCode).toBe(200);
@@ -884,18 +882,13 @@ describe("Codex 후속 F07 — 중재자 권한 경계", () => {
       expect(saved?.payload?.origin).toMatchObject({ actor: "mediator" });
     } finally { await app.close(); }
   });
-  // 2026-09-14 Codex 3차 R3-04 — 범위 변경도 사용자 권한 대행이다: OFF 에서 중재자 scope_change 는 403 이고 세대가 오르지 않는다.
-  it("OFF 에서 중재자 scope_change 는 403 이며 세대·타임라인이 그대로다; ON 이면 origin 을 남기고 세대가 오른다", async () => {
-    const { app, database } = await makeApp();
+  // 과거 OFF 파일이 남아 있어도 현재 정책에 따라 중재자의 범위 변경을 기록한다.
+  it("예전 OFF 파일이 있어도 scope_change는 origin을 남기고 세대를 올린다", async () => {
+    const { app, database, root } = await makeApp();
     try {
       draftTopic(database, "r3-scope");
       const headers = { ...token, "x-consensus-actor": "mediator" };
-      await app.inject({ method: "POST", url: "/api/mediation-autonomy", headers: { ...token, "idempotency-key": "r3-off" }, payload: { autonomy: "off", note: "audit" } });
-      const refused = await app.inject({ method: "POST", url: "/api/topics/r3-scope/messages", headers: { ...headers, "idempotency-key": "r3-scope-off" }, payload: { kind: "scope_change", body: "Unapproved expanded scope" } });
-      expect(refused.statusCode).toBe(403);
-      expect(database.getTopic("r3-scope").scopeGeneration).toBe(1);
-      expect(database.getTimeline("r3-scope").some((event) => event.body === "Unapproved expanded scope")).toBe(false);
-      await app.inject({ method: "POST", url: "/api/mediation-autonomy", headers: { ...token, "idempotency-key": "r3-on" }, payload: { autonomy: "on", note: "user" } });
+      writeFileSync(join(root, "mediation-autonomy.json"), JSON.stringify({ autonomy: "off" }));
       const allowed = await app.inject({ method: "POST", url: "/api/topics/r3-scope/messages", headers: { ...headers, "idempotency-key": "r3-scope-on" }, payload: { kind: "scope_change", body: "Delegated scope change" } });
       expect(allowed.statusCode).toBe(200);
       expect(database.getTopic("r3-scope").scopeGeneration).toBe(2);

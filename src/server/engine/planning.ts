@@ -1,3 +1,4 @@
+import { hierarchyContext, assertTask, assertEntryReady } from "../topicStructure.js";
 import { normalizeToleranceBlocks } from "../../shared/tolerance.js";
 // 계획 수렴 파이프라인: CLAUDE_PLAN → CODEX_AUDIT → CLAUDE_REVISION → CODEX_CLOSEOUT → CONSENSUS_ACK.
 // 각 단계의 검증 순서(검증 → 메모리 반영 → pause → 저장)가 이 파일의 계약이다.
@@ -135,6 +136,7 @@ export class PlanningPipeline {
 
   async runPlanningLoop(topicId: string, signal: AbortSignal): Promise<void> {
     let topic = this.core.requireState(topicId, "DRAFT");
+    assertTask(topic); assertEntryReady(this.core.dependencies.database, topic);
     this.core.requireParticipants(topic);
 
     topic = this.core.transition(topicId, "CLAUDE_PLAN", "Claude가 첫 계획을 작성합니다.");
@@ -151,7 +153,7 @@ export class PlanningPipeline {
     const timeline = resumedPlanTimeline(this.core.dependencies.database, topic, previousPlanMarkdown ? hashPlan(previousPlanMarkdown) : null, planMode);
     const planDelivery = this.timelineDelivery(planMode, timeline);
     const claudePlan = await this.core.turn(planRoute, topic, buildClaudePlanPrompt({
-      title: topic.title, worktreePath: topic.worktreePath, sourceRepositoryPath: topic.repositoryPath,
+      title: topic.title, goalContext: hierarchyContext(this.core.dependencies.database, topic), worktreePath: topic.worktreePath, sourceRepositoryPath: topic.repositoryPath,
       baseRef: topic.baseRef,
       scopeGeneration: topic.scopeGeneration,
       timeline,

@@ -6,13 +6,11 @@ import type {
   AttachParticipantInput,
   ClientConfig,
   CreateTopicInput,
-  MediationAutonomy,
   PostMessageInput,
   Topic,
   TopicActivity,
   TopicDetail,
   UpdateAgentSettingsInput,
-  UpdateMediationAutonomyInput,
 } from "../shared/contracts";
 
 const API_ROOT = "/api";
@@ -116,17 +114,6 @@ export const api = {
 
   getConfig(): Promise<ClientConfig> {
     return request<ClientConfig>("/config");
-  },
-
-  getMediationAutonomy(): Promise<MediationAutonomy> {
-    return request<MediationAutonomy>("/mediation-autonomy");
-  },
-
-  setMediationAutonomy(input: UpdateMediationAutonomyInput): Promise<MediationAutonomy> {
-    return request<MediationAutonomy>("/mediation-autonomy", {
-      method: "POST",
-      body: JSON.stringify(input),
-    });
   },
 
   async listTopics(): Promise<Topic[]> {

@@ -23,9 +23,6 @@ beforeEach(() => {
     state: "IMPLEMENTING", runningAction: true, lastChangeAt: "2026-09-08T01:00:00.000Z", lastChangedPath: "a.swift",
     scanned: 1, truncated: false, autoRetryAt: null, checkedAt: "2026-09-08T01:00:05.000Z",
   });
-  vi.spyOn(api, "getMediationAutonomy").mockResolvedValue({
-    autonomy: "on", set_at: "2026-09-08T01:41:01Z", set_by: "example-user", note: "", history: [], unset: false,
-  });
   vi.spyOn(api, "getConfig").mockResolvedValue({
     repositoryPath: "/Users/example/sample-ios",
     memoryDirectory: "/Users/example/sample-memory",
@@ -43,23 +40,21 @@ afterEach(() => {
 });
 
 describe("방 화면의 비동기 결과", () => {
-  it("메시지 전송이 실패하면 사용자가 쓴 내용을 지우지 않는다", async () => {
+  it("중재 세션의 기록을 보여 주고 웹 지시 입력란과 위임 토글은 제공하지 않는다", async () => {
     const topic = makeTopic();
     vi.spyOn(api, "listTopics").mockResolvedValue([topic]);
-    vi.spyOn(api, "getTopic").mockResolvedValue(makeDetail(topic));
-    vi.spyOn(api, "postMessage").mockRejectedValue(new Error("네트워크 연결에 실패했습니다."));
-
+    vi.spyOn(api, "getTopic").mockResolvedValue(makeDetail(topic, [timelineEvent(1, "중재 세션에서 전달한 지시")]));
     render(<App />);
-    const editor = await screen.findByPlaceholderText("두 에이전트가 함께 알아야 할 내용을 적어 주세요.");
-    fireEvent.change(editor, { target: { value: "지워지면 안 되는 근거" } });
-    fireEvent.click(screen.getByRole("button", { name: "보내기" }));
-
-    expect(await screen.findByText("네트워크 연결에 실패했습니다.")).toBeInTheDocument();
-    expect(editor).toHaveValue("지워지면 안 되는 근거");
+    expect(await screen.findByText("중재 세션에서 전달한 지시")).toBeInTheDocument();
+    expect(screen.queryByPlaceholderText("두 에이전트가 함께 알아야 할 내용을 적어 주세요.")).not.toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: "메시지 종류" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "보내기" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("switch", { name: "자율중재 위임" })).not.toBeInTheDocument();
   });
 
   it("늦게 끝난 전체 조회가 먼저 받은 SSE 메시지를 지우지 않는다", async () => {
     const topic = makeTopic();
+    topic.participants = ["claude", "codex"].map(role => ({ role: role as "claude" | "codex", sessionId: `${role}-session`, mode: "attached", acknowledgedPlanSHA256: null }));
     const first = timelineEvent(1, "첫 기록");
     const second = timelineEvent(2, "SSE로 먼저 도착한 기록");
     const staleRefresh = deferred<TopicDetail>();
@@ -68,13 +63,12 @@ describe("방 화면의 비동기 결과", () => {
       .mockResolvedValueOnce(makeDetail(topic, [first]))
       .mockReturnValueOnce(staleRefresh.promise)
       .mockResolvedValue(makeDetail(topic, []));
-    vi.spyOn(api, "postMessage").mockResolvedValue({ accepted: true, actionId: "message", topic });
+    vi.spyOn(api, "runAction").mockResolvedValue({ accepted: true, actionId: "plan", topic });
 
     render(<App />);
-    const editor = await screen.findByPlaceholderText("두 에이전트가 함께 알아야 할 내용을 적어 주세요.");
+    await screen.findByText("첫 기록");
     await waitFor(() => expect(eventSources).toHaveLength(1));
-    fireEvent.change(editor, { target: { value: "새 메시지" } });
-    fireEvent.click(screen.getByRole("button", { name: "보내기" }));
+    fireEvent.click(screen.getByRole("button", { name: "합의 시작" }));
     await waitFor(() => expect(api.getTopic).toHaveBeenCalledTimes(2));
 
     eventSources[0].emit(second);
@@ -86,41 +80,16 @@ describe("방 화면의 비동기 결과", () => {
 });
 
 describe("저장소와 에이전트 실행 설정", () => {
-  it("새 주제 화면은 저장소 경로를 입력받지 않고 서버가 고정한 sample-ios 경로를 보여 준다", async () => {
+  it("시작 안내는 세 가지 경로를 보여 주고 웹 지시를 입력받지 않는다", async () => {
     vi.spyOn(api, "listTopics").mockResolvedValue([]);
-    const createTopic = vi.spyOn(api, "createTopic").mockResolvedValue(makeTopic());
-
+    const create = vi.spyOn(api, "createTopic");
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "첫 주제 만들기" }));
-
-    expect(screen.getByText("/Users/example/sample-ios")).toBeInTheDocument();
-    expect(screen.getByText("/Users/example/sample-memory")).toBeInTheDocument();
-    expect(screen.getByText("현재 주제에 맞는 문서만 골라 각 모델에 전달합니다.")).toBeInTheDocument();
-    expect(screen.queryByRole("textbox", { name: "저장소 경로" })).not.toBeInTheDocument();
-    fireEvent.change(screen.getByRole("textbox", { name: "주제 이름" }), { target: { value: "설정 변경" } });
-    fireEvent.click(screen.getByRole("button", { name: "주제 만들기" }));
-
-    await waitFor(() => expect(createTopic).toHaveBeenCalledWith({
-      title: "설정 변경", baseRef: "HEAD", branchPrefix: "consensus", requestedBranchName: null,
-    predecessorTopicId: null, startMode: "plan",
-    }));
-  });
-
-  // 브랜치 접두사는 저장소 관례(feature/·refactoring/ 등)에 맞춰야 해서 주제마다 정한다.
-  it("브랜치 접두사를 바꾸면 그 값으로 주제를 만든다", async () => {
-    vi.spyOn(api, "listTopics").mockResolvedValue([]);
-    const createTopic = vi.spyOn(api, "createTopic").mockResolvedValue(makeTopic());
-
-    render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "첫 주제 만들기" }));
-    fireEvent.change(screen.getByRole("textbox", { name: "주제 이름" }), { target: { value: "Rx 제거" } });
-    fireEvent.change(screen.getByRole("textbox", { name: /브랜치 접두사/ }), { target: { value: "refactoring" } });
-    fireEvent.click(screen.getByRole("button", { name: "주제 만들기" }));
-
-    await waitFor(() => expect(createTopic).toHaveBeenCalledWith({
-      title: "Rx 제거", baseRef: "HEAD", branchPrefix: "refactoring", requestedBranchName: null,
-    predecessorTopicId: null, startMode: "plan",
-    }));
+    fireEvent.click(await screen.findByRole("button", { name: "작업 시작 방식 보기" }));
+    expect(screen.getByRole("heading", { name: "Goal에서 시작" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Source에서 시작" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "브레인스토밍에서 시작" })).toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: "주제 이름" })).not.toBeInTheDocument();
+    expect(create).not.toHaveBeenCalled();
   });
 
   it("연결된 세션을 교체하지 않고 Claude 모델과 추론 강도만 저장한다", async () => {
@@ -666,39 +635,6 @@ class FakeEventSource {
   }
 }
 
-describe("자율중재 위임 토글", () => {
-  it("현재 값을 보여 주고 누르면 반대 값으로 저장한다", async () => {
-    const topic = makeTopic();
-    vi.spyOn(api, "listTopics").mockResolvedValue([topic]);
-    vi.spyOn(api, "getTopic").mockResolvedValue(makeDetail(topic));
-    const set = vi.spyOn(api, "setMediationAutonomy").mockResolvedValue({
-      autonomy: "off", set_at: "2026-09-08T02:00:00Z", set_by: "web", note: "웹 토글",
-      history: [{ autonomy: "on", set_at: "2026-09-08T01:41:01Z", set_by: "example-user", note: "" }], unset: false,
-    });
-    render(<App />);
-    const toggle = await screen.findByRole("switch", { name: "자율중재 위임" });
-    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "true"));
-    expect(toggle).toHaveTextContent("자율중재 위임 ON");
-    fireEvent.click(toggle);
-    await waitFor(() => expect(set).toHaveBeenCalledWith({ autonomy: "off", note: "웹 토글" }));
-    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "false"));
-    expect(toggle).toHaveTextContent("자율중재 위임 OFF");
-  });
-
-  it("스위치 파일이 없으면 OFF 로 보이고 제목에 그 사실을 적는다", async () => {
-    const topic = makeTopic();
-    vi.spyOn(api, "listTopics").mockResolvedValue([topic]);
-    vi.spyOn(api, "getTopic").mockResolvedValue(makeDetail(topic));
-    vi.spyOn(api, "getMediationAutonomy").mockResolvedValue({
-      autonomy: "off", set_at: null, set_by: null, note: null, history: [], unset: true,
-    });
-    render(<App />);
-    const toggle = await screen.findByRole("switch", { name: "자율중재 위임" });
-    await waitFor(() => expect(toggle).toHaveTextContent("자율중재 위임 OFF"));
-    expect(toggle.getAttribute("title")).toContain("파일이 없어");
-  });
-});
-
 describe("계획 전 선택형 논의", () => {
   it("같은 AI의 두 참여자를 버튼과 발언의 접근 가능한 이름으로 구분한다", async () => {
     const topic = { ...makeTopic(), state: "BRAINSTORM_READY" as const };
@@ -719,39 +655,20 @@ describe("계획 전 선택형 논의", () => {
     expect(screen.getByText("논의 참여자 2 · Codex")).toBeInTheDocument();
   });
 
-  it("먼저 논의하기로 주제를 만들고 AI를 자동 호출하지 않는다", async () => {
-    vi.spyOn(api, "listTopics").mockResolvedValue([]);
-    const created = { ...makeTopic(), state: "BRAINSTORM_READY" as const };
-    const create = vi.spyOn(api, "createTopic").mockResolvedValue(created);
-    vi.spyOn(api, "getTopic").mockResolvedValue(makeDetail(created));
-    const run = vi.spyOn(api, "runAction");
-    render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "첫 주제 만들기" }));
-    fireEvent.change(screen.getByRole("textbox", { name: "주제 이름" }), { target: { value: "긴 계획 전달 방법" } });
-    fireEvent.change(screen.getByRole("combobox", { name: "시작 방식" }), { target: { value: "brainstorm" } });
-    fireEvent.click(screen.getByRole("button", { name: "주제 만들기" }));
-    await waitFor(() => expect(create).toHaveBeenCalledWith(expect.objectContaining({ startMode: "brainstorm" })));
-    expect(run).not.toHaveBeenCalled();
-  });
-
-  it.each(["plan", "close"] as const)("논의 후 %s 선택은 사용자가 결론을 입력한 뒤에만 실행된다", async choice => {
+  it("논의의 Goal 결정은 중재 세션으로 안내한다", async () => {
     const topic: Topic = { ...makeTopic(), state: "BRAINSTORM_READY", participants: ["claude", "codex"].map(role => ({
       role: role as "claude" | "codex", sessionId: `${role}-session`, mode: "created", acknowledgedPlanSHA256: null,
     })) };
     vi.spyOn(api, "listTopics").mockResolvedValue([topic]);
     vi.spyOn(api, "getTopic").mockResolvedValue(makeDetail(topic));
-    const run = vi.spyOn(api, "runAction").mockResolvedValue({ accepted: true, actionId: "action", topic });
+    const run = vi.spyOn(api, "runAction");
     render(<App />);
     expect(await screen.findByRole("button", { name: "한 바퀴 논의" })).toBeEnabled();
-    expect(screen.queryByRole("button", { name: "합의 시작" })).not.toBeInTheDocument();
+    expect(screen.getByText("Goal 확정·계획 전환은 중재 세션에서 진행합니다.")).toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: "결론과 다음 행동" })).not.toBeInTheDocument();
     expect(run).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: choice === "plan" ? "계획으로 진행" : "논의 종료" }));
-    const submit = screen.getByRole("button", { name: choice === "plan" ? "계획 시작" : "결론 남기고 종료" });
-    expect(submit).toBeDisabled();
-    fireEvent.change(screen.getByRole("textbox", { name: "결론과 다음 행동" }), { target: { value: "작은 실험으로 먼저 확인합니다." } });
-    fireEvent.click(submit);
-    await waitFor(() => expect(run).toHaveBeenCalledWith(topic.id, `brainstorm-${choice}`, { decision: "작은 실험으로 먼저 확인합니다." }));
   });
+
 });
 
 function makeTopic(): Topic {

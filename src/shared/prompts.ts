@@ -399,6 +399,7 @@ function finalReviewContract(): string {
 
 export function buildClaudePlanPrompt(input: {
   title: string;
+  goalContext?: string;
   worktreePath: string;
   sourceRepositoryPath: string;
   baseRef: string;
@@ -420,6 +421,7 @@ export function buildClaudePlanPrompt(input: {
   return `계획 작성자 역할입니다. 이 단계에서는 코드를 수정하지 마세요.
 
 주제: ${input.title}
+${input.goalContext ?? ""}
 작업 worktree: ${input.worktreePath}
 원본 저장소(메타데이터이며 작업 경로로 사용하지 않음): ${input.sourceRepositoryPath}
 기준 리비전: ${input.baseRef}

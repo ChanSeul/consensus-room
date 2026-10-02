@@ -1,0 +1,43 @@
+// @vitest-environment jsdom
+import "@testing-library/jest-dom/vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, expect, it, vi } from "vitest";
+import { TopicSchema } from "../src/shared/contracts";
+import { TopicOverview, TopicTree } from "../src/web/TopicStructure";
+import { DEFAULT_AGENT_SETTINGS } from "../src/shared/contracts";
+afterEach(cleanup);
+const topic = (id: string, title: string, parentTopicId: string | null, group = false) => TopicSchema.parse({
+  id, title, slug: id, parentTopicId, topicKind: group ? "group" : "task", repositoryPath: "/tmp/repo", worktreePath: "/tmp/repo",
+  state: "DRAFT", baseRef: "HEAD", branchName: null, scopeGeneration: 1, planRevision: 0,
+  planSHA256: null, approvedPlanSHA256: null, agentSettings: DEFAULT_AGENT_SETTINGS, participants: [],
+  createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), lastError: null,
+  workEntry: { mode: "goal", goal: `${title}의 목표`, sourceIds: [], evidenceDigest: null },
+});
+it("keeps nested navigation, leaf totals, collapsed branches and the selected path coherent", () => {
+  const root = topic("r", "제품 큰 그림", null, true), sub = topic("s", "입력 경로", "r", true), leaf = topic("l", "자료 읽기", "s");
+  const closed = { ...topic("c", "목표 입력", "r"), state: "CLOSED" as const }, onSelect = vi.fn();
+  const topics = [leaf, closed, root, sub]; // Server order is recent activity, not hierarchy order.
+  const view = render(<TopicTree topics={topics} selectedId={root.id} onSelect={onSelect} />);
+  expect(screen.getByText("말단 1/2 종료")).toBeInTheDocument();
+  expect(screen.getByText("말단 0/1 종료")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "제품 큰 그림 하위 주제" }));
+  expect(screen.queryByText("자료 읽기")).not.toBeInTheDocument();
+  view.rerender(<TopicTree topics={topics} selectedId={leaf.id} onSelect={onSelect} />);
+  expect(screen.getByText("자료 읽기")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: /말단 · 실행.*자료 읽기/ }));
+  expect(onSelect).toHaveBeenCalledWith(leaf.id);
+  render(<TopicOverview topic={leaf} topics={topics} onSelect={onSelect} />);
+  fireEvent.click(screen.getByRole("button", { name: "Root · 제품 큰 그림" }));
+  expect(onSelect).toHaveBeenLastCalledWith(root.id);
+  expect(screen.getByText("자료 읽기의 목표")).toBeInTheDocument();
+});
+it("keeps source and brainstorm entry modes visible after moving into implementation", () => {
+  const source = { ...topic("s", "자료 구현", null), state: "IMPLEMENTING" as const,
+    workEntry: { mode: "sources" as const, goal: "실패를 표시한다", sourceIds: [], evidenceDigest: null } };
+  const view = render(<TopicOverview topic={source} topics={[source]} onSelect={vi.fn()} />);
+  expect(screen.getByText("Source에서 시작")).toBeInTheDocument();
+  expect(screen.getByText("구현·검토").closest("li")).toHaveAttribute("aria-current", "step");
+  const brainstorm = { ...source, workEntry: { ...source.workEntry, mode: "brainstorm" as const } };
+  view.rerender(<TopicOverview topic={brainstorm} topics={[brainstorm]} onSelect={vi.fn()} />);
+  expect(screen.getByText("브레인스토밍에서 시작")).toBeInTheDocument();
+});

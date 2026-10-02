@@ -1,16 +1,18 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { buildApp } from "../src/server/app";
 import { ConsensusDatabase } from "../src/server/database";
-import { mediationAutonomyPath, readMediationAutonomy } from "../src/server/mediationAutonomy";
+import { readMediationAutonomy } from "../src/server/mediationAutonomy";
 import type { AgentAdapter, CommandRunner } from "../src/server/types";
 
 const temporaryDirectories: string[] = [];
+const apps: Awaited<ReturnType<typeof buildApp>>[] = [];
 
-afterEach(() => {
+afterEach(async () => {
+  for (const app of apps.splice(0)) await app.close();
   for (const directory of temporaryDirectories.splice(0)) {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -55,96 +57,51 @@ async function makeApp() {
     claude: adapter("claude"),
     codex: adapter("codex"),
   });
-  return { app, root };
+  apps.push(app);
+  return { app, root, database };
 }
 
 const auth = { "x-consensus-token": "launch-token-for-test" };
 
-describe("자율 중재 위임 스위치 API", () => {
-  it("파일이 없으면 off(unset)로 읽힌다", async () => {
-    const { app } = await makeApp();
-    const response = await app.inject({ method: "GET", url: "/api/mediation-autonomy", headers: auth });
-    expect(response.statusCode).toBe(200);
-    expect(response.json()).toMatchObject({ autonomy: "off", unset: true, history: [] });
-  });
+describe("항상 ON인 자율중재 정책", () => {
+  it.each([undefined, '{"autonomy":"off","history":[]}', '{"autonomy":"on"}', 'invalid legacy JSON'])(
+    "기존 파일 %s와 무관하게 상태와 중재 진입점이 ON이며 파일을 변경하지 않는다", async (legacy) => {
+      const { app, root } = await makeApp();
+      const path = join(root, "mediation-autonomy.json");
+      if (legacy !== undefined) writeFileSync(path, legacy);
+      const response = await app.inject({ method: "GET", url: "/api/mediation-autonomy", headers: auth });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({ autonomy: "on", unset: false, set_by: "policy" });
+      const context = await app.inject({ method: "GET", url: "/api/mediation/context", headers: auth });
+      expect(context.json().autonomy).toEqual(response.json());
+      expect(readMediationAutonomy()).toEqual(response.json());
+      if (legacy !== undefined) expect(readFileSync(path, "utf8")).toBe(legacy);
+      else expect(existsSync(path)).toBe(false);
+    });
 
-  it("on → off 로 바꾸면 이전 값이 history 에 남고 파일은 셸 스크립트와 같은 필드를 가진다", async () => {
+  it("OFF와 잘못된 요청은 거부하고 인증과 멱등 키를 계속 요구한다", async () => {
     const { app, root } = await makeApp();
-    const on = await app.inject({
-      method: "POST", url: "/api/mediation-autonomy", headers: { ...auth, "idempotency-key": "k-on" },
-      payload: { autonomy: "on", note: "웹 토글" },
-    });
-    expect(on.statusCode).toBe(200);
-    expect(on.json()).toMatchObject({ autonomy: "on", set_by: "web", note: "웹 토글", unset: false, history: [] });
-
-    const off = await app.inject({
-      method: "POST", url: "/api/mediation-autonomy", headers: { ...auth, "idempotency-key": "k-off" },
-      payload: { autonomy: "off" },
-    });
-    expect(off.statusCode).toBe(200);
-    expect(off.json().autonomy).toBe("off");
-    expect(off.json().history).toHaveLength(1);
-    expect(off.json().history[0]).toMatchObject({ autonomy: "on", set_by: "web", note: "웹 토글" });
-
-    const document = JSON.parse(readFileSync(mediationAutonomyPath(root), "utf8"));
-    expect(Object.keys(document).sort()).toEqual(["autonomy", "history", "note", "set_at", "set_by"]);
-    expect(document.autonomy).toBe("off");
-
-    const read = await app.inject({ method: "GET", url: "/api/mediation-autonomy", headers: auth });
-    expect(read.json()).toMatchObject({ autonomy: "off", unset: false });
+    for (const autonomy of ["off", "maybe", null]) {
+      const result = await app.inject({ method: "POST", url: "/api/mediation-autonomy",
+        headers: { ...auth, "idempotency-key": `k-${autonomy}` }, payload: { autonomy } });
+      expect(result.statusCode).toBe(400);
+    }
+    expect((await app.inject({ method: "POST", url: "/api/mediation-autonomy", headers: auth, payload: { autonomy: "on" } })).statusCode).toBe(400);
+    expect((await app.inject({ method: "GET", url: "/api/mediation-autonomy" })).statusCode).toBe(401);
+    expect(existsSync(join(root, "mediation-autonomy.json"))).toBe(false);
   });
 
-  it("셸 스크립트가 쓴 파일(note 빈 문자열·history 포함)을 그대로 읽는다", async () => {
-    const { app, root } = await makeApp();
-    writeFileSync(mediationAutonomyPath(root), JSON.stringify({
-      autonomy: "on", set_at: "2026-09-08T01:41:01Z", set_by: "example-user", note: "",
-      history: [{ autonomy: "off", set_at: "2026-09-08T01:00:00Z", set_by: "example-user", note: "test" }],
-    }));
-    const response = await app.inject({ method: "GET", url: "/api/mediation-autonomy", headers: auth });
-    expect(response.statusCode).toBe(200);
-    expect(response.json()).toMatchObject({ autonomy: "on", set_by: "example-user", note: "", unset: false });
-    expect(response.json().history).toHaveLength(1);
-    expect(readMediationAutonomy(root).autonomy).toBe("on");
-  });
-
-  it("잘못된 값은 400, Idempotency-Key 가 없으면 400, 인증 없으면 401", async () => {
-    const { app } = await makeApp();
-    const bad = await app.inject({
-      method: "POST", url: "/api/mediation-autonomy", headers: { ...auth, "idempotency-key": "k-bad" },
-      payload: { autonomy: "maybe" },
-    });
-    expect(bad.statusCode).toBe(400);
-    const noKey = await app.inject({ method: "POST", url: "/api/mediation-autonomy", headers: auth, payload: { autonomy: "on" } });
-    expect(noKey.statusCode).toBe(400);
-    const noAuth = await app.inject({ method: "GET", url: "/api/mediation-autonomy" });
-    expect(noAuth.statusCode).toBe(401);
-  });
-
-  it("같은 Idempotency-Key 재요청은 저장된 응답을 재생하고 history 를 늘리지 않는다", async () => {
-    const { app } = await makeApp();
-    const headers = { ...auth, "idempotency-key": "k-same" };
-    const first = await app.inject({ method: "POST", url: "/api/mediation-autonomy", headers, payload: { autonomy: "on" } });
-    const second = await app.inject({ method: "POST", url: "/api/mediation-autonomy", headers, payload: { autonomy: "on" } });
+  it("기존 on 요청과 재시도는 ON을 반환하며 이전 토글 응답은 재생하지 않는다", async () => {
+    const { app, database } = await makeApp();
+    database.claimGlobalRequest("mediation-autonomy:set", "k-same", { autonomy: "on" });
+    database.finishGlobalRequest("mediation-autonomy:set", "k-same", { autonomy: "on", set_by: "web", note: "old toggle" });
+    const request = { method: "POST" as const, url: "/api/mediation-autonomy",
+      headers: { ...auth, "idempotency-key": "k-same" }, payload: { autonomy: "on" } };
+    const first = await app.inject(request);
+    const second = await app.inject(request);
+    expect(first.statusCode).toBe(200);
+    expect(first.json()).toMatchObject({ autonomy: "on", set_by: "policy" });
     expect(second.statusCode).toBe(200);
     expect(second.json()).toEqual(first.json());
-    const read = await app.inject({ method: "GET", url: "/api/mediation-autonomy", headers: auth });
-    expect(read.json().history).toHaveLength(0);
-  });
-});
-
-describe("스위치 파일 쓰기의 임시 파일", () => {
-  it("호출마다 고유한 임시 이름을 쓰고 끝나면 남기지 않는다(Codex 지적 3)", async () => {
-    const { app, root } = await makeApp();
-    for (const value of ["on", "off", "on"]) {
-      const response = await app.inject({
-        method: "POST", url: "/api/mediation-autonomy", headers: { ...auth, "idempotency-key": `k-${value}-${Math.random()}` },
-        payload: { autonomy: value },
-      });
-      expect(response.statusCode).toBe(200);
-    }
-    const { readdirSync } = await import("node:fs");
-    expect(readdirSync(root).filter((name) => name.includes(".tmp"))).toEqual([]);
-    expect(readMediationAutonomy(root)).toMatchObject({ autonomy: "on" });
-    expect(readMediationAutonomy(root).history).toHaveLength(2);
   });
 });

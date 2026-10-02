@@ -15,6 +15,14 @@ from pathlib import Path
 import sqlite3
 import sys
 
+def room_data_directory():
+    if os.environ.get("CONSENSUS_ROOM_DATA_DIR"):
+        return Path(os.environ["CONSENSUS_ROOM_DATA_DIR"])
+    if sys.platform == "darwin":
+        return Path.home() / "Library/Application Support/ConsensusRoom"
+    return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "consensus-room"
+
+
 FIELDS = ('inputTokens', 'cachedInputTokens', 'cacheCreationInputTokens', 'outputTokens')
 ROLES = ('runner', 'mediator', 'pre-audit', 'host-review', 'work-admission', 'repair')
 
@@ -374,7 +382,7 @@ def markdown(report):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--room-home', type=Path, default=Path.home() / 'Library/Application Support/ConsensusRoom')
+    parser.add_argument('--room-home', type=Path, default=room_data_directory())
     parser.add_argument('--claude-projects', type=Path, default=Path.home() / '.claude/projects')
     parser.add_argument('--mapping', type=Path)
     parser.add_argument('--from', dest='since')

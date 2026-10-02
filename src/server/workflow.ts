@@ -28,6 +28,8 @@ import { ConsensusDatabase } from "./database.js";
 import { GitService } from "./git.js";
 import { redactRecord } from "./security.js";
 import type { AgentAdapter, ExecutionLimits, ParticipantRole, ProjectMemoryWriter } from "./types.js";
+import { isTopicGroup, workEntry } from "../shared/topicStructure.js";
+import { assertTask, assertEntryReady, hierarchyContext } from "./topicStructure.js";
 import { EngineCore, type MaintenanceLockOwner } from "./engine/core.js";
 import { PlanningPipeline } from "./engine/planning.js";
 import { BrainstormPipeline } from "./engine/brainstorm.js";
@@ -40,7 +42,7 @@ import { UsageLimitRetryScheduler, type RetryClock } from "./engine/usageLimitRe
 import { recoverableFinalizedFirstPlan } from "./planningStore.js";
 import { bindingOf, describeBinding, legacyBinding, resolveRoute, sameBinding, UnsupportedRoute, type SessionBinding, type TurnRoute } from "./turnRouting.js";
 
-// 호출 주체 — 브라우저 사용자(기본)와 중재 세션(x-consensus-actor: mediator, 위임 스위치 on 일 때만). 이벤트 payload 에 남긴다(D03).
+// 호출 주체 — 브라우저 사용자(기본)와 중재 세션(x-consensus-actor: mediator, 자율중재는 항상 ON). 이벤트 payload 에 남긴다(D03).
 import { CLOSED_DIAGNOSIS_STATUSES, MEDIATOR_PENDING_STATUSES, type DiagnosisInput, type DiagnosisRecord } from "../shared/diagnoses.js";
 import type { MediatorIdentity, TurnJob } from "../shared/roles.js";
 import type { StageDecision, StageResult } from "../shared/workGroups.js";
@@ -356,6 +358,27 @@ export class WorkflowEngine {
   }
   assertBudgetEditable(topicId: string): void { this.core.assertNoActiveWork(topicId); }
 
+  setGoal(topicId: string, input: { goal: string; evidenceDigest?: string }, origin?: CallOrigin): Topic {
+    const db = this.core.dependencies.database;
+    this.core.assertNotShuttingDown(); this.core.assertNoActiveWork(topicId);
+    const topic = this.core.requireState(topicId, "DRAFT");
+    if (topic.planSHA256) throw Object.assign(new Error("현재 계획을 무효화한 뒤 Goal을 변경하세요."), { statusCode: 409 });
+    if (db.listTopics().some(child => child.parentTopicId === topic.id))
+      throw Object.assign(new Error("하위 주제가 생긴 상위 Goal은 고정됩니다. 새 범위는 새 관리 주제로 시작하세요."), { statusCode: 409 });
+    const entry = workEntry(topic);
+    if (entry.mode === "sources") {
+      db.evidence.assertReady(topic, false);
+      const state = db.evidence.topic(topic);
+      if (input.evidenceDigest !== state.digest || !entry.sourceIds.length || entry.sourceIds.some(id => !state.sources.some(source => source.id === id)))
+        throw Object.assign(new Error("시작 Source 전체를 검토한 현재 evidenceDigest가 필요합니다."), { statusCode: 409 });
+    }
+    return db.applyTopicTransition({ topicId, changes: { workEntry: { ...entry, goal: redactSecrets(input.goal),
+      evidenceDigest: entry.mode === "sources" ? input.evidenceDigest! : null } }, events: [{
+      actor: "user", kind: "decision", state: topic.state, body: `Goal: ${redactSecrets(input.goal)}`,
+      payload: { goalEstablished: true, previousGoal: entry.goal, evidenceDigest: input.evidenceDigest ?? null, ...(origin ? { origin } : {}) },
+    }] });
+  }
+
   private brainstormPreconditions(topicId: string): Topic {
     this.core.assertNotShuttingDown();
     this.core.assertNoActiveWork(topicId);
@@ -377,16 +400,16 @@ export class WorkflowEngine {
     }, actionId);
   }
 
-  finishBrainstorm(topicId: string, input: { decision: string }, next: "plan" | "close", actionId?: string, origin?: CallOrigin): string {
+  finishBrainstorm(topicId: string, input: { decision: string; goal?: string }, next: "plan" | "close", actionId?: string, origin?: CallOrigin): string {
     const parsed = BrainstormDecisionSchema.parse(input);
     const topic = this.brainstormPreconditions(topicId);
-    if (next === "plan") {
+    if (next === "plan" && !isTopicGroup(topic)) {
       this.core.requireParticipants(topic);
       this.core.assertBudgetAvailable(topicId);
     }
     // 논의 전용 배정은 계획 연속성 v2의 시작 세션이 아니다. 다른 배정으로 넘길 때만 새 세션을 예약하고,
     // 이전 세션 신원과 사용자 결정을 상태 전이와 함께 남긴다. 같은 배정의 대화는 그대로 이어 쓴다.
-    const handoffs = next === "plan" ? topic.participants.flatMap(participant => {
+    const handoffs = next === "plan" && !isTopicGroup(topic) ? topic.participants.flatMap(participant => {
       if (!participant.sessionId || participant.sessionId.startsWith("pending:")) return [];
       const route = this.seatRoute(topic, participant.role === "claude" ? { role: "planner", operation: "plan" } : { role: "reviewer", operation: "audit" });
       const stored = this.core.dependencies.database.participantBinding(topicId, participant.role) ?? legacyBinding(participant.role);
@@ -398,7 +421,8 @@ export class WorkflowEngine {
     return this.core.startAction(topicId, `brainstorm-${next}`, async signal => {
       const state: WorkflowState = next === "plan" ? "DRAFT" : "CLOSED";
       this.core.dependencies.database.applyTopicTransition({ topicId,
-        changes: { state, lastError: null, resumeState: null },
+        changes: { state, lastError: null, resumeState: null,
+          ...(next === "plan" ? { workEntry: { ...workEntry(topic), goal: redactSecrets(parsed.goal ?? parsed.decision) } } : {}) },
         participants: handoffs.map(handoff => handoff.participant),
         events: [...handoffs.map(handoff => ({ actor: "system" as const, kind: "system" as const, state,
           body: "논의와 계획의 참여자 배정이 달라 계획용 새 세션을 연결합니다. 논의 기록은 계획에 전달합니다.",
@@ -406,10 +430,11 @@ export class WorkflowEngine {
         })), { actor: "user", kind: "decision", state, body: redactSecrets(parsed.decision),
           payload: { brainstormConclusion: next, ...(origin ? { origin } : {}) } },
         { actor: "system", kind: "system", state,
-          body: next === "plan" ? "사용자가 논의 결과를 바탕으로 계획 작성을 선택했습니다. 기존 발언의 가설·대안은 승인으로 간주하지 않습니다."
+          body: next === "plan" && isTopicGroup(topic) ? "논의 결과를 Goal로 확정했습니다. 하위 주제로 나누어 진행하세요."
+            : next === "plan" ? "사용자가 논의 결과를 바탕으로 계획 작성을 선택했습니다. 기존 발언의 가설·대안은 승인으로 간주하지 않습니다."
             : "사용자의 결정으로 논의를 마쳤습니다. 계획이나 구현은 시작하지 않습니다." }],
       });
-      if (next === "plan") await this.planning.runPlanningLoop(topicId, signal);
+      if (next === "plan" && !isTopicGroup(topic)) await this.planning.runPlanningLoop(topicId, signal);
     }, actionId);
   }
 
@@ -417,7 +442,8 @@ export class WorkflowEngine {
     // 원장에 running 행을 만들기 전에 상태를 확인한다. 비동기 work에서 거부하면 이미 끝난 주제까지 FAILED로 덮인다.
     this.core.assertNotShuttingDown();
     this.core.assertNoActiveWork(topicId);
-    this.core.requireState(topicId, "DRAFT");
+    const topic = this.core.requireState(topicId, "DRAFT");
+    assertTask(topic); assertEntryReady(this.core.dependencies.database, topic);
     this.assertStageContextCurrent(topicId);
     this.ensureInheritedDecisions(topicId);
     return this.core.startAction(topicId, "plan", (signal) => this.planning.runPlanningLoop(topicId, signal), actionId);
@@ -495,6 +521,7 @@ export class WorkflowEngine {
     const topic = this.core.dependencies.database.getTopic(topicId);
     const flags = this.core.dependencies.database.getFlags(topicId);
     const resume = flags.resumeState;
+    if (resume !== "BRAINSTORMING") assertTask(topic);
     // 공통 진단 상태 검사: 중재자가 처리할 진단(적용 대기·재확인·반박·추가 증거)이 있으면 재개하지 않는다 — 자동 재시도도 이 경로다.
     // 계획 단계 재시도는 전체 재계획이 재확인으로 돌린 진단에 막히지 않는다(host-review R9) — 재개 단계를 함께 넘긴다.
     this.core.diagnoses.assertResumable(topicId, "재시도(retry)", resume);
@@ -696,6 +723,7 @@ export class WorkflowEngine {
 
   // 구현 시작의 부작용 전 검사(startAction 의 실행 중 작업 검사 포함) — startImplementation 과 재개 정보가 같은 함수를 쓴다(엔진 개편 E1).
   private implementPreconditions(topicId: string): void {
+    assertTask(this.core.dependencies.database.getTopic(topicId));
     this.core.assertNotShuttingDown();
     this.core.diagnoses.assertResumable(topicId, "구현 시작(implement)");
     assertImplementationGate(this.core.dependencies.database.getTopic(topicId));
@@ -706,6 +734,7 @@ export class WorkflowEngine {
   // 승인의 검사 — approve 와 재개 정보가 같은 함수를 쓴다(엔진 개편 E1).
   private approvePreconditions(topicId: string, planSHA256: string | null): void {
     const topic = this.core.dependencies.database.getTopic(topicId);
+    assertTask(topic);
     this.core.dependencies.database.evidence.assertReady(topic);
     if (topic.state !== "AWAITING_USER_APPROVAL" || !planSHA256 || topic.planSHA256 !== planSHA256) {
       throw new Error("현재 승인을 기다리는 계획 해시와 일치하지 않습니다.");
@@ -750,6 +779,8 @@ export class WorkflowEngine {
     const brainstormRound = latestBrainstormRound(timeline);
     return {
       topicId: topic.id, title: topic.title, state: topic.state, resumeState: flags.resumeState ?? null,
+      entry: workEntry(topic), hierarchy: { topicKind: topic.topicKind ?? "task", parentTopicId: topic.parentTopicId ?? null,
+        context: hierarchyContext(db, topic), children: db.listTopics().filter(child => child.parentTopicId === topic.id).map(child => ({ id: child.id, title: child.title, topicKind: child.topicKind ?? "task", state: child.state })) },
       scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch, planRevision: topic.planRevision,
       plan: {
         planSHA256: topic.planSHA256, approvedPlanSHA256: topic.approvedPlanSHA256,
@@ -891,17 +922,23 @@ export class WorkflowEngine {
     const flags = db.getFlags(topicId);
     if (db.runningAction(topicId) || this.core.active.has(topicId)) return [{ action: "stop", blocker: null }];
     const actions: ResumeAction[] = [];
+    if (isTopicGroup(topic) && topic.state === "CLOSED") return actions;
     if (topic.state === "BRAINSTORM_READY") {
       const blocker = this.blocker(() => { this.brainstormPreconditions(topicId); });
       const runnable = this.blocker(() => {
         const current = this.brainstormPreconditions(topicId); this.core.requireParticipants(current); this.core.assertBudgetAvailable(topicId);
       });
       actions.push({ action: "brainstorm", blocker: runnable },
-        { action: "brainstorm-plan", blocker: runnable, input: { decision: null } },
+        { action: "brainstorm-plan", blocker: isTopicGroup(topic) ? blocker : runnable, input: { decision: null, goal: null } },
         { action: "brainstorm-close", blocker, input: { decision: null } });
+    } else if (topic.state === "DRAFT" && isTopicGroup(topic)) {
+      actions.push({ action: "topic:create-child", blocker: this.blocker(() => assertEntryReady(db, topic)), input: { parentTopicId: topic.id } });
+      if (!db.listTopics().some(child => child.parentTopicId === topic.id)) actions.push({ action: "goal:set", blocker: null, input: { goal: null } });
     } else if (topic.state === "DRAFT") {
+      if (!workEntry(topic).goal || workEntry(topic).mode === "sources") actions.push({ action: "goal:set", blocker: null, input: { goal: null, evidenceDigest: db.evidence.topic(topic).digest } });
       actions.push({ action: "plan", blocker: this.blocker(() => {
         this.core.assertNotShuttingDown(); this.core.assertNoActiveWork(topicId); this.core.requireState(topicId, "DRAFT");
+        assertTask(topic); assertEntryReady(db, topic);
         this.assertStageContextCurrent(topicId);
       }) });
     } else if (INTERRUPTED_STATES.has(topic.state)) {

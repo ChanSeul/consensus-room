@@ -9,7 +9,7 @@ export const BrainstormRoundSchema = z.object({
   order: z.tuple([BrainstormRoleSchema, BrainstormRoleSchema]).refine(([a, b]) => a !== b),
 });
 export const BrainstormInputSchema = z.object({ message: z.string().trim().min(1).max(12000).optional() }).strict();
-export const BrainstormDecisionSchema = z.object({ decision: z.string().trim().min(1).max(12000) }).strict();
+export const BrainstormDecisionSchema = z.object({ decision: z.string().trim().min(1).max(12000), goal: z.string().trim().min(1).max(12000).optional() }).strict();
 
 export function latestBrainstormRound(events: readonly TimelineEvent[]) {
   const event = events.findLast(item => item.actor === "system" && item.payload.brainstormRound !== undefined);

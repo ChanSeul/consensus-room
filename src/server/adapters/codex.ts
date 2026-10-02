@@ -14,6 +14,7 @@ import {
 import { executionPolicyNote } from "../../shared/prompts.js";
 import { readAppliedInstructions } from "../projectInstructions.js";
 import type { AgentAdapter, CommandRunner, CreatedSession, OutputSchema, SessionTurn } from "../types.js";
+import { defaultDataDirectory } from "../config.js";
 import { agentEnvironment } from "../security.js";
 import { ProjectMemoryReader, type MemoryReaderOptions } from "../projectMemory.js";
 import { agentRunError, parseAgentResult, parseStructuredResult, SessionIdentityMismatch } from "./resultParser.js";
@@ -158,7 +159,7 @@ export class CodexAdapter implements AgentAdapter {
 
   constructor(
     private readonly runner: CommandRunner,
-    private readonly schemaPath = join(homedir(), "Library", "Application Support", "ConsensusRoom", "agent-result.schema.json"),
+    private readonly schemaPath = join(process.env.CONSENSUS_ROOM_DATA_DIR ?? defaultDataDirectory(), "agent-result.schema.json"),
     // 앱 수명 동안 유지되는 단일 관리형 홈. 액션마다 임시 디렉터리를 만들면 이 아래 세션이 사라져 exec resume이 깨진다.
     // 기본값을 schemaPath 옆에 두면 index.ts가 주는 dataDirectory를 그대로 따라간다.
     private readonly codexHome = join(dirname(schemaPath), "codex-home"),

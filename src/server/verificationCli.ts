@@ -1,11 +1,11 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { parseArgs, promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 import { z } from "zod";
+import { defaultDataDirectory } from "./config.js";
 import { executeVerification } from "./verificationRunner.js";
 import { STATIC_PROFILE_ID, STATIC_SCRIPT_SHA256, staticProfileSchema } from "./verificationInputs.js";
 import type { PreparedVerification, VerificationCompletion, VerificationRun } from "./verifications.js";
@@ -96,7 +96,7 @@ async function main() {
     "install-profile": { type: "boolean" }, python: { type: "string" },
   } });
   const dataDirectory = resolve(values["data-dir"] ?? process.env.CONSENSUS_ROOM_DATA_DIR ??
-    join(homedir(), "Library", "Application Support", "ConsensusRoom"));
+    defaultDataDirectory());
   if (values["install-profile"]) {
     if (!values.python) throw new Error("--python에 Python 실행 파일의 절대 경로를 지정하세요.");
     return installProfile(dataDirectory, values.python);

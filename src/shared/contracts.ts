@@ -1,9 +1,11 @@
+import { MediatorInterruptStatusSchema } from "./mediatorInterrupts.js";
 import agentDefaults from "./agent-defaults.json";
 import { EngineDefectReportSchema } from "./engineDefects.js";
 import {ReviewAllowanceSchema,ReviewScopeSchema} from "./reviews.js";
 import { type BudgetAccount } from "./budgets.js";
 import { RevisionAllowanceSchema } from "./revisions.js";
 import { z } from "zod";
+import { WorkEntryInputSchema, WorkEntrySchema } from "./topicStructure.js";
 import { PlanningStepSchema, PlanningStepJsonSchema, CodexPlanningStepJsonSchema } from "./planningControl.js";
 import { ToleranceLedgerEntrySchema } from "./tolerance";
 
@@ -209,6 +211,9 @@ export const ParticipantSchema = z.object({
 export type Participant = z.infer<typeof ParticipantSchema>;
 
 export const TopicSchema = z.object({
+  topicKind: z.enum(["group", "task"]).optional(),
+  parentTopicId: z.string().nullable().optional(),
+  workEntry: WorkEntrySchema.nullable().optional(),
   id: z.string().min(1),
   slug: z.string().min(1),
   title: z.string().min(1),
@@ -324,6 +329,9 @@ export const BranchNameSchema = z.string().trim().min(1).max(120)
   ), "git이 거부하는 ref 세그먼트가 있습니다.");
 
 export const CreateTopicInputSchema = z.object({
+  topicKind: z.enum(["group", "task"]).optional(),
+  parentTopicId: z.string().uuid().nullable().optional(),
+  entry: WorkEntryInputSchema.optional(),
   title: z.string().trim().min(2).max(120),
   startMode: z.enum(["plan", "brainstorm"]).default("plan"),
   // '-'로 시작하면 git worktree add에서 옵션으로 해석될 수 있다(감사 부차 지적).
@@ -604,9 +612,8 @@ export function validatePlanHeadings(markdown: string): string[] {
   });
 }
 
-// ---- 자율 중재 위임 스위치 (2026-09-08) --------------------------------------------------------
-// 정본은 데이터 디렉터리의 `mediation-autonomy.json` 하나다. 셸 스크립트(mediation_autonomy.sh)와
-// 웹 토글이 같은 파일을 읽고 쓴다. 파일이 없으면 off 로 취급한다(fail-closed).
+// ---- 자율중재 정책 (2026-10-02: 항상 ON) ----------------------------------------------------
+// 과거 이력 값은 호환 유지하지만 현재 응답과 설정 요청은 ON만 허용한다.
 export const MEDIATION_AUTONOMY_VALUES = ["on", "off"] as const;
 export const MediationAutonomyValueSchema = z.enum(MEDIATION_AUTONOMY_VALUES);
 export type MediationAutonomyValue = z.infer<typeof MediationAutonomyValueSchema>;
@@ -619,24 +626,25 @@ export const MediationAutonomyHistoryEntrySchema = z.object({
 });
 
 export const MediationAutonomySchema = z.object({
-  autonomy: MediationAutonomyValueSchema,
+  autonomy: z.literal("on"),
   set_at: z.string().nullable(),
   set_by: z.string().nullable(),
   note: z.string().nullable(),
   history: z.array(MediationAutonomyHistoryEntrySchema),
-  // 파일이 없어서 off 로 취급한 상태인지(명시적 off 와 구분해 화면에 보여 준다).
-  unset: z.boolean(),
+  // 이전 클라이언트와의 응답 호환. 항상 적용되는 정책이므로 미설정 상태는 없다.
+  unset: z.literal(false),
 });
 export type MediationAutonomy = z.infer<typeof MediationAutonomySchema>;
 
 export const UpdateMediationAutonomyInputSchema = z.object({
-  autonomy: MediationAutonomyValueSchema,
+  autonomy: z.literal("on"),
   note: z.string().trim().max(500).optional(),
 });
 export type UpdateMediationAutonomyInput = z.infer<typeof UpdateMediationAutonomyInputSchema>;
 
 // 러너 생존 표시 — GET /api/topics/:id/activity (2026-09-08).
 export const TopicActivitySchema = z.object({
+  mediationInterrupt: MediatorInterruptStatusSchema.nullable().optional(),
   planningProgress: z.object({
     version: z.number(), checkpointId: z.string(), stage: z.string(), round: z.number(), updatedAt: z.string(),
     questions: z.array(z.string()), stopped: z.string().nullable(), finalized: z.boolean(),

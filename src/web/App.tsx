@@ -3,6 +3,8 @@ import { EvidencePanel } from "./EvidencePanel";
 import { RevisionPanel } from "./RevisionPanel";
 import { WorkGroupsPanel } from "./WorkGroupsPanel";
 import { BudgetPanel } from "./BudgetPanel";
+import { EntryGuide, TopicOverview, TopicTree } from "./TopicStructure";
+import { isTopicGroup, workEntry } from "../shared/topicStructure";
 import {
   FormEvent,
   ReactNode,
@@ -19,7 +21,6 @@ import type {
   ClientConfig,
   Finding,
   JobRouteView,
-  MediationAutonomy,
   MessageKind,
   Participant,
   RoutingView,
@@ -125,39 +126,6 @@ const ACTIVE_STATES = new Set<WorkflowState>([
   "CLAUDE_FIX",
   "CODEX_FINAL_REVIEW",
 ]);
-
-// 자율 중재 위임 토글 — 정본은 서버 데이터 디렉터리의 mediation-autonomy.json(셸 스크립트와 공유).
-function AutonomyToggle({
-  value,
-  busy,
-  onToggle,
-}: {
-  value: MediationAutonomy | null;
-  busy: boolean;
-  onToggle: () => void;
-}) {
-  const on = value?.autonomy === "on";
-  const detail = value
-    ? value.unset
-      ? "스위치 파일이 없어 off 로 취급 중"
-      : `${value.set_at ?? "?"} · ${value.set_by ?? "?"}${value.note ? ` · ${value.note}` : ""}`
-    : "불러오는 중";
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={on}
-      aria-label="자율중재 위임"
-      className={`autonomy-toggle ${on ? "on" : "off"}`}
-      disabled={busy || !value}
-      title={`자율중재 위임 ${on ? "ON" : "OFF"} — ${detail}`}
-      onClick={onToggle}
-    >
-      <span className="autonomy-track" aria-hidden="true"><span className="autonomy-knob" /></span>
-      <span className="autonomy-label">자율중재 위임 {on ? "ON" : "OFF"}</span>
-    </button>
-  );
-}
 
 const WORKING_STATES = new Set<WorkflowState>([
   "BRAINSTORMING",
@@ -290,8 +258,6 @@ export function App() {
   const [actionNotice,setActionNotice]=useState<string|null>(null);
   const [dialog, setDialog] = useState<Dialog>(null);
   const [mobilePanel, setMobilePanel] = useState<"topics" | "chat" | "plan">("chat");
-  const [autonomy, setAutonomy] = useState<MediationAutonomy | null>(null);
-  const [autonomyBusy, setAutonomyBusy] = useState(false);
   const [activity, setActivity] = useState<TopicActivity | null>(null);
   const [stageDelivery, setStageDelivery] = useState<({ topicId: string } & StageDeliveryView) | null>(null);
   const reconnectRef = useRef(0);
@@ -344,19 +310,6 @@ export function App() {
     void refreshTopics();
   }, [refreshTopics]);
 
-  // 위임 스위치는 파일이 정본이라(SSH·스크립트로도 바뀐다) 주기적으로 다시 읽는다.
-  useEffect(() => {
-    let cancelled = false;
-    const load = () => api.getMediationAutonomy().then((next) => {
-      if (!cancelled) setAutonomy(next);
-    }).catch((cause) => {
-      if (!cancelled) setError(errorMessage(cause));
-    });
-    void load();
-    const timer = window.setInterval(() => { void load(); }, 15_000);
-    return () => { cancelled = true; window.clearInterval(timer); };
-  }, []);
-
   // 러너 생존 표시 — 에이전트가 도는 상태에서만 10초마다 작업 트리 최근 변경을 읽는다.
   useEffect(() => {
     const state = detail?.topic.id === selectedTopicId ? detail.topic.state : null;
@@ -384,20 +337,6 @@ export function App() {
     if (!selectedTopicId || (state !== "CLOSED" && state !== "READY_TO_DELIVER")) { setStageDelivery(null); return; }
     void refreshStageDelivery(selectedTopicId);
   }, [selectedTopicId, detail?.topic.id, detail?.topic.state, refreshStageDelivery]);
-
-  const toggleAutonomy = useCallback(async () => {
-    if (!autonomy || autonomyBusy) return;
-    const nextValue = autonomy.autonomy === "on" ? "off" : "on";
-    setAutonomyBusy(true);
-    try {
-      setAutonomy(await api.setMediationAutonomy({ autonomy: nextValue, note: "웹 토글" }));
-      setError(null);
-    } catch (cause) {
-      setError(errorMessage(cause));
-    } finally {
-      setAutonomyBusy(false);
-    }
-  }, [autonomy, autonomyBusy]);
 
   useEffect(() => {
     let cancelled = false;
@@ -517,7 +456,6 @@ export function App() {
             <span>계획은 함께 합의하고, 구현은 승인 뒤에 시작합니다.</span>
           </div>
         </div>
-        <AutonomyToggle value={autonomy} busy={autonomyBusy} onToggle={() => { void toggleAutonomy(); }} />
         {selected && (
           <div className="topbar-state">
             <StatusBadge state={selected.state} />
@@ -553,7 +491,7 @@ export function App() {
               <p className="eyebrow">TOPICS</p>
               <h1>주제</h1>
             </div>
-            <button className="icon-button" onClick={() => setDialog("create")} aria-label="새 주제 만들기">+</button>
+            <button className="icon-button" onClick={() => setDialog("create")} aria-label="작업 시작 방식 안내">+</button>
           </div>
           <WorkGroupsPanel onTopic={id=>{void refreshTopics();setSelectedTopicId(id);setMobilePanel("chat");}}/>
           <div className="topic-list">
@@ -562,25 +500,11 @@ export function App() {
             ) : topics.length === 0 ? (
               <EmptyPanel>
                 <strong>아직 주제가 없습니다.</strong>
-                <span>첫 주제를 만들고 두 에이전트 세션을 연결해 보세요.</span>
-                <button className="primary-button" onClick={() => setDialog("create")}>첫 주제 만들기</button>
+                <span>Claude 또는 Codex 중재 세션에서 첫 주제를 시작하세요.</span>
+                <button className="primary-button" onClick={() => setDialog("create")}>작업 시작 방식 보기</button>
               </EmptyPanel>
             ) : (
-              topics.map((topic) => (
-                <button
-                  className={`topic-card ${topic.id === selectedTopicId ? "selected" : ""}`}
-                  key={topic.id}
-                  onClick={() => {
-                    setSelectedTopicId(topic.id);
-                    setMobilePanel("chat");
-                  }}
-                >
-                  <span className="topic-card-title">{topic.title}</span>
-                  <StatusBadge state={topic.state} />
-                  <span className="topic-card-meta">계획 {topic.planRevision}판 · 범위 {topic.scopeGeneration}세대</span>
-                  <span className="topic-card-time">{formatTime(topic.updatedAt)}</span>
-                </button>
-              ))
+              <TopicTree topics={topics} status={topic => <StatusBadge state={topic.state} />} selectedId={selectedTopicId} onSelect={id => { setSelectedTopicId(id); setMobilePanel("chat"); }} />
             )}
           </div>
         </aside>
@@ -597,13 +521,12 @@ export function App() {
                 onSession={(role) => setDialog(role)}
                 onAction={(action, body) => void run(action, () => api.runAction(selected.id, action, body))}
               />
+              <TopicOverview topic={selected} topics={topics} onSelect={setSelectedTopicId} />
+              {activity?.mediationInterrupt && <div className="mediator-interrupt" role="status">
+                <strong>중재자 호출 · {{ unconfigured: "수신 세션 미연결", waiting: "전송 대기", sending: "전송 중", sent: "세션에 전달됨", acknowledged: "중재자 수신 확인", failed: "전송 실패", unknown: "전송 결과 확인 필요" }[activity.mediationInterrupt.state]}</strong>
+                <span>{activity.mediationInterrupt.error ?? activity.mediationInterrupt.reason}</span>
+              </div>}
               <Timeline events={detail.timeline} />
-              <MessageComposer
-                disabled={Boolean(busyAction) || selected.state === "CLOSED"}
-                onSubmit={(kind, body) =>
-                  run("message", () => api.postMessage(selected.id, { kind, body }))
-                }
-              />
             </>
           ) : (
             <EmptyPanel>
@@ -655,18 +578,9 @@ export function App() {
       </main>
 
       {dialog === "create" && (
-        <CreateTopicDialog
-          busy={busyAction === "create"}
-          repositoryPath={clientConfig?.repositoryPath ?? "불러오는 중…"}
-          memoryDirectory={clientConfig?.memoryDirectory ?? "불러오는 중…"}
-          onClose={() => setDialog(null)}
-          onSubmit={(input) =>
-            run("create", async () => {
-              const topic = await api.createTopic(input);
-              setSelectedTopicId(topic.id);
-            })
-          }
-        />
+        <Modal title="중재 세션에서 작업 시작" description="세 가지 방식 중 현재 작업에 맞는 출발점을 중재자에게 전달하세요." onClose={() => setDialog(null)}>
+          <EntryGuide />
+        </Modal>
       )}
       {(dialog === "claude" || dialog === "codex") && selected && (
         <SessionDialog
@@ -724,7 +638,7 @@ function RoomHeader({
 }) {
   const claude = participantFor(topic, "claude");
   const codex = participantFor(topic, "codex");
-  const canStart = topic.state === "DRAFT" && Boolean(claude && codex);
+  const canStart = !isTopicGroup(topic) && Boolean(workEntry(topic).goal) && topic.state === "DRAFT" && Boolean(claude && codex);
   const pendingRetry = topic.state === "FAILED" && Boolean(autoRetryAt);
   const canStop = ACTIVE_STATES.has(topic.state) || pendingRetry;
   const deliveryRecovery = topic.state === "USER_DECISION_REQUIRED" && topic.lastError?.includes("커밋 또는 push 도중");
@@ -735,12 +649,12 @@ function RoomHeader({
       <div>
         <div className="room-title-row">
           <h2>{topic.title}</h2>
-          <StatusBadge state={topic.state} />
+          {isTopicGroup(topic) && topic.state === "DRAFT" ? <span className="status-badge tone-quiet">하위 주제 관리</span> : <StatusBadge state={topic.state} />}
         </div>
         <p>{topic.repositoryPath} · {topic.baseRef}</p>
       </div>
       <div className="room-actions">
-        {(["claude", "codex"] as const).map((seat) => {
+        {(!isTopicGroup(topic) || topic.state.startsWith("BRAINSTORM")) && (["claude", "codex"] as const).map((seat) => {
           const participant = seat === "claude" ? claude : codex;
           const entry = seatRoute(routing, seat);
           const provider = routing ? entry?.route?.provider : DEFAULT_SEAT_PROVIDER[seat];
@@ -756,7 +670,7 @@ function RoomHeader({
           <button className="danger-button" disabled={Boolean(busyAction)} onClick={() => onAction("stop")}>{pendingRetry ? "재시도 예약 취소" : "중단"}</button>
         ) : canRetry ? (
           <button className="secondary-button" disabled={Boolean(busyAction)} onClick={() => onAction("retry")}>다시 시도</button>
-        ) : (
+        ) : isTopicGroup(topic) ? <span className="entry-origin">하위 주제의 진행 상황을 관리합니다.</span> : (
           <button className="primary-button" disabled={!canStart || budgetPaused || Boolean(busyAction)} onClick={() => onAction("plan")}>합의 시작</button>
         )}
       </div>
@@ -767,22 +681,9 @@ function RoomHeader({
 function BrainstormActions({ connected, busy, budgetPaused, onAction }: {
   connected: boolean; busy: boolean; budgetPaused: boolean; onAction: (action: string, body?: Record<string, unknown>) => void;
 }) {
-  const [choice, setChoice] = useState<"plan" | "close" | null>(null);
-  const [decision, setDecision] = useState("");
   return <>
     <button className="primary-button" disabled={!connected || busy || budgetPaused} onClick={() => onAction("brainstorm")}>한 바퀴 논의</button>
-    <button className="secondary-button" disabled={!connected || busy || budgetPaused} onClick={() => setChoice("plan")}>계획으로 진행</button>
-    <button className="ghost-button" disabled={busy} onClick={() => setChoice("close")}>논의 종료</button>
-    {choice && <Modal title={choice === "plan" ? "논의에서 계획으로" : "논의 마치기"}
-      description={choice === "plan" ? "선택한 방향을 남기면 계획 작성과 검토를 시작합니다. 구현은 계획을 승인한 뒤 시작합니다." : "지금 진행하지 않기로 한 이유나 논의에서 얻은 결론을 남겨 주세요."}
-      onClose={() => setChoice(null)}>
-      <form className="modal-form" onSubmit={event => { event.preventDefault(); onAction(`brainstorm-${choice}`, { decision: decision.trim() }); setChoice(null); }}>
-        <label><span>결론과 다음 행동</span><textarea required maxLength={12000} rows={8} value={decision} onChange={event => setDecision(event.target.value)}
-          placeholder={choice === "plan" ? "해결할 문제, 선택한 방향과 이유, 이번에 하지 않을 것, 확인할 결과, 남은 불확실성을 적어 주세요. 작은 실험만 계획해도 됩니다." : "예: 현재 방식으로 충분해서 진행하지 않음 / 자료가 부족해 보류 / 논의만으로 궁금한 점이 해결됨"} /></label>
-        <div className="modal-actions"><button type="button" className="ghost-button" onClick={() => setChoice(null)}>취소</button>
-          <button className="primary-button" disabled={busy || !decision.trim()}>{choice === "plan" ? "계획 시작" : "결론 남기고 종료"}</button></div>
-      </form>
-    </Modal>}
+    <span className="entry-origin">Goal 확정·계획 전환은 중재 세션에서 진행합니다.</span>
   </>;
 }
 
@@ -831,45 +732,6 @@ function Timeline({ events }: { events: TimelineEvent[] }) {
       ))}
       <div ref={bottomRef} />
     </div>
-  );
-}
-
-function MessageComposer({
-  disabled,
-  onSubmit,
-}: {
-  disabled: boolean;
-  onSubmit: (kind: "note" | "scope_change" | "evidence" | "decision", body: string) => Promise<boolean>;
-}) {
-  const [kind, setKind] = useState<"note" | "scope_change" | "evidence" | "decision">("note");
-  const [body, setBody] = useState("");
-
-  const submit = (event: FormEvent) => {
-    event.preventDefault();
-    const trimmed = body.trim();
-    if (!trimmed || disabled) return;
-    void onSubmit(kind, trimmed).then((succeeded) => {
-      if (succeeded) setBody("");
-    });
-  };
-
-  return (
-    <form className="composer" onSubmit={submit}>
-      <label>
-        <span className="sr-only">메시지 종류</span>
-        <select value={kind} onChange={(event) => setKind(event.target.value as typeof kind)} disabled={disabled}>
-          {Object.entries(MESSAGE_COPY).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-        </select>
-      </label>
-      <textarea
-        value={body}
-        onChange={(event) => setBody(event.target.value)}
-        disabled={disabled}
-        placeholder={kind === "scope_change" ? "바뀐 범위를 적어 주세요. 기존 승인은 취소됩니다." : kind === "evidence" ? "파일 경로, 실행 결과, 공식 문서처럼 새 근거를 적어 주세요." : kind === "decision" ? "에이전트가 따라야 할 결정을 분명하게 적어 주세요." : "두 에이전트가 함께 알아야 할 내용을 적어 주세요."}
-        rows={2}
-      />
-      <button className="primary-button" disabled={disabled || !body.trim()}>보내기</button>
-    </form>
   );
 }
 
@@ -1167,40 +1029,6 @@ function Modal({ title, description, onClose, children }: { title: string; descr
         {children}
       </section>
     </div>
-  );
-}
-
-function CreateTopicDialog({ busy, repositoryPath, memoryDirectory, onClose, onSubmit }: { busy: boolean; repositoryPath: string; memoryDirectory: string; onClose: () => void; onSubmit: (input: { title: string; baseRef: string; branchPrefix: string; requestedBranchName: string | null; predecessorTopicId: string | null; startMode: "plan" | "brainstorm" }) => void }) {
-  const [title, setTitle] = useState("");
-  const [startMode, setStartMode] = useState<"plan" | "brainstorm">("plan");
-  const [baseRef, setBaseRef] = useState("HEAD");
-  const [branchPrefix, setBranchPrefix] = useState("consensus");
-  const [requestedBranchName, setRequestedBranchName] = useState("");
-  return (
-    <Modal title="새 주제 만들기" description="목표가 정해졌다면 바로 계획하고, 할 가치가 있는지부터 생각하고 싶다면 먼저 논의하세요. 참여할 AI는 역할 배정에 따릅니다." onClose={onClose}>
-      <form className="modal-form" onSubmit={(event) => { event.preventDefault(); onSubmit({ title, baseRef, branchPrefix, requestedBranchName: requestedBranchName.trim() || null , predecessorTopicId: null, startMode }); }}>
-        <label><span>주제 이름</span><input autoFocus required minLength={2} maxLength={120} value={title} onChange={(event) => setTitle(event.target.value)} placeholder="예: 채팅 취소 처리 정리" /></label>
-        <label><span>시작 방식</span><select aria-label="시작 방식" value={startMode} onChange={event => setStartMode(event.target.value as "plan" | "brainstorm")}>
-          <option value="plan">바로 계획하기</option><option value="brainstorm">먼저 논의하기</option>
-        </select><small>논의는 매번 순서를 무작위로 정해 AI가 한 번씩 발언합니다. 계획으로 넘어갈지는 직접 선택합니다.</small></label>
-        <label><span>고정 저장소</span><output className="fixed-value">{repositoryPath}</output></label>
-        <label><span>공용 메모리</span><output className="fixed-value">{memoryDirectory}</output><small>현재 주제에 맞는 문서만 골라 각 모델에 전달합니다.</small></label>
-        <label><span>기준 리비전</span><input required value={baseRef} onChange={(event) => setBaseRef(event.target.value)} /></label>
-        <label>
-          <span>브랜치 접두사</span>
-          <input required maxLength={40} pattern="[A-Za-z0-9][A-Za-z0-9._-]*" value={branchPrefix}
-            onChange={(event) => setBranchPrefix(event.target.value)} placeholder="consensus" />
-          <small>이름을 직접 지정하지 않으면 <code>{branchPrefix || "consensus"}/&lt;주제&gt;-&lt;id&gt;-g&lt;세대&gt;</code>로 만들어집니다.</small>
-        </label>
-        <label>
-          <span>브랜치 이름 직접 지정</span>
-          <input maxLength={120} value={requestedBranchName}
-            onChange={(event) => setRequestedBranchName(event.target.value)} placeholder="비워 두면 위 규칙으로 자동 생성" />
-          <small>적으면 <code>{requestedBranchName.trim() || "…"}-g&lt;세대&gt;</code>가 됩니다. 세대 접미사는 범위 변경 시 브랜치가 겹치지 않게 항상 붙습니다.</small>
-        </label>
-        <div className="modal-actions"><button type="button" className="ghost-button" onClick={onClose}>취소</button><button className="primary-button" disabled={busy || repositoryPath === "불러오는 중…"}>{busy ? "만드는 중…" : "주제 만들기"}</button></div>
-      </form>
-    </Modal>
   );
 }
 

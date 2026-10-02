@@ -13,6 +13,14 @@ from urllib.error import HTTPError
 from urllib.parse import parse_qs, quote, urlsplit
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 
+def room_data_directory():
+    if os.environ.get("CONSENSUS_ROOM_DATA_DIR"):
+        return Path(os.environ["CONSENSUS_ROOM_DATA_DIR"])
+    if sys.platform == "darwin":
+        return Path.home() / "Library/Application Support/ConsensusRoom"
+    return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "consensus-room"
+
+
 
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -43,7 +51,7 @@ def mediator_identity():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--launch-file", type=Path, default=Path.home() / "Library/Application Support/ConsensusRoom/consensus-room.url")
+    parser.add_argument("--launch-file", type=Path, default=room_data_directory() / "consensus-room.url")
     parser.add_argument("command", choices=["due", "claim", "snapshot", "unchanged", "failure", "attach", "status", "batch", "ack", "connections", "use-rest", "metrics", "host-import", "host-plan", "catalog", "collect"])
     parser.add_argument("--id", help="source ID, or topic ID for attach/status")
     parser.add_argument("--input", type=Path, help="JSON file (do not place secret credentials here)")

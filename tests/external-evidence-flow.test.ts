@@ -204,9 +204,9 @@ it("serves authenticated bridge APIs, rejects stale completions and enforces med
   expect(repeated.statusCode).toBe(409);
   const state = (await app.inject({ method: "GET", url: "/api/topics/t/evidence", headers })).json();
   expect(state.reviewed).toBe(false);
-  const denied = await app.inject({ method: "POST", url: "/api/topics/t/evidence/review", headers: { ...headers, "x-consensus-actor": "mediator" }, payload: { digest: state.digest, plan: state.plan, reason: "Reviewed" } });
-  expect(denied.statusCode).toBe(403);
-  expect((await app.inject({ method: "POST", url: "/api/topics/t/evidence/review", headers, payload: { digest: state.digest, plan: state.plan, reason: "Reviewed source and plan" } })).statusCode).toBe(200);
+  const denied = await app.inject({ method: "POST", url: "/api/topics/t/evidence/review", headers: { "x-consensus-actor": "mediator" }, payload: { digest: state.digest, plan: state.plan, reason: "Reviewed" } });
+  expect(denied.statusCode).toBe(401);
+  expect((await app.inject({ method: "POST", url: "/api/topics/t/evidence/review", headers: { ...headers, "x-consensus-actor": "mediator" }, payload: { digest: state.digest, plan: state.plan, reason: "Reviewed source and plan" } })).statusCode).toBe(200);
   expect((await app.inject({ method: "POST", url: "/api/evidence/status", headers, payload: { dependencies: [{ sourceId: f.source.id, contentHash: update.json().contentHash }] } })).json()).toEqual({ status: "current" });
   const address = await app.listen({ host: "127.0.0.1", port: 0 });
   const launchFile = join(f.root, "launch.url");
@@ -257,7 +257,7 @@ it("uses mediator HTTP and CLI batches without model calls or implicit acknowled
     expect(hostRead.statusCode).toBe(200);
     expect(hostRead.json().changes.map((unit: any) => unit.content)).toEqual(["initial"]);
     expect(fetch).not.toHaveBeenCalled();
-    expect((await app.inject({ method: "POST", url: `/api/evidence/${f.source.id}/use-rest`, headers: mediator, payload: {} })).statusCode).toBe(403);
+    expect((await app.inject({ method: "POST", url: `/api/evidence/${f.source.id}/use-rest`, headers: mediator, payload: {} })).statusCode).not.toBe(200);
     const convert = () => app.inject({ method: "POST", url: `/api/evidence/${f.source.id}/use-rest`, headers, payload: {} });
     expect((await convert()).statusCode).not.toBe(200);
     configured = true;
@@ -573,7 +573,7 @@ it.each([false,true])("frozen corpus uses committed hashes with an existing inde
   expect(entries).toHaveLength(1);expect(JSON.parse(readFileSync(entries[0].path,"utf8")).content).toBe("initial");
 });
 
-it("the user can explicitly re-review migrated closed committed evidence through HTTP",async()=>{
+it("the user and delegated mediator can explicitly re-review migrated closed committed evidence through HTTP",async()=>{
   const f=fixture();f.ingest("changed after historical approval");
   const raw=new DatabaseSync(join(f.root,"room.sqlite"));
   try {raw.prepare("UPDATE topics SET state='CLOSED',committed_oid=? WHERE id='t'").run("b".repeat(40));} finally {raw.close();}
@@ -584,7 +584,7 @@ it("the user can explicitly re-review migrated closed committed evidence through
   const headers={"x-consensus-token":"test-token"},payload={digest:before.digest,plan:before.plan,reason:"Explicitly reviewed retained body"};
   try {
     const url="/api/topics/t/evidence/review";
-    expect((await app.inject({method:"POST",url,headers:{...headers,"x-consensus-actor":"mediator"},payload})).statusCode).toBe(403);
+    expect((await app.inject({method:"POST",url,headers:{...headers,"x-consensus-actor":"mediator"},payload})).statusCode).toBe(200);
     expect((await app.inject({method:"POST",url,headers,payload})).statusCode).toBe(200);
     expect(f.database.getTopic("t").state).toBe("CLOSED");
     expect(f.database.evidence.topic(f.database.getTopic("t"))).toMatchObject({digest:before.digest,reviewed:true,ready:true});

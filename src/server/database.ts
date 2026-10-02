@@ -1,3 +1,5 @@
+import { needsMediatorAttention } from "../shared/mediatorInterrupts.js";
+import { MediatorInterruptStore } from "./mediation/interruptStore.js";
 import { ReviewLedger } from "./reviewLedger.js";
 import { RoleRegistry } from "./roleAssignments.js";
 import { EngineDefectStore } from "./engineDefects.js";
@@ -68,6 +70,7 @@ export class ConsensusDatabase {
   readonly planning: PlanningStore;
   readonly roles: RoleRegistry;
   readonly engineDefects: EngineDefectStore;
+  readonly interrupts: MediatorInterruptStore;
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true });
@@ -84,6 +87,7 @@ export class ConsensusDatabase {
     this.reviews = new ReviewLedger(this.db);
     this.roles = new RoleRegistry(this.db);
     this.engineDefects = new EngineDefectStore(this.db);
+    this.interrupts = new MediatorInterruptStore(this.db);
     this.evidence.freezeFinalized();
     this.evidence.catalog.migrateLegacy();
   }
@@ -305,6 +309,10 @@ export class ConsensusDatabase {
     this.ensureColumn("action_requests", "error", "TEXT");
     // 인도 요청의 시작 HEAD(parent) 등 실행 전 좌표 — 재시작 복구가 "이 요청이 실제로 커밋을 만들었는가" 를 판정할 근거(2026-09-21 host-review R1·R2).
     this.ensureColumn("action_requests", "annotation_json", "TEXT");
+    this.ensureColumn("topics", "topic_kind", "TEXT NOT NULL DEFAULT 'task'");
+    this.ensureColumn("topics", "parent_topic_id", "TEXT REFERENCES topics(id)");
+    this.ensureColumn("topics", "work_entry_json", "TEXT");
+    this.db.exec("CREATE INDEX IF NOT EXISTS topics_parent ON topics(parent_topic_id)");
     this.ensureColumn("topics", "reviewed_head", "TEXT");
     this.ensureColumn("topics", "reviewed_diff_sha256", "TEXT");
     this.ensureColumn("topics", "committed_oid", "TEXT");
@@ -500,8 +508,8 @@ export class ConsensusDatabase {
         scope_generation, plan_revision, plan_sha256, approved_plan_sha256,
         claude_model, claude_effort, codex_model, codex_effort,
         claude_impl_model, claude_impl_effort, codex_impl_model, codex_impl_effort,
-        created_at, updated_at, last_error
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        created_at, updated_at, last_error, topic_kind, parent_topic_id, work_entry_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       input.id, input.slug, input.title, input.repositoryPath, input.baseRef, input.worktreePath,
       input.branchPrefix ?? "consensus",
@@ -513,6 +521,7 @@ export class ConsensusDatabase {
       settings.claude.implementation?.model ?? null, settings.claude.implementation?.effort ?? null,
       settings.codex.implementation?.model ?? null, settings.codex.implementation?.effort ?? null,
       input.createdAt, input.updatedAt, input.lastError,
+      input.topicKind ?? "task", input.parentTopicId ?? null, input.workEntry ? JSON.stringify(input.workEntry) : null,
     );
     this.revisions.initialize(input.id);
     this.reviews.initialize(input.id);
@@ -555,6 +564,7 @@ export class ConsensusDatabase {
   }
 
   updateTopic(id: string, changes: Partial<{
+    workEntry: Topic["workEntry"];
     state: WorkflowState;
     scopeGeneration: number;
     planEpoch: number;
@@ -586,6 +596,7 @@ export class ConsensusDatabase {
     codexImplEffort: AgentExecutionSettings["effort"] | null;
   }>): Topic {
     const columns: Record<string, string> = {
+      workEntry: "work_entry_json",
       state: "state", scopeGeneration: "scope_generation", planEpoch: "plan_epoch", planRevision: "plan_revision",
       planSHA256: "plan_sha256", approvedPlanSHA256: "approved_plan_sha256",
       branchName: "branch_name", lastError: "last_error", fixPassUsed: "fix_pass_used", secondFixPassUsed: "second_fix_pass_used",
@@ -607,7 +618,7 @@ export class ConsensusDatabase {
     const assignments = entries.map(([key]) => `${columns[key]} = ?`);
     // 구현 세션 id 를 바꾸면 그 세션의 바인딩도 무효다 — setImplementationSession 이 새 바인딩을 곧바로 쓴다(E2b).
     if ("implementationSessionId" in changes) assignments.push("implementation_session_provider = NULL", "implementation_session_binding_json = NULL");
-    const values = entries.map(([key, value]) => key === "fixPassUsed" ? (value ? 1 : 0) : value) as SqlValue[];
+    const values = entries.map(([key, value]) => key === "workEntry" ? JSON.stringify(value) : key === "fixPassUsed" ? (value ? 1 : 0) : value) as SqlValue[];
     this.db.prepare(`UPDATE topics SET ${assignments.join(", ")}, updated_at = ? WHERE id = ?`)
       .run(...values, now(), id);
     const result = this.getTopic(id);
@@ -944,16 +955,19 @@ export class ConsensusDatabase {
       input.topicId, sequenceRow.sequence, scopeGeneration, input.actor, input.kind, input.state,
       input.body, JSON.stringify(input.payload ?? {}), createdAt,
     );
-    return TimelineEventSchema.parse({
+    const event = TimelineEventSchema.parse({
       id: Number(result.lastInsertRowid), topicId: input.topicId, sequence: sequenceRow.sequence,
       scopeGeneration, actor: input.actor, kind: input.kind, state: input.state, body: input.body,
       payload: input.payload ?? {}, createdAt,
     });
+    this.interrupts.observe(this.getTopic(input.topicId), event, this.getFlags(input.topicId).resumeState);
+    return event;
   }
 
   private emitEvent(event: TimelineEvent): void {
     try {
       this.events.emit(`topic:${event.topicId}`, event);
+      if (event.actor === "system" && needsMediatorAttention(event.state) || event.payload.interruptRetry) this.events.emit("mediation-change");
     } catch {
       // 구독자 오류는 이미 확정된 원장 기록을 실패나 롤백처럼 보이게 만들지 않는다.
     }
@@ -1514,6 +1528,8 @@ export class ConsensusDatabase {
     });
     return TopicSchema.parse({
       id: row.id, slug: row.slug, title: row.title, repositoryPath: row.repository_path,
+      topicKind: row.topic_kind ?? "task", parentTopicId: row.parent_topic_id ?? null,
+      workEntry: row.work_entry_json ? JSON.parse(String(row.work_entry_json)) : null,
       baseRef: row.base_ref, worktreePath: row.worktree_path,
       branchPrefix: row.branch_prefix ?? "consensus",
       requestedBranchName: row.requested_branch_name ?? null, predecessorTopicId: (row.predecessor_topic_id as string | null) ?? null,

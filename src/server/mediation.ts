@@ -15,7 +15,7 @@ export interface MediationPolicy {
   error: string | null;
 }
 
-// 호출마다 다시 읽는다 — 정책을 고친 뒤 서버를 재시작하지 않아도 다음 호출부터 새 버전이 기록된다(위임 스위치 파일과 같은 규칙).
+// 호출마다 다시 읽는다 — 정책을 고친 뒤 서버를 재시작하지 않아도 다음 호출부터 새 버전이 기록된다(공통 정책 정본).
 export function readMediationPolicy(path: string): MediationPolicy {
   try {
     const text = readFileSync(path, "utf8");

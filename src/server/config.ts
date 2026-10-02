@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { delimiter, join, resolve } from "node:path";
 import {
   AgentSettingsSchema,
   DEFAULT_AGENT_SETTINGS,
@@ -9,29 +9,14 @@ import {
 } from "../shared/contracts.js";
 import type { ExecutionLimits } from "./types.js";
 
-export const SAMPLE_IOS_REPOSITORY = "/Users/example/sample-ios";
-export const SAMPLE_IOS_MEMORY_DIRECTORY = join(
-  homedir(),
-  "Library",
-  "Mobile Documents",
-  "com~apple~CloudDocs",
-  "shared-ai",
-  "memory",
-);
-export const CLAUDE_SKILL_DIRECTORIES = [
-  join(homedir(), ".claude", "skills"),
-] as const;
-export const CODEX_SKILL_DIRECTORIES = [
-  join(
-    homedir(),
-    "Library",
-    "Mobile Documents",
-    "com~apple~CloudDocs",
-    "codex-config",
-    "skills",
-  ),
-  join(homedir(), ".codex", "skills", ".system"),
-] as const;
+// Shared defaults contain no developer or project identity. Private launchers pass explicit overrides.
+export function defaultDataDirectory(platform: NodeJS.Platform = process.platform, home = homedir(), env: NodeJS.ProcessEnv = process.env): string {
+  return platform === "darwin" ? join(home, "Library", "Application Support", "ConsensusRoom")
+    : join(env.XDG_DATA_HOME || join(home, ".local", "share"), "consensus-room");
+}
+function skillDirectories(value: string | undefined, defaults: string[]): string[] {
+  return value === undefined ? defaults : value.split(delimiter).map(path => path.trim()).filter(Boolean);
+}
 
 export interface ServerConfig {
   guardedPlanning?: boolean;
@@ -66,7 +51,7 @@ export function loadConfig(overrides: Partial<ServerConfig> = {}): ServerConfig 
   const dataDirectory = resolve(
     overrides.dataDirectory ??
       process.env.CONSENSUS_ROOM_DATA_DIR ??
-      join(homedir(), "Library", "Application Support", "ConsensusRoom"),
+      defaultDataDirectory(),
   );
   // 환경변수로 지정한 데이터 디렉터리가 없으면 새로 만들지 않고 거부한다. 2026-09-08 실측: 재시작 스크립트가
   // 공백이 든 경로를 잘라 넘겨(`…/Library/Application`) 서버가 빈 DB 로 2분간 떠 있었다. 오타·잘림으로 빈 방이
@@ -77,6 +62,7 @@ export function loadConfig(overrides: Partial<ServerConfig> = {}): ServerConfig 
       "경로를 확인하거나(공백·잘림), 의도한 것이면 먼저 mkdir 하십시오.",
     );
   }
+  const repositoryPath = resolve(overrides.repositoryPath ?? process.env.CONSENSUS_ROOM_REPOSITORY ?? process.cwd());
   const defaultAgentSettings = AgentSettingsSchema.parse(overrides.defaultAgentSettings ?? {
     claude: {
       ...DEFAULT_AGENT_SETTINGS.claude,
@@ -112,10 +98,10 @@ export function loadConfig(overrides: Partial<ServerConfig> = {}): ServerConfig 
     databasePath: resolve(overrides.databasePath ?? join(dataDirectory, "consensus-room.sqlite")),
     // 후보 웹 출력 디렉터리(restart_room.sh 가 커밋별로 만든다, F12). 없으면 종전대로 dist.
     webDirectory: resolve(overrides.webDirectory ?? process.env.CONSENSUS_ROOM_WEB_DIR ?? join(process.cwd(), "dist")),
-    repositoryPath: resolve(overrides.repositoryPath ?? SAMPLE_IOS_REPOSITORY),
-    memoryDirectory: resolve(overrides.memoryDirectory ?? SAMPLE_IOS_MEMORY_DIRECTORY),
-    claudeSkillDirectories: (overrides.claudeSkillDirectories ?? CLAUDE_SKILL_DIRECTORIES).map((path) => resolve(path)),
-    codexSkillDirectories: (overrides.codexSkillDirectories ?? CODEX_SKILL_DIRECTORIES).map((path) => resolve(path)),
+    repositoryPath,
+    memoryDirectory: resolve(overrides.memoryDirectory ?? process.env.CONSENSUS_ROOM_MEMORY_DIR ?? join(repositoryPath, ".consensus-room", "memory")),
+    claudeSkillDirectories: (overrides.claudeSkillDirectories ?? skillDirectories(process.env.CONSENSUS_ROOM_CLAUDE_SKILL_DIRS, [join(homedir(), ".claude", "skills")])).map((path) => resolve(path)),
+    codexSkillDirectories: (overrides.codexSkillDirectories ?? skillDirectories(process.env.CONSENSUS_ROOM_CODEX_SKILL_DIRS, [join(homedir(), ".codex", "skills"), join(homedir(), ".codex", "skills", ".system")])).map((path) => resolve(path)),
     defaultAgentSettings,
     figmaMcpUrl: overrides.figmaMcpUrl !== undefined
       ? overrides.figmaMcpUrl

@@ -154,9 +154,8 @@ it.each(["reversed", "same-provider"])("uses assigned participants for %s and ha
   const sessions = f.database.getTopic(f.id).participants.map(p => p.sessionId);
   expect(new Set(sessions).size).toBe(2);
   expect((await f.action("brainstorm-plan", { decision: " " })).statusCode).toBe(400);
-  expect((await f.action("brainstorm-plan", { decision: "비교 실험만 계획" }, { "x-consensus-actor": "mediator" })).statusCode).toBe(403);
   expect(f.calls).toHaveLength(2);
-  await f.action("brainstorm-plan", { decision: "비교 실험만 계획하고 전체 도입은 제외합니다." }); await f.done();
+  expect((await f.action("brainstorm-plan", { decision: "비교 실험만 계획하고 전체 도입은 제외합니다." }, { "x-consensus-actor": "mediator" })).statusCode).toBe(200); await f.done();
   expect(f.calls[2].turn.job).toEqual({ role: "planner", operation: "plan" });
   expect(f.calls[2].turn.prompt).toContain("전체 도입은 제외");
   expect(f.calls[2].turn.prompt).toContain("비교 실험을 제안");

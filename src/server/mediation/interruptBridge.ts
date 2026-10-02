@@ -1,0 +1,94 @@
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { pathToFileURL } from "node:url";
+import { z } from "zod";
+import type { MediatorInterrupt, MediatorSession } from "../../shared/mediatorInterrupts.js";
+import { interruptMessage, sendCodexInterrupt } from "./codexInterrupt.js";
+
+type Delivery = { interrupt: MediatorInterrupt; claim: string };
+export function claudeChannelNotification(item: MediatorInterrupt) {
+  return { method: "notifications/claude/channel" as const, params: { content: interruptMessage(item),
+    meta: { interrupt_id: item.id, topic_id: item.topicId, source_role: item.sourceRole } } };
+}
+export async function runInterruptBridge(): Promise<void> {
+  const provider = z.enum(["claude", "codex"]).parse(process.argv[2]);
+  const required = (name: string) => { const value = process.env[name]?.trim(); if (!value) throw new Error(`${name} 설정이 필요합니다.`); return value; };
+  const base = new URL(required("CONSENSUS_ROOM_URL"));
+  if (!(["localhost", "127.0.0.1", "[::1]"].includes(base.hostname) && base.protocol === "http:") || base.username || base.password || base.search || base.hash)
+    throw new Error("CONSENSUS_ROOM_URL은 토큰 없는 localhost HTTP 주소여야 합니다.");
+  const token = required("CONSENSUS_ROOM_TOKEN"), topicId = required("CONSENSUS_ROOM_TOPIC_ID");
+  const identity = /^([A-Za-z0-9][A-Za-z0-9._:-]*)@([0-9]+)$/.exec(required("CONSENSUS_MEDIATOR"));
+  if (!identity) throw new Error("CONSENSUS_MEDIATOR 형식: 참여자@배정버전");
+  const session: MediatorSession = { provider, sessionId: required("CONSENSUS_MEDIATOR_SESSION_ID") };
+  const abort = new AbortController();
+  for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, () => abort.abort());
+  const headers = { "x-consensus-token": token, "x-consensus-actor": "mediator", "x-consensus-mediator": identity[1], "x-consensus-mediator-version": identity[2], "content-type": "application/json" };
+  const request = async <T>(path: string, body?: unknown): Promise<T> => {
+    const response = await fetch(new URL(`/api/${path}`, base), { headers, method: body === undefined ? "GET" : "POST",
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.any([abort.signal, AbortSignal.timeout(30_000)]) });
+    if (!response.ok) {
+      const failure = await response.json().catch(() => ({})) as { code?: string };
+      throw Object.assign(new Error(`중재 인터럽트 API ${response.status}`), { status: response.status,
+        fatal: [401, 403].includes(response.status) || Boolean(failure.code && /MEDIATOR/.test(failure.code)) });
+    }
+    return await response.json() as T;
+  };
+  const received = new Map<string, Delivery>();
+  const receipt = (delivery: Delivery, state: "sent" | "acknowledged" | "failed" | "unknown", error?: string) => request(
+    `topics/${delivery.interrupt.topicId}/interrupts/${delivery.interrupt.id}/receipt`, { ...session, claim: delivery.claim, state, ...(error ? { error } : {}) });
+  let mcp: Server | null = null;
+  if (provider === "claude") {
+    mcp = new Server({ name: "consensus-room", version: "1.0.0" }, { capabilities: { experimental: { "claude/channel": {} }, tools: {} },
+      instructions: "Consensus Room의 현재 중재자에게 개입 요청을 전달합니다. 알림 ID를 확인하고 consensus_interrupt_ack로 수신을 확인하세요. resume의 현재 상태와 기존 권한을 기준으로 중재하며, 알림 자체를 재개 승인으로 취급하지 마세요." });
+    mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [{ name: "consensus_interrupt_ack", description: "이미 받은 중재 개입 요청의 수신을 확인합니다. 작업 상태나 승인을 변경하지 않습니다.", inputSchema: { type: "object", properties: { interruptId: { type: "string" } }, required: ["interruptId"], additionalProperties: false } }] }));
+    mcp.setRequestHandler(CallToolRequestSchema, async ({ params }) => {
+      if (params.name !== "consensus_interrupt_ack") throw new Error("알 수 없는 도구");
+      const { interruptId } = z.object({ interruptId: z.string() }).strict().parse(params.arguments);
+      const delivery = received.get(interruptId); if (!delivery) throw new Error("이 채널에서 전달한 현재 요청이 아닙니다.");
+      await receipt(delivery, "acknowledged");
+      return { content: [{ type: "text", text: "중재자 수신 확인을 기록했습니다." }] };
+    });
+    const initialized = new Promise<void>(resolve => { mcp!.oninitialized = resolve; });
+    mcp.onclose = () => abort.abort();
+    await mcp.connect(new StdioServerTransport()); await initialized;
+  }
+  try {
+    while (!abort.signal.aborted) {
+      try {
+        const query = new URLSearchParams({ ...session, waitMs: "25000", descendants: "true" });
+        const { items } = await request<{ items: MediatorInterrupt[] }>(`topics/${encodeURIComponent(topicId)}/interrupts?${query}`);
+        for (const item of items) {
+          if (abort.signal.aborted) break;
+          let delivery: Delivery;
+          try { delivery = await request<Delivery>(`topics/${item.topicId}/interrupts/${item.id}/claim`, session); }
+          catch (error) { if ((error as { status?: number }).status === 409 && !(error as { fatal?: boolean }).fatal) continue; throw error; }
+          try {
+            if (mcp) {
+              received.set(item.id, delivery);
+              try { await mcp.notification(claudeChannelNotification(delivery.interrupt)); }
+              catch { throw Object.assign(new Error("Claude 채널 전송 결과를 확인할 수 없습니다."), { uncertain: true }); }
+            }
+            else await sendCodexInterrupt(session.sessionId, delivery.interrupt, process.env.CONSENSUS_CODEX_SOCKET);
+          } catch (error) {
+            await receipt(delivery, (error as { uncertain?: boolean }).uncertain ? "unknown" : "failed", error instanceof Error ? error.message : "전송 실패");
+            continue;
+          }
+          // A lost receipt never causes another send in this process. The server expires it to unknown.
+          await receipt(delivery, "sent");
+        }
+      } catch (error) {
+        if (abort.signal.aborted) break;
+        if ((error as { fatal?: boolean }).fatal) throw error;
+        process.stderr.write("중재 인터럽트 연결을 확인하지 못했습니다. 5초 뒤 다시 연결합니다.\n");
+        await new Promise<void>(resolve => {
+          const finish = () => { clearTimeout(timer); abort.signal.removeEventListener("abort", finish); resolve(); };
+          const timer = setTimeout(finish, 5000); abort.signal.addEventListener("abort", finish, { once: true });
+        });
+      }
+    }
+  } finally { await mcp?.close(); }
+}
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  runInterruptBridge().catch(error => { process.stderr.write(`${error instanceof Error ? error.message : "인터럽트 연결 실패"}\n`); process.exitCode = 1; });
+}
