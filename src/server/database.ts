@@ -564,6 +564,7 @@ export class ConsensusDatabase {
   }
 
   updateTopic(id: string, changes: Partial<{
+    parentTopicId: string | null;
     workEntry: Topic["workEntry"];
     state: WorkflowState;
     scopeGeneration: number;
@@ -596,6 +597,7 @@ export class ConsensusDatabase {
     codexImplEffort: AgentExecutionSettings["effort"] | null;
   }>): Topic {
     const columns: Record<string, string> = {
+      parentTopicId: "parent_topic_id",
       workEntry: "work_entry_json",
       state: "state", scopeGeneration: "scope_generation", planEpoch: "plan_epoch", planRevision: "plan_revision",
       planSHA256: "plan_sha256", approvedPlanSHA256: "approved_plan_sha256",

@@ -1,3 +1,4 @@
+import { assertTopicParent } from "./topicStructure.js";
 import { dependencyClosure, stageReady, WorkGroupCreateOptionsSchema, WorkGroupInputSchema } from "../shared/workGroups.js";
 import { BudgetPolicySchema, OBSERVE_USAGE } from "../shared/budgets.js";
 import { existsSync } from "node:fs";
@@ -58,6 +59,7 @@ export class WorkGroupService {
     const id = randomUUID();
     const creation = WorkGroupCreateOptionsSchema.parse(options);
     const parsed = WorkGroupInputSchema.parse(input);
+    assertTopicParent(this.database, creation.parentTopicId);
     let base: string;
     if (creation.baseRef === undefined) base = await this.git.head(this.repositoryPath);
     else {
@@ -84,12 +86,13 @@ export class WorkGroupService {
     );
     prepared?.(id);
     return this.database.workGroups.atomic(() => {
+      assertTopicParent(this.database, creation.parentTopicId);
       const group = this.database.workGroups.create(
         id,
         parsed,
         this.repositoryPath,
         base,
-        { branchPrefix: creation.branchPrefix, predecessor },
+        { parentTopicId: creation.parentTopicId, branchPrefix: creation.branchPrefix, predecessor },
       );
       this.database.budgets.configure(
         id,
@@ -155,6 +158,7 @@ export class WorkGroupService {
     requested: string | undefined,
   ) {
     const group = this.database.workGroups.get(id);
+    assertTopicParent(this.database, group.parentTopicId);
     this.database.budgets.assertAvailable([id]);
     const reserved = reservation(group);
     const { stage, selected } = this.admit(group, requested, reserved?.stageId);
@@ -204,18 +208,20 @@ export class WorkGroupService {
     // Recheck after the asynchronous Git boundary; never link against a changed common contract.
     // 착수 조건도 다시 본다 — 기다리는 사이 막혔던 단계가 재개됐으면 선택 착수는 성립하지 않는다(예약은 남아 다음 호출이 이어 연다).
     const current = this.database.workGroups.get(id);
-    if (current.version !== group.version)
+    if (current.version !== group.version || current.parentTopicId !== group.parentTopicId)
       throw new Error(
         "작업 묶음이 변경됐습니다. 생성한 작업 트리는 보존했습니다.",
       );
     this.admit(current, requested, stage.id);
     const budget = stage.budget ?? OBSERVE_USAGE;
     const created = this.database.workGroups.atomic(() => {
+      assertTopicParent(this.database, current.parentTopicId);
       const timestamp = new Date().toISOString();
       const topic =
         this.database.listTopics().find((topic) => topic.id === topicId) ??
         this.database.createTopic({
           id: topicId,
+          parentTopicId: current.parentTopicId ?? null,
           slug,
           title: `${group.title} · ${stage.title}`,
           repositoryPath: group.repositoryPath,

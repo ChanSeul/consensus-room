@@ -125,13 +125,14 @@ export type WorkGroupInput = z.infer<typeof WorkGroupInputSchema>;
 //    같은 기준 위에서 시작하므로 모든 단계가 그 원장을 이어받는다(inheritedDeferredFindings → deferredFindingsFor).
 export const WorkGroupCreateOptionsSchema = z
   .object({
+    parentTopicId: z.string().uuid().optional(),
     baseRef: z.string().trim().min(1).refine((value) => !value.startsWith("-"), "기준 리비전은 '-'로 시작할 수 없습니다.").optional(),
     branchPrefix: BranchPrefixSchema.optional(),
     predecessorTopicId: z.string().uuid().optional(),
   })
   .strict();
 export type WorkGroupCreateOptions = z.infer<typeof WorkGroupCreateOptionsSchema>;
-const CREATE_OPTION_KEYS = ["baseRef", "branchPrefix", "predecessorTopicId"] as const;
+const CREATE_OPTION_KEYS = ["baseRef", "branchPrefix", "predecessorTopicId", "parentTopicId"] as const;
 // 생성 요청 본문을 묶음 입력과 생성 전용 입력으로 나눠 각각 검증한다.
 export function parseWorkGroupCreateBody(body: unknown): { input: WorkGroupInput; options: WorkGroupCreateOptions } {
   const record = body && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, unknown>) : {};
@@ -218,6 +219,7 @@ export interface WorkGroupRevision {
   contractsChanged?: boolean;
 }
 export interface WorkGroup extends WorkGroupInput {
+  parentTopicId?: string;
   id: string;
   repositoryPath: string;
   baseOID: string;

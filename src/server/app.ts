@@ -2,7 +2,7 @@ import { registerInterruptRoutes, interruptStatus } from "./mediation/interruptR
 import { z } from "zod";
 import { SetTopicGoalSchema } from "../shared/topicStructure.js";
 import { parseEvidenceSource } from "../shared/externalEvidence.js";
-import { assertTopicParent } from "./topicStructure.js";
+import { adoptTopics, assertTopicParent } from "./topicStructure.js";
 import { BrainstormDecisionSchema, BrainstormInputSchema } from "../shared/brainstorm.js";
 import { PlanningMigrationSchema } from "../shared/planningControl.js";
 import {ReviewGrantInputSchema} from "../shared/reviews.js";
@@ -184,8 +184,9 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     if (request.headers["x-consensus-actor"] !== "mediator") return;
     const route = request.routeOptions.url ?? "";
     const id = (request.params as { id?: string }).id;
-    const parentId = route === "/api/topics" && typeof (request.body as { parentTopicId?: unknown } | null)?.parentTopicId === "string"
+    let parentId = (route === "/api/topics" || route === "/api/work-groups") && typeof (request.body as { parentTopicId?: unknown } | null)?.parentTopicId === "string"
       ? (request.body as { parentTopicId: string }).parentTopicId : null;
+    if (id && route === "/api/work-groups/:id/next") parentId = database.workGroups.get(id).parentTopicId ?? null;
     // 토픽 경로는 그 토픽의 적용 배정(토픽 → 전역)과 대조한다. 원문 id 경로(/api/evidence/:id/*, 연결 토픽의 근거 상태)와 작업 묶음 경로
     // (/api/work-groups/:id/*)는 여러 토픽이 함께 쓰는 리소스다 — 영향받는 진행 중(닫히지 않은) 토픽 중 하나의 현재 배정과 같으면 수락한다
     // (host-review a7a9ce86 F-002: 토픽마다 중재자가 다르면 모두와 같을 수 없다). 영향 토픽이 없거나 조회할 수 없으면 전역 배정으로 판정한다.
@@ -240,11 +241,14 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   app.post("/api/work-groups",async(request,reply)=>{
     // 생성 전용 입력(기준 커밋·단계 브랜치 접두사·묶음 밖 선행 토픽)은 묶음 입력과 따로 검증한다 — 개정 입력(revise)에는 없다.
     const {input,options}=parseWorkGroupCreateBody(request.body);
+    if (options.parentTopicId && request.headers["x-consensus-actor"] === "mediator") assertMediatorAssignment(database.roles, request.headers, options.parentTopicId);
     return runIdempotent(request,reply,globalLedger(database,"work-group:create"),201,key=>workGroups.create(input,id=>database.annotateGlobalRequest("work-group:create",key,{plannedGroupId:id}),options));
   });
   // 본문 stageId 가 있으면 막힌 단계 옆 독립 준비 단계를 골라 연다(E4-6). 없으면 기본 규칙(한 번에 한 단계, 첫 준비 단계).
   app.post<{Params:{id:string}}>("/api/work-groups/:id/next",async(request,reply)=>{
     callOrigin(request);
+    const parentId = database.workGroups.get(request.params.id).parentTopicId;
+    if (parentId && request.headers["x-consensus-actor"] === "mediator") assertMediatorAssignment(database.roles, request.headers, parentId);
     const requested=(request.body as {stageId?:unknown}|undefined)?.stageId;
     if(requested!==undefined&&(typeof requested!=="string"||!requested))throw Object.assign(new Error("stageId 는 단계 ID 문자열이어야 합니다."),{statusCode:400});
     return runIdempotent(request,reply,globalLedger(database,`work-group:next:${request.params.id}`),201,key=>workGroups.next(request.params.id,(plannedTopicId,worktreePath)=>database.annotateGlobalRequest(`work-group:next:${request.params.id}`,key,{plannedTopicId,worktreePath}),requested));
@@ -465,6 +469,15 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       });
       return topic;
     });
+  });
+
+  app.post<{ Params: { id: string } }>("/api/topics/:id/adopt", async (request, reply) => {
+    if (request.headers["x-consensus-actor"] === "mediator") throw Object.assign(new Error("기존 주제의 계층 연결은 사용자만 지정할 수 있습니다."), { statusCode: 403 });
+    const input = z.object({ topicIds: z.array(z.string().uuid()).max(500).default([]), workGroupIds: z.array(z.string().uuid()).max(50).default([]) })
+      .strict().refine(value => value.topicIds.length + value.workGroupIds.length > 0, "연결할 주제 또는 묶음이 필요합니다.").parse(request.body);
+    return runIdempotent(request, reply, actionLedger(database, request.params.id, "topics:adopt"), 200,
+      () => adoptTopics(database, request.params.id, input.topicIds, input.workGroupIds, id => workflow.assertBudgetEditable(id)),
+      createHash("sha256").update(JSON.stringify(input)).digest("hex"));
   });
 
   app.post<{ Params: { id: string } }>("/api/topics/:id/goal", async (request, reply) => {

@@ -119,14 +119,14 @@ export class WorkGroups {
     input: WorkGroupInput,
     repositoryPath: string,
     baseOID: string,
-    options: Pick<WorkGroup, "branchPrefix" | "predecessor"> = {},
+    options: Pick<WorkGroup, "branchPrefix" | "predecessor" | "parentTopicId"> = {},
   ): WorkGroup {
     const group: WorkGroup = {
       ...sanitizeInput(input),
       id,
       repositoryPath,
       baseOID,
-      ...compact({ branchPrefix: options.branchPrefix, predecessor: options.predecessor ? structuredClone(options.predecessor) : undefined }),
+      ...compact({ parentTopicId: options.parentTopicId, branchPrefix: options.branchPrefix, predecessor: options.predecessor ? structuredClone(options.predecessor) : undefined }),
       version: 1,
       createdAt: new Date().toISOString(),
       links: {},
@@ -361,6 +361,14 @@ export class WorkGroups {
     const covered = new Set([...context.priorResults.map((r) => r.stageId),
       ...context.mergeTargets.filter((m) => m.result).map((m) => m.stageId)]);
     return renderContext(context, prior.filter((p) => !covered.has(p.stageId)));
+  }
+  // 계층 연결은 단계 계약을 개정하거나 동결 결과를 무효화하지 않는다.
+  attachParent(id: string, parentTopicId: string): void {
+    const group = this.get(id);
+    if (group.parentTopicId && group.parentTopicId !== parentTopicId)
+      throw new Error("작업 묶음에는 이미 부모 주제가 있습니다.");
+    if (Object.keys(group.pending ?? {}).length) throw new Error("준비 중인 단계가 있어 계층을 변경할 수 없습니다.");
+    if (group.parentTopicId !== parentTopicId) this.save({ ...group, parentTopicId });
   }
   private save(g: WorkGroup) {
     this.db

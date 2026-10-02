@@ -14,7 +14,7 @@ export function EntryGuide() {
 
 export function TopicTree({ topics, selectedId, onSelect, status }: { topics: Topic[]; selectedId: string | null; onSelect: (id: string) => void; status?: (topic: Topic) => ReactNode }) {
   const forest = useMemo(() => topicForest(topics), [topics]);
-  const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set(topics.filter(isTopicGroup).map(topic => topic.id)));
   useEffect(() => {
     const selected = topics.find(topic => topic.id === selectedId);
     if (!selected) return;

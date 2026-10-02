@@ -86,8 +86,10 @@ const stageStatus = (state: string | null | undefined) =>
 
 export function WorkGroupsPanel({
   onTopic,
+  topicIds,
 }: {
   onTopic: (id: string) => void;
+  topicIds?: readonly string[];
 }) {
   const [groups, setGroups] = useState<WorkGroupView[]>([]);
   const [busy, setBusy] = useState(false),
@@ -128,11 +130,12 @@ export function WorkGroupsPanel({
       const topic = await api.nextWorkStage(groupId, stageId);
       onTopic(topic.id);
     });
-  if (groups.length === 0 && !error) return null;
+  const visibleGroups = topicIds ? groups.filter(group => (group.parentTopicId && topicIds.includes(group.parentTopicId)) || Object.values(group.links).some(link => topicIds.includes(link.topicId))) : groups;
+  if (visibleGroups.length === 0 && !error) return null;
   return (
     <section className="work-groups" aria-label="단계별 작업">
       {error && <p role="alert">{error}</p>}
-      {groups.map((group) => {
+      {visibleGroups.map((group) => {
         const integration = group.stages.at(-1)!;
         const verified = group.stageStates[integration.id] === "CLOSED";
         const questions = (group.questions ?? []).filter(

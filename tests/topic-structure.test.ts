@@ -138,3 +138,69 @@ it("child creation uses the parent's current mediator assignment instead of the 
   expect((await f.post("topics", body, { "x-consensus-actor": "mediator", "x-consensus-mediator": "global-owner", "x-consensus-mediator-version": "1" })).statusCode).toBe(409);
   expect((await f.post("topics", body, { "x-consensus-actor": "mediator", "x-consensus-mediator": "root-owner", "x-consensus-mediator-version": "2" })).statusCode).toBe(201);
 });
+
+it("adopts existing results without changing approvals, plans or worktrees and persists the hierarchy", async () => {
+  const f = await fixture();
+  const parent = await f.create({ title: "기존 작업 큰 그림", topicKind: "group" });
+  const leaf = await f.create({ title: "기존 실행 결과" });
+  f.db.updateTopic(leaf.id, { state: "READY_TO_DELIVER", planSHA256: "a".repeat(64), approvedPlanSHA256: "a".repeat(64),
+    planRevision: 3, planEpoch: 2, committedOID: "b".repeat(40) });
+  const before = f.db.getTopic(leaf.id), flags = f.db.getFlags(leaf.id);
+  const response = await f.post(`topics/${parent.id}/adopt`, { topicIds: [leaf.id] }, { "idempotency-key": "adopt-result" });
+  expect(response.statusCode, response.body).toBe(200);
+  expect((await f.post(`topics/${parent.id}/adopt`, { topicIds: [leaf.id] }, { "idempotency-key": "adopt-result" })).body).toBe(response.body);
+  await f.restart();
+  const after = f.db.getTopic(leaf.id);
+  expect({ ...after, parentTopicId: before.parentTopicId, updatedAt: before.updatedAt }).toEqual(before);
+  expect(after.parentTopicId).toBe(parent.id);
+  expect(f.db.getFlags(leaf.id)).toEqual(flags);
+  expect(f.calls).toHaveLength(0);
+});
+
+it("rejects reparenting, active work, manager cycles and mediator adoption atomically", async () => {
+  const f = await fixture();
+  const parent = await f.create({ title: "첫 큰 그림", topicKind: "group" });
+  const other = await f.create({ title: "다른 큰 그림", topicKind: "group" });
+  const leaf = await f.create({ title: "첫 실행" });
+  const busy = await f.create({ title: "작업 중 실행" });
+  f.db.updateTopic(busy.id, { state: "IMPLEMENTING" });
+  expect((await f.post(`topics/${parent.id}/adopt`, { topicIds: [leaf.id, busy.id] })).statusCode).toBe(409);
+  expect(f.db.getTopic(leaf.id).parentTopicId).toBeNull();
+  expect((await f.post(`topics/${parent.id}/adopt`, { topicIds: [other.id] })).statusCode).toBe(409);
+  expect((await f.post(`topics/${parent.id}/adopt`, { topicIds: [leaf.id] }, { "x-consensus-actor": "mediator" })).statusCode).toBe(403);
+  expect((await f.app.inject({ method: "POST", url: `/api/topics/${parent.id}/adopt`, payload: { topicIds: [leaf.id] } })).statusCode).toBe(401);
+  expect((await f.post(`topics/${parent.id}/adopt`, { topicIds: [leaf.id] })).statusCode).toBe(200);
+  expect((await f.post(`topics/${other.id}/adopt`, { topicIds: [leaf.id] })).statusCode).toBe(409);
+  f.db.updateTopic(busy.id, { state: "DRAFT" });
+});
+
+it("adopts legacy work groups together and keeps subsequent stage creation under the same parent", async () => {
+  const f = await fixture();
+  const parent = await f.create({ title: "단계 작업 큰 그림", topicKind: "group" });
+  const input = { title: "단계 묶음", goal: "순차 진행", contracts: "기존 동작 보존", stages: [
+    { id: "a", title: "첫 작업", goal: "첫 결과", acceptance: "첫 확인", dependsOn: [] },
+    { id: "b", title: "다음 작업", goal: "독립 결과", acceptance: "다음 확인", dependsOn: [] },
+    { id: "z", kind: "integration", title: "통합", goal: "전체 확인", acceptance: "통합 확인", dependsOn: ["a", "b"] },
+  ] };
+  const made = await f.post("work-groups", input); expect(made.statusCode, made.body).toBe(201);
+  const groupId = made.json().id;
+  const first = await f.post(`work-groups/${groupId}/next`, {}); expect(first.statusCode, first.body).toBe(201);
+  const firstId = first.json().id;
+  expect((await f.post(`topics/${parent.id}/adopt`, { topicIds: [firstId] })).statusCode).toBe(409);
+  const before = f.db.workGroups.get(groupId);
+  expect((await f.post(`topics/${parent.id}/adopt`, { workGroupIds: [groupId] })).statusCode).toBe(200);
+  expect(f.db.getTopic(firstId).parentTopicId).toBe(parent.id);
+  expect(f.db.workGroups.get(groupId)).toEqual({ ...before, parentTopicId: parent.id });
+  f.db.updateTopic(firstId, { state: "BLOCKED_ON_EVIDENCE", resumeState: "CLAUDE_PLAN" });
+  const next = await f.post(`work-groups/${groupId}/next`, { stageId: "b" }); expect(next.statusCode, next.body).toBe(201);
+  expect(next.json().parentTopicId).toBe(parent.id);
+  expect((await f.post("role-assignments", { scope: "global", role: "mediator", participant: "global-owner", expectedVersion: 0 })).statusCode).toBe(200);
+  expect((await f.post("role-assignments", { scope: `topic:${parent.id}`, role: "mediator", participant: "root-owner", expectedVersion: 0 })).statusCode).toBe(200);
+  const owner = { "x-consensus-actor": "mediator", "x-consensus-mediator": "root-owner", "x-consensus-mediator-version": "2" };
+  const stale = { ...owner, "x-consensus-mediator": "global-owner", "x-consensus-mediator-version": "1" };
+  expect((await f.post("work-groups", { ...input, parentTopicId: parent.id }, stale)).statusCode).toBe(409);
+  const fresh = await f.post("work-groups", { ...input, parentTopicId: parent.id }, owner); expect(fresh.statusCode, fresh.body).toBe(201);
+  expect((await f.post(`work-groups/${fresh.json().id}/next`, {}, stale)).statusCode).toBe(409);
+  const freshStage = await f.post(`work-groups/${fresh.json().id}/next`, {}, owner); expect(freshStage.statusCode, freshStage.body).toBe(201);
+  expect(freshStage.json().parentTopicId).toBe(parent.id);
+});

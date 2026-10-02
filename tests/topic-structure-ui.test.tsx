@@ -19,8 +19,9 @@ it("keeps nested navigation, leaf totals, collapsed branches and the selected pa
   const topics = [leaf, closed, root, sub]; // Server order is recent activity, not hierarchy order.
   const view = render(<TopicTree topics={topics} selectedId={root.id} onSelect={onSelect} />);
   expect(screen.getByText("말단 1/2 종료")).toBeInTheDocument();
-  expect(screen.getByText("말단 0/1 종료")).toBeInTheDocument();
+  expect(screen.queryByText("입력 경로")).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "제품 큰 그림 하위 주제" }));
+  expect(screen.getByText("말단 0/1 종료")).toBeInTheDocument();
   expect(screen.queryByText("자료 읽기")).not.toBeInTheDocument();
   view.rerender(<TopicTree topics={topics} selectedId={leaf.id} onSelect={onSelect} />);
   expect(screen.getByText("자료 읽기")).toBeInTheDocument();

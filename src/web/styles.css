@@ -293,3 +293,9 @@ h3 { font-size: 17px; }
 
 .mediator-interrupt { flex: 0 0 auto; display: grid; gap: 5px; padding: 12px 24px; background: #302619; border-bottom: 1px solid #57482c; color: #e6c789; font-size: 12px; }
 .mediator-interrupt > span { color: #c4b79c; max-height: 70px; overflow: auto; white-space: pre-wrap; }
+
+/* 목표와 실행 제어는 우측 패널의 일반 문서 흐름에 둔다. */
+.inspector-scroll > .topic-overview { margin: 0 -15px; max-height: none; overflow: visible; padding: 18px 15px; }
+.room-controls { padding: 16px 0; border-bottom: 1px solid var(--line); }
+.room-controls .room-actions { display: grid; grid-template-columns: minmax(0, 1fr); align-items: stretch; }
+.room-controls .session-chip { text-align: left; overflow-wrap: anywhere; }
