@@ -21,7 +21,7 @@ afterEach(() => {
 
 describe("설정 초기화에서 구현 모델 보존", () => {
   it.each([
-    [undefined, undefined, "claude-opus-5-5", "max"],
+    [undefined, undefined, "claude-fable-5-1", "xhigh"],
     ["claude-opus-5-5", "high", "claude-opus-5-5", "high"],
   ])("계획 환경변수 %s/%s와 별개로 구현은 Sonnet 5.5를 쓴다", (model, effort, expectedModel, expectedEffort) => {
     vi.stubEnv("CONSENSUS_ROOM_CLAUDE_MODEL", model);
