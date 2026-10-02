@@ -12,6 +12,10 @@ const eventSources: FakeEventSource[] = [];
 
 beforeEach(() => {
   eventSources.length = 0;
+  vi.spyOn(api,"sessionGraph").mockImplementation(async topicId => ({ topicId, nodes: [
+    {id:"planner",kind:"session",topicId,lane:topicId,label:"플래너",subtitle:"claude",role:"planner",status:"idle",historical:false,sessionId:"claude-session",details:[]},
+    {id:"reviewer",kind:"session",topicId,lane:topicId,label:"계획 검토자",subtitle:"claude",role:"plan-reviewer",status:"idle",historical:false,sessionId:"reviewer-session",details:[]},
+  ],edges:[],lanes:[{id:topicId,title:"주제"}],warnings:[],checkedAt:new Date().toISOString()}));
   vi.spyOn(api,"listWorkGroups").mockResolvedValue([]);
   Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
     configurable: true,
@@ -44,6 +48,7 @@ describe("방 화면의 비동기 결과", () => {
     vi.spyOn(api, "listTopics").mockResolvedValue([topic]);
     vi.spyOn(api, "getTopic").mockResolvedValue(makeDetail(topic, [timelineEvent(1, "중재 세션에서 전달한 지시")]));
     render(<App />);
+    fireEvent.click(await screen.findByRole("tab", { name: "대화창" }));
     expect(await screen.findByText("중재 세션에서 전달한 지시")).toBeInTheDocument();
     expect(screen.queryByPlaceholderText("두 에이전트가 함께 알아야 할 내용을 적어 주세요.")).not.toBeInTheDocument();
     expect(screen.queryByRole("combobox", { name: "메시지 종류" })).not.toBeInTheDocument();
@@ -51,10 +56,9 @@ describe("방 화면의 비동기 결과", () => {
     expect(screen.queryByRole("switch", { name: "자율중재 위임" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "긴 작업을 단계로 나누기" })).not.toBeInTheDocument();
     const overview = screen.getByRole("region", { name: "주제 목표와 진행 방식" });
-    const controls = screen.getByRole("region", { name: "에이전트와 실행" });
+    const controls = screen.getByRole("region", { name: "작업 실행" });
     expect(overview.closest(".inspector-scroll")?.firstElementChild).toBe(overview);
-    expect(controls.previousElementSibling).toBe(overview);
-    expect(controls.closest(".chat-pane")).toBeNull();
+    expect(controls.closest(".chat-pane")).not.toBeNull();
     expect(screen.getByText("검토 쟁점").closest("details")?.nextElementSibling).toBeNull();
     for (const label of ["범위 지정 커밋", "푸시 승인", "주제 닫기", "빌드 트리 정리"])
       expect(screen.queryByRole("button", { name: label })).not.toBeInTheDocument();
@@ -74,6 +78,7 @@ describe("방 화면의 비동기 결과", () => {
     vi.spyOn(api, "runAction").mockResolvedValue({ accepted: true, actionId: "plan", topic });
 
     render(<App />);
+    fireEvent.click(await screen.findByRole("tab", { name: "대화창" }));
     await screen.findByText("첫 기록");
     await waitFor(() => expect(eventSources).toHaveLength(1));
     fireEvent.click(screen.getByRole("button", { name: "합의 시작" }));
@@ -119,7 +124,8 @@ describe("저장소와 에이전트 실행 설정", () => {
     });
 
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: /Claude 연결됨/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /^플래너 ·/ }));
+    fireEvent.click(screen.getByRole("button", {name:"현재 세션·설정 변경"}));
     fireEvent.change(screen.getByRole("textbox", { name: "Claude 모델" }), { target: { value: "sonnet" } });
     fireEvent.change(screen.getByRole("combobox", { name: "Claude 추론 강도" }), { target: { value: "high" } });
     fireEvent.click(screen.getByRole("button", { name: "설정 저장" }));
@@ -140,7 +146,8 @@ describe("저장소와 에이전트 실행 설정", () => {
     const update = vi.spyOn(api, "updateAgentSettings").mockResolvedValue(topic);
 
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: /Claude 연결/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /^플래너 ·/ }));
+    fireEvent.click(screen.getByRole("button", {name:"현재 세션·설정 변경"}));
     fireEvent.change(screen.getByRole("textbox", { name: "Claude 모델" }), { target: { value: "sonnet" } });
     fireEvent.click(screen.getByRole("button", { name: "설정 저장" }));
 
@@ -151,20 +158,7 @@ describe("저장소와 에이전트 실행 설정", () => {
     }));
   });
 
-  it("구현 단계에서는 계획 모델이 아니라 구현 모델을 보여 준다", async () => {
-    const planning = withImplementationOverride(makeTopic());
-    vi.spyOn(api, "listTopics").mockResolvedValue([planning]);
-    vi.spyOn(api, "getTopic").mockResolvedValue(makeDetail(planning));
-    const { unmount } = render(<App />);
-    expect(await screen.findByRole("button", { name: /Claude 연결 · 계획 fable · xhigh/ })).toBeInTheDocument();
-    unmount();
 
-    const implementing = { ...planning, state: "IMPLEMENTING" as const };
-    vi.spyOn(api, "listTopics").mockResolvedValue([implementing]);
-    vi.spyOn(api, "getTopic").mockResolvedValue(makeDetail(implementing));
-    render(<App />);
-    expect(await screen.findByRole("button", { name: /Claude 연결 · 구현 opus · xhigh/ })).toBeInTheDocument();
-  });
 });
 
 function withImplementationOverride(topic: Topic): Topic {
@@ -208,32 +202,9 @@ describe("역할과 실제 실행 AI", () => {
     ] };
   }
 
-  it("좌석 칩은 역할과 그 좌석이 지금 실행할 실제 AI 를 보여 주고, 배정 경로면 프로필 설정을 보여 준다", async () => {
-    const topic = auditing();
-    vi.spyOn(api, "listTopics").mockResolvedValue([topic]);
-    vi.spyOn(api, "getTopic").mockResolvedValue({ ...makeDetail(topic), routing: routing({ "reviewer/audit": claudeReviewer }) });
-    render(<App />);
-    expect(await screen.findByRole("button", { name: "작성자 · Claude 연결됨 · opus · xhigh" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "검토자 · Claude 연결됨 · 배정 claude-opus-5-5 · high" })).toBeInTheDocument();
-    // 상태 문구는 회사 이름이 아니라 역할이다(상태 값 CODEX_AUDIT 는 호환 이름).
-    expect(screen.getAllByText("계획 검토").length).toBeGreaterThan(0);
-    expect(screen.queryByText("Codex 검토")).not.toBeInTheDocument();
-  });
 
-  it("좌석 칩은 서버가 정한 현재 작업의 경로를 쓴다 — 작업별 배정(개정만 Codex)이면 개정 단계의 작성자 칩이 Codex 다", async () => {
-    const topic = { ...auditing(), state: "CLAUDE_REVISION" as const };
-    const codexReviser: RoutingView["jobs"][number] = { role: "planner", operation: "revision", refusal: null, inheritsFrom: null, route: {
-      provider: "codex", participant: "reviser-codex", profileId: "codex-reviser",
-      basis: { kind: "assignment", scope: TOPIC_SCOPE, role: "planner", operation: "revision", version: 3 }, settings: { model: "gpt-6-astra", effort: "high" } } };
-    const closeout: RoutingView["jobs"][number] = { ...claudeReviewer, operation: "closeout" };
-    vi.spyOn(api, "listTopics").mockResolvedValue([topic]);
-    vi.spyOn(api, "getTopic").mockResolvedValue({ ...makeDetail(topic), routing: {
-      ...routing({ "planner/revision": codexReviser }), jobs: [...routing({ "planner/revision": codexReviser }).jobs, closeout],
-      current: { author: { role: "planner", operation: "revision" }, reviewer: { role: "reviewer", operation: "closeout" } } } });
-    render(<App />);
-    expect(await screen.findByRole("button", { name: "작성자 · Codex 연결됨 · 배정 gpt-6-astra · high" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "검토자 · Claude 연결됨 · 배정 claude-opus-5-5 · high" })).toBeInTheDocument();
-  });
+
+
 
   it("타임라인: 경로가 기록된 결과는 역할과 실제 AI 를, 경로가 없는 기록은 좌석 역할만 보여 준다(추측한 AI 를 붙이지 않는다)", async () => {
     const topic = auditing();
@@ -243,37 +214,24 @@ describe("역할과 실제 실행 AI", () => {
     vi.spyOn(api, "listTopics").mockResolvedValue([topic]);
     vi.spyOn(api, "getTopic").mockResolvedValue({ ...makeDetail(topic, [routed, unrouted]), routing: routing({ "reviewer/audit": claudeReviewer }) });
     render(<App />);
+    fireEvent.click(await screen.findByRole("tab", { name: "대화창" }));
     const routedMessage = (await screen.findByText("감사 결과")).closest("article")!;
     expect(routedMessage).toHaveTextContent("검토자 · Claude");
     const unroutedMessage = screen.getByText("계획 1판을 저장했습니다.").closest("article")!;
     expect(unroutedMessage.querySelector(".message-meta strong")).toHaveTextContent(/^작성자$/);
   });
 
-  it("host-review F004: routing 이 있으면 기본 배정도 서버가 정한 현재 작업의 설정을 쓴다 — 실패 뒤 재개 단계가 구현이면 구현 모델", async () => {
-    const topic = { ...withImplementationOverride(auditing()), state: "FAILED" as const };
-    const implementDefault: RoutingView["jobs"][number] = { role: "implementer", operation: "implement", refusal: null, inheritsFrom: null, route: {
-      provider: "claude", participant: "claude", profileId: null, basis: { kind: "default" }, settings: { model: "opus", effort: "xhigh" } } };
-    vi.spyOn(api, "listTopics").mockResolvedValue([topic]);
-    vi.spyOn(api, "getTopic").mockResolvedValue({ ...makeDetail(topic), routing: routing({ "implementer/implement": implementDefault },
-      { author: { role: "implementer", operation: "implement" }, reviewer: { role: "reviewer", operation: "review" } }) });
-    render(<App />);
-    expect(await screen.findByRole("button", { name: "작성자 · Claude 연결됨 · 구현 opus · xhigh" })).toBeInTheDocument();
-  });
 
-  it("routing 이 없는 과거 응답은 좌석의 기본 공급자로 표시한다", async () => {
-    const topic = auditing();
-    vi.spyOn(api, "listTopics").mockResolvedValue([topic]);
-    vi.spyOn(api, "getTopic").mockResolvedValue(makeDetail(topic));
-    render(<App />);
-    expect(await screen.findByRole("button", { name: /^검토자 · Codex 연결됨/ })).toBeInTheDocument();
-  });
+
+
 
   it("세션 창은 좌석 역할로 부르고, 배정 경로로 실행되면 입력이 기본 배정 설정이라는 것을 알린다", async () => {
     const topic = auditing();
     vi.spyOn(api, "listTopics").mockResolvedValue([topic]);
     vi.spyOn(api, "getTopic").mockResolvedValue({ ...makeDetail(topic), routing: routing({ "reviewer/audit": claudeReviewer }) });
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: /^검토자 · Claude 연결됨/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /^계획 검토자 ·/ }));
+    fireEvent.click(screen.getByRole("button", {name:"현재 세션·설정 변경"}));
     expect(screen.getByRole("heading", { name: "검토자 좌석 세션과 실행 설정" })).toBeInTheDocument();
     expect(screen.getByText(/지금 이 좌석은 배정 topic:topic-1 v2\(프로필 claude-reviewer, Claude\)으로 실행됩니다 — 아래 설정은 배정이 없을 때\(기본 배정\)의 Codex 설정입니다/))
       .toBeInTheDocument();
@@ -405,8 +363,8 @@ describe("계획 전 선택형 논의", () => {
       jobs, sessions: [], current: { author: { role: "planner", operation: "brainstorm" }, reviewer: { role: "reviewer", operation: "brainstorm" } },
     } });
     render(<App />);
-    expect(await screen.findByRole("button", { name: /^참여자 1 · Codex/ })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /^참여자 2 · Codex/ })).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("tab", { name: "대화창" }));
+    await screen.findByText("발언 1");
     expect(screen.getByText("논의 참여자 1 · Codex")).toBeInTheDocument();
     expect(screen.getByText("논의 참여자 2 · Codex")).toBeInTheDocument();
   });
@@ -527,7 +485,7 @@ it("추가 승인 뒤 예산이 부족하면 안내를 표시하고 토픽 전�
  vi.mocked(api.getActivity).mockResolvedValue({state:"USER_DECISION_REQUIRED",runningAction:false,lastChangeAt:null,lastChangedPath:null,scanned:0,truncated:false,autoRetryAt:null,checkedAt:"now",revisionPaused:true,revisionAllowance:{topicId:a.id,used:3,limit:3,version:1,firstPlanUsed:true,historyIncomplete:false,startedAt:"now"}});
  vi.spyOn(api,"runAction").mockResolvedValue({accepted:true,actionId:"grant",topic:a,resumeBlocked:"승인은 저장했습니다. 재개하려면 예산을 추가하세요."} as any);
  render(<App/>);fireEvent.click(await screen.findByRole("button",{name:"재작성 1회 추가 승인 후 재개"}));
- expect(await screen.findByRole("status")).toHaveTextContent("승인은 저장했습니다. 재개하려면 예산을 추가하세요.");
+ expect(await screen.findByText("승인은 저장했습니다. 재개하려면 예산을 추가하세요.")).toBeInTheDocument();
  fireEvent.click(screen.getByRole("button",{name:/다른 승인 토픽/}));
  await waitFor(()=>expect(screen.queryByText("승인은 저장했습니다. 재개하려면 예산을 추가하세요.")).not.toBeInTheDocument());
 });
@@ -535,7 +493,7 @@ it("추가 승인 뒤 예산이 부족하면 안내를 표시하고 토픽 전�
 it("scrollIntoView 반환값을 effect 정리 함수로 사용하지 않는다",async()=>{
  Object.defineProperty(HTMLElement.prototype,"scrollIntoView",{configurable:true,value:vi.fn(()=>Promise.resolve())});
  vi.spyOn(api,"listTopics").mockResolvedValue([makeTopic()]);vi.spyOn(api,"getTopic").mockResolvedValue(makeDetail(makeTopic(),[timelineEvent(1,"스크롤 확인")]));
- const view=render(<App/>);await screen.findByRole("heading",{name:makeTopic().title});
+ const view=render(<App/>);fireEvent.click(await screen.findByRole("tab",{name:"대화창"}));
  await waitFor(()=>expect(HTMLElement.prototype.scrollIntoView).toHaveBeenCalled());
  expect(()=>view.unmount()).not.toThrow();
 });

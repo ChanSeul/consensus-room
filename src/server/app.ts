@@ -1,3 +1,5 @@
+import { buildSessionGraph } from "./sessionGraph.js";
+import { readHostReviewGraph } from "./hostReviewGraph.js";
 import { registerInterruptRoutes, interruptStatus } from "./mediation/interruptRoutes.js";
 import { z } from "zod";
 import { SetTopicGoalSchema } from "../shared/topicStructure.js";
@@ -288,7 +290,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   // 같은 입력을 새 요청 키로 다시 보내면(지금 버전 또는 직전 버전) 저장하지 않고 ③만 이어 한다 — 범위 세대가 이미 오른 단계는 범위를 다시 바꾸지 않고
   // 대기만 푼다(version·범위 세대·예산을 중복으로 올리지 않는다). 예산 계정은 어느 경로에서도 다시 설정하지 않는다.
   app.post<{Params:{id:string}}>("/api/work-groups/:id/revise",async(request,reply)=>{
-    const body=request.body as {input:unknown;version:number};
+    const body=request.body as {input:unknown;version:number;mode?:string};
     const input=WorkGroupInputSchema.parse(body?.input);
     const origin=request.headers["x-consensus-actor"]==="mediator"?"mediator":"user";
     return runIdempotent(request,reply,globalLedger(database,`work-group:revise:${request.params.id}`),200,async()=>{
@@ -299,6 +301,8 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       if(group.stages.every(stage=>group.links[stage.id] && database.getTopic(group.links[stage.id].topicId).state==="CLOSED"))throw new Error("완료한 작업 묶음은 변경할 수 없습니다.");
       if(Object.keys(group.pending??{}).length)throw new Error("준비 중인 단계를 먼저 연결하세요.");
       const preview=database.workGroups.previewRevision(group.id,input,body.version,topicId=>database.getTopic(topicId).state==="CLOSED");
+      // Graph edits change only future execution. Never interrupt or invalidate a linked stage's approval.
+      if (body.mode === "pipeline" && preview.affected.length) throw Object.assign(new Error("이미 시작된 단계에 영향을 주는 연결 변경입니다. 편집안을 새로 확인하세요."), {statusCode:409});
       const generations:Record<string,number>={};
       for(const stageId of preview.affected) {
         const link=group.links[stageId],topic=database.getTopic(link.topicId);
@@ -499,6 +503,14 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     changedPathsCache.set(topicId, { at: Date.now(), paths });
     return paths;
   };
+
+  let graphHostCache: { at: number; value: ReturnType<typeof readHostReviewGraph> } | null = null;
+  app.get<{ Params: { id: string } }>("/api/topics/:id/graph", async request => {
+    database.getTopic(request.params.id);
+    if (!graphHostCache || Date.now() - graphHostCache.at > 10_000)
+      graphHostCache = { at: Date.now(), value: readHostReviewGraph(config.dataDirectory) };
+    return buildSessionGraph(database, request.params.id, graphHostCache.value);
+  });
 
   app.get<{ Params: { id: string }; Querystring: { after?: string } }>("/api/topics/:id", async (request) => {
     const topic = database.getTopic(request.params.id);

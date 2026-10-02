@@ -1,3 +1,4 @@
+import { graphRecords } from "./graphRecords.js";
 import { needsMediatorAttention } from "../shared/mediatorInterrupts.js";
 import { MediatorInterruptStore } from "./mediation/interruptStore.js";
 import { ReviewLedger } from "./reviewLedger.js";
@@ -95,6 +96,8 @@ export class ConsensusDatabase {
   close(): void {
     this.db.close();
   }
+
+  graphRecords(topicId: string) { return graphRecords(this.db, topicId); }
 
   verificationRecords(topicId: string): unknown[] {
     return this.db.prepare("SELECT record_json FROM verification_runs WHERE topic_id = ? ORDER BY rowid DESC")

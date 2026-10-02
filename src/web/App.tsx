@@ -1,3 +1,6 @@
+import { PipelineEditor } from "./PipelineEditor";
+import { SessionGraph, GraphInspector } from "./SessionGraph";
+import type { GraphNode } from "../shared/sessionGraph";
 import {ReviewPanel} from "./ReviewPanel";
 import { EvidencePanel } from "./EvidencePanel";
 import { RevisionPanel } from "./RevisionPanel";
@@ -14,7 +17,6 @@ import {
   useRef,
   useState,
 } from "react";
-import { appliedExecutionSettings, runsImplementationTurn } from "../shared/execution";
 import type {
   AgentExecutionSettings,
   AgentRole,
@@ -217,6 +219,11 @@ function participantFor(topic: Topic, role: "claude" | "codex"): Participant | u
 
 export function App() {
   const [topics, setTopics] = useState<Topic[]>([]);
+  const [centerTab, setCenterTab] = useState<"graph" | "conversation">("graph");
+  const [pipelineEditing, setPipelineEditing] = useState(false);
+  const [graphRevision, setGraphRevision] = useState(0);
+  const [graphSelection, setGraphSelection] = useState<{ scope: string; node: GraphNode } | null>(null);
+  const [evidenceTopicId, setEvidenceTopicId] = useState<string | null>(null);
   const [clientConfig, setClientConfig] = useState<ClientConfig | null>(null);
   const [selectedTopicId, setSelectedTopicId] = useState<string | null>(null);
   const [detail, setDetail] = useState<TopicDetail | null>(null);
@@ -439,7 +446,7 @@ export function App() {
 
       <nav className="mobile-tabs" aria-label="화면 영역">
         <button className={mobilePanel === "topics" ? "active" : ""} onClick={() => setMobilePanel("topics")}>주제</button>
-        <button className={mobilePanel === "chat" ? "active" : ""} onClick={() => setMobilePanel("chat")}>대화</button>
+        <button className={mobilePanel === "chat" ? "active" : ""} onClick={() => setMobilePanel("chat")}>Graph·대화</button>
         <button className={mobilePanel === "plan" ? "active" : ""} onClick={() => setMobilePanel("plan")}>계획·근거</button>
       </nav>
 
@@ -485,7 +492,22 @@ export function App() {
                 <strong>중재자 호출 · {{ unconfigured: "수신 세션 미연결", waiting: "전송 대기", sending: "전송 중", sent: "세션에 전달됨", acknowledged: "중재자 수신 확인", failed: "전송 실패", unknown: "전송 결과 확인 필요" }[activity.mediationInterrupt.state]}</strong>
                 <span>{activity.mediationInterrupt.error ?? activity.mediationInterrupt.reason}</span>
               </div>}
-              <Timeline events={detail.timeline} />
+              <div className="center-navigation">
+                <div className="center-tabs" role="tablist" aria-label="작업 보기">
+                  <button id="graph-tab" role="tab" aria-controls="graph-panel" aria-selected={centerTab === "graph"} onClick={() => setCenterTab("graph")}>Graph</button>
+                  <button id="conversation-tab" role="tab" aria-controls="conversation-panel" aria-selected={centerTab === "conversation"} onClick={() => setCenterTab("conversation")}>대화창</button>
+                </div>
+                <ExecutionControls topic={selected} busyAction={busyAction} autoRetryAt={activity?.autoRetryAt ?? null}
+                  budgetPaused={Boolean(activity?.budget?.pause || activity?.budgetRecoveryRequired || activity?.revisionPaused || activity?.reviewPaused)}
+                  onAction={(action, body) => void run(action, () => api.runAction(selected.id, action, body))} />
+              </div>
+              {centerTab === "graph" ? <div className="center-content" id="graph-panel" role="tabpanel" aria-labelledby="graph-tab">
+                {pipelineEditing ? <PipelineEditor key={selected.id} topicId={selected.id} title={selected.title} goal={selected.workEntry?.goal ?? selected.title}
+                  topicIds={topics.filter(topic => topic.id === selected.id || topicAncestors(topic, topics).some(parent => parent.id === selected.id)).map(topic => topic.id)}
+                  canCreate={isTopicGroup(selected)} onDone={() => { setPipelineEditing(false); setGraphRevision(value => value + 1); void refreshTopics(); }} /> :
+                <SessionGraph key={`${selected.id}:${graphRevision}`} topicId={selected.id} onEdit={() => setPipelineEditing(true)} onEvidence={() => setEvidenceTopicId(selected.id)} selectedNodeId={graphSelection?.scope === selected.id ? graphSelection.node.id : undefined}
+                  onSelect={(node, reveal) => { setGraphSelection(node ? { scope: selected.id, node } : null); if (node && reveal && window.innerWidth <= 820) setMobilePanel("plan"); }} />}
+              </div> : <div className="center-content" id="conversation-panel" role="tabpanel" aria-labelledby="conversation-tab"><Timeline events={detail.timeline} /></div>}
             </>
           ) : (
             <EmptyPanel>
@@ -498,24 +520,16 @@ export function App() {
         <aside className={`inspector-pane mobile-${mobilePanel}`}>
           {selected && detail ? (
             <Inspector
-              evidenceBusy={Boolean(busyAction) || Boolean(activity?.runningAction)}
               detail={detail}
               findings={findings}
               busyAction={busyAction}
-              closedStagePush={stageDelivery?.topicId === selected.id && stageDelivery.closedPush}
               onAction={(action, body) => void run(action, () => api.runAction(selected.id, action, body))}
               overview={<TopicOverview topic={selected} topics={topics} onSelect={setSelectedTopicId} />}
               controls={<>
-                <RoomControls
-                  budgetPaused={Boolean(activity?.budget?.pause || activity?.budgetRecoveryRequired || activity?.revisionPaused || activity?.reviewPaused)}
-                  autoRetryAt={activity?.autoRetryAt ?? null}
-                  topic={selected}
-                  routing={detail.routing}
-                  busyAction={busyAction}
-                  onSession={(role) => setDialog(role)}
-                  onAction={(action, body) => void run(action, () => api.runAction(selected.id, action, body))}
-                />
-                {isTopicGroup(selected) && <WorkGroupsPanel
+                <GraphInspector node={graphSelection?.scope === selected.id ? graphSelection.node : null} currentTopicId={selected.id}
+                  onTopic={id => { setSelectedTopicId(id); setCenterTab("graph"); setMobilePanel("chat"); }} onSession={setDialog}
+                  onEvidence={id => { setSelectedTopicId(id); setEvidenceTopicId(id); }} />
+                {isTopicGroup(selected) && <WorkGroupsPanel key={graphRevision}
                   topicIds={topics.filter(topic => topic.id === selected.id || topicAncestors(topic, topics).some(parent => parent.id === selected.id)).map(topic => topic.id)}
                   onTopic={id => { void refreshTopics(); setSelectedTopicId(id); setMobilePanel("chat"); }} />}
               </>}
@@ -548,6 +562,10 @@ export function App() {
         </aside>
       </main>
 
+      {evidenceTopicId && detail?.topic.id === evidenceTopicId && <Modal title="원문 연결·검수 관리" description="그래프에 표시할 원문과 검수 상태를 관리합니다." onClose={() => setEvidenceTopicId(null)}>
+        <EvidencePanel key={evidenceTopicId} topicId={evidenceTopicId} busy={Boolean(busyAction) || Boolean(activity?.runningAction)} archived={detail.topic.state === "CLOSED"}
+          archivedReviewRequired={stageDelivery?.topicId === evidenceTopicId && stageDelivery.closedPush} />
+      </Modal>}
       {dialog === "create" && (
         <Modal title="중재 세션에서 작업 시작" description="세 가지 방식 중 현재 작업에 맞는 출발점을 중재자에게 전달하세요." onClose={() => setDialog(null)}>
           <EntryGuide />
@@ -575,22 +593,18 @@ export function App() {
   );
 }
 
-function RoomControls({
+function ExecutionControls({
   topic,
   busyAction,
   autoRetryAt,
   budgetPaused,
-  onSession,
   onAction,
-  routing,
 }: {
   topic: Topic;
-  routing?: RoutingView;
   busyAction: string | null;
   // FAILED 상태에 예약된 사용 한도 자동 재시도 시각 — 있으면 '예약 취소'(stop) 를 제공한다.
   autoRetryAt: string | null;
   budgetPaused: boolean;
-  onSession: (role: "claude" | "codex") => void;
   onAction: (action: string, body?: Record<string, unknown>) => void;
 }) {
   const claude = participantFor(topic, "claude");
@@ -602,18 +616,8 @@ function RoomControls({
   const canRetry = ["FAILED", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED"].includes(topic.state) && !deliveryRecovery && !budgetPaused;
 
   return (
-    <section className="room-controls" aria-label="에이전트와 실행">
+    <section className="execution-controls" aria-label="작업 실행">
       <div className="room-actions">
-        {(!isTopicGroup(topic) || topic.state.startsWith("BRAINSTORM")) && (["claude", "codex"] as const).map((seat) => {
-          const participant = seat === "claude" ? claude : codex;
-          const entry = seatRoute(routing, seat);
-          const provider = routing ? entry?.route?.provider : DEFAULT_SEAT_PROVIDER[seat];
-          return (
-            <button key={seat} className={`session-chip ${participant ? "connected" : ""}`} onClick={() => onSession(seat)}>
-              {topic.state.startsWith("BRAINSTORM") ? `참여자 ${seat === "claude" ? 1 : 2}` : SEAT_COPY[seat]} · {provider ? PROVIDER_COPY[provider] : "실행할 수 없는 배정"} {participant ? "연결됨" : "연결"} · <StageSettings topic={topic} role={seat} routing={routing} />
-            </button>
-          );
-        })}
         {topic.state === "BRAINSTORM_READY" ? (
           <BrainstormActions key={topic.id} connected={Boolean(claude && codex)} busy={Boolean(busyAction)} budgetPaused={budgetPaused} onAction={onAction} />
         ) : canStop ? (
@@ -686,22 +690,17 @@ function Timeline({ events }: { events: TimelineEvent[] }) {
 }
 
 function Inspector({
-  evidenceBusy,
   detail,
   findings,
   busyAction,
-  closedStagePush,
   onAction,
   overview,
   controls,
   children,
 }: {
-  evidenceBusy: boolean;
   detail: TopicDetail;
   findings: Finding[];
   busyAction: string | null;
-  // 닫힌 단계의 미전달 결과에는 원문 근거 재검수를 제공한다.
-  closedStagePush: boolean;
   onAction: (action: string, body?: Record<string, unknown>) => void;
   overview: ReactNode;
   controls: ReactNode;
@@ -722,8 +721,6 @@ function Inspector({
     <div className="inspector-scroll">
       {overview}
       {controls}
-      <EvidencePanel key={topic.id} topicId={topic.id} busy={evidenceBusy} archived={topic.state === "CLOSED"}
-        archivedReviewRequired={closedStagePush} />
       <details className="inspector-section execution-details">
         <summary>사용량·횟수 설정·계획 조사 기록</summary>
         {children}
@@ -810,26 +807,6 @@ function seatSessionLabel(routing: RoutingView | undefined, seat: Seat): string 
   const session = routing?.sessions.find((entry) => entry.seat === (seat === "claude" ? "author" : "plan-review"));
   const provider = routing ? session?.binding?.provider : DEFAULT_SEAT_PROVIDER[seat];
   return provider ? `${SEAT_COPY[seat]} · ${PROVIDER_COPY[provider]}` : SEAT_COPY[seat];
-}
-
-// 지금 단계에 실제로 적용되는 모델·추론을 보여 준다. 구현 전용 오버라이드가 있을 때만 어느 쪽인지
-// 라벨을 붙인다 — 오버라이드가 없으면 모든 단계가 같은 설정이라 라벨이 잡음이다.
-function StageSettings({ topic, role, routing }: { topic: Topic; role: "claude" | "codex"; routing?: RoutingView }) {
-  // routing 이 있으면 서버가 그 좌석의 현재 작업에 실제로 적용하는 설정을 쓴다 — 배정이면 프로필 설정, 기본 배정이면 주제 설정(구현 작업이면 구현 전용
-  // 모델). 멈춘 상태의 재개 단계도 서버가 정한다(host-review F004: FAILED·재개 IMPLEMENTING 에서 계획 모델을 보였다). 아래의 상태 추정은 routing 이 없는
-  // 과거 응답에만 쓴다.
-  if (routing) {
-    const job = routing.current[role === "claude" ? "author" : "reviewer"];
-    const route = seatRoute(routing, role)?.route;
-    if (!route) return <span className="stage-settings">—</span>;
-    const label = route.basis.kind === "assignment" ? "배정 " : topic.agentSettings[role].implementation ? (job.role === "implementer" ? "구현 " : "계획 ") : "";
-    return <span className="stage-settings">{label}{route.settings.model} · {route.settings.effort}</span>;
-  }
-  const settings = topic.agentSettings[role];
-  const implementationStage = runsImplementationTurn(role, topic.state);
-  const applied = appliedExecutionSettings(settings, implementationStage);
-  const label = settings.implementation ? (implementationStage ? "구현 " : "계획 ") : "";
-  return <span className="stage-settings">{label}{applied.model} · {applied.effort}</span>;
 }
 
 function Modal({ title, description, onClose, children }: { title: string; description: string; onClose: () => void; children: ReactNode }) {
