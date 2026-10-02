@@ -1,3 +1,4 @@
+import type { SessionSettingsTarget } from "../shared/sessionSettings.js";
 import { createHash } from "node:crypto";
 import type { ConsensusDatabase } from "./database.js";
 import { routingView } from "./turnRouting.js";
@@ -14,6 +15,7 @@ const hash = (value: string) => createHash("sha256").update(value).digest("hex")
 const stageRole = (stage: string): GraphRole => /IMPLEMENT|CLAUDE_FIX/.test(stage) ? "runner"
   : /FINAL_REVIEW|CODEX_REVIEW/.test(stage) ? "reviewer" : /AUDIT|CLOSEOUT/.test(stage) ? "plan-reviewer" : "planner";
 const roleJob = { author: ["planner", "plan"], "plan-review": ["reviewer", "audit"], implementation: ["implementer", "implement"], "code-review": ["reviewer", "review"] } as const;
+const settingsTarget: Partial<Record<GraphRole, SessionSettingsTarget>> = { planner: "planner", runner: "implementer", "plan-reviewer": "plan-review", reviewer: "code-review", mediator: "mediator", verifier: "verifier", "host-reviewer": "host-reviewer" };
 const seatRole = { author: "planner", "plan-review": "plan-reviewer", implementation: "runner", "code-review": "reviewer" } as const;
 
 export function buildSessionGraph(db: ConsensusDatabase, topicId: string, host: ReturnType<typeof readHostReviewGraph>): SessionGraph {
@@ -34,16 +36,21 @@ export function buildSessionGraph(db: ConsensusDatabase, topicId: string, host: 
       status: running ? "running" : topic.state === "CLOSED" ? "complete" : ["FAILED", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED"].includes(topic.state) ? "blocked" : "idle", historical: false,
       details: [{ label: "Goal", value: topic.workEntry?.goal ?? topic.title }, { label: "상태", value: topic.state }] });
     if (topic.parentTopicId && ids.has(topic.parentTopicId)) edge(`topic:${topic.parentTopicId}`, topicNode, "hierarchy", "하위 주제");
+    const environments = db.sessions.forTopic(topic.id);
     const sessions = new Map<string, GraphNode[]>(), current: Partial<Record<GraphRole, GraphNode>> = {};
     const session = (sid: string | null, role: GraphRole, provider: string | null, historical: boolean) => {
       sid = sessionId(sid);
-      const id = sid ? `session:${lane}:${provider ?? "unknown"}:${sid}` : `role:${lane}:${role}`;
+      const id = sid ? `session:${lane}:${role}:${provider ?? "unknown"}:${sid}` : `role:${lane}:${role}`;
       const node = add({ id, kind: "session", topicId: lane, lane, label: GRAPH_ROLES[role], subtitle: provider ?? "공급자 기록 없음", role,
         status: sid ? "idle" : "unconnected", historical, sessionId: sid, provider,
         details: [{ label: "세션 ID", value: sid ?? "아직 연결되지 않았습니다." }, { label: "공급자", value: provider ?? "기록 없음" }] });
-      if (!historical) node.historical = false;
+      if (!historical) {
+        node.historical = false;
+        const target = settingsTarget[role];
+        if (target && !node.settingsTargets?.includes(target)) node.settingsTargets = [...(node.settingsTargets ?? []), target];
+      }
+      if (sid) node.environment = environments.findLast(record => record.sessionId === sid && record.provider === provider);
       if (sid && !(sessions.get(sid) ?? []).includes(node)) sessions.set(sid, [...(sessions.get(sid) ?? []), node]);
-      if (node.role !== role && !node.label.includes(GRAPH_ROLES[role])) node.label += ` · ${GRAPH_ROLES[role]}`;
       return node;
     };
     for (const role of ["mediator", "verifier"] as const) {
@@ -77,8 +84,19 @@ export function buildSessionGraph(db: ConsensusDatabase, topicId: string, host: 
     }
     const records = db.graphRecords(lane);
     const knownSession = (sid: string, role: GraphRole, provider: string | null = null) => {
-      const found = sessions.get(sid);
-      return found?.length === 1 ? found[0] : session(sid, role, provider, true);
+      const matches = (sessions.get(sid) ?? []).filter(node => node.role === role && (provider === null || node.provider === provider));
+      // A SID identifies a conversation, not its role.
+      return matches.length === 1 ? matches[0] : session(sid, role, provider, true);
+    };
+    const sourceConsumer = (sid: string, provider: string | null = null) => {
+      const matches = (sessions.get(sid) ?? []).filter(node => node.role !== "session" && (provider === null || node.provider === provider));
+      if (matches.length === 1) return matches[0];
+      const providers = new Set(matches.map(node => node.provider));
+      const sharedProvider = provider ?? (providers.size === 1 ? matches[0]?.provider ?? null : null);
+      const node = session(sid, "session", sharedProvider, !matches.some(match => !match.historical));
+      node.label = matches.length > 1 ? "공유 세션 참조" : "세션 참조";
+      if (!node.details.some(detail => detail.label === "원문 귀속")) node.details.push({ label: "원문 귀속", value: "이 원문 전달 기록에는 역할 구분이 없습니다. 세션 단위 참조이며 별도 실행 역할이 아닙니다." });
+      return node;
     };
     for (const recovery of records.recoverySessions) {
       const sid = sessionId(recovery.sessionId); if (!sid) continue;
@@ -109,15 +127,18 @@ export function buildSessionGraph(db: ConsensusDatabase, topicId: string, host: 
     for (const source of db.evidence.list(topic.id)) { const node = sourceNode(source.id); if (node) edge(node.id, topicNode, "registered", "작업에 연결"); }
     for (const receipt of records.receipts) {
       const consumer = JSON.parse(String(receipt.consumer)) as unknown[], sid = text(consumer[receipt.mediator ? 2 : 3]); if (!sid) continue;
-      const node = knownSession(sid, receipt.mediator ? "mediator" : "session"), source = sourceNode(String(receipt.sourceId));
+      const node = receipt.mediator ? knownSession(sid, "mediator") : sourceConsumer(sid, text(consumer[2]));
+      const source = sourceNode(String(receipt.sourceId));
       if (source) edge(source.id, node.id, "delivered", receipt.linkOnly ? `원문 링크 전달 · 범위 ${consumer[1]}` : `전달 기록 · ${receipt.units}개 원문 조각${receipt.partialChars ? ` · 본문 일부 전달 (${receipt.partialChars}자)` : ""} · 범위 ${consumer[1]}`);
     }
     for (const fragment of records.fragments) {
-      const node = knownSession(String(fragment.sessionId), "session"), selector = String(fragment.selector), kind = String(fragment.kind);
+      const selector = String(fragment.selector), kind = String(fragment.kind);
       if (kind === "context") continue; // Work instructions and full transcripts are not original sources.
+      const node = sourceConsumer(String(fragment.sessionId));
       const id = `fragment:${lane}:${hash(`${kind}:${selector}:${fragment.hash}`)}`;
-      add({ id, kind: "source", topicId: lane, lane, label: selector, subtitle: `${kind} · 고정 원문`, status: "complete", historical: node.historical,
+      const source = add({ id, kind: "source", topicId: lane, lane, label: selector, subtitle: `${kind} · 고정 원문`, status: "complete", historical: node.historical,
         details: [{ label: "참조", value: selector }, { label: "전달한 버전", value: String(fragment.hash) }, { label: "전달 종류", value: kind }] });
+      if (!node.historical) source.historical = false;
       edge(id, node.id, "delivered", `전달 기록 · ${fragment.fragments}개 구간`);
     }
     const path = [current.mediator, current.planner, current["plan-reviewer"], current.runner, current.reviewer, current.verifier].filter((n): n is GraphNode => Boolean(n));
@@ -145,12 +166,24 @@ export function buildSessionGraph(db: ConsensusDatabase, topicId: string, host: 
     }
     if (running && records.active) {
       const jobRole = records.active.jobRole, operation = String(records.active.operation ?? "");
+      // Core's repair calls retain the parent's topic stage, although their operation changes.
+      const planReview = ["audit", "closeout", "brainstorm", "ack"].includes(operation)
+        || ["contract-correction", "plan-repair"].includes(operation) && stageRole(topic.state) === "plan-reviewer";
       const activeRole: GraphRole = jobRole === "planner" ? "planner" : jobRole === "implementer" ? "runner"
-        : jobRole === "reviewer" ? ["audit", "closeout", "brainstorm", "ack"].includes(operation) ? "plan-reviewer" : "reviewer"
+        : jobRole === "reviewer" ? planReview ? "plan-reviewer" : "reviewer"
           : topic.state === "BRAINSTORMING" && records.active.role === "codex" ? "plan-reviewer" : stageRole(topic.state);
       const node = current[activeRole];
       // Both a live action and an unfinished provider usage record are needed. Waiting/stopped topics never pulse.
       if (node && (records.active.role === "codex") === ["reviewer", "plan-reviewer"].includes(activeRole)) node.status = "running";
+    }
+    // Environment records identify a conversation/provider, not the role of that spawn (consumer is consensus-engine/runtime-cli).
+    // Do not present a runner's latest observation as the planner's own environment when roles share a conversation.
+    for (const group of sessions.values()) for (const node of group) {
+      const roles = new Set(group.filter(other => other.provider === node.provider && other.role !== "session").map(other => other.role));
+      if (node.environment && roles.size > 1) {
+        node.environment = undefined;
+        node.details.push({ label: "환경 관측 범위", value: "여러 역할이 같은 세션 ID를 공유합니다. 저장된 최근 관측은 역할별 spawn을 구분하지 못해 이 역할의 환경으로 표시하지 않습니다." });
+      }
     }
     for (const node of graph.nodes.filter(n => n.lane === lane && n.kind === "session" && n.sessionId && n.status !== "running")) {
       node.status = node.historical ? "unknown" : topic.state === "CLOSED" ? "complete" : ["FAILED", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED"].includes(topic.state) ? "blocked" : "idle";
@@ -171,9 +204,9 @@ export function buildSessionGraph(db: ConsensusDatabase, topicId: string, host: 
       if (stage.kind === "integration") for (const previous of group.stages.filter(item => item.kind === "work")) edge(stageNode(previous.id), stageNode(stage.id), "dependency", "전체 작업 완료 후 통합 검증");
     }
   }
-  graph.lanes.push({ id: "host", title: "호스트 리뷰 · 프로젝트 실행과 별도" });
+  graph.lanes.push({ id: "host", title: "engine-review · 프로젝트 실행과 별도" });
   if (host.nodes.length) { graph.nodes.push(...structuredClone(host.nodes)); graph.edges.push(...structuredClone(host.edges)); }
-  else graph.nodes.push({ id: "host:unconnected", kind: "session", topicId: null, lane: "host", role: "host-reviewer", label: "Host reviewer", subtitle: "연결된 리뷰 세션 없음",
+  else graph.nodes.push({ id: "host:unconnected", kind: "session", topicId: null, lane: "host", role: "host-reviewer", label: "engine-review", subtitle: "연결된 리뷰 세션 없음",
     status: "unconnected", historical: false, details: [{ label: "상태", value: host.warning ?? "아직 실행 기록이 없습니다." }] });
   if (host.warning) graph.warnings.push(host.warning);
   for (const node of graph.nodes.filter(n => n.kind === "session")) {
@@ -185,5 +218,13 @@ export function buildSessionGraph(db: ConsensusDatabase, topicId: string, host: 
   // Labels are data. Expose no secret-looking values from arbitrary source titles or stored settings.
   for (const node of graph.nodes) { node.label = redactSecrets(node.label); node.subtitle = redactSecrets(node.subtitle); node.details = node.details.map(item => ({ ...item, value: redactSecrets(item.value) })); if (node.url) node.url = redactSecrets(node.url); }
   for (const item of graph.edges) { item.label = redactSecrets(item.label); if (item.detail) item.detail = redactSecrets(item.detail); }
+  for (const node of graph.nodes.filter(node => node.kind === "session")) {
+    if (node.role === "host-reviewer" && !node.historical) node.settingsTargets = ["host-reviewer"];
+    const env = node.environment;
+    node.details.push({ label: "실행 환경", value: env ? `${env.hostname} · ${env.hostOS.platform} ${env.hostOS.release} (${env.hostOS.arch})` : "관측 기록 없음" });
+    if (env) node.details.push({ label: "실행 작업 경로", value: env.cwd }, { label: "시작 소비처", value: env.consumer },
+      { label: "격리·sandbox", value: `${env.isolated ? "격리 입력" : "일반 입력"} · ${env.workspace} · ${env.access} · ${env.sandbox}` },
+      { label: "실행 당시 모델·강도", value: `${env.model} · ${env.effort}` }, { label: "실행 관측 시각", value: env.spawnedAt });
+  }
   return graph;
 }

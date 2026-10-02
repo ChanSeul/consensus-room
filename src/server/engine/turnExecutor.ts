@@ -1,3 +1,4 @@
+import { reviewCriteriaPrompt } from "../sessionSettings.js";
 import { invokeAdapter } from "../runtime/invoke.js";
 import { PlanningPaused, type InvocationUsage, type TimelineDelivery } from "../../shared/planningControl.js";
 import { AgentRunError } from "../adapters/resultParser.js";
@@ -199,9 +200,16 @@ export class TurnExecutor {
       && !planningControlApplies(database, request.topic.id, database.getTopic(request.topic.id).state, flags)
       ? database.planning.sessionReceipt(requested) : null;
     const memoryBodies = Boolean(receipt && !receipt.memoryBodies);
+    const reviews = request.route.job.role === "reviewer" && (request.route.reviewLedger || ["audit", "closeout", "review", "final-review"].includes(request.route.job.operation));
+    // Planning admission and cumulative limits survive participant reassignment within this contract.
+    // Its review criteria must survive the same identity change as well.
+    const criteriaKey = reviews ? JSON.stringify([request.topic.id, request.route.reviewLedger ?? [request.route.job.operation,
+      request.topic.scopeGeneration, request.topic.planEpoch, request.topic.planSHA256, request.route.provider]]) : null;
+    const criteriaSnapshot = criteriaKey ? database.sessions.criteria(criteriaKey, request.route.reviewCriteria) : null;
+    const criteriaText = flags.protocolOnly ? "" : reviewCriteriaPrompt(criteriaSnapshot?.criteria);
     const base = {
       topicId: request.topic.id,
-      prompt: request.prompt, freshSessionPrompt: request.freshSessionPrompt, cwd: request.topic.worktreePath, signal: request.signal,
+      prompt: request.prompt + criteriaText, freshSessionPrompt: request.freshSessionPrompt === undefined ? undefined : request.freshSessionPrompt + criteriaText, cwd: request.topic.worktreePath, signal: request.signal,
       inputSequence: request.inputSequence,
       timelineDelivery: request.timelineDelivery,
       ...(flags.evidenceAssessment ? { evidenceAssessment: true } : {}),
@@ -210,6 +218,8 @@ export class TurnExecutor {
       ...(request.route.reviewLedger ? { reviewLedger: request.route.reviewLedger } : {}),
       ...(memoryBodies ? { memoryBodies: true } : {}),
       planMode: request.planMode, protocolOnly: flags.protocolOnly, planningWrite: request.planningWrite, readablePaths: request.readablePaths,
+      consumer: "consensus-engine",
+      onExecutionEnvironment: (record: import("../../shared/sessionSettings.js").SessionEnvironment) => database.sessions.observe(request.topic.id, record),
       settings: request.settings, providerOptions: request.route.options, beforeSpawn: admit.async, admitSync: admit.sync,
       onProcessSpawn: ((observe) => (process: Parameters<NonNullable<SessionTurn["onProcessSpawn"]>>[0]) => { observe(process); request.onSpawn?.(); })(this.core.processObserver(request.topic.id)),
       // 사용량은 기존 observer 로 그대로 넘기고(원장·이벤트 기록 유지), 이 호출의 마지막 스냅숏만 따로 잡는다(실패 관측).
@@ -228,7 +238,8 @@ export class TurnExecutor {
           noteProtocolSession(id);
           onCreated?.(id);
         } } });
-        return this.settle(request, { sessionId: created.sessionId, result: created.result, created: true }, receipts);
+        const outcome = await this.settle(request, { sessionId: created.sessionId, result: created.result, created: true }, receipts);
+        return outcome;
       }
       const session = request.session;
       let sessionId = session.sessionId;
@@ -243,7 +254,8 @@ export class TurnExecutor {
         if (id !== session.sessionId) noteProtocolSession(id);
         sessionId = id; session.onSessionCreated?.(id);
       } } });
-      return this.settle(request, { sessionId, result, created: sessionId !== session.sessionId }, receipts);
+      const outcome = await this.settle(request, { sessionId, result, created: sessionId !== session.sessionId }, receipts);
+      return outcome;
     } catch (error) {
       if (typeof error === "object" && error !== null && !invocationFailures.has(error)) {
         invocationFailures.set(error, { sessionId: requested, seat: request.route.seat, job: request.route.job,
@@ -332,6 +344,8 @@ export class TurnExecutor {
       sessionId: request.session.sessionId, prompt: request.prompt, cwd: request.topic.worktreePath, signal: request.signal,
       job: request.route.job, protocolOnly: flags.protocolOnly, implementation: flags.implementation, planMode: false, settings: request.settings,
       providerOptions: request.route.options, beforeSpawn: admit.async, admitSync: admit.sync,
+      consumer: "consensus-engine",
+      onExecutionEnvironment: record => this.core.dependencies.database.sessions.observe(request.topic.id, record),
       onProcessSpawn: this.core.processObserver(request.topic.id),
       onUsage: request.onUsage ?? this.core.usageObserver(request.topic.id, request.route, request.purpose),
     } });

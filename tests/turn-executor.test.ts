@@ -373,12 +373,16 @@ describe("E3-4c host-review 39d21df9 F004 — 프로토콜 턴이 만든 세션�
     constructor(private readonly provider: "claude" | "codex") {}
     async run(spec: CommandSpec): Promise<CommandResult> {
       this.calls.push(spec);
+      await spec.beforeSpawn?.(); spec.admitSync?.();
+      spec.onSpawn?.({ pid: 123, pgid: 123, executable: this.provider, commandLine: this.provider, startedAt: new Date().toISOString() });
       const lines: unknown[] = [];
       if (this.provider === "codex") {
         const resume = spec.args.indexOf("resume");
         lines.push({ type: "thread.started", thread_id: resume >= 0 ? spec.args[resume + 1] : `executor-thread-${++this.threads}` });
       }
       lines.push({ kind: "ACK", summary: "확인했습니다.", findings: [], evidenceRefs: [] });
+      // The real runner streams JSON events before returning its captured output.
+      for (const line of lines) spec.onJSONLine?.(line, Date.now());
       return { exitCode: 0, stdout: lines.map((line) => JSON.stringify(line)).join("\n"), stderr: "", jsonLines: lines };
     }
   }
@@ -426,6 +430,17 @@ describe("E3-4c host-review 39d21df9 F004 — 프로토콜 턴이 만든 세션�
     };
     return { database, runner, inAction };
   }
+  it.each(["claude", "codex"] as const)("%s 실제 spawn 메타데이터를 확정 세션에 저장한다", async provider => {
+    const { database, inAction } = executorRoom(provider);
+    try {
+      let sessionId = "";
+      await inAction(async turn => { sessionId = await turn({ role: provider === "claude" ? "planner" : "reviewer", operation: "ack" }, "IMPLEMENTING", null); });
+      const records = database.sessions.forTopic("t");
+      expect(records).toHaveLength(1);
+      expect(records[0]).toMatchObject({ sessionId, provider, consumer: "consensus-engine", hostname: expect.any(String),
+        hostOS: { platform: process.platform }, access: "none" });
+    } finally { database.close(); }
+  });
   const stdin = (runner: StdinRunner, index: number) => runner.calls[index].stdin ?? "";
   const hasBody = (text: string) => text.includes("--- 메모리 문서 시작: context-router.md ---") && text.includes(BODY);
   const JOBS = {

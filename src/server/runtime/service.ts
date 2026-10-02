@@ -25,6 +25,8 @@ export async function executeRuntimeRequest(request: RuntimeRequest, adapter: Ag
     isolated: request.isolated, snapshotWorkspace: request.workspace === "snapshot", sessionHome: request.sessionHome,
     writablePaths: request.writablePaths,
     settings: request.settings, providerOptions: request.providerOptions, signal,
+    consumer: "runtime-cli",
+    onExecutionEnvironment: environment => emit({ type: "environment", environment }),
     onSessionCreated: recordSession, onUsage: usage => emit({ type: "usage", usage }),
     // 실제 공급자 spawn 과 원시 사용량(E2e-2) — 호출자(운영 도구)가 차감·사용량 원장을 이 관측으로 쓴다.
     onProcessSpawn: spawned => emit({ type: "spawn", pid: spawned.pid, at: Date.now() }),

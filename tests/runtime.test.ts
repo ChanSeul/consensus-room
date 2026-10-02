@@ -302,3 +302,150 @@ describe("공통 호출과 공급자 생성", () => {
     }
   });
 });
+
+describe("실제 어댑터 spawn 환경 관측", () => {
+  it.each(["claude", "codex"] as const)("%s: spawn과 SID 순서를 결합하고 spawn 거부는 기록하지 않는다", async provider => {
+    const f = fixture();
+    let denied = false;
+    const adapters = createRuntimeAdapters({ run: async spec => {
+      await spec.beforeSpawn?.(); spec.admitSync?.();
+      if (denied) throw new Error("spawn denied");
+      spec.onSpawn?.({ pid: 123, pgid: 123, executable: provider, commandLine: provider, startedAt: "2026-01-01T00:00:00.000Z" });
+      const jsonLines = provider === "claude"
+        ? [{ type: "result", subtype: "success", num_turns: 1, structured_output: result }]
+        : [{ type: "thread.started", thread_id: id }, { type: "item.completed", item: { type: "agent_message", text: JSON.stringify(result) } }];
+      for (const value of jsonLines) spec.onJSONLine?.(value, Date.now());
+      return { exitCode: 0, stdout: jsonLines.map(line => JSON.stringify(line)).join("\n"), stderr: "", jsonLines };
+    } }, { dataDirectory: f.data });
+    const input = { ...request(f.cwd), provider, providerOptions: {}, settings: { model: provider === "claude" ? "opus" : "gpt-6-astra", effort: "high" } };
+    const first = await execute(input, f.data, adapters[provider]);
+    expect(first.status).toBe(0);
+    const environments = first.events.filter(event => event.type === "environment").map(event => event.environment);
+    expect(environments.length).toBeGreaterThan(0);
+    expect(environments.at(-1)).toMatchObject({ provider, cwd: f.cwd, consumer: "runtime-cli", access: "write",
+      model: input.settings.model, effort: "high", hostname: expect.any(String), hostOS: { platform: process.platform, arch: process.arch } });
+    expect(environments.at(-1)!.sessionId).toBe(first.events.find(event => event.type === "result")!.sessionId);
+    if (provider === "codex") expect(environments[0].sessionId).toBeNull();
+    else expect(environments[0].sessionId).toBeTruthy(); // Claude issues ID before spawn.
+    denied = true;
+    const refused = await execute(input, f.data, adapters[provider]);
+    expect(refused.status).not.toBe(0);
+    expect(refused.events.filter(event => event.type === "environment" || event.type === "spawn")).toEqual([]);
+  });
+});
+
+
+it("keeps the failed Claude spawn under its old SID when recovery allocates and spawns a new session", async () => {
+  const f = fixture();
+  const environments: import("../src/shared/sessionSettings").SessionEnvironment[] = [];
+  let spawns = 0;
+  const claude = createRuntimeAdapters({ run: async spec => {
+    spawns++;
+    spec.onSpawn?.({ pid: 120 + spawns, pgid: 120 + spawns, executable: "claude", commandLine: "claude", startedAt: `2026-01-01T00:00:0${spawns}.000Z` });
+    if (spawns === 1) throw new Error("resume failed");
+    const jsonLines = [{ type: "result", subtype: "success", num_turns: 1, structured_output: result }];
+    return { exitCode: 0, stdout: jsonLines.map(line => JSON.stringify(line)).join("\n"), stderr: "", jsonLines };
+  } }, { dataDirectory: f.data }).claude;
+  let recoveredId: string | undefined;
+  const recovering = { ...claude, resumeTurn: async (turn: SessionTurn) => {
+    await expect(claude.resumeTurn(turn)).rejects.toThrow("resume failed");
+    const { sessionId: _old, ...fresh } = turn;
+    const created = await claude.createSession(fresh);
+    recoveredId = created.sessionId;
+    return created.result;
+  } } as AgentAdapter;
+  await expect(invokeAdapter(recovering, { method: "resume", turn: {
+    sessionId: id, cwd: f.cwd, prompt: "recover", job: { role: "implementer", operation: "implement" },
+    settings: { model: "opus", effort: "high" },
+    onExecutionEnvironment: record => environments.push(record),
+    onSessionCreated: (_next, phase) => {
+      expect(phase).toBe("allocated");
+      expect(environments).toHaveLength(1);
+      expect(environments[0].sessionId).toBe(id);
+    },
+  } })).resolves.toEqual(result);
+  expect(spawns).toBe(2);
+  expect(environments).toHaveLength(2);
+  expect(environments.map(record => record.sessionId)).toEqual([id, recoveredId]);
+  expect(recoveredId).not.toBe(id);
+  expect(environments[0].executionId).not.toBe(environments[1].executionId);
+});
+
+it.each(["create", "create-structured"] as const)("does not adopt a rejected Codex SID after the real JSON observer swallows the rejection (%s)", async method => {
+  const f = fixture(), runner = new SpawnCommandRunner();
+  const environments: import("../src/shared/sessionSettings").SessionEnvironment[] = [];
+  const lines = [{ type: "thread.started", thread_id: id }, { type: "item.completed", item: { type: "agent_message", text: JSON.stringify(result) } }, { type: "turn.completed", usage: {} }];
+  const adapter = createRuntimeAdapters({ run: spec => runner.run({ ...spec, command: process.execPath,
+    args: ["-e", `console.log(${JSON.stringify(lines.map(line => JSON.stringify(line)).join("\n"))})`] }) }, { dataDirectory: f.data }).codex;
+  const reject = vi.fn(() => { throw new Error("caller rejects SID"); });
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    const turn = { cwd: f.cwd, prompt: "create", job: { role: "implementer", operation: "implement" } as const,
+      onSessionCreated: reject, onExecutionEnvironment: (record: import("../src/shared/sessionSettings").SessionEnvironment) => environments.push(record) };
+    if (method === "create") await invokeAdapter(adapter, { method, turn });
+    else await invokeAdapter(adapter, { method, turn, schema: { type: "object" } });
+    expect(reject).toHaveBeenCalled(); expect(warn).toHaveBeenCalledWith(expect.stringContaining("caller rejects SID"));
+    expect(environments).toHaveLength(1); expect(environments[0].sessionId).toBeNull();
+  } finally { warn.mockRestore(); }
+});
+
+it.each([false, true])("keeps a recovered Codex create unknown until its SID is confirmed (%s)", async confirms => {
+  const f = fixture();
+  const environments: import("../src/shared/sessionSettings").SessionEnvironment[] = [];
+  let spawns = 0;
+  const next = "22222222-2222-4222-8222-222222222222";
+  const codex = createRuntimeAdapters({ run: async spec => {
+    spawns++;
+    spec.onSpawn?.({ pid: 100 + spawns, pgid: 100 + spawns, executable: "codex", commandLine: "codex", startedAt: "2026-01-01T00:00:00.000Z" });
+    if (spawns === 1 || !confirms) throw new Error("stream failed before thread.started");
+    const jsonLines = [{ type: "thread.started", thread_id: next }, { type: "item.completed", item: { type: "agent_message", text: JSON.stringify(result) } }];
+    for (const value of jsonLines) spec.onJSONLine?.(value, Date.now());
+    return { exitCode: 0, stdout: jsonLines.map(line => JSON.stringify(line)).join("\n"), stderr: "", jsonLines };
+  } }, { dataDirectory: f.data }).codex;
+  const recovering = { ...codex, resumeTurn: async (turn: SessionTurn) => {
+    await expect(codex.resumeTurn(turn)).rejects.toThrow("stream failed");
+    const { sessionId: _old, ...fresh } = turn;
+    return (await codex.createSession(fresh)).result;
+  } } as AgentAdapter;
+  const promise = invokeAdapter(recovering, { method: "resume", turn: { sessionId: id, cwd: f.cwd, prompt: "recover",
+    job: { role: "implementer", operation: "implement" }, onExecutionEnvironment: record => environments.push(record) } });
+  if (confirms) await expect(promise).resolves.toEqual(result); else await expect(promise).rejects.toThrow("stream failed");
+  expect(spawns).toBe(2);
+  expect(environments.map(record => record.sessionId)).toEqual(confirms ? [id, null, next] : [id, null]);
+  expect(environments[0].executionId).not.toBe(environments[1].executionId);
+  if (confirms) expect(environments[2].executionId).toBe(environments[1].executionId);
+});
+
+it.each([true, false])("resume SID rotation changes environment ownership only after caller acceptance (%s)", async accepted => {
+  const environments: import("../src/shared/sessionSettings").SessionEnvironment[] = [];
+  const next = "22222222-2222-4222-8222-222222222222";
+  const observed: import("../src/shared/sessionSettings").SessionEnvironment = {
+    executionId: "actual-spawn-1", sessionId: null, provider: "claude", consumer: "consensus-engine",
+    spawnedAt: "2026-01-01T00:00:00.000Z", cwd: "/tmp", hostname: "test-host",
+    hostOS: { platform: "darwin", release: "test", arch: "arm64" }, isolated: false,
+    workspace: "git", access: "read", sandbox: "observed", model: "opus", effort: "high",
+  };
+  const adapter = fakeAdapter();
+  adapter.resumeTurn = async turn => {
+    turn.onExecutionEnvironment?.(observed);
+    turn.onSessionCreated?.(next);
+    return result;
+  };
+  const promise = invokeAdapter(adapter, { method: "resume", turn: {
+    sessionId: id, cwd: "/tmp", prompt: "resume", job: { role: "reviewer", operation: "audit" },
+    onExecutionEnvironment: record => environments.push(record),
+    onSessionCreated: returned => {
+      expect(returned).toBe(next);
+      expect(environments.at(-1)?.sessionId).toBe(id); // not reassigned before identity validation
+      if (!accepted) throw new Error("identity mismatch");
+    },
+  } });
+  if (accepted) {
+    await expect(promise).resolves.toEqual(result);
+    expect(environments.map(record => record.sessionId)).toEqual([id, next]);
+  } else {
+    await expect(promise).rejects.toThrow("identity mismatch");
+    expect(environments.map(record => record.sessionId)).toEqual([id]);
+  }
+  expect(environments.every(record => record.executionId === observed.executionId)).toBe(true);
+});

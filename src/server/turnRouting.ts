@@ -37,6 +37,7 @@ export interface TurnRoute extends SessionBinding {
   // 이 경로로 core.turn·실행기를 지나 SessionTurn.reviewLedger 로 예산 래퍼에 닿는다(core.turn 의 턴 요청은 호출자 필드를 받지 않아 경로가 유일한 통로다).
   // 예산 래퍼는 읽기·판정·그 판정의 계약 교정에서 이 ID 로 리뷰를 예약한다. 원장 없는 교정은 호출마다 예약하며 경로 판정·바인딩과는 무관하다.
   reviewLedger?: string;
+  reviewCriteria?: import("../shared/sessionSettings.js").ReviewCriteria;
 }
 
 export class UnsupportedRoute extends Error {
@@ -115,7 +116,7 @@ export function resolveRoute(database: ConsensusDatabase, topic: Topic, job: Tur
     throw new UnsupportedRoute(`${label}의 프로필 ${profile.id} 옵션을 실행할 수 없습니다: ${optionProblem}.`, { job, provider: profile.provider, basis });
   }
   return { job, seat, provider: profile.provider, participant: assignment.participant, profileId: profile.id, basis, settings: settings.data,
-    options: profile.options ?? {} };
+    options: profile.options ?? {}, reviewCriteria: profile.reviewCriteria };
 }
 
 function profileSettingsProblem(profile: AgentProfile): string | null {

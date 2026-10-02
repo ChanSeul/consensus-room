@@ -89,6 +89,7 @@ type EventPayload =
   | { type: "error"; code: RuntimeErrorCode; message: string }
   // 실제 공급자 프로세스가 떴다(E2e-2) — 호출자는 이 이벤트로만 모델 호출을 센다. pid 는 공급자 프로세스, at 은 epoch ms.
   | { type: "spawn"; pid: number; at: number }
+  | { type: "environment"; environment: import("../../shared/sessionSettings.js").SessionEnvironment }
   // 공급자가 보고한 원시 사용량(E2e-2, Codex turn.completed.usage) — 합산·보정하지 않는다.
   | { type: "provider-usage"; usage: Record<string, unknown> }
   | { type: "session-status"; sessionId: string; exists: boolean; reason: string };

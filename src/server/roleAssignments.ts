@@ -15,6 +15,12 @@ export class RoleRegistry {
       CREATE TABLE IF NOT EXISTS role_assignment_history(scope TEXT NOT NULL,role TEXT NOT NULL,operation TEXT NOT NULL,version INTEGER NOT NULL,record_json TEXT NOT NULL,PRIMARY KEY(scope,role,operation,version));`);
   }
 
+  atomic<T>(body: () => T): T {
+    this.db.exec("BEGIN IMMEDIATE");
+    try { const result = body(); this.db.exec("COMMIT"); return result; }
+    catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
   profiles(): AgentProfile[] {
     return this.db.prepare("SELECT record_json FROM agent_profiles ORDER BY id").all().map(row => JSON.parse(String(row.record_json)) as AgentProfile);
   }
@@ -61,7 +67,7 @@ export class RoleRegistry {
   // 새 버전은 (역할, 작업)의 모든 scope 이력에서 유일하게 발급한다 — scope 마다 1부터 매기면 전역 m@1 과 토픽 m@1 이 같은 신원 토큰이 되어,
   // 교체 전 세션의 요청이 새 토픽 배정으로 수락된다(host-review a7a9ce86 F-003). 요청 신원은 participant@version 그대로다.
   assign(input: RoleAssignmentInput, now = new Date().toISOString()): RoleAssignment {
-    this.db.exec("BEGIN IMMEDIATE");
+    this.db.exec("SAVEPOINT assign_role");
     try {
       const current = this.assignment(input.scope, input.role, input.operation);
       const currentVersion = current?.version ?? 0;
@@ -80,10 +86,10 @@ export class RoleRegistry {
         ON CONFLICT(scope,role,operation) DO UPDATE SET record_json=excluded.record_json`).run(next.scope, next.role, next.operation, json);
       this.db.prepare("INSERT INTO role_assignment_history(scope,role,operation,version,record_json) VALUES(?,?,?,?,?)")
         .run(next.scope, next.role, next.operation, next.version, json);
-      this.db.exec("COMMIT");
+      this.db.exec("RELEASE assign_role");
       return next;
     } catch (error) {
-      this.db.exec("ROLLBACK");
+      this.db.exec("ROLLBACK TO assign_role; RELEASE assign_role");
       throw error;
     }
   }

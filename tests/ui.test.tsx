@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "../src/web/App";
 import { api } from "../src/web/api";
+import type { SessionSettingsTarget, SessionSettingsView } from "../src/shared/sessionSettings";
 import type { RoutingView, TimelineEvent, Topic, TopicDetail } from "../src/shared/contracts";
 
 const eventSources: FakeEventSource[] = [];
@@ -13,8 +14,8 @@ const eventSources: FakeEventSource[] = [];
 beforeEach(() => {
   eventSources.length = 0;
   vi.spyOn(api,"sessionGraph").mockImplementation(async topicId => ({ topicId, nodes: [
-    {id:"planner",kind:"session",topicId,lane:topicId,label:"플래너",subtitle:"claude",role:"planner",status:"idle",historical:false,sessionId:"claude-session",details:[]},
-    {id:"reviewer",kind:"session",topicId,lane:topicId,label:"계획 검토자",subtitle:"claude",role:"plan-reviewer",status:"idle",historical:false,sessionId:"reviewer-session",details:[]},
+    {id:"planner",kind:"session",topicId,lane:topicId,label:"플래너",subtitle:"claude",role:"planner",settingsTargets:["planner"],status:"idle",historical:false,sessionId:"claude-session",details:[]},
+    {id:"reviewer",kind:"session",topicId,lane:topicId,label:"계획 검토자",subtitle:"claude",role:"plan-reviewer",settingsTargets:["plan-review"],status:"idle",historical:false,sessionId:"reviewer-session",details:[]},
   ],edges:[],lanes:[{id:topicId,title:"주제"}],warnings:[],checkedAt:new Date().toISOString()}));
   vi.spyOn(api,"listWorkGroups").mockResolvedValue([]);
   Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
@@ -92,6 +93,10 @@ describe("방 화면의 비동기 결과", () => {
   });
 });
 
+function settingsFor(target:SessionSettingsTarget):SessionSettingsView {
+  return {target,editable:true,revision:"actual-assignment-revision",appliesTo:"next-execution",mixed:false,models:["opus","sonnet"],efforts:["medium","high"],operations:[{operation:target==="plan-review"?"audit":target==="implementer"?"implement":"plan",provider:"claude",model:"opus",effort:"medium",scope:"topic:topic-1"}]};
+}
+
 describe("저장소와 에이전트 실행 설정", () => {
   it("시작 안내는 세 가지 경로를 보여 주고 웹 지시를 입력받지 않는다", async () => {
     vi.spyOn(api, "listTopics").mockResolvedValue([]);
@@ -118,44 +123,42 @@ describe("저장소와 에이전트 실행 설정", () => {
     vi.spyOn(api, "listTopics").mockResolvedValue([topic]);
     vi.spyOn(api, "getTopic").mockResolvedValue(makeDetail(topic));
     const attach = vi.spyOn(api, "attachParticipant").mockResolvedValue(topic);
-    const update = vi.spyOn(api, "updateAgentSettings").mockResolvedValue({
-      ...topic,
-      agentSettings: { ...topic.agentSettings, claude: { model: "sonnet", effort: "high" } },
+    vi.spyOn(api,"sessionSettings").mockResolvedValue(settingsFor("planner"));
+    const update=vi.spyOn(api,"updateSessionSettings").mockImplementation(async()=>{
+      vi.mocked(api.sessionGraph).mockResolvedValue({topicId:topic.id,nodes:[{id:"planner",kind:"session",topicId:topic.id,lane:topic.id,label:"플래너",subtitle:"claude",role:"planner",settingsTargets:["planner"],status:"idle",historical:false,sessionId:"claude-session",details:[{label:"플래너 현재 설정",value:"saved-route-sonnet-high"},{label:"세션 프로필",value:"기본 배정"}]}],edges:[],lanes:[{id:topic.id,title:"주제"}],warnings:[],checkedAt:"after-save"});
+      const next=settingsFor("planner");return {...next,operations:next.operations.map(operation=>({...operation,model:"sonnet",effort:"high" as const}))};
     });
 
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: /^플래너 ·/ }));
-    fireEvent.click(screen.getByRole("button", {name:"현재 세션·설정 변경"}));
-    fireEvent.change(screen.getByRole("textbox", { name: "Claude 모델" }), { target: { value: "sonnet" } });
-    fireEvent.change(screen.getByRole("combobox", { name: "Claude 추론 강도" }), { target: { value: "high" } });
-    fireEvent.click(screen.getByRole("button", { name: "설정 저장" }));
+    fireEvent.click(screen.getByRole("button", {name:/계획 작성 · 다음 실행 설정/}));
+    fireEvent.change(await screen.findByRole("combobox", { name: "모델" }), { target: { value: "sonnet" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "추론 강도" }), { target: { value: "high" } });
+    fireEvent.click(screen.getByRole("button", { name: "다음 실행 설정 저장" }));
 
-    await waitFor(() => expect(update).toHaveBeenCalledWith(topic.id, "claude", {
-      model: "sonnet",
+    await waitFor(() => expect(update).toHaveBeenCalledWith(topic.id, {
+      target:"planner",revision:"actual-assignment-revision",model: "sonnet",
       effort: "high",
     }));
     expect(attach).not.toHaveBeenCalled();
+    expect(await screen.findByText("saved-route-sonnet-high")).toBeInTheDocument();
+    expect(screen.getByText("세션 생성 시 프로필")).toBeInTheDocument();
+    expect(screen.getByRole("combobox",{name:"모델"})).toHaveValue("sonnet");
+    expect(api.sessionGraph).toHaveBeenCalledTimes(2);
   });
 
-  // 2026-09-07: 폼에 구현 칸이 없어 저장할 때마다 서버가 구현 오버라이드를 NULL 로 지웠다.
-  // 그 뒤 구현 턴은 계획 모델(fable)로 돌게 된다.
-  it("계획 모델만 바꿔 저장해도 구현 전용 설정은 그대로 함께 보낸다", async () => {
-    const topic = withImplementationOverride(makeTopic());
-    vi.spyOn(api, "listTopics").mockResolvedValue([topic]);
-    vi.spyOn(api, "getTopic").mockResolvedValue(makeDetail(topic));
-    const update = vi.spyOn(api, "updateAgentSettings").mockResolvedValue(topic);
-
-    render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: /^플래너 ·/ }));
-    fireEvent.click(screen.getByRole("button", {name:"현재 세션·설정 변경"}));
-    fireEvent.change(screen.getByRole("textbox", { name: "Claude 모델" }), { target: { value: "sonnet" } });
-    fireEvent.click(screen.getByRole("button", { name: "설정 저장" }));
-
-    await waitFor(() => expect(update).toHaveBeenCalledWith(topic.id, "claude", {
-      model: "sonnet",
-      effort: "xhigh",
-      implementation: { model: "opus", effort: "xhigh" },
-    }));
+  it("미연결 구현 역할도 기본 좌석과 다른 실제 실행 설정을 편집한다",async()=>{
+    const topic=withImplementationOverride(makeTopic());
+    vi.spyOn(api,"listTopics").mockResolvedValue([topic]);vi.spyOn(api,"getTopic").mockResolvedValue(makeDetail(topic));
+    vi.mocked(api.sessionGraph).mockResolvedValue({topicId:topic.id,nodes:[{id:"runner",kind:"session",topicId:topic.id,lane:topic.id,label:"러너",subtitle:"claude",role:"runner",settingsTargets:["implementer"],status:"unconnected",historical:false,sessionId:null,details:[]}],edges:[],lanes:[{id:topic.id,title:"주제"}],warnings:[],checkedAt:"now"});
+    vi.spyOn(api,"sessionSettings").mockResolvedValue(settingsFor("implementer"));const update=vi.spyOn(api,"updateSessionSettings").mockResolvedValue(settingsFor("implementer"));
+    const legacy=vi.spyOn(api,"updateAgentSettings"),attach=vi.spyOn(api,"attachParticipant");
+    render(<App/>);fireEvent.click(await screen.findByRole("button",{name:/러너 · 미연결/}));
+    fireEvent.click(screen.getByRole("button",{name:/구현 · 다음 실행 설정/}));
+    fireEvent.change(await screen.findByRole("combobox",{name:"모델"}),{target:{value:"sonnet"}});
+    fireEvent.click(screen.getByRole("button",{name:"다음 실행 설정 저장"}));
+    await waitFor(()=>expect(update).toHaveBeenCalledWith(topic.id,{target:"implementer",revision:"actual-assignment-revision",model:"sonnet",effort:"medium"}));
+    expect(legacy).not.toHaveBeenCalled();expect(attach).not.toHaveBeenCalled();
   });
 
 
@@ -225,17 +228,15 @@ describe("역할과 실제 실행 AI", () => {
 
 
 
-  it("세션 창은 좌석 역할로 부르고, 배정 경로로 실행되면 입력이 기본 배정 설정이라는 것을 알린다", async () => {
-    const topic = auditing();
-    vi.spyOn(api, "listTopics").mockResolvedValue([topic]);
-    vi.spyOn(api, "getTopic").mockResolvedValue({ ...makeDetail(topic), routing: routing({ "reviewer/audit": claudeReviewer }) });
-    render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: /^계획 검토자 ·/ }));
-    fireEvent.click(screen.getByRole("button", {name:"현재 세션·설정 변경"}));
-    expect(screen.getByRole("heading", { name: "검토자 좌석 세션과 실행 설정" })).toBeInTheDocument();
-    expect(screen.getByText(/지금 이 좌석은 배정 topic:topic-1 v2\(프로필 claude-reviewer, Claude\)으로 실행됩니다 — 아래 설정은 배정이 없을 때\(기본 배정\)의 Codex 설정입니다/))
-      .toBeInTheDocument();
-    expect(screen.getByRole("textbox", { name: "Codex 모델" })).toBeInTheDocument();
+  it("검토 노드는 기본 Codex 좌석 대신 실제 배정된 Claude 설정을 편집한다", async () => {
+    const topic=auditing();vi.spyOn(api,"listTopics").mockResolvedValue([topic]);
+    vi.spyOn(api,"getTopic").mockResolvedValue({...makeDetail(topic),routing:routing({"reviewer/audit":claudeReviewer})});
+    const get=vi.spyOn(api,"sessionSettings").mockResolvedValue(settingsFor("plan-review"));
+    render(<App/>);fireEvent.click(await screen.findByRole("button",{name:/^계획 검토자 ·/}));
+    fireEvent.click(screen.getByRole("button",{name:/계획 검토 · 다음 실행 설정/}));
+    expect(await screen.findByRole("combobox",{name:"모델"})).toHaveValue("opus");
+    expect(get).toHaveBeenCalledWith(topic.id,"plan-review");expect(screen.getByText("claude · opus · medium")).toBeInTheDocument();
+    expect(screen.queryByRole("textbox",{name:"Codex 모델"})).not.toBeInTheDocument();
   });
 });
 

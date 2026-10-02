@@ -1,3 +1,4 @@
+import type { SessionEnvironment, SessionSettingsTarget } from "./sessionSettings.js";
 export type GraphRole = "mediator" | "planner" | "plan-reviewer" | "runner" | "reviewer" | "host-reviewer" | "verifier" | "session";
 export type GraphStatus = "running" | "idle" | "complete" | "blocked" | "unconnected" | "unknown";
 export interface GraphNode {
@@ -16,6 +17,8 @@ export interface GraphNode {
   workGroupId?: string;
   stageId?: string;
   url?: string;
+  settingsTargets?: SessionSettingsTarget[];
+  environment?: SessionEnvironment;
   details: Array<{ label: string; value: string }>;
 }
 export interface GraphEdge {
@@ -37,7 +40,7 @@ export interface SessionGraph {
 }
 export const GRAPH_ROLES: Record<GraphRole, string> = {
   mediator: "중재자", planner: "플래너", "plan-reviewer": "계획 검토자", runner: "러너",
-  reviewer: "코드 검토자", "host-reviewer": "Host reviewer", verifier: "검증자", session: "세션",
+  reviewer: "코드 검토자", "host-reviewer": "engine-review", verifier: "검증자", session: "세션",
 };
 export const GRAPH_STATUS: Record<GraphStatus, string> = {
   running: "진행 중", idle: "대기", complete: "종료", blocked: "정지", unconnected: "미연결", unknown: "관측 없음",

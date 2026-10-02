@@ -134,6 +134,9 @@ export interface SessionTurn {
   // (resolveSupportedTurn)가 다시 읽어 변환한다.
   providerOptions?: Readonly<Record<string, unknown>>;
   onProcessSpawn?: (process: SpawnedProcess) => void;
+  consumer?: string;
+  // Provider spawn mode is per execution, including a fresh create inside an outer recovery/resume call.
+  onExecutionEnvironment?: (record: import("../shared/sessionSettings.js").SessionEnvironment, mode?: "create" | "resume") => void;
   // 턴이 쓴 토큰·시간을 알린다(codex `turn.completed` / claude `result` 이벤트에서 읽음). 기록 전용 —
   // 관찰자가 던져도 턴 결과는 유지된다(adapters/usage.ts notifyUsage).
   onUsage?: (usage: TurnUsage) => void;
@@ -147,7 +150,8 @@ export interface SessionTurn {
   // Providers may compact earlier to fit it; this neither replaces nor increases ledger limits.
   executionBudget?: Readonly<import("../shared/budgets.js").BudgetVector>;
   // 세션 id 가 만들어진 즉시(프로세스 실행 전) 알린다 — 턴이 429·stop 으로 끊겨도 resume 할 수 있게 저장하기 위함(2026-09-03 실측).
-  onSessionCreated?: (sessionId: string) => void;
+  // allocated is a new ID reserved before spawn; confirmed identifies the current spawned execution.
+  onSessionCreated?: (sessionId: string, phase?: "allocated" | "confirmed") => void;
   // 공급자가 보고한 원시 사용량 객체(E2e-2, Codex turn.completed.usage) — 기록 전용, 합산·보정하지 않는다.
   onProviderUsage?: (usage: Record<string, unknown>) => void;
   // 이 턴에서 추가로 읽기를 허용할 경로(예: 주제 디렉터리의 plan.md). 이어지는 턴이 계획 본문을 다시 받지 않는 대신

@@ -1,3 +1,4 @@
+import { observeEnvironment } from "./sessionEnvironment.js";
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
@@ -394,7 +395,7 @@ export class CodexAdapter implements AgentAdapter {
         if (typeof value === "object" && value !== null && "type" in value && value.type === "thread.started") {
           const threadId = (value as { thread_id?: unknown }).thread_id;
           if (newSession) {
-            if (typeof threadId === "string") turn.onSessionCreated?.(threadId);
+            if (typeof threadId === "string") turn.onSessionCreated?.(threadId, "confirmed");
           } else if (requestedSessionId !== undefined && threadId !== requestedSessionId) {
             foreignThreads.push(threadId === undefined ? "ID 없음" : JSON.stringify(threadId));
             returnedThread ??= typeof threadId === "string" ? threadId : foreignThreads.at(-1)!;
@@ -424,7 +425,7 @@ export class CodexAdapter implements AgentAdapter {
       cwd: turn.cwd,
       stdin,
       signal: turn.signal,
-      onSpawn: turn.onProcessSpawn,
+      onSpawn: spawned => { turn.onProcessSpawn?.(spawned); observeEnvironment(turn, "codex", resolveSupportedTurn("codex", turn).policy, executionSettings, "Codex managed permission profile; approval never", spawned, newSession ? "create" : "resume"); },
       // HOME은 git·keychain 경로 때문에 그대로 두고, codex 설정 출처만 CODEX_HOME으로 잘라낸다.
       environment: agentEnvironment({ ...environment, CODEX_HOME: topicHome }),
     });

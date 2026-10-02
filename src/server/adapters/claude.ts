@@ -1,3 +1,4 @@
+import { observeEnvironment } from "./sessionEnvironment.js";
 import { createHash, randomUUID } from "node:crypto";
 import { PlanningPaused } from "../../shared/planningControl.js";
 import { readdirSync } from "node:fs";
@@ -124,7 +125,7 @@ export class ClaudeAdapter implements AgentAdapter {
     // 세션 id 를 알리기 전에 표현 가능 여부를 본다 — 거부될 턴의 세션 id 가 참여자·리뷰 세션에 저장되지 않게(E2b).
     resolveSupportedTurn("claude", turn);
     const sessionId = randomUUID();
-    turn.onSessionCreated?.(sessionId);
+    turn.onSessionCreated?.(sessionId, "allocated");
     return { sessionId, result: await this.invoke(turn, ["--session-id", sessionId], true) };
   }
 
@@ -364,7 +365,7 @@ export class ClaudeAdapter implements AgentAdapter {
         beforeSpawn: turn.beforeSpawn, admitSync: turn.admitSync,
         onInterruptedOutput: turn.onInterruptedOutput,
         command: "claude", args, cwd: workspace, stdin: transport,
-        signal: turn.signal, onSpawn: turn.onProcessSpawn,
+        signal: turn.signal, onSpawn: spawned => { turn.onProcessSpawn?.(spawned); observeEnvironment(turn, "claude", policy, executionSettings, `Claude ${permissionMode}; sandbox enabled`, spawned, newSession ? "create" : "resume"); },
         onJSONLine: (value, at) => { toolTime.observe(value, at); metrics.observe(value); observeDesign(value); observeInstructionContext(value); },
         // stream-json 의 마지막 줄은 {"type":"result"} 다. 그 뒤 2분 안에 프로세스가 안 끝나면 hang 으로 보고 정리한다.
         finalResultTimeoutMs: FINAL_RESULT_TIMEOUT_MS,

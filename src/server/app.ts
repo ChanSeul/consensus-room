@@ -1,3 +1,5 @@
+import { SessionSettingsTargetSchema, SessionSettingsUpdateSchema } from "../shared/sessionSettings.js";
+import { readSessionSettings, updateSessionSettings } from "./sessionSettings.js";
 import { buildSessionGraph } from "./sessionGraph.js";
 import { readHostReviewGraph } from "./hostReviewGraph.js";
 import { registerInterruptRoutes, interruptStatus } from "./mediation/interruptRoutes.js";
@@ -603,6 +605,18 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     const ledger = actionLedger(database, request.params.id, `participant:${role}`);
     return runIdempotent(request, reply, ledger, 200,
       (idempotencyKey) => workflow.attachParticipant(request.params.id, role, input, idempotencyKey));
+  });
+
+  app.get<{ Params: { id: string }; Querystring: { target: string } }>("/api/topics/:id/session-settings", async request =>
+    readSessionSettings(database, request.params.id, SessionSettingsTargetSchema.parse(request.query.target)));
+  app.post<{ Params: { id: string } }>("/api/topics/:id/session-settings", async (request, reply) => {
+    if (request.headers["x-consensus-actor"] === "mediator") throw Object.assign(new Error("세션 설정은 사용자만 변경할 수 있습니다."), { statusCode: 403 });
+    const input = SessionSettingsUpdateSchema.parse(request.body);
+    return runIdempotent(request, reply, globalLedger(database, `session-settings:${request.params.id}:${input.target}`), 200, () => {
+      const result = updateSessionSettings(database, request.params.id, input);
+      database.events.emit("mediation-change");
+      return result;
+    });
   });
 
   app.post<{ Params: { id: string; role: string } }>("/api/topics/:id/participants/:role/settings", async (request, reply) => {

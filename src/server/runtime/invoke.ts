@@ -19,6 +19,24 @@ export function invokeAdapter(adapter: AgentAdapter, call: ResumeStructuredCall)
 export function invokeAdapter(adapter: AgentAdapter, call: CreateCall | ResumeCall | RepairCall | CreateStructuredCall | ResumeStructuredCall):
   Promise<CreatedSession | AgentResult | PlanRepair | StructuredCreated | Record<string, unknown>> {
   call.turn.signal?.throwIfAborted();
+  const original = call.turn;
+  let sessionId = "sessionId" in original ? original.sessionId : null;
+  let latest: import("../../shared/sessionSettings.js").SessionEnvironment | undefined;
+  if (original.onExecutionEnvironment) call = { ...call, turn: { ...original,
+    onSessionCreated: (id: string, phase?: "allocated" | "confirmed") => {
+      // The caller validates paired recovery/identity first. A rejected SID must never rewrite observed ownership.
+      original.onSessionCreated?.(id, phase);
+      sessionId = id;
+      // Allocation belongs to the next spawn, never to a failed execution from an earlier recovery round.
+      if (phase === "allocated") latest = undefined;
+      if (latest && latest.sessionId !== id) { latest = { ...latest, sessionId: id }; original.onExecutionEnvironment?.(latest); }
+    },
+    onExecutionEnvironment: (record: import("../../shared/sessionSettings.js").SessionEnvironment, mode?: "create" | "resume") => {
+      // A recovered Codex create has no SID until its thread.started is accepted.
+      if (mode === "create" && record.provider === "codex") sessionId = null;
+      latest = { ...record, sessionId }; original.onExecutionEnvironment?.(latest, mode);
+    },
+  } } as typeof call;
   switch (call.method) {
     case "create": return adapter.createSession(call.turn);
     case "resume": return adapter.resumeTurn(call.turn);

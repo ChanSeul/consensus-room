@@ -16,7 +16,7 @@ function liveProvider(pid: unknown, started: unknown, provider: string | null): 
 // Optional local integration. Missing installation is explicit; no model or global home scan.
 export function readHostReviewGraph(dataDirectory: string): { nodes: GraphNode[]; edges: GraphEdge[]; warning?: string } {
   const home = join(dataDirectory, "review-tools"), file = join(home, "reviews.sqlite");
-  if (!existsSync(file)) return { nodes: [], edges: [], warning: "Host-review 기록 저장소가 연결되지 않았습니다." };
+  if (!existsSync(file)) return { nodes: [], edges: [], warning: "engine-review 기록 저장소가 연결되지 않았습니다." };
   let db: DatabaseSync | undefined;
   try {
     db = new DatabaseSync(file, { readOnly: true });
@@ -43,7 +43,7 @@ export function readHostReviewGraph(dataDirectory: string): { nodes: GraphNode[]
       }
       } catch { /* A missing or corrupt subject affects only this historical session. */ }
       // Probe only live-looking runs; completed histories require no subprocesses.
-      nodes.push({ id, kind: "session", role: "host-reviewer", topicId: null, lane: "host", label: "Host reviewer", subtitle: `${repo} · ${model}`,
+      nodes.push({ id, kind: "session", role: "host-reviewer", topicId: null, lane: "host", label: "engine-review", subtitle: `${repo} · ${model}`,
         provider, sessionId: session, status: row.status === "passed" ? "complete" : row.status === "running" ? !latest.has(repo) && liveProvider(row.provider_pid, row.started, provider) ? "running" : "unknown" : "blocked",
         historical: latest.has(repo), details: [{ label: "세션 ID", value: session }, { label: "저장소", value: repo },
           { label: "실행 당시 모델", value: model }, { label: "추론 강도", value: effort }, { label: "리뷰 원장 상태", value: String(row.status) },
@@ -51,6 +51,6 @@ export function readHostReviewGraph(dataDirectory: string): { nodes: GraphNode[]
       latest.add(repo);
     }
     return { nodes, edges };
-  } catch { return { nodes: [], edges: [], warning: "Host-review 기록을 읽지 못했습니다. 해당 세션의 상태는 확인할 수 없습니다." }; }
+  } catch { return { nodes: [], edges: [], warning: "engine-review 기록을 읽지 못했습니다. 해당 세션의 상태는 확인할 수 없습니다." }; }
   finally { db?.close(); }
 }

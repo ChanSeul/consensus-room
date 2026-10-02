@@ -1,3 +1,4 @@
+import { SessionRecords } from "./sessionRecords.js";
 import { graphRecords } from "./graphRecords.js";
 import { needsMediatorAttention } from "../shared/mediatorInterrupts.js";
 import { MediatorInterruptStore } from "./mediation/interruptStore.js";
@@ -70,6 +71,7 @@ export class ConsensusDatabase {
   readonly evidence: EvidenceStore;
   readonly planning: PlanningStore;
   readonly roles: RoleRegistry;
+  readonly sessions: SessionRecords;
   readonly engineDefects: EngineDefectStore;
   readonly interrupts: MediatorInterruptStore;
 
@@ -87,6 +89,7 @@ export class ConsensusDatabase {
     this.revisions = new RevisionLedger(this.db);
     this.reviews = new ReviewLedger(this.db);
     this.roles = new RoleRegistry(this.db);
+    this.sessions = new SessionRecords(this.db);
     this.engineDefects = new EngineDefectStore(this.db);
     this.interrupts = new MediatorInterruptStore(this.db);
     this.evidence.freezeFinalized();

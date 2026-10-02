@@ -97,7 +97,7 @@ export class BudgetController {
         admitSync:()=>{turn.admitSync?.();this.ledger.markDispatching(id);},
         // 원장 호출의 spawn 은 원장에 영속한다 — 이 뒤 원장의 다른 호출이 spawn 전에 실패해도 원장의 예약을 되돌리지 않는다(재시작 뒤에도).
         onProcessSpawn:process=>{spawned=true;this.ledger.markDispatching(id);if(ledger)this.database?.planning.markReviewLedgerSpawned(ledger);turn.onProcessSpawn?.(process);},
-        onSessionCreated:id=>{sessionId=id;turn.onSessionCreated?.(id);},
+        onSessionCreated:(id,phase)=>{sessionId=id;turn.onSessionCreated?.(id,phase);},
         onInterruptedOutput:output=>{partial=output;turn.onInterruptedOutput?.(output);},
         onUsage:usage=>{observe(usage);turn.onUsage?.({...usage,executionId:id});},
       });

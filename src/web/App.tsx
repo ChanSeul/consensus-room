@@ -222,6 +222,7 @@ export function App() {
   const [centerTab, setCenterTab] = useState<"graph" | "conversation">("graph");
   const [pipelineEditing, setPipelineEditing] = useState(false);
   const [graphRevision, setGraphRevision] = useState(0);
+  const [settingsGraphRevision, setSettingsGraphRevision] = useState(0);
   const [graphSelection, setGraphSelection] = useState<{ scope: string; node: GraphNode } | null>(null);
   const [evidenceTopicId, setEvidenceTopicId] = useState<string | null>(null);
   const [clientConfig, setClientConfig] = useState<ClientConfig | null>(null);
@@ -518,7 +519,7 @@ export function App() {
                 {pipelineEditing ? <PipelineEditor key={selected.id} topicId={selected.id} title={selected.title} goal={selected.workEntry?.goal ?? selected.title}
                   topicIds={topics.filter(topic => topic.id === selected.id || topicAncestors(topic, topics).some(parent => parent.id === selected.id)).map(topic => topic.id)}
                   canCreate={isTopicGroup(selected)} onDone={() => { setPipelineEditing(false); setGraphRevision(value => value + 1); void refreshTopics(); }} /> :
-                <SessionGraph key={`${selected.id}:${graphRevision}`} topicId={selected.id} onEdit={() => { setGraphSelection(null); setPipelineEditing(true); }} onEvidence={() => setEvidenceTopicId(selected.id)} selectedNodeId={graphSelection?.scope === selected.id ? graphSelection.node.id : undefined}
+                <SessionGraph key={`${selected.id}:${graphRevision}`} topicId={selected.id} refreshVersion={settingsGraphRevision} onEdit={() => { setGraphSelection(null); setPipelineEditing(true); }} onEvidence={() => setEvidenceTopicId(selected.id)} selectedNodeId={graphSelection?.scope === selected.id ? graphSelection.node.id : undefined}
                   onSelect={(node, reveal) => { setGraphSelection(node ? { scope: selected.id, node } : null); if (node && reveal && window.innerWidth <= 820) setMobilePanel("plan"); }} />}
               </div> : <div className="center-content" id="conversation-panel" role="tabpanel" aria-labelledby="conversation-tab"><Timeline events={detail.timeline} /></div>}
             </>
@@ -539,8 +540,8 @@ export function App() {
               onAction={(action, body) => void run(action, () => api.runAction(selected.id, action, body))}
               overview={<TopicOverview topic={selected} topics={topics} onSelect={setSelectedTopicId} />}
               controls={<>
-                <GraphInspector node={graphSelection?.scope === selected.id ? graphSelection.node : null} currentTopicId={selected.id}
-                  onTopic={id => { setSelectedTopicId(id); setCenterTab("graph"); setMobilePanel("chat"); }} onSession={setDialog}
+                <GraphInspector node={graphSelection?.scope === selected.id ? graphSelection.node : null} currentTopicId={selected.id} onSettingsSaved={() => setSettingsGraphRevision(value => value + 1)}
+                  onTopic={id => { setSelectedTopicId(id); setCenterTab("graph"); setMobilePanel("chat"); }}
                   onEvidence={id => { setSelectedTopicId(id); setEvidenceTopicId(id); }} />
                 {isTopicGroup(selected) && <WorkGroupsPanel key={graphRevision}
                   topicIds={topics.filter(topic => topic.id === selected.id || topicAncestors(topic, topics).some(parent => parent.id === selected.id)).map(topic => topic.id)}

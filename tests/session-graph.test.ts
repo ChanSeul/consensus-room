@@ -67,6 +67,7 @@ it("scopes descendants, distinguishes actual source delivery, and keeps role set
   const planner=graph.nodes.find(n=>n.sessionId==="author-session")!;
   expect(planner.details).toContainEqual({label:"플래너 현재 설정",value:"codex · review-model · high"});
   expect(planner.provider).toBe("claude"); // Existing session identity doesn't become the configured future provider.
+  expect(graph.nodes.some(n=>n.sessionId==="author-session" && n.role==="session")).toBe(false);
   expect(graph.edges.filter(e=>e.kind==="delivered")).toEqual([expect.objectContaining({to:planner.id,label:expect.stringContaining("1개 원문 조각")})]);
   expect(graph.edges.filter(e=>e.kind==="registered")).toHaveLength(1);
   expect(graph.edges.filter(e=>e.kind==="communication")).toHaveLength(0);
@@ -81,7 +82,7 @@ it("shows persisted interrupt delivery without attributing a legacy request to a
   const claim=f.db.interrupts.claim("t",item.id,target);
   f.db.interrupts.receipt("t",item.id,target,claim.claim,"sent",null);
   let edge=f.graph("t").edges.find(e=>e.kind==="communication")!;
-  expect(edge).toMatchObject({from:"topic:t",to:"session:t:codex:med-session",status:"sent"});
+  expect(edge).toMatchObject({from:"topic:t",to:"session:t:mediator:codex:med-session",status:"sent"});
   expect(edge.detail).toContain("발신 세션 ID 기록이 없어");
   f.db.interrupts.receipt("t",item.id,target,claim.claim,"acknowledged",null);
   edge=f.graph("t").edges.find(e=>e.kind==="communication")!;expect(edge.status).toBe("acknowledged");
@@ -140,7 +141,7 @@ it("reads host session settings without trusting corrupt or out-of-root subject 
   sql.prepare("INSERT INTO runs VALUES(?,?,?,?,?,?,?,?)").run("new","job","host-session","passed","head-a",2,null,a);
   sql.prepare("INSERT INTO runs VALUES(?,?,?,?,?,?,?,?)").run("old","job","old-session","running","head-b",1,null,b);sql.close();
   const graph=readHostReviewGraph(f.root);
-  expect(graph.nodes.find(n=>n.sessionId==="host-session")).toMatchObject({provider:"codex",status:"complete",historical:false});
+  expect(graph.nodes.find(n=>n.sessionId==="host-session")).toMatchObject({label:"engine-review",provider:"codex",status:"complete",historical:false});
   expect(graph.nodes.find(n=>n.sessionId==="host-session")?.details).toContainEqual({label:"실행 당시 모델",value:"host-model"});
   expect(graph.nodes.find(n=>n.sessionId==="old-session")).toMatchObject({status:"unknown",historical:true});
 });
@@ -209,4 +210,70 @@ it("rejects new work after integration has started and restores attention withou
   const sql=new DatabaseSync(f.path);sql.exec("DELETE FROM mediator_interrupts");sql.close();
   const history=vi.spyOn(f.db,"getTimeline").mockImplementation(()=>{throw new Error("Full history must not load");});
   f.db.restoreMediatorInterrupts();expect(f.db.interrupts.current("z")).toMatchObject({reason:"reviewer needs mediator",sourceRole:"reviewer"});expect(f.db.interrupts.current("r")).toBeNull();expect(history).not.toHaveBeenCalled();
+});
+
+it("keeps shared conversation IDs in independent role nodes with role-correct settings, activity and connections", () => {
+  const f = fixture(); f.topic("shared");
+  const sid = "one-conversation", sha = "a".repeat(64);
+  const binding = { provider: "codex" as const, participant: "codex", profileId: null, basis: { kind: "default" as const } };
+  f.db.updateTopic("shared", { state: "IMPLEMENTING", planSHA256: sha, approvedPlanSHA256: sha });
+  for (const role of ["claude", "codex"] as const) f.db.upsertParticipant("shared", {
+    role, sessionId: sid, mode: "attached", acknowledgedPlanSHA256: sha,
+  }, binding);
+  f.db.setImplementationSession("shared", sid, binding);
+  // Legacy stored sessions may share IDs even though the current admission API rejects this combination.
+  const legacy = new DatabaseSync(f.path);
+  legacy.prepare("INSERT INTO codex_review_sessions(topic_id,session_id,scope_generation,plan_epoch,plan_sha256,provider,binding_json) VALUES(?,?,?,?,?,?,?)")
+    .run("shared", sid, 1, f.db.getTopic("shared").planEpoch, sha, "codex", JSON.stringify(binding));
+  legacy.close();
+  f.db.roles.createProfile({ id: "shared-profile", provider: "codex", model: "gpt-6-astra", effort: "medium", options: {} });
+  for (const role of ["mediator", "verifier"] as const) f.db.roles.assign({ scope: "topic:shared", role, operation: "",
+    participant: role, profileId: "shared-profile", sessionId: sid, expectedVersion: 0, note: "" });
+  f.db.appendEvent({ topicId: "shared", actor: "codex", kind: "system", state: "CODEX_AUDIT", body: "recorded plan review",
+    payload: { sessionId: sid, role: "codex", provider: "codex" } });
+  f.db.startAction({ id: "active", topicId: "shared", kind: "implement", status: "running", createdAt: new Date().toISOString(),
+    finishedAt: null, error: null, pid: null, pgid: null, processCommand: null, processExecutable: null, processStartedAt: null });
+  f.db.saveExecutionUsage("shared", 1, "claude", "turn", { executionId: "active-turn", recordKind: "progress",
+    route: { ...binding, job: { role: "implementer", operation: "implement" } } });
+  const source = f.db.evidence.register("shared", { url: "https://example.com/shared", label: "Shared original", mode: "rest", intervalSeconds: 900 });
+  const sql = new DatabaseSync(f.path);
+  sql.prepare("INSERT INTO evidence_link_receipts VALUES(?,?)").run(JSON.stringify(["shared", 1, "codex", sid]), source.id); sql.close();
+  f.db.planning.noteProtocolSession("shared", sid);
+  f.db.planning.recordDelivery(sid, [{ id: "shared-fragment", kind: "file", selector: "docs/requirements.md",
+    hash: sha, offset: 0, nextOffset: null, content: "Shared requirements" }]);
+  f.db.sessions.observe("shared", { executionId: "shared-observation", sessionId: sid, provider: "codex", consumer: "consensus-engine",
+    spawnedAt: new Date().toISOString(), cwd: f.root, hostname: "test-host", hostOS: { platform: "darwin", release: "test", arch: "arm64" },
+    isolated: false, workspace: "git", access: "write", sandbox: "recorded", model: "gpt-6-astra", effort: "medium" });
+  const graph = f.graph("shared"), roles = ["mediator", "planner", "plan-reviewer", "runner", "reviewer", "verifier"];
+  const roleNodes = roles.map(role => graph.nodes.find(node => node.role === role && node.sessionId === sid)!);
+  expect(roleNodes.every(Boolean)).toBe(true);
+  expect(new Set(roleNodes.map(node => node.id)).size).toBe(6);
+  expect(roleNodes.every(node => node.environment === undefined)).toBe(true);
+  expect(roleNodes.every(node => node.details.some(detail => detail.label === "환경 관측 범위"))).toBe(true);
+  expect(roleNodes.map(node => node.settingsTargets)).toEqual([["mediator"], ["planner"], ["plan-review"], ["implementer"], ["code-review"], ["verifier"]]);
+  expect(roleNodes.filter(node => node.status === "running").map(node => node.role)).toEqual(["runner"]);
+  for (let index = 1; index < roleNodes.length; index++) expect(graph.edges).toContainEqual(expect.objectContaining({
+    from: roleNodes[index - 1].id, to: roleNodes[index].id, kind: "flow",
+  }));
+  expect(graph.edges.find(edge => edge.id === "ack:shared")).toMatchObject({ from: roleNodes[1].id, to: roleNodes[2].id });
+  const generic = graph.nodes.find(node => node.role === "session" && node.sessionId === sid)!;
+  expect(generic).toMatchObject({ historical: false, label: "공유 세션 참조" });
+  const visible = new Set(graph.nodes.filter(node => !node.historical).map(node => node.id));
+  expect(visible.has(generic.id)).toBe(true);
+  expect(graph.edges.filter(edge => edge.kind === "delivered").every(edge => visible.has(edge.from) && visible.has(edge.to))).toBe(true);
+  expect(generic.settingsTargets).toBeUndefined();
+  expect(graph.edges.filter(edge => edge.kind === "delivered")).toEqual([
+    expect.objectContaining({ to: generic.id }), expect.objectContaining({ to: generic.id }),
+  ]);
+  expect(f.db.getTopic("shared").participants.map(participant => participant.sessionId)).toEqual([sid, sid]);
+  // Core retains the parent stage while it submits either kind of review correction.
+  for (const state of ["CODEX_AUDIT", "CODEX_CLOSEOUT", "CODEX_REVIEW", "CODEX_FINAL_REVIEW"] as const) {
+    f.db.updateTopic("shared", { state });
+    for (const operation of ["contract-correction", "plan-repair"] as const) {
+      f.db.saveExecutionUsage("shared", 1, "codex", "correction", { executionId: `${state}-${operation}`, recordKind: "progress",
+        route: { ...binding, job: { role: "reviewer", operation } } });
+      const active = f.graph("shared").nodes.filter(node => node.status === "running" && node.kind === "session");
+      expect(active.map(node => node.role)).toEqual([state === "CODEX_AUDIT" || state === "CODEX_CLOSEOUT" ? "plan-reviewer" : "reviewer"]);
+    }
+  }
 });

@@ -1,3 +1,4 @@
+import type { SessionSettingsTarget, SessionSettingsUpdate, SessionSettingsView } from "../shared/sessionSettings";
 import type { SessionGraph } from "../shared/sessionGraph";
 import type { WorkGroup, WorkGroupInput, WorkGroupView } from "../shared/workGroups";
 import type { EvidenceCatalog, EvidenceCollectionResult, EvidenceRootInput, EvidenceSourceInput, EvidenceSource, EvidenceTopicState, EvidenceReviewInput } from "../shared/externalEvidence";
@@ -94,6 +95,8 @@ function unwrapTopics(payload: Topic[] | { topics: Topic[] }): Topic[] {
 }
 
 export const api = {
+  sessionSettings: (id: string, target: SessionSettingsTarget) => request<SessionSettingsView>(`/topics/${encodeURIComponent(id)}/session-settings?target=${encodeURIComponent(target)}`),
+  updateSessionSettings: (id: string, input: SessionSettingsUpdate) => request<SessionSettingsView>(`/topics/${encodeURIComponent(id)}/session-settings`, { method: "POST", body: JSON.stringify(input) }),
   sessionGraph: (id: string) => request<SessionGraph>(`/topics/${encodeURIComponent(id)}/graph`),
   configureIterations: (id: string, scope: "planning" | "implementation" | "revision", limit: number | null, version: number) => request(`/topics/${id}/iteration-limits`, { method: "PUT", body: JSON.stringify({ scope, limit, version }) }),
   evidenceCatalog: (id: string) => request<EvidenceCatalog>(`/topics/${id}/evidence/catalog`),

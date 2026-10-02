@@ -1055,7 +1055,7 @@ Checkpoint must fit ${LIMIT.checkpointBytes} UTF-8 bytes. Final result must sati
             record.imageBytes = (record.imageBytes ?? 0) + (image?.bytes ?? 0);
             save(); turn.onProcessSpawn?.(process);
           },
-          onSessionCreated: id => {
+          onSessionCreated: (id, phase) => {
             if (keepSession && record.sessionId && record.sessionId !== id) {
               // 예상 밖 신원 변경(K1) — 응답을 채택하지 않고(기존 차단) 복구 상태에 남긴다. 자동 복구 사유가 아니다.
               blockLineage("identity-mismatch", { provider: adapter.role, code: "identity-mismatch", message: "The CLI changed the planning session identity." },
@@ -1075,7 +1075,7 @@ Checkpoint must fit ${LIMIT.checkpointBytes} UTF-8 bytes. Final result must sati
               record.sessionId = previous.sessionId; record.sessions = previous.sessions;
               throw error;
             }
-            turn.onSessionCreated?.(id);
+            turn.onSessionCreated?.(id, phase);
           } };
         let result!: AgentResult;
         let failure: unknown = null;

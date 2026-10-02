@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { ReviewCriteriaSchema } from "./sessionSettings.js";
 
 // 역할(무엇을 하는가)·프로필(어떤 AI 를 어떻게 실행하는가)·참여자(누구)·세션(어느 대화)·배정 버전(언제부터)을 분리한다(엔진 개편 E1).
 // E1 은 중재자(mediator) 배정만 서버 판정에 쓰고, 러너 역할은 기존 토픽별 participants 로 호환 유지한다(E2 에서 옮긴다).
@@ -49,6 +50,7 @@ export const AgentProfileInputSchema = z.object({
   effort: z.string().trim().min(1).max(40),
   // 공급자별 옵션 — 그 공급자 어댑터가 해석하는 키만 받는다(위 PROVIDER_OPTION_SCHEMAS, E2c). 다른 공급자의 같은 이름 옵션으로 바꿔 읽지 않는다(plan §2.3).
   options: z.record(z.string(), z.unknown()).default({}),
+  reviewCriteria: ReviewCriteriaSchema.optional(),
 }).strict().superRefine((profile, context) => {
   const problem = providerOptionsProblem(profile.provider, profile.options);
   if (problem) context.addIssue({ code: "custom", path: ["options"], message: problem });

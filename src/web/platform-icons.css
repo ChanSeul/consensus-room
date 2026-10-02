@@ -1,0 +1,20 @@
+.platform-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: var(--platform-icon-size, 28px);
+  height: var(--platform-icon-size, 28px);
+  border: 1px solid #00000016;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #596579;
+}
+
+.platform-icon svg { display: block; width: 72%; height: 72%; }
+.platform-icon--claude { color: #d97757; }
+.platform-icon--openai { color: #000000; }
+.platform-icon--jira, .platform-icon--confluence { color: #0052cc; }
+.platform-icon--docs { color: #4285f4; }
+.platform-icon--github { color: #181717; }
+.platform-icon--sheets { color: #0f9d58; }
