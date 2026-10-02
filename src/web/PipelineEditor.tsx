@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { WorkGroupInputSchema, type WorkGroupInput, type WorkGroupView, type WorkStage } from "../shared/workGroups";
-import { api } from "./api";
+import { api, ApiError } from "./api";
 
 export function pipelineInput(group: WorkGroupInput): WorkGroupInput {
   return { title: group.title, goal: group.goal, contracts: group.contracts, stages: structuredClone(group.stages),
@@ -16,7 +16,7 @@ export function orderPipeline(input: WorkGroupInput): WorkGroupInput {
   }
   return WorkGroupInputSchema.parse({ ...input, stages });
 }
-type Draft = { groupId: string | null; version: number; input: WorkGroupInput };
+type Draft = { groupId: string | null; version: number; input: WorkGroupInput; pendingCreation?: string };
 
 export function PipelineEditor({ topicId, topicIds, canCreate, title, goal, onDone }: {
   topicId: string; topicIds: string[]; canCreate: boolean; title: string; goal: string; onDone: () => void;
@@ -38,7 +38,8 @@ export function PipelineEditor({ topicId, topicIds, canCreate, title, goal, onDo
         try {
           const saved = JSON.parse(raw) as Draft;
           if ((saved.groupId === null && canCreate || visible.some(group => group.id === saved.groupId)) && Number.isInteger(saved.version)) {
-            setDraft({ ...saved, input: WorkGroupInputSchema.parse(saved.input) }); setMessage("이 브라우저에 저장한 편집안을 불러왔습니다. 아직 실행에 적용되지 않았습니다."); return;
+            if (saved.pendingCreation !== undefined && (saved.groupId !== null || typeof saved.pendingCreation !== "string" || !saved.pendingCreation || saved.pendingCreation.length > 200)) throw new Error("Invalid pending request");
+            setDraft({ ...saved, input: WorkGroupInputSchema.parse(saved.input) }); setMessage(saved.pendingCreation ? "생성 요청의 응답을 확인하지 못했습니다. 실행에 적용을 눌러 같은 요청의 결과를 확인하세요." : "이 브라우저에 저장한 편집안을 불러왔습니다. 아직 실행에 적용되지 않았습니다."); return;
           }
         } catch { setMessage("저장한 편집안을 읽지 못했습니다. 현재 파이프라인을 불러왔습니다."); }
       }
@@ -46,10 +47,11 @@ export function PipelineEditor({ topicId, topicIds, canCreate, title, goal, onDo
     }).catch(error => { if (!cancelled) setMessage(String(error)); });
     return () => { cancelled = true; };
   }, [topicId]);
+  const editingLocked = busy || Boolean(draft?.pendingCreation);
   const group = groups.find(item => item.id === draft?.groupId);
   const locked = (id: string) => Boolean(group?.links[id] || group?.pending?.[id]);
   const selectedStage = draft?.input.stages.find(stage => stage.id === selected);
-  const change = (input: WorkGroupInput) => { setDraft(value => value ? { ...value, input } : null); setMessage("적용 전 편집안"); };
+  const change = (input: WorkGroupInput) => { if (editingLocked) return; setDraft(value => value ? { ...value, input } : null); setMessage("적용 전 편집안"); };
   const updateStage = (patch: Partial<WorkStage>) => { if (draft && selected && !locked(selected)) change({ ...draft.input, stages: draft.input.stages.map(stage => stage.id === selected ? { ...stage, ...patch } : stage) }); };
   const connect = (to: string) => {
     if (!origin || !draft) return;
@@ -78,11 +80,36 @@ export function PipelineEditor({ topicId, topicIds, canCreate, title, goal, onDo
       if (!apply) { setMessage("이 브라우저에 편집안을 저장했습니다. 실행 순서는 아직 바뀌지 않았습니다."); return; }
       setBusy(true);
       if (draft.groupId) await api.applyPipeline(draft.groupId, input, draft.version);
-      else await api.createWorkGroup(input, topicId);
+      else {
+        const pending = { ...draft, input, pendingCreation: draft.pendingCreation ?? crypto.randomUUID() };
+        // Persist the exact request before dispatch. An unknown outcome must survive a reload without creating a second group.
+        window.localStorage.setItem(key, JSON.stringify(pending)); setDraft(pending);
+        try { await api.createWorkGroup(input, topicId, pending.pendingCreation); }
+        catch (error) {
+          const status = error instanceof ApiError && error.detail && typeof error.detail === "object" && "status" in error.detail ? error.detail.status : null;
+          if (error instanceof ApiError && error.status < 500 && status !== "running" && status !== "unknown") {
+            const editable = { groupId:null,version:0,input }; setDraft(editable);
+            try { window.localStorage.setItem(key,JSON.stringify(editable)); } catch { /* The saved request remains safe to retry. */ }
+          }
+          throw error;
+        }
+      }
       try { window.localStorage.removeItem(key); } catch { /* Applying does not depend on browser storage. */ }
       onDone();
     } catch (error) { setMessage(`${error instanceof Error ? error.message : String(error)} · 편집안은 유지됩니다.`); }
     finally { setBusy(false); }
+  };
+  const loadLatest = async () => {
+    if (!draft?.groupId || editingLocked) return;
+    setBusy(true);
+    try {
+      const all = await api.listWorkGroups(), latest = all.find(item => item.id === draft.groupId);
+      if (!latest) throw new Error("파이프라인을 찾을 수 없습니다.");
+      const next = {groupId:latest.id,version:latest.version,input:pipelineInput(latest)};
+      window.localStorage.setItem(key,JSON.stringify(next));
+      setGroups(all.filter(item => groups.some(group => group.id === item.id))); setDraft(next);
+      setSelected(null); setOrigin(null); setSelectedEdge(null); setMessage("편집을 취소하고 서버의 최신 파이프라인을 불러왔습니다.");
+    } catch (error) { setMessage(String(error)); } finally { setBusy(false); }
   };
   const fresh = () => {
     setSelected(null); setOrigin(null); setSelectedEdge(null);
@@ -100,15 +127,17 @@ export function PipelineEditor({ topicId, topicIds, canCreate, title, goal, onDo
   return <section className="pipeline-editor" aria-label="실행 파이프라인 편집">
     <div className="graph-toolbar">
       <button onClick={onDone} disabled={busy}>← 세션 그래프</button>
-      <select aria-label="편집할 파이프라인" value={draft?.groupId ?? ""} disabled={busy} onChange={event => {
+      <select aria-label="편집할 파이프라인" value={draft?.groupId ?? ""} disabled={editingLocked} onChange={event => {
         const value = groups.find(group => group.id === event.target.value); if (value) { setDraft({ groupId: value.id, version: value.version, input: pipelineInput(value) }); setSelected(null); setOrigin(null); setSelectedEdge(null); setMessage(""); }
       }}><option value="" disabled>새 파이프라인</option>{groups.map(group => <option key={group.id} value={group.id}>{group.title} · v{group.version}</option>)}</select>
-      {canCreate && <button onClick={fresh} disabled={busy}>파이프라인 추가</button>}
-      {draft && <><button onClick={add} disabled={busy || draft.input.stages.length >= 20}>작업 노드 추가</button><button onClick={() => void save(false)} disabled={busy}>편집안 저장</button><button className="primary-button" onClick={() => void save(true)} disabled={busy}>실행에 적용</button></>}
+      {draft?.groupId && <button onClick={() => void loadLatest()} disabled={editingLocked}>편집 취소 · 최신본 불러오기</button>}
+      {canCreate && <button onClick={fresh} disabled={editingLocked}>파이프라인 추가</button>}
+      {draft && <><button onClick={add} disabled={editingLocked || draft.input.stages.length >= 20}>작업 노드 추가</button><button onClick={() => void save(false)} disabled={editingLocked}>편집안 저장</button><button className="primary-button" onClick={() => void save(true)} disabled={busy}>실행에 적용</button></>}
     </div>
     <p className="pipeline-help">작업의 출력 ● → 다음 작업의 입력 ● 순서로 연결하세요. 연결선을 선택하고 대상 확인 후 삭제합니다. 각 작업은 계획 → 검토 → 구현 → 검토를 거칩니다. 통합 검증은 모든 작업이 끝난 뒤 실행됩니다.</p>
     {selectedEdge && draft && <div className="graph-toolbar" role="status"><span>선택한 연결: {draft.input.stages.find(s=>s.id===selectedEdge.from)?.title} → {draft.input.stages.find(s=>s.id===selectedEdge.to)?.title}</span>
-      <button disabled={busy || locked(selectedEdge.to)} onClick={()=>removeEdge(selectedEdge.from,selectedEdge.to)}>{selectedEdge.from} → {selectedEdge.to} 연결 삭제</button><button onClick={()=>setSelectedEdge(null)}>선택 해제</button></div>}
+      <button disabled={editingLocked || locked(selectedEdge.to)} onClick={()=>removeEdge(selectedEdge.from,selectedEdge.to)}>{selectedEdge.from} → {selectedEdge.to} 연결 삭제</button><button onClick={()=>setSelectedEdge(null)}>선택 해제</button></div>}
+    {draft?.pendingCreation && <p role="status">생성 응답 확인 중에는 편집이 잠깁니다. 실행에 적용을 다시 누르면 같은 요청을 확인합니다.</p>}
     {message && <p className="graph-notice" role="status">{message}</p>}
     {!draft && <p className="graph-empty">{loaded ? "연결된 파이프라인이 없습니다. 큰 그림 주제에서 파이프라인을 추가할 수 있습니다." : "파이프라인을 불러오는 중입니다."}</p>}
     {draft && <>
@@ -131,17 +160,17 @@ export function PipelineEditor({ topicId, topicIds, canCreate, title, goal, onDo
             <button className={`graph-node ${stage.id === selected ? "selected" : ""}`} style={{ width:168, height:108 }} onClick={() => setSelected(stage.id)}>
               <small>{stage.kind === "integration" ? "통합 검증" : locked(stage.id) ? "연결된 작업 · 보호됨" : "미착수 작업"}</small><strong>{stage.title}</strong><small>{stage.acceptance ? "완료 조건 설정됨" : "완료 조건 미정"}</small>
             </button>
-            <button className="pipeline-port in" aria-label={`${stage.id} 입력에 연결`} disabled={busy || locked(stage.id) || !origin} onClick={() => connect(stage.id)}>●</button>
-            <button className={`pipeline-port out ${origin === stage.id ? "chosen" : ""}`} aria-label={`${stage.id} 출력 선택`} disabled={busy || stage.kind === "integration"} onClick={() => setOrigin(origin === stage.id ? null : stage.id)}>●</button>
+            <button className="pipeline-port in" aria-label={`${stage.id} 입력에 연결`} disabled={editingLocked || locked(stage.id) || !origin} onClick={() => connect(stage.id)}>●</button>
+            <button className={`pipeline-port out ${origin === stage.id ? "chosen" : ""}`} aria-label={`${stage.id} 출력 선택`} disabled={editingLocked || stage.kind === "integration"} onClick={() => setOrigin(origin === stage.id ? null : stage.id)}>●</button>
           </div>)}
         </div>
       </div>
       <div className="pipeline-details">
-        {!draft.groupId && <fieldset disabled={busy}><legend>파이프라인</legend>
+        {!draft.groupId && <fieldset disabled={editingLocked}><legend>파이프라인</legend>
           <label>이름<input value={draft.input.title} onChange={e => change({ ...draft.input, title: e.target.value })} /></label>
           <label>공통 계약<textarea value={draft.input.contracts} onChange={e => change({ ...draft.input, contracts: e.target.value })} placeholder="각 작업이 함께 지킬 계약" /></label>
         </fieldset>}
-        {selectedStage ? <fieldset disabled={busy || locked(selectedStage.id)}><legend>{selectedStage.title}{locked(selectedStage.id) ? " · 시작된 작업은 보호됩니다" : " · 노드 설정"}</legend>
+        {selectedStage ? <fieldset disabled={editingLocked || locked(selectedStage.id)}><legend>{selectedStage.title}{locked(selectedStage.id) ? " · 시작된 작업은 보호됩니다" : " · 노드 설정"}</legend>
           <label>작업 이름<input value={selectedStage.title} onChange={e => updateStage({ title:e.target.value })} /></label>
           <label>작업 목표<textarea value={selectedStage.goal} onChange={e => updateStage({ goal:e.target.value })} /></label>
           <label>완료 조건<textarea value={selectedStage.acceptance ?? ""} onChange={e => updateStage({ acceptance:e.target.value || undefined })} /></label>
@@ -149,7 +178,7 @@ export function PipelineEditor({ topicId, topicIds, canCreate, title, goal, onDo
             <label>분리 이유<input value={selectedStage.separation.detail} onChange={e => updateStage({ separation:{ ...selectedStage.separation!,detail:e.target.value } })} placeholder="이 결과를 따로 검증하는 이점" /></label></>}
           <div className="pipeline-dependencies">선행 작업{selectedStage.dependsOn.length ? selectedStage.dependsOn.map(id => <button key={id}
             onClick={() => updateStage({dependsOn:selectedStage.dependsOn.filter(dep => dep !== id)})}>선행 {draft.input.stages.find(s => s.id === id)?.title ?? id} 제거</button>) : " 없음"}</div>
-          <button onClick={removeStage} disabled={busy || locked(selectedStage.id) || selectedStage.kind === "integration"}>선택 노드 삭제</button>
+          <button onClick={removeStage} disabled={editingLocked || locked(selectedStage.id) || selectedStage.kind === "integration"}>선택 노드 삭제</button>
         </fieldset> : <p>노드를 선택하면 목표·완료 조건을 편집할 수 있습니다. 적용한 연결은 실제 다음 단계의 시작 조건에 반영됩니다.</p>}
       </div>
     </>}

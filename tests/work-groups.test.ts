@@ -92,7 +92,7 @@ it("작업 묶음 문맥은 이어 쓰는 판과 새 세션용 전체 문맥 판
     groups = new WorkGroups(db);
   groups.create("g", { title: "작업", goal: "전체 목표", contracts: "공통계약-표식", stages: [stage("a"), stage("b", "integration")] }, "/repo", "head");
   groups.link("g", "a", "t", "head");
-  const database = { listTopics: () => [{ id: "t", worktreePath: "/w" }], workGroups: groups } as unknown as ConsensusDatabase;
+  const database = { topicForTurn: () => ({ id: "t", worktreePath: "/w" }), workGroups: groups } as unknown as ConsensusDatabase;
   const seen: Array<Omit<SessionTurn, "sessionId">> = [];
   const inner: AgentAdapter = {
     role: "codex", validateExistingSession: async () => true,

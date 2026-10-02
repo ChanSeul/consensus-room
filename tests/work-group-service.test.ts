@@ -550,6 +550,7 @@ describe("어댑터 게이트", () => {
     const topics = [{ id: "ta", worktreePath: "/wa", state: "CLOSED" }, { id: "tb", worktreePath: "/wb", state: "DRAFT", scopeGeneration: 1 }];
     const database = {
       listTopics: () => topics, getTopic: (id: string) => topics.find((topic) => topic.id === id), workGroups: groups,
+      topicForTurn: ({ cwd }: Pick<SessionTurn, "cwd">) => topics.find(topic => topic.worktreePath === cwd),
     } as unknown as ConsensusDatabase;
     const hooks = { onHead: null as null | (() => void), heads: 0 };
     const git = {
@@ -614,6 +615,7 @@ describe("어댑터 게이트", () => {
     ];
     const database = {
       listTopics: () => topics, getTopic: (id: string) => topics.find((topic) => topic.id === id), workGroups: groups,
+      topicForTurn: ({ cwd }: Pick<SessionTurn, "cwd">) => topics.find(topic => topic.worktreePath === cwd),
       getFlags: () => ({ committedOID: "commit-p", pushedOID: "commit-p", reviewedTreeOID: "tree-p" }),
     } as unknown as ConsensusDatabase;
     const git = {

@@ -151,6 +151,10 @@ export class EvidenceStore {
       CREATE TABLE IF NOT EXISTS evidence_mediator_source_receipts(consumer TEXT NOT NULL, source_id TEXT NOT NULL, PRIMARY KEY(consumer,source_id));
       CREATE TABLE IF NOT EXISTS evidence_mediator_legacy(consumer TEXT PRIMARY KEY);
     `);
+    for (const table of [RUNNER_TABLES.units, RUNNER_TABLES.progress, RUNNER_TABLES.sources,
+      MEDIATOR_TABLES.units, MEDIATOR_TABLES.progress, MEDIATOR_TABLES.sources]) {
+      db.exec(`CREATE INDEX IF NOT EXISTS ${table}_topic ON ${table}(json_extract(consumer,'$[0]')) WHERE json_valid(consumer)`);
+    }
     this.catalog = new EvidenceCatalogStore(db, this, clock);
     this.automation = new EvidenceAutomationStore(db);
   }

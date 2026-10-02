@@ -363,9 +363,10 @@ export class WorkflowEngine {
     this.core.assertNotShuttingDown(); this.core.assertNoActiveWork(topicId);
     const topic = this.core.requireState(topicId, "DRAFT");
     if (topic.planSHA256) throw Object.assign(new Error("현재 계획을 무효화한 뒤 Goal을 변경하세요."), { statusCode: 409 });
-    if (db.listTopics().some(child => child.parentTopicId === topic.id))
-      throw Object.assign(new Error("하위 주제가 생긴 상위 Goal은 고정됩니다. 새 범위는 새 관리 주제로 시작하세요."), { statusCode: 409 });
     const entry = workEntry(topic);
+    if (db.listTopics().some(child => child.parentTopicId === topic.id) &&
+        !(entry.mode === "sources" && redactSecrets(input.goal) === entry.goal))
+      throw Object.assign(new Error("하위 주제가 생긴 상위 Goal은 고정됩니다. 새 범위는 새 관리 주제로 시작하세요."), { statusCode: 409 });
     if (entry.mode === "sources") {
       db.evidence.assertReady(topic, false);
       const state = db.evidence.topic(topic);

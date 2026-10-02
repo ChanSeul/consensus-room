@@ -1085,3 +1085,15 @@ it("rejects invalid scoped Jira routing and a different source site before sendi
   await expect(differentSite.discover(source, null, new AbortController().signal)).rejects.toThrow("연결");
   expect(request).not.toHaveBeenCalled();
 });
+
+it("delivers originals and receipts by explicit topic identity for shared directories",async()=>{
+  const {db,root,topic,ingest}=setup();ingest([unit("a","First topic original")]);
+  const second=db.createTopic({...topic,id:"second",slug:"second",title:"Second",updatedAt:"2099-01-01T00:00:00.000Z"});
+  const source=db.evidence.register(second.id,{...sourceInput,url:"https://example.com/second"});
+  const check=db.evidence.begin(source.id,true)!;db.evidence.ingest(source.id,{checkId:check.checkId,revision:"v1",units:[unit("b","Second topic original")]});
+  const prompts:string[]=[];const adapter=withEvidence({role:"claude",validateExistingSession:async()=>true,createSession:async turn=>{prompts.push(turn.prompt);return {sessionId:`session-${turn.topicId}`,result:{kind:"BRAINSTORM",summary:"done",findings:[],evidenceRefs:[]}};},resumeTurn:async()=>{throw new Error("unused");}},db,join(root,"images"));
+  for (const id of [topic.id,second.id]) await adapter.createSession({topicId:id,cwd:root,prompt:"discuss"});
+  expect(prompts[0]).toContain("First topic original");expect(prompts[0]).not.toContain("Second topic original");expect(prompts[1]).toContain("Second topic original");
+  expect(db.evidence.packet(topic,"claude",`session-${topic.id}`).text).not.toContain("First topic original");
+  await expect(adapter.createSession({cwd:root,prompt:"ambiguous"})).rejects.toThrow("명시적인 topicId");
+});

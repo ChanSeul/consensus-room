@@ -119,7 +119,7 @@ const ALLOWED_INDEX_HEADER = "Allowed wiki index: candidates only, not document 
 export function guardedPlanning(adapter: AgentAdapter, database: ConsensusDatabase, git: GitService,
   memoryDirectory?: string, imageDirectory?: string): AgentAdapter {
   async function run(turn: Omit<SessionTurn, "sessionId"> | SessionTurn, resume: boolean) {
-    const topic = database.listTopics().find(t => t.worktreePath === turn.cwd);
+    const topic = database.topicForTurn(turn);
     if (!topic || !planningControlApplies(database, topic.id, topic.state, turn)) {
       if (carriesTimeline(turn.timelineDelivery)) throw new PlanningPaused(TIMELINE_UNSUPPORTED);
       return resume ? { sessionId: (turn as SessionTurn).sessionId, result: await adapter.resumeTurn(turn as SessionTurn) }

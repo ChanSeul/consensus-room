@@ -790,10 +790,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     database.recoverInterruptedNonDeliveryRequests();
     database.recoverInterruptedDeliveryRequests();
     database.recoverInterruptedGlobalRequests();
-    for (const topic of database.listTopics()) {
-      const event = database.getTimeline(topic.id).findLast(event => event.actor === "system" && event.state === topic.state && event.scopeGeneration === topic.scopeGeneration);
-      if (event) database.interrupts.observe(topic, event, database.getFlags(topic.id).resumeState);
-    }
+    database.restoreMediatorInterrupts();
     const restored = workflow.restoreScheduledRetries();
     evidence.start();
     engineDefects.start();

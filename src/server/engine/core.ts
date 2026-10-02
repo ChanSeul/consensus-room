@@ -149,9 +149,9 @@ export class EngineCore {
   readonly fixContracts: FixContracts;
 
   constructor(readonly dependencies: WorkflowDependencies) {
-    const controller = new BudgetController(dependencies.database.budgets, cwd => {
-      const topic = dependencies.database.listTopics().find(t => t.worktreePath === cwd && this.active.has(t.id));
-      if (!topic) throw new Error("집계를 연결할 실행 중 토픽이 없습니다.");
+    const controller = new BudgetController(dependencies.database.budgets, (cwd, topicId) => {
+      const topic = dependencies.database.topicForTurn({ cwd, topicId });
+      if (!topic || !this.active.has(topic.id)) throw new Error("집계를 연결할 실행 중 토픽이 없습니다.");
       return {topicId:topic.id,accounts:this.budgetAccounts(topic.id),stage:topic.state};
     }, async(topicId,output)=>{
       await dependencies.artifacts.write(topicId,"interrupted-output",1,JSON.stringify(redactRecord(output as Record<string,unknown>)));

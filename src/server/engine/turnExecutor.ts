@@ -200,6 +200,7 @@ export class TurnExecutor {
       ? database.planning.sessionReceipt(requested) : null;
     const memoryBodies = Boolean(receipt && !receipt.memoryBodies);
     const base = {
+      topicId: request.topic.id,
       prompt: request.prompt, freshSessionPrompt: request.freshSessionPrompt, cwd: request.topic.worktreePath, signal: request.signal,
       inputSequence: request.inputSequence,
       timelineDelivery: request.timelineDelivery,

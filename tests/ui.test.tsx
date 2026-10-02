@@ -497,3 +497,19 @@ it("scrollIntoView 반환값을 effect 정리 함수로 사용하지 않는다",
  await waitFor(()=>expect(HTMLElement.prototype.scrollIntoView).toHaveBeenCalled());
  expect(()=>view.unmount()).not.toThrow();
 });
+
+it("discovers mediator-created roots and child progress while the selected root has no events", async () => {
+  vi.useFakeTimers();Object.defineProperty(document,"hidden",{configurable:true,value:false});
+  const root:Topic={...makeTopic(),id:"root",title:"외부에서 시작한 큰 그림",topicKind:"group",parentTopicId:null};
+  const child:Topic={...makeTopic(),id:"child",title:"외부 하위 작업",parentTopicId:root.id};
+  let topics:Topic[]=[];vi.spyOn(api,"listTopics").mockImplementation(async()=>topics);vi.spyOn(api,"getTopic").mockResolvedValue(makeDetail(root));
+  const view=render(<App/>);
+  try {
+    await act(async()=>{});expect(screen.getByText("아직 주제가 없습니다.")).toBeInTheDocument();
+    topics=[root,child];await act(async()=>{await vi.advanceTimersByTimeAsync(10_000);});
+    expect(screen.getByRole("button",{name:/Root.*외부에서 시작한 큰 그림.*0\/1/})).toBeInTheDocument();
+    topics=[root,{...child,state:"CLOSED",updatedAt:"2026-10-02T00:00:00.000Z"}];
+    await act(async()=>{await vi.advanceTimersByTimeAsync(10_000);});
+    expect(screen.getByRole("button",{name:/Root.*외부에서 시작한 큰 그림.*1\/1/})).toBeInTheDocument();
+  } finally {view.unmount();vi.useRealTimers();}
+});

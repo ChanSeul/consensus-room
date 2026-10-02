@@ -25,6 +25,11 @@ export function readHostReviewGraph(dataDirectory: string): { nodes: GraphNode[]
     const nodes: GraphNode[] = [], edges: GraphEdge[] = [], seen = new Set<string>(), latest = new Set<string>();
     for (const row of rows) {
       const session = String(row.session_id), repo = String(row.repo), key = `${repo}:${session}`;
+      const id = `host:${key}`, source = `host-source:${row.head}`, historical = latest.has(repo);
+      if (!nodes.some(node => node.id === source)) nodes.push({ id: source, kind: "source", topicId: null, lane: "host", label: "검토 스냅샷",
+        subtitle: String(row.head).slice(0, 10), status: "complete", historical, details: [{ label: "Git 커밋", value: String(row.head) }] });
+      if (!historical) nodes.find(node => node.id === source)!.historical = false;
+      if (!edges.some(edge => edge.id === `${source}:${id}`)) edges.push({ id: `${source}:${id}`, from: source, to: id, kind: "delivered", label: "검토 입력" });
       if (seen.has(key)) continue;
       seen.add(key);
       let provider: string | null = null, model = "기록 없음", effort = "기록 없음";
@@ -37,17 +42,12 @@ export function readHostReviewGraph(dataDirectory: string): { nodes: GraphNode[]
         }
       }
       } catch { /* A missing or corrupt subject affects only this historical session. */ }
-      const id = `host:${key}`, source = `host-source:${row.head}`;
       // Probe only live-looking runs; completed histories require no subprocesses.
       nodes.push({ id, kind: "session", role: "host-reviewer", topicId: null, lane: "host", label: "Host reviewer", subtitle: `${repo} · ${model}`,
         provider, sessionId: session, status: row.status === "passed" ? "complete" : row.status === "running" ? !latest.has(repo) && liveProvider(row.provider_pid, row.started, provider) ? "running" : "unknown" : "blocked",
         historical: latest.has(repo), details: [{ label: "세션 ID", value: session }, { label: "저장소", value: repo },
           { label: "실행 당시 모델", value: model }, { label: "추론 강도", value: effort }, { label: "리뷰 원장 상태", value: String(row.status) },
           { label: "검토 커밋", value: String(row.head) }] });
-      if (!nodes.some(node => node.id === source)) nodes.push({ id: source, kind: "source", topicId: null, lane: "host", label: "검토 스냅샷",
-        subtitle: String(row.head).slice(0, 10), status: "complete", historical: latest.has(repo), details: [{ label: "Git 커밋", value: String(row.head) }] });
-      edges.push({ id: `${source}:${id}`, from: source, to: id, kind: "delivered", label: "검토 입력" });
-      if (!latest.has(repo)) nodes.find(node => node.id === source)!.historical = false;
       latest.add(repo);
     }
     return { nodes, edges };

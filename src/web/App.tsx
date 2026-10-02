@@ -245,10 +245,16 @@ export function App() {
     detailRequestRef.current += 1;
   }, [selectedTopicId]);
 
+  const topicsRequestRef = useRef(0);
   const refreshTopics = useCallback(async () => {
+    const requestID = ++topicsRequestRef.current;
     try {
       const nextTopics = await api.listTopics();
-      setTopics(nextTopics);
+      if (requestID !== topicsRequestRef.current) return;
+      setTopics(current => nextTopics.map(topic => {
+        const observed = current.find(item => item.id === topic.id);
+        return observed && observed.updatedAt > topic.updatedAt ? observed : topic;
+      }));
       setSelectedTopicId((current) => current ?? nextTopics.find(topic => !topic.parentTopicId)?.id ?? null);
     } catch (cause) {
       setError(errorMessage(cause));
@@ -282,7 +288,13 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    void refreshTopics();
+    let cancelled = false, timer: number | undefined;
+    const poll = async () => {
+      if (!document.hidden) await refreshTopics();
+      if (!cancelled) timer = window.setTimeout(poll, 10_000);
+    };
+    void refreshTopics().finally(() => { if (!cancelled) timer = window.setTimeout(poll, 10_000); });
+    return () => { cancelled = true; window.clearTimeout(timer); topicsRequestRef.current++; };
   }, [refreshTopics]);
 
   // 러너 생존 표시 — 에이전트가 도는 상태에서만 10초마다 작업 트리 최근 변경을 읽는다.
@@ -480,6 +492,7 @@ export function App() {
               <TopicTree topics={topics} status={topic => <StatusBadge state={topic.state} />} selectedId={selectedTopicId} onSelect={id => { setSelectedTopicId(id); setMobilePanel("chat"); }} />
             )}
           </div>
+          <WorkGroupsPanel unparentedOnly onTopic={id => { void refreshTopics(); setSelectedTopicId(id); setMobilePanel("chat"); }} />
         </aside>
 
         <section className={`chat-pane mobile-${mobilePanel}`}>
@@ -505,14 +518,14 @@ export function App() {
                 {pipelineEditing ? <PipelineEditor key={selected.id} topicId={selected.id} title={selected.title} goal={selected.workEntry?.goal ?? selected.title}
                   topicIds={topics.filter(topic => topic.id === selected.id || topicAncestors(topic, topics).some(parent => parent.id === selected.id)).map(topic => topic.id)}
                   canCreate={isTopicGroup(selected)} onDone={() => { setPipelineEditing(false); setGraphRevision(value => value + 1); void refreshTopics(); }} /> :
-                <SessionGraph key={`${selected.id}:${graphRevision}`} topicId={selected.id} onEdit={() => setPipelineEditing(true)} onEvidence={() => setEvidenceTopicId(selected.id)} selectedNodeId={graphSelection?.scope === selected.id ? graphSelection.node.id : undefined}
+                <SessionGraph key={`${selected.id}:${graphRevision}`} topicId={selected.id} onEdit={() => { setGraphSelection(null); setPipelineEditing(true); }} onEvidence={() => setEvidenceTopicId(selected.id)} selectedNodeId={graphSelection?.scope === selected.id ? graphSelection.node.id : undefined}
                   onSelect={(node, reveal) => { setGraphSelection(node ? { scope: selected.id, node } : null); if (node && reveal && window.innerWidth <= 820) setMobilePanel("plan"); }} />}
               </div> : <div className="center-content" id="conversation-panel" role="tabpanel" aria-labelledby="conversation-tab"><Timeline events={detail.timeline} /></div>}
             </>
           ) : (
             <EmptyPanel>
               <strong>왼쪽에서 주제를 선택해 주세요.</strong>
-              <span>각 주제는 서로 다른 세션과 작업 디렉터리를 사용합니다.</span>
+              <span>큰 그림 주제 아래에서 실행 작업과 각 세션의 진행 상황을 확인합니다.</span>
             </EmptyPanel>
           )}
         </section>

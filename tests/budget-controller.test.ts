@@ -79,3 +79,11 @@ it("관측 저장이 실패해도 토큰을 복구하고 다음 호출을 막는
  expect(ledger.account("t")?.used.inputTokens).toBe(20);
  await expect(wrapped.resumeTurn({cwd:"/tmp",prompt:"test",sessionId:"s"})).rejects.toThrow();db.close();
 });
+
+it("charges two topics sharing cwd to their explicit accounts",async()=>{
+ const db=new DatabaseSync(":memory:"),ledger=new BudgetLedger(db);for(const id of ["one","two"])ledger.configure(id,policy,"test");
+ const adapter:AgentAdapter={role:"claude",validateExistingSession:async()=>true,createSession:async turn=>{turn.onUsage?.({inputTokens:turn.topicId==="one"?3:7,outputTokens:1,recordKind:"final",completeness:"complete"});return {sessionId:"s",result:{kind:"BRAINSTORM",summary:"done",findings:[],evidenceRefs:[]}};},resumeTurn:async()=>{throw Error("unused");}};
+ const wrapped=new BudgetController(ledger,(_cwd,topicId)=>{if(!topicId)throw Error("missing topic identity");return {topicId,accounts:[topicId],stage:"BRAINSTORMING"};},async()=>{}).wrap(adapter);
+ await Promise.all(["one","two"].map(topicId=>wrapped.createSession({topicId,cwd:"/shared",prompt:"discuss"})));
+ expect(ledger.account("one")!.used.inputTokens).toBe(3);expect(ledger.account("two")!.used.inputTokens).toBe(7);db.close();
+});

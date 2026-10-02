@@ -87,9 +87,11 @@ const stageStatus = (state: string | null | undefined) =>
 export function WorkGroupsPanel({
   onTopic,
   topicIds,
+  unparentedOnly = false,
 }: {
   onTopic: (id: string) => void;
   topicIds?: readonly string[];
+  unparentedOnly?: boolean;
 }) {
   const [groups, setGroups] = useState<WorkGroupView[]>([]);
   const [busy, setBusy] = useState(false),
@@ -130,11 +132,12 @@ export function WorkGroupsPanel({
       const topic = await api.nextWorkStage(groupId, stageId);
       onTopic(topic.id);
     });
-  const visibleGroups = topicIds ? groups.filter(group => (group.parentTopicId && topicIds.includes(group.parentTopicId)) || Object.values(group.links).some(link => topicIds.includes(link.topicId))) : groups;
+  const visibleGroups = unparentedOnly ? groups.filter(group => !group.parentTopicId) : topicIds ? groups.filter(group => (group.parentTopicId && topicIds.includes(group.parentTopicId)) || Object.values(group.links).some(link => topicIds.includes(link.topicId))) : groups;
   if (visibleGroups.length === 0 && !error) return null;
   return (
     <section className="work-groups" aria-label="단계별 작업">
       {error && <p role="alert">{error}</p>}
+      {unparentedOnly && <p>관리 주제 없는 작업 묶음</p>}
       {visibleGroups.map((group) => {
         const integration = group.stages.at(-1)!;
         const verified = group.stageStates[integration.id] === "CLOSED";

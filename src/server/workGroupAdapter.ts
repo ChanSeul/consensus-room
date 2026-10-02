@@ -11,9 +11,7 @@ export function wrapWorkGroupAdapter(
   const enrich = async <T extends Omit<SessionTurn, "sessionId">>(
     turn: T,
   ): Promise<T> => {
-    const topic = database
-      .listTopics()
-      .find((topic) => topic.worktreePath === turn.cwd);
+    const topic = database.topicForTurn(turn);
     const group = topic ? database.workGroups.forTopic(topic.id) : null;
     if (!topic || !group) return turn;
     const stage = group.stages.find(

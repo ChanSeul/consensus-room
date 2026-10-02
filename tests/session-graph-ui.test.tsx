@@ -4,7 +4,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { SessionGraph, GraphInspector } from "../src/web/SessionGraph";
 import { PipelineEditor, orderPipeline } from "../src/web/PipelineEditor";
-import { api } from "../src/web/api";
+import { api, ApiError } from "../src/web/api";
 import type { SessionGraph as Graph } from "../src/shared/sessionGraph";
 import type { WorkGroupView } from "../src/shared/workGroups";
 afterEach(()=>{cleanup();vi.restoreAllMocks();vi.useRealTimers();window.localStorage.clear();});
@@ -61,4 +61,50 @@ it("adds and deletes pending nodes, rejects cycles, and keeps linked nodes read-
   fireEvent.click(screen.getByRole("button",{name:"작업 노드 추가"}));expect(screen.getByRole("textbox",{name:"작업 이름"})).toHaveValue("새 작업");
   fireEvent.click(screen.getByRole("button",{name:"선택 노드 삭제"}));expect(screen.queryByRole("button",{name:/미착수 작업 새 작업/})).not.toBeInTheDocument();
   const input=pipeline();input.stages[0].dependsOn=["b"];input.stages[1].dependsOn=["a"];expect(()=>orderPipeline(input)).toThrow("순환 연결");
+});
+
+it("recovers from stale revisions through an explicit latest-server reset",async()=>{
+  const original=pipeline(),latest={...pipeline(),version:5,title:"서버 최신 파이프라인"};
+  vi.spyOn(api,"listWorkGroups").mockResolvedValueOnce([original]).mockResolvedValue([latest]);
+  const apply=vi.spyOn(api,"applyPipeline").mockRejectedValueOnce(new Error("version conflict")).mockResolvedValue(latest);
+  render(<PipelineEditor topicId="r" topicIds={["r"]} canCreate title="Root" goal="Goal" onDone={vi.fn()}/>);
+  fireEvent.click(await screen.findByRole("button",{name:"실행에 적용"}));await screen.findByText(/version conflict/);
+  fireEvent.click(screen.getByRole("button",{name:"편집 취소 · 최신본 불러오기"}));await screen.findByText(/편집을 취소하고 서버의 최신/);
+  fireEvent.click(screen.getByRole("button",{name:"실행에 적용"}));await waitFor(()=>expect(apply).toHaveBeenCalledTimes(2));expect(apply.mock.calls[1][2]).toBe(5);
+});
+
+it.each([
+  new TypeError("network unavailable"),
+  new ApiError("request running",409,{status:"running"}),
+  new ApiError("request unknown",409,{status:"unknown"}),
+  new ApiError("server unavailable",503),
+])("retries an unknown creation after reload with the same body and request key: %s",async(error)=>{
+  const input=pipeline();const {pipelineInput}=await import("../src/web/PipelineEditor");
+  window.localStorage.setItem("consensus:pipeline-draft:r",JSON.stringify({groupId:null,version:0,input:pipelineInput(input)}));
+  vi.spyOn(api,"listWorkGroups").mockResolvedValue([]);const create=vi.spyOn(api,"createWorkGroup").mockRejectedValueOnce(error).mockResolvedValue(input);
+  const show=()=>render(<PipelineEditor topicId="r" topicIds={["r"]} canCreate title="Root" goal="Goal" onDone={vi.fn()}/>);
+  let view=show();fireEvent.click(await screen.findByRole("button",{name:"실행에 적용"}));await screen.findByText(`${error.message} · 편집안은 유지됩니다.`);
+  expect(screen.getByRole("button",{name:"작업 노드 추가"})).toBeDisabled();
+  expect(screen.getByRole("combobox",{name:"편집할 파이프라인"})).toBeDisabled();
+  expect(screen.getByRole("textbox",{name:"이름"})).toBeDisabled();view.unmount();view=show();
+  await screen.findByText(/생성 요청의 응답을 확인하지 못했습니다/);fireEvent.click(screen.getByRole("button",{name:"실행에 적용"}));
+  await waitFor(()=>expect(create).toHaveBeenCalledTimes(2));expect(create.mock.calls[1]).toEqual(create.mock.calls[0]);expect(create.mock.calls[0][2]).toBeTruthy();
+  await waitFor(()=>expect(window.localStorage.getItem("consensus:pipeline-draft:r")).toBeNull());
+});
+
+
+it("does not dispatch a new creation when its retry identity cannot be persisted",async()=>{
+  vi.spyOn(api,"listWorkGroups").mockResolvedValue([pipeline()]);
+  const create=vi.spyOn(api,"createWorkGroup");
+  render(<PipelineEditor topicId="r" topicIds={["r"]} canCreate title="Root" goal="Goal" onDone={vi.fn()}/>);
+  await screen.findByRole("button",{name:"실행에 적용"});
+  fireEvent.click(screen.getByRole("button",{name:"파이프라인 추가"}));
+  fireEvent.change(screen.getByRole("textbox",{name:"공통 계약"}),{target:{value:"기존 기능을 보존한다"}});
+  fireEvent.click(screen.getByRole("button",{name:/첫 작업/}));
+  fireEvent.change(screen.getByRole("textbox",{name:"작업 목표"}),{target:{value:"작업을 완료한다"}});
+  vi.spyOn(window.localStorage,"setItem").mockImplementation(()=>{throw new Error("storage unavailable");});
+  fireEvent.click(screen.getByRole("button",{name:"실행에 적용"}));
+  await screen.findByText(/storage unavailable/);
+  expect(create).not.toHaveBeenCalled();
+  expect(screen.getByRole("textbox",{name:"작업 목표"})).toBeEnabled();
 });

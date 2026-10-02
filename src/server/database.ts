@@ -536,6 +536,18 @@ export class ConsensusDatabase {
     return rows.map((row) => this.mapTopic(row));
   }
 
+  topicForTurn(turn: { cwd: string; topicId?: string }): Topic | undefined {
+    if (turn.topicId) {
+      const topic = this.getTopic(turn.topicId);
+      if (topic.worktreePath !== turn.cwd) throw new Error("턴의 주제와 작업 경로가 다릅니다.");
+      return topic;
+    }
+    // Legacy adapter callers are accepted only when the directory identifies exactly one topic.
+    const rows = this.db.prepare("SELECT * FROM topics WHERE worktree_path=? LIMIT 2").all(turn.cwd);
+    if (rows.length > 1) throw new Error("공유 작업 경로에는 명시적인 topicId가 필요합니다.");
+    return rows[0] ? this.mapTopic(rows[0]) : undefined;
+  }
+
   getTopic(id: string): Topic {
     const row = this.db.prepare("SELECT * FROM topics WHERE id = ?").get(id);
     if (!row) throw new Error(`주제를 찾을 수 없습니다: ${id}`);
@@ -975,6 +987,15 @@ export class ConsensusDatabase {
       if (event.actor === "system" && needsMediatorAttention(event.state) || event.payload.interruptRetry) this.events.emit("mediation-change");
     } catch {
       // 구독자 오류는 이미 확정된 원장 기록을 실패나 롤백처럼 보이게 만들지 않는다.
+    }
+  }
+
+  restoreMediatorInterrupts(): void {
+    for (const topic of this.listTopics()) {
+      if (!needsMediatorAttention(topic.state)) continue;
+      const row = this.db.prepare(`SELECT * FROM timeline_events WHERE topic_id=? AND scope_generation=?
+        AND state=? AND actor='system' ORDER BY sequence DESC LIMIT 1`).get(topic.id, topic.scopeGeneration, topic.state);
+      if (row) this.interrupts.observe(topic, this.mapEvent(row), this.getFlags(topic.id).resumeState);
     }
   }
 

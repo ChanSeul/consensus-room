@@ -215,3 +215,13 @@ describe("단계 준비와 닫힌 단계 전달(host-review F010·F002)", () => 
     await waitFor(() => expect(push).toHaveBeenCalledWith("topic-a", "push"));
   });
 });
+
+it("keeps unparented legacy groups operable before any topic is adopted",async()=>{
+  vi.spyOn(api,"listWorkGroups").mockResolvedValue([view({links:{},title:"기존 작업 묶음"}),view({id:"managed",title:"이미 관리 중",parentTopicId:"root"})]);
+  const next=vi.spyOn(api,"nextWorkStage").mockResolvedValue(topic("created-stage")),onTopic=vi.fn();
+  const {container}=render(<WorkGroupsPanel unparentedOnly onTopic={onTopic}/>);
+  await screen.findByText(/기존 작업 묶음/);expect(screen.queryByText(/이미 관리 중/)).not.toBeInTheDocument();
+  const summary=container.querySelector("summary")!;fireEvent.click(summary);
+  fireEvent.click(screen.getByRole("button", {name:"다음 단계 열기"}));
+  await waitFor(()=>expect(next).toHaveBeenCalledWith("g", undefined));expect(onTopic).toHaveBeenCalledWith("created-stage");
+});

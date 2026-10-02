@@ -204,3 +204,29 @@ it("adopts legacy work groups together and keeps subsequent stage creation under
   const freshStage = await f.post(`work-groups/${fresh.json().id}/next`, {}, owner); expect(freshStage.statusCode, freshStage.body).toBe(201);
   expect(freshStage.json().parentTopicId).toBe(parent.id);
 });
+
+it("revalidates the same Source Goal after children exist without allowing a scope rewrite", async () => {
+  const f=await fixture();const root=await f.create({title:"Source root",topicKind:"group",entry:{mode:"sources",sources:[{url:"https://example.com/renewed",label:"source"}]}});
+  const publish=(revision:string)=>{const catalog=f.db.evidence.catalog.state(root.id),source=f.db.evidence.get(catalog.roots[0].sourceId);f.db.evidence.catalog.importHostSnapshot(root.id,{version:catalog.version,rootId:catalog.roots[0].id,sourceId:source.id,previousHash:source.contentHash,previousCheckedAt:source.checkedAt,observedAt:Date.now(),revision,units:[{id:"spec",kind:"document",content:revision}],missing:[]},[]);};
+  publish("v1");const goal="Same reviewed Goal";
+  expect((await f.post(`topics/${root.id}/goal`,{goal,evidenceDigest:f.db.evidence.topic(f.db.getTopic(root.id)).digest})).statusCode).toBe(200);
+  await f.create({title:"First child",parentTopicId:root.id});publish("v2");
+  expect((await f.post("topics",{title:"stale child",parentTopicId:root.id})).statusCode).toBe(409);
+  const evidenceDigest=f.db.evidence.topic(f.db.getTopic(root.id)).digest;
+  expect((await f.post(`topics/${root.id}/goal`,{goal:"different Goal",evidenceDigest})).statusCode).toBe(409);
+  expect((await f.post(`topics/${root.id}/goal`,{goal,evidenceDigest})).statusCode).toBe(200);
+  expect((await f.post("topics",{title:"Next child",parentTopicId:root.id})).statusCode).toBe(201);
+});
+
+it("binds management turns explicitly when two topics share their repository directory", async () => {
+  const f=await fixture();const roots=[];
+  for (const title of ["First manager","Second manager"]) roots.push(await f.create({title,topicKind:"group",entry:{mode:"brainstorm"}}));
+  expect(roots[0].worktreePath).toBe(roots[1].worktreePath);
+  for (const root of roots) {
+    await f.attach(root.id);await f.post(`topics/${root.id}/actions/brainstorm`,{});await f.done(root.id);
+    expect(f.calls.at(-1)?.topicId).toBe(root.id);
+    expect(f.db.topicForTurn({cwd:f.root,topicId:root.id})?.id).toBe(root.id);
+  }
+  expect(()=>f.db.topicForTurn({cwd:f.root})).toThrow("명시적인 topicId");
+  expect(f.calls).toHaveLength(2);
+});

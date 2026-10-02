@@ -1840,7 +1840,11 @@ it("lets bounded planning request a Figma product comment while omitting the vis
 // E3-2-2a — 세션 유지 계획 제어 턴의 타임라인 버전 고정 참조. 공개 흐름은 엔진(startPlan·retry) + 실제 guardedPlanning(엔진이 예산·작업 묶음 래퍼로 감싼다)
 // + 아래 읽기 모델 대역이다. 대역은 모델이 하듯 패킷의 참조 표시(와 읽은 색인)에서 selector 를 찾고, 받은 조각을 모아 각 문서를 offset 0 부터 돌려받은
 // nextOffset 을 따라 읽는다(다음 offset 은 앞 조각을 받아야 알 수 있어 한 문서는 라운드마다 한 조각이다). 래퍼는 문자열을 해석하지 않는다.
-describe("E3-2-2a timeline references", () => {
+// Large reference flows have exceeded 10s while offsets kept advancing. Bound the action,
+// then leave time for retries and shutdown; these are watchdogs, not latency requirements.
+const TIMELINE_ACTION_TIMEOUT_MS = 30_000;
+const TIMELINE_TEST_TIMEOUT_MS = 90_000;
+describe("E3-2-2a timeline references", { timeout: TIMELINE_TEST_TIMEOUT_MS }, () => {
   const TOLERANCE = '\n```tolerance\n{"scopePaths":["**"],"rules":[]}\n```';
   const planMarkdown = (marker: string) => REQUIRED_PLAN_HEADINGS
     .map(heading => `## ${heading}\n\n${marker} ${heading}${heading === "허용 오차" ? TOLERANCE : ""}`).join("\n\n");
@@ -1903,10 +1907,11 @@ describe("E3-2-2a timeline references", () => {
     for (const role of ["claude", "codex"] as const) context.database.upsertParticipant("topic", {
       role, sessionId: `${role}-existing`, mode: "attached", acknowledgedPlanSHA256: null });
     const settle = async () => {
-      const deadline = Date.now() + 10_000;
+      const deadline = Date.now() + TIMELINE_ACTION_TIMEOUT_MS;
       while (context.database.runningAction("topic")) {
-        if (Date.now() > deadline) throw new Error("Workflow did not complete");
-        await new Promise<void>(resolve => setImmediate(resolve));
+        if (Date.now() > deadline) throw new Error(`Workflow did not complete within ${TIMELINE_ACTION_TIMEOUT_MS}ms`);
+        // Yield between SQLite observations while the planning reader performs file I/O.
+        await new Promise<void>(resolve => setTimeout(resolve, 1));
       }
     };
     return { ...context, settle, artifacts: new ArtifactStore(join(context.root, "artifacts"), context.database) };
@@ -2031,18 +2036,21 @@ describe("E3-2-2a timeline references", () => {
     expect(reference.bytes).toBeGreaterThan(PLANNING_LIMITS.promptBytes);
     const model = readingModel(planMarkdown("E3_2_2A_OVER"));
     const engine = new WorkflowEngine({ database, git, artifacts, claude: guardedPlanning(model.adapter, database, git), codex: stopAudit().adapter });
-    engine.startPlan("topic"); await settle();
-    expect(model.calls[0].prompt).not.toContain(decision.body.slice(0, 300));
-    expect(model.calls.length).toBeGreaterThan(FORMER_RESEARCH_ROUNDS + 1);
-    expect(model.calls.some(call => call.prompt.includes("No more research is available"))).toBe(false);
-    expect(model.calls.every(call => Buffer.byteLength(call.prompt) < PLANNING_LIMITS.promptBytes)).toBe(true);
-    expect(assembled(model.received, reference.selector)).toMatchObject({ complete: true, text: timelineEventText(decision) });
-    const keys = model.delivered.map(entry => `${entry.selector}#${entry.offset}`);
-    expect(new Set(keys).size).toBe(keys.length);
-    expect(database.planning.referenceComplete("claude-existing", database.getTopic("topic"), reference)).toBe(true);
-    expect(await artifacts.readLatest("topic", "plan")).toContain("E3_2_2A_OVER");
-    expect(database.getTopic("topic")).toMatchObject({ state: "FAILED", lastError: "E3_2_2A_AUDIT_STOP" });
-    await engine.shutdown();
+    try {
+      engine.startPlan("topic"); await settle();
+      expect(model.calls[0].prompt).not.toContain(decision.body.slice(0, 300));
+      expect(model.calls.length).toBeGreaterThan(FORMER_RESEARCH_ROUNDS + 1);
+      expect(model.calls.some(call => call.prompt.includes("No more research is available"))).toBe(false);
+      expect(model.calls.every(call => Buffer.byteLength(call.prompt) < PLANNING_LIMITS.promptBytes)).toBe(true);
+      expect(assembled(model.received, reference.selector)).toMatchObject({ complete: true, text: timelineEventText(decision) });
+      const keys = model.delivered.map(entry => `${entry.selector}#${entry.offset}`);
+      expect(new Set(keys).size).toBe(keys.length);
+      expect(database.planning.referenceComplete("claude-existing", database.getTopic("topic"), reference)).toBe(true);
+      expect(await artifacts.readLatest("topic", "plan")).toContain("E3_2_2A_OVER");
+      expect(database.getTopic("topic")).toMatchObject({ state: "FAILED", lastError: "E3_2_2A_AUDIT_STOP" });
+    } finally {
+      await engine.shutdown();
+    }
   });
 
   // E3-4a Q-A2: 끝 조각을 먼저 읽고 가운데가 빈 채 낸 완료는 거절하지 않고 중간 단계로 강등한다 — 같은 시도에서 호스트가 남은 필수 구간을 청해 싣고 다시 판단한다.
@@ -2199,9 +2207,9 @@ describe("E3-2-2a timeline references", () => {
       return undefined;
     });
     const settleOn = async (db: ConsensusDatabase) => {
-      const deadline = Date.now() + 10_000;
+      const deadline = Date.now() + TIMELINE_ACTION_TIMEOUT_MS;
       while (db.runningAction("topic")) {
-        if (Date.now() > deadline) throw new Error("Workflow did not complete");
+        if (Date.now() > deadline) throw new Error(`Workflow did not complete within ${TIMELINE_ACTION_TIMEOUT_MS}ms`);
         await new Promise<void>(resolve => setImmediate(resolve));
       }
     };
@@ -2300,18 +2308,21 @@ describe("E3-2-2a timeline references", () => {
       return undefined;
     });
     engine = new WorkflowEngine({ database, git, artifacts, claude: guardedPlanning(model.adapter, database, git), codex: stopAudit().adapter });
-    engine.startPlan("topic"); await settle();
-    expect(database.getTopic("topic").lastError).toContain("New user decisions or evidence");
-    const decision = eventOf(database, late);
-    const before = model.calls.length;
-    engine.retry("topic"); await settle();
-    const retried = model.calls.slice(before);
-    expect(retried.length).toBeGreaterThan(0);
-    expect(retried[0].prompt).toContain(timelineReference(decision).selector);
-    expect(retried[0].prompt).not.toContain(late.slice(0, 300));
-    expect(retried.every(call => Buffer.byteLength(call.prompt) < PLANNING_LIMITS.promptBytes)).toBe(true);
-    expect(database.getTopic("topic").lastError ?? "").not.toContain("exceed the planning packet limit");
-    await engine.shutdown();
+    try {
+      engine.startPlan("topic"); await settle();
+      expect(database.getTopic("topic").lastError).toContain("New user decisions or evidence");
+      const decision = eventOf(database, late);
+      const before = model.calls.length;
+      engine.retry("topic"); await settle();
+      const retried = model.calls.slice(before);
+      expect(retried.length).toBeGreaterThan(0);
+      expect(retried[0].prompt).toContain(timelineReference(decision).selector);
+      expect(retried[0].prompt).not.toContain(late.slice(0, 300));
+      expect(retried.every(call => Buffer.byteLength(call.prompt) < PLANNING_LIMITS.promptBytes)).toBe(true);
+      expect(database.getTopic("topic").lastError ?? "").not.toContain("exceed the planning packet limit");
+    } finally {
+      await engine.shutdown();
+    }
   });
 
   it("does not acknowledge a late response while a scope change waits for it", async () => {
@@ -2381,9 +2392,9 @@ describe("E3-2-2a timeline references", () => {
     const v1Engine = new WorkflowEngine({ database: v1.database, git: v1.git, artifacts: new ArtifactStore(join(v1.root, "artifacts"), v1.database),
       claude: guardedPlanning(v1Model.adapter, v1.database, v1.git), codex: stopAudit().adapter });
     v1Engine.startPlan("topic");
-    const deadline = Date.now() + 10_000;
+    const deadline = Date.now() + TIMELINE_ACTION_TIMEOUT_MS;
     while (v1.database.runningAction("topic")) {
-      if (Date.now() > deadline) throw new Error("Workflow did not complete");
+      if (Date.now() > deadline) throw new Error(`Workflow did not complete within ${TIMELINE_ACTION_TIMEOUT_MS}ms`);
       await new Promise<void>(resolve => setImmediate(resolve));
     }
     expect(v1Model.calls.length).toBeGreaterThan(0);

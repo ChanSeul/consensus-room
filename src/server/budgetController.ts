@@ -18,7 +18,7 @@ interface Context { topicId: string; accounts: string[]; stage: string; }
 const REVIEW_LEDGER_OPERATIONS: ReadonlySet<string> = new Set(["review", "final-review", "review-read", "contract-correction"]);
 // All model methods pass through this boundary, including direct delivery/correction calls.
 export class BudgetController {
-  constructor(private readonly ledger: BudgetLedger, private readonly context: (cwd:string) => Context,
+  constructor(private readonly ledger: BudgetLedger, private readonly context: (cwd:string, topicId?:string) => Context,
     private readonly checkpoint: (topicId:string, output:unknown) => Promise<void>,
     private readonly revisions?: RevisionLedger, private readonly budgetsEnabled = true, private readonly reviews?:ReviewLedger,
     private readonly database?: ConsensusDatabase) {}
@@ -35,7 +35,7 @@ export class BudgetController {
   }
   private async run<T>(role:string, turn:Omit<SessionTurn,"sessionId">, invoke:(turn:Omit<SessionTurn,"sessionId">)=>Promise<T>):Promise<T> {
     turn.signal?.throwIfAborted();
-    const ctx=this.context(turn.cwd), id=randomUUID(), startedAt=Date.now();
+    const ctx=this.context(turn.cwd, turn.topicId), id=randomUUID(), startedAt=Date.now();
     // 재작성·리뷰 한도는 공급자 이름이 아니라 턴의 job 역할로 집계한다 — 계획자·검토자가 다른 공급자로 배정돼도 한도가 빠지지 않게(E2b).
     // role(공급자)은 세션 귀속이라 체크포인트 대조·키·예산 원장에는 그대로 쓴다.
     const job=jobOfTurn(role as "claude"|"codex",turn);

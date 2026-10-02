@@ -293,7 +293,7 @@ export class EvidenceService {
 // A failed/cancelled call never acknowledges content that the model may not have received.
 export function withEvidence(adapter: AgentAdapter, database: ConsensusDatabase, imageDirectory: string): AgentAdapter {
   const run = async <T>(turn: Omit<SessionTurn, "sessionId"> | SessionTurn, invoke: (enriched: typeof turn) => Promise<T>, session: (result: T) => string): Promise<T> => {
-    const topic = database.listTopics().find(topic => topic.worktreePath === turn.cwd);
+    const topic = database.topicForTurn(turn);
     if (!topic || turn.protocolOnly || turn.planningControl) return invoke(turn);
     // Impact review already carries the exact diff and a local cache; do not inject a fresh session full-corpus page.
     if (turn.evidenceAssessment) return invoke({ ...turn, evidenceManaged: true, figmaReadEnabled: false });

@@ -19,6 +19,11 @@ import { EXECUTION_POLICY_NOTE, timelineEventText, timelineReference } from "../
 import { hashPlan } from "../src/shared/workflow";
 import { agentRunError } from "../src/server/adapters/resultParser";
 
+// Multi-page Git workflows can outlive Vitest's 5s default while making progress.
+// Keep finite action/test watchdogs, not latency requirements, with room for retries and cleanup.
+const DELIVERY_ACTION_TIMEOUT_MS = 30_000;
+const DELIVERY_TEST_TIMEOUT_MS = 90_000;
+
 const temporaryDirectories: string[] = [];
 
 afterEach(() => {
@@ -27,7 +32,7 @@ afterEach(() => {
   }
 });
 
-describe("승인 뒤 구현부터 전달까지", () => {
+describe("승인 뒤 구현부터 전달까지", { timeout: DELIVERY_TEST_TIMEOUT_MS }, () => {
   it.each([true, false])("Claude 구현·보완과 최종 리뷰 뒤에만 전달한다 (파일 수정: %s)", async (changeOnFix) => {
     const root = mkdtempSync(join(tmpdir(), "consensus-room-delivery-"));
     temporaryDirectories.push(root);
@@ -168,7 +173,7 @@ describe("승인 뒤 구현부터 전달까지", () => {
   });
 });
 
-describe("인도 커밋 사슬(C1→C2→C3) — 2026-09-21", () => {
+describe("인도 커밋 사슬(C1→C2→C3) — 2026-09-21", { timeout: DELIVERY_TEST_TIMEOUT_MS }, () => {
   // S11 계획([d02] S11-A03)은 소스·flip·문서를 세 커밋으로 순서대로 인도한다. 이전 엔진은 기준을 리뷰 HEAD 로 고정해 두 번째 커밋부터
   // "worktree 가 바뀌었다" 로 거부했다(모든 이전 단계가 커밋 1회라 드러나지 않았다). 기준은 마지막 확정 커밋, 내용 불변은 리뷰 HEAD 기준이다.
   async function setupTwoFiles(label: string) {
@@ -678,7 +683,7 @@ function waitForState(
     const timeout = setTimeout(() => {
       cleanup();
       reject(new Error(`상태 대기 실패: ${database.getTopic(topicId).state}`));
-    }, 5_000);
+    }, DELIVERY_ACTION_TIMEOUT_MS);
     const listener = (event: { state: string }) => {
       if (event.state === expected) {
         cleanup();
@@ -700,7 +705,8 @@ async function waitUntil(predicate: () => boolean, timeoutMilliseconds = 3_000):
   const deadline = Date.now() + timeoutMilliseconds;
   while (!predicate()) {
     if (Date.now() >= deadline) throw new Error("조건을 기다리는 동안 제한 시간을 넘었습니다.");
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    // Yield between SQLite observations instead of querying on every event-loop pass.
+    await new Promise<void>((resolve) => setTimeout(resolve, 1));
   }
 }
 
@@ -995,7 +1001,7 @@ async function pagedTopic(label: string, decisions: readonly string[]) {
       database = new ConsensusDatabase(databasePath);
       artifacts = new ArtifactStore(join(data, "topics"), database);
     },
-    idle: () => waitUntil(() => database.runningAction(topicId) === null, 20_000),
+    idle: () => waitUntil(() => database.runningAction(topicId) === null, DELIVERY_ACTION_TIMEOUT_MS),
   };
 }
 
@@ -1009,7 +1015,7 @@ function joined(pages: readonly PageMark[], selector: string): string {
 const pageBytes = (pages: readonly PageMark[]) => pages.reduce((sum, page) => sum + page.end - page.offset, 0);
 const RECHECK = "이미 만든 결과를 그 결정과 다시 대조해";
 
-describe("E3-2-2b 타임라인 쪽 — 구현·수정·코드 리뷰", () => {
+describe("E3-2-2b 타임라인 쪽 — 구현·수정·코드 리뷰", { timeout: DELIVERY_TEST_TIMEOUT_MS }, () => {
   it("구현: 한국어 50,000자 결정이 첫 턴·계속 진행 쪽으로 나뉘어 원문과 같고, 완독 전 완료는 재대조 계속 진행이며, 한 리뷰 호출 예산을 넘는 리뷰는 판정 전 읽기 호출로 나눠 실은 뒤 한 번 판정한다", async () => {
     const decision = koreanDecision(50_000, "a");
     const room = await pagedTopic("impl", [decision]);
@@ -1396,7 +1402,7 @@ describe("E3-2-2b 타임라인 쪽 — 구현·수정·코드 리뷰", () => {
   });
 });
 
-describe("E3-2-2b host-review 1차 보완(55f3795 F001~F003)", () => {
+describe("E3-2-2b host-review 1차 보완(55f3795 F001~F003)", { timeout: DELIVERY_TEST_TIMEOUT_MS }, () => {
   it("F001: 응답 수신 경계에서 의무 기록이 실패하면 커서도 전진하지 않아, DB 를 다시 연 재시도가 남은 필수 원문을 끝까지 실은 뒤에만 구현을 채택한다", async () => {
     const room = await pagedTopic("f001", [koreanDecision(50_000, "j")]);
     const { reference, text } = room.references[0];
@@ -1631,7 +1637,7 @@ function generousBudget(room: Awaited<ReturnType<typeof pagedTopic>>) {
 const reviewUsed = (room: Awaited<ReturnType<typeof pagedTopic>>) => room.database.reviews.account(room.topicId, "implementation").used;
 const operationsOf = (calls: readonly LedgerCall[]) => calls.map((call) => `${call.method}:${call.operation}`);
 
-describe("E3-4c 코드 리뷰 다중 호출 원장", () => {
+describe("E3-4c 코드 리뷰 다중 호출 원장", { timeout: DELIVERY_TEST_TIMEOUT_MS }, () => {
   it("한 호출 예산을 넘는 필수 자료는 판정 전 리뷰 읽기 호출(도구 없음·ACK·설정 상속)로 끝까지 싣고 판정은 한 번이며, 논리 리뷰 전체가 원장 ID 하나로 리뷰 1회만 쓴다", async () => {
     const { room, total } = await largeReviewRoom("ledger-reads");
     const [first, second] = room.references;
@@ -1993,7 +1999,7 @@ function reviewMemory(): string {
   return root;
 }
 
-describe("E3-4c host-review 39d21df9 F003·F004 — 세션별 수신 기록", () => {
+describe("E3-4c host-review 39d21df9 F003·F004 — 세션별 수신 기록", { timeout: DELIVERY_TEST_TIMEOUT_MS }, () => {
   it("F003: 이전 원장의 리뷰 읽기 호출이 만든 세션은 트리가 바뀌어 새 원장이 열려도 첫 판정에 계획 전문·계획 검토 근거를 싣고 '이미 전달' 안내를 하지 않는다", async () => {
     const { room } = await largeReviewRoom("receipt-new-tree");
     const topic = room.database.getTopic(room.topicId);

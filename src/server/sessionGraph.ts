@@ -61,7 +61,8 @@ export function buildSessionGraph(db: ConsensusDatabase, topicId: string, host: 
       const role = seatRole[seat.seat], node = session(seat.sessionId, role, seat.binding?.provider ?? null, topic.topicKind === "group" && !discussion); current[role] = node;
       const fallback = roleJob[seat.seat];
       const currentJob = seat.seat === "author" || seat.seat === "implementation" ? routing.current.author : routing.current.reviewer;
-      const operation = currentJob.role === fallback[0] ? currentJob.operation : fallback[1];
+      const seatOperations = seat.seat === "plan-review" ? ["audit", "closeout", "brainstorm", "ack"] : seat.seat === "code-review" ? ["review", "final-review", "review-read", "contract-correction"] : null;
+      const operation = currentJob.role === fallback[0] && (!seatOperations || seatOperations.includes(currentJob.operation)) ? currentJob.operation : fallback[1];
       const route = routing.jobs.find(item => item.role === fallback[0] && item.operation === operation);
       for (const job of routing.jobs.filter(item => item.role === fallback[0] && (seat.seat === "plan-review" ? ["audit","closeout","brainstorm"].includes(item.operation) : seat.seat === "code-review" ? ["review","final-review","review-read"].includes(item.operation) : true))) {
         node.details.push({label:`${job.role}/${job.operation}`,value:job.route ? `${job.route.provider} · ${job.route.settings.model} · ${job.route.settings.effort}` : job.refusal ?? "실행 경로 없음"});
@@ -77,8 +78,10 @@ export function buildSessionGraph(db: ConsensusDatabase, topicId: string, host: 
       return found?.length === 1 ? found[0] : session(sid, role, provider, true);
     };
     for (const event of records.events) {
-      const sid = text(event.sessionId); if (!sid) continue;
-      knownSession(sid, stageRole(String(event.state)), text(event.routeProvider) ?? text(event.provider));
+      const sid = text(event.sessionId); if (!sid || sid.startsWith("pending:")) continue;
+      const role: GraphRole = event.seat === "implementation" ? "runner" : event.seat === "code-review" ? "reviewer"
+        : event.seat === "codex" || event.seat === "plan-review" ? "plan-reviewer" : event.seat === "claude" || event.seat === "author" ? "planner" : stageRole(String(event.state));
+      knownSession(sid, role, text(event.routeProvider) ?? text(event.provider));
     }
     for (const checkpoint of records.checkpoints) {
       const all = [...(checkpoint.sessions ? JSON.parse(String(checkpoint.sessions)) as string[] : []), text(checkpoint.sessionId)].filter((id): id is string => Boolean(id));
@@ -96,7 +99,7 @@ export function buildSessionGraph(db: ConsensusDatabase, topicId: string, host: 
     for (const receipt of records.receipts) {
       const consumer = JSON.parse(String(receipt.consumer)) as unknown[], sid = text(consumer[receipt.mediator ? 2 : 3]); if (!sid) continue;
       const node = knownSession(sid, receipt.mediator ? "mediator" : "session"), source = sourceNode(String(receipt.sourceId));
-      if (source) edge(source.id, node.id, "delivered", receipt.linkOnly ? `원문 링크 전달 · 범위 ${consumer[1]}` : `전달 기록 · ${receipt.units}개 원문 조각 · 범위 ${consumer[1]}`);
+      if (source) edge(source.id, node.id, "delivered", receipt.linkOnly ? `원문 링크 전달 · 범위 ${consumer[1]}` : `전달 기록 · ${receipt.units}개 원문 조각${receipt.partialChars ? ` · 본문 일부 전달 (${receipt.partialChars}자)` : ""} · 범위 ${consumer[1]}`);
     }
     for (const fragment of records.fragments) {
       const node = knownSession(String(fragment.sessionId), "session"), selector = String(fragment.selector), kind = String(fragment.kind);
@@ -158,7 +161,7 @@ export function buildSessionGraph(db: ConsensusDatabase, topicId: string, host: 
     }
   }
   graph.lanes.push({ id: "host", title: "호스트 리뷰 · 프로젝트 실행과 별도" });
-  if (host.nodes.length) { graph.nodes.push(...host.nodes); graph.edges.push(...host.edges); }
+  if (host.nodes.length) { graph.nodes.push(...structuredClone(host.nodes)); graph.edges.push(...structuredClone(host.edges)); }
   else graph.nodes.push({ id: "host:unconnected", kind: "session", topicId: null, lane: "host", role: "host-reviewer", label: "Host reviewer", subtitle: "연결된 리뷰 세션 없음",
     status: "unconnected", historical: false, details: [{ label: "상태", value: host.warning ?? "아직 실행 기록이 없습니다." }] });
   if (host.warning) graph.warnings.push(host.warning);

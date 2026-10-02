@@ -121,3 +121,61 @@ it("keeps the two brainstorming sessions visible on a management topic", () => {
   expect(graph.nodes.filter(n=>["planner","plan-reviewer"].includes(n.role??"")).map(n=>[n.sessionId,n.historical])).toEqual([["claude-discussion",false],["codex-discussion",false]]);
   expect(graph.nodes.some(n=>n.role==="runner")).toBe(false);
 });
+
+it("keeps plan and code reviewer settings tied to their own seats across stages", () => {
+  const f=fixture();f.topic("t");
+  for (const operation of ["audit","review"] as const) {
+    f.db.roles.createProfile({id:operation,provider:"codex",model:`${operation}-model`,effort:"high",options:{}});
+    f.db.roles.assign({scope:"topic:t",role:"reviewer",operation,participant:`${operation}-owner`,profileId:operation,sessionId:null,expectedVersion:0,note:"test"});
+  }
+  for (const state of ["CODEX_AUDIT","CODEX_REVIEW"] as const) {
+    f.db.updateTopic("t",{state});
+    const graph=f.graph("t");
+    expect(graph.nodes.find(n=>n.role==="plan-reviewer")?.details).toContainEqual({label:"계획 검토자 현재 설정",value:"codex · audit-model · high"});
+    expect(graph.nodes.find(n=>n.role==="reviewer")?.details).toContainEqual({label:"코드 검토자 현재 설정",value:"codex · review-model · high"});
+  }
+});
+
+it("retains replaced sessions, partial body delivery and indexed receipt lookups", () => {
+  const f=fixture(),topic=f.topic("t");
+  f.db.appendEvent({topicId:"t",actor:"system",kind:"system",state:"DRAFT",body:"session changed",payload:{sessionRebound:{seat:"claude",previous:{sessionId:"old-discussion",binding:{provider:"claude"}}}}});
+  f.db.appendEvent({topicId:"t",actor:"user",kind:"scope_change",state:"DRAFT",body:"scope changed",payload:{previousSessions:{codex:"old-review"},previousBindings:{codex:{provider:"codex"}}}});
+  const source=f.db.evidence.register(topic.id,{url:"https://example.com/large",label:"Large original",mode:"rest",intervalSeconds:900});
+  const sql=new DatabaseSync(f.path),consumer=JSON.stringify([topic.id,1,"claude","old-discussion"]);
+  sql.prepare("INSERT INTO evidence_link_receipts VALUES(?,?)").run(consumer,source.id);
+  sql.prepare("INSERT INTO evidence_receipt_progress VALUES(?,?,?,?,?)").run(consumer,source.id,"large-unit","hash",1200);
+  const graph=f.graph("t");
+  expect(graph.nodes.find(n=>n.sessionId==="old-discussion")).toMatchObject({historical:true,role:"planner"});
+  expect(graph.nodes.find(n=>n.sessionId==="old-review")).toMatchObject({historical:true,role:"plan-reviewer",provider:"codex"});
+  const delivered=graph.edges.filter(e=>e.kind==="delivered");expect(delivered).toHaveLength(1);expect(delivered[0].label).toContain("본문 일부 전달");
+  for (const table of ["evidence_receipts","evidence_receipt_progress","evidence_link_receipts","evidence_mediator_unit_receipts","evidence_mediator_progress","evidence_mediator_source_receipts"]) {
+    const plan=sql.prepare(`EXPLAIN QUERY PLAN SELECT consumer,source_id,COUNT(*) FROM ${table} WHERE json_valid(consumer) AND json_extract(consumer,'$[0]')=? GROUP BY consumer,source_id`).all("t");
+    expect(plan.some(row=>String(row.detail).includes(`SEARCH ${table} USING INDEX ${table}_topic`))).toBe(true);
+  }
+  sql.close();
+});
+
+it("does not mutate the cached host graph while retaining every reviewed snapshot of a resumed session", () => {
+  const f=fixture();f.topic("t");const home=join(f.root,"review-tools");mkdirSync(home);
+  const sql=new DatabaseSync(join(home,"reviews.sqlite"));sql.exec("CREATE TABLE runs(id,job,session_id,status,head,started,provider_pid,directory);CREATE TABLE jobs(id,repo);");
+  sql.prepare("INSERT INTO jobs VALUES(?,?)").run("job","engine");
+  for (const [index,head] of ["old-head","new-head"].entries()) sql.prepare("INSERT INTO runs VALUES(?,?,?,?,?,?,?,?)").run(String(index),"job","same-session","passed",head,index,null,home);
+  sql.close();const host=readHostReviewGraph(f.root),original=structuredClone(host);
+  const a=buildSessionGraph(f.db,"t",host),b=buildSessionGraph(f.db,"t",host);
+  expect(host).toEqual(original);expect(b.nodes).toEqual(a.nodes);
+  expect(host.nodes.filter(n=>n.kind==="session")).toHaveLength(1);expect(host.edges).toHaveLength(2);
+  expect(host.nodes.filter(n=>n.kind==="source").map(n=>n.subtitle).sort()).toEqual(["new-head","old-head"]);
+});
+
+it("rejects new work after integration has started and restores attention without loading conversation history", () => {
+  const f=fixture();f.topic("r",null,true);f.topic("a","r");f.topic("z","r");
+  const input={title:"group",goal:"goal",contracts:"contract",stages:[{id:"a",title:"A",goal:"A",kind:"work" as const,dependsOn:[]},{id:"z",title:"Z",goal:"Z",kind:"integration" as const,dependsOn:["a"]}]};
+  f.db.workGroups.create("g",input,f.root,"base");f.db.workGroups.link("g","a","a","base");f.db.workGroups.link("g","z","z","base");
+  const next={...input,stages:[input.stages[0],{id:"b",title:"B",goal:"B",kind:"work" as const,dependsOn:[],outcome:"B result",separation:{basis:"rollback" as const,detail:"Separate reversible result"}},input.stages[1]]};
+  expect(()=>f.db.workGroups.previewRevision("g",next,1)).toThrow("통합 검증이 시작된 뒤");expect(f.db.workGroups.get("g").version).toBe(1);
+  f.db.updateTopic("z",{state:"USER_DECISION_REQUIRED",resumeState:"CODEX_REVIEW"});
+  f.db.appendEvent({topicId:"z",actor:"system",kind:"system",state:"USER_DECISION_REQUIRED",body:"reviewer needs mediator"});
+  const sql=new DatabaseSync(f.path);sql.exec("DELETE FROM mediator_interrupts");sql.close();
+  const history=vi.spyOn(f.db,"getTimeline").mockImplementation(()=>{throw new Error("Full history must not load");});
+  f.db.restoreMediatorInterrupts();expect(f.db.interrupts.current("z")).toMatchObject({reason:"reviewer needs mediator",sourceRole:"reviewer"});expect(f.db.interrupts.current("r")).toBeNull();expect(history).not.toHaveBeenCalled();
+});

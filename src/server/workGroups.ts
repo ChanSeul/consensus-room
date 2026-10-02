@@ -564,6 +564,10 @@ const inputFields = (g: WorkGroup): WorkGroupInput => ({ title: g.title, goal: g
 
 function planRevision(old: WorkGroup, parsed: WorkGroupInput, expectedVersion: number, closedIds: ReadonlySet<string>): RevisionPreview {
   const closed = old.stages.map((s) => s.id).filter((id) => closedIds.has(id));
+  const integration = old.stages.find(stage => stage.kind === "integration");
+  if (integration && (old.links[integration.id] || old.pending?.[integration.id]) &&
+      parsed.stages.some(stage => stage.kind === "work" && !old.stages.some(previous => previous.id === stage.id)))
+    throw Object.assign(new Error("통합 검증이 시작된 뒤에는 새 작업을 추가할 수 없습니다."), { statusCode: 409 });
   // 재적용: 입력이 지금 레코드와 같고 기대 버전이 지금 버전이거나, 직전 버전이면서 마지막 개정이 지금 버전을 만든 것이다(그 개정의 입력이 곧
   // 지금 레코드다). 버전을 올리지 않고 재계획 대기 단계만 돌려준다 — 호출자가 대기 단계마다 세대를 비교해 처리한다.
   if (canonical(comparableInput(parsed)) === canonical(comparableInput(old)) && (expectedVersion === old.version ||

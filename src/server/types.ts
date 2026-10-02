@@ -73,6 +73,8 @@ export interface CommandRunner {
 }
 
 export interface SessionTurn {
+  // Stable engine identity; management topics may share the same repository directory.
+  topicId?: string;
   // 엔진이 이 턴에 명시한 역할·작업(엔진 개편 E2a). 어댑터는 job 과 턴 형태로 역할 정책(adapters/turnPolicy.ts)을 계산해 자기 CLI 인자로 변환한다.
   // implementation·protocolOnly 는 job 에서 유도한 값이 함께 실린다(래퍼가 읽는다). job 이 없으면 어댑터가 공급자·플래그로 유도한다(호환 경계).
   job?: TurnJob;
