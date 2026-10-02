@@ -1753,10 +1753,10 @@ describe("plan 권한 모드는 최초 계획과 findings 0 개정 두 번만 �
     database.close();
   });
 
-  it("계획 수렴 턴은 계획 모델(Opus 5.5)을 받고 구현 오버라이드는 노출되지 않는다", async () => {
+  it("계획 수렴 턴은 계획 모델(Fable 5.1)을 받고 구현 오버라이드는 노출되지 않는다", async () => {
     const { database, planTurn, revisionTurn } = await run([], []);
     for (const turn of [planTurn, revisionTurn]) {
-      expect(turn.settings).toEqual({ model: "claude-opus-5-5", effort: "max" });
+      expect(turn.settings).toEqual({ model: "claude-fable-5-1", effort: "xhigh" });
     }
     database.close();
   });
