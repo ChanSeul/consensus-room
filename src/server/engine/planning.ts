@@ -39,7 +39,7 @@ import { bindingOf, legacyBinding, resolveRoute, sameBinding, UnsupportedRoute, 
 import type { StoredArtifact } from "../types.js";
 import type { EngineCore } from "./core.js";
 import { preparePlanningContext } from "./planningContext.js";
-import { classifyCloseoutAdditions, judgeCloseout } from "./findingJudgment.js";
+import { auditRevisionFindings, classifyCloseoutAdditions, judgeCloseout } from "./findingJudgment.js";
 
 const IMPLEMENTATION_NOTE_PREFIX = "구현 노트로 승계(엔진 자동, 개정 생략): ";
 
@@ -515,26 +515,30 @@ export class PlanningPipeline {
     if (this.core.interruptForNewUserInput(topic, context.inputSequence)) return;
     if (this.core.pauseForResult(topicId, audit, "CODEX_AUDIT", "계획 검토에 사용자 결정이나 외부 증거가 필요합니다.")) return;
 
-    // 2026-09-13 사용자 규칙: 감사 지적이 전부 경미(MEDIUM 이하)이거나 이미 판단이 끝난 것이면 개정 턴을 사지 않는다 —
-    // 경미 지적은 구현 노트로 러너에게 넘기고(AGREED_ACTION 으로 승계), 계획은 그대로 종결 확인으로 간다.
+    // Audit distinguishes a plan defect from an already planned implementation duty.
+    // Keep every obligation; only new minor notes are added without revising the plan.
     const actionable = audit.findings.filter((finding) => !isSettledFinding(finding));
-    if (actionable.length > 0 && actionable.every(isMinorFinding)) {
-      const carried = actionable.map((finding) => ({
+    const revisionFindings = auditRevisionFindings(claudePlan.findings, audit.findings);
+    const regressions = dispositionRegressions(claudePlan.findings, audit.findings);
+    if (actionable.length > 0 && regressions.length === 0 && revisionFindings.every(isMinorFinding)) {
+      const notes = revisionFindings.filter(finding => actionable.includes(finding));
+      const noteIDs = new Set(notes.map(finding => finding.id));
+      const carried = audit.findings.map((finding) => !noteIDs.has(finding.id) ? finding : ({
         ...finding, disposition: "AGREED_ACTION" as const, requiresUserDecision: false,
         rationale: `${IMPLEMENTATION_NOTE_PREFIX}${finding.rationale}`,
       }));
-      await this.core.recordImplementationNotes(topic, actionable, "audit", signal);
+      await this.core.recordImplementationNotes(topic, notes, "audit", signal);
       const synthetic: AgentResult = {
-        kind: "REVISION", summary: "감사 지적이 전부 경미해 개정을 생략했습니다(엔진 자동) — 경미 지적은 구현 노트로 러너에게 넘어갑니다.",
-        findings: uniqueFindings([...audit.findings.filter((finding) => isSettledFinding(finding)), ...carried]),
+        kind: "REVISION", summary: "계획 수정이 필요한 중대 지적이 없어 개정을 생략했습니다(엔진 자동). 기존 구현 의무와 경미 지적은 유지합니다.",
+        findings: carried,
         evidenceRefs: [], planEdits: [],
       };
       const revision = this.core.dependencies.database.timelineCount(topicId) + 1;
       const artifact = await this.core.writeArtifact(topic, "claude-revision", revision, JSON.stringify(synthetic, null, 2), signal);
       // 합성 개정의 채택 기록은 이 생략 이벤트다 — 계획을 유지하므로 계획 확정 이벤트가 없고, 산출물 revision 을 명시해 그 합성 개정만 가리킨다(F010).
       this.core.event(topicId, "system", "system",
-        `감사 지적 ${actionable.length}건이 전부 경미(MEDIUM 이하)라 개정 턴을 생략합니다 — 구현 노트로 러너에게 넘기고 종결 확인으로 갑니다: ${actionable.map((finding) => finding.id).join(", ")}`,
-        { skippedRevision: true, implementationNoteIDs: actionable.map((finding) => finding.id),
+        `계획 수정이 필요한 중대 지적이 없어 개정 턴을 생략합니다 — 기존 구현 의무를 유지하고 경미 지적을 구현 노트로 넘겨 종결 확인으로 갑니다: ${notes.map((finding) => finding.id).join(", ")}`,
+        { skippedRevision: true, implementationNoteIDs: notes.map((finding) => finding.id),
           adoptedResult: { kind: "claude-revision", revision: artifact.revision } satisfies AdoptedResult });
       await this.runPlanningFromCloseout(topicId, synthetic, storedFirstPlan, signal);
       return;

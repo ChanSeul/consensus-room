@@ -12,6 +12,7 @@ import { SpawnCommandRunner } from "../src/server/processRunner";
 import { guardedPlanning } from "../src/server/guardedPlanning";
 import { BudgetController } from "../src/server/budgetController";
 import { PlanningReader, utf8Slice } from "../src/server/planningReader";
+import { renderDeferredFindingsDigest } from "../src/server/deferredFindingsDigest";
 import { PLANNING_LIMITS, PlanningPaused, type PlanningFragment, type PlanningStep } from "../src/shared/planningControl";
 import { buildClaudePlanPrompt, buildCodexAuditPrompt, planTimelineDelivery, timelineEventText, timelineReference } from "../src/shared/prompts";
 import { WorkflowEngine } from "../src/server/workflow";
@@ -46,6 +47,38 @@ const codexSessionMissing = (sessionId: string) =>
   agentRunError("codex", 1, `Error: thread/resume: thread/resume failed: no rollout found for thread id ${sessionId} (code -32600)\n`, "");
 
 const cleanups: Array<() => void> = [];
+it.each(["IME", "View.swift::body"])("pinned archive search locates the complete entry for %s without unrelated history", async (literal) => {
+  const path = "/artifacts/deferred.md";
+  const rationale = "앞서 합의한 입력 계약을 보존한다.\n\n## 재현\n\n```markdown\n## SAMPLE [LOW] 과거 항목\n\n" +
+    "출처 review · 토픽 previous-topic · 기록 2026-09-01\n\n한글 IME 계약과 View.swift::body를 확인한다.\n```";
+  const entry = `## SU-1 [HIGH] 입력 보존\n\n출처 review · 토픽 topic-1 · 기록 2026-10-05\n\n${rationale}\n`;
+  const body = renderDeferredFindingsDigest({ id: "topic-1", scopeGeneration: 1 }, [
+    { id: "OLD", severity: "LOW", title: "이전 항목", rationale: "이전 근거\n".repeat(3000), source: "review", topicId: "prior", recordedAt: "2026-10-01" },
+    { id: "SU-1", severity: "HIGH", title: "입력 보존", rationale, source: "review", topicId: "topic-1", recordedAt: "2026-10-05" },
+  ]);
+  const reader = new PlanningReader("/unused", "a".repeat(40), new Map([[`artifact:${path}`, body]]));
+  const search = await reader.read({ kind: "search", selector: `artifact::${path}::${literal}`, offset: 0, question: "입력 계약" });
+  const match = JSON.parse(search.content);
+  const original = await reader.read({ kind: "artifact", selector: match.selector, offset: match.offset, question: "해당 원문" });
+  expect(original.content).toBe(entry);
+  expect(original.hash).toBe(match.hash);
+  expect(original.nextOffset).toBeNull();
+  expect(await reader.read({ kind: "search", selector: `artifact::${path}::absent`, offset: 0, question: "없는 항목" }))
+    .toMatchObject({ content: "", nextOffset: null });
+  for (const selector of ["artifact::/etc/passwd::root", `artifact::${path}::`]) {
+    await expect(reader.read({ kind: "search", selector, offset: 0, question: "거부" })).rejects.toThrow("pinned artifact");
+  }
+});
+it.each(["", "<!-- consensus-room:deferred-findings-index:v1 [-1] -->\n"])("archive search preserves context without a valid producer index (%s)", async (header) => {
+  const path = "/artifacts/legacy.md";
+  const body = header + "# 기존 이연 원장\n\n## CURRENT [HIGH] 현재 근거\n\n```markdown\n" +
+    "## QUOTED [LOW] 인용\n\n출처 audit · 토픽 prior · 기록 2026-10-01\n\nIME\n```\n";
+  const reader = new PlanningReader("/unused", "a".repeat(40), new Map([[`artifact:${path}`, body]]));
+  const result = await reader.read({ kind: "search", selector: `artifact::${path}::IME`, offset: 0, question: "기존 원문" });
+  const match = JSON.parse(result.content);
+  const original = await reader.read({ kind: "artifact", selector: match.selector, offset: match.offset, question: "완전한 문맥" });
+  expect(original.content).toBe(body);
+});
 afterEach(() => { vi.restoreAllMocks(); for (const clean of cleanups.splice(0).reverse()) clean(); });
 function setup(role: "claude" | "codex" = "claude", executionInput = 100000, executionDuration = 100000, enable = true) {
   const root = mkdtempSync(join(tmpdir(), "guarded-planning-"));

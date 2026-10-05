@@ -3,10 +3,11 @@ import type { DatabaseSync } from "node:sqlite";
 import type { TimelineEvent, Topic } from "../../shared/contracts.js";
 import { needsMediatorAttention, type MediatorConnectionStatus, type MediatorInterventionStatus, type MediatorInterrupt, type MediatorInterruptStatus } from "../../shared/mediatorInterrupts.js";
 import type { ActionRecord } from "../types.js";
+import { ACTIVE_WORKFLOW_STATES } from "../../shared/workflow.js";
 
 type Delivery = { state: "sending" | "sent" | "acknowledged" | "failed" | "unknown"; claim: string; attempts: number; updatedAt: number; error: string | null; transportUnavailable?: boolean };
 type Record = MediatorInterrupt & { binding: string; reviewProgress?: boolean; continuationKey?: string; open: boolean; deliveries: { [target: string]: Delivery };
-  handling?: { [target: string]: string }; resumed?: { at: string; actionId: string } };
+  handling?: { [target: string]: string }; startedActionId?: string; resumed?: { at: string; actionId: string } };
 function conflict(message: string): never { throw Object.assign(new Error(message), { statusCode: 409 }); }
 export class MediatorInterruptStore {
   constructor(private readonly db: DatabaseSync, private readonly clock = Date.now, private readonly continuation: (topicId: string) => { key: string; reason: string } | null = () => null) {
@@ -31,14 +32,14 @@ export class MediatorInterruptStore {
     if (!record || record.id !== id) conflict("현재 개입 요청이 아닙니다.");
     record.handling ??= {}; record.handling[target] ??= new Date(this.clock()).toISOString(); this.save(record);
   }
-  // Admission to a new running action is separate evidence from delivery/handling.
-  // Do not attribute it to the mediator, or count advisory review alerts as a resumed stop.
+  // Admission alone cannot release a stop: an evidence assessment may leave it unchanged.
+  // Pair the admitted action with an actual active-state transition in current().
   actionStarted(topic: Topic, action: ActionRecord): void {
     const row = this.db.prepare("SELECT record_json FROM mediator_interrupts WHERE topic_id=? AND open=1 ORDER BY rowid DESC LIMIT 1").get(topic.id);
     if (!row || action.status !== "running" || !["plan", "implement", "retry", "evidence-assessment", "brainstorm", "brainstorm-plan", "brainstorm-close"].includes(action.kind)) return;
     const record: Record = JSON.parse(String(row.record_json)), binding = JSON.parse(record.binding);
     if (record.reviewProgress || record.continuationKey || binding[0] !== topic.scopeGeneration || binding[1] !== topic.planEpoch || !needsMediatorAttention(record.state)) return;
-    this.save({ ...record, open: false, resumed: { at: action.createdAt, actionId: action.id } });
+    this.save({ ...record, startedActionId: action.id });
   }
   intervention(topicId: string, target: string | null): MediatorInterventionStatus | null {
     this.current(topicId); // Expire obsolete open requests before presenting history.
@@ -77,6 +78,13 @@ export class MediatorInterruptStore {
     const topic = this.db.prepare("SELECT scope_generation,plan_epoch,state FROM topics WHERE id=?").get(topicId);
     const continuationKey = record.continuationKey ? this.continuation(topicId)?.key : undefined;
     if (!topic || (record.continuationKey && continuationKey !== record.continuationKey) || (record.reviewProgress && topic.state === "CLOSED") || record.binding !== JSON.stringify([Number(topic.scope_generation), Number(topic.plan_epoch), record.reviewProgress ? "review-progress" : continuationKey ?? topic.state])) {
+      const binding = JSON.parse(record.binding);
+      if (topic && record.startedActionId && !record.reviewProgress && !record.continuationKey
+        && binding[0] === Number(topic.scope_generation) && binding[1] === Number(topic.plan_epoch)
+        && (ACTIVE_WORKFLOW_STATES.has(topic.state as Topic["state"]) || topic.state === "CONSENSUS_ACK")
+        && this.db.prepare("SELECT 1 FROM actions WHERE id=? AND topic_id=? AND status='running'").get(record.startedActionId, topicId)) {
+        record.resumed = { at: new Date(this.clock()).toISOString(), actionId: record.startedActionId };
+      }
       this.save({ ...record, open: false }); return null;
     }
     return record;

@@ -27,6 +27,7 @@ function withoutNullOptionals(value: unknown): unknown {
       const copy = { ...(finding as Record<string, unknown>) };
       if (copy.disposition === null) delete copy.disposition;
       if (copy.evidenceGap === null) delete copy.evidenceGap;
+      if (copy.planImpact === null) delete copy.planImpact;
       return copy;
     });
   }

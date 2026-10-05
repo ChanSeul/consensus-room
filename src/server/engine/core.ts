@@ -10,6 +10,7 @@ import type { RewriteKind } from "../../shared/revisions.js";
 import { wrapWorkGroupAdapter } from "../workGroupAdapter.js";
 import { BudgetController } from "../budgetController.js";
 import { recoverableFinalizedFirstPlan } from "../planningStore.js";
+import { renderDeferredFindingsDigest } from "../deferredFindingsDigest.js";
 import { PlanningPaused, type TimelineDelivery } from "../../shared/planningControl.js";
 import { BudgetBlocked } from "../budgetLedger.js";
 import { applyPlanLineEdits, applyPlanRepair, planRepairPrompt, repairablePlan } from "../../shared/planPatches.js";
@@ -1066,11 +1067,7 @@ export class EngineCore {
   // readablePaths 로 받아 kind=artifact selector=<경로> 문서로 싣는다).
   async writeDeferredFindingsDigest(topic: Topic, findings: readonly DeferredFinding[], signal: AbortSignal): Promise<string | null> {
     if (!findings.length) return null;
-    const body = [
-      "# 이연 쟁점 원문(서버 보존, 읽기 전용)", "",
-      `주제 ${topic.id} · 범위 세대 ${topic.scopeGeneration} · ${findings.length}건. 계획·감사 프롬프트의 이연 쟁점 목록이 가리키는 근거 전문이다.`, "",
-      ...findings.map((finding) => `## ${finding.id} [${finding.severity}] ${finding.title}\n\n출처 ${finding.source} · 토픽 ${finding.topicId} · 기록 ${finding.recordedAt}\n\n${finding.rationale}\n`),
-    ].join("\n");
+    const body = renderDeferredFindingsDigest(topic, findings);
     const latest = await this.dependencies.artifacts.readLatest(topic.id, DEFERRED_FINDINGS_DIGEST);
     if (latest !== body) {
       const revision = (this.dependencies.database.latestArtifact(topic.id, DEFERRED_FINDINGS_DIGEST)?.revision ?? 0) + 1;

@@ -278,9 +278,10 @@ describe("이연 쟁점 목록 — 절단 없는 인라인 예산과 원문 산�
       `근거 ${index} `.repeat(40) + (index === 119 ? "LAST-RATIONALE-END" : "")));
     const path = "/data/topics/t/artifacts/deferred-findings-digest.md";
     for (const prompt of [planWith(findings, path), auditWith(findings, path)]) {
-      expect(prompt).toContain(`kind=artifact selector=${path} 를 offset 0 부터 읽고, 돌려받은 nextOffset 을 따라 null 이 될 때까지 이어 읽으세요`);
-      expect(prompt).toContain(`계획 제어가 없는 턴이면 같은 경로의 파일(${path})을 직접 읽으세요`);
-      expect(prompt).toContain(`근거 전문 ${findings.length}건은 원문 산출물에 있습니다`);
+      expect(prompt).toContain(`kind=search selector=artifact::${path}::<ID 또는 관련 키워드>`);
+      expect(prompt).toContain("전체를 순서대로 읽는 필수 과제가 아닙니다");
+      expect(prompt).not.toContain("null 이 될 때까지 이어 읽으세요");
+      expect(prompt).toContain(`근거 전문 ${findings.length}건은 원문 산출물에 보존되어 있습니다`);
       expect(prompt).not.toContain("LAST-RATIONALE-END");
       expect(prompt).not.toContain("근거 0 근거 0");
       const indexed = findings.filter((finding) => prompt.includes(`- ${finding.id} [MEDIUM] ${finding.id} 제목 (review, topic-aa)`));

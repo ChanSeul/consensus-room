@@ -29,10 +29,25 @@ export async function runInterruptBridge(): Promise<void> {
       ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.any([abort.signal, AbortSignal.timeout(30_000)]) });
     if (!response.ok) {
       const failure = await response.json().catch(() => ({})) as { code?: string };
-      throw Object.assign(new Error(`중재 인터럽트 API ${response.status}`), { status: response.status,
+      throw Object.assign(new Error(`중재 인터럽트 API ${response.status}`), { status: response.status, code: failure.code,
         fatal: [401, 403].includes(response.status) || Boolean(failure.code && /MEDIATOR/.test(failure.code)) });
     }
     return await response.json() as T;
+  };
+  let subscriptionTopicId = topicId, checkedAt = 0, available = false;
+  const requestInterrupt = async <T>(item: MediatorInterrupt, operation: string, body: unknown): Promise<T> => {
+    try { return await request<T>(`topics/${item.topicId}/interrupts/${item.id}/${operation}`, body); }
+    catch (error) {
+      const failure = error as { status?: number; code?: string };
+      if (item.topicId !== subscriptionTopicId && failure.status === 409
+        && ["STALE_MEDIATOR_ASSIGNMENT", "MEDIATOR_SESSION_MISMATCH"].includes(failure.code ?? "")) {
+        // Do not retry the revoked child or adopt another identity. Only a still-authorized
+        // parent subscription can continue receiving its other children.
+        await request(`topics/${encodeURIComponent(subscriptionTopicId)}/interrupts/connection?${new URLSearchParams(session)}`);
+        throw Object.assign(error as Error, { fatal: false, childReassigned: true });
+      }
+      throw error;
+    }
   };
   const received = new Map<string, Delivery>();
   const wait = (ms: number) => new Promise<void>(resolve => {
@@ -40,8 +55,8 @@ export async function runInterruptBridge(): Promise<void> {
     const finish = () => { clearTimeout(timer); abort.signal.removeEventListener("abort", finish); resolve(); };
     const timer = setTimeout(finish, ms); abort.signal.addEventListener("abort", finish, { once: true });
   });
-  const receipt = (delivery: Delivery, state: "sent" | "acknowledged" | "failed" | "unknown", error?: string, transportUnavailable = false) => request(
-    `topics/${delivery.interrupt.topicId}/interrupts/${delivery.interrupt.id}/receipt`, { ...session, claim: delivery.claim, state, ...(error ? { error } : {}), transportUnavailable });
+  const receipt = (delivery: Delivery, state: "sent" | "acknowledged" | "failed" | "unknown", error?: string, transportUnavailable = false) => requestInterrupt(
+    delivery.interrupt, "receipt", { ...session, claim: delivery.claim, state, ...(error ? { error } : {}), transportUnavailable });
   let mcp: Server | null = null;
   if (provider === "claude") {
     mcp = new Server({ name: "consensus-room", version: "1.0.0" }, { capabilities: { experimental: { "claude/channel": {} }, tools: {} },
@@ -58,14 +73,13 @@ export async function runInterruptBridge(): Promise<void> {
     mcp.onclose = () => abort.abort();
     await mcp.connect(new StdioServerTransport()); await initialized;
   }
-  let subscriptionTopicId = topicId, checkedAt = 0, available = false;
   const reportConnection = (error: string | null) => request(`topics/${encodeURIComponent(subscriptionTopicId)}/interrupts/connection`, { ...session, available: error === null, error });
   try {
     while (!abort.signal.aborted) {
       try {
         if (Date.now() - checkedAt >= 30_000) {
           // The server resolves the assignment's scope; never adopt a different identity/version.
-          const connection = await request<{ subscriptionTopicId: string }>(`topics/${encodeURIComponent(topicId)}/interrupts/connection?${new URLSearchParams(session)}`);
+          const connection = await request<{ subscriptionTopicId: string }>(`topics/${encodeURIComponent(subscriptionTopicId)}/interrupts/connection?${new URLSearchParams(session)}`);
           subscriptionTopicId = connection.subscriptionTopicId;
           let error: string | null = null;
           try { if (!mcp) await probeCodexSession(session.sessionId, process.env.CONSENSUS_CODEX_SOCKET); }
@@ -78,7 +92,7 @@ export async function runInterruptBridge(): Promise<void> {
         for (const item of items) {
           if (abort.signal.aborted) break;
           let delivery: Delivery;
-          try { delivery = await request<Delivery>(`topics/${item.topicId}/interrupts/${item.id}/claim`, session); }
+          try { delivery = await requestInterrupt<Delivery>(item, "claim", session); }
           catch (error) { if ((error as { status?: number }).status === 409 && !(error as { fatal?: boolean }).fatal) continue; throw error; }
           try {
             if (mcp) {
@@ -101,6 +115,7 @@ export async function runInterruptBridge(): Promise<void> {
       } catch (error) {
         if (abort.signal.aborted) break;
         if ((error as { fatal?: boolean }).fatal) throw error;
+        if ((error as { childReassigned?: boolean }).childReassigned) continue;
         process.stderr.write("중재 인터럽트 연결을 확인하지 못했습니다. 5초 뒤 다시 연결합니다.\n");
         await wait(5000);
       }

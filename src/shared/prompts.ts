@@ -126,12 +126,12 @@ function renderDeferredFindings(findings: readonly DeferredFinding[] | undefined
     body = [
       ...index,
       ...(rest ? [`- … 외 ${rest}건(인라인 예산을 넘어 색인을 생략했습니다 — 원문 산출물에 모두 있습니다)`] : []),
-      `근거 전문 ${findings.length}건은 원문 산출물에 있습니다: kind=artifact selector=${sourcePath} 를 offset 0 부터 읽고, 돌려받은 nextOffset 을 따라 null 이 될 때까지 이어 읽으세요. 계획 제어가 없는 턴이면 같은 경로의 파일(${sourcePath})을 직접 읽으세요.`,
+      `근거 전문 ${findings.length}건은 원문 산출물에 보존되어 있습니다: kind=artifact selector=${sourcePath}. 전체를 순서대로 읽는 필수 과제가 아닙니다. 현재 변경·계획 또는 새 증거와 관련된 쟁점만 kind=search selector=artifact::${sourcePath}::<ID 또는 관련 키워드> 로 찾고, 반환된 offset에서 kind=artifact로 해당 항목의 원문을 읽으세요. 항목이 조각 경계를 넘으면 nextOffset을 따라 해당 항목이 끝날 때까지만 읽으세요. 검색 결과 자체는 원문 확인이 아닙니다. 계획 제어가 없는 턴이면 같은 경로의 파일(${sourcePath})에서 필요한 항목을 찾아 읽으세요.`,
     ].join("\n");
   }
   return stage === "plan"
-    ? `\n이전 계획·선행 토픽에서 **이연된 쟁점**(이번 범위에서 다시 판단하세요 — 넣으면 계획에 반영하고, 아니면 계획의 범위 밖 절에 이유와 함께 적으세요):\n${body}\n`
-    : `\n이미 이연 판정을 받은 쟁점(이번 범위에서 다시 판단하되, 같은 근거로 재지적하지 말고 계획이 이를 어떻게 다뤘는지만 확인하세요):\n${body}\n`;
+    ? `\n이전 계획·선행 토픽에서 **이연된 쟁점**(기존 이연 판정은 유지합니다. 현재 변경·새 증거로 영향받는 항목만 다시 판단하고, 포함할 항목만 계획에 반영하세요. 관련 없는 원장 전수 읽기·재판정·재기록은 하지 마세요):\n${body}\n`
+    : `\n이미 이연 판정을 받은 쟁점(기존 판정을 재사용하고 현재 계획·새 증거에 영향받는 항목만 확인하세요. 관련 없는 원장 전수 읽기·재판정·재기록이나 같은 근거의 재지적은 하지 마세요):\n${body}\n`;
 }
 
 function renderFindingIndex(findings: readonly Finding[]): string {
@@ -499,7 +499,8 @@ ${dispositionContract("AUDIT")}
 
 위에 나열된 Claude의 쟁점 ID(${(input.claudePlan?.findings ?? []).map((finding) => finding.id).join(", ") || "없음"})는
 하나도 빠뜨리지 말고 같은 ID로 반환 findings에 다시 담으세요. 서버가 ID 누락을 기계적으로 검사해 응답을 거부합니다.
-각 항목에는 그 쟁점을 검증한 결과를 rationale에 적고, 새로 발견한 결함은 새 ID로 추가하세요.`;
+각 항목에는 그 쟁점을 검증한 결과를 rationale에 적고, 새로 발견한 결함은 새 ID로 추가하세요.
+계획 수정과 구현 의무를 구분하세요. 기존 AGREED_ACTION이 현재 계획에 충분히 반영되어 구현·실행 검증만 남았다면 같은 ID·심각도·AGREED_ACTION을 유지하고 planImpact=implementation을 명시하세요. rationale과 evidenceRefs에는 현재 계획의 해당 절과 확인 근거를 적으세요. 완료나 수정 검증으로 바꾸지 마세요. 현재 계획의 누락·모순·변경이 필요하면 같은 ID라도 planImpact=revision입니다. 새 결함, 심각도가 높아진 결함, 사용자 결정·승인 필요 항목에는 implementation을 쓰지 마세요. 구분을 확인하지 못하면 null로 두세요. 이전 응답의 planImpact를 현재 계획 검토 없이 승계하지 마세요.`;
 }
 
 export function buildClaudeRevisionPrompt(input: {

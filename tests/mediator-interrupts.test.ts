@@ -400,7 +400,7 @@ it("resolves a closed leaf to its assigned parent and surfaces a narrow subscrip
   expect((await f.app.inject({ url: "/api/topics/integration/resume", headers: f.headers })).json().mediation.connection.state).toBe("connected");
 });
 
-it("keeps delivery, mediator handling, and a new engine action separate across restart", async () => {
+it.each(["IMPLEMENTING", "CONSENSUS_ACK"] as const)("keeps delivery, handling, and %s resumption separate across restart", async state => {
   const f = await fixture(); f.pause();
   const id = (await f.get()).json().items[0].id, claim = (await f.post(id, "claim")).json().claim;
   const activity = async () => (await f.app.inject({ url: "/api/topics/topic-1/activity", headers: f.headers })).json();
@@ -414,15 +414,41 @@ it("keeps delivery, mediator handling, and a new engine action separate across r
     finishedAt: null, error: null, pid: null, pgid: null, processExecutable: null, processCommand: null, processStartedAt: null };
   f.db.startAction(action); f.db.finishAction(action.id, "succeeded");
   expect((await activity()).mediationIntervention.resumedAt).toBeNull();
-  f.db.applyTopicTransition({ topicId: f.topic.id, changes: { state: "IMPLEMENTING", resumeState: null },
+  f.db.applyTopicTransition({ topicId: f.topic.id, changes: { state, resumeState: null },
     startAction: { ...action, id: "resume-implementation", kind: "retry" },
-    events: [{ actor: "system", kind: "system", state: "IMPLEMENTING", body: "작업 재개" }] });
-  expect(await activity()).toMatchObject({ mediationInterrupt: null, mediationIntervention: { id, delivery: "sent", handlingAt: expect.any(String), resumedAt: action.createdAt, actionId: "resume-implementation", closed: true } });
+    events: [{ actor: "system", kind: "system", state, body: "작업 재개" }] });
+  expect(await activity()).toMatchObject({ mediationInterrupt: null, mediationIntervention: { id, delivery: "sent", handlingAt: expect.any(String), resumedAt: expect.any(String), actionId: "resume-implementation", closed: true } });
   await f.restart();
   expect((await activity()).mediationIntervention.actionId).toBe("resume-implementation");
   expect((await f.post(id, "handling")).statusCode).toBe(409);
   f.db.updateTopic(f.topic.id, { scopeGeneration: 2 });
   expect((await activity()).mediationIntervention).toBeNull();
+});
+
+it("preserves a delivered and handled stop through a no-impact evidence assessment", async () => {
+  const f = await fixture(); f.pause("CODEX_REVIEW", "READY_TO_DELIVER");
+  const id = (await f.get()).json().items[0].id, claim = (await f.post(id, "claim")).json().claim;
+  await f.post(id, "receipt", { claim, state: "sent" });
+  await f.post(id, "handling");
+  const action = { id: "assessment", topicId: f.topic.id, kind: "evidence-assessment", status: "running" as const,
+    createdAt: new Date().toISOString(), finishedAt: null, error: null, pid: null, pgid: null,
+    processExecutable: null, processCommand: null, processStartedAt: null };
+  f.db.startAction(action);
+  const activity = async () => (await f.app.inject({ url: "/api/topics/topic-1/activity", headers: f.headers })).json();
+  expect((await activity()).mediationIntervention).toMatchObject({ id, resumedAt: null, closed: false });
+  f.db.appendEvent({ topicId: f.topic.id, actor: "system", kind: "system", state: "READY_TO_DELIVER", body: "근거 검토 완료: 영향 없음" });
+  f.db.finishAction(action.id, "succeeded");
+  await f.restart();
+  expect(await activity()).toMatchObject({ mediationInterrupt: { id, state: "sent" },
+    mediationIntervention: { id, delivery: "sent", handlingAt: expect.any(String), resumedAt: null, closed: false } });
+  expect((await f.get()).json().items).toEqual([]);
+  // A later assessment only counts as resumption when it hands off into an active workflow.
+  f.db.startAction({ ...action, id: "assessment-replan" });
+  expect((await activity()).mediationIntervention.resumedAt).toBeNull();
+  f.db.applyTopicTransition({ topicId: f.topic.id, changes: { state: "CLAUDE_REVISION" },
+    events: [{ actor: "system", kind: "system", state: "CLAUDE_REVISION", body: "근거 변경 반영을 위한 개정" }] });
+  expect(await activity()).toMatchObject({ mediationInterrupt: null,
+    mediationIntervention: { id, actionId: "assessment-replan", resumedAt: expect.any(String), closed: true } });
 });
 
 it("a connection probe reads the assigned session without sending a model turn", async () => {
@@ -442,13 +468,32 @@ it("a connection probe reads the assigned session without sending a model turn",
   expect(childProcess.spawn).toHaveBeenCalledWith("codex", ["app-server", "proxy", "--sock", "/tmp/explicit.sock"], expect.anything());
 });
 
-it.each([true, false])("bridge started on a closed leaf checks connection before delivering sibling requests: %s", async available => {
+it.each([
+  { available: true, race: null }, { available: false, race: null },
+  { available: true, race: "claim" }, { available: true, race: "receipt" }, { available: true, race: "parent" },
+] as const)("bridge preserves authorized parent delivery from a closed leaf: $available / $race", async ({ available, race }) => {
   const f = await fixture();
+  const originalTarget = interruptTarget(f.db, f.topic.id)!.key;
   f.db.createTopic({ ...f.topic, id: "closed", slug: "closed", parentTopicId: f.topic.id, state: "CLOSED" });
   f.db.createTopic({ ...f.topic, id: "integration", slug: "integration", parentTopicId: f.topic.id });
   f.db.applyTopicTransition({ topicId: "integration", changes: { state: "USER_DECISION_REQUIRED", resumeState: "IMPLEMENTING" },
     events: [{ actor: "system", kind: "system", state: "USER_DECISION_REQUIRED", body: "범위 확인" }] });
   const bin = mkdtempSync(join(tmpdir(), "room-bridge-")), calls = join(bin, "calls.jsonl");
+  const clockFile = join(bin, "clock"), clockPreload = join(bin, "clock.cjs"), connectionPaths: string[] = [];
+  writeFileSync(clockFile, "0");
+  writeFileSync(clockPreload, `const originalNow=Date.now; Date.now=()=>originalNow()+Number(require('node:fs').readFileSync(${JSON.stringify(clockFile)}, 'utf8'));`);
+  let raced = false;
+  f.app.addHook("onRequest", async request => {
+    if (request.method === "GET" && request.url.includes("/interrupts/connection?")) connectionPaths.push(request.url.split("?")[0]);
+    if (race && !raced && request.method === "POST" && request.url.startsWith("/api/topics/integration/interrupts/")
+      && request.url.endsWith(race === "receipt" ? "/receipt" : "/claim")) {
+      raced = true;
+      if (race === "parent") f.assign("new-owner", "new-session", 1);
+      else f.db.roles.assign({ scope: "topic:integration", role: "mediator", operation: "", participant: "child-owner",
+        profileId: "mediator-profile", sessionId: "child-session", expectedVersion: 0, note: "reassigned during delivery" });
+      f.pause("IMPLEMENTING");
+    }
+  });
   writeFileSync(calls, "");
   writeFileSync(join(bin, "codex"), `#!/usr/bin/env node
 const fs=require('node:fs');require('node:readline').createInterface({input:process.stdin}).on('line', line=>{
@@ -457,7 +502,7 @@ const fs=require('node:fs');require('node:readline').createInterface({input:proc
  if(request.id)process.stdout.write(JSON.stringify({id:request.id,result:request.method==='thread/read'?{thread:{id:'mediator-session',status:{type:'idle'}}}:{}})+'\\n');
 });\n`, { mode: 0o700 });
   const address = await listenReady(f.app, { port: 0, host: "127.0.0.1" });
-  const bridge = childProcess.spawn(process.execPath, ["--import", "tsx", "src/server/mediation/interruptBridge.ts", "codex"], {
+  const bridge = childProcess.spawn(process.execPath, ["--require", clockPreload, "--import", "tsx", "src/server/mediation/interruptBridge.ts", "codex"], {
     cwd: process.cwd(), stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, CONSENSUS_ROOM_URL: address,
       CONSENSUS_ROOM_TOKEN: "test", CONSENSUS_ROOM_TOPIC_ID: "closed", CONSENSUS_MEDIATOR: "owner@1", CONSENSUS_MEDIATOR_SESSION_ID: "mediator-session" },
   });
@@ -466,10 +511,34 @@ const fs=require('node:fs');require('node:readline').createInterface({input:proc
     if (bridge.exitCode === null && bridge.signalCode === null) { const exit = new Promise<void>(resolve => bridge.once("exit", () => resolve())); bridge.kill(); await exit; }
     rmSync(bin, { recursive: true, force: true });
   });
-  await vi.waitFor(() => expect(f.db.interrupts.connection(interruptTarget(f.db, f.topic.id)!.key, f.topic.id).state, bridgeError).toBe(available ? "connected" : "unavailable"), { timeout: 5000 });
+  await vi.waitFor(() => expect(f.db.interrupts.connection(originalTarget, f.topic.id).state, bridgeError).toBe(available ? "connected" : "unavailable"), { timeout: 5000 });
+  if (race) {
+    if (race === "parent") await vi.waitFor(() => expect(bridge.exitCode).toBe(1), { timeout: 5000 });
+    else {
+      await vi.waitFor(() => expect(f.db.interrupts.status(f.topic.id, originalTarget)?.state, bridgeError).toBe("sent"), { timeout: 5000 });
+      expect(bridge.exitCode, bridgeError).toBeNull();
+    }
+    expect(raced).toBe(true);
+    expect(connectionPaths).toContain("/api/topics/topic-1/interrupts/connection");
+    expect(f.db.interrupts.status("integration", interruptTarget(f.db, "integration")!.key)?.state).toBe("waiting");
+    const turns = readFileSync(calls, "utf8").trim().split("\n").map(line => JSON.parse(line)).filter(r => ["turn/start", "turn/steer"].includes(r.method));
+    expect(turns).toHaveLength(race === "parent" ? 0 : race === "receipt" ? 2 : 1);
+    if (race !== "parent") expect(turns.at(-1).params.input[0].text).toContain("/api/topics/topic-1/resume");
+    return;
+  }
   if (available) await vi.waitFor(() => expect(f.db.interrupts.status("integration", interruptTarget(f.db, "integration")!.key)?.state).toBe("sent"), { timeout: 5000 });
   else expect(f.db.interrupts.status("integration", interruptTarget(f.db, "integration")!.key)?.state).toBe("waiting");
   const requests = readFileSync(calls, "utf8").trim().split("\n").map(line => JSON.parse(line));
   expect(requests.filter(r => ["turn/start", "turn/steer"].includes(r.method))).toHaveLength(available ? 1 : 0);
   expect(requests.some(r => r.method === "thread/start" || r.method === "thread/resume" || r.method === "turn/interrupt")).toBe(false);
+  if (available) {
+    f.db.roles.assign({ scope: "topic:closed", role: "mediator", operation: "", participant: "child-owner",
+      profileId: "mediator-profile", sessionId: "child-session", expectedVersion: 0, note: "independent child mediator" });
+    writeFileSync(clockFile, "31000");
+    f.pause("IMPLEMENTING"); // Wake the existing long poll; the next connection probe is due.
+    await vi.waitFor(() => expect(connectionPaths, bridgeError).toContain("/api/topics/topic-1/interrupts/connection"), { timeout: 5000 });
+    await vi.waitFor(() => expect(f.db.interrupts.status(f.topic.id, interruptTarget(f.db, f.topic.id)!.key)?.state).toBe("sent"), { timeout: 5000 });
+    expect(bridge.exitCode, bridgeError).toBeNull();
+    expect(connectionPaths.filter(path => path === "/api/topics/closed/interrupts/connection")).toHaveLength(1);
+  }
 });

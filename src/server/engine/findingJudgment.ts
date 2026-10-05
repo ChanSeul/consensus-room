@@ -24,6 +24,23 @@ export type OpenFindingReason =
   | "agreed-action";   // 합의한 조치 — 수정·개정·종결 확인이 다룬다
 export interface OpenFinding { finding: Finding; reason: OpenFindingReason }
 
+// An obligation to implement is not itself a defect in the plan. Reuse only the
+// auditor's explicit judgment on an already agreed, same-severity obligation.
+// New/escalated findings, regressions and missing judgments keep the revision path.
+export function auditRevisionFindings(known: readonly Finding[], audit: readonly Finding[]): Finding[] {
+  const prior = new Map(known.map(finding => [finding.id, finding]));
+  const regressed = new Set(dispositionRegressions(known, audit));
+  return audit.filter(finding => {
+    if (regressed.has(finding.id)) return true;
+    if (isSettledFinding(finding)) return false;
+    const before = prior.get(finding.id);
+    return !(finding.planImpact === "implementation" && finding.disposition === "AGREED_ACTION"
+      && !finding.requiresUserDecision && !finding.evidenceGap && finding.evidenceRefs.length > 0
+      && before?.disposition === "AGREED_ACTION" && !before.requiresUserDecision
+      && before.severity === finding.severity);
+  });
+}
+
 function unsettledReason(finding: Finding): OpenFindingReason {
   if (finding.requiresUserDecision) return "decision";
   if (!finding.disposition || finding.disposition === "EXTERNAL_EVIDENCE") return "evidence";

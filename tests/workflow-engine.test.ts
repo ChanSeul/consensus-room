@@ -17,7 +17,7 @@ import { resumedPlanTimeline } from "../src/server/engine/planning";
 import { buildClaudePlanPrompt } from "../src/shared/prompts";
 import { WorkflowEngine } from "../src/server/workflow";
 import { parseTolerancePolicy, ToleranceFormatError } from "../src/shared/tolerance";
-import { REQUIRED_PLAN_HEADINGS, type AgentResult } from "../src/shared/contracts";
+import { REQUIRED_PLAN_HEADINGS, type AgentResult, type Finding } from "../src/shared/contracts";
 import { hashPlan, normalizePlan, redactSecrets } from "../src/shared/workflow";
 import { agentRunError } from "../src/server/adapters/resultParser";
 import { PlanningPaused } from "../src/shared/planningControl";
@@ -4285,6 +4285,35 @@ describe("개정 2회차 뒤 종결 확인의 처분 되돌림 — 결정 뒤 �
 // 2026-09-13 사용자 규칙 "코덱스 리뷰에서 사소한 finding 이 나오면 개정하지 말고 중재자가 runner 에게 따로 알려라":
 // MEDIUM 이하는 개정 턴 대신 구현 노트로 러너에게 간다(엔진이 기록·프롬프트에 실어 자동으로 알린다).
 describe("경미 지적은 개정 대신 구현 노트", () => {
+  it("계획에 반영된 HIGH 구현 의무는 유지하며 개정 모델 호출 없이 승인 대기로 간다", async () => {
+    const first = validPlan("이미 합의한 UI 교정과 실행 검증");
+    const sha = hashPlan(`${first.trim()}\n`);
+    const inherited = finding("DG-1", "UI 교정", { severity: "HIGH", disposition: "AGREED_ACTION" });
+    const audited = { ...inherited, planImpact: "implementation" as const, evidenceRefs: ["plan:WU1"] };
+    const minor = finding("A-M", "렌더 결과 재사용", { severity: "MEDIUM", disposition: "AGREED_ACTION" });
+    const { database, artifacts, engine, claude } = makePlanningEngine({
+      slug: "inherited-action-skips-revision",
+      claudeResults: [
+        { kind: "PLAN", summary: "계획", planMarkdown: first, findings: [inherited], evidenceRefs: [] },
+        { kind: "ACK", summary: "확인", planSHA256: sha, findings: [], evidenceRefs: [] },
+      ],
+      codexResults: [
+        { kind: "AUDIT", summary: "기존 의무는 계획에 반영됨", findings: [audited, minor], evidenceRefs: [] },
+        { kind: "CLOSEOUT", summary: "종결", planSHA256: sha, findings: [audited, minor], evidenceRefs: [] },
+        { kind: "ACK", summary: "확인", planSHA256: sha, findings: [], evidenceRefs: [] },
+      ],
+    });
+    engine.startPlan("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+    expect(database.getTopic("topic-1")).toMatchObject({ state: "AWAITING_USER_APPROVAL", planRevision: 1, planSHA256: sha });
+    expect(claude.calls).toHaveLength(2);
+    const revision = JSON.parse((await artifacts.readLatest("topic-1", "claude-revision"))!);
+    expect(revision.findings.find((f: Finding) => f.id === "DG-1")).toMatchObject({ severity: "HIGH", disposition: "AGREED_ACTION" });
+    const notes = JSON.parse((await artifacts.readLatest("topic-1", "implementation-notes"))!).notes;
+    expect(notes.map((note: { id: string }) => note.id)).toEqual(["A-M"]);
+    database.close();
+  });
+
   it("감사 지적이 전부 경미면 개정 턴을 생략하고 종결 확인 → 승인 대기까지 간다", async () => {
     const first = validPlan("첫 계획");
     const firstSHA = hashPlan(`${first.trim()}\n`);

@@ -3,6 +3,7 @@ import { promisify } from "node:util";
 import { posix } from "node:path";
 import { PLANNING_LIMITS, PlanningPaused, type PlanningFragment, type PlanningRead } from "../shared/planningControl.js";
 import { planningHash } from "./planningStore.js";
+import { deferredFindingSections } from "./deferredFindingsDigest.js";
 
 const execute = promisify(execFile);
 // Malformed offsets and directory-as-file requests are correctable. Access failures remain hard stops.
@@ -61,6 +62,37 @@ export class PlanningReader {
         throw new PlanningPaused("Requested source is not in the pinned manifest.");
       }
       text = value;
+    } else if (request.kind === "search" && request.selector.startsWith("artifact::")) {
+      const selector = request.selector.slice("artifact::".length);
+      // Resolve the pinned path first: the remaining literal may itself contain "::".
+      let path = "", body: string | undefined;
+      for (const [key, value] of this.documents) {
+        if (!key.startsWith("artifact:")) continue;
+        const candidate = key.slice("artifact:".length);
+        if (candidate.length > path.length && selector.startsWith(`${candidate}::`)) { path = candidate; body = value; }
+      }
+      const needle = selector.slice(path.length + 2).trim().toLocaleLowerCase();
+      if (!path || !needle || body === undefined) throw new PlanningPaused("Artifact search requires a pinned artifact path and a non-empty literal.");
+      // Search only host-pinned text; return byte offsets into its original body, never filesystem reads.
+      const matches: string[] = [];
+      const sourceHash = planningHash(body);
+      let offset = 0, sectionOffset = 0;
+      const seen = new Set<number>();
+      const sections = deferredFindingSections(body);
+      let section = 0;
+      const lines = body.split(/(?<=\n)/);
+      for (const line of lines) {
+        if (offset < sections.contentOffset) { offset += Buffer.byteLength(line); continue; }
+        // Use producer-owned boundaries, never headings quoted inside a rationale.
+        // Legacy or malformed indexes conservatively return the original document start.
+        while (section < sections.starts.length && sections.starts[section]! <= offset) sectionOffset = sections.starts[section++]!;
+        if (line.toLocaleLowerCase().includes(needle) && !seen.has(sectionOffset)) {
+          seen.add(sectionOffset);
+          matches.push(JSON.stringify({ selector: path, hash: sourceHash, offset: sectionOffset, excerpt: line.trim().slice(0, 800) }));
+        }
+        offset += Buffer.byteLength(line);
+      }
+      text = matches.join("\n");
     } else if (request.kind === "search" && request.selector.startsWith("evidence::")) {
       const needle = request.selector.slice("evidence::".length).trim().toLocaleLowerCase();
       if (!needle) throw new PlanningPaused("Evidence search literal is empty.");

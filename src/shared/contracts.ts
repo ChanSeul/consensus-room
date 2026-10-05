@@ -103,6 +103,9 @@ export const FindingSchema = z.object({
   requiresUserDecision: z.boolean().default(false),
   // External originals only; never mandatory validation, code defects or approval.
   evidenceGap: z.enum(["unavailable", "insufficient"]).optional(),
+  // Audit-only judgment: an inherited agreed action is already covered by this exact plan.
+  // Absence remains conservative; this never marks implementation complete.
+  planImpact: z.enum(["revision", "implementation"]).optional(),
 });
 export type Finding = z.infer<typeof FindingSchema>;
 
@@ -512,7 +515,7 @@ export const AgentResultJsonSchema = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["id", "title", "severity", "disposition", "rationale", "evidenceRefs", "requiresUserDecision", "evidenceGap"],
+        required: ["id", "title", "severity", "disposition", "rationale", "evidenceRefs", "requiresUserDecision", "evidenceGap", "planImpact"],
         properties: {
           id: { type: "string" },
           title: { type: "string" },
@@ -522,6 +525,7 @@ export const AgentResultJsonSchema = {
           evidenceRefs: { type: "array", items: { type: "string" } },
           requiresUserDecision: { type: "boolean" },
           evidenceGap: { anyOf: [{ enum: ["unavailable", "insufficient"] }, { type: "null" }] },
+          planImpact: { anyOf: [{ enum: ["revision", "implementation"] }, { type: "null" }] },
         },
       },
     },
