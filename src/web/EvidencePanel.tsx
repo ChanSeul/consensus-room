@@ -69,6 +69,11 @@ export function EvidencePanel({ topicId, busy, archived = false, archivedReviewR
       {source.error && <span role="status"> · {source.error}</span>}
       {source.mode === "rest" ? <button disabled={busy || saving} onClick={() => void run(() => api.checkEvidence(source.id))}>원문 갱신</button> : <span> · 호스트 연결로 확인 <button disabled={busy || saving} onClick={() => void run(() => api.useRestEvidence(source.id))}>서버 수집으로 전환 (공유 주제 모두 적용)</button></span>}
     </div>}</EvidencePlatforms></section>)}
+    {!archived && Boolean(state?.deferred?.length) && <section aria-label="근거 확보 To-do">
+      <h3>근거 확보 To-do ({state!.deferred!.length})</h3>
+      <p>아래 자료와 이에 의존하는 작업은 보류하고, 확보된 근거로 나머지 작업을 계속합니다.</p>
+      {state!.deferred!.map(gap => <p key={gap.sourceId}><a href={gap.url} target="_blank" rel="noreferrer">{gap.label}</a> · {gap.reason}</p>)}
+    </section>}
     {!archived && state?.assessments?.map(job => <p key={job.id} role="status">{job.status === "pending" ? "검토 대기" : job.status === "running" ? "영향 검토 중" : job.status === "failed" ? "검토 실패" : ({ "no-impact": "영향 없음", replan: "계획 재검토 필요", decision: "판단 필요" }[job.outcome ?? "decision"])}{job.summary ? ` · ${job.summary}` : ""}</p>)}
     {state?.collectionMetrics && <p>도구 호출 {state.collectionMetrics.toolCalls ?? 0}회 · 변경 없는 수집 {state.collectionMetrics.unchangedCollections ?? 0}회 · 영향 검토 모델 호출 {state.collectionMetrics.modelCalls ?? 0}회</p>}
     {!archived && reviewForm}

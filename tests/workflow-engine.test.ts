@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { ArtifactStore } from "../src/server/artifacts";
@@ -11,6 +12,7 @@ import { SpawnCommandRunner } from "../src/server/processRunner";
 import { execFileSync } from "node:child_process";
 import type { AgentAdapter, CommandRunner, ProjectMemoryWriter } from "../src/server/types";
 import { EngineCore, FormatViolation, isFormatOnlyViolation } from "../src/server/engine/core";
+import { ContinuationCoordinator } from "../src/server/engine/continuation";
 import { resumedPlanTimeline } from "../src/server/engine/planning";
 import { buildClaudePlanPrompt } from "../src/shared/prompts";
 import { WorkflowEngine } from "../src/server/workflow";
@@ -18,6 +20,7 @@ import { parseTolerancePolicy, ToleranceFormatError } from "../src/shared/tolera
 import { REQUIRED_PLAN_HEADINGS, type AgentResult } from "../src/shared/contracts";
 import { hashPlan, normalizePlan, redactSecrets } from "../src/shared/workflow";
 import { agentRunError } from "../src/server/adapters/resultParser";
+import { PlanningPaused } from "../src/shared/planningControl";
 
 const temporaryDirectories: string[] = [];
 
@@ -53,6 +56,7 @@ function makeEngine(
   planSHA256: string | null,
   alreadyApproved = false,
   runner: CommandRunner | null = null,
+  attachParticipants = true,
 ) {
   const root = mkdtempSync(join(tmpdir(), "consensus-room-engine-"));
   temporaryDirectories.push(root);
@@ -76,7 +80,7 @@ function makeEngine(
   });
   database.revisions.configure("topic-1", 3, database.revisions.account("topic-1").version);
   for (const scope of ["planning", "implementation"] as const) database.reviews.configure("topic-1", scope, 3, database.reviews.account("topic-1", scope).version);
-  for (const role of ["claude", "codex"] as const) {
+  for (const role of attachParticipants ? ["claude", "codex"] as const : []) {
     database.upsertParticipant("topic-1", {
       role,
       sessionId: `${role}-session`,
@@ -105,8 +109,209 @@ function makeEngine(
     claude: unavailableAdapter("claude"),
     codex: unavailableAdapter("codex"),
   });
-  return { database, engine, dependencies: { database, artifacts: new ArtifactStore(join(root, "topics"), database), git: new GitService(unavailableRunner), claude: unavailableAdapter("claude"), codex: unavailableAdapter("codex") } };
+  return { root, database, engine, dependencies: { database, artifacts: new ArtifactStore(join(root, "topics"), database), git: new GitService(unavailableRunner), claude: unavailableAdapter("claude"), codex: unavailableAdapter("codex") } };
 }
+
+it("rejects incomplete planning admission without stranding the topic, then accepts repaired participants", async () => {
+  const { database, engine } = makeEngine("DRAFT", null, false, null, false);
+  expect(() => engine.startPlan("topic-1", "missing-participants")).toThrow("세션");
+  expect(database.getTopic("topic-1").state).toBe("DRAFT");
+  expect(database.getAction("missing-participants")).toBeNull();
+  for (const role of ["claude", "codex"] as const) database.upsertParticipant("topic-1", {
+    role, sessionId: role, mode: "attached", acknowledgedPlanSHA256: null,
+  });
+  expect(engine.startPlan("topic-1", "repaired-participants")).toBe("repaired-participants");
+  await engine.shutdown();
+  expect(database.getAction("repaired-participants")).not.toBeNull();
+  database.close();
+});
+
+it("contains failure-persistence and settlement observer faults while preserving the unfinished action for recovery", async () => {
+  const { database, dependencies } = makeEngine("DRAFT", null);
+  const core = new EngineCore(dependencies);
+  const finish = database.finishActionAndFailTopic.bind(database);
+  database.finishActionAndFailTopic = () => { throw new Error("failure storage unavailable"); };
+  core.settledObserver = () => { throw new Error("observer unavailable"); };
+  const actionId = core.startAction("topic-1", "test", async () => { throw new Error("work failed"); });
+  await core.active.get("topic-1")!.completion;
+  await new Promise<void>(resolve => setImmediate(resolve));
+  expect(core.active.has("topic-1")).toBe(false);
+  expect(database.getAction(actionId)?.status).toBe("running");
+  database.finishActionAndFailTopic = finish;
+  database.recoverInterruptedActions();
+  expect(database.getAction(actionId)?.status).toBe("cancelled");
+  expect(database.getFlags("topic-1").resumeState).toBe("DRAFT");
+  database.close();
+});
+
+it.each([false, true])("planning pause keeps action and resume recoverable when event storage fails (%s)", async fail => {
+  const { root, database, dependencies } = makeEngine("DRAFT", null);
+  database.updateTopic("topic-1", { state: "CLAUDE_PLAN" });
+  const core = new EngineCore(dependencies);
+  core.evidenceWaitObserver = () => { throw new Error("observer unavailable"); };
+  const fault = new DatabaseSync(join(root, "room.sqlite"));
+  if (fail) fault.exec("CREATE TRIGGER reject_pause BEFORE INSERT ON timeline_events BEGIN SELECT RAISE(ABORT, 'pause unavailable'); END");
+  const id = core.startAction("topic-1", "test", async () => { throw new PlanningPaused("external input needed", "evidence"); });
+  await core.active.get("topic-1")!.completion;
+  expect(database.getAction(id)?.status).toBe(fail ? "running" : "cancelled");
+  expect(database.getTopic("topic-1").state).toBe(fail ? "CLAUDE_PLAN" : "BLOCKED_ON_EVIDENCE");
+  if (fail) {
+    fault.exec("DROP TRIGGER reject_pause");
+    database.recoverInterruptedActions();
+  } else expect(database.getTimeline("topic-1").at(-1)?.payload).toMatchObject({ externalEvidence: true, resumeState: "CLAUDE_PLAN" });
+  expect(database.getFlags("topic-1").resumeState).toBe("CLAUDE_PLAN");
+  fault.close(); database.close();
+});
+
+it("recovers a legacy failed draft admission through retry without changing scope or starting a model", async () => {
+  const { database, engine } = makeEngine("DRAFT", null, false, null, false);
+  database.updateTopic("topic-1", { state: "FAILED", resumeState: "DRAFT", lastError: "missing participant" });
+  const before = database.getTopic("topic-1");
+  const id = engine.retry("topic-1");
+  await waitForActionCompletion(database, "topic-1");
+  expect(database.getTopic("topic-1")).toMatchObject({ state: "DRAFT", scopeGeneration: before.scopeGeneration,
+    planEpoch: before.planEpoch, planSHA256: null, participants: [] });
+  expect(database.getAction(id)?.status).toBe("succeeded");
+  expect(() => engine.startPlan("topic-1")).toThrow("세션");
+  database.close();
+});
+
+it("action cancellation reaches a pending Git operation before any model call", async () => {
+  let entered!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  let release!: () => void;
+  const runner: CommandRunner = { run: spec => new Promise((resolve, reject) => {
+    release = () => resolve({ exitCode: 0, stdout: "head", stderr: "", jsonLines: [] });
+    spec.signal?.addEventListener("abort", () => reject(new Error("git cancelled")), { once: true });
+    entered();
+  }) };
+  const { database, dependencies } = makeEngine("DRAFT", null, false, runner);
+  const core = new EngineCore(dependencies);
+  const id = core.startAction("topic-1", "test", async () => { await dependencies.git.head("/tmp/repository"); });
+  const completion = core.active.get("topic-1")!.completion;
+  await started;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    core.active.get("topic-1")!.controller.abort(new Error("user stop"));
+    await Promise.race([completion, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Git did not cancel")), 200); })]);
+    expect(database.getAction(id)?.status).toBe("cancelled");
+  } finally { clearTimeout(timer); release(); await completion; database.close(); }
+});
+
+it("contains continuation storage faults and does not repeat an unrecorded failed attempt", async () => {
+  const hash = "a".repeat(64), { database, engine } = makeEngine("AWAITING_USER_APPROVAL", hash, true);
+  const coordinator = new ContinuationCoordinator(database, engine, {} as never);
+  coordinator.arm("topic-1", { planSHA256: hash, reason: "existing approved scope" });
+  const save = database.continuations.save.bind(database.continuations);
+  let attempts = 0;
+  engine.assertContinuationIdle = () => { attempts++; throw new Error("cannot start"); };
+  database.continuations.save = () => { throw new Error("storage unavailable"); };
+  await new Promise<void>(resolve => setImmediate(resolve));
+  await new Promise<void>(resolve => setImmediate(resolve));
+  coordinator.wake();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  expect(attempts).toBe(1);
+  expect(database.continuations.get("topic-1")?.status).toBe("pending");
+  database.continuations.save = save;
+  await coordinator.stop();
+  database.close();
+});
+
+it.each(["IMPLEMENTING", "CODEX_REVIEW", "CLAUDE_FIX", "CODEX_FINAL_REVIEW"] as const)(
+  "atomically admits %s recovery across state and action writes", resume => {
+    for (const fault of ["after-state", "after-action"]) {
+      const hash = "a".repeat(64), { root, database, engine } = makeEngine("AWAITING_USER_APPROVAL", hash, true);
+      database.updateTopic("topic-1", { state: "FAILED", resumeState: resume });
+      const observer = new DatabaseSync(join(root, "room.sqlite"), { readOnly: true });
+      const update = database.updateTopic.bind(database), start = database.startAction.bind(database);
+      const timeline = database.timelineCount("topic-1");
+      const checkDurableBoundary = () => {
+        // A separate connection sees only the old complete state until admission commits.
+        expect(observer.prepare("SELECT state,resume_state FROM topics WHERE id='topic-1'").get())
+          .toMatchObject({ state: "FAILED", resume_state: resume });
+        expect(observer.prepare("SELECT id FROM actions WHERE id='recovery'").get()).toBeUndefined();
+      };
+      database.updateTopic = (id, changes) => {
+        const result = update(id, changes);
+        if (id === "topic-1" && changes.state === resume) {
+          checkDurableBoundary();
+          if (fault === "after-state") throw new Error("Injected interrupted admission");
+        }
+        return result;
+      };
+      database.startAction = record => {
+        start(record);
+        checkDurableBoundary();
+        if (fault === "after-action") throw new Error("Injected interrupted admission");
+      };
+      expect(() => engine.resumeApprovedDelivery("topic-1", hash, "recovery")).toThrow("Injected interrupted admission");
+      database.updateTopic = update; database.startAction = start;
+      expect(database.getTopic("topic-1").state).toBe("FAILED");
+      expect(database.getFlags("topic-1").resumeState).toBe(resume);
+      expect(database.getAction("recovery")).toBeNull();
+      expect(database.timelineCount("topic-1")).toBe(timeline);
+      database.recoverInterruptedActions();
+      expect(database.getFlags("topic-1").resumeState).toBe(resume);
+      observer.close(); database.close();
+    }
+  });
+
+it("continuation recovery revalidates approved delivery intent at admission and execution", () => {
+  const hash = "a".repeat(64);
+  const { database, engine } = makeEngine("AWAITING_USER_APPROVAL", hash, true);
+  database.updateTopic("topic-1", { state: "FAILED", resumeState: "IMPLEMENTING" });
+  expect(engine.continuationAdmission("topic-1", hash)).toBe("recover-delivery");
+  // Approval can change after the scheduler saves its intent. The execution port must recheck it.
+  database.updateTopic("topic-1", { approvedPlanSHA256: null });
+  expect(() => engine.resumeApprovedDelivery("topic-1", hash, "must-not-start")).toThrow("같은 승인 계획");
+  expect(database.runningAction("topic-1")).toBeNull();
+  database.updateTopic("topic-1", { approvedPlanSHA256: hash, resumeState: "CLAUDE_PLAN" });
+  expect(() => engine.continuationAdmission("topic-1", hash)).toThrow("같은 승인 계획");
+  expect(() => engine.resumeApprovedDelivery("topic-1", hash, "must-not-replan")).toThrow("같은 승인 계획");
+  expect(database.getTopic("topic-1").state).toBe("FAILED");
+  database.close();
+});
+
+it.each(["unavailable", "unreceived"])("preserves %s design debt despite resolution claims until observed, including detached sources", async observation => {
+  const { database, dependencies } = makeEngine("DRAFT", null);
+  const core = new EngineCore(dependencies), topic = database.getTopic("topic-1");
+  const source = database.evidence.register(topic.id, { url: "https://www.figma.com/design/abc?node-id=1-2", label: "Design", mode: "connector", intervalSeconds: 300 });
+  const request = { tool: "mcp__figma-desktop__get_metadata", input: { nodeId: "1:2" } };
+  database.evidence.designRequest(topic, request, false, observation === "unavailable" ? "HTTP 403 Access denied" : undefined);
+  database.evidence.beginDesignTurn(topic);
+  let first: Awaited<ReturnType<EngineCore["deferredFindingsOf"]>> = [];
+  const actionId = core.startAction(topic.id, "test", async signal => {
+    await core.recordEvidenceGaps(topic, signal);
+    first = await core.deferredFindingsOf(topic.id);
+    await core.recordEvidenceGaps(topic, signal);
+  });
+  await core.active.get(topic.id)!.completion;
+  expect(database.getAction(actionId)?.status).toBe("succeeded");
+  const failure = first.filter(finding => finding.id.startsWith("FIGMA-UNAVAILABLE-"));
+  expect(failure).toHaveLength(1); expect(failure[0]).toMatchObject({ source: "evidence", severity: "INFO" });
+  expect(failure[0].rationale).toContain(observation === "unavailable" ? "HTTP 403 Access denied" : "No response was retained");
+  expect(await core.deferredFindingsOf(topic.id)).toEqual(first);
+  let retainedWhileFailed = false, retainedWhilePending = false, retainedWhileDetached = false;
+  const resolved = core.startAction(topic.id, "test", async signal => {
+    await core.pruneDeferredFindings(topic, [failure[0].id], signal);
+    retainedWhileFailed = (await core.deferredFindingsOf(topic.id)).some(item => item.id === failure[0].id);
+    database.evidence.detach(topic.id, source.id);
+    await core.pruneDeferredFindings(topic, [failure[0].id], signal);
+    retainedWhileDetached = (await core.deferredFindingsOf(topic.id)).some(item => item.id === failure[0].id);
+    database.evidence.designRequest(topic, request);
+    await core.pruneDeferredFindings(topic, [failure[0].id], signal);
+    retainedWhilePending = (await core.deferredFindingsOf(topic.id)).some(item => item.id === failure[0].id);
+    database.evidence.observeDesign(topic, JSON.stringify({ ...request, content: "Verified design response" }));
+    database.evidence.designRequest(topic, request, true);
+    await core.pruneDeferredFindings(topic, [failure[0].id], signal);
+    await core.recordEvidenceGaps(topic, signal);
+  });
+  await core.active.get(topic.id)!.completion;
+  expect(database.getAction(resolved)?.status).toBe("succeeded");
+  expect(retainedWhileFailed).toBe(true); expect(retainedWhilePending).toBe(true); expect(retainedWhileDetached).toBe(true);
+  expect(await core.deferredFindingsOf(topic.id)).toEqual(first.filter(item => item.id !== failure[0].id));
+  database.close();
+});
 
 describe("범위 세대", () => {
   it("사용자가 범위를 바꾸면 세대를 하나 올리고 이전 계획·승인·ACK를 전부 무효로 한다", async () => {
@@ -2769,6 +2974,27 @@ describe("멈춘 계획의 재사용", () => {
     requestedUserDecision: "게이트 2 주기를 정해 주세요.",
   };
 
+  it("a corrected evidence blocker reuses the complete plan for independent audit, without waiving validation", async () => {
+    const finding = { id: "RUN-1", title: "Required runtime validation", severity: "HIGH" as const,
+      disposition: "EXTERNAL_EVIDENCE" as const, rationale: "Run the tests during implementation", evidenceRefs: [], requiresUserDecision: false };
+    const { database, engine, artifacts, claude, codex } = makePlanningEngine({ slug: "future-validation",
+      claudeResults: [{ kind: "PLAN", summary: "Implementation and validation plan", planMarkdown: plan, findings: [finding], evidenceRefs: [] }],
+      codexResults: [{ kind: "AUDIT", summary: "Validation still needs execution", findings: [finding], evidenceRefs: [] }],
+    });
+    engine.startPlan("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+    expect(database.getTopic("topic-1").state).toBe("BLOCKED_ON_EVIDENCE");
+    await engine.postMessage("topic-1", "decision", "Review the stored plan. Runtime execution remains required after implementation and is not waived.");
+    engine.retry("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+    expect(claude.calls).toHaveLength(1);
+    expect(codex.calls).toHaveLength(1);
+    expect(await artifacts.readLatest("topic-1", "plan")).toContain("멈춘 계획");
+    expect(database.getTopic("topic-1")).toMatchObject({ state: "BLOCKED_ON_EVIDENCE", approvedPlanSHA256: null });
+    expect(database.getFlags("topic-1").resumeState).toBe("CODEX_AUDIT");
+    database.close();
+  });
+
   it.each([false, true])("결정이 올라온 뒤 retry 는 계획 턴 없이 저장된 계획으로 감사에 들어간다 (중간 활성화: %s)", async (enableWhilePaused) => {
     const { database, artifacts, engine, claude, codex } = makePlanningEngine({
       slug: "paused-plan-reuse",
@@ -3549,9 +3775,9 @@ describe("settled 쟁점 서버 승계 — 수정·리뷰 경로", () => {
     const resolved = finding("F-1", "결함", { disposition: "RESOLVED_BY_FIX" });
     const { database, engine, artifacts } = await makeReviewRecovery({
       resumeState: "CLAUDE_FIX", implementationFindings: [action], originalReviewFindings: [action, noAction, deferred],
-      // 최종 리뷰도 F-1 판정만 적는다 — F-2·TODO-1 은 서버가 승계한다.
-      codexResult: { kind: "FINAL_REVIEW", summary: "수정 확인", findings: [resolved], evidenceRefs: [] },
-      codexResults: [{ kind: "FINAL_REVIEW", summary: "수정 확인", findings: [resolved], evidenceRefs: [] }],
+      // 수정 턴은 기록을 보존하고, 리뷰는 TODO-1의 현재 범위를 명시적으로 확인한다.
+      codexResult: { kind: "FINAL_REVIEW", summary: "수정 확인", findings: [resolved, deferred], evidenceRefs: [] },
+      codexResults: [{ kind: "FINAL_REVIEW", summary: "수정 확인", findings: [resolved, deferred], evidenceRefs: [] }],
       // 수정 응답 하나뿐 — 교정 재제출이 일어나면 가짜 응답 부족으로 FAILED 가 되어 드러난다.
       claudeResults: [{ kind: "FIX", status: "completed", summary: "F-1 만 고쳤다", findings: [resolved], evidenceRefs: ["feature.txt"] }],
     });
@@ -3593,7 +3819,7 @@ describe("settled 쟁점 서버 승계 — 수정·리뷰 경로", () => {
   // 2026-09-13 Codex 지적 1: 첫 리뷰의 AGREED_NO_ACTION 이 수정 결과의 최신 판단(AGREED_ACTION·RESOLVED_BY_FIX)을 덮어
   // 최종 리뷰가 그 쟁점을 누락해도 READY_TO_DELIVER 까지 가던 구멍.
   it("최종 리뷰가 최신 판단이 바뀐 쟁점을 누락하면 옛 no-action 으로 승계되지 않고 교정으로 간다", async () => {
-    for (const latest of ["AGREED_ACTION", "RESOLVED_BY_FIX"] as const) {
+    for (const latest of ["AGREED_ACTION", "RESOLVED_BY_FIX", "DEFERRED_OUT_OF_SCOPE"] as const) {
       const { database, engine } = await makeReviewRecovery({
         resumeState: "CODEX_FINAL_REVIEW",
         implementationFindings: [finding("F-1", "결함", { disposition: latest })],
@@ -3648,7 +3874,7 @@ describe("계약 교정의 표기 위반 분류", () => {
   it("스키마·응답 종류·허용 오차 블록 형식 오류는 표기 위반이고, 쟁점 누락(plain Error)은 아니다", () => {
     expect(isFormatOnlyViolation(new FormatViolation("kind"))).toBe(true);
     expect(isFormatOnlyViolation(new ToleranceFormatError("허용 오차 블록 형식 오류: rules.0.invariants.0 Too big"))).toBe(true);
-    expect(() => parseTolerancePolicy("## 허용 오차\n```tolerance\n{\"scopePaths\":[],\"rules\":[]}\n```\n")).toThrow(ToleranceFormatError);
+    expect(() => parseTolerancePolicy("## 허용 오차\n```tolerance\n{\"scopePaths\":[\" \"],\"rules\":[]}\n```\n")).toThrow(ToleranceFormatError);
     expect(isFormatOnlyViolation(new Error("Claude fix 가 검토 쟁점을 누락했습니다: F-1"))).toBe(false);
   });
 });
@@ -3787,7 +4013,7 @@ it("묶음의 중간 단계는 검증된 로컬 커밋에서 push 없이 닫고 
  database.workGroups.link("group","a","topic-1","head");
  // 동기 close 는 묶음 단계를 닫지 않는다(동결 기록 없이 닫히면 다음 단계가 승계할 수 없다).
  expect(()=>engine.close("topic-1")).toThrow("closeStage");
- await expect(engine.closeStage("topic-1")).rejects.toThrow("먼저 검증된 결과를 커밋하세요");
+ await expect(engine.closeStage("topic-1")).rejects.toThrow("저장된 plan.md가 없습니다");
  database.updateTopic("topic-1",{committedOID:commit,reviewedTreeOID:tree});
  await expect(engine.closeStage("topic-1")).rejects.toThrow("작업 트리 HEAD");
  head=commit;treeFiles="form.swift\0";
@@ -3878,7 +4104,7 @@ it("통합 단계는 의존하지 않는 단계를 포함해 다른 모든 단�
  fx.notAncestors.clear();
  // 커밋 없이 기준(x-commit)에서 검증만 한 통합(F004) — 리뷰 HEAD 가 기준이 아니면(리뷰 기록 없음) 닫지 않는다.
  fx.database.updateTopic("topic-1",{committedOID:null,reviewedHead:null});fx.setHead("x-commit");
- await expect(fx.engine.closeStage("topic-1")).rejects.toThrow("변경 없는 통합 결과를 리뷰한 기록");
+ await expect(fx.engine.closeStage("topic-1")).rejects.toThrow("변경 없는 단계 결과를 리뷰한 기록");
  // 리뷰한 작업 트리에 변경이 있었는데(리뷰 트리 ≠ 기준 트리) 커밋하지 않고 되돌렸으면 리뷰한 결과가 아니다.
  fx.database.updateTopic("topic-1",{reviewedHead:"x-commit",reviewedTreeOID:fx.dirtyTree});
  await expect(fx.engine.closeStage("topic-1")).rejects.toThrow("리뷰한 작업 트리에 변경이 있었습니다");
@@ -4369,11 +4595,15 @@ describe("Codex 감사 2026-09-14 — resume-implementation / 계약 교정 원�
     });
     database.setImplementationSession("topic-1", "claude-implementation-session");
     database.updateTopic("topic-1", { state: "USER_DECISION_REQUIRED" });
+    database.updateTopic("topic-1", { fixPassUsed: true, secondFixPassUsed: true, reviewedHead: "old-head",
+      reviewedDiffSHA256: "old-diff", reviewedTreeOID: "old-tree" });
     const before = database.reviews.account("topic-1", "implementation").used;
     expect(() => engine.resumeImplementation("topic-1", { expectedState: "FAILED", expectedScopeGeneration: 1, reason: "x" })).toThrow("기대 상태");
     expect(() => engine.resumeImplementation("topic-1", { expectedState: "USER_DECISION_REQUIRED", expectedScopeGeneration: 9, reason: "x" })).toThrow("범위 세대");
     const topic = engine.resumeImplementation("topic-1", { expectedState: "USER_DECISION_REQUIRED", expectedScopeGeneration: 1, reason: "완료 형식 중간 보고를 되돌림" }, { actor: "mediator", delegationSetAt: "2026-09-14T00:00:00Z" });
     expect(topic.state).toBe("USER_DECISION_REQUIRED");
+    expect(database.getFlags("topic-1")).toMatchObject({ fixPassUsed: false, secondFixPassUsed: false,
+      reviewedHead: null, reviewedDiffSHA256: null, reviewedTreeOID: null });
     expect(database.getFlags("topic-1").resumeState).toBe("IMPLEMENTING");
     expect(database.reviews.account("topic-1", "implementation").used).toBe(before);
     const event = database.getTimeline("topic-1").at(-1)!;
@@ -4849,5 +5079,43 @@ it("감사 교정은 다른 원문 ID를 잘못 붙인 원본을 정상 교정 �
   const audit = JSON.parse((await artifacts.readLatest("topic-1", "audit"))!);
   expect(audit.findings).toEqual(canonical);
   expect(codex.calls).toHaveLength(2);
+  database.close();
+});
+
+
+it("stops identical continuation reports even when the accumulated report includes older text", async () => {
+  const pending = { kind: "FIX" as const, findings: [], evidenceRefs: [], status: "in_progress" as const,
+    remainingSteps: ["Finish the same pending work"] };
+  const claude = new QueuedAdapter("claude", [
+    { ...pending, summary: "Initial investigation" },
+    ...Array.from({ length: 3 }, () => ({ ...pending, summary: "Still investigating" })),
+  ]);
+  const codex = new QueuedAdapter("codex", []);
+  const { database, engine } = await makeReviewRecovery({ resumeState: "CLAUDE_FIX",
+    implementationFindings: [], originalReviewFindings: [],
+    codexResult: { kind: "REVIEW", summary: "unused", findings: [], evidenceRefs: [] }, claude, codex });
+  database.setImplementationSession("topic-1", "claude-implementation-session");
+  engine.retry("topic-1");
+  await waitForActionCompletion(database, "topic-1");
+  expect(database.getTopic("topic-1")).toMatchObject({ state: "USER_DECISION_REQUIRED" });
+  expect(database.getTopic("topic-1").lastError).toContain("같은 작업 보고를 반복");
+  expect(database.getFlags("topic-1").resumeState).toBe("CLAUDE_FIX");
+  expect(claude.calls).toHaveLength(4);
+  expect(codex.calls).toHaveLength(0);
+  database.close();
+});
+
+
+it("does not age out a live or unrecognized maintenance owner", () => {
+  const { root, database, dependencies } = makeEngine("DRAFT", null);
+  const path = join(root, "maintenance.lock");
+  const core = new EngineCore({ ...dependencies, maintenanceLockPath: path });
+  const at = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+  writeFileSync(path, JSON.stringify({ pid: process.pid, at }));
+  expect(() => core.assertNoMaintenanceLock()).toThrow("유지보수 잠금");
+  writeFileSync(path, "{partial");
+  expect(() => core.assertNoMaintenanceLock()).toThrow("유지보수 잠금");
+  writeFileSync(path, JSON.stringify({ pid: 2147483647, at }));
+  expect(() => core.assertNoMaintenanceLock()).not.toThrow();
   database.close();
 });

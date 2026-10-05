@@ -3,12 +3,16 @@ import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { assertFindingCoverage } from "../src/shared/workflow";
+import { evidenceHash, stableJSON } from "../src/server/evidence/store";
 import { ConsensusDatabase } from "../src/server/database";
 import { EVIDENCE_PAGE_BYTES, parseEvidenceSource, type EvidenceRange, type EvidenceSourceInput, type EvidenceUnitInput,
   type MediatorEvidenceBatch } from "../src/shared/externalEvidence";
 import { EvidenceService, withEvidence } from "../src/server/evidence/service";
 import { RestEvidenceConnector, evidenceCredentials } from "../src/server/evidence/connectors";
 import type { AgentAdapter } from "../src/server/types";
+import { accumulate } from "../src/server/engine/checkpoint";
+import type { AgentResult } from "../src/shared/contracts";
 
 // Public contracts: source ingestion -> topic freshness/gates, packet -> actual adapter prompt,
 // and provider HTTP -> complete snapshots. Fake boundaries model pagination, edits, failure and late replies.
@@ -96,7 +100,10 @@ describe("source identity and persistent content cache", () => {
     expect(() => db.evidence.assertReady(topic)).toThrow("검토");
     const check = db.evidence.begin(source.id, true)!; db.evidence.failed(source.id, check.checkId, "429");
     expect(db.evidence.status(deps)).toBe("unavailable");
-    expect(() => db.evidence.review(topic, db.evidence.topic(topic).digest, "ignore", topic)).toThrow("최신");
+    db.evidence.review(topic, db.evidence.topic(topic).digest, "접근 불가 원문과 의존 작업은 To-do로 제외", topic);
+    expect(db.evidence.topic(topic).deferred).toEqual([expect.objectContaining({ sourceId: source.id })]);
+    expect(db.evidence.usableSources(topic)).toEqual([]);
+    expect(db.evidence.status(deps)).toBe("unavailable");
   });
   it("does not partially replace a source on duplicate units or invalid screenshots", () => {
     const { db, source, ingest } = setup(); ingest([unit("1", "A")]);
@@ -469,7 +476,8 @@ it("delivers Figma product comments and link removal, without claiming design un
   expect(db.evidence.packet(topic, "claude", "fresh").delivered.map(row => row.unitId)).toEqual(["decision"]);
   await adapter.resumeTurn(turn); expect(turns[1].prompt).not.toContain("save draft on exit");
   db.evidence.failed(source.id, db.evidence.begin(source.id, true)!.checkId, "offline");
-  expect(db.evidence.topic(topic).ready).toBe(false); // Known product comments still require fresh evidence.
+  expect(db.evidence.topic(topic).ready).toBe(true);
+  expect(db.evidence.usableSources(topic)).toEqual([]); // Failed product comments are deferred, never injected as current.
   db.evidence.detach(topic.id, source.id);
   await adapter.resumeTurn(turn);
   expect(turns[2].prompt).toContain(`"removedSourceId":"${source.id}"`);
@@ -569,7 +577,53 @@ it.each(["429", "cancelled", "invalid-result"])("retains native design evidence 
   expect(review.prompt).toContain(hash);
 });
 
-it("requires recapture after a missing tool response, including on later no-tool resumes", async () => {
+it("ignores late design callbacks after cancellation and retains unknown reads for resume", async () => {
+  const { db, root, topic, ingest } = setup(); ingest([unit("1", "Behavior")]);
+  db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc?node-id=1-2" });
+  const request = { tool: "mcp__figma-desktop__get_metadata", input: { nodeId: "1:2" } }, abort = new AbortController();
+  let attempt = 0, resumedPrompt = "";
+  const adapter = withEvidence({ role: "claude", validateExistingSession: async () => true, createSession: async () => { throw Error("unused"); },
+    resumeTurn: async turn => {
+      if (++attempt === 1) {
+        turn.onFigmaRequest!(request);
+        abort.abort();
+        turn.onFigmaRequest!({ ...request, input: { nodeId: "1:3" } });
+        turn.onFigmaResult!({ ...request, content: "late success" });
+        turn.onFigmaResult!({ ...request, content: "late failure", isError: true });
+      } else resumedPrompt = turn.prompt;
+      return { kind: "IMPLEMENTATION", summary: "done", status: "completed", findings: [], evidenceRefs: [] };
+    } }, db, join(root, "images"));
+  await adapter.resumeTurn({ cwd: root, sessionId: "s", prompt: "Implement", implementation: true, signal: abort.signal });
+  expect(db.evidence.pendingDesignRequests(topic)).toEqual([request]);
+  expect(db.evidence.designObservations(topic)).toEqual([]);
+  expect(db.evidence.failedDesignRequests(topic)).toEqual([]);
+  const resumed = await adapter.resumeTurn({ cwd: root, sessionId: "s", prompt: "Resume", implementation: true });
+  expect(resumed.evidenceRefs).toEqual([]);
+  expect(resumedPrompt).toContain("unreceived");
+  expect(resumedPrompt).not.toContain("late success");
+});
+
+it("keeps design debt outside accumulated summaries while supplying current referenced gaps", async () => {
+  const { db, root, topic, ingest } = setup(); ingest([unit("1", "Behavior")]);
+  db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc?node-id=1-2" });
+  for (let i = 0; i < 36; i++) db.evidence.designRequest(topic, { tool: "mcp__figma-desktop__get_metadata", input: { nodeId: `1:${i + 2}` } });
+  let attempt = 0, accumulated: AgentResult | null = null;
+  const adapter = withEvidence({ role: "claude", validateExistingSession: async () => true, createSession: async () => { throw Error("unused"); },
+    resumeTurn: async turn => {
+      expect(turn.prompt).toContain("unreceived");
+      expect(turn.readablePaths?.filter(path => path.endsWith(".observed-design.json"))).toHaveLength(36);
+      return { kind: "IMPLEMENTATION", summary: `Progress ${++attempt}`, status: "in_progress", findings: [], evidenceRefs: [] };
+    } }, db, join(root, "images"));
+  for (let i = 0; i < 10; i++) {
+    const next = await adapter.resumeTurn({ cwd: root, sessionId: "s", prompt: "Continue", implementation: true });
+    expect(next.summary).toBe(`Progress ${i + 1}`);
+    accumulated = accumulate(accumulated, next, [], i).result;
+  }
+  expect(accumulated!.summary).not.toContain("get_metadata");
+  expect(db.evidence.designReadGaps(topic)).toHaveLength(36);
+});
+
+it("rejects current capture loss but defers previous unknown reads until a successful explicit retry", async () => {
   const { ClaudeAdapter } = await import("../src/server/adapters/claude");
   const { db, root, topic, ingest } = setup(); ingest([unit("1", "Behavior")]);
   db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc?node-id=1-2" });
@@ -584,13 +638,18 @@ it("requires recapture after a missing tool response, including on later no-tool
   const adapter = withEvidence(native, db, join(root, "images"));
   const turn = { cwd: root, sessionId: "s", prompt: "Implement", implementation: true };
   await expect(adapter.resumeTurn(turn)).rejects.toThrow("not captured");
-  await expect(adapter.resumeTurn(turn)).rejects.toThrow("previous attempt");
-  expect(db.evidence.pendingDesignRequests(topic)).toHaveLength(1);
+  const continued = await adapter.resumeTurn(turn);
+  expect(continued.summary).toBe("done");
+  expect(continued.evidenceRefs).toEqual([]);
+  expect(db.evidence.pendingDesignRequests(topic)).toEqual([]);
+  expect(db.evidence.failedDesignRequests(topic)).toEqual([]);
+  expect(db.evidence.designReadGaps(topic)).toHaveLength(1);
   expect((await adapter.resumeTurn(turn)).evidenceRefs).toHaveLength(1);
   expect(db.evidence.pendingDesignRequests(topic)).toEqual([]);
+  expect(db.evidence.designReadGaps(topic)).toEqual([]);
 });
 
-it("does not clear an uncaptured design request when a retry returns a tool error", async () => {
+it("retains explicit design failures as unverified To-do without forcing another read", async () => {
   const { db, root, topic, ingest } = setup(); ingest([unit("1", "Behavior")]);
   db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc?node-id=1-2" });
   const request = { tool: "mcp__figma-desktop__get_metadata", input: { nodeId: "1:2" } };
@@ -601,9 +660,44 @@ it("does not clear an uncaptured design request when a retry returns a tool erro
       turn.onFigmaResult?.({ ...request, content: "Access denied", isError: true });
       return { kind: "IMPLEMENTATION", summary: "done", status: "completed", findings: [], evidenceRefs: [] };
     } }, db, join(root, "images"));
-  await expect(adapter.resumeTurn({ cwd: root, sessionId: "s", prompt: "Retry", implementation: true })).rejects.toThrow("previous attempt");
-  expect(db.evidence.pendingDesignRequests(topic)).toEqual([request]);
+  const result = await adapter.resumeTurn({ cwd: root, sessionId: "s", prompt: "Retry", implementation: true });
+  expect(result.summary).toBe("done");
+  expect(result.findings).toEqual([]);
+  expect(result.evidenceRefs).toEqual([]);
+  expect(db.evidence.pendingDesignRequests(topic)).toEqual([]);
   expect(db.evidence.designObservations(topic)).toEqual([]);
+  const reopened = new ConsensusDatabase(join(root, "room.sqlite")); databases.push(reopened);
+  expect(reopened.evidence.failedDesignRequests(topic)).toMatchObject([{ request, failure: "Access denied" }]);
+  let delivered: any;
+  const continued = withEvidence({ role: "claude", validateExistingSession: async () => true, createSession: async () => { throw Error("unused"); },
+    resumeTurn: async turn => { delivered = turn; return { kind: "IMPLEMENTATION", summary: "Other work", status: "completed", findings: [], evidenceRefs: [] }; }
+  }, reopened, join(root, "images"));
+  const resumed = await continued.resumeTurn({ cwd: root, sessionId: "s", prompt: "Continue", implementation: true });
+  expect(resumed.findings).toEqual([]);
+  const judgment = { id: `FIGMA-UNAVAILABLE-${topic.scopeGeneration}-${evidenceHash(stableJSON(request))}`,
+    title: "Unverified design", evidenceRefs: [], severity: "HIGH" as const, disposition: "AGREED_ACTION" as const,
+    requiresUserDecision: true, rationale: "The reviewer requires an explicit decision." };
+  const review = withEvidence({ role: "codex", validateExistingSession: async () => true, createSession: async () => { throw Error("unused"); },
+    resumeTurn: async () => ({ kind: "REVIEW", summary: "Decision needed", status: "blocked", findings: [judgment], evidenceRefs: [], requestedUserDecision: "Confirm required verification" })
+  }, reopened, join(root, "images"));
+  const reviewed = await review.resumeTurn({ cwd: root, sessionId: "review", prompt: "Review", implementation: true });
+  expect(reviewed.findings).toEqual([judgment]);
+  expect(reviewed.status).toBe("blocked"); expect(reviewed.requestedUserDecision).toBe("Confirm required verification");
+  const omitted = withEvidence({ role: "codex", validateExistingSession: async () => true, createSession: async () => { throw Error("unused"); },
+    resumeTurn: async () => ({ kind: "REVIEW", summary: "done", status: "completed", findings: [], evidenceRefs: [] })
+  }, reopened, join(root, "images"));
+  const missing = await omitted.resumeTurn({ cwd: root, sessionId: "review", prompt: "Review", implementation: true });
+  expect(missing.findings).toEqual([]);
+  expect(() => assertFindingCoverage([judgment], missing.findings, "review")).toThrow();
+  expect(delivered.prompt).toContain("Do not automatically repeat failed reads");
+  expect(delivered.prompt).not.toContain("Repeat these reads before completing");
+  const failure = JSON.parse(readFileSync(delivered.readablePaths.find((path: string) => path.endsWith(".json")), "utf8"));
+  expect(failure.observation).toMatchObject({ content: "Access denied", isError: true });
+  reopened.evidence.designRequest(topic, request);
+  expect(reopened.evidence.pendingDesignRequests(topic)).toEqual([request]);
+  expect(reopened.evidence.failedDesignRequests(topic)).toEqual([]);
+  reopened.evidence.designRequest(topic, request, true);
+  expect(reopened.evidence.pendingDesignRequests(topic)).toEqual([]);
 });
 
 it("detaching an independent Figma file disposes only its requests and permits the remaining product task", async () => {
@@ -636,7 +730,8 @@ it("keeps a child-node read pending while its parent screen remains linked", asy
   const adapter = withEvidence({ role: "claude", validateExistingSession: async () => true, createSession: async () => { throw Error("unused"); },
     resumeTurn: async () => ({ kind: "IMPLEMENTATION", summary: "done", status: "completed", findings: [], evidenceRefs: [] })
   }, reopened, join(root, "images"));
-  await expect(adapter.resumeTurn({ cwd: root, sessionId: "s", prompt: "Continue", implementation: true })).rejects.toThrow("previous attempt");
+  expect((await adapter.resumeTurn({ cwd: root, sessionId: "s", prompt: "Continue", implementation: true })).status).toBe("completed");
+  expect(reopened.evidence.designReadGaps(topic).map(gap => gap.request)).toEqual([request]);
   reopened.evidence.detach(topic.id, parent.id);
   expect(reopened.evidence.pendingDesignRequests(topic)).toEqual([]);
   expect((await adapter.resumeTurn({ cwd: root, sessionId: "s", prompt: "Continue", implementation: true })).status).toBe("completed");
@@ -669,7 +764,8 @@ it("keeps an unresolved child-node read when only another candidate screen is de
   const adapter = withEvidence({ role: "claude", validateExistingSession: async () => true, createSession: async () => { throw Error("unused"); },
     resumeTurn: async () => ({ kind: "IMPLEMENTATION", summary: "done", status: "completed", findings: [], evidenceRefs: [] })
   }, reopened, join(root, "images"));
-  await expect(adapter.resumeTurn({ cwd: root, sessionId: "s", prompt: "Continue", implementation: true })).rejects.toThrow("previous attempt");
+  expect((await adapter.resumeTurn({ cwd: root, sessionId: "s", prompt: "Continue", implementation: true })).status).toBe("completed");
+  expect(reopened.evidence.designReadGaps(topic).map(gap => gap.request)).toEqual([request]);
   reopened.evidence.detach(topic.id, screenA.id);
   expect(reopened.evidence.pendingDesignRequests(topic)).toEqual([]);
   expect((await adapter.resumeTurn({ cwd: root, sessionId: "s", prompt: "Continue", implementation: true })).status).toBe("completed");
@@ -693,7 +789,8 @@ it("restores candidate links when a child-node read is retried after a screen is
   const adapter = withEvidence({ role: "claude", validateExistingSession: async () => true, createSession: async () => { throw Error("unused"); },
     resumeTurn: async () => ({ kind: "IMPLEMENTATION", summary: "done", status: "completed", findings: [], evidenceRefs: [] })
   }, reopened, join(root, "images"));
-  await expect(adapter.resumeTurn({ cwd: root, sessionId: "s", prompt: "Continue", implementation: true })).rejects.toThrow("previous attempt");
+  expect((await adapter.resumeTurn({ cwd: root, sessionId: "s", prompt: "Continue", implementation: true })).status).toBe("completed");
+  expect(reopened.evidence.designReadGaps(topic).map(gap => gap.request)).toEqual([request]);
   reopened.evidence.detach(topic.id, screenB.id);
   expect(reopened.evidence.pendingDesignRequests(topic)).toEqual([]);
 });
@@ -712,7 +809,8 @@ it("reactivates an unresolved read when its last screen is reattached before ano
   const adapter = withEvidence({ role: "claude", validateExistingSession: async () => true, createSession: async () => { throw Error("unused"); },
     resumeTurn: async () => ({ kind: "IMPLEMENTATION", summary: "done", status: "completed", findings: [], evidenceRefs: [] })
   }, reopened, join(root, "images"));
-  await expect(adapter.resumeTurn({ cwd: root, sessionId: "s", prompt: "Continue", implementation: true })).rejects.toThrow("previous attempt");
+  expect((await adapter.resumeTurn({ cwd: root, sessionId: "s", prompt: "Continue", implementation: true })).status).toBe("completed");
+  expect(reopened.evidence.designReadGaps(topic).map(gap => gap.request)).toEqual([request]);
 });
 
 it("keeps an uncaptured read pending when a different screen in the same Figma file is linked", async () => {
@@ -727,7 +825,8 @@ it("keeps an uncaptured read pending when a different screen in the same Figma f
   const adapter = withEvidence({ role: "claude", validateExistingSession: async () => true, createSession: async () => { throw Error("unused"); },
     resumeTurn: async () => ({ kind: "IMPLEMENTATION", summary: "done", status: "completed", findings: [], evidenceRefs: [] })
   }, reopened, join(root, "images"));
-  await expect(adapter.resumeTurn({ cwd: root, sessionId: "s", prompt: "Continue", implementation: true })).rejects.toThrow("previous attempt");
+  expect((await adapter.resumeTurn({ cwd: root, sessionId: "s", prompt: "Continue", implementation: true })).status).toBe("completed");
+  expect(reopened.evidence.designReadGaps(topic).map(gap => gap.request)).toEqual([request]);
 });
 
 // E3-1 쪽·구간 전달: 두 소비처(중재자 batch·러너 턴)가 한 쪽 구성 규칙을 쓴다. 공개 경계는 store 의 batch·ack·packet·receipt, 서비스 응답,

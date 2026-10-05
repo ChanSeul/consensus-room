@@ -86,6 +86,22 @@ function closeStage(fx: Fixture, groupId: string, stageId: string, closedAt: str
 }
 const creationEvent = (fx: Fixture, topicId: string) => fx.database.getTimeline(topicId)[0];
 
+it("continuation reports the actual default admission blocker and never readies integration early", async () => {
+  const fx = fixture(), service = fx.service();
+  const group = await service.create(groupInput([
+    work("a"), work("b", { acceptance: undefined, dependsOn: ["a"] }), integration("z", ["a", "b"]),
+  ]));
+  expect(service.continuation(group).stageId).toBe("a");
+  await service.next(group.id);
+  expect(service.continuation(fx.database.workGroups.get(group.id)).stageId).toBeNull();
+  closeStage(fx, group.id, "a", "2026-10-04T00:00:00.000Z");
+  const status = service.continuation(fx.database.workGroups.get(group.id));
+  expect(status.stageId).toBeNull();
+  expect(status.reason).toContain("완료 조건");
+  expect(status.reason).toContain("남은 단계 b");
+  await expect(service.next(group.id)).rejects.toThrow(status.reason!);
+});
+
 describe("착수 선택과 기준 커밋", () => {
   it("기본은 한 번에 한 단계다. 외부 결정으로 막힌 단계 옆에서만 독립 준비 단계를 고르고, 갈라진 결과는 가장 최근 head 를 기준으로 합류 대상에 싣는다", async () => {
     const fx = fixture();
@@ -211,6 +227,26 @@ describe("착수 선택과 기준 커밋", () => {
     expect(dLink).toMatchObject({ topicId: d.id, baseOID: closedA.commit });
     expect(dLink.mergeTargets ?? []).toEqual([]);
     expect(creationEvent(fx, d.id).payload).toMatchObject({ stageId: "d", selected: false });
+  });
+
+  it("unavailable evidence can be deferred without resolving it, and the next worker retains the excluded scope", async () => {
+    const fx = fixture(), service = fx.service();
+    const question = { id: "q", stageId: "a", text: "Unavailable API field", blocksStart: true };
+    const input = groupInput([work("a"), integration("z", ["a"])], { questions: [question] });
+    const group = await service.create(input);
+    await expect(service.next(group.id)).rejects.toThrow("열 수 있는 준비된 단계가 없습니다");
+    const deferredReason = "Exclude the unconfirmed field; implement documented fields and recheck the source later";
+    fx.database.workGroups.revise(group.id, { ...input, questions: [{ ...question, deferredReason }] }, 1);
+    const saved = fx.database.workGroups.get(group.id);
+    expect(saved.questions![0].resolution).toBeUndefined();
+    expect(service.selectableStages(saved)).toEqual(["a"]);
+    const topic = await service.next(group.id);
+    const prompt = creationEvent(fx, topic.id).body;
+    expect(prompt).toContain(deferredReason);
+    expect(prompt).toContain("미해소");
+    expect(prompt).toContain("그 질문에 의존하는 동작은 이번 구현에서 제외");
+    expect(prompt).not.toContain("(착수 차단)");
+    await expect(service.next(group.id)).rejects.toThrow();
   });
 
   it("필요한 결과를 모두 가진 head 가 있으면 가장 최근 head 가 아니어도 그것을 기준으로 하고 합류 대상을 두지 않는다", async () => {

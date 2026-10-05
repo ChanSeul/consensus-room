@@ -26,6 +26,7 @@ function withoutNullOptionals(value: unknown): unknown {
       if (!finding || typeof finding !== "object" || Array.isArray(finding)) return finding;
       const copy = { ...(finding as Record<string, unknown>) };
       if (copy.disposition === null) delete copy.disposition;
+      if (copy.evidenceGap === null) delete copy.evidenceGap;
       return copy;
     });
   }

@@ -76,6 +76,8 @@ async function read(request: Request, options: UserFileReadOptions): Promise<str
     const env = { ...process.env };
     delete env.NODE_OPTIONS;
     const child = spawn(process.execPath, ["-e", worker, JSON.stringify({ ...request, deadlineMs: timeoutMs })], { env, stdio: ["ignore", "pipe", "ignore"] });
+    child.once("error", reject);
+    if (!child.stdout) return;
     const chunks: Buffer[] = [];
     const outputLimit = request.operation === "memoryBatch" ? 1024 + request.paths!.length * request.maxBytes! * 16 : 2 * 1024 * 1024;
     let size = 0;
@@ -93,7 +95,6 @@ async function read(request: Request, options: UserFileReadOptions): Promise<str
       if (size > outputLimit) stop(new UserFileAccessBlocked(request.path, "reader output exceeds its bound"));
       else chunks.push(chunk);
     });
-    child.on("error", error => { failure ??= error; });
     child.on("close", (code, signal) => {
       clearTimeout(timer);
       options.signal?.removeEventListener("abort", abort);

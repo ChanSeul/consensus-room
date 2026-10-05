@@ -1,3 +1,4 @@
+import { assertTurnResult, turnContract } from "../../shared/turnContract.js";
 import { isTopicGroup } from "../../shared/topicStructure.js";
 import {ReviewBlocked} from "../reviewLedger.js";
 import { existsSync, readFileSync } from "node:fs";
@@ -15,6 +16,7 @@ import { applyPlanLineEdits, applyPlanRepair, planRepairPrompt, repairablePlan }
 // WorkflowEngine 분해(2026-08-31): 상태 전환·세션·산출물·메모리·전달이 한 클래스(1,504줄)에 있어
 // 순서 결함이 반복된다는 Codex 진단에 따른 분리. EngineCore는 공유 상태와 횡단 프리미티브만 갖는다 —
 // 흐름(계획 수렴·구현 전달)은 PlanningPipeline·DeliveryPipeline이, 공개 API는 WorkflowEngine 파사드가 갖는다.
+import { evidenceHash, stableJSON } from "../evidence/store.js";
 import { createHash, randomUUID } from "node:crypto";
 import { ZodError } from "zod";
 import { ToleranceFormatError } from "../../shared/tolerance.js";
@@ -52,13 +54,15 @@ import {
 } from "../../shared/workflow.js";
 import { buildContractCorrectionPrompt } from "../../shared/prompts.js";
 import { redactAgentResult, redactRecord, redactUnverifiedResult } from "../security.js";
-import type { AgentAdapter, AppliedMemoryChange, ParticipantRole, TurnUsage } from "../types.js";
+import type { ActionRecord, AgentAdapter, AppliedMemoryChange, ParticipantRole, TurnUsage } from "../types.js";
 import { exceededLimits } from "../adapters/executionMetrics.js";
 import type { WorkflowDependencies } from "../workflow.js";
 import { AdmissionRefused, TurnExecutor, type TurnPurpose, type WriteGuards } from "./turnExecutor.js";
 import { WorkCheckpoints } from "./checkpoint.js";
 import { FixContracts } from "./fixContracts.js";
 import { DiagnosisService } from "./diagnoses.js";
+import { reportBackgroundFailure, runBackgroundTask } from "../backgroundTask.js";
+import { failureResumePoint, isResumePoint, resetCycle } from "../../shared/workflowLifecycle.js";
 
 // 결과 JSON 의 표기만 틀린 위반(스키마·kind). 재제출에 판단이 필요 없어 교정 턴의 추론 강도를 low 로 내린다
 // (2026-09-07 Codex 자기 최적화 제안 ③). 쟁점 누락·처분 규칙 위반은 판단이 섞이므로 여기 속하지 않는다.
@@ -113,7 +117,7 @@ function boundedError(message: string): string {
 }
 
 const DEFERRED_SOURCE_LABEL: Record<DeferredFinding["source"], string> = {
-  closeout: "종결 확인", review: "첫 코드 리뷰", "final-review": "최종 리뷰", implementation: "구현 to-do", fix: "수정 to-do",
+  evidence: "근거 부족 To-do", closeout: "종결 확인", review: "첫 코드 리뷰", "final-review": "최종 리뷰", implementation: "구현 to-do", fix: "수정 to-do",
 };
 // 계획·감사 턴의 이연 쟁점 원문 산출물 종류 — 토픽 자기 원장(deferred-findings)과 다른 종류다(원장은 이 토픽이 이연한 것만, 이것은 턴에 실은 전체).
 export const DEFERRED_FINDINGS_DIGEST = "deferred-findings-digest";
@@ -135,9 +139,11 @@ export class EngineCore {
   readonly turnInputSequence = new Map<string, number>();
   shuttingDown = false;
   // 주제가 FAILED 로 떨어진 직후(원장 마감 뒤) 알린다 — 사용 한도 자동 재시도 예약(engine/usageLimitRetry.ts).
+  evidenceWaitObserver?: (topicId: string, resumeState: WorkflowState) => void;
   failureObserver?: (topicId: string, message: string) => void;
   // 새 action 이 시작될 때 알린다 — 그 주제의 예약된 자동 재시도를 취소한다.
   actionObserver?: (topicId: string) => void;
+  settledObserver?: () => void;
   private readonly warnedLimits = new Map<string, Set<string>>();
   // 모델 호출의 단일 경계(PLAN §2) — 파이프라인은 adapter 를 직접 부르지 않는다.
   readonly executor: TurnExecutor;
@@ -222,10 +228,11 @@ export class EngineCore {
     if (this.shuttingDown) throw new Error("서버가 종료 중입니다. 재시작 뒤 다시 요청하세요.");
   }
 
-  startAction(topicId: string, kind: string, work: (signal: AbortSignal) => Promise<void>, requestedActionId?: string): string {
+  startAction(topicId: string, kind: string, work: (signal: AbortSignal) => Promise<void>, requestedActionId?: string,
+    initialTransition?: { to: WorkflowState; message: string }): string {
     this.assertNotShuttingDown();
     this.assertNoActiveWork(topicId);
-    const topic = this.dependencies.database.getTopic(topicId);
+    let topic = this.dependencies.database.getTopic(topicId);
     if (isTopicGroup(topic) && !["brainstorm", "brainstorm-plan", "brainstorm-close"].includes(kind)
       && !(kind === "retry" && this.dependencies.database.getFlags(topicId).resumeState === "BRAINSTORMING"))
       throw conflict("관리 주제에서는 실행할 수 없습니다. 말단 주제에서 작업을 시작하세요.");
@@ -235,45 +242,59 @@ export class EngineCore {
     let resolveCompletion!: () => void;
     const completion = new Promise<void>((resolve) => { resolveCompletion = resolve; });
     const scopeGeneration = this.dependencies.database.getTopic(topicId).scopeGeneration;
-    this.dependencies.database.startAction({
+    const inputSequence = this.latestSequence(topicId);
+    const record: ActionRecord = {
       id: actionId, topicId, kind, status: "running", createdAt: new Date().toISOString(),
       finishedAt: null, error: null, pid: null, pgid: null,
       processExecutable: null, processCommand: null,
       processStartedAt: null,
-    });
+    };
+    if (initialTransition) {
+      assertTransition(topic.state, initialTransition.to);
+      topic = this.dependencies.database.applyTopicTransition({ topicId,
+        changes: { state: initialTransition.to, lastError: null, resumeState: null }, startAction: record,
+        events: [{ actor: "system", kind: "system", state: initialTransition.to, body: initialTransition.message,
+          payload: { from: topic.state, to: initialTransition.to } }],
+      });
+    } else this.dependencies.database.startAction(record);
     this.active.set(topicId, { actionId, controller, completion });
-    this.actionObserver?.(topicId);
-    void work(controller.signal).then(() => {
+    // A resumed action may consume stored results without a model turn. Its input
+    // watermark starts here, never at the last turn of a previous action.
+    this.turnInputSequence.set(topicId, inputSequence);
+    void runBackgroundTask(`action:${actionId}`, () => this.dependencies.git.withSignal(controller.signal, async () => {
+      try { this.actionObserver?.(topicId); }
+      catch (error) { reportBackgroundFailure(`action:${actionId}:admission-observer`, error); }
+      await this.recordEvidenceGaps(topic, controller.signal);
+      await work(controller.signal);
       if (!this.isCurrentAction(topicId, actionId, scopeGeneration)) return;
       this.dependencies.database.finishAction(actionId, "succeeded");
-    }).catch((error: unknown) => {
-      if (kind === "evidence-assessment") {
+    }), (error: unknown) => {
+      if (kind === "evidence-assessment" && !this.dependencies.database.evidenceActionOwnsWorkflow(topicId, actionId)) {
         this.dependencies.database.finishAction(actionId, controller.signal.aborted ? "cancelled" : "failed",
           redactSecrets(error instanceof Error ? error.message : String(error)));
         return;
       }
       if (error instanceof PlanningPaused && this.isCurrentAction(topicId, actionId, scopeGeneration)) {
         const topic = this.dependencies.database.getTopic(topicId);
-        this.dependencies.database.finishAction(actionId, "cancelled", error.message);
-        this.interrupt(topicId, "USER_DECISION_REQUIRED", error.message, topic.state, { planningPause: true });
+        this.interrupt(topicId, error.reason === "evidence" ? "BLOCKED_ON_EVIDENCE" : "USER_DECISION_REQUIRED", error.message, topic.state,
+          error.reason === "evidence" ? { externalEvidence: true } : { planningPause: true }, actionId);
         return;
       }
       if ((error instanceof BudgetBlocked || error instanceof RevisionBlocked || error instanceof ReviewBlocked) && this.isCurrentAction(topicId, actionId, scopeGeneration)) {
         const topic = this.dependencies.database.getTopic(topicId);
-        this.dependencies.database.finishAction(actionId, "cancelled", error.message);
-        this.interrupt(topicId, "USER_DECISION_REQUIRED", error.message, topic.state, error instanceof RevisionBlocked ? {revisionPause:true} : error instanceof ReviewBlocked ? {reviewPause:error.scope} : {budgetPause:true});
+        this.interrupt(topicId, "USER_DECISION_REQUIRED", error.message, topic.state,
+          error instanceof RevisionBlocked ? {revisionPause:true} : error instanceof ReviewBlocked ? {reviewPause:error.scope} : {budgetPause:true}, actionId);
         return;
       }
       // spawn 직전 실행 허용 거부(계획 변경·유지보수·예산 소진·쓰기 기준 불일치)는 정상 정지다 — 결과는 checkpoint 로 보존됐고 사람이 재개한다.
       // FAILED 로 떨어뜨리면 사용 한도 자동 재시도가 같은 거부를 반복한다(PLAN §2 검증 조건 1).
       if (error instanceof AdmissionRefused && this.isCurrentAction(topicId, actionId, scopeGeneration)) {
         const topic = this.dependencies.database.getTopic(topicId);
-        this.dependencies.database.finishAction(actionId, "cancelled", error.message);
         if (topic.state !== "USER_DECISION_REQUIRED" && topic.state !== "BLOCKED_ON_EVIDENCE") {
           // 예산 소진 거부는 기존 예산 정지와 같은 재개 계약(budgetPause → retry 가 같은 단계를 이어간다, 계획을 다시 만들지 않는다).
           this.interrupt(topicId, "USER_DECISION_REQUIRED", error.message, topic.state,
-            { admissionRefused: error.reason, ...(error.reason === "budget" ? { budgetPause: true } : {}) });
-        }
+            { admissionRefused: error.reason, ...(error.reason === "budget" ? { budgetPause: true } : {}) }, actionId);
+        } else this.dependencies.database.finishAction(actionId, "cancelled", error.message);
         return;
       }
       const cancelled = controller.signal.aborted;
@@ -293,15 +314,12 @@ export class EngineCore {
         error: message,
         expectedScopeGeneration: scopeGeneration,
       });
-      this.event(topicId, "system", "system", cancelled
-        ? "실행을 중단했습니다."
-        : failure.topicFailed
-          ? `실행에 실패했습니다: ${message}`
-          : `실행 요청을 처리하지 못했습니다: ${message} 주제 상태는 그대로 유지했습니다.`);
+      if (!failure.topicFailed) this.event(topicId, "system", "system", `실행 요청을 처리하지 못했습니다: ${message} 주제 상태는 그대로 유지했습니다.`);
       if (!cancelled && failure.topicFailed) this.failureObserver?.(topicId, message);
-    }).finally(() => {
+    }, () => {
       if (this.active.get(topicId)?.actionId === actionId) this.active.delete(topicId);
       resolveCompletion();
+      this.settledObserver?.();
     });
     return actionId;
   }
@@ -318,7 +336,7 @@ export class EngineCore {
   }
 
   // 중재자가 도구 트리·서버를 교체하는 동안(next-stop.sh) 새 실행을 시작하지 않는다 — 유휴 확인과 교체 사이의 경쟁을 막는 공유 잠금.
-  // 60분이 지난 잠금은 버려진 것으로 보고 무시한다(스크립트가 죽어 지우지 못한 경우).
+  // 60분이 지나고 소유 PID가 실제로 종료된 잠금만 무시한다. 손상된 소유 기록은 시간만으로 해제하지 않는다.
   // 잠금 **소유자**(잠금 파일의 pid·at 을 그대로 제시한 호출)는 통과한다 — 유지보수 스크립트가 잠금을 쥔 채 마지막에 기준 갱신(rebaseline)을
   // 부르는 종료 절차가 자기 잠금에 막히지 않게(R3-06). 잠금을 조기에 풀어 유휴 확인↔교체 경쟁을 되살리지 않는다.
   assertNoMaintenanceLock(owner?: MaintenanceLockOwner): void {
@@ -326,8 +344,14 @@ export class EngineCore {
     if (!path || !existsSync(path)) return;
     let info: { at?: string; reason?: string; pid?: number } = {};
     try { info = JSON.parse(readFileSync(path, "utf8")) as { at?: string; reason?: string; pid?: number }; } catch { /* 형식 무관 — 파일 존재가 잠금이다 */ }
-    const age = info.at ? Date.now() - Date.parse(info.at) : 0;
-    if (Number.isFinite(age) && age > 60 * 60 * 1000) return;
+    const timestamp = info.at ? Date.parse(info.at) : NaN;
+    const age = Date.now() - timestamp;
+    let deadOwner = false;
+    if (Number.isInteger(info.pid) && info.pid! > 1) {
+      try { process.kill(info.pid!, 0); }
+      catch (error) { deadOwner = (error as NodeJS.ErrnoException).code === "ESRCH"; }
+    }
+    if (deadOwner && age > 60 * 60 * 1000) return;
     if (owner && typeof info.pid === "number" && info.pid === owner.pid && info.at === owner.at) return;
     throw new Error(`중재자 유지보수 잠금 중입니다(${info.reason ?? "사유 없음"}, ${info.at ?? "시각 없음"}) — 끝난 뒤 다시 시도하세요.`);
   }
@@ -451,10 +475,7 @@ export class EngineCore {
         writeGuards: options.writeGuards,
       });
       accepted = true;
-      for (const defect of checked.engineDefects ?? []) {
-        const key = createHash("sha256").update(JSON.stringify(defect)).digest("hex");
-        this.dependencies.database.engineDefects.enqueue(topic.id, { ...defect, key });
-      }
+      this.recordResultDefects(topic.id, checked);
       if(pending)await this.writeArtifact(topic,"pending-contract-repair",this.latestSequence(topic.id)+1,"null",signal);
       return checked;
     } catch(error) {
@@ -520,6 +541,7 @@ export class EngineCore {
       writeGuards?: WriteGuards;
       // 교정 호출을 열기 **전에** 호출자가 누적본을 checkpoint 로 보존한다(PLAN §2: 호출 실패·재시작에도 같은 기록에서 이어간다).
       beforeCorrection?: (raw: AgentResult, violation: string) => Promise<void>;
+      onCorrectionResponse?: (result: AgentResult) => void;
     },
   ): Promise<AgentResult> {
     const role = route.seat;
@@ -535,6 +557,7 @@ export class EngineCore {
     let repairPlan: string | null = null;
     try {
       const parsed = normalized(context.normalize, redactAgentResult(AgentResultSchema.parse(raw)));
+      assertTurnResult(route.job, parsed);
       context.check?.(parsed);
       this.reportCarriedFindings(topic.id, context.normalize, false);
       return parsed;
@@ -544,8 +567,7 @@ export class EngineCore {
       violation = error instanceof Error ? error.message : String(error);
       if (error instanceof ToleranceFormatError) repairPlan = repairablePlan(redactAgentResult(raw), context.planBase);
     }
-    if (this.dependencies.database.planning.enabled(topic.id) &&
-        ["CLAUDE_PLAN", "CLAUDE_REVISION", "CODEX_AUDIT", "CODEX_CLOSEOUT"].includes(topic.state)) {
+    if (planningControlApplies(this.dependencies.database, topic.id, topic.state, turnFlags(route.job))) {
       const checkpoint = this.dependencies.database.planning.latest(topic.id);
       if (checkpoint && checkpoint.stage === topic.state && checkpoint.role === route.provider &&
           checkpoint.scopeGeneration === topic.scopeGeneration && checkpoint.planEpoch === topic.planEpoch) {
@@ -616,7 +638,8 @@ export class EngineCore {
       `기계 계약 위반을 같은 세션에 돌려보내 1회 교정합니다${formatOnly ? "(표기 교정 — 추론 low)" : ""}: ${violation}`);
     // 논의의 재제출도 같은 읽기·팬아웃 금지 정책이다. 일반 검토자 교정 job으로 바꾸면 하위 에이전트 권한이 열린다.
     const discussion = route.job.operation === "brainstorm";
-    const correctionRoute: TurnRoute = discussion ? route : { ...route, job: { role: route.job.role, operation: "contract-correction" } };
+    const constrained = turnContract(route.job).kinds !== null;
+    const correctionRoute: TurnRoute = constrained ? route : { ...route, job: { role: route.job.role, operation: "contract-correction" } };
     const settings = route.settings;
     // 실행 허용(새 입력·계획 변경·취소·유지보수·예산·쓰기 기준)은 실행기가 adapter 호출 전과 spawn 직전에 본다(R3-03 → PLAN §2).
     const { result: corrected } = await this.executor.execute({
@@ -624,14 +647,20 @@ export class EngineCore {
       route: correctionRoute, topic, signal: context.signal, purpose: "계약 교정 재제출", inputSequence: context.startedAfter,
       expected: { ...this.expectationOf(topic), state: this.dependencies.database.getTopic(topic.id).state },
       writeGuards: context.writeGuards,
-      session: { mode: "resume", sessionId }, prompt: buildContractCorrectionPrompt(violation),
-      planMode: context.planMode, planningWrite: discussion ? undefined : "repair", readablePaths: context.readablePaths,
+      session: { mode: "resume", sessionId }, prompt: buildContractCorrectionPrompt(violation, turnContract(route.job).kinds),
+      onResponse: context.onCorrectionResponse ? response => {
+        const corrected = redactAgentResult(response.result);
+        const retained = mergeCorrectionResult(salvageResultFields(raw, corrected.kind), corrected).result;
+        context.onCorrectionResponse!({ ...retained, engineDefects: corrected.engineDefects ?? raw.engineDefects });
+      } : undefined,
+      planMode: context.planMode, planningWrite: constrained ? undefined : "repair", readablePaths: context.readablePaths,
       settings: formatOnly ? { ...settings, effort: "low" } : settings,
     });
     this.assertCurrent(topic.id, context.signal, topic.scopeGeneration, this.dependencies.database.getTopic(topic.id).state);
     // 교정 응답은 원본에서 개별로 유효했던 필드(요약·쟁점·증거·요청 결정·상태) 위에 병합한다 — 교정이 거부된 필드만 고치고
     // 나머지를 비워 내면 본 턴의 보고와 미해결 결정 요청이 흐름에서 사라진다(Codex 감사 R01 ②).
     const parsedCorrection = redactAgentResult(AgentResultSchema.parse(corrected));
+    assertTurnResult(route.job, parsedCorrection);
     if (discussion) {
       // 논의는 전체 발언을 재제출한다. 계획·감사용 병합으로 금지한 쟁점을 원본에서 되살리지 않는다.
       context.check?.(parsedCorrection);
@@ -646,13 +675,21 @@ export class EngineCore {
       this.event(topic.id, "system", "system", `계약 교정 재제출에 원본의 유효한 필드를 병합했습니다(서버 보존): ${merged.preserved.join(" · ")}`,
         { correctionPreserved: merged.preserved });
     }
-    const reparsed = normalized(context.normalize, redactAgentResult(AgentResultSchema.parse(merged.result)));
+    const reparsed = normalized(context.normalize, redactAgentResult(AgentResultSchema.parse({ ...merged.result, engineDefects: parsedCorrection.engineDefects ?? raw.engineDefects })));
+    assertTurnResult(route.job, reparsed);
     context.check?.(reparsed);
     this.reportCarriedFindings(topic.id, context.normalize, true);
     return reparsed;
   }
 
   // 최종 검사를 통과한 결과 기준으로 승계 id 와 실제 교정 여부를 한 번 남긴다 — 절감 측정의 근거(payload.carriedFindings·corrected).
+  recordResultDefects(topicId: string, result: AgentResult): void {
+    for (const defect of result.engineDefects ?? []) {
+      const key = createHash("sha256").update(JSON.stringify(defect)).digest("hex");
+      this.dependencies.database.engineDefects.enqueue(topicId, { ...defect, key });
+    }
+  }
+
   private reportCarriedFindings(topicId: string, normalize: ResultNormalizer | undefined, corrected: boolean): void {
     const carried = normalize?.carried?.() ?? [];
     if (carried.length === 0) return;
@@ -764,13 +801,7 @@ export class EngineCore {
   }
 
   transition(topicId: string, to: WorkflowState, message: string): Topic {
-    const topic = this.dependencies.database.getTopic(topicId);
-    assertTransition(topic.state, to);
-    const updated = this.dependencies.database.updateTopic(topicId, {
-      state: to, lastError: null, resumeState: null,
-    });
-    this.event(topicId, "system", "system", message, { from: topic.state, to });
-    return updated;
+    return this.transitionWith(topicId, to, message);
   }
 
   // 상태 전이를 수정 작업 계약 행·진단 상태 기록·추가 이벤트와 **한 transaction** 으로 — 수정 작업을 여는 전이(계약 생성)와 수락 전이(회차 소비·계약 수락·
@@ -794,23 +825,33 @@ export class EngineCore {
     message: string,
     resumeState: WorkflowState,
     payload: Record<string, unknown> = {},
+    actionId?: string,
   ): void {
     const topic = this.dependencies.database.getTopic(topicId);
-    assertTransition(topic.state, state);
-    this.dependencies.database.updateTopic(topicId, { state, resumeState, lastError: boundedError(redactSecrets(message)) });
-    this.event(topicId, "system", "system", message, { resumeState, ...payload });
+    if (topic.state !== state) assertTransition(topic.state, state);
+    const resume = failureResumePoint(resumeState, this.dependencies.database.getFlags(topicId).resumeState ?? null);
+    if (!isResumePoint(resume)) throw new Error("중단 기록에는 실제 재개 단계를 지정해야 합니다.");
+    this.dependencies.database.applyTopicTransition({ topicId,
+      changes: { state, resumeState: resume, lastError: boundedError(redactSecrets(message)) },
+      ...(actionId ? { finishAction: { id: actionId, status: "cancelled", error: message } } : {}),
+      events: [{ actor: "system", kind: "system", state, body: message, payload: { ...payload, resumeState: resume,
+        waitingCompletedActionId: actionId ?? this.active.get(topicId)?.actionId } }],
+    });
+    if (state === "BLOCKED_ON_EVIDENCE" && payload.externalEvidence === true) {
+      try { this.evidenceWaitObserver?.(topicId, resumeState); }
+      catch (error) { reportBackgroundFailure(`topic:${topicId}:evidence-wait-observer`, error); }
+    }
   }
 
   resetToDraft(topic: Topic, message: string): void {
     // 이전 계획에 묶인 진행 중 진단을 먼저 재확인으로 돌린다 — 초기화 도중 끊겨도 옛 개정·지시가 새 계획에 실리지 않는 쪽으로 멈춘다(fail-closed).
     this.diagnoses.staleOnReplan(topic);
-    this.dependencies.database.updateTopic(topic.id, {
+    this.dependencies.database.applyTopicTransition({ topicId: topic.id, changes: {
       state: "DRAFT", planRevision: 0, planEpoch: topic.planEpoch + 1,
       planSHA256: null, approvedPlanSHA256: null, lastError: null,
-      fixPassUsed: false, closeoutRevisionUsed: false, resumeState: null,
-    });
-    this.dependencies.database.clearAcknowledgements(topic.id);
-    this.event(topic.id, "system", "system", message, { scopeGeneration: topic.scopeGeneration });
+      ...resetCycle("plan"), resumeState: null,
+    }, clearAcknowledgements: true, events: [{ actor: "system", kind: "system", state: "DRAFT", body: message,
+      payload: { scopeGeneration: topic.scopeGeneration, replanConsumedThrough: this.dependencies.database.getTimeline(topic.id).at(-1)?.sequence ?? 0 } }] });
   }
 
   async stopIfRunning(topicId: string): Promise<void> {
@@ -900,6 +941,24 @@ export class EngineCore {
   // `deferred-findings` 에 누적한다. 발견 시점이 아니라 **처분**(DEFERRED_OUT_OF_SCOPE·AGREED_NO_ACTION)이 기준이다 —
   // 늦게 발견했다는 이유로 범위 밖이라 적으면 해결 안 한 문제를 범위 밖으로 기록하게 된다.
   // 후속 목록의 출처 표시 — 사용자는 인도 전에 이 목록의 처분(후속 토픽·다음 계획·폐기)을 정한다.
+  async recordEvidenceGaps(topic: Topic, signal: AbortSignal): Promise<void> {
+    const gaps = this.dependencies.database.evidence.topic(topic).deferred ?? [];
+    await this.recordDeferredFindings(topic, gaps.map(gap => ({
+      id: `EVIDENCE-${topic.scopeGeneration}-${gap.sourceId}`, title: `근거 확보: ${gap.label}`,
+      severity: "INFO", disposition: "DEFERRED_OUT_OF_SCOPE", requiresUserDecision: false,
+      rationale: `${gap.url} — ${gap.reason}. 이 자료에만 의존하는 판단·구현은 보류하고 나머지 범위를 계속합니다.`, evidenceRefs: [gap.url],
+    })), "evidence", signal);
+    const designGaps = this.dependencies.database.evidence.designReadView(topic).gaps;
+    await this.recordDeferredFindings(topic, designGaps.map(gap => ({
+      id: `FIGMA-UNAVAILABLE-${topic.scopeGeneration}-${evidenceHash(stableJSON(gap.request))}`,
+      title: `Figma read deferred (${gap.observation}): ${gap.request.tool}`, severity: "INFO", disposition: "DEFERRED_OUT_OF_SCOPE",
+      requiresUserDecision: false, evidenceRefs: [],
+      rationale: `Unverified source; dependent behavior remains excluded. Request: ${stableJSON(gap.request)}. ` +
+        (gap.observation === "unavailable" ? `Failure digest: ${evidenceHash(stableJSON(gap.failure))}. Retained failure: ${stableJSON(gap.failure).slice(0, 2000)}`
+          : "No response was retained from the previous attempt. Unknown; not a successful or failed source read."),
+    })), "evidence", signal);
+  }
+
   async recordDeferredFindings(
     topic: Topic, findings: readonly Finding[], source: DeferredFinding["source"], signal: AbortSignal,
   ): Promise<void> {
@@ -907,7 +966,13 @@ export class EngineCore {
     const existing = await this.deferredFindingsOf(topic.id);
     const recordedAt = new Date().toISOString();
     const additions = findings
-      .filter((finding) => !existing.some((item) => item.id === finding.id))
+      .filter((finding) => {
+        const previous = existing.find(item => item.id === finding.id);
+        // Host evidence is a projection of current observation state. Preserve the historical
+        // artifact, but update unknown -> unavailable without overwriting a model's judgment.
+        return !previous || (source === "evidence" && previous.source === "evidence" &&
+          (previous.title !== finding.title || previous.rationale !== finding.rationale));
+      })
       .map((finding) => ({
         id: finding.id, title: finding.title, severity: finding.severity, rationale: finding.rationale,
         source, topicId: topic.id, recordedAt,
@@ -915,7 +980,7 @@ export class EngineCore {
     if (additions.length === 0) return;
     const revision = this.dependencies.database.timelineCount(topic.id) + 1;
     await this.writeArtifact(topic, "deferred-findings", revision,
-      JSON.stringify({ findings: [...existing, ...additions] }, null, 2), signal);
+      JSON.stringify({ findings: [...existing.filter(item => !additions.some(addition => addition.id === item.id)), ...additions] }, null, 2), signal);
     this.event(topic.id, "system", "system",
       `후속 목록에 기록(이번 범위 밖, ${DEFERRED_SOURCE_LABEL[source]}): ${additions.map((item) => `${item.id} ${item.title}`).join(", ")}`,
       { deferredFindingIDs: additions.map((item) => item.id) });
@@ -926,8 +991,13 @@ export class EngineCore {
   async pruneDeferredFindings(topic: Topic, resolvedIDs: readonly string[], signal: AbortSignal): Promise<void> {
     if (resolvedIDs.length === 0) return;
     const existing = await this.deferredFindingsOf(topic.id);
+    const prefix = `FIGMA-UNAVAILABLE-${topic.scopeGeneration}-`;
+    const reads = resolvedIDs.some(id => id.startsWith(prefix)) ? this.dependencies.database.evidence.unresolvedDesignReads(topic) : [];
+    const pendingDesign = new Set(reads
+      .map(request => prefix + evidenceHash(stableJSON(request))));
     const remaining = existing.filter((item) =>
-      !(resolvedIDs.includes(item.id) && (item.source === "implementation" || item.source === "fix" || item.source === "review")));
+      !(resolvedIDs.includes(item.id) && (item.source === "implementation" || item.source === "fix" || item.source === "review" ||
+        (item.source === "evidence" && item.id.startsWith(prefix) && !pendingDesign.has(item.id)))));
     if (remaining.length === existing.length) return;
     const removed = existing.filter((item) => !remaining.includes(item));
     const revision = this.dependencies.database.timelineCount(topic.id) + 1;
@@ -1057,7 +1127,7 @@ export class EngineCore {
       result.findings.find((finding) => finding.requiresUserDecision)?.rationale;
     if (decision) {
       this.interrupt(topicId, "USER_DECISION_REQUIRED", decision || fallbackMessage, resumeState,
-        result.status === "blocked" ? { runnerBlocked: true, remainingSteps: result.remainingSteps ?? [] } : {});
+        result.status === "blocked" ? { runnerBlocked: true, remainingSteps: result.remainingSteps ?? [] } : { requestedDecision: true });
       return true;
     }
     const missingEvidence = result.findings.find((finding) => finding.disposition === "EXTERNAL_EVIDENCE");
@@ -1113,7 +1183,7 @@ export class EngineCore {
       topic.id,
       "USER_DECISION_REQUIRED",
       "에이전트가 답하는 동안 새 메시지가 추가되었습니다. 같은 단계를 다시 실행해 새 내용을 반영하세요.",
-      topic.state,
+      topic.state, { newInputSequence: newUserInput.sequence },
     );
     return true;
   }

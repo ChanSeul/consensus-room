@@ -12,6 +12,40 @@ import type { EvidenceRootInput, EvidenceSource } from "../src/shared/externalEv
 // HTTP fixtures exercise pagination/comments/failure, never reproduce production calculations.
 // New contracts have no prior implementation to restore. Live auth and rendered UI remain separate.
 const cleanup: Array<() => void> = [];
+it.each([false, true])("host recovery delivers current evidence after a collection failure (same body: %s)", async sameBody => {
+  const {db}=fixture(), catalog=db.evidence.catalog;
+  const root=catalog.add("a",input("https://team.atlassian.net/browse/APP-1"),true);
+  let unavailable=false;
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw new Error("unused");},configured:()=>true,
+    discover:async()=>{
+      if (unavailable) throw new Error("Official app unavailable");
+      return {units:[{id:"body",kind:"issue" as const,content:"Current policy"}],links:[],cursor:null,revision:"v1"};
+    }});
+  const capture=(missing:string[]=[])=>{
+    const source=db.evidence.get(root.sourceId);
+    return service.importHost("a",{version:catalog.version("a"),rootId:root.id,sourceId:source.id,
+      previousHash:source.contentHash,previousCheckedAt:source.checkedAt,observedAt:Date.now(),revision:"v2",
+      units:[{id:"body",kind:"issue",content:sameBody?"Current policy":"Updated policy"}],missing});
+  };
+  try {
+    await service.collect(root.id,true);
+    unavailable=true;
+    await service.collect(root.id,true);
+    expect(db.evidence.usableSources(db.getTopic("a"))).toHaveLength(0);
+    const first=capture();
+    expect(first.collection).toMatchObject({status:sameBody?"unchanged":"collected",checkedAt:first.checkedAt});
+    expect(db.evidence.usableSources(db.getTopic("a")).map(s=>s.id)).toEqual([root.sourceId]);
+    capture(["comments unread"]);
+    expect(db.evidence.usableSources(db.getTopic("a"))).toHaveLength(0);
+    const recovered=capture();
+    expect(recovered.collection).toMatchObject({status:"unchanged",checkedAt:recovered.checkedAt});
+    expect(recovered.collection?.error).toBeUndefined();
+    expect(recovered.collection?.missing).toBeUndefined();
+    expect(db.evidence.usableSources(db.getTopic("a")).map(s=>s.id)).toEqual([root.sourceId]);
+    expect(db.evidence.topic(db.getTopic("a")).deferred).toEqual([]);
+    expect((await service.prepareMediator(db,"a","recovered-session")).corpus).toMatchObject({sources:1,units:1});
+  } finally {await service.stop();}
+});
 it("a complete host capture reaches the mediator without REST credentials; partial captures and stale reads do not", async () => {
   const {db}=fixture();
   const root=db.evidence.catalog.add("a",{...input("https://docs.google.com/spreadsheets/d/policy/edit"),scope:"group"},true);
@@ -141,7 +175,7 @@ function fixture() {
   return {db,topic};
 }
 const input = (url: string, scope: EvidenceRootInput["scope"] = "group"): EvidenceRootInput => ({url,label:url,scope,required:true,mode:"rest",intervalSeconds:900});
-it("a scoped stage consumes only its selected roots; failed and expired selected originals still stop its mediator", async () => {
+it("a scoped stage preserves expired selected originals while its mediator still requires freshness", async () => {
   // Group revision/link -> catalog -> actual mediator packet/readiness. Restore the old inheritance to see RED.
   // Live OAuth and Figma pixels are not proved by these captured source fixtures.
   vi.useFakeTimers({toFake:["Date"]});
@@ -170,13 +204,17 @@ it("a scoped stage consumes only its selected roots; failed and expired selected
     expect(db.getTopic("ui").planEpoch).toBe(binding.planEpoch);
     expect(db.evidence.topic(db.getTopic("ui")).digest).toBe(digest);
     capture(selected[0],["selected node contents unread"]);
-    expect(db.evidence.topic(db.getTopic("ui")).ready).toBe(false);
+    expect(db.evidence.topic(db.getTopic("ui"))).toMatchObject({ ready: true,
+      deferred: [expect.objectContaining({ sourceId: selected[0].sourceId })] });
     await expect(service.prepareMediator(db,"ui","failed-session")).rejects.toThrow();
     capture(selected[0]);
     expect(db.evidence.topic(db.getTopic("ui")).ready).toBe(true);
     vi.setSystemTime(Date.now()+1_900_000);
-    expect(db.evidence.topic(db.getTopic("ui")).ready).toBe(false);
+    expect(db.evidence.topic(db.getTopic("ui"))).toMatchObject({ ready: true });
+    expect(db.evidence.usableSources(db.getTopic("ui")).map(source=>source.id).sort()).toEqual(selected.map(root=>root.sourceId).sort());
     await expect(service.prepareMediator(db,"ui","expired-session")).rejects.toThrow();
+    expect(db.evidence.usableSources(db.getTopic("ui")).map(source=>source.id).sort()).toEqual(selected.map(root=>root.sourceId).sort());
+    expect(db.evidence.get(selected[0].sourceId).collection?.status).not.toBe("error");
   } finally {await service.stop();}
 });
 it.each(["missing","proposed","removed"])("a stage cannot treat a %s selected root as an empty successful corpus", state => {

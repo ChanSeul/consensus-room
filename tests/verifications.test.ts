@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ArtifactStore } from "../src/server/artifacts";
-import { buildApp } from "../src/server/app";
+import { buildApp, listenReady } from "../src/server/app";
 import { loadConfig } from "../src/server/config";
 import { ConsensusDatabase } from "../src/server/database";
 import { runMediatorVerification } from "../src/server/verificationCli";
@@ -211,7 +211,7 @@ describe("정적 검사 실행 기록", () => {
     expect(result.reused).toBe(true);
     expect(f.service.list("topic-1")).toHaveLength(1);
     // 실제 CLI 진입점·시작 URL 읽기·프로필 등록·HTTP 왕복까지 별도 프로세스로 확인한다.
-    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const address = await listenReady(app, { host: "127.0.0.1", port: 0 });
     await writeFile(join(f.data, "consensus-room.url"), `${address}/?token=test-token`);
     const cli = (...args: string[]) => promisify(execFile)(process.execPath,
       ["--import", "tsx", join(import.meta.dirname, "../src/server/verificationCli.ts"), "--data-dir", f.data, ...args],

@@ -15,6 +15,22 @@ export function interruptTarget(db: ConsensusDatabase, topicId: string): { key: 
 export function interruptStatus(db: ConsensusDatabase, topicId: string) {
   return db.interrupts.status(topicId, interruptTarget(db, topicId)?.key ?? null);
 }
+export function interruptSubscription(db: ConsensusDatabase, topicId: string): string {
+  const scope = db.roles.effective(topicId, "mediator")?.scope;
+  if (scope?.startsWith("topic:")) return scope.slice(6);
+  let topic = db.getTopic(topicId);
+  const visited = new Set([topic.id]);
+  while (topic.parentTopicId && !visited.has(topic.parentTopicId)) {
+    topic = db.getTopic(topic.parentTopicId); visited.add(topic.id);
+  }
+  return topic.id;
+}
+export function mediatorConnectionStatus(db: ConsensusDatabase, topicId: string) {
+  return db.interrupts.connection(interruptTarget(db, topicId)?.key ?? null, interruptSubscription(db, topicId));
+}
+export function mediatorInterventionStatus(db: ConsensusDatabase, topicId: string) {
+  return db.interrupts.intervention(topicId, interruptTarget(db, topicId)?.key ?? null);
+}
 export function registerInterruptRoutes(app: FastifyInstance, db: ConsensusDatabase): void {
   const authorized = (request: FastifyRequest, topicId: string, session: MediatorSession): string => {
     if (request.headers["x-consensus-actor"] !== "mediator") throw Object.assign(new Error("현재 중재 세션에서 호출하세요."), { statusCode: 403 });
@@ -25,6 +41,19 @@ export function registerInterruptRoutes(app: FastifyInstance, db: ConsensusDatab
   };
   const wakeups = new Set<() => void>();
   app.addHook("preClose", async () => { for (const wake of wakeups) wake(); });
+  app.get<{ Params: { id: string } }>("/api/topics/:id/interrupts/connection", async request => {
+    const input = MediatorSessionSchema.parse(request.query);
+    authorized(request, request.params.id, input);
+    const subscriptionTopicId = interruptSubscription(db, request.params.id);
+    authorized(request, subscriptionTopicId, input);
+    return { subscriptionTopicId, status: mediatorConnectionStatus(db, request.params.id) };
+  });
+  app.post<{ Params: { id: string } }>("/api/topics/:id/interrupts/connection", async request => {
+    const input = MediatorSessionSchema.extend({ available: z.boolean(), error: z.string().max(1000).nullable().default(null) }).strict().parse(request.body);
+    const target = authorized(request, request.params.id, input);
+    db.interrupts.reportConnection(target, request.params.id, input.available, input.error ? redactSecrets(input.error) : null);
+    return { status: mediatorConnectionStatus(db, request.params.id) };
+  });
   app.get<{ Params: { id: string } }>("/api/topics/:id/interrupts", async (request, reply) => {
     const input = MediatorSessionSchema.extend({ waitMs: z.coerce.number().int().min(0).max(25000).default(0), descendants: z.enum(["true", "false"]).default("true") }).parse(request.query);
     authorized(request, request.params.id, input);
@@ -52,14 +81,19 @@ export function registerInterruptRoutes(app: FastifyInstance, db: ConsensusDatab
     return { items };
   });
   const path = "/api/topics/:id/interrupts/:interruptId";
+  app.post<{ Params: { id: string; interruptId: string } }>(`${path}/handling`, async request => {
+    const session = MediatorSessionSchema.parse(request.body), target = authorized(request, request.params.id, session);
+    db.interrupts.handling(request.params.id, request.params.interruptId, target);
+    return { intervention: mediatorInterventionStatus(db, request.params.id) };
+  });
   app.post<{ Params: { id: string; interruptId: string } }>(`${path}/claim`, async request => {
     const session = MediatorSessionSchema.parse(request.body), target = authorized(request, request.params.id, session);
     return db.interrupts.claim(request.params.id, request.params.interruptId, target);
   });
   app.post<{ Params: { id: string; interruptId: string } }>(`${path}/receipt`, async request => {
-    const input = MediatorSessionSchema.extend({ claim: z.string().uuid(), state: z.enum(["sent", "acknowledged", "failed", "unknown"]), error: z.string().max(1000).optional() }).parse(request.body);
+    const input = MediatorSessionSchema.extend({ claim: z.string().uuid(), state: z.enum(["sent", "acknowledged", "failed", "unknown"]), error: z.string().max(1000).optional(), transportUnavailable: z.boolean().default(false) }).parse(request.body);
     const target = authorized(request, request.params.id, input);
-    db.interrupts.receipt(request.params.id, request.params.interruptId, target, input.claim, input.state, input.error ? redactSecrets(input.error) : null);
+    db.interrupts.receipt(request.params.id, request.params.interruptId, target, input.claim, input.state, input.error ? redactSecrets(input.error) : null, input.transportUnavailable);
     return { status: interruptStatus(db, request.params.id) };
   });
   app.post<{ Params: { id: string; interruptId: string } }>(`${path}/retry`, async request => {

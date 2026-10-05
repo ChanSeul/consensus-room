@@ -9,8 +9,9 @@ import { BudgetController } from "./budgetController.js";
 import { AgentResultSchema, AgentExecutionSettingsSchema } from "../shared/contracts.js";
 import { safeError, agentEnvironment } from "./security.js";
 import { EngineDefectReportSchema } from "../shared/engineDefects.js";
-import { repositoryIdentity, recoverEngineRepositoryLock, type EngineRepositoryOwner } from "./engineRepositoryLock.js";
+import { repositoryIdentity, recoverEngineRepositoryLock, refreshEngineRepositoryLock, type EngineRepositoryOwner } from "./engineRepositoryLock.js";
 import { systemProcessControl } from "./processSupervisor.js";
+import { reportBackgroundFailure, runBackgroundTask } from "./backgroundTask.js";
 
 export const EngineDefectInput = EngineDefectReportSchema;
 export interface EngineDefect extends z.infer<typeof EngineDefectInput> {
@@ -77,6 +78,7 @@ export class EngineDefectWorker {
   private timer?: ReturnType<typeof setInterval>;
   private pending?: Promise<void>;
   private abort?: AbortController;
+  private readonly faulted = new Set<string>();
   constructor(private readonly db: ConsensusDatabase, private readonly runner: CommandRunner,
     private readonly adapter: AgentAdapter, private readonly dataDirectory: string,
     private readonly repository: string, private readonly sandboxAvailable: boolean) {}
@@ -93,16 +95,32 @@ export class EngineDefectWorker {
     this.timer.unref();
     this.poll();
   }
+  retry(id: string): EngineDefect {
+    const row = this.db.engineDefects.get(id);
+    if (row.status !== "blocked") throw Object.assign(new Error("blocked 작업만 재개할 수 있습니다."), { statusCode: 409 });
+    this.db.engineDefects.save({ ...row, status: "todo", error: undefined });
+    this.faulted.delete(id);
+    return this.db.engineDefects.get(id);
+  }
   private poll(): void {
+    try { this.pollReady(); } catch (error) { reportBackgroundFailure("engine-defect:scan", error); }
+  }
+  private pollReady(): void {
     if (this.pending || !this.sandboxAvailable || existsSync(join(this.dataDirectory, "maintenance.lock"))) return;
-    const rows = this.db.engineDefects.list().filter(item => this.db.getTopic(item.topicId).state === "CLOSED");
+    const rows = this.db.engineDefects.list().filter(item => !this.faulted.has(item.id) && this.db.getTopic(item.topicId).state === "CLOSED");
     const ready = rows.find(item => item.status === "ready_to_apply");
     if (ready && !this.db.runningActions().length) {
-      this.pending = this.apply(ready).finally(() => { this.pending = undefined; }); return;
+      this.launch(ready, () => this.apply(ready)); return;
     }
     const row = rows.find(item => item.status === "todo");
     if (!row) return;
-    this.pending = this.execute(row).finally(() => { this.pending = undefined; });
+    this.launch(row, () => this.execute(row));
+  }
+  private launch(row: EngineDefect, work: () => Promise<void>): void {
+    this.pending = runBackgroundTask(`engine-defect:${row.id}`, work, error => {
+      this.faulted.add(row.id);
+      this.db.engineDefects.save({ ...row, status: "blocked", error: safeError(error) });
+    }, () => { this.pending = undefined; });
   }
   async stop(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
@@ -143,7 +161,7 @@ export class EngineDefectWorker {
       admitted();
       row.metrics = { ...row.metrics, queueWaitMs: Date.now() - Date.parse(row.createdAt) };
       heartbeat = setInterval(() => {
-        try { admitted(); owner.at = new Date().toISOString(); writeFileSync(lock, JSON.stringify(owner), { mode: 0o600 }); }
+        try { admitted(); owner.at = new Date().toISOString(); refreshEngineRepositoryLock(lock, owner); }
         catch (error) { this.abort?.abort(error); }
       }, 30_000);
       const group = this.db.workGroups.forTopic(row.topicId);

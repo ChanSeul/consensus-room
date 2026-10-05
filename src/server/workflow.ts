@@ -1,9 +1,12 @@
+import { EVIDENCE_PLANNING_STATES } from "./evidence/resume.js";
+import { stableJSON } from "./evidence/store.js";
 import { EvidenceAdmissionExpired } from "./evidence/scheduler.js";
 import { EvidenceAssessmentPipeline } from "./engine/evidenceAssessment.js";
-import type { PlanningMigration } from "../shared/planningControl.js";
+import type { PlanningMigration, PlanningUsageRecovery } from "../shared/planningControl.js";
 import {reviewScope,type ReviewScope} from "../shared/reviews.js";
 import { assertToleranceWidening, normalizeToleranceBlocks, parseTolerancePolicy, replaceToleranceBlock, TolerancePolicySchema } from "../shared/tolerance.js";
 import { hashPlan, normalizePlan } from "../shared/workflow.js";
+import { currentStopEvent, isRetryPoint, resetCycle, stopRecord, RESOURCE_PAUSE_KEYS } from "../shared/workflowLifecycle.js";
 import { RevisionBlocked } from "./revisionLedger.js";
 import { ReviewBlocked } from "./reviewLedger.js";
 import { BudgetBlocked } from "./budgetLedger.js";
@@ -21,6 +24,7 @@ import {
 import {
   assertImplementationGate,
   bothAgentsAcknowledged,
+  isDeliveryResumeState,
   canTransition,
   redactSecrets, replanDirective } from "../shared/workflow.js";
 import { ArtifactStore, StaleArtifactError } from "./artifacts.js";
@@ -62,7 +66,7 @@ const PLANNING_STAGES: ReadonlySet<string> = new Set(["DRAFT", "CLAUDE_PLAN", "C
 const PLANNING_RESULT_KINDS = ["claude-plan", "diagnosis-plan-revision", "audit", "claude-revision", "closeout"] as const;
 const DELIVERY_RESULT_KINDS = ["implementation-result", "codex-review", "claude-fix", "codex-final-review"] as const;
 const RUNNER_REPORT_KINDS: ReadonlySet<string> = new Set(["implementation-result", "claude-fix"]);
-const PAUSE_KEYS = ["planningPause", "budgetPause", "revisionPause", "reviewPause", "admissionRefused"] as const;
+const PAUSE_KEYS = RESOURCE_PAUSE_KEYS;
 // 좌석의 대표 job(E2b) — 좌석 세션을 연결할 때 그 세션이 어느 공급자의 것이어야 하는지 정하는 기준. 'claude' 좌석은 이 세션을 처음 이어 쓰는
 // 계획 턴(계획자), 'codex' 좌석은 감사 턴(검토자)이다. 배정이 없으면 좌석 이름과 같은 공급자다(turnRouting.ts 기본 배정).
 const SEAT_JOB: Readonly<Record<ParticipantRole, TurnJob>> = {
@@ -129,6 +133,7 @@ const SCOPE_CHANGE_ALLOWED_STATES: Readonly<Record<WorkflowState, boolean>> = {
 // 공개 API 파사드. 흐름은 PlanningPipeline·DeliveryPipeline, 공유 상태·프리미티브는 EngineCore가 갖는다
 // (2026-08-31 분해 — 한 클래스가 전부 소유해 순서 결함이 반복된다는 Codex 진단).
 export class WorkflowEngine {
+  onSettled?: () => void;
   private readonly core: EngineCore;
   private readonly planning: PlanningPipeline;
   private readonly brainstorming: BrainstormPipeline;
@@ -139,15 +144,110 @@ export class WorkflowEngine {
 
   constructor(dependencies: WorkflowDependencies) {
     this.core = new EngineCore(dependencies);
+    this.core.settledObserver = () => this.onSettled?.();
     this.planning = new PlanningPipeline(this.core);
     this.brainstorming = new BrainstormPipeline(this.core);
     this.delivery = new DeliveryPipeline(this.core);
     this.usageLimitRetry = new UsageLimitRetryScheduler(this.core, (topicId) => this.retry(topicId), dependencies.clock);
     this.core.failureObserver = (topicId, message) => this.usageLimitRetry.consider(topicId, message);
-    this.core.actionObserver = (topicId) => this.usageLimitRetry.cancel(topicId);
+    this.core.actionObserver = (topicId) => {
+      this.usageLimitRetry.cancel(topicId);
+      dependencies.database.evidence.resumes.cancel(topicId);
+    };
+    this.core.evidenceWaitObserver = (topicId, resumeState) => {
+      if (this.core.active.has(topicId) && !this.core.active.get(topicId)!.controller.signal.aborted &&
+          !dependencies.database.evidence.topic(dependencies.database.getTopic(topicId)).ready)
+        this.armEvidenceResume(topicId, resumeState);
+    };
   }
 
-  pollEvidenceAssessments(): void { new EvidenceAssessmentPipeline(this.core).poll(); }
+  private mediatorBinding(topicId: string): string {
+    return stableJSON(this.core.dependencies.database.roles.effective(topicId, "mediator"));
+  }
+
+  private armEvidenceResume(topicId: string, resumeState: WorkflowState): void {
+    const db = this.core.dependencies.database;
+    db.evidence.resumes.arm(db.getTopic(topicId), resumeState, this.mediatorBinding(topicId));
+    this.core.event(topicId, "system", "system", "근거 수집이 완료되면 기존 실행 조건을 확인하고 자동 재개합니다. 중지하면 예약을 취소합니다.",
+      { evidenceResume: { pending: true, resumeState } });
+  }
+
+  pollEvidenceAssessments(): void {
+    const db = this.core.dependencies.database;
+    if (this.core.shuttingDown) return;
+    for (const intent of db.evidence.resumes.list()) {
+      const topic = db.getTopic(intent.topicId);
+      if (topic.scopeGeneration !== intent.scopeGeneration || topic.planEpoch !== intent.planEpoch ||
+          topic.planSHA256 !== intent.planSHA256 || this.mediatorBinding(topic.id) !== intent.mediator ||
+          !["DRAFT", "BLOCKED_ON_EVIDENCE"].includes(topic.state) || db.getAction(intent.actionId)) {
+        db.evidence.resumes.cancel(topic.id); continue;
+      }
+      // Existing topic/resource locks govern admission; unrelated topics may continue concurrently.
+      if (!this.canPublishEvidence(topic.id)) continue;
+      const evidence = db.evidence.topic(topic);
+      if (!evidence.ready || (!(intent.resumeState === "DRAFT" || intent.resumeState === "BRAINSTORMING" || EVIDENCE_PLANNING_STATES.has(intent.resumeState)) && !evidence.reviewed)) continue;
+      try {
+        this.core.assertBudgetAvailable(topic.id);
+        if (topic.state === "DRAFT" && intent.resumeState === "DRAFT") this.startPlan(topic.id, intent.actionId);
+        else if (topic.state === "BLOCKED_ON_EVIDENCE" && db.getFlags(topic.id).resumeState === intent.resumeState) this.retry(topic.id, intent.actionId);
+        else db.evidence.resumes.cancel(topic.id);
+      } catch (error) {
+        db.evidence.resumes.cancel(topic.id);
+        this.core.event(topic.id, "system", "system", `근거 수집 후 자동 재개가 실행 조건에 막혔습니다: ${error instanceof Error ? error.message : String(error)}`,
+          { evidenceResume: { blocked: true } });
+      }
+    }
+    new EvidenceAssessmentPipeline(this.core, (id, job, result, signal) => this.planning.runEvidenceRevision(id, job, result, signal)).poll();
+    this.onSettled?.();
+  }
+
+  reviewCurrentEvidence(topicId: string, actionId: string): string | null {
+    return new EvidenceAssessmentPipeline(this.core, (id, job, result, signal) => this.planning.runEvidenceRevision(id, job, result, signal))
+      .reviewCurrent(topicId, actionId);
+  }
+
+  assertContinuationIdle(topicId: string): void {
+    this.core.assertNotShuttingDown();
+    this.core.assertNoActiveWork(topicId);
+  }
+
+  // The workflow, not the durable scheduler, owns phase eligibility and recovery preconditions.
+  continuationAdmission(topicId: string, planSHA256: string): "approved-plan" | "delivery-ready" | "recover-delivery" {
+    this.assertContinuationIdle(topicId);
+    const topic = this.core.dependencies.database.getTopic(topicId);
+    if (topic.planSHA256 !== planSHA256 || !bothAgentsAcknowledged(topic.participants, planSHA256))
+      throw new Error("합의된 현재 계획에 대해서만 자동 진행을 요청할 수 있습니다.");
+    if (topic.state === "AWAITING_USER_APPROVAL") return "approved-plan";
+    if (topic.state === "READY_TO_DELIVER") return "delivery-ready";
+    this.assertApprovedDeliveryRecovery(topicId, planSHA256);
+    return "recover-delivery";
+  }
+
+  private assertApprovedDeliveryRecovery(topicId: string, planSHA256: string): void {
+    const { topic, resume } = this.retryPreconditions(topicId);
+    if (topic.state !== "FAILED" || topic.planSHA256 !== planSHA256 || topic.approvedPlanSHA256 !== planSHA256 ||
+        !bothAgentsAcknowledged(topic.participants, planSHA256) || !isDeliveryResumeState(resume) ||
+        this.core.diagnoses.pendingPlanRevision(topicId)) throw new Error("같은 승인 계획의 중단된 구현·리뷰만 자동 재개할 수 있습니다.");
+  }
+
+  resumeApprovedDelivery(topicId: string, planSHA256: string, actionId: string): string {
+    // Revalidate after scheduling: no unseen-plan revision can replace the authorized intent.
+    this.assertApprovedDeliveryRecovery(topicId, planSHA256);
+    return this.retry(topicId, actionId);
+  }
+  pendingCommitPaths(topicId: string): Promise<string[]> {
+    return this.core.dependencies.git.changedPaths(this.core.dependencies.database.getTopic(topicId).worktreePath);
+  }
+  async assertReviewedLocalDelivery(topicId: string): Promise<void> {
+    const { database: db, git } = this.core.dependencies;
+    // Group close validates and freezes its own stronger result proof.
+    if (db.workGroups.forTopic(topicId)) return;
+    const topic = db.getTopic(topicId), flags = db.getFlags(topicId);
+    if (!flags.reviewedHead || !flags.reviewedDiffSHA256) throw new Error("로컬 완료를 확인할 최종 리뷰 스냅샷이 없습니다.");
+    const current = await git.snapshot(topic.worktreePath, flags.reviewedHead);
+    if (current.head !== (flags.committedOID ?? flags.reviewedHead) || current.diffSHA256 !== flags.reviewedDiffSHA256 ||
+        (await git.changedPaths(topic.worktreePath)).length) throw new Error("현재 작업 트리가 검토된 로컬 완료 결과와 다릅니다. 변경을 되돌리거나 남긴 채 닫지 않았습니다.");
+  }
 
   canPublishEvidence(topicId: string): boolean {
     try { this.core.assertNoActiveWork(topicId); return true; } catch { return false; }
@@ -248,6 +348,19 @@ export class WorkflowEngine {
         },
       }],
     });
+  }
+
+  authorizeUnknownPlanningUsage(topicId: string, input: PlanningUsageRecovery, requestKey: string, origin?: CallOrigin) {
+    this.core.assertNotShuttingDown();
+    this.core.assertNoActiveWork(topicId);
+    const db = this.core.dependencies.database, topic = db.getTopic(topicId);
+    const safeInput = { ...input, reason: redactSecrets(input.reason) };
+    db.applyTopicTransition({ topicId, changes: {}, planningUsageRecovery: { input: safeInput, requestKey }, events: [{
+      actor: "system", kind: "system", state: topic.state,
+      body: `누락 사용량을 미확인으로 보존하고 지정한 호출 이후의 재개를 허용했습니다: ${safeInput.reason}`,
+      payload: { planningUsageRecovery: safeInput, requestKey, requestAction: "planning:usage-recovery", ...(origin ? { origin } : {}) },
+    }] });
+    return db.planning.progress(topicId);
   }
 
   async migrateInterruptedPlanning(topicId: string, input: PlanningMigration, requestKey: string, origin?: CallOrigin) {
@@ -373,6 +486,7 @@ export class WorkflowEngine {
       if (input.evidenceDigest !== state.digest || !entry.sourceIds.length || entry.sourceIds.some(id => !state.sources.some(source => source.id === id)))
         throw Object.assign(new Error("시작 Source 전체를 검토한 현재 evidenceDigest가 필요합니다."), { statusCode: 409 });
     }
+    db.evidence.resumes.cancel(topicId);
     return db.applyTopicTransition({ topicId, changes: { workEntry: { ...entry, goal: redactSecrets(input.goal),
       evidenceDigest: entry.mode === "sources" ? input.evidenceDigest! : null } }, events: [{
       actor: "user", kind: "decision", state: topic.state, body: `Goal: ${redactSecrets(input.goal)}`,
@@ -445,9 +559,15 @@ export class WorkflowEngine {
     this.core.assertNoActiveWork(topicId);
     const topic = this.core.requireState(topicId, "DRAFT");
     assertTask(topic); assertEntryReady(this.core.dependencies.database, topic);
+    this.core.requireParticipants(topic);
     this.assertStageContextCurrent(topicId);
     this.ensureInheritedDecisions(topicId);
-    return this.core.startAction(topicId, "plan", (signal) => this.planning.runPlanningLoop(topicId, signal), actionId);
+    return this.core.startAction(topicId, "plan", async (signal) => {
+      if (!this.core.dependencies.database.evidence.topic(topic).ready) {
+        this.armEvidenceResume(topicId, "DRAFT"); return;
+      }
+      await this.planning.runPlanningLoop(topicId, signal);
+    }, actionId);
   }
 
   // 작업 묶음 단계가 이어받는 결정(선행 단계 동결 결과의 사용자 결정 원문)을 현재 범위 세대 타임라인에 싣는다(E4 보완 F012·F013). 계획 시작 경계(DRAFT,
@@ -504,8 +624,12 @@ export class WorkflowEngine {
   stop(topicId: string): void {
     const action = this.core.active.get(topicId);
     const cancelledRetry = this.usageLimitRetry.cancelByUser(topicId);
+    const cancelledEvidence = this.core.dependencies.database.evidence.resumes.cancel(topicId);
+    const cancelledContinuation = this.core.dependencies.database.continuations.cancel(topicId);
+    if (cancelledContinuation) this.core.event(topicId, "system", "system", "자동 진행 예약을 중지했습니다.");
+    if (cancelledEvidence) this.core.event(topicId, "system", "system", "근거 수집 후 자동 재개 예약을 취소했습니다.", { evidenceResume: { cancelled: true } });
     if (!action) {
-      if (cancelledRetry) return;
+      if (cancelledRetry || cancelledEvidence || cancelledContinuation) return;
       throw new Error("중단할 실행이 없습니다.");
     }
     action.controller.abort(new Error("사용자가 실행을 중단했습니다."));
@@ -522,12 +646,15 @@ export class WorkflowEngine {
     const topic = this.core.dependencies.database.getTopic(topicId);
     const flags = this.core.dependencies.database.getFlags(topicId);
     const resume = flags.resumeState;
+    if (!this.core.diagnoses.pendingPlanRevision(topicId)) {
+      if (!resume) throw new Error("재시도할 단계가 기록되어 있지 않습니다.");
+      if (!isRetryPoint(resume)) throw new Error(`재시도를 지원하지 않는 단계입니다: ${resume}`);
+    }
     if (resume !== "BRAINSTORMING") assertTask(topic);
     // 공통 진단 상태 검사: 중재자가 처리할 진단(적용 대기·재확인·반박·추가 증거)이 있으면 재개하지 않는다 — 자동 재시도도 이 경로다.
     // 계획 단계 재시도는 전체 재계획이 재확인으로 돌린 진단에 막히지 않는다(host-review R9) — 재개 단계를 함께 넘긴다.
     this.core.diagnoses.assertResumable(topicId, "재시도(retry)", resume);
-    const interruption = this.core.dependencies.database.getTimeline(topicId).filter(event =>
-      event.scopeGeneration === topic.scopeGeneration && event.actor === "system" && event.payload?.resumeState).at(-1);
+    const interruption = currentStopEvent(topic, resume ?? null, this.core.dependencies.database.getTimeline(topicId));
     // 리뷰 한도 정지는 **그 리뷰 단계를 재개할 때만** 막는다. 중재자가 resume_state 를 다른 단계(예: 러너가 중간 보고를
     // 완료 형식으로 닫아 리뷰로 넘어간 것을 IMPLEMENTING 으로 되돌림, 2026-09-14 S11)로 바꿨으면 리뷰 승인은 필요 없다.
     if(interruption?.payload?.reviewPause && topic.state==="USER_DECISION_REQUIRED" && interruption.payload.resumeState===resume)
@@ -535,17 +662,40 @@ export class WorkflowEngine {
     // 재작성 한도 정지도 **그 계획 단계를 재개할 때만** 막는다 — 정정이 재개 단계를 구현으로 되돌렸으면 쓰지 않을 재작성 승인을 요구하지 않는다(2026-09-15 감사 2차).
     if(interruption?.payload?.revisionPause===true && topic.state==="USER_DECISION_REQUIRED" && interruption.payload.resumeState===resume)
       this.core.dependencies.database.revisions.assertAvailable(topicId,resume==="CLAUDE_PLAN"?"plan":"revision");
+    if (topic.state === "USER_DECISION_REQUIRED" && interruption?.payload?.resumeState === resume &&
+        (interruption.payload.evidenceAssessmentDecision === true ||
+          (interruption.payload.requestedDecision === true && this.planning.pendingEvidenceRevision(topicId))) &&
+        !interruption.payload.planningPause && !interruption.payload.budgetPause && !interruption.payload.revisionPause &&
+        !interruption.payload.reviewPause && !interruption.payload.admissionRefused &&
+        !this.core.dependencies.database.getTimeline(topicId, interruption.sequence).some(event => event.actor === "user" && event.kind === "decision"))
+      throw new Error("근거 개정에서 요청한 결정에 답한 뒤 재개하세요.");
     return { topic, resume, interruption };
   }
 
   retry(topicId: string, actionId?: string): string {
     const preconditions = this.retryPreconditions(topicId);
     let topic = preconditions.topic;
+    if (topic.planSHA256 && (preconditions.resume === "CONSENSUS_ACK" ||
+        (preconditions.resume === "CLAUDE_REVISION" && preconditions.interruption?.payload?.evidenceReviewNewInput === true))) {
+      const evidence = this.core.dependencies.database.evidence.topic(topic);
+      if (!evidence.reviewed) this.core.dependencies.database.evidence.automation.retryPlanReview(topic, evidence.sources, evidence.digest);
+    }
     const { resume, interruption } = preconditions;
+    if (topic.state === "USER_DECISION_REQUIRED" && interruption?.payload?.evidenceAssessmentDecision === true) {
+      const db = this.core.dependencies.database;
+      const job = db.evidence.automation.jobs(topicId).find(item => item.id === interruption.payload?.evidenceAssessmentId);
+      const result = job && db.evidence.automation.receipt(job.id)?.accepted;
+      if (!job || !result) throw new Error("결정을 요청한 검토 결과가 없습니다.");
+      return this.core.startAction(topicId, "retry", signal => job.digest === db.evidence.topic(topic).digest
+        ? this.planning.runEvidenceRevision(topicId, job, result, signal)
+        : this.planning.resumePlanningAtAck(topicId, signal), actionId);
+    }
+    if (topic.state === "BLOCKED_ON_EVIDENCE" && resume && !this.core.dependencies.database.evidence.topic(topic).ready) {
+      return this.core.startAction(topicId, "retry", async () => this.armEvidenceResume(topicId, resume), actionId);
+    }
     // 실행 환경 때문에 멈춘 정지(예산·한도·spawn 직전 허용 거부: 유지보수 잠금·계획 변경·기준 불일치)는 사람의 제품 결정이 아니다 — 저장된 같은 단계로
     // 재개하고 계획을 다시 만들지 않는다(CF-07: 유지보수 거부 뒤 retry 가 계획부터 다시 만들었다).
-    if (topic.state === "USER_DECISION_REQUIRED" && (interruption?.payload?.planningPause === true || interruption?.payload?.budgetPause === true || interruption?.payload?.revisionPause === true || Boolean(interruption?.payload?.reviewPause)
-      || typeof interruption?.payload?.admissionRefused === "string")
+    if (topic.state === "USER_DECISION_REQUIRED" && stopRecord(topic, resume ?? null, interruption).reason === "resource"
       && interruption?.payload?.resumeState === resume) {
       // Budget pauses resume the exact infrastructure stage, without consuming a product decision or resetting the plan.
       topic = this.core.dependencies.database.updateTopic(topicId, {state:"FAILED"});
@@ -566,6 +716,12 @@ export class WorkflowEngine {
       return this.core.startAction(topicId, "retry", (signal) => this.planning.runDiagnosisPlanRevision(topicId, signal), actionId);
     }
     if (!resume) throw new Error("재시도할 단계가 기록되어 있지 않습니다.");
+    if (resume === "DRAFT") {
+      // An interrupted admission has no model stage to replay. Restore configuration
+      // without changing scope, participants, checkpoints or buying a planning turn.
+      return this.core.startAction(topicId, "retry", async () => {}, actionId,
+        { to: "DRAFT", message: "중단된 실행 준비 상태를 복구했습니다. 세션과 입력을 확인한 뒤 계획을 시작하세요." });
+    }
     if (resume === "BRAINSTORM_READY") {
       // 라운드나 사용자 결정을 저장하기 전 종료됐다. 시작 의도를 추측해 AI를 호출하지 않고 선택 화면을 복구한다.
       return this.core.startAction(topicId, "retry", async () => {
@@ -611,6 +767,9 @@ export class WorkflowEngine {
     }
     if (resume === "CLAUDE_REVISION" && this.planning.pausedRevisionReusable(topicId)) {
       return this.core.startAction(topicId, "retry", (signal) => this.planning.resumePlanningFromPausedRevision(topicId, signal), actionId);
+    }
+    if (resume === "CLAUDE_REVISION" && this.planning.pendingEvidenceRevision(topicId)) {
+      return this.core.startAction(topicId, "retry", signal => this.planning.resumePlanningAtRevision(topicId, signal), actionId);
     }
     // 계획 턴이 이미 결과를 낸 뒤 멈췄다면 저장된 산출물로 그 지점부터 재개한다. 계획을 다시 만드는 것은
     // 같은 계획을 또 생성하는 비용일 뿐이다. 저장된 산출물이 없으면 재개 함수가 명시적으로 실패하므로,
@@ -661,9 +820,9 @@ export class WorkflowEngine {
       // 범위 세대는 올리지 않는다. 재시도의 근거가 된 사용자 evidence·decision이 같은 세대에 있어야 새 프롬프트에 실린다.
       return this.restartPlanning(topic, "계획 실행을 처음부터 재시도합니다.", actionId);
     }
-    if (["IMPLEMENTING", "CODEX_REVIEW", "CLAUDE_FIX", "CODEX_FINAL_REVIEW"].includes(resume)) {
-      this.core.transition(topicId, resume, "중단된 구현 단계를 재시도합니다.");
-      return this.core.startAction(topicId, "retry", (signal) => this.delivery.resumeDelivery(topicId, resume, signal), actionId);
+    if (isDeliveryResumeState(resume)) {
+      return this.core.startAction(topicId, "retry", (signal) => this.delivery.resumeDelivery(topicId, resume, signal), actionId,
+        { to: resume, message: "중단된 구현 단계를 재시도합니다." });
     }
     throw new Error(`재시도를 지원하지 않는 단계입니다: ${resume}`);
   }
@@ -703,7 +862,9 @@ export class WorkflowEngine {
     if(!["FAILED","USER_DECISION_REQUIRED"].includes(topic.state))return null;
     const interruption=db.getTimeline(topicId).filter(e=>e.scopeGeneration===topic.scopeGeneration && e.actor==="system" && e.payload?.resumeState).at(-1);
     if(topic.state==="USER_DECISION_REQUIRED" && !interruption?.payload?.reviewPause && !interruption?.payload?.budgetPause)return null;
-    const scope=reviewScope(db.getFlags(topicId).resumeState??"");
+    const resume = db.getFlags(topicId).resumeState;
+    const recordedScope = interruption?.payload?.resumeState === resume ? interruption?.payload?.reviewPause : null;
+    const scope = recordedScope === "planning" || recordedScope === "implementation" ? recordedScope : reviewScope(resume ?? "");
     if(!scope)return null;
     const account=db.reviews.account(topicId,scope);
     return account.limit !== null && account.used>=account.limit?scope:null;
@@ -757,16 +918,16 @@ export class WorkflowEngine {
     // 정지의 정본은 topic.lastError·resume_state 다(interrupt·실패 기록이 함께 쓴다). resumeState 이벤트는 그것이 **지금** 정지를 만든 기록일 때만
     // 싣는다 — USER_DECISION_REQUIRED·BLOCKED_ON_EVIDENCE 이고, 같은 재개 단계이며, 그 뒤 상태 전이가 없을 때. FAILED 의 원인은 실패 기록(lastError·
     // 실패 action)이지 옛 정지 요청이 아니다(host-review a7a9ce86 F-007).
-    const lastTransition = timeline.filter(event => event.actor === "system" && event.payload?.to !== undefined).at(-1)?.sequence ?? 0;
-    const lastPause = timeline.filter(event => event.actor === "system" && event.payload?.resumeState).at(-1) ?? null;
+    const lastPause = currentStopEvent(topic, flags.resumeState ?? null, timeline);
     const interruption = (topic.state === "USER_DECISION_REQUIRED" || topic.state === "BLOCKED_ON_EVIDENCE")
-      && lastPause && lastPause.sequence > lastTransition && lastPause.payload?.resumeState === flags.resumeState ? lastPause : null;
+      && lastPause ? lastPause : null;
     const inputsSinceInterruption = interruption
       ? timeline.filter(event => event.sequence > interruption.sequence && event.actor === "user" && (event.kind === "decision" || event.kind === "evidence")).length
       : null;
     const lastAction = db.latestAction(topicId);
     const stop = INTERRUPTED_STATES.has(topic.state) ? {
       state: topic.state, reason: topic.lastError, resumeState: flags.resumeState ?? null,
+      contract: stopRecord(topic, flags.resumeState ?? null, interruption ?? undefined),
       failedAction: topic.state === "FAILED" && lastAction && (lastAction.status === "failed" || lastAction.status === "cancelled")
         ? { id: lastAction.id, kind: lastAction.kind, status: lastAction.status, error: lastAction.error, finishedAt: lastAction.finishedAt } : null,
     } : null;
@@ -780,6 +941,7 @@ export class WorkflowEngine {
     const brainstormRound = latestBrainstormRound(timeline);
     return {
       topicId: topic.id, title: topic.title, state: topic.state, resumeState: flags.resumeState ?? null,
+      evidenceResume: db.evidence.resumes.get(topicId),
       entry: workEntry(topic), hierarchy: { topicKind: topic.topicKind ?? "task", parentTopicId: topic.parentTopicId ?? null,
         context: hierarchyContext(db, topic), children: db.listTopics().filter(child => child.parentTopicId === topic.id).map(child => ({ id: child.id, title: child.title, topicKind: child.topicKind ?? "task", state: child.state })) },
       scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch, planRevision: topic.planRevision,
@@ -798,6 +960,7 @@ export class WorkflowEngine {
         conclusion: timeline.findLast(event => event.actor === "user" && event.payload.brainstormConclusion)?.body ?? null,
       } : null,
       autoRetryAt: this.scheduledRetryAt(topicId),
+      continuation: db.continuations.get(topicId),
       stop,
       openRequests: {
         interruption: interruption ? { sequence: interruption.sequence, body: interruption.body, resumeState: interruption.payload?.resumeState ?? null,
@@ -923,6 +1086,10 @@ export class WorkflowEngine {
     const flags = db.getFlags(topicId);
     if (db.runningAction(topicId) || this.core.active.has(topicId)) return [{ action: "stop", blocker: null }];
     const actions: ResumeAction[] = [];
+    if (["AWAITING_USER_APPROVAL", "READY_TO_DELIVER"].includes(topic.state) && !db.evidence.topic(topic).reviewed)
+      actions.push({ action: "review-evidence", blocker: this.blocker(() => {
+        this.core.assertNoActiveWork(topicId); this.core.assertBudgetAvailable(topicId); db.evidence.assertReady(topic, false); db.reviews.assertAvailable(topicId, "planning");
+      }) });
     if (isTopicGroup(topic) && topic.state === "CLOSED") return actions;
     if (topic.state === "BRAINSTORM_READY") {
       const blocker = this.blocker(() => { this.brainstormPreconditions(topicId); });
@@ -977,6 +1144,9 @@ export class WorkflowEngine {
       }
       actions.push({ action: "archive", blocker: this.blocker(() => { this.core.assertNotShuttingDown(); this.core.assertNoActiveWork(topicId); }) });
     }
+    if (db.evidence.resumes.get(topicId) && !actions.some(item => item.action === "stop")) actions.push({ action: "stop", blocker: null });
+    if (["pending", "running"].includes(db.continuations.get(topicId)?.status ?? "") && !actions.some(item => item.action === "stop"))
+      actions.push({ action: "stop", blocker: null });
     return actions;
   }
 
@@ -1000,7 +1170,7 @@ export class WorkflowEngine {
   // 닫기(API 경로) — 묶음 단계면 검증된 로컬 커밋(HEAD==committedOID·clean·커밋 트리==리뷰 트리·기준의 후손)과 합류 대상·통합의 조상 관계를 확인하고
   // 결과를 동결한 뒤 닫는다. push 는 요구하지 않는다: 원격 전달은 단계 착수와 분리된 상태이고, 닫힌 단계의 동결 결과는 따로 push 한다(plan §3.3, E4 보완
   // F002). git 경계 뒤 사전 검사를 다시 하고, 그 사이 커밋이 바뀌었으면 거부한다. 동결은 전이보다 먼저 쓰고(전이 실패 뒤 재시도는 닫히기 전이라 교체), 닫힌
-  // 뒤에는 바뀌지 않는다. 변경 없이 검증한 통합은 리뷰한 기준 커밋을 확정 커밋으로 CLOSED 전이와 한 transaction 에 기록한다 — 전달 계약(push)이 이
+  // 뒤에는 바뀌지 않는다. 변경 없이 검증한 통합·무변경 승인 작업은 리뷰한 기준 커밋을 확정 커밋으로 CLOSED 전이와 한 transaction 에 기록한다 — 전달 계약(push)이 이
   // 커밋을 싣는다(F003).
   async closeStage(topicId: string): Promise<Topic> {
     const db = this.core.dependencies.database;
@@ -1014,6 +1184,11 @@ export class WorkflowEngine {
       this.closePreconditions(topicId);
       const flags = db.getFlags(topicId);
       if ((flags.committedOID ?? null) !== record.committedOID) throw new Error("단계를 확인하는 동안 결과 커밋이 바뀌었습니다. 다시 닫아 주세요.");
+      if (record.committedOID === null) {
+        const topic = db.getTopic(topicId);
+        const evidenceInput = db.evidence.captureForCommit(topic);
+        db.evidence.bindCommitInput(topic, evidenceInput, record.result.commitOID);
+      }
       db.workGroups.freezeResult(record.groupId, record.result, { replaceUnclosed: true });
       return this.core.transitionWith(topicId, "CLOSED", "주제를 닫았습니다.", record.committedOID === null
         ? { changes: { committedOID: record.result.commitOID }, payload: { verifiedBaseResult: record.result.commitOID } } : {});
@@ -1034,6 +1209,13 @@ export class WorkflowEngine {
     const integration = stage.kind === "integration";
     const head = await git.head(topic.worktreePath);
     if ((await git.changedPaths(topic.worktreePath)).length) throw new Error("작업 트리에 커밋하지 않은 변경이 있어 단계를 닫을 수 없습니다.");
+    const reviewedBaseCandidate = !link.preparedMerge && head === link.baseOID;
+    if (!flags.committedOID && !integration && reviewedBaseCandidate) {
+      const { content } = await this.core.requireCurrentPlanArtifact(topicId);
+      if (hashPlan(content) !== topic.approvedPlanSHA256) throw new Error("승인된 무변경 계획을 확인할 수 없습니다.");
+      // Scope/tolerance limits permitted edits; it does not require an edit. The final review
+      // below proves whether this approved plan actually produced the unchanged base tree.
+    }
     let commitOID: string;
     if (flags.committedOID) {
       if (head !== flags.committedOID) throw new Error("작업 트리 HEAD 가 단계 결과 커밋과 다릅니다 — 검증된 로컬 커밋에서만 닫습니다.");
@@ -1042,14 +1224,14 @@ export class WorkflowEngine {
         throw new Error("단계 결과 커밋의 트리가 리뷰한 트리와 다릅니다.");
       }
       commitOID = flags.committedOID;
-    } else if (integration && !link.preparedMerge && head === link.baseOID) {
-      // 변경 없이 검증만 한 통합 단계 — 기준 커밋이 곧 결과다. 다만 "변경 없음" 도 리뷰가 확인한 사실이어야 한다(F004): 리뷰 HEAD 가 기준 커밋이고 리뷰한
+    } else if (reviewedBaseCandidate) {
+      // 변경 없이 검증만 한 통합 또는 무변경 승인 작업 — 기준 커밋이 곧 결과다. 다만 "변경 없음" 도 리뷰가 확인한 사실이어야 한다(F004): 리뷰 HEAD 가 기준 커밋이고 리뷰한
       // 작업 트리가 기준 커밋 트리와 같을 때만. 리뷰한 수정을 커밋하지 않고 되돌린 작업 트리는 리뷰한 결과가 아니다.
       if (!flags.reviewedTreeOID || flags.reviewedHead !== head) {
-        throw new Error("변경 없는 통합 결과를 리뷰한 기록(리뷰 HEAD·리뷰 트리)이 없어 단계를 닫을 수 없습니다.");
+        throw new Error("변경 없는 단계 결과를 리뷰한 기록(리뷰 HEAD·리뷰 트리)이 없어 단계를 닫을 수 없습니다.");
       }
       if ((await git.diffTrees(topic.worktreePath, head, flags.reviewedTreeOID)).files.length) {
-        throw new Error("리뷰한 작업 트리에 변경이 있었습니다 — 리뷰한 변경을 커밋해야 통합 결과로 닫을 수 있습니다(되돌린 기준 커밋은 리뷰한 결과가 아닙니다).");
+        throw new Error("리뷰한 작업 트리에 변경이 있었습니다 — 리뷰한 변경을 커밋해야 단계 결과로 닫을 수 있습니다(되돌린 기준 커밋은 리뷰한 결과가 아닙니다).");
       }
       commitOID = head;
     } else {
@@ -1079,6 +1261,8 @@ export class WorkflowEngine {
         if (change.status === "written" && typeof change.path === "string" && typeof change.sha256 === "string") memory.set(change.path, change.sha256);
       }
     }
+    const questions = (group.questions ?? []).filter(q => !q.resolution && (q.stageId === stage.id || q.stageId === null));
+    const deferredQuestions = questions.filter(q => q.deferredReason).map(q => ({ id: q.id, text: q.text, deferredReason: q.deferredReason }));
     const result: StageResult = {
       stageId: stage.id, topicId, baseOID: link.baseOID, commitOID,
       reviewedTreeOID: flags.reviewedTreeOID ?? "", planSHA256: topic.approvedPlanSHA256,
@@ -1087,8 +1271,9 @@ export class WorkflowEngine {
         .filter(record => typeof record.id === "string" && typeof record.status === "string")
         .map(record => ({ id: record.id as string, status: record.status as string })),
       memoryChanges: [...memory].map(([path, sha256]) => ({ path, sha256 })).sort((a, b) => a.path.localeCompare(b.path)),
-      openQuestions: (group.questions ?? []).filter(question => !question.resolution && (question.stageId === stage.id || question.stageId === null))
+      openQuestions: questions.filter(question => !question.deferredReason)
         .map(question => `${question.id}: ${question.text}`),
+      ...(deferredQuestions.length ? { deferredQuestions } : {}),
       // 실제 보류 원장(deferred-findings 산출물) — 재개 판정의 열린 지적(resumeFindings.open)은 DEFERRED_OUT_OF_SCOPE 를 빼므로 쓰지 않는다(F007).
       deferredFindings: await this.core.deferredFindingsOf(topicId),
       // 현재 범위 세대의 사용자 결정 원문 전부(F012·F013) — 개수·길이로 자르지 않고, 과거 세대 결정과 절차 기록은 넣지 않는다.
@@ -1255,7 +1440,7 @@ export class WorkflowEngine {
         + "그 전달·처분이 묻힙니다. 재시도(retry)로 수정 작업을 이어 처분을 받거나, 정정(supersedes)으로 닫은 뒤 재개하세요."), { statusCode: 409 });
     }
     return db.applyTopicTransition({
-      topicId, changes: { resumeState: "IMPLEMENTING" }, contracts: open ? [{ ...open, status: "abandoned" as const }] : undefined,
+      topicId, changes: { resumeState: "IMPLEMENTING", ...resetCycle("implementation") }, contracts: open ? [{ ...open, status: "abandoned" as const }] : undefined,
       events: [{ actor: "user", kind: "decision", state: topic.state,
         body: `구현 계속 재개(공식): resume → IMPLEMENTING. ${input.reason}`,
         payload: { implementationResume: { fromState: topic.state, scopeGeneration: topic.scopeGeneration }, ...(origin ? { origin } : {}) } }],
@@ -1312,6 +1497,7 @@ export class WorkflowEngine {
         changes: {
           state: "DRAFT",
           planEpoch: nextEpoch,
+          ...resetCycle("plan"),
           planRevision: 0,
           planSHA256: null,
           approvedPlanSHA256: null,
@@ -1453,7 +1639,7 @@ export class WorkflowEngine {
           implementationBaseOID: null,
           worktreePath,
           lastError: null,
-          fixPassUsed: false,
+          ...resetCycle("plan"),
           resumeState: null,
           implementationSessionId: null,
           implementationPromptSequence: null,

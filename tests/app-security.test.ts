@@ -5,13 +5,67 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { buildApp } from "../src/server/app";
+import { buildApp, listenReady } from "../src/server/app";
+import { request as httpRequest } from "node:http";
+import { ProcessSupervisor, systemProcessControl } from "../src/server/processSupervisor";
+import { acquireServerOwnership } from "../src/server/serverOwnership";
 import { ConsensusDatabase } from "../src/server/database";
 import { TopicActivitySchema } from "../src/shared/contracts";
 import { SpawnCommandRunner } from "../src/server/processRunner";
 import type { AgentAdapter, CommandRunner } from "../src/server/types";
 
 const temporaryDirectories: string[] = [];
+
+it("owns a data directory exclusively across server instances and releases it without deleting a lock file", () => {
+  const root = mkdtempSync(join(tmpdir(), "server-ownership-")); temporaryDirectories.push(root);
+  const release = acquireServerOwnership(root);
+  try { expect(() => acquireServerOwnership(root)).toThrow(); }
+  finally { release(); }
+  const next = acquireServerOwnership(root); next(); next();
+});
+
+it("refuses a live pre-lease server registry before recovery", () => {
+  const root = mkdtempSync(join(tmpdir(), "server-ownership-")); temporaryDirectories.push(root);
+  writeFileSync(join(root, "server-process.json"), JSON.stringify({ pid: process.pid, ...systemProcessControl.inspect(process.pid) }));
+  expect(() => acquireServerOwnership(root)).toThrow("이미 실행 중");
+  // Unverifiable legacy owners fail closed rather than being taken over.
+  writeFileSync(join(root, "server-process.json"), "{}");
+  expect(() => acquireServerOwnership(root)).toThrow("소유 기록");
+});
+
+it("gates requests until recovery finishes and propagates startup failure", async () => {
+  const { app, database } = await makeApp();
+  let release!: () => void;
+  const barrier = new Promise<void>(resolve => { release = resolve; });
+  let entered!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const recover = vi.spyOn(ProcessSupervisor.prototype, "recover").mockImplementation(async () => { entered(); await barrier; });
+  const fail = vi.spyOn(database, "recoverInterruptedActions").mockImplementation(() => { throw new Error("recovery failed"); });
+  const listen = listenReady(app, { host: "127.0.0.1", port: 0 });
+  const assertion = expect(listen).rejects.toThrow("recovery failed");
+  try {
+    await started;
+    for (const url of ["/api/health", "/api/topics"]) {
+      const response = await app.inject({ url: `${url}?token=launch-token-for-test` });
+      expect(response.statusCode).toBe(503);
+      expect(response.json().ok).toBe(false);
+    }
+    release(); await assertion;
+    expect(app.server.listening).toBe(false);
+  } finally { release(); recover.mockRestore(); fail.mockRestore(); await app.close(); }
+});
+
+it("ends open SSE responses before waiting for HTTP close", async () => {
+  const { app, database } = await makeApp(); draftTopic(database, "stream-topic");
+  const address = await listenReady(app, { host: "127.0.0.1", port: 0 });
+  const response = await new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
+    const request = httpRequest(`${address}/api/topics/stream-topic/events`, { headers: { "x-consensus-token": "launch-token-for-test" } }, resolve);
+    request.on("error", reject); request.end();
+  });
+  response.resume();
+  try { await app.close(); expect(app.server.listening).toBe(false); }
+  finally { response.destroy(); await app.close(); }
+});
 
 it("engine repository lock refuses that repository while another project remains admitted", async () => {
   const { app, database, root } = await makeApp(undefined, undefined, { gitRepository: true });

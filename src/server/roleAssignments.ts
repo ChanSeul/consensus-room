@@ -47,9 +47,21 @@ export class RoleRegistry {
     return row ? JSON.parse(String(row.record_json)) as RoleAssignment : null;
   }
 
-  // 토픽 배정이 있으면 그것, 없으면 전역 배정. 둘 다 없으면 null(배정 전의 기존 동작).
+  // 중재자는 가장 가까운 상위 주제의 기존 배정을 잇는다. 명시적 하위 배정(미연결 포함)은
+  // 상속을 막으며, 작업자 모델 배정은 종전처럼 자기 토픽/전역만 확인한다.
   effective(topicId: string | null, role: AgentRole, operation = ""): RoleAssignment | null {
-    return (topicId ? this.assignment(`topic:${topicId}`, role, operation) : null) ?? this.assignment("global", role, operation);
+    const visited = new Set<string>();
+    let current = topicId;
+    while (current) {
+      if (visited.has(current)) throw conflict("중재자 조회 중 주제 계층 순환을 발견했습니다.");
+      visited.add(current);
+      const assignment = this.assignment(`topic:${current}`, role, operation);
+      if (assignment) return assignment;
+      if (role !== "mediator") break;
+      const row = this.db.prepare("SELECT parent_topic_id FROM topics WHERE id=?").get(current);
+      current = row?.parent_topic_id ? String(row.parent_topic_id) : null;
+    }
+    return this.assignment("global", role, operation);
   }
 
   list(scope?: string, role?: AgentRole): RoleAssignment[] {

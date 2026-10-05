@@ -2,6 +2,8 @@ import type { ConsensusDatabase } from "./database.js";
 import type { GitService } from "./git.js";
 import type { AgentAdapter, SessionTurn } from "./types.js";
 import { resolvePriorResults } from "./workGroupService.js";
+import { GUARDED_STAGES, timelineReferencesApply } from "./guardedPlanning.js";
+import { jobOfTurn } from "./adapters/turnPolicy.js";
 
 export function wrapWorkGroupAdapter(
   adapter: AgentAdapter,
@@ -10,6 +12,7 @@ export function wrapWorkGroupAdapter(
 ): AgentAdapter {
   const enrich = async <T extends Omit<SessionTurn, "sessionId">>(
     turn: T,
+    sharedPlanning = true,
   ): Promise<T> => {
     const topic = database.topicForTurn(turn);
     const group = topic ? database.workGroups.forTopic(topic.id) : null;
@@ -26,6 +29,11 @@ export function wrapWorkGroupAdapter(
     // 머리말은 지금 묶음의 단계 문맥이고, 동결 결과가 덮지 않은 검증 증거(동결하지 않은 E4 전 선행)는 옛 줄 형식으로 잇는다(F009). 선행 결과가
     // 모두 동결돼 있으면 renderStageContext 와 같다.
     const context = database.workGroups.prompt(topic.id, proof);
+    if (sharedPlanning && GUARDED_STAGES.has(topic.state) && timelineReferencesApply(database, topic.id, topic.state, turn,
+      jobOfTurn(adapter.role, turn).role)) {
+      return { ...turn, planningDocuments: [...(turn.planningDocuments ?? []),
+        { selector: "shared:work-group", content: context }] };
+    }
     // 과제 프롬프트를 바꾸는 변환은 새·교체 세션용 전체 문맥 판에도 똑같이 적용한다 — 계획 제어가 세션을 교체하면 그 판이 과제가 된다
     // (host-review 전 사전 검증 261622a-09250218). 통합 단계 지시는 단계 문맥(render)이 담는다.
     const header = `${context}\n\n`;
@@ -43,6 +51,6 @@ export function wrapWorkGroupAdapter(
   };
   if (adapter.resumePlanRepair)
     wrapped.resumePlanRepair = async (turn) =>
-      adapter.resumePlanRepair!(await enrich(turn));
+      adapter.resumePlanRepair!(await enrich(turn, false));
   return wrapped;
 }

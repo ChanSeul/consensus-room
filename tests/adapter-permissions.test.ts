@@ -416,6 +416,29 @@ describe("에이전트별 권한 경계", () => {
     expect(runner.calls[0].stdin?.endsWith("수정 계획을 다시 검토해 주세요.")).toBe(true);
   });
 
+  it("호스트 리뷰의 Fast는 생성·재개에 전달하고 다음 일반 턴에 남기지 않는다", async () => {
+    const runner = new RecordingRunner(successfulResult([
+      { type: "thread.started", thread_id: "fast-review-thread" }, planResult,
+    ]));
+    const { adapter } = codexAdapter(runner);
+    const turn = { prompt: "Review", cwd: "/tmp", isolated: true,
+      job: { role: "reviewer", operation: "review" } as const,
+      settings: { model: "gpt-6-astra", effort: "xhigh" } as const,
+      providerOptions: { serviceTier: "fast" } };
+    const created = await adapter.createSession(turn);
+    await adapter.resumeTurn({ ...turn, sessionId: created.sessionId });
+    await adapter.createSession({ ...turn, providerOptions: {} });
+    for (const call of runner.calls.slice(0, 2)) {
+      const exec = call.args.indexOf("exec");
+      expect(call.args.slice(0, exec)).toEqual([
+        "--strict-config", "-a", "never", "-m", "gpt-6-astra", "-c", 'model_reasoning_effort="xhigh"',
+        "-c", 'service_tier="fast"', "-c", "features.fast_mode=true",
+      ]);
+    }
+    expect(runner.calls[1].args).toContain("fast-review-thread");
+    expect(runner.calls[2].args.some(arg => arg.startsWith("service_tier=") || arg.startsWith("features.fast_mode="))).toBe(false);
+  });
+
   it("Codex 턴은 사용자 홈이 아니라 앱이 관리하는 CODEX_HOME으로 실행한다", async () => {
     const runner = new RecordingRunner(successfulResult([
       { type: "thread.started", thread_id: "codex-thread-1" },
@@ -895,7 +918,7 @@ describe("에이전트별 권한 경계", () => {
     expect(args).toContain("--strict-mcp-config");
     expect(args[args.indexOf("--setting-sources") + 1]).toBe("");
     // 정책 c(2026-08-31): 구현 턴은 코드 쓰기 접근과 웹의 결합(최대 유출 표면)을 막기 위해 웹 도구를 뺀다.
-    expect(args[args.indexOf("--tools") + 1]).toBe("Read,Glob,Grep,Bash,Skill,Edit,Write,Workflow");
+    expect(args[args.indexOf("--tools") + 1]).toBe("Read,Glob,Grep,Bash,Skill,Edit,Write,Workflow,TaskOutput");
     const settings = JSON.parse(args[args.indexOf("--settings") + 1]) as {
       ultracode?: boolean;
       permissions: { allow: string[]; deny: string[] };
@@ -905,6 +928,7 @@ describe("에이전트별 권한 경계", () => {
     expect(settings.ultracode).toBe(true);
     // Workflow는 도구 목록만으로는 dontAsk에서 거부된다. allow 규칙이 함께 있어야 실제로 쓸 수 있다.
     expect(settings.permissions.allow).toContain("Workflow");
+    expect(settings.permissions.allow).toContain("TaskOutput");
     expect(settings.permissions.allow).toContain("Edit(//tmp/**)");
     expect(settings.permissions.deny).toContain("Edit(//tmp/.git)");
     expect(settings.sandbox).toMatchObject({
@@ -943,6 +967,8 @@ describe("에이전트별 권한 경계", () => {
       name: string;
     };
     expect(manifest.name).toBe("consensus-room");
+    expect(runner.calls[0].stdin).toContain("consensus-room:probe");
+    expect(runner.calls[0].stdin).not.toContain("consensus-room:no-manifest");
     // SKILL.md가 있는 항목만 연결되고, 없는 항목은 검토 실패로 제외된다.
     expect(lstatSync(join(pluginDirectory, "skills", "probe")).isSymbolicLink()).toBe(true);
     expect(() => lstatSync(join(pluginDirectory, "skills", "no-manifest"))).toThrow();
@@ -1205,6 +1231,30 @@ describe("메모리 주입은 세션 생성 턴에만 한다", () => {
     writeFileSync(join(root, "swift-concurrency.md"), "# 스위프트 동시성 규칙\n\nMEMORY-MARKER-BODY");
     return root;
   }
+
+  it.each(["claude", "codex"] as const)("%s evidence creation and correction share read-only output and memory contracts", async provider => {
+    const directory = mkdtempSync(join(tmpdir(), "evidence-contract-")); temporaryDirectories.push(directory);
+    const runner = new RecordingRunner(successfulResult([
+      { type: "thread.started", thread_id: "thread-1" },
+      { kind: "EVIDENCE_REPLAN", summary: "Policy changed", findings: [], evidenceRefs: [] },
+    ]));
+    const adapter = provider === "claude" ? new ClaudeAdapter(runner, memoryFixture())
+      : new CodexAdapter(runner, join(directory, "schema.json"), join(directory, "home"), memoryFixture());
+    const job = { role: "planner", operation: "evidence-assessment" } as const;
+    await adapter.createSession({ cwd: directory, prompt: "swift evidence review", job, planMode: true });
+    await adapter.resumeTurn({ cwd: directory, prompt: "swift correction", job, planMode: true,
+      sessionId: provider === "claude" ? "11111111-1111-4111-8111-111111111111" : "thread-1" });
+    for (const call of runner.calls) {
+      expect(call.stdin).toContain("memoryUpdates");
+      expect(call.stdin).not.toContain("반드시 한 번 판단하세요");
+      const schema = provider === "claude" ? JSON.parse(call.args[call.args.indexOf("--json-schema") + 1])
+        : JSON.parse(readFileSync(call.args[call.args.indexOf("--output-schema") + 1], "utf8"));
+      expect(schema.properties.kind.enum).toEqual(["EVIDENCE_NO_IMPACT", "EVIDENCE_REPLAN", "EVIDENCE_NEEDS_DECISION"]);
+      expect(schema.properties.memoryUpdates.anyOf[0].maxItems).toBe(0);
+      expect(schema.properties.planMarkdown).toEqual({ type: "null" });
+      if (provider === "claude") expect(call.args[call.args.indexOf("--permission-mode") + 1]).toBe("dontAsk");
+    }
+  });
 
   it("Claude: createSession에만 붙고 resume·protocolOnly에는 안 붙는다", async () => {
     const runner = new RecordingRunner(successfulResult([planResult]));
@@ -1911,6 +1961,23 @@ describe("러너 auto-compact 임계값", () => {
   });
 });
 
+
+it("a job image directory has one recursive read grant without following sibling symlinks", async () => {
+  const root = mkdtempSync(join(tmpdir(), "evidence-directory-")); temporaryDirectories.push(root);
+  const directory = join(root, "job-images"), link = join(root, "linked-directory"), file = join(root, "manifest.json");
+  mkdirSync(directory); symlinkSync(directory, link); writeFileSync(file, "{}");
+  const runner = new RecordingRunner(successfulResult([planResult]));
+  await new ClaudeAdapter(runner).createSession({ prompt: "Read selected evidence", cwd: "/tmp/worktree", evidenceManaged: true,
+    readablePaths: [directory, link, file] });
+  const args = runner.calls[0].args;
+  const settings = JSON.parse(args[args.indexOf("--settings") + 1]);
+  expect(settings.permissions.allow).toContain(`Read(/${directory}/**)`);
+  expect(settings.permissions.allow).toContain(`Read(/${link})`);
+  expect(settings.permissions.allow).toContain(`Read(/${file})`);
+  expect(settings.permissions.allow).not.toContain(`Read(/${link}/**)`);
+  expect(settings.permissions.allow).not.toContain(`Read(/${root}/**)`);
+  expect(settings.sandbox.filesystem.allowRead).toEqual(expect.arrayContaining([directory, link, file]));
+});
 
 it("managed source evidence disables direct provider reads and permits only the supplied cached PNG", async () => {
   const cachedImage = "/tmp/evidence-cache/hash.png";

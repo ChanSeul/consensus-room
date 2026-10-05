@@ -36,6 +36,146 @@ const rpc = (id = 1, name = "get_design_context") => ({ jsonrpc: "2.0", id, meth
 const post = (url: string, message = rpc()) => fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(message) });
 
 describe("Workflow Figma capture", () => {
+  it("allows retry after the last consumer cancels a partial JSON body", async () => {
+    let calls = 0, started!: () => void, disconnected!: () => void;
+    const bodyStarted = new Promise<void>(resolve => { started = resolve; });
+    const closed = new Promise<void>(resolve => { disconnected = resolve; });
+    const upstream = await endpoint((_request, response) => {
+      if (++calls === 1) {
+        response.once("close", disconnected);
+        response.writeHead(200, { "content-type": "application/json" });
+        response.write('{"jsonrpc":"2.0",'); started();
+      } else response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ jsonrpc: "2.0", id: 1,
+        result: { content: [{ type: "text", text: "Recovered JSON" }] } }));
+    });
+    const { onResult } = await invoke(upstream, async url => {
+      const abort = new AbortController();
+      const first = fetch(url, { method: "POST", body: JSON.stringify(rpc()), signal: abort.signal }).catch(error => error);
+      await bodyStarted; abort.abort(); await first; await closed;
+      expect((await (await post(url)).json() as any).result.content[0].text).toBe("Recovered JSON");
+    });
+    expect(onResult).toHaveBeenCalledOnce();
+  });
+
+  it("coalesces progress tokens but retains other request metadata", async () => {
+    let calls = 0;
+    const upstream = await endpoint((request, response) => { void (async () => {
+      let text = ""; for await (const chunk of request) text += chunk;
+      const message = JSON.parse(text); calls++;
+      response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ jsonrpc: "2.0", id: message.id,
+        result: { content: [{ type: "text", text: "Source" }] } }));
+    })(); });
+    await invoke(upstream, async url => {
+      const message = (id: number, purpose = "same") => ({ ...rpc(id), params: { ...rpc(id).params, _meta: { progressToken: id, purpose } } });
+      await Promise.all([post(url, message(1)), post(url, message(2))]);
+      await post(url, message(3)); expect(calls).toBe(1);
+      await post(url, message(4, "other")); expect(calls).toBe(2);
+    });
+  });
+
+  it("preserves a shared SSE read after its first consumer cancels", async () => {
+    let calls = 0, finish!: () => void;
+    const upstream = await endpoint((_request, response) => {
+      calls++;
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.write('data: {"jsonrpc":"2.0","method":"notifications/progress","params":{}}\n\n');
+      finish = () => response.end(`data: ${JSON.stringify({ jsonrpc: "2.0", id: 1,
+        result: { content: [{ type: "text", text: "Shared source survives" }] } })}\n\n`);
+    });
+    const { captureFigma } = await import("../src/server/adapters/figmaCapture");
+    const sink = vi.fn(); let joined!: () => void, requests = 0;
+    const secondJoined = new Promise<void>(resolve => { joined = resolve; });
+    const capture = await captureFigma(upstream, ["get_design_context"], { cwd: "/tmp", prompt: "read", onFigmaResult: sink,
+      onFigmaRequest: () => { if (++requests === 2) joined(); } });
+    try {
+      const first = await post(capture.url); const reader = first.body!.getReader(); await reader.read();
+      const second = post(capture.url, rpc(2)); await secondJoined;
+      await reader.cancel(); finish();
+      const answer = await (await second).json() as any;
+      expect(answer.id).toBe(2); expect(answer.result.content[0].text).toBe("Shared source survives");
+      expect(calls).toBe(1); expect(sink).toHaveBeenCalledTimes(2); capture.assertCaptured();
+    } finally { await capture.close(); }
+  });
+
+  it.each([403, 404, 503])("captures explicit HTTP %s errors without inventing successful evidence", async status => {
+    const upstream = await endpoint((_request, response) => response.writeHead(status).end("Original access failure"));
+    const { onResult } = await invoke(upstream, async url => { expect((await post(url)).status).toBe(status); });
+    expect(onResult).toHaveBeenCalledOnce();
+    expect(onResult.mock.calls[0][0]).toMatchObject({ isError: true,
+      content: [{ type: "text", text: `Figma HTTP ${status}: Original access failure` }] });
+  });
+
+  it.each([false, true])("shares one captured read across concurrent and later readers with distinct RPC ids (SSE=%s)", async sse => {
+    let calls = 0;
+    const upstream = await endpoint((request, response) => {
+      void (async () => {
+        let text = ""; for await (const chunk of request) text += chunk;
+        const message = JSON.parse(text); calls++;
+        await new Promise(resolve => setTimeout(resolve, 20));
+        const answer = { jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: "ONE SOURCE SNAPSHOT" }] } };
+        response.writeHead(200, { "content-type": sse ? "text/event-stream" : "application/json" })
+          .end(sse ? `data: ${JSON.stringify(answer)}\n\n` : JSON.stringify(answer));
+      })();
+    });
+    const read = async (response: Response) => {
+      const text = await response.text();
+      return JSON.parse(text.startsWith("data:") ? text.slice(5).trim() : text);
+    };
+    const { onResult } = await invoke(upstream, async url => {
+      const results = await Promise.all([post(url, rpc(11)), post(url, rpc(12))].map(async result => read(await result)));
+      expect(results.map(result => result.id)).toEqual([11, 12]);
+      expect((await read(await post(url, rpc(13)))).id).toBe(13);
+      expect(calls).toBe(1);
+    });
+    expect(onResult).toHaveBeenCalledTimes(3);
+    await invoke(upstream, async url => { await read(await post(url)); });
+    expect(calls).toBe(2); // A new turn must read the current upstream source again.
+  });
+
+  it.each(["http", "tool"])("stops uncached upstream reads after a %s rate limit and still serves captured evidence", async mode => {
+    let calls = 0;
+    const upstream = await endpoint((request, response) => {
+      void (async () => {
+        let text = ""; for await (const chunk of request) text += chunk;
+        const message = JSON.parse(text); calls++;
+        const limited = calls > 1;
+        response.writeHead(limited && mode === "http" ? 429 : 200, { "content-type": "application/json" })
+          .end(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { isError: limited,
+            content: [{ type: "text", text: limited ? "Rate limit exceeded, please try again tomorrow" : "CAPTURED" }] } }));
+      })();
+    });
+    await invoke(upstream, async url => {
+      await post(url);
+      const different = rpc(2); different.params.arguments.nodeId = "7:1";
+      await post(url, different);
+      const later = rpc(3); later.params.arguments.nodeId = "8:1";
+      const failure = await (await post(url, later)).json() as any;
+      expect(failure.id).toBe(3); expect(failure.result.isError).toBe(true);
+      const cached = await (await post(url, rpc(4))).json() as any;
+      expect(cached.result.content[0].text).toBe("CAPTURED");
+      expect(calls).toBe(2);
+    });
+  });
+
+  it("keeps MCP sessions separate and honors an explicit expired Retry-After", async () => {
+    let calls = 0;
+    const upstream = await endpoint((request, response) => {
+      void (async () => {
+        let text = ""; for await (const chunk of request) text += chunk;
+        const message = JSON.parse(text); calls++;
+        response.writeHead(calls === 2 ? 429 : 200, { "content-type": "application/json", "retry-after": "0" })
+          .end(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: `version-${calls}` }] } }));
+      })();
+    });
+    await invoke(upstream, async url => {
+      const request = (session: string) => fetch(url, { method: "POST", headers: { "content-type": "application/json", "mcp-session-id": session }, body: JSON.stringify(rpc()) });
+      expect((await (await request("one")).json() as any).result.content[0].text).toBe("version-1");
+      expect((await request("two")).status).toBe(429);
+      expect((await (await request("two")).json() as any).result.content[0].text).toBe("version-3");
+      expect(calls).toBe(3);
+    });
+  });
+
   it.each([false, true])("retains a child response absent from the parent stream (SSE=%s)", async sse => {
     const answer = { jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: "EXACT CHILD DESIGN" }] } };
     const upstream = await endpoint((_request, response) => response.writeHead(200, { "content-type": sse ? "text/event-stream" : "application/json" })
@@ -119,7 +259,9 @@ it.each(["http", "rpc", "redirect"])("accepts successful retry after a terminal 
       .end(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: "Recovered design" }] } }));
   });
   const { onResult } = await invoke(upstream, async url => { await post(url); await post(url); });
-  expect(onResult).toHaveBeenCalledOnce();
+  expect(onResult).toHaveBeenCalledTimes(mode === "redirect" ? 1 : 2);
+  if (mode !== "redirect") expect(onResult.mock.calls[0][0]).toMatchObject({ isError: true });
+  expect(onResult.mock.calls.at(-1)![0].content).toEqual([{ type: "text", text: "Recovered design" }]);
 });
 
 it("forwards SSE requests and captures a result before the stream closes", async () => {

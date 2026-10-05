@@ -4,6 +4,7 @@ import { redactSecrets } from "../shared/workflow.js";
 import type { DeferredFinding } from "../shared/contracts.js";
 import {
   WorkGroupInputSchema,
+  workQuestionResultText,
   dependencyClosure,
   type PreparedMerge,
   type StageDecision,
@@ -41,7 +42,7 @@ export interface StageContext {
   contracts: string;
   stage: { id: string; kind: WorkStage["kind"]; title: string; goal: string; acceptance?: string; outcome?: string; separation?: StageSeparation;
     checklist?: string[]; evidenceRootIds?: string[] };
-  questions: Array<{ id: string; text: string; blocksStart: boolean; resolution?: string }>;
+  questions: Array<{ id: string; text: string; blocksStart: boolean; resolution?: string; deferredReason?: string }>;
   priorResults: StageContextResult[];
   mergeTargets: Array<{ stageId: string; result?: StageContextResult }>;
   merge?: PreparedMerge;
@@ -107,11 +108,10 @@ export class WorkGroups {
     return g;
   }
   forTopic(topicId: string): WorkGroup | null {
-    return (
-      this.list().find((g) =>
-        Object.values(g.links).some((l) => l.topicId === topicId),
-      ) ?? null
-    );
+    const row = this.db.prepare(`SELECT record_json FROM work_groups
+      WHERE EXISTS (SELECT 1 FROM json_each(work_groups.record_json, '$.links')
+        WHERE json_extract(value, '$.topicId')=?) ORDER BY rowid LIMIT 1`).get(topicId);
+    return row ? JSON.parse(String(row.record_json)) as WorkGroup : null;
   }
   // options 는 생성 전용 입력(검증은 서비스가 끝냈다) — 없으면 레코드에 필드를 두지 않아 기존 동작과 같다.
   create(
@@ -431,11 +431,16 @@ export function inheritedDecisionEvent(groupId: string, entry: { stageId: string
   };
 }
 
-const resultView = (r: StageResult): StageContextResult => ({
+const resultView = (r: StageResult, seenDeferred?: Set<string>): StageContextResult => ({
   stageId: r.stageId, commitOID: r.commitOID, planSHA256: r.planSHA256, reviewedTreeOID: r.reviewedTreeOID,
   verifications: r.verifications.map((v) => ({ id: v.id, status: v.status })),
   memoryChanges: r.memoryChanges.map((m) => ({ path: m.path, sha256: m.sha256 })),
-  openQuestions: [...r.openQuestions],
+  openQuestions: [...r.openQuestions, ...(r.deferredQuestions ?? []).map(workQuestionResultText).filter(text => {
+    if (!seenDeferred) return true;
+    if (seenDeferred.has(text)) return false;
+    seenDeferred.add(text);
+    return true;
+  })],
   ...(r.deferredFindings.length ? { deferredFindings: { count: r.deferredFindings.length, ids: r.deferredFindings.map((f) => f.id) } } : {}),
   ...(r.decisions.length ? { decisions: { count: r.decisions.length, digest: decisionDigest(r.decisions) } } : {}),
   ...(r.legacy ? { legacy: true } : {}),
@@ -454,6 +459,10 @@ export function buildStageContext(group: WorkGroup, stageId: string): StageConte
   const link = group.links[stageId];
   const integration = stage.kind === "integration";
   const priorIds = inheritedStages(group, stageId);
+  const questions = (group.questions ?? []).filter((q) => q.stageId === null || q.stageId === stageId);
+  // Only the new exclusion format is deduplicated. Legacy result arrays retain their exact approved context hash.
+  const seenDeferred = new Set(questions.filter(q => !q.resolution && q.deferredReason).map(workQuestionResultText));
+  const priorResults = priorIds.filter(id => results[id]).map(id => resultView(results[id], seenDeferred));
   return {
     goal: group.goal,
     contracts: group.contracts,
@@ -462,9 +471,9 @@ export function buildStageContext(group: WorkGroup, stageId: string): StageConte
       evidenceRootIds: stage.evidenceRootIds ? [...stage.evidenceRootIds] : undefined,
       separation: stage.separation ? compact({ ...stage.separation }) as StageSeparation : undefined,
       checklist: stage.checklist?.length ? [...stage.checklist] : undefined }) as StageContext["stage"],
-    questions: (group.questions ?? []).filter((q) => q.stageId === null || q.stageId === stageId)
-      .map((q) => compact({ id: q.id, text: q.text, blocksStart: q.blocksStart, resolution: q.resolution }) as StageContext["questions"][number]),
-    priorResults: priorIds.filter((id) => results[id]).map((id) => resultView(results[id])),
+    questions: questions
+      .map((q) => compact({ id: q.id, text: q.text, blocksStart: q.blocksStart, resolution: q.resolution, deferredReason: q.deferredReason }) as StageContext["questions"][number]),
+    priorResults,
     mergeTargets: (link?.mergeTargets ?? []).map((target) => ({ stageId: target, ...(results[target] ? { result: resultView(results[target]) } : {}) })),
     ...(link?.preparedMerge ? { merge: structuredClone(link.preparedMerge) } : {}),
     integration,
@@ -513,7 +522,9 @@ export function renderContext(context: StageContext, legacyPrior: PriorLine[] = 
   if (context.questions.length) {
     lines.push("이 단계에 걸린 미정 사항:");
     for (const q of context.questions)
-      lines.push(`- ${q.id}${q.blocksStart ? " (착수 차단)" : ""}: ${q.text}${q.resolution !== undefined ? ` — 해소: ${q.resolution}` : " — 미해소"}`);
+      lines.push(`- ${q.id}${q.blocksStart && !q.resolution && !q.deferredReason ? " (착수 차단)" : ""}: ${q.text}${q.resolution !== undefined ? ` — 해소: ${q.resolution}` : " — 미해소"}${q.deferredReason !== undefined ? ` — 후속 확인(To-do): ${q.deferredReason}` : ""}`);
+    if (context.questions.some((q) => q.deferredReason && !q.resolution))
+      lines.push("후속 확인으로 넘긴 질문은 해결된 계약이 아닙니다. 그 질문에 의존하는 동작은 이번 구현에서 제외하고 To-do에 보존하세요. 확인된 근거로 가능한 나머지 작업을 진행하세요. 오래된 접근 실패·자료 부족 판단은 원문과 직접 연결된 구현/명세를 다시 확인하고, 현재 버전·확인 결과를 기록하세요. 접근 불가를 제품 미결정으로 바꾸거나 계약을 추정하지 마세요.");
   }
   lines.push("선행 단계의 확정 근거:");
   for (const result of context.priorResults) lines.push(...resultLines(result));
@@ -686,6 +697,7 @@ function sanitizeInput(input: WorkGroupInput): WorkGroupInput {
     }) as WorkStage),
     questions: parsed.questions?.map((q) => compact({
       ...q, text: redactSecrets(q.text), resolution: q.resolution === undefined ? undefined : redactSecrets(q.resolution),
+      deferredReason: q.deferredReason === undefined ? undefined : redactSecrets(q.deferredReason),
     })),
   }) as WorkGroupInput;
 }

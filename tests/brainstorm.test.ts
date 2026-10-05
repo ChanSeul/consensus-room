@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { ServerConfig } from "../src/server/config";
-import { buildApp } from "../src/server/app";
+import { buildApp, listenReady } from "../src/server/app";
 import { ConsensusDatabase } from "../src/server/database";
 import { SpawnCommandRunner } from "../src/server/processRunner";
 import { turnPolicy } from "../src/server/adapters/turnPolicy";
@@ -70,7 +70,7 @@ async function fixture(control?: (turn: Omit<SessionTurn, "sessionId">, index: n
     }
   };
   const events = () => database.getScopedTimeline(id, database.getTopic(id).scopeGeneration);
-  const restart = async () => { await app.close(); database = new ConsensusDatabase(join(root, "room.sqlite")); app = await build(); await app.listen({ host: "127.0.0.1", port: 0 }); await done(); };
+  const restart = async () => { await app.close(); database = new ConsensusDatabase(join(root, "room.sqlite")); app = await build(); await listenReady(app, { host: "127.0.0.1", port: 0 }); await done(); };
   return { get app() { return app; }, get database() { return database; }, id, calls, post, action, done, events, restart };
 }
 
@@ -214,7 +214,7 @@ it("hands an operation-only discussion assignment to the default planner under c
   expect(f.database.planning.policyVersion(f.id)).toBe(2);
 });
 
-it("waits for external evidence before and during a speech, then retries only unaccepted speech", async () => {
+it("defers missing evidence but retries an unaccepted speech when actual source content changes", async () => {
   const entered = latch<void>(); const release = latch<AgentResult>();
   const f = await fixture(async (_turn, index) => { if (index === 1) { entered.resolve(); return release.promise; } return reply("최신 근거의 의견"); });
   cleanups.push(async () => release.resolve(reply()));
@@ -223,10 +223,8 @@ it("waits for external evidence before and during a speech, then retries only un
     const check = (await f.post(`/api/evidence/${source.id}/check`, { force: true })).json();
     expect((await f.post(`/api/evidence/${source.id}/snapshot`, { checkId: check.checkId, revision, units: [{ id: "issue", kind: "issue", content: revision }] })).statusCode).toBe(200);
   };
-  await f.action("brainstorm"); await f.done();
-  expect(f.database.getTopic(f.id).state).toBe("BLOCKED_ON_EVIDENCE");
-  expect(f.calls).toHaveLength(0);
-  await publish("v1"); await f.action("retry"); await entered.promise;
+  await f.action("brainstorm"); await entered.promise;
+  expect(f.calls).toHaveLength(1);
   await publish("v2"); release.resolve(reply("OLD EVIDENCE")); await f.done();
   expect(f.database.getTopic(f.id).state).toBe("BLOCKED_ON_EVIDENCE");
   expect(brainstormReplies(f.events(), latestBrainstormRound(f.events())!.sequence)).toHaveLength(0);

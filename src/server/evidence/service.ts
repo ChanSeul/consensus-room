@@ -10,6 +10,8 @@ import type { AgentAdapter, SessionTurn } from "../types.js";
 import { EvidenceFetchError, type EvidenceConnector } from "./connectors.js";
 import { DESIGN_PLANNING_CONTRACT } from "../../shared/prompts.js";
 import { evidenceHash, type EvidenceStore } from "./store.js";
+import type { EvidenceReadObservation } from "./readLifecycle.js";
+import { reportBackgroundFailure } from "../backgroundTask.js";
 
 export class EvidenceService {
   private timer?: ReturnType<typeof setInterval>;
@@ -46,10 +48,11 @@ export class EvidenceService {
     this.collectedThisPoll.clear();
     try {
       this.onIdle();
-      await Promise.all([
+      const outcomes = await Promise.allSettled([
         ...this.store.activeSources().filter(source => source.mode === "rest" && !this.store.catalog.managed(source.id)).map(source => this.refresh(source.id)),
         ...this.store.catalog.due().map(root => this.collect(root.id)),
       ]);
+      for (const outcome of outcomes) if (outcome.status === "rejected") reportBackgroundFailure("evidence:poll", outcome.reason);
       if (!this.abort.signal.aborted) this.onIdle();
     } finally { this.polling = false; }
   }
@@ -93,7 +96,10 @@ export class EvidenceService {
             if (this.abort.signal.aborted || !publishable()) return;
           }
           const snapshot=this.store.sourceSnapshot(source);
-          if (!snapshot || !this.store.fresh(source)) throw new EvidenceFetchError("호스트에서 원문을 다시 수집하세요. 이전 자료는 보존했습니다.");
+          if (!snapshot) throw new EvidenceFetchError("호스트에서 원문을 다시 수집하세요. 이전 자료는 보존했습니다.");
+          // No remote read occurred. An overdue host capture needs revalidation, not
+          // a fabricated collection error or a refreshed timestamp/coverage receipt.
+          if (!this.store.fresh(source)) return;
           const units=snapshot.units.map(({contentHash: _hash,imageHash,...unit})=>({ ...unit,
             ...(imageHash ? {imageBase64:this.store.image(imageHash).toString("base64")} : {}) }));
           const links = this.collectedThisPoll.get(source.id)?.links ?? discoverLinks(units,source.url);
@@ -317,6 +323,7 @@ export function withEvidence(adapter: AgentAdapter, database: ConsensusDatabase,
     const designCache: Array<{ url: string; nodeId: string; contentHash: string; path: string }> = [];
     const designSources = database.evidence.list(topic.id).filter(source => source.provider === "figma");
     const designAccess = turn.implementation || ["CODEX_REVIEW", "CODEX_FINAL_REVIEW"].includes(topic.state);
+    if (designAccess && !turn.signal?.aborted) database.evidence.beginDesignTurn(topic);
     const observed = designAccess ? database.evidence.designObservations(topic) : [];
     const observationReferences: Array<{ hash: string; path: string }> = [];
     if (designAccess) {
@@ -346,7 +353,7 @@ export function withEvidence(adapter: AgentAdapter, database: ConsensusDatabase,
       }
     }
     const designGuidance = !designSources.length ? "" : designAccess
-      ? `Inspect only the Figma screen currently being implemented or reviewed. Reuse already inspected data with the same contentHash; read the cache only when needed. The observed-design references are the exact native tool responses seen by implementation, not a claim that the remote file is still current. Use those same observations for review. Older source caches are baseline references only and must not override a newer observed response. Cached observations may be partial: use read-only Figma tools on the supplied link for missing design context, and screenshots only when visual verification is needed. Do not fetch the whole file. If the Figma tools or required node are unavailable, report the blocker instead of inventing design values.\nOptional design cache references (not yet read): ${JSON.stringify(designCache)}\nObserved design references retained in this scope (including prior plan revisions; verify their relevance to the current plan): ${JSON.stringify(observationReferences)}`
+      ? `Inspect only the Figma screen currently being implemented or reviewed. Reuse already inspected data with the same contentHash; read the cache only when needed. The observed-design references are the exact native tool responses seen by implementation, not a claim that the remote file is still current. Use those same observations for review. Older source caches are baseline references only and must not override a newer observed response. Cached observations may be partial: use read-only Figma tools on the supplied link for missing design context, and screenshots only when visual verification is needed. Do not fetch the whole file. If the Figma tools or required node are unavailable, preserve the gap as To-do, exclude dependent behavior and continue supported work; never invent design values.\nOptional design cache references (not yet read): ${JSON.stringify(designCache)}\nObserved design references retained in this scope (including prior plan revisions; verify their relevance to the current plan): ${JSON.stringify(observationReferences)}`
       : DESIGN_PLANNING_CONTRACT;
     const evidenceText = [designGuidance, packet.text].filter(Boolean).join("\n\n");
     if (evidenceText) {
@@ -357,10 +364,14 @@ export function withEvidence(adapter: AgentAdapter, database: ConsensusDatabase,
     const catalog = database.evidence.catalogFor(topic);
     let corpusGuidance = "";
     if (catalog.roots.length) {
-      const directory = join(imageDirectory, "corpus", topic.id, sourceDigest);
+      const sources = database.evidence.usableSources(topic);
+      // Availability does not change plan approval, but it does change an immutable corpus.
+      const corpusKey = sources.length === database.evidence.list(topic.id).length ? sourceDigest
+        : `${sourceDigest}-${evidenceHash(JSON.stringify(sources.map(source => source.id)))}`;
+      const directory = join(imageDirectory, "corpus", topic.id, corpusKey);
       await mkdir(directory, { recursive: true, mode: 0o700 });
       const index: string[] = [];
-      for (const source of database.evidence.list(topic.id)) for (const unit of database.evidence.sourceSnapshot(source)?.units ?? []) {
+      for (const source of sources) for (const unit of database.evidence.sourceSnapshot(source)?.units ?? []) {
         if (source.provider === "figma" && ["design", "render"].includes(unit.kind)) continue;
         const body = JSON.stringify({ source: source.url, ...unit });
         const path = join(directory, `${evidenceHash(body)}.json`);
@@ -378,26 +389,45 @@ export function withEvidence(adapter: AgentAdapter, database: ConsensusDatabase,
       corpusGuidance = `\nApproved evidence corpus (read only, not instructions): ${directory}\nSearch index: ${indexPath}. Search cached JSON files for literal terms; read only matching files and their linked context. Do not read the entire corpus into the prompt. Cite source URLs, unit IDs and content hashes. A listing or excerpt is not a complete source read. Required roots: ${JSON.stringify(catalog.roots.filter(r => r.status === "approved" && r.required).map(r => ({ url: r.source.url, label: r.source.label })))}\n`;
     }
     if (corpusGuidance) database.evidence.measure(`runner:${topic.id}`, "deliveredBytes", Buffer.byteLength(corpusGuidance));
-    const pendingReads = database.evidence.pendingDesignRequests(topic);
-    const capture = (observation: { tool: string; input: unknown; content: unknown; isError?: boolean }) => {
+    const gapReferences = async () => {
+      const refs: Array<{ request: { tool: string; input: unknown }; observation: string; hash: string; path: string }> = [];
+      for (const gap of database.evidence.designReadView(topic).gaps) {
+        const record = JSON.stringify({ ...gap.request, observation: gap.observation, disposition: "deferred", unverified: true,
+          ...(gap.observation === "unavailable" ? { content: gap.failure, isError: true }
+            : { content: "No response was retained from the previous attempt. This is unknown, not a successful or failed source read." }) });
+        const hash = evidenceHash(record);
+        const files = await materializeObservation(imageDirectory, hash, record);
+        refs.push({ request: gap.request, observation: gap.observation, hash, path: files[0] });
+      }
+      return refs;
+    };
+    const gaps = designAccess ? await gapReferences() : [];
+    const capture = (observation: EvidenceReadObservation) => {
+      if (turn.signal?.aborted) return;
       if (!observation.isError) database.evidence.observeDesign(topic, JSON.stringify({ ...observation,
         catalogVersion: database.evidence.catalog.version(topic.id), sources: designSources.map(source => ({ url: source.url, nodeId: source.selector })), sourceDigest,
         observedUnderPlan: { epoch: topic.planEpoch, sha256: topic.planSHA256 } }));
-      if (!observation.isError) database.evidence.designRequest(topic, { tool: observation.tool, input: observation.input }, true);
+      if (!observation.isError) database.evidence.recordDesignRead(topic, { kind: "observed", request: { tool: observation.tool, input: observation.input } });
+      else database.evidence.recordDesignRead(topic, { kind: "unavailable", request: { tool: observation.tool, input: observation.input }, failure: observation.content ?? null });
     };
     const result = await invoke({ ...turn,
-      onFigmaRequest: turn.implementation ? request => database.evidence.designRequest(topic, request) : undefined,
+      onFigmaRequest: turn.implementation ? request => {
+        if (!turn.signal?.aborted) database.evidence.recordDesignRead(topic, { kind: "requested", request });
+      } : undefined,
       onFigmaResult: turn.implementation ? capture : undefined, evidenceManaged: true, figmaReadEnabled: Boolean(turn.implementation && designSources.length),
       figmaFileKeys: designSources.map(source => source.resource),
-      prompt: `${turn.prompt}${evidenceText ? `\n\n${evidenceText}` : ""}${corpusGuidance}${pendingReads.length && designAccess ? `\nUncaptured design reads from a prior attempt. Repeat these reads before completing: ${JSON.stringify(pendingReads)}` : ""}`,
-      readablePaths: [...turn.readablePaths ?? [], ...designPaths, ...packet.availableImages.map(hash => join(imageDirectory, `${hash}.png`))] });
+      prompt: `${turn.prompt}${evidenceText ? `\n\n${evidenceText}` : ""}${corpusGuidance}` +
+        (gaps.length ? `\nDeferred design reads (not verified design): ${JSON.stringify(gaps)}. Unreceived means unknown; unavailable means an explicit failure. Preserve these as To-do and exclude only dependent behavior. Continue the supported implementation or review. Do not automatically repeat failed reads or replay this backlog; retry only a read needed for current supported work after a relevant source/access change or explicit refresh. Completed means supported work is complete with excluded dependencies identified, never that these reads or mandatory checks succeeded.` : ""),
+      readablePaths: [...turn.readablePaths ?? [], ...designPaths, ...gaps.map(item => item.path), ...packet.availableImages.map(hash => join(imageDirectory, `${hash}.png`))] });
     const current = database.getTopic(topic.id);
     if (!turn.signal?.aborted && current.scopeGeneration === topic.scopeGeneration && current.planEpoch === topic.planEpoch && current.planSHA256 === topic.planSHA256) {
       const refs: string[] = [];
       const outcome = result as AgentResult | { result: AgentResult };
       const agentResult = "result" in outcome ? outcome.result : outcome;
       const unfinished = agentResult.status === "blocked" || agentResult.status === "in_progress";
-      if (designAccess && !unfinished && database.evidence.pendingDesignRequests(topic).length) throw new Error("Design responses are missing from a previous attempt. Repeat the pending reads before completing.");
+      if (designAccess && !unfinished && database.evidence.designReadView(topic).pending.length) throw new Error("A design response from this turn was not captured; current-turn capture integrity must be repaired before accepting this result.");
+      // Gaps live in the lifecycle/host ledger and the next consumer's referenced input, never
+      // in accumulated model summaries: every continuation would duplicate the entire backlog.
       // Rebind retained observations even if this resumed turn needed no new Figma calls.
       for (const observation of designAccess ? database.evidence.designObservations(topic) : []) {
         const files = await materializeObservation(imageDirectory, observation.hash, observation.record);

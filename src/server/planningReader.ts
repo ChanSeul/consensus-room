@@ -12,6 +12,9 @@ export class InvalidPlanningOffset extends PlanningPaused {
 export class PlanningDirectoryRead extends PlanningPaused {
   constructor() { super("Requested path is a directory, not file evidence. Request a regular file inside it or use a path::literal search."); }
 }
+export class UnavailablePlanningEvidence extends PlanningPaused {
+  constructor() { super("External evidence is unavailable in this snapshot. Defer this source and dependent work as To-do; continue with available evidence."); }
+}
 export function utf8Slice(text: string, offset: number, limit: number): { text: string; next: number | null } {
   const bytes = Buffer.from(text);
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > bytes.length || (offset < bytes.length && (bytes[offset] & 0xc0) === 0x80)) {
@@ -31,7 +34,7 @@ function safeSelector(path: string): void {
 
 export class PlanningReader {
   constructor(private readonly root: string, private readonly tree: string,
-    readonly documents: ReadonlyMap<string, string>) {
+    readonly documents: ReadonlyMap<string, string>, private readonly evidenceAvailable: (selector: string) => boolean = () => true) {
     if (!/^[a-f0-9]{40,64}$/.test(tree)) throw new Error("Invalid snapshot tree");
   }
   private async git(args: string[]): Promise<string> {
@@ -44,17 +47,24 @@ export class PlanningReader {
       throw new PlanningPaused("Snapshot read unavailable or too large; narrow the requested path or search.");
     }
   }
+  assertAvailable(request: PlanningRead): void {
+    if (request.kind === "evidence" && !this.evidenceAvailable(request.selector)) throw new UnavailablePlanningEvidence();
+  }
   async read(request: PlanningRead): Promise<PlanningFragment> {
+    this.assertAvailable(request);
     if (request.kind === "image") throw new PlanningPaused("Images must use the pinned evidence image broker.");
     let text: string;
     if (["context", "memory", "evidence", "artifact"].includes(request.kind)) {
       const value = this.documents.get(`${request.kind}:${request.selector}`);
-      if (value === undefined) throw new PlanningPaused("Requested source is not in the pinned manifest.");
+      if (value === undefined) {
+        if (request.kind === "evidence") throw new UnavailablePlanningEvidence();
+        throw new PlanningPaused("Requested source is not in the pinned manifest.");
+      }
       text = value;
     } else if (request.kind === "search" && request.selector.startsWith("evidence::")) {
       const needle = request.selector.slice("evidence::".length).trim().toLocaleLowerCase();
       if (!needle) throw new PlanningPaused("Evidence search literal is empty.");
-      text = [...this.documents].filter(([key, body]) => key.startsWith("evidence:") && `${key}\n${body}`.toLocaleLowerCase().includes(needle))
+      text = [...this.documents].filter(([key, body]) => key.startsWith("evidence:") && this.evidenceAvailable(key.slice("evidence:".length)) && `${key}\n${body}`.toLocaleLowerCase().includes(needle))
         .map(([key, body]) => {
           const at = Math.max(0, body.toLocaleLowerCase().indexOf(needle) - 120);
           return JSON.stringify({ selector: key.slice("evidence:".length), hash: planningHash(body), excerpt: body.slice(at, at + 800) });

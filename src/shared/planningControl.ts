@@ -6,6 +6,29 @@ export const PlanningMigrationSchema = z.object({
 }).strict();
 export type PlanningMigration = z.infer<typeof PlanningMigrationSchema>;
 
+// This authorizes continuation with unknown cost; it never claims missing usage was measured.
+export const PlanningUsageRecoverySchema = z.object({
+  checkpointId: z.string().min(1), checkpointSHA256: z.string().regex(/^[a-f0-9]{64}$/),
+  gapIds: z.array(z.string().min(1)).min(1).max(100),
+  acceptUnknownUsage: z.literal(true), reason: z.string().trim().min(1).max(2000),
+}).strict();
+export type PlanningUsageRecovery = z.infer<typeof PlanningUsageRecoverySchema>;
+export interface PlanningUsageGap {
+  id: string; round: number; sessionId: string | null; executionId?: string;
+  observedUsage: Partial<PlanningUsage>; missingFields: string[];
+  authorization?: { requestKey: string; reason: string; at: string };
+}
+
+export function planningUsageGaps(record: PlanningCheckpoint): PlanningUsageGap[] {
+  if (!record.usageIncomplete) return [];
+  // Legacy checkpoints retain the whole unknown attempt; no fabricated per-call measurement.
+  return record.usageGaps?.length ? record.usageGaps : [{ id: `legacy:${record.admissionId}`, round: record.round,
+    sessionId: record.sessionId, observedUsage: {}, missingFields: ["legacy-call-usage"] }];
+}
+export function planningUsageBlocked(record: PlanningCheckpoint): boolean {
+  return planningUsageGaps(record).some(gap => !gap.authorization);
+}
+
 // 한 호출 패킷 한도(계획 64KiB·검토 96KiB)는 자료 분할 기준이다. 같은 세션의 누적 호스트 입력·응답은 측정값으로만 남기고 다음 호출을 막는 기준으로 쓰지
 // 않는다(plan §3.6, E3-3a — 예전 검토 누적 한도 감사 256KiB·종결 384KiB 는 제거했다). 조사 회차도 측정값이다 — 회차 수만으로 최종 정리를 강제하지 않고
 // (예전 고정 회차 8 + 정리 1 은 제거, E3-4a), 진척 없는 반복(stalledRounds)·예산 soft limit·취소·권한·공급자 오류가 끊는다.
@@ -66,6 +89,9 @@ export interface PlanningCheckpoint {
   version: 1; id: string; key: string; topicId: string; role: "claude" | "codex";
   stage: string; tree: string; evidenceDigest: string; instructionHash: string;
   scopeGeneration: number; planEpoch: number; prompt: string; inputSequence: number;
+  // Both task versions and their delivery descriptors belong to the same logical attempt.
+  // Operational pause/retry events must not silently replace the saved full-context version.
+  taskContext?: { freshSessionPrompt?: string; timelineDelivery?: TimelineDelivery; readablePaths?: readonly string[] };
   planSHA256: string | null;
   admissionId: string; round: number; stalled: number; sessionId: string | null;
   step: PlanningStep; fragments: PlanningFragment[]; delivered: string[];
@@ -74,13 +100,17 @@ export interface PlanningCheckpoint {
   usage: PlanningUsage; updatedAt: string; stopped: string | null;
   finalized: boolean; finalAttempted: boolean;
   citationRepairAttempted?: boolean;
+  checkpointRepair?: { bytes: number; attempted: boolean };
   started: boolean; injectedBytes: number;
   sourceHash?: string;
+  // Selected memory and approved artifacts are decision premises, independent of the external corpus.
+  premiseHash?: string;
   deliveredContractHash?: string;
   // The task body is a required context document when its inline packet would overflow.
   // Reading is tracked in the existing per-session byte-range receipts, not another attempt.
   taskReference?: Pick<TimelineReference, "selector" | "hash" | "bytes" | "unit" | "version">;
   instructionReference?: Pick<TimelineReference, "selector" | "hash" | "bytes" | "unit" | "version">;
+  contextReferences?: Array<Pick<TimelineReference, "selector" | "hash" | "bytes" | "unit" | "version">>;
   deliveredInstructionHash?: string;
   peakStep?: PlanningUsage;
   lastRequestInputTokens?: number;
@@ -88,6 +118,7 @@ export interface PlanningCheckpoint {
   imageBytes?: number;
   responseBytes?: number;
   usageIncomplete?: boolean;
+  usageGaps?: PlanningUsageGap[];
   metrics?: PlanningMetrics;
   sessions?: string[];
   // 앞선 대화들의 누적(엔진 개편 E2b) — 참여자가 바뀌어 한 논리 시도가 대화 여럿에 걸치면, 이 레코드의 round·started·injectedBytes 등은 지금 대화의
@@ -95,6 +126,15 @@ export interface PlanningCheckpoint {
   priorAttempt?: { rounds: number; started: boolean; injectedBytes: number; imageBytes: number; deliveredFragments: number };
   lastResponse?: import("./contracts.js").AgentResult;
   responsePending?: boolean;
+  // Actual delivery paired with the saved response; never infer reads from a reconstructed packet.
+  pendingResponseReceipt?: {
+    sessionId: string | null; contract: RecoveryContract; inputSequence: number;
+    sourceHash: string; instructionHash: string; responseHash: string;
+    presented: TimelineReference[];
+    reads: Array<Pick<PlanningFragment, "kind" | "selector" | "hash" | "offset" | "nextOffset">>;
+  };
+  // A recoverable provider failure must survive a pause for unknown usage, before another call.
+  pendingProviderRecovery?: { sessionId: string | null; contract: RecoveryContract; error: RecoveryError };
   // 최근 응답의 complete 를 중간 단계로 강등했는가(E3-4a Q-A·Q-A2, host-review 39d21df9 F002) — 청한 읽기 수, 끝까지 읽지 않은 필수 타임라인 참조 수, 아직
   // 채택되지 않은 이연 읽기 수. raw 는 lastResponse 에 그대로 있다.
   demotedComplete?: { requests: number; unreadRequired: number; deferred: number };
@@ -114,6 +154,9 @@ export interface PlanningCheckpoint {
   // 상속 조각 재검증이 전달로 되살릴 때 적는다. 색인 문서 자체는 적지 않는다(무관한 위키 편집이 시도를 초기화하지 않게). 실행 시작 때 지금 버전과
   // 다르면 원문 변경(sourceChanged)으로 다루고, 실행 중 현재성 검사는 멈춘다. 원문 변경 초기화가 사실·조각·전달과 함께 지운다.
   memoryReads?: Record<string, string>;
+  // Only external fragments and their source dependencies; availability never resets local research.
+  evidenceFragments?: Record<string, string[]>;
+  deferredEvidenceSources?: string[];
   imageHash?: string;
   finalResult?: import("./contracts.js").AgentResult;
   // 이 체크포인트가 문서로 싣는 타임라인 참조(E3-2-2a) — 만들 때 고정한다. 읽기가 진행돼도 문서 목록이 줄지 않아야 체크포인트가 초기화되지 않는다.
@@ -173,7 +216,7 @@ export interface RecoveryLineage {
 }
 
 export class PlanningPaused extends Error {
-  constructor(message: string) { super(message); this.name = "PlanningPaused"; }
+  constructor(message: string, readonly reason: "control" | "evidence" = "control") { super(message); this.name = "PlanningPaused"; }
 }
 
 // 타임라인 버전 고정 참조(E3-2-2a). 엔진이 불변 timeline_events 행으로 만든 이 descriptor 가 정본이다 — 프롬프트의 참조 줄은 모델용 표시일 뿐이고,

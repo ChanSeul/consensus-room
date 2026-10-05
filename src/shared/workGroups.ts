@@ -57,9 +57,16 @@ export const WorkQuestionSchema = z
     text: z.string().trim().min(1),
     blocksStart: z.boolean().default(false),
     resolution: z.string().trim().min(1).optional(),
+    // Preserve unresolved scope as a follow-up, without treating it as a confirmed contract.
+    deferredReason: z.string().trim().min(1).optional(),
   })
   .strict();
 export type WorkQuestion = z.infer<typeof WorkQuestionSchema>;
+
+export function workQuestionResultText(question: Pick<WorkQuestion, "id" | "text" | "deferredReason">): string {
+  return `${question.id}: ${question.text}${question.deferredReason
+    ? ` — 미해소·후속 확인(To-do): ${question.deferredReason}. 해결된 계약이 아니며, 이 질문에 의존하는 동작은 구현에서 제외하고 원문 재확인 후 판단하세요.` : ""}`;
+}
 
 export const WorkGroupInputSchema = z
   .object({
@@ -188,6 +195,8 @@ export interface StageResult {
   verifications: Array<{ id: string; status: string }>;
   memoryChanges: Array<{ path: string; sha256: string }>;
   openQuestions: string[];
+  // Optional new-format exclusions; legacy openQuestions and their context hashes remain unchanged.
+  deferredQuestions?: Array<Pick<WorkQuestion, "id" | "text" | "deferredReason">>;
   // 그 단계 토픽의 보류 지적 원장(deferred-findings, 닫을 때) — 잘라내지 않는다(host-review F007). legacy 결과는 빈 목록.
   deferredFindings: DeferredFinding[];
   // 그 단계 현재 범위 세대의 사용자 결정 원문 전부(§4.1) — legacy 결과는 빈 목록.
@@ -240,6 +249,7 @@ export interface WorkGroupView extends WorkGroup {
   stageStates: Record<string, string | null>;
   delivery: Record<string, { committedOID: string | null; pushedOID: string | null }>;
   delivered: boolean;
+  continuation?: { groupId: string; stageId: string | null; reason: string | null };
   readyStages: string[];
   selectableStages: string[];
   replanPending: string[];
@@ -249,7 +259,7 @@ export interface WorkGroupView extends WorkGroup {
 export function stageReady(group: Pick<WorkGroupInput, "stages" | "questions">, stageId: string): boolean {
   const stage = group.stages.find((s) => s.id === stageId);
   if (!stage || !stage.acceptance) return false;
-  return !(group.questions ?? []).some((q) => q.blocksStart && !q.resolution && (q.stageId === null || q.stageId === stageId));
+  return !(group.questions ?? []).some((q) => q.blocksStart && !q.resolution && !q.deferredReason && (q.stageId === null || q.stageId === stageId));
 }
 // 의존 추이 폐포(자기 제외).
 export function dependencyClosure(group: Pick<WorkGroupInput, "stages">, stageId: string): string[] {

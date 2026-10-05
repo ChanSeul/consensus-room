@@ -72,6 +72,6 @@ it("실제 큰 개정을 익명화한 사례에서 동일 결과를 더 작은 �
 });
 
 it("정책 값이 잘못되면 값 보존 부분 교정을 호출할 후보로 고르지 않는다", () => {
-  const planMarkdown = '```tolerance\n{"scopePaths":[],"rules":[]}\n```\n';
+  const planMarkdown = '```tolerance\n{"scopePaths":[" "],"rules":[]}\n```\n';
   expect(repairablePlan({kind:"PLAN",summary:"x",findings:[],evidenceRefs:[],planMarkdown})).toBeNull();
 });

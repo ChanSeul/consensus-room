@@ -1,8 +1,14 @@
 import { createHash } from "node:crypto";
+import { sourceStringEnd, type SourceStringCache } from "./sourceStrings";
 
 import type { AgentResult, Finding, Participant, PlanEdit, WorkflowState } from "./contracts";
 import { FIX_AWARE_KINDS, FindingSchema, RESPONSE_RESOLVED_IDS_LIMIT, validatePlanHeadings } from "./contracts";
 import { parseTolerancePolicy } from "./tolerance";
+
+export const DELIVERY_RESUME_STATES = ["IMPLEMENTING", "CODEX_REVIEW", "CLAUDE_FIX", "CODEX_FINAL_REVIEW"] as const;
+export type DeliveryResumeState = typeof DELIVERY_RESUME_STATES[number];
+export const isDeliveryResumeState = (state: unknown): state is DeliveryResumeState =>
+  DELIVERY_RESUME_STATES.some(candidate => candidate === state);
 
 export const ACTIVE_WORKFLOW_STATES: ReadonlySet<WorkflowState> = new Set([
   "BRAINSTORMING",
@@ -32,15 +38,15 @@ const NEXT_STATES: Readonly<Record<WorkflowState, ReadonlySet<WorkflowState>>> =
   CLAUDE_REVISION: new Set(["CODEX_CLOSEOUT", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED", "FAILED"]),
   // CLAUDE_REVISION 포함: 종결 확인의 새 쟁점은 처음부터 다시 도는 대신 개정 2회차(바퀴당 1회)로 반영한다(2026-09-07).
   CODEX_CLOSEOUT: new Set(["CONSENSUS_ACK", "CLAUDE_REVISION", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED", "FAILED"]),
-  CONSENSUS_ACK: new Set(["AWAITING_USER_APPROVAL", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED", "FAILED"]),
-  AWAITING_USER_APPROVAL: new Set(["IMPLEMENTING", "DRAFT", "FAILED"]),
+  CONSENSUS_ACK: new Set(["AWAITING_USER_APPROVAL", "CLAUDE_REVISION", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED", "FAILED"]),
+  AWAITING_USER_APPROVAL: new Set(["IMPLEMENTING", "DRAFT", "CLAUDE_REVISION", "USER_DECISION_REQUIRED", "FAILED"]),
   IMPLEMENTING: new Set(["CODEX_REVIEW", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED", "FAILED"]),
   CODEX_REVIEW: new Set(["CLAUDE_FIX", "READY_TO_DELIVER", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED", "FAILED"]),
   CLAUDE_FIX: new Set(["CODEX_FINAL_REVIEW", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED", "FAILED"]),
   CODEX_FINAL_REVIEW: new Set(["READY_TO_DELIVER", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED", "FAILED", "CLAUDE_FIX"]),
   // CLAUDE_FIX: 인도 대기 중 발견한 외부 검증 실패를 중재자 진단으로 반환한다 — 진단 전용 수정 작업 → 최종 리뷰(2026-09-14 진단 계획).
   // CLAUDE_PLAN: 계획 변경이 필요한 중재자 진단 — 진단 계획 개정 턴(→ 감사·종결·ACK·사용자 승인). 작업 트리·브랜치·구현 기준은 보존한다.
-  READY_TO_DELIVER: new Set(["CLOSED", "DRAFT", "FAILED", "CLAUDE_FIX", "CLAUDE_PLAN", "USER_DECISION_REQUIRED"]),
+  READY_TO_DELIVER: new Set(["CLOSED", "DRAFT", "FAILED", "CLAUDE_FIX", "CLAUDE_PLAN", "CLAUDE_REVISION", "USER_DECISION_REQUIRED"]),
   CLOSED: new Set(),
   BLOCKED_ON_EVIDENCE: new Set([
     "BRAINSTORMING",
@@ -243,6 +249,8 @@ export function carryForwardFindings(
   const carried: Finding[] = [];
   for (const finding of source) {
     if (present.has(finding.id) || !isSettledFinding(finding, options)) continue;
+    // Deferral is non-blocking, but its evidence and scope still require an explicit review judgment.
+    if (options.forReview && (finding.disposition === "DEFERRED_OUT_OF_SCOPE" || finding.evidenceGap)) continue;
     present.add(finding.id);
     carried.push({
       ...finding,
@@ -301,7 +309,8 @@ export function mergeCorrectionResult(original: AgentResult, corrected: AgentRes
   const originalSummary = original.summary.trim();
   let summary = corrected.summary;
   if (originalSummary && !corrected.summary.includes(originalSummary)) {
-    summary = `${corrected.summary.trimEnd()}${CORRECTION_SUMMARY_SEPARATOR}${originalSummary}`;
+    const summaries = [...corrected.summary.split(CORRECTION_SUMMARY_SEPARATOR), ...originalSummary.split(CORRECTION_SUMMARY_SEPARATOR)];
+    summary = [...new Set(summaries.map(value => value.trim()).filter(Boolean))].join(CORRECTION_SUMMARY_SEPARATOR);
     preserved.push("summary");
   }
   const { requestedUserDecision: _dropped, resolvesRequestedDecision: _flag, resolvedRequestId: _rid, resolvedRequestIds: _rids, ...rest } = corrected;
@@ -554,19 +563,350 @@ export function shouldRunFixPass(findings: readonly Finding[]): boolean {
   );
 }
 
+// Read a value without consuming its enclosing quotes, including quotes escaped
+// inside a JSON string. Replacing only this range preserves the caller's grammar.
+function credentialValue(text: string, offset: number, grammar: "assignment" | "cookie" | "authorization-pair" | "environment" = "assignment", limit = text.length,
+  sourceStrings: SourceStringCache = new Map()):
+  { start: number; end: number; after: number; quoted: boolean } {
+  if (text.startsWith("[REDACTED]", offset)) return { start: offset, end: offset + 10, after: offset + 10, quoted: false };
+  let quoteIndex = offset;
+  while (grammar !== "environment" && text[quoteIndex] === "\\") quoteIndex++;
+  const quote = text[quoteIndex];
+  if (quote === '"' || ((quote === "'" || quote === "`") && (grammar === "assignment" || grammar === "environment"))) {
+    const escapes = quoteIndex - offset, start = quoteIndex + 1;
+    if (!escapes && (quote === "`" || quote === '"') && (grammar === "assignment" || grammar === "environment")) {
+      const value = sourceStringEnd(text, quoteIndex, limit, sourceStrings);
+      return { start, end: value.after - (value.closed ? 1 : 0), after: value.after, quoted: true };
+    }
+    let fallbackEnd = limit;
+    for (let cursor = start; cursor < limit; cursor++) {
+      if (text[cursor] === "\n" || text[cursor] === "\r") {
+        fallbackEnd = Math.min(fallbackEnd, cursor);
+        if (grammar !== "assignment" && grammar !== "environment") break;
+      }
+      if (text[cursor] !== quote) continue;
+      let slashes = 0;
+      for (let index = cursor - 1; index >= start && text[index] === "\\"; index--) slashes++;
+      if (slashes % (2 * (escapes + 1)) === escapes)
+        return { start, end: cursor - escapes, after: cursor + 1, quoted: true };
+    }
+    return { start, end: fallbackEnd, after: fallbackEnd, quoted: true };
+  }
+  let end = offset;
+  const delimiter = grammar === "environment" ? /[\s,;]/ : grammar === "cookie" ? /[\s;,]/
+    : grammar === "authorization-pair" ? /[\s,]/ : /[\s,;&"'`)}\]|\\]/;
+  while (end < limit && !delimiter.test(text[end])) end++;
+  return { start: offset, end, after: end, quoted: false };
+}
+
+function redactCredentialValues(text: string, quotedContent: boolean): string {
+  const ranges: Array<{ start: number; end: number; replacement: string; priority: number }> = [];
+  const sourceStrings: SourceStringCache = new Map();
+  const valueAt = (offset: number, grammar: Parameters<typeof credentialValue>[2] = "assignment", limit = text.length) =>
+    credentialValue(text, offset, grammar, limit, sourceStrings);
+  const strings: Array<{ start: number; end: number }> = [];
+  // JSON string syntax belongs to the enclosing document, not to the credential
+  // grammar. Decode complete strings, redact their contents, and re-encode only
+  // changed contents. Never run the outer scanner inside those string spans.
+  for (const match of text.matchAll(/"(?:\\.|[^"\\])*"/g)) {
+    let slashes = 0;
+    for (let cursor = match.index! - 1; cursor >= 0 && text[cursor] === "\\"; cursor--) slashes++;
+    if (slashes % 2) continue;
+    let decoded: string;
+    try { decoded = JSON.parse(match[0]) as string; } catch { continue; }
+    const start = match.index!, end = start + match[0].length;
+    strings.push({ start, end });
+    const redacted = redactTextSecrets(decoded, true);
+    if (redacted !== decoded) ranges.push({ start: start + 1, end: end - 1,
+      replacement: JSON.stringify(redacted).slice(1, -1), priority: 1 });
+  }
+  const containing = <T extends { start: number; end: number }>(spans: readonly T[], index: number): T | undefined => {
+    let low = 0, high = spans.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (spans[middle].end <= index) low = middle + 1; else high = middle;
+    }
+    return low < spans.length && spans[low].start <= index ? spans[low] : undefined;
+  };
+  const insideString = (index: number) => containing(strings, index);
+  const shellLiterals: Array<{ start: number; end: number }> = [];
+  for (let start = text.indexOf("'"); start >= 0;) {
+    const json = insideString(start);
+    if (json) { start = text.indexOf("'", json.end); continue; }
+    const close = text.indexOf("'", start + 1);
+    const end = close < 0 ? text.length : close + 1;
+    shellLiterals.push({ start, end });
+    start = text.indexOf("'", end);
+  }
+  // Parameter annotations are code contracts, independent of their type names.
+  // Scope the exception to declarations; a standalone Authorization header must
+  // still be masked even when its value resembles a type identifier.
+  type ParameterSpan = { start: number; end: number; colon?: number };
+  const declarations: ParameterSpan[] = [];
+  const defaults = new Map<number, number>();
+  const comments: Array<{ start: number; end: number }> = [];
+  const blockStartByEnd = new Map<number, number>(), blockEndByStart = new Map<number, number>();
+  const blockStack: number[] = [];
+  // Balanced Swift blocks own their closing token even in a source fragment.
+  // Matching all pairs once avoids backward searches from each init candidate.
+  for (const token of text.matchAll(/\/\*|\*\//g)) {
+    if (token[0] === "/*") blockStack.push(token.index!);
+    else if (blockStack.length) {
+      const start = blockStack.pop()!, end = token.index! + 2;
+      blockStartByEnd.set(end, start);
+      blockEndByStart.set(start, end);
+    }
+  }
+  const quoteEnd = (start: number): number => sourceStringEnd(text, start, text.length, sourceStrings).after;
+  const lineStarts = [0, ...Array.from(text.matchAll(/\r\n?|\n/g), match => match.index! + match[0].length)];
+  const lineComments = new Map<number, number>();
+  const beforeComment = new Map<number, string | undefined>();
+  const previousCodeCharacter = (offset: number): string | undefined => {
+    let previous = offset - 1;
+    const visited: number[] = [];
+    const finish = (character: string | undefined): string | undefined => {
+      for (const start of visited) beforeComment.set(start, character);
+      return character;
+    };
+    while (previous >= 0) {
+      if (/\s/.test(text[previous])) { previous--; continue; }
+      const blockStart = blockStartByEnd.get(previous + 1);
+      if (blockStart !== undefined) {
+        if (beforeComment.has(blockStart)) return finish(beforeComment.get(blockStart));
+        visited.push(blockStart);
+        previous = blockStart - 1;
+        continue;
+      }
+      let low = 0, high = lineStarts.length;
+      while (low + 1 < high) {
+        const middle = (low + high) >>> 1;
+        if (lineStarts[middle] <= previous) low = middle; else high = middle;
+      }
+      const start = lineStarts[low], end = lineStarts[low + 1] ?? text.length;
+      if (!lineComments.has(start)) {
+        let comment = -1;
+        for (let cursor = start; cursor < end;) {
+          if (text[cursor] === '"' || text[cursor] === "'") { cursor = quoteEnd(cursor); continue; }
+          const blockEnd = blockEndByStart.get(cursor);
+          if (blockEnd !== undefined) { cursor = blockEnd; continue; }
+          if (text.startsWith("//", cursor)) { comment = cursor; break; }
+          cursor++;
+        }
+        lineComments.set(start, comment);
+      }
+      const comment = lineComments.get(start)!;
+      if (comment >= 0 && comment <= previous) {
+        // Cache the predecessor of the whole comment chain, not just its text.
+        // Many declaration-like words in consecutive comments otherwise walk
+        // the same earlier lines once for every candidate.
+        if (beforeComment.has(comment)) return finish(beforeComment.get(comment));
+        visited.push(comment);
+        previous = comment - 1;
+        continue;
+      }
+      return finish(text[previous]);
+    }
+    return finish(undefined);
+  };
+  const declarationStarts = new Map<number, boolean>();
+  for (const match of text.matchAll(/\b(?:(?:func|function)\s+[A-Za-z_$][\w.$]*|init[!?]?|subscript|constructor)(?:<[^>\r\n]*>)?\s*\(/g)) {
+    if (previousCodeCharacter(match.index!) !== ".") {
+      declarationStarts.set(match.index! + match[0].length - 1, /^(?:func\b|init\b|subscript\b)/.test(match[0]));
+    }
+  }
+  type Declaration = { start: number; annotation: boolean; nestedComments: boolean; colon?: number; ranges: ParameterSpan[] };
+  const delimiters: Array<{ close: string; declaration?: Declaration }> = [];
+  const activeDeclarations: Declaration[] = [];
+  // Source islands start at a recognized declaration, not at prose parentheses
+  // or a preceding declaration. Each owns its comments, strings and parameters.
+  // One forward pass also preserves linear handling of truncated declarations.
+  for (let cursor = 0; declarationStarts.size && cursor < text.length; cursor++) {
+    const quoted = insideString(cursor);
+    if (quoted) { cursor = quoted.end - 1; continue; }
+    if (declarationStarts.has(cursor)) {
+      const declaration: Declaration = { start: cursor + 1, annotation: true,
+        nestedComments: declarationStarts.get(cursor)!, ranges: [] };
+      activeDeclarations.push(declaration);
+      delimiters.push({ close: ")", declaration });
+      continue;
+    }
+    if (!delimiters.length) continue;
+    const character = text[cursor];
+    if (character === "'" || character === "`") { cursor = quoteEnd(cursor) - 1; continue; }
+    if (text.startsWith("//", cursor)) {
+      let end = cursor + 2;
+      while (end < text.length && text[end] !== "\n" && text[end] !== "\r") end++;
+      comments.push({ start: cursor, end });
+      cursor = end - 1;
+      continue;
+    }
+    if (text.startsWith("/*", cursor)) {
+      let end: number;
+      if (activeDeclarations.at(-1)!.nestedComments) {
+        end = blockEndByStart.get(cursor) ?? text.length;
+      } else {
+        const close = text.indexOf("*/", cursor + 2);
+        end = close < 0 ? text.length : close + 2;
+      }
+      comments.push({ start: cursor, end });
+      cursor = end - 1;
+      continue;
+    }
+    const top = delimiters.at(-1)!;
+    if (top.declaration && (character === "," || character === "=")) {
+      const declaration = top.declaration;
+      if (declaration.annotation) {
+        declaration.ranges.push({ start: declaration.start, end: cursor + (character === "=" ? 1 : 0), colon: declaration.colon });
+        if (character === "=" && declaration.colon !== undefined) defaults.set(declaration.colon, cursor + 1);
+      }
+      declaration.start = cursor + 1;
+      declaration.annotation = character === ",";
+      declaration.colon = undefined;
+    } else if (top.declaration?.annotation && character === ":") {
+      top.declaration.colon ??= cursor;
+    } else if ("([{<".includes(character) && (character !== "<" || activeDeclarations.at(-1)?.annotation)) {
+      delimiters.push({ close: ")]}>"["([{<".indexOf(character)] });
+    } else if (character === top.close) {
+      delimiters.pop();
+      if (top.declaration) {
+        activeDeclarations.pop();
+        const declaration = top.declaration;
+        if (declaration.annotation) declaration.ranges.push({ start: declaration.start, end: cursor, colon: declaration.colon });
+        for (const range of declaration.ranges) declarations.push(range);
+      }
+    }
+  }
+  const afterTrivia = (offset: number): number => {
+    while (offset < text.length) {
+      if (/\s/.test(text[offset])) { offset++; continue; }
+      const comment = containing(comments, offset);
+      if (!comment) break;
+      offset = comment.end;
+    }
+    return offset;
+  };
+  declarations.sort((a, b) => a.start - b.start);
+  const placeholder = (value: string, variable = false) => /^(?:\[REDACTED\]|<[^<>\r\n]+>)$/.test(value.trim()) ||
+    (variable && /^\$/.test(value.trim()));
+  const add = (value: ReturnType<typeof credentialValue>, variable = false) => {
+    if (value.end > value.start && !placeholder(text.slice(value.start, value.end), variable))
+      ranges.push({ start: value.start, end: value.end, replacement: "[REDACTED]", priority: 0 });
+  };
+  const parameter = (key: number): boolean => {
+    const colon = text.indexOf(":", key), defaultStart = defaults.get(colon);
+    // Privacy does not depend on a complete declaration or type exemption.
+    // A truncated declaration still has a literal credential default to mask.
+    if (defaultStart !== undefined) {
+      const value = valueAt(afterTrivia(defaultStart));
+      if (value.quoted) add(value);
+    }
+    const declaration = containing(declarations, key);
+    return declaration !== undefined && declaration.colon === colon;
+  };
+  for (const match of text.matchAll(/(^|[\s,({?&]|["'`](?=[\w-]+\s*=))((?:password|passwd|token|secret|api[_-]?key|access[_-]?token|auth[_-]?token|refresh[_-]?token)\s*[:=]\s*)/gi)) {
+    if (insideString(match.index! + match[1].length)) continue;
+    // Keep an opaque quoted namespace:value label. Actual JSON credential keys
+    // are handled before this pass; log fields and = assignments remain scanned.
+    if (quotedContent && match.index === 0 && /^[\w-]+:$/.test(match[2])) continue;
+    if (/:\s*$/.test(match[2]) && parameter(match.index! + match[1].length)) continue;
+    const value = valueAt(match.index! + match[0].length);
+    const literal = text.slice(value.start, value.end);
+    const query = match[1] === "?" || match[1] === "&";
+    if (!query && !value.quoted && (/[(]/.test(literal) ||
+        (/:(?:\s*)$/.test(match[2]) && /^(?:String|NSString|Data|Int|Bool|Token)(?:[?<].*)?$/.test(literal)) ||
+        /^(?:read|use|from|the|only|never|true|false|null|undefined|nil)$/i.test(literal))) continue;
+    add(value, !query && !value.quoted && !containing(shellLiterals, match.index! + match[1].length));
+  }
+  // Environment assignments use the same decoded-string and value boundaries.
+  // Running a regex after JSON re-encoding can consume the closing quote escape.
+  for (const match of text.matchAll(/\b[A-Z][A-Z0-9_]{1,60}(?:_KEY|_TOKEN|_SECRET|_PASSWORD|_PASSWD|_CREDENTIALS?)\s*=\s*/g)) {
+    if (insideString(match.index!)) continue;
+    const shell = containing(shellLiterals, match.index!);
+    const limit = shell && text[shell.end - 1] === "'" ? shell.end - 1 : text.length;
+    add(valueAt(match.index! + match[0].length, "environment", limit));
+  }
+  const pairPattern = /[^\s=;,"'`|\\]+\s*=\s*/y;
+  const schemePattern = /[A-Za-z][A-Za-z0-9_-]*\s+/y;
+  const typeSuffix = /\s*(?:[,)]|=)/y;
+  const redactPairs = (offset: number, separator: ";" | ",", limit: number): boolean => {
+    let cursor = offset, matched = false;
+    for (;;) {
+      pairPattern.lastIndex = cursor;
+      const pair = pairPattern.exec(text);
+      if (!pair || cursor + pair[0].length > limit) return matched;
+      matched = true;
+      const value = valueAt(cursor + pair[0].length, separator === ";" ? "cookie" : "authorization-pair", limit); add(value);
+      cursor = value.after;
+      while (cursor < limit && /\s/.test(text[cursor])) cursor++;
+      if (cursor >= limit) return matched;
+      if (text[cursor] !== separator) return matched;
+      cursor++;
+      while (cursor < limit && /\s/.test(text[cursor])) cursor++;
+    }
+  };
+  for (const match of text.matchAll(/\b(Authorization|Proxy-Authorization|Cookie|Set-Cookie)\s*:\s*/gi)) {
+    if (insideString(match.index!)) continue;
+    const cursor = match.index! + match[0].length;
+    if (parameter(match.index!)) continue;
+    // A shell's outer quotes are not Cookie octets. JSON-compatible double
+    // quotes were handled above; shell-only escapes still need this boundary.
+    const wrapper = text[match.index! - 1];
+    const wrapperEnd = wrapper === "'" || wrapper === '"' ? valueAt(match.index! - 1).end : -1;
+    const newline = text.indexOf("\n", cursor);
+    const limit = Math.min(wrapperEnd < 0 ? text.length : wrapperEnd, newline < 0 ? text.length : newline);
+    if (/cookie/i.test(match[1])) {
+      redactPairs(cursor, ";", limit);
+      continue;
+    }
+    const value = valueAt(cursor);
+    if (value.quoted) {
+      const literal = text.slice(value.start, value.end).replace(/^(?:Bearer|Basic)\s+/i, "");
+      if (!placeholder(literal)) add(value);
+      continue;
+    }
+    const first = text.slice(value.start, value.end);
+    typeSuffix.lastIndex = value.after;
+    if (/^(?:String|NSString|Data|Token)\??$/.test(first) && typeSuffix.test(text)) continue;
+    schemePattern.lastIndex = cursor;
+    const scheme = schemePattern.exec(text);
+    if (scheme) {
+      if (!/^(?:Basic|Bearer|Negotiate|Token)\s/i.test(scheme[0]) &&
+          redactPairs(cursor + scheme[0].length, ",", limit)) continue;
+      const token = valueAt(cursor + scheme[0].length);
+      if (!placeholder(text.slice(token.start, token.end))) {
+        if (token.quoted) add(token); else add({ ...token, start: cursor });
+      }
+    } else add(value);
+  }
+  const chunks: string[] = [];
+  let cursor = 0;
+  for (const range of ranges.sort((a, b) => a.start - b.start || b.end - a.end || a.priority - b.priority)) {
+    if (range.start < cursor) continue;
+    chunks.push(text.slice(cursor, range.start), range.replacement);
+    cursor = range.end;
+  }
+  chunks.push(text.slice(cursor));
+  return chunks.join("");
+}
+
 export function redactSecrets(value: string): string {
+  return redactTextSecrets(value, false);
+}
+
+function redactTextSecrets(value: string, quotedContent: boolean): string {
+  // JSON secret fields retain both delimiters. Free-text headers/assignments then
+  // redact value ranges rather than swallowing code, quotes or a whole line.
+  let text = value.replace(
+    /("(?:password|passwd|token|secret|api[_-]?key|access[_-]?token|auth[_-]?token|refresh[_-]?token|Authorization|Proxy-Authorization|Cookie|Set-Cookie)"\s*:\s*)"(?:\\.|[^"\\])*"/gi,
+    '$1"[REDACTED]"',
+  );
+  text = redactCredentialValues(text, quotedContent);
   const patterns: RegExp[] = [
-    /\b(Authorization|Proxy-Authorization|Cookie|Set-Cookie)\s*:\s*[^\r\n]+/gi,
     /\b(sk-(?:proj-)?[A-Za-z0-9_-]{12,})\b/g,
     /\b(gh[opsu]_[A-Za-z0-9]{20,})\b/g,
     /\b(xox[baprs]-[A-Za-z0-9-]{12,})\b/g,
     /\b(AKIA[A-Z0-9]{16})\b/g,
     /\b(Bearer\s+)[A-Za-z0-9._~+\/-]+=*/gi,
-    /\b(password|passwd|token|secret|api[_-]?key)\s*[:=]\s*([^\s,;]+)/gi,
-    // OPENAI_API_KEY=..., SENTRY_AUTH_TOKEN=... 같은 환경 변수 표기(감사 부차 지적).
-    /\b([A-Z][A-Z0-9_]{1,60}(?:_KEY|_TOKEN|_SECRET|_PASSWORD|_PASSWD|_CREDENTIALS?))\s*=\s*([^\s,;"']+)/g,
-    // { "token": "..." } 같은 JSON 표기.
-    /"(password|passwd|token|secret|api[_-]?key|access[_-]?token|auth[_-]?token|refresh[_-]?token)"\s*:\s*"[^"]*"/gi,
   ];
 
   return patterns.reduce((redacted, pattern) => {
@@ -582,7 +922,7 @@ export function redactSecrets(value: string): string {
       }
       return "[REDACTED]";
     });
-  }, value);
+  }, text);
 }
 
 export function resetParticipantsForScopeChange(participants: readonly Participant[]): Participant[] {

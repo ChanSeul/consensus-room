@@ -1,4 +1,4 @@
-import { MediatorInterruptStatusSchema } from "./mediatorInterrupts.js";
+import { MediatorConnectionStatusSchema, MediatorInterventionStatusSchema, MediatorInterruptStatusSchema } from "./mediatorInterrupts.js";
 import agentDefaults from "./agent-defaults.json";
 import { EngineDefectReportSchema } from "./engineDefects.js";
 import {ReviewAllowanceSchema,ReviewScopeSchema} from "./reviews.js";
@@ -101,6 +101,8 @@ export const FindingSchema = z.object({
   rationale: z.string().min(1),
   evidenceRefs: z.array(z.string()).default([]),
   requiresUserDecision: z.boolean().default(false),
+  // External originals only; never mandatory validation, code defects or approval.
+  evidenceGap: z.enum(["unavailable", "insufficient"]).optional(),
 });
 export type Finding = z.infer<typeof FindingSchema>;
 
@@ -351,7 +353,7 @@ export const DeferredFindingSchema = z.object({
   severity: FindingSchema.shape.severity,
   rationale: z.string(),
   // implementation/fix = 러너가 구현 중 범위 밖으로 판정해 to-do 로 남긴 것(DEFERRED_OUT_OF_SCOPE 처분, 2026-09-08).
-  source: z.enum(["closeout", "review", "final-review", "implementation", "fix"]),
+  source: z.enum(["closeout", "review", "final-review", "implementation", "fix", "evidence"]),
   topicId: z.string().min(1),
   recordedAt: z.string(),
 });
@@ -510,7 +512,7 @@ export const AgentResultJsonSchema = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["id", "title", "severity", "disposition", "rationale", "evidenceRefs", "requiresUserDecision"],
+        required: ["id", "title", "severity", "disposition", "rationale", "evidenceRefs", "requiresUserDecision", "evidenceGap"],
         properties: {
           id: { type: "string" },
           title: { type: "string" },
@@ -519,6 +521,7 @@ export const AgentResultJsonSchema = {
           rationale: { type: "string" },
           evidenceRefs: { type: "array", items: { type: "string" } },
           requiresUserDecision: { type: "boolean" },
+          evidenceGap: { anyOf: [{ enum: ["unavailable", "insufficient"] }, { type: "null" }] },
         },
       },
     },
@@ -645,6 +648,8 @@ export type UpdateMediationAutonomyInput = z.infer<typeof UpdateMediationAutonom
 // 러너 생존 표시 — GET /api/topics/:id/activity (2026-09-08).
 export const TopicActivitySchema = z.object({
   mediationInterrupt: MediatorInterruptStatusSchema.nullable().optional(),
+  mediationConnection: MediatorConnectionStatusSchema.optional(),
+  mediationIntervention: MediatorInterventionStatusSchema.nullable().optional(),
   planningProgress: z.object({
     version: z.number(), checkpointId: z.string(), stage: z.string(), round: z.number(), updatedAt: z.string(),
     questions: z.array(z.string()), stopped: z.string().nullable(), finalized: z.boolean(),
@@ -676,6 +681,8 @@ export const TopicActivitySchema = z.object({
   truncated: z.boolean(),
   // 사용 한도(429)로 FAILED 인 주제에 예약된 자동 재시도 시각(ISO). 없으면 null.
   autoRetryAt: z.string().nullable().default(null),
+  evidenceResumePending: z.boolean().optional(),
+  continuation: z.object({ pending: z.boolean(), step: z.string(), error: z.string().nullable() }).nullable().optional(),
   checkedAt: z.string(),
 });
 export type TopicActivity = z.infer<typeof TopicActivitySchema>;

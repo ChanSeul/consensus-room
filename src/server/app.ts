@@ -1,21 +1,23 @@
+import { monitorReviewProgress } from "./reviewProgress.js";
+import { ContinuationCoordinator } from "./engine/continuation.js";
 import { SessionSettingsTargetSchema, SessionSettingsUpdateSchema } from "../shared/sessionSettings.js";
 import { readSessionSettings, updateSessionSettings } from "./sessionSettings.js";
 import { buildSessionGraph } from "./sessionGraph.js";
 import { readHostReviewGraph } from "./hostReviewGraph.js";
-import { registerInterruptRoutes, interruptStatus } from "./mediation/interruptRoutes.js";
+import { registerInterruptRoutes, interruptStatus, mediatorConnectionStatus, mediatorInterventionStatus } from "./mediation/interruptRoutes.js";
 import { z } from "zod";
 import { SetTopicGoalSchema } from "../shared/topicStructure.js";
 import { parseEvidenceSource } from "../shared/externalEvidence.js";
 import { adoptTopics, assertTopicParent } from "./topicStructure.js";
 import { BrainstormDecisionSchema, BrainstormInputSchema } from "../shared/brainstorm.js";
-import { PlanningMigrationSchema } from "../shared/planningControl.js";
+import { PlanningMigrationSchema, PlanningUsageRecoverySchema } from "../shared/planningControl.js";
 import {ReviewGrantInputSchema} from "../shared/reviews.js";
 import { DIAGNOSIS_ID_PATTERN, DiagnosisInputSchema } from "../shared/diagnoses.js";
 import {
   ToolTreeRebaselineInputSchema,
   ResumeImplementationInputSchema, AmendToleranceInputSchema } from "../shared/contracts.js";
 import { RevisionGrantInputSchema } from "../shared/revisions.js";
-import { parseWorkGroupCreateBody, stageReady, WorkGroupInputSchema, type WorkGroupView } from "../shared/workGroups.js";
+import { parseWorkGroupCreateBody, WorkGroupInputSchema, type WorkGroupView } from "../shared/workGroups.js";
 import { WorkGroupService } from "./workGroupService.js";
 import { BudgetPolicySchema, BudgetResumeInputSchema } from "../shared/budgets.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -62,6 +64,18 @@ import { guardRunnerControl } from "./adapters/turnPolicy.js";
 import { RestEvidenceConnector, evidenceCredentials, type EvidenceConnector } from "./evidence/connectors.js";
 import { registerEvidenceRoutes } from "./evidence/routes.js";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
+import type { ServerResponse } from "node:http";
+import type { FastifyListenOptions } from "fastify";
+
+const initializers = new WeakMap<FastifyInstance, () => Promise<void>>();
+// Binding establishes port ownership first. Recovery must finish before readiness
+// or launch URL publication; unlike onListen, failures reject the startup caller.
+export async function listenReady(app: FastifyInstance, options: FastifyListenOptions): Promise<string> {
+  const address = await app.listen(options);
+  try { await initializers.get(app)?.(); }
+  catch (error) { await app.close(); throw error; }
+  return address;
+}
 
 export const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
 type SandboxProbeRun = (command: string, args: string[]) => Pick<SpawnSyncReturns<string>, "status" | "stderr" | "error">;
@@ -119,8 +133,8 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     database,
     artifacts,
     git,
-    claude: guardedPlanning(withEvidence(guardRunnerControl(dependencies.claude), database, join(config.dataDirectory, "evidence-images")), database, git, config.memoryDirectory, join(config.dataDirectory, "evidence-images")),
-    codex: guardedPlanning(withEvidence(guardRunnerControl(dependencies.codex), database, join(config.dataDirectory, "evidence-images")), database, git, config.memoryDirectory, join(config.dataDirectory, "evidence-images")),
+    claude: guardedPlanning(withEvidence(monitorReviewProgress(guardRunnerControl(dependencies.claude), database), database, join(config.dataDirectory, "evidence-images")), database, git, config.memoryDirectory, join(config.dataDirectory, "evidence-images")),
+    codex: guardedPlanning(withEvidence(monitorReviewProgress(guardRunnerControl(dependencies.codex), database), database, join(config.dataDirectory, "evidence-images")), database, git, config.memoryDirectory, join(config.dataDirectory, "evidence-images")),
     verifications,
     memory: new ProjectMemoryStore(config.memoryDirectory),
     executionLimits: config.executionLimits,
@@ -158,8 +172,12 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
         if(!parsed.success)throw new Error(`선행 토픽 ${topicId} 의 보류 원장 형식이 올바르지 않습니다.`);
         return parsed.data.findings;
       }});
+  const continuations = new ContinuationCoordinator(database, workflow, workGroups);
+  workflow.onSettled = () => continuations.wake();
   // 시작 URL의 일회성 token이나 인증 헤더가 request log에 남지 않도록 HTTP request logging을 끈다.
   const app = Fastify({ logger: false });
+  let phase: "created" | "recovering" | "ready" | "failed" | "stopping" = "created";
+  const streams = new Set<ServerResponse>();
 
   await app.register(cookie);
   app.addHook("onRequest", async (request, reply) => {
@@ -179,6 +197,14 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     const bearer = request.headers.authorization?.replace(/^Bearer\s+/i, "");
     const token = header ?? bearer ?? request.cookies.consensus_room_token;
     if (token !== config.launchToken) await reply.code(401).send({ error: "인증 토큰이 필요합니다." });
+  });
+
+  app.addHook("onRequest", async (_request, reply) => {
+    // In-process inject clients own their fixture DB and do not run startup recovery.
+    // A listening server, including health probes, must never observe half-recovered state.
+    if (phase === "stopping" || (app.server.listening && phase !== "ready")) {
+      return reply.code(503).send({ ok: false, error: "서버 시작 또는 종료 처리 중입니다." });
+    }
   });
 
   // 중재자 배정 확인(엔진 개편 E1): 중재자 헤더가 붙은 변경 요청은 적용 배정이 있으면 참여자·버전이 현재 배정과 같아야 한다.
@@ -233,13 +259,14 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   // 통합 단계 결과 커밋이 push 된 것이다(push 는 조상 전체를 싣는다) — 기능 검증 완료(통합 단계 CLOSED)와 구분한다. 닫힌 단계도 동결 결과를 push 한다.
   app.get("/api/work-groups",async()=>database.workGroups.list().map((group):WorkGroupView=>{
     const integration=group.stages.at(-1)!,integrationLink=group.links[integration.id],integrationResult=group.results?.[integration.id];
+    const continuation = workGroups.continuation(group), selectableStages = workGroups.selectableStages(group);
     return {...group,budget:database.budgets.account(group.id),
       stageStates:Object.fromEntries(group.stages.map(stage=>[stage.id,group.links[stage.id]?database.getTopic(group.links[stage.id].topicId).state:null])),
       delivery:Object.fromEntries(Object.entries(group.links).map(([stageId,link])=>{const flags=database.getFlags(link.topicId);return [stageId,{committedOID:flags.committedOID??null,pushedOID:flags.pushedOID??null}];})),
       // 묶음 전달 완료: 통합 결과 커밋이 묶음의 어느 연결 토픽에서든 push 됐다(변경 없는 통합은 다른 단계가 이미 push 한 기준 커밋이 결과일 수 있다 — E4 보완 F003).
       delivered:Boolean(integrationLink&&integrationResult&&Object.values(group.links).some(link=>database.getFlags(link.topicId).pushedOID===integrationResult.commitOID)),
-      readyStages:group.stages.filter(stage=>!group.links[stage.id]&&stageReady(group,stage.id)).map(stage=>stage.id),
-      selectableStages:workGroups.selectableStages(group),
+      readyStages:[...new Set([continuation.stageId, ...selectableStages].filter((id): id is string => id !== null))],
+      continuation, selectableStages,
       replanPending:group.stages.filter(stage=>group.links[stage.id]?.replanPending).map(stage=>stage.id)};
   }));
   app.post("/api/work-groups",async(request,reply)=>{
@@ -368,10 +395,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     if (request.headers["x-consensus-actor"] === "mediator") {
       throw Object.assign(new Error("중단된 엔진 결함 재개는 사용자만 요청할 수 있습니다."), { statusCode: 403 });
     }
-    const row = database.engineDefects.get(request.params.id);
-    if (row.status !== "blocked") throw Object.assign(new Error("blocked 작업만 재개할 수 있습니다."), { statusCode: 409 });
-    database.engineDefects.save({ ...row, status: "todo", error: undefined });
-    return database.engineDefects.get(row.id);
+    return engineDefects.retry(request.params.id);
   });
   // 프로필 역할 적합성(plan §2.5 "프로필 조회·검증", E2c) — 배정하면 역할·작업마다 실행할 수 있는지와 사유. 경로 판정과 같은 함수로 계산한다.
   app.get<{ Params: { id: string } }>("/api/agent-profiles/:id/suitability", async (request) => {
@@ -540,7 +564,10 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     const info = await workflow.resumeInfo(request.params.id);
     const assignment = database.roles.effective(info.topicId, "mediator");
     const policy = readMediationPolicy(DEFAULT_MEDIATION_POLICY_PATH);
-    return { ...info, mediation: { assignment, interrupt: interruptStatus(database, info.topicId), autonomy: readMediationAutonomy().autonomy, policyVersion: policy.version } };
+    const group = database.workGroups.forTopic(info.topicId);
+    return { ...info, workGroupContinuation: group ? workGroups.continuation(group) : null, mediation: { assignment, interrupt: interruptStatus(database, info.topicId),
+      connection: mediatorConnectionStatus(database, info.topicId), intervention: mediatorInterventionStatus(database, info.topicId),
+      autonomy: readMediationAutonomy().autonomy, policyVersion: policy.version } };
   });
 
   // 러너 생존 표시: 작업 트리 최근 변경 + 실행 중 액션 여부. 스캔은 10초 캐시(큰 트리 반복 스캔 방지).
@@ -560,6 +587,8 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     return {
       state: topic.state,
       mediationInterrupt: interruptStatus(database, topic.id),
+      mediationConnection: mediatorConnectionStatus(database, topic.id),
+      mediationIntervention: mediatorInterventionStatus(database, topic.id),
       runningAction: database.runningAction(topic.id) !== null,
       executionUsage: database.getExecutionUsage(topic.id),
       ...activity,
@@ -571,6 +600,12 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       reviewAllowances: [database.reviews.account(topic.id,"planning"),database.reviews.account(topic.id,"implementation")],
       reviewPaused: workflow.reviewPaused(topic.id),
       autoRetryAt: workflow.scheduledRetryAt(topic.id),
+      evidenceResumePending: database.evidence.resumes.get(topic.id) !== null,
+      continuation: (() => {
+        const record = database.continuations.get(topic.id);
+        return !record || ["complete", "cancelled"].includes(record.status) ? null
+          : { pending: record.status !== "blocked", step: record.step, error: record.error };
+      })(),
       checkedAt: new Date().toISOString(),
     };
   });
@@ -634,6 +669,12 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       key => workflow.migrateInterruptedPlanning(request.params.id, input, key, origin));
   });
 
+  app.post<{ Params: { id: string } }>("/api/topics/:id/planning-control/usage-recovery", async (request, reply) => {
+    const origin = callOrigin(request), input = PlanningUsageRecoverySchema.parse(request.body);
+    return runIdempotent(request, reply, actionLedger(database, request.params.id, "planning:usage-recovery"), 200,
+      key => workflow.authorizeUnknownPlanningUsage(request.params.id, input, key, origin));
+  });
+
   app.post<{ Params: { id: string } }>("/api/topics/:id/planning-control", async (request, reply) => {
     callOrigin(request);
     workflow.assertBudgetEditable(request.params.id);
@@ -657,6 +698,10 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       : workflow.postMessage(request.params.id, input.kind, input.body, idempotencyKey, origin));
   });
 
+  app.post<{ Params: { id: string } }>("/api/topics/:id/continuation", async (request, reply) =>
+    runIdempotent(request, reply, actionLedger(database, request.params.id, "continuation"), 200,
+      () => continuations.arm(request.params.id, request.body, callOrigin(request))));
+
   app.post<{ Params: { id: string; action: string } }>("/api/topics/:id/actions/:action", async (request, reply) => {
     const topicId = request.params.id;
     const action = request.params.action;
@@ -670,7 +715,12 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
           body: `중재자 위임 호출: ${action}(위임 on, set_at ${origin.delegationSetAt ?? "?"})`, payload: { origin, action } });
       }
       let response: unknown;
-      if(action === "resume-implementation") {
+      if(action === "review-evidence") {
+        callOrigin(request);
+        workflow.reviewCurrentEvidence(topicId, actionId);
+        response = accepted(actionId, database.getTopic(topicId));
+      }
+      else if(action === "resume-implementation") {
         const input = ResumeImplementationInputSchema.parse(request.body);
         response = accepted(randomUUID(), workflow.resumeImplementation(topicId, input, origin));
       }
@@ -757,7 +807,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
 
   app.get<{ Params: { id: string }; Querystring: { after?: string; token?: string } }>(
     "/api/topics/:id/events",
-    async (request, reply) => streamEvents(request, reply, database),
+    async (request, reply) => streamEvents(request, reply, database, streams),
   );
 
   app.setErrorHandler((error, _request, reply) => {
@@ -797,29 +847,42 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   // 이전 서버의 잔여 작업 회수는 listen 성공 뒤에만 한다 — 같은 데이터 폴더로 두 번째 서버를
   // 실수로 띄우면 포트 바인드에서 먼저 죽어야지, 첫 서버의 정상 작업을 회수(=강제 종료)하고
   // 죽으면 안 된다(2026-08-31 Codex 지적: 부팅 회수가 bind보다 먼저라 소유권 없이 남의 작업을 죽임).
-  app.addHook("onListen", async () => {
-    await verifications.recoverExpired();
-    await new ProcessSupervisor(undefined, undefined, join(config.dataDirectory, "review-tools", "host-review")).recover(database.runningActions());
-    database.recoverInterruptedActions();
-    database.recoverInterruptedNonDeliveryRequests();
-    database.recoverInterruptedDeliveryRequests();
-    database.recoverInterruptedGlobalRequests();
-    database.restoreMediatorInterrupts();
-    const restored = workflow.restoreScheduledRetries();
-    evidence.start();
-    engineDefects.start();
-    if (restored > 0) process.stdout.write(`시작: 사용 한도로 멈춘 주제 ${restored}건의 자동 재시도 예약을 복원했습니다.\n`);
-  });
+  let initialization: Promise<void> | undefined;
+  initializers.set(app, () => initialization ??= (async () => {
+    if (phase !== "created") throw new Error("서버를 초기화할 수 없는 상태입니다.");
+    phase = "recovering";
+    try {
+      await verifications.recoverExpired();
+      await new ProcessSupervisor(undefined, undefined, join(config.dataDirectory, "review-tools", "host-review")).recover(database.runningActions());
+      database.recoverInterruptedActions();
+      database.recoverInterruptedNonDeliveryRequests();
+      database.recoverInterruptedDeliveryRequests();
+      database.recoverInterruptedGlobalRequests();
+      database.restoreMediatorInterrupts();
+      if ((phase as string) === "stopping") throw new Error("서버 초기화 중 종료됐습니다.");
+      const restored = workflow.restoreScheduledRetries();
+      continuations.start();
+      evidence.start();
+      engineDefects.start();
+      phase = "ready";
+      if (restored > 0) process.stdout.write(`시작: 사용 한도로 멈춘 주제 ${restored}건의 자동 재시도 예약을 복원했습니다.\n`);
+    } catch (error) { if ((phase as string) !== "stopping") phase = "failed"; throw error; }
+  })());
 
   // 종료 순서: 새 요청 차단(shuttingDown) → 실행 중 에이전트 중단·원장 마감 → DB 닫기. DB 만 닫으면 에이전트 프로세스가
   // 고아로 남고 원장이 running 인 채 재시작 회수에 기대야 했다(2026-09-07 Codex 제안 ②).
-  app.addHook("onClose", async () => {
-    await engineDefects.stop();
-    await evidence.stop();
-    const stopped = await workflow.shutdown();
-    if (stopped > 0) process.stdout.write(`종료: 실행 중이던 action ${stopped}건을 중단하고 원장을 마감했습니다.\n`);
-    database.close();
-  });
+  let shutdown: Promise<void> | undefined;
+  app.addHook("preClose", () => shutdown ??= (async () => {
+    phase = "stopping";
+    for (const response of streams) { response.end(); response.destroy(); }
+    await initialization?.catch(() => {});
+    // Start all stops before awaiting any: continuations may be waiting for an action
+    // whose cancellation belongs to workflow.shutdown(). Keep the DB open until all settle.
+    const outcomes = await Promise.allSettled([continuations.stop(), engineDefects.stop(), evidence.stop(), workflow.shutdown()]);
+    const errors = outcomes.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+    if (errors.length) throw new AggregateError(errors, "서버 종료 처리를 마치지 못했습니다.");
+  })());
+  app.addHook("onClose", async () => { await shutdown; database.close(); });
   return app;
 }
 
@@ -937,18 +1000,21 @@ function streamEvents(
   request: FastifyRequest<{ Params: { id: string }; Querystring: { after?: string; token?: string } }>,
   reply: FastifyReply,
   database: ConsensusDatabase,
+  streams: Set<ServerResponse>,
 ): void {
   const topicId = request.params.id;
   database.getTopic(topicId);
   const after = Number(request.query.after ?? request.headers["last-event-id"] ?? 0);
   reply.hijack();
   const response = reply.raw;
+  streams.add(response);
   response.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
     "Cache-Control": "no-cache, no-transform",
     Connection: "keep-alive",
     "X-Accel-Buffering": "no",
   });
+  response.flushHeaders();
   let lastSent = Number.isFinite(after) ? after : 0;
   const send = (event: ReturnType<ConsensusDatabase["getTimeline"]>[number]) => {
     if (event.sequence <= lastSent) return;
@@ -959,8 +1025,9 @@ function streamEvents(
   database.events.on(eventName, send);
   database.getTimeline(topicId, lastSent).forEach(send);
   const heartbeat = setInterval(() => response.write(": heartbeat\n\n"), 15_000);
-  request.raw.once("close", () => {
+  response.once("close", () => {
     clearInterval(heartbeat);
     database.events.off(eventName, send);
+    streams.delete(response);
   });
 }

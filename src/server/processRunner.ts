@@ -22,6 +22,12 @@ export class SpawnCommandRunner implements CommandRunner {
 
   private spawnAndCollect(spec: CommandSpec): Promise<CommandResult> {
     return new Promise((resolve, reject) => {
+      let settled = false;
+      const finishReject = (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        reject(error);
+      };
       // 마지막 동기 검사 — 취소·새 입력·계획·실행 상태. 여기서 던지면 프로세스는 뜨지 않는다.
       if (spec.signal?.aborted) { reject(abortError(spec.signal.reason)); return; }
       if (spec.admitSync) {
@@ -33,6 +39,10 @@ export class SpawnCommandRunner implements CommandRunner {
         stdio: ["pipe", "pipe", "pipe"],
         detached: this.ownGroup && process.platform !== "win32",
       });
+      // Failed spawn can have no pipes. Own its error before touching any stream;
+      // Node emits the original spawn error asynchronously even in that case.
+      child.once("error", finishReject);
+      if (!child.stdout || !child.stderr || !child.stdin) return;
       const group = this.ownGroup;
       // close 이후에도 process group을 다룰 수 있도록 spawn 시점의 PID를 붙잡아 둔다.
       const childPID = child.pid;
@@ -43,7 +53,6 @@ export class SpawnCommandRunner implements CommandRunner {
       let totalOutputTooLarge = false;
       let lineTooLarge = false;
       let stdoutBytes = 0;
-      let settled = false;
       let aborted = false;
       let abortReason: unknown;
       let spawnObserverError: unknown;
@@ -85,39 +94,43 @@ export class SpawnCommandRunner implements CommandRunner {
         }
       });
       child.stderr.on("data", (chunk: string) => { lastOutputAt = Date.now(); stderrTail.push(chunk); });
-      // 호스트 소유 그룹(caller, E2e-1 host-review F002): 실행의 끝은 공급자 프로세스의 종료다. 공급자가 띄운 자식이 stdout·stderr 를 물려받아 열어
-      // 두면 파이프 EOF(close)가 오지 않는다 — 그 자식은 호스트가 그룹 종료로 끝낸다(운영 도구가 공급자를 직접 띄우던 때와 같은 계약).
-      // 공급자가 종료 전에 쓴 출력은 이미 파이프에 있다: 파이프 버퍼보다 큰 쓰기는 읽힐 때까지 공급자를 막으므로, 종료 뒤 남는 것은 버퍼 하나 분량이고
-      // 곧바로 읽을 수 있다. 출력이 CALLER_DRAIN_IDLE_MS 동안 멈췄는지를 타이머 단계에서 보고, 닫기 전에 check 단계(setImmediate)에서 한 번 더
-      // 확인한다 — 그 사이의 poll 단계가 대기 중인 파이프 데이터를 먼저 읽으므로, 이벤트 루프가 늦어 타이머가 늦게 돌아도 이미 쓴 출력을 버리지 않는다.
-      // 자식이 계속 써도 CALLER_DRAIN_MAX_MS 뒤에는 닫는다(그 뒤 출력은 공급자 것이 아니다). own 모드(엔진)는 그대로 close 를 기다린다.
-      if (!group) {
-        child.once("exit", () => {
-          const exitedAt = Date.now();
-          let confirming = false;
-          const timer = setInterval(() => {
-            if (child.stdout.destroyed && child.stderr.destroyed) { clearInterval(timer); return; }
-            const now = Date.now();
-            if (confirming || (now - lastOutputAt < CALLER_DRAIN_IDLE_MS && now - exitedAt < CALLER_DRAIN_MAX_MS)) return;
-            confirming = true;
-            const seen = lastOutputAt;
-            setImmediate(() => {
-              confirming = false;
-              if (lastOutputAt !== seen && Date.now() - exitedAt < CALLER_DRAIN_MAX_MS) return;
-              clearInterval(timer);
-              child.stdout.destroy();
-              child.stderr.destroy();
-            });
-          }, 20);
-          child.once("close", () => clearInterval(timer));
-        });
-      }
-      const finishReject = (error: unknown) => {
-        if (settled) return;
-        settled = true;
-        reject(error);
+      // Direct-child exit and inherited-pipe EOF are separate lifetimes in both modes.
+      // A descendant can escape the owned group while holding a pipe. Drain buffered
+      // final output, then detach its pipe; group termination is awaited separately.
+      // This imposes no deadline on a running model call.
+      let pipeDrainStarted = false;
+      const drainPipes = () => {
+        if (pipeDrainStarted) return;
+        pipeDrainStarted = true;
+        const exitedAt = Date.now();
+        let confirming = false;
+        const timer = setInterval(() => {
+          if (child.stdout.destroyed && child.stderr.destroyed) { clearInterval(timer); return; }
+          const now = Date.now();
+          if (confirming || (now - lastOutputAt < PIPE_DRAIN_IDLE_MS && now - exitedAt < PIPE_DRAIN_MAX_MS)) return;
+          confirming = true;
+          const seen = lastOutputAt;
+          // Let poll deliver buffered data before destroying the streams.
+          setImmediate(() => {
+            confirming = false;
+            if (lastOutputAt !== seen && Date.now() - exitedAt < PIPE_DRAIN_MAX_MS) return;
+            clearInterval(timer);
+            child.stdout.destroy();
+            child.stderr.destroy();
+          });
+        }, 20);
+        child.once("close", () => clearInterval(timer));
       };
+      child.once("exit", (code) => {
+        exitCode = code;
+        if (finalResultTimer !== undefined) clearTimeout(finalResultTimer);
+        // The direct child can exit successfully while owned descendants still write.
+        // Close their lifetime before publishing completion, independently of pipe EOF.
+        if (group) terminate();
+        drainPipes();
+      });
       const terminate = () => {
+        if (terminationDrain) return;
         try {
           terminateProcessGroup(childPID, "SIGTERM", group);
         } catch (error) {
@@ -136,7 +149,6 @@ export class SpawnCommandRunner implements CommandRunner {
         terminate();
       };
       spec.signal?.addEventListener("abort", abort, { once: true });
-      child.once("error", finishReject);
       let exitCode: number | null = null;
       child.once("close", (code) => {
         exitCode = code;
@@ -328,8 +340,8 @@ function psEnvironment(): NodeJS.ProcessEnv {
 }
 
 // caller 모드에서 공급자 종료 뒤 남은 파이프를 읽는 시간 — 출력이 이만큼 멈추면 닫고, 자식이 계속 써도 상한 뒤에는 닫는다.
-const CALLER_DRAIN_IDLE_MS = 100;
-const CALLER_DRAIN_MAX_MS = 2_000;
+const PIPE_DRAIN_IDLE_MS = 100;
+const PIPE_DRAIN_MAX_MS = 2_000;
 
 function terminateProcessGroup(pid: number | undefined, signal: NodeJS.Signals, group = true): void {
   if (!pid) return;

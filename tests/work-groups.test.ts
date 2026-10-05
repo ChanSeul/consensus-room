@@ -174,7 +174,7 @@ it("E4-1 새 서술 필드(결과·분리 근거·체크리스트·질문)도 �
   const secret = "sk-proj-1234567890abcdef";
   const stages = [work("s1"), work("s2", { dependsOn: ["s1"], outcome: `결과 ${secret}`,
     separation: { basis: "rollback", detail: `근거 ${secret}` }, checklist: [`항목 ${secret}`] }), integrationStage("int", ["s2"])];
-  const questions = [{ id: "q1", stageId: "s2", text: `질문 ${secret}`, blocksStart: false, resolution: `해소 ${secret}` }];
+  const questions = [{ id: "q1", stageId: "s2", text: `질문 ${secret}`, blocksStart: false, resolution: `해소 ${secret}`, deferredReason: `Excluded ${secret}` }];
   expect(JSON.stringify(groups.create("g", groupInput({ stages, questions }), "/repo", "base"))).not.toContain(secret);
   const added = [...stages.slice(0, 2), work("s3", { dependsOn: ["s1"], outcome: `새 결과 ${secret}`,
     separation: { basis: "independent-verification", detail: `새 근거 ${secret}` }, checklist: [`새 항목 ${secret}`] }), integrationStage("int", ["s2", "s3"])];
@@ -280,7 +280,7 @@ it("E4-3 단계 문맥은 자기 단계·현재 질문·의존 폐포 결과만 
   expect(header).toContain("이 단계 범위 밖(다른 단계)에 속하는 미정 사항은 작업 묶음이 따로 기록·해소합니다. 이 단계 계획이 불완전하다는 근거가 아니므로 그런 사항으로 사용자 결정을 요청하지 말고 계획의 '제외 범위'에 적으세요. 이 단계 착수를 막는 미정 사항은 위 목록에 있습니다.");
   expect(header).toContain("'제외 범위'");
   expect(header).toContain("분리 근거가 성립하지 않으면(파일·함수·역할만 다름)");
-  expect(header).toContain("착수 차단");
+  expect(header).not.toContain("(착수 차단)");
   expect(header).toContain("E4 전 결과");
   expect(header).not.toContain("전체 통합 검증 단계");
   // 해시는 같은 객체의 정본 JSON(키 정렬)의 sha256 이다 — 레코드의 키 순서가 달라도 같다.
@@ -288,6 +288,49 @@ it("E4-3 단계 문맥은 자기 단계·현재 질문·의존 폐포 결과만 
     ? Object.fromEntries(Object.entries(value).reverse()) : value)) as WorkGroup;
   expect(groups.stageContextDigest(reversed, "s2")).toBe(groups.stageContextDigest(group, "s2"));
   expect(groups.stageContextDigest(group, "s2")).toMatch(/^[a-f0-9]{64}$/);
+  db.close();
+});
+
+it("legacy repeated questions retain the pre-deferral context digest", () => {
+  const { db, groups } = openStore();
+  const questions = [{ id: "q", stageId: null, text: "Legacy unresolved question", blocksStart: false }];
+  groups.create("g", groupInput({ questions }), "/repo", "base");
+  for (const id of ["s1", "s2", "s3"]) {
+    groups.link("g", id, `t-${id}`, "base");
+    groups.freezeResult("g", frozen(id, `t-${id}`, { openQuestions: ["q: Legacy unresolved question"] }));
+  }
+  groups.link("g", "int", "t-int", "base");
+  // Captured with the deployed 77dfcef renderer, before deferredReason existed.
+  expect(groups.stageContextDigest(groups.get("g"), "int")).toBe("a52495c3f9c22ad207d7488f4942131b8585f2774b9a05be400438ca3563d3fb");
+  expect(groups.stageContextState("t-int")).toMatchObject({ current: true });
+  db.close();
+});
+
+it("integration delivers repeated group deferrals once while preserving frozen history and distinct reasons", () => {
+  const { db, groups } = openStore();
+  const stages = Array.from({ length: 19 }, (_, i) => work(`s${i}`));
+  const questions = Array.from({ length: 12 }, (_, i) => ({ id: `q${i}`, stageId: null, text: `Unconfirmed field ${i}`,
+    blocksStart: true, deferredReason: `Deferred field ${i}: exclude its production activation until the source is confirmed; continue supported work.` }));
+  groups.create("g", groupInput({ stages: [...stages, integrationStage("int", stages.map(s => s.id))], questions }), "/repo", "base");
+  for (const s of stages) {
+    groups.link("g", s.id, `t-${s.id}`, "base");
+    groups.freezeResult("g", frozen(s.id, `t-${s.id}`, { deferredQuestions: questions.map(({ id, text, deferredReason }) => ({ id, text, deferredReason })) }));
+  }
+  const group = groups.get("g"), history = JSON.stringify(group.results);
+  const prompt = groups.renderStageContext(group, "int");
+  for (const q of questions) expect(prompt.split(q.deferredReason).length - 1).toBe(1);
+  expect(Buffer.byteLength(prompt)).toBeLessThan(64 * 1024);
+  expect(JSON.stringify(group.results)).toBe(history);
+  // Historical reasons differing from today's question must not disappear just because the ID matches.
+  const changed = structuredClone(group);
+  changed.results!.s0.deferredQuestions![0].deferredReason = "Earlier exclusion: no writes";
+  expect(groups.renderStageContext(changed, "int")).toContain("Earlier exclusion: no writes");
+  expect(groups.stageContextDigest(changed, "int")).not.toBe(groups.stageContextDigest(group, "int"));
+  // Stage-specific reasons repeated by several frozen results still reach a dependent worker once.
+  changed.questions = questions.map(q => ({ ...q, stageId: "s0" }));
+  const dependent = groups.renderStageContext(changed, "int");
+  for (const q of questions) expect(dependent.split(q.deferredReason).length - 1).toBe(1);
+  expect(dependent).toContain("Earlier exclusion: no writes");
   db.close();
 });
 
@@ -597,4 +640,23 @@ it("단계 브랜치 이름은 같거나 세대 접미사(-g<n>) 뒤 경로로 �
   expect(() => WorkGroupInputSchema.parse(input("feature/same", "feature/same"))).toThrow("단계 브랜치 이름이 겹칩니다");
   for (const [a, z] of [["feature/x", "feature/x/verify"], ["feature/x", "feature/x-g/verify"], ["feature/x", "feature/x-gate"], ["feature/x-cp1", "feature/x"]])
     expect(() => WorkGroupInputSchema.parse(input(a, z))).not.toThrow();
+});
+
+it("keeps native plan-repair context inline because that path cannot read shared planning documents", async () => {
+  const db = new DatabaseSync(":memory:"), groups = new WorkGroups(db);
+  groups.create("g", { title: "Group", goal: "Goal", contracts: "REPAIR_COMMON_CONTRACT",
+    stages: [stage("a"), stage("b", "integration")] }, "/repo", "head");
+  groups.link("g", "a", "t", "head");
+  const database = { topicForTurn: () => ({ id: "t", state: "CLAUDE_REVISION", worktreePath: "/w" }), workGroups: groups,
+    planning: { enabled: () => true, continuityEnabled: () => true } } as unknown as ConsensusDatabase;
+  let received: SessionTurn | undefined;
+  const wrapped = wrapWorkGroupAdapter({ role: "claude", validateExistingSession: async () => true,
+    createSession: async () => { throw new Error("not used"); }, resumeTurn: async () => { throw new Error("not used"); },
+    resumePlanRepair: async turn => { received = turn; return { baseSHA256: "a".repeat(64), edits: [{ find: "old", replace: "new" }] }; },
+  }, database, {} as GitService);
+  await wrapped.resumePlanRepair!({ sessionId: "same-session", cwd: "/w", prompt: "Repair this patch." });
+  expect(received!.prompt).toContain("REPAIR_COMMON_CONTRACT");
+  expect(received!.prompt).toContain("Repair this patch.");
+  expect(received!.planningDocuments).toBeUndefined();
+  db.close();
 });

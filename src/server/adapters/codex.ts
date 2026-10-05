@@ -1,3 +1,4 @@
+import { turnContract, turnOutputSchema } from "../../shared/turnContract.js";
 import { observeEnvironment } from "./sessionEnvironment.js";
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -283,7 +284,11 @@ export class CodexAdapter implements AgentAdapter {
         release();
       }
     });
-    this.topicQueues.set(key, Promise.allSettled([previous, run]));
+    // Queue tails retain ordering, never the output of every previous model turn.
+    // An aborted waiter must still wait for the preceding owner before releasing its tail.
+    const tail = Promise.allSettled([previous, run]).then(() => undefined);
+    this.topicQueues.set(key, tail);
+    void tail.then(() => { if (this.topicQueues.get(key) === tail) this.topicQueues.delete(key); });
     return run;
   }
 
@@ -294,13 +299,13 @@ export class CodexAdapter implements AgentAdapter {
     outputSchema?: OutputSchema,
   ) {
     // 명시적 job 의 도구 접근을 권한 프로필로 옮긴다. 확인·계획 제어 턴은 쓰기 job 이어도 파일을 쓸 수 없다.
-    const { policy, protocolOnly } = resolveSupportedTurn("codex", turn);
+    const { job, policy, protocolOnly } = resolveSupportedTurn("codex", turn);
     // -s/-a are top-level Codex options. resume 뒤에 놓으면 CLI가 거부한다.
     await mkdir(dirname(this.schemaPath), { recursive: true });
     // Separate immutable contents prevent parallel normal/controlled topics from replacing each other's schema.
     // 소비처 schema 는 내용 해시 파일이다 — 같은 데이터 폴더를 쓰는 다른 소비처의 schema 를 덮지 않는다(E2e.md 규칙 4).
-    const schemaContents = JSON.stringify(outputSchema ?? (turn.planningControl ? CodexPlanningAgentResultJsonSchema : AgentResultJsonSchema), null, 2);
-    const schemaPath = outputSchema
+    const schemaContents = JSON.stringify(outputSchema ?? (turn.planningControl ? CodexPlanningAgentResultJsonSchema : turnOutputSchema(job)), null, 2);
+    const schemaPath = outputSchema || turnContract(job).kinds
       ? join(dirname(this.schemaPath), "output-schemas", `${createHash("sha256").update(schemaContents).digest("hex")}.json`)
       : turn.planningControl ? `${this.schemaPath}.planning.json` : this.schemaPath;
     await mkdir(dirname(schemaPath), { recursive: true });
@@ -324,7 +329,7 @@ export class CodexAdapter implements AgentAdapter {
     // 않았다 — 엔진이 그 세션의 첫 일반 resume 에 memoryBodies 를 실으면 그 resume 에 한 번 싣는다(매니페스트 없이).
     const injectMemory = Boolean(this.memory) && !protocolOnly && !turn.planningControl && (newSession || turn.memoryBodies === true);
     const enriched = injectMemory
-      ? await this.memory!.buildPrompt(turn.prompt, this.role, turn.signal)
+      ? await this.memory!.buildPrompt(turn.prompt, this.role, turn.signal, turnContract(job).memoryUpdates)
       : turn.planningControl ? turn.prompt : await this.withMemoryManifest(turn, protocolOnly);
     // 프로토콜 확인 턴은 판단에 필요한 값을 프롬프트가 다 담고 있어 프로젝트 지시문(AGENTS.md)도 싣지 않는다
     // (2026-09-07 Codex 자기 최적화 제안 ②: ACK 턴마다 지시문 블록을 재전송하던 낭비).
@@ -367,6 +372,7 @@ export class CodexAdapter implements AgentAdapter {
     instructionBytes = 0,
   ) {
     const executionSettings = turn.settings ?? DEFAULT_AGENT_SETTINGS.codex;
+    const { options } = resolveSupportedTurn("codex", turn);
     const startedAt = Date.now();
     const toolTime = createToolTimeMeter("codex");
     const metrics = new ExecutionMetrics("codex", Buffer.byteLength(stdin, "utf8") + instructionBytes, executionSettings.model, executionSettings.effort, !newSession, startedAt);
@@ -416,10 +422,8 @@ export class CodexAdapter implements AgentAdapter {
         "-a", "never",
         "-m", executionSettings.model,
         "-c", `model_reasoning_effort=\"${executionSettings.effort}\"`,
-        // 2026-09-01 사용자 지시로 1.5x 속도 티어(`-c service_tier="priority"`, "Fast")를 썼으나
-        // 2026-09-06 사용자 지시 "코덱스 fast 모드는 normal 모드로" 로 제거 — 새 플랜(prolite)의 사용량 한도를
-        // priority 티어가 더 빨리 소모하기 때문. 기본(normal) 티어 = service_tier 키를 넘기지 않는다.
-        // (speed_tier 는 --strict-config 가 미지 필드로 거부한다는 실측은 그대로 유효.)
+        // Explicit per-profile speed; an omitted option keeps the existing default.
+        ...(options.serviceTier === "fast" ? ["-c", 'service_tier="fast"', "-c", "features.fast_mode=true"] : []),
         ...commandArgs,
       ],
       cwd: turn.cwd,
@@ -459,7 +463,7 @@ export class CodexAdapter implements AgentAdapter {
     protocolOnly: boolean,
   ): Promise<string> {
     if (!this.memory || protocolOnly) return turn.prompt;
-    const manifest = await this.memory.buildManifest(turn.prompt, this.role, turn.signal);
+    const manifest = await this.memory.buildManifest(turn.prompt, this.role, turn.signal, turnContract(resolveSupportedTurn("codex", turn).job).memoryUpdates);
     return manifest ? `${turn.prompt}\n\n${manifest}` : turn.prompt;
   }
 

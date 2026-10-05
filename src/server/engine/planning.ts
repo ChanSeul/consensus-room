@@ -1,4 +1,7 @@
 import { hierarchyContext, assertTask, assertEntryReady } from "../topicStructure.js";
+import { EvidenceAssessmentPipeline } from "./evidenceAssessment.js";
+import type { EvidenceAssessment } from "../../shared/externalEvidence.js";
+import { stableJSON } from "../evidence/store.js";
 import { normalizeToleranceBlocks } from "../../shared/tolerance.js";
 // 계획 수렴 파이프라인: CLAUDE_PLAN → CODEX_AUDIT → CLAUDE_REVISION → CODEX_CLOSEOUT → CONSENSUS_ACK.
 // 각 단계의 검증 순서(검증 → 메모리 반영 → pause → 저장)가 이 파일의 계약이다.
@@ -295,13 +298,14 @@ export class PlanningPipeline {
     const database = this.core.dependencies.database;
     const topic = database.getTopic(topicId);
     const events = database.getTimeline(topicId).filter((event) => event.scopeGeneration === topic.scopeGeneration);
+    const consumedThrough = Math.max(0, ...events.map(event => Number(event.payload?.replanConsumedThrough) || 0));
     let lastInterrupt = -1;
     events.forEach((event, index) => {
       if (event.actor === "system" && Array.isArray(event.payload?.closeoutEssentialFindingIDs)) lastInterrupt = index;
     });
     if (lastInterrupt < 0) return false;
     return events.slice(lastInterrupt + 1)
-      .some((event) => event.actor === "user" && event.kind === "decision" && replanDirective(event.body));
+      .some((event) => event.sequence > consumedThrough && event.actor === "user" && event.kind === "decision" && replanDirective(event.body));
   }
 
   // 개정 턴도 같다(2026-09-07 S10 #31: 배치 순서 확인 하나로 $11·35분짜리 개정 턴이 반복될 뻔했다).
@@ -312,7 +316,7 @@ export class PlanningPipeline {
   private pausedResultReusable(topicId: string, kind: "claude-plan" | "claude-revision"): boolean {
     const database = this.core.dependencies.database;
     const topic = database.getTopic(topicId);
-    if (topic.state !== "USER_DECISION_REQUIRED") return false;
+    if (topic.state !== "USER_DECISION_REQUIRED" && !(kind === "claude-plan" && topic.state === "BLOCKED_ON_EVIDENCE")) return false;
     const stored = database.latestArtifact(topicId, kind);
     if (!stored || stored.scopeGeneration !== topic.scopeGeneration) return false;
     // 이미 채택된 개정(계획 확정 기록이 가리킨다)은 멈춘 결과가 아니다 — 재사용하면 그 편집(planEdits·planLineEdits)을 이미 반영된 계획에 한 번 더 적용한다
@@ -388,7 +392,8 @@ export class PlanningPipeline {
   }
 
   async resumePlanningFromPausedPlan(topicId: string, signal: AbortSignal): Promise<void> {
-    let topic = this.core.requireState(topicId, "USER_DECISION_REQUIRED");
+    let topic = this.core.dependencies.database.getTopic(topicId);
+    if (!this.pausedPlanReusable(topicId)) throw new Error("현재 중단 계획을 재사용할 결정과 완결된 읽기 상태가 필요합니다.");
     this.core.requireParticipants(topic);
     const stored = this.core.dependencies.database.latestArtifact(topicId, "claude-plan");
     if (!stored) throw new Error("재사용할 계획 산출물이 없습니다.");
@@ -550,6 +555,35 @@ export class PlanningPipeline {
       await this.adoptReceivedRevision(topicId, received, stored, signal);
       return;
     }
+    const progress = this.evidenceRevisionProgress(topicId);
+    const obligation = progress && !progress.handedOff ? progress.job : null;
+    if (obligation) {
+      const result = this.core.dependencies.database.evidence.automation.receipt(obligation.id)?.accepted;
+      if (!result) throw new Error("근거 개정의 원본 검토 결과가 없습니다.");
+      const db = this.core.dependencies.database;
+      const lateInput = db.getTopic(topicId).state === "USER_DECISION_REQUIRED" &&
+        db.getTimeline(topicId).filter(event => event.payload?.resumeState).at(-1)?.payload?.newInputSequence;
+      if (progress?.adopted && !lateInput) {
+        await this.resumePlanningAtCloseout(topicId, signal);
+      } else {
+        await this.runPlanningFromRevision(topicId, result, stored, signal);
+      }
+      return;
+    }
+    const db = this.core.dependencies.database;
+    const current = db.getTopic(topicId), events = db.getScopedTimeline(topicId, current.scopeGeneration);
+    const newInput = events.filter(event => event.actor === "system" && event.payload?.evidenceReviewNewInput === true &&
+      event.payload.evidenceReviewPlanEpoch === current.planEpoch).at(-1);
+    const adoptedAfterInput = newInput && events.some(event => event.sequence > newInput.sequence && event.actor !== "user" &&
+      (event.payload?.adoptedResult as { kind?: string } | undefined)?.kind === "claude-revision");
+    if (newInput && !adoptedAfterInput) {
+      // A decision after final review is a new revision input, even when an earlier
+      // second revision settled every finding. Keep this obligation across retries/restarts.
+      const closeout = await this.core.latestResult(topicId, "closeout");
+      await this.runPlanningFromRevision2(topicId, closeout, closeout.findings.map(finding => finding.id), stored,
+        await this.roundKnownFindings(topicId), signal);
+      return;
+    }
     if (this.core.dependencies.database.getFlags(topicId).closeoutRevisionUsed) {
       // 개정 2회차 도중 죽었다 — 감사가 아니라 종결 확인의 새 쟁점을 다시 반영한다(기존 계획 = 2판).
       const closeout = await this.core.latestResult(topicId, "closeout");
@@ -575,6 +609,13 @@ export class PlanningPipeline {
         // 남은 것이 경미 지적뿐이면(배포 전 엔진이 필수로 분류했던 것) 저장된 종결로 합의를 마친다 — 종결 재실행은 전이표가 막는다.
         if (closeout.planSHA256 === stored.sha256 && classifyCloseout(closeout).state === "CONSENSUS_ACK") {
           return this.runConsensusFinalization(topicId, closeout.findings, stored.sha256, signal);
+        }
+        // The stored decision has no unresolved revision finding. Enter the explicit
+        // recovery edge instead of letting the resumer attempt a forbidden pause→closeout.
+        const current = this.core.dependencies.database.getTopic(topicId);
+        if (current.state === "USER_DECISION_REQUIRED") {
+          this.core.transitionWith(topicId, "FAILED", "저장된 종결의 결정을 같은 단계에서 재확인합니다.",
+            { changes: { resumeState: "CODEX_CLOSEOUT" } });
         }
         return this.resumePlanningAtCloseout(topicId, signal);
       }
@@ -947,7 +988,13 @@ export class PlanningPipeline {
     signal: AbortSignal,
   ): Promise<void> {
     const topic = this.core.transition(topicId, "CONSENSUS_ACK", "두 에이전트가 같은 계획 해시를 확인합니다.");
-    if (!await this.runAcknowledgements(topic, sha256, signal)) return;
+    const acknowledgementBindings = ["claude", "codex"].map(role => bindingOf(this.core.route(topic,
+      role === "claude" ? { role: "planner", operation: "ack" } : { role: "reviewer", operation: "ack" })));
+    const rawConsensus = await this.core.dependencies.artifacts.readLatest(topicId, "consensus");
+    const previous = rawConsensus ? JSON.parse(rawConsensus) as Record<string, unknown> : null;
+    const reuse = previous?.planSHA256 === sha256 && previous.scopeGeneration === topic.scopeGeneration && previous.planEpoch === topic.planEpoch &&
+      stableJSON(previous.acknowledgementBindings) === stableJSON(acknowledgementBindings) && bothAgentsAcknowledged(topic.participants, sha256);
+    if (!reuse && !await this.runAcknowledgements(topic, sha256, signal)) return;
     const acknowledged = this.core.dependencies.database.getTopic(topicId);
     if (!bothAgentsAcknowledged(acknowledged.participants, sha256)) {
       throw new Error("두 에이전트의 계획 ACK가 일치하지 않습니다.");
@@ -958,10 +1005,48 @@ export class PlanningPipeline {
       planEpoch: acknowledged.planEpoch,
       findings: closeoutFindings,
       acknowledgedBy: ["claude", "codex"],
+      acknowledgementBindings,
       createdAt: new Date().toISOString(),
     }, null, 2), signal);
     if (this.core.interruptForLatestTurnInput(topic)) return;
+    if (!await new EvidenceAssessmentPipeline(this.core, (id, job, result, stop) => this.runEvidenceRevision(id, job, result, stop))
+      .finishPlanning(topicId, signal)) return;
     this.core.transition(topicId, "AWAITING_USER_APPROVAL", "계획 합의가 끝났습니다. 사용자 구현 승인을 기다립니다.");
+  }
+
+  private evidenceRevisionProgress(topicId: string) {
+    const db = this.core.dependencies.database, topic = db.getTopic(topicId);
+    const events = db.getScopedTimeline(topicId, topic.scopeGeneration);
+    const start = events.filter(event => event.payload?.evidenceRevisionPlanEpoch === topic.planEpoch).at(-1);
+    if (!start || events.some(event => event.sequence > start.sequence && event.payload?.to === "AWAITING_USER_APPROVAL")) return null;
+    const adopted = events.find(event => event.sequence > start.sequence && event.payload?.artifactKind === "plan" && event.payload.adoptedResult);
+    const job = db.evidence.automation.jobs(topicId).find(job => job.id === start.payload?.evidenceRevisionId);
+    if (!job || (!adopted && (job.binding !== stableJSON([topic.scopeGeneration, topic.planEpoch, topic.planSHA256]) ||
+      job.planRevision !== topic.planRevision))) return null;
+    // Recovery ownership moves to closeout, but the evidence revision remains open
+    // until consensus. Its unanswered decisions must still block premature retries.
+    const handedOff = Boolean(adopted && events.some(event => event.sequence > adopted.sequence && event.payload?.to === "CODEX_CLOSEOUT"));
+    return { job, adopted, handedOff };
+  }
+
+  pendingEvidenceRevision(topicId: string): EvidenceAssessment | null {
+    return this.evidenceRevisionProgress(topicId)?.job ?? null;
+  }
+
+  async runEvidenceRevision(topicId: string, job: EvidenceAssessment, result: AgentResult, signal: AbortSignal): Promise<void> {
+    const db = this.core.dependencies.database, topic = db.getTopic(topicId);
+    if (job.binding !== stableJSON([topic.scopeGeneration, topic.planEpoch, topic.planSHA256]) ||
+      job.planRevision !== topic.planRevision || job.digest !== db.evidence.topic(topic).digest)
+      throw new Error("계획 또는 원문이 바뀌어 이전 근거 개정을 적용하지 않았습니다.");
+    const continuation = db.continuations.get(topicId);
+    const actionId = this.core.active.get(topicId)!.actionId;
+    if (this.pendingEvidenceRevision(topicId)?.id !== job.id || !db.evidenceActionOwnsWorkflow(topicId, actionId)) this.core.event(topicId, "system", "system",
+      "완료된 근거 검토의 지적을 현재 계획에 반영합니다. 기존 판단과 검토 결과를 보존합니다.",
+      { evidenceRevisionId: job.id, evidenceRevisionPlanEpoch: topic.planEpoch, evidenceRevisionBaseSHA256: topic.planSHA256,
+        evidenceRevisionActionId: actionId,
+        continuationId: continuation?.actionId === actionId ? continuation?.id : undefined });
+    await this.runPlanningFromRevision(topicId, result,
+      { markdown: (await this.core.requireCurrentPlanArtifact(topicId)).content, sha256: topic.planSHA256! }, signal);
   }
 
   private async runAcknowledgements(topic: Topic, sha256: string, signal: AbortSignal): Promise<boolean> {
@@ -1040,7 +1125,7 @@ export class PlanningPipeline {
     database.applyTopicTransition({
       topicId: topic.id,
       changes: { planRevision: revision, planSHA256: artifact.sha256, approvedPlanSHA256: null },
-      clearAcknowledgements: true,
+      clearAcknowledgements: database.getTopic(topic.id).planSHA256 !== artifact.sha256,
       events: [{ actor: "claude", kind: "agent_output", state: topic.state, body: `계획 ${revision}판을 저장했습니다.`,
         payload: { artifactKind: "plan", revision, artifactRevision: artifact.revision, sha256: artifact.sha256, adoptedResult: adopted } }],
     });

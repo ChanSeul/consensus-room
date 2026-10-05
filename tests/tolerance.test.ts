@@ -18,6 +18,9 @@ import {
   normalizeToleranceBlocks,
 } from "../src/shared/tolerance";
 
+import { assertPlanContract } from "../src/shared/workflow";
+import { REQUIRED_PLAN_HEADINGS } from "../src/shared/contracts";
+
 const policyBlock = `## 허용 오차
 
 \`\`\`tolerance
@@ -359,4 +362,21 @@ describe("누적 원장 저장 계약", () => {
     expect(carried.ledger).toHaveLength(501);
     expect(AgentResultSchema.safeParse({ kind: "IMPLEMENTATION", summary: "s", findings: [], evidenceRefs: [], toleranceLedger: carried.ledger }).success).toBe(true);
   });
+});
+
+it("accepts a no-change plan and rejects every undeclared file change", () => {
+  const block = '```tolerance\n{"scopePaths":[],"rules":[]}\n```';
+  const plan = REQUIRED_PLAN_HEADINGS.map(heading => `## ${heading}\n${heading === "허용 오차" ? block : "Read-only investigation; no repository edits."}`).join("\n\n");
+  expect(() => assertPlanContract(plan)).not.toThrow();
+  const policy = parseTolerancePolicy(plan)!;
+  expect(evaluateTolerance(policy, [], []).violations).toEqual([]);
+  for (const change of [
+    { file: "existing.swift", untracked: false, hunks: [] },
+    { file: "new.swift", untracked: true, hunks: [] },
+    { file: "asset.png", untracked: false, binary: true, hunks: [] },
+  ]) {
+    expect(evaluateTolerance(policy, [change], []).violations).not.toHaveLength(0);
+    expect(evaluateTolerance(policy, [change], [{ ruleId: "T-1", file: change.file, note: "Unapproved" }]).violations).not.toHaveLength(0);
+  }
+  expect(() => parseTolerancePolicy('```tolerance\n{"scopePaths":[" "],"rules":[]}\n```')).toThrow();
 });

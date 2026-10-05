@@ -19,7 +19,9 @@ import { pendingReviewRequests } from "../src/server/engine/reviewRequests";
 import { AgentRunError, agentRunError } from "../src/server/adapters/resultParser";
 
 const temporaryDirectories: string[] = [];
-afterEach(() => {
+const openApps: Awaited<ReturnType<typeof buildApp>>[] = [];
+afterEach(async () => {
+  for (const app of openApps.splice(0)) await app.close();
   vi.restoreAllMocks();
   for (const directory of temporaryDirectories.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
@@ -396,6 +398,7 @@ async function room(label: string, steps: Step[], options: { autonomy?: "on" | "
     database, runner, claude, codex,
   });
   let keys = 0;
+  openApps.push(app);
   const call = async (method: "GET" | "POST", url: string, body?: unknown, extra: { key?: string; mediator?: boolean } = {}) => {
     const response = await app.inject({
       method, url,
@@ -514,7 +517,7 @@ describe("중재자 진단 — 저장·조회·동일 계획 재개(1단계)", (
     expect(String(retry.body.error)).toContain("DG-1");
     expect(r.claude.turns).toHaveLength(1);
     expect(r.database.getTopic(r.topicId).state).toBe("USER_DECISION_REQUIRED");
-    r.database.close();
+    await r.app.close();
   });
 
   it("적용하면 결정이 올라와 있어도 확인 턴이 아니라 실제 수정 턴으로 반환되고, 열린 요청은 러너가 id 로 해소해야만 닫힌다", { timeout: 30_000 }, async () => {
@@ -567,7 +570,7 @@ describe("중재자 진단 — 저장·조회·동일 계획 재개(1단계)", (
     const reviewOriginal = /원문: `([^`]+)`/.exec(r.codex.prompts[0])?.[1];
     expect(reviewOriginal).toBeTruthy();
     expect(r.codex.readable[0]).toContain(reviewOriginal);
-    r.database.close();
+    await r.app.close();
   });
 
   it("등록 뒤 코드가 바뀐 진단은 적용하지 않고 기록을 보존한 채 재확인을 요구한다 — 정정 진단으로만 넘어간다", { timeout: 30_000 }, async () => {
@@ -601,7 +604,7 @@ describe("중재자 진단 — 저장·조회·동일 계획 재개(1단계)", (
     expect((await r.call("POST", `/api/topics/${r.topicId}/diagnoses/DG-2/apply`, undefined, { mediator: true })).status).toBe(200);
     await r.idle("READY_TO_DELIVER");
     expect((await r.diagnoses()).map((item) => item.status)).toEqual(["superseded", "resolved"]);
-    r.database.close();
+    await r.app.close();
   });
 
   it("인도 대기 중 등록된 실패는 커밋·푸시·종료를 막고, 적용하면 완료 판정을 취소한 뒤 진단 수정 → 최종 리뷰를 거쳐야 커밋된다", { timeout: 30_000 }, async () => {
@@ -637,7 +640,7 @@ describe("중재자 진단 — 저장·조회·동일 계획 재개(1단계)", (
     expect(r.database.getFlags(r.topicId).fixPassUsed).toBe(false);
     const committed = await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "진단 수정 포함", paths: ["feature.txt"] });
     expect(committed.status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("원인 미확정의 조사 기록은 적용할 수 없고 재개를 막는다 — 수정 불필요 결론(정정)이 닫는다", { timeout: 30_000 }, async () => {
@@ -661,7 +664,7 @@ describe("중재자 진단 — 저장·조회·동일 계획 재개(1단계)", (
     await waitFor(() => r.claude.turns.length === 2, "재개 턴");
     // 실행이 끝난 뒤에 DB 를 닫는다 — 실행 중에 닫으면 엔진의 뒤이은 기록이 닫힌 DB 에 부딪힌다(ERR_INVALID_STATE).
     await waitFor(() => r.database.runningAction(r.topicId) === null, "재개 실행 종료");
-    r.database.close();
+    await r.app.close();
   });
 
   it("예전 OFF 파일과 무관하게 진단의 상태·존재 조건을 검사한다", { timeout: 30_000 }, async () => {
@@ -672,7 +675,7 @@ describe("중재자 진단 — 저장·조회·동일 계획 재개(1단계)", (
     expect((await r.call("POST", `/api/topics/${r.topicId}/diagnoses`, fixDiagnosis(), { mediator: true })).status).toBe(409);
     expect((await r.call("POST", `/api/topics/${r.topicId}/diagnoses/DG-1/apply`, undefined, { mediator: true })).status).toBe(404);
     expect((await r.call("GET", `/api/topics/${r.topicId}/diagnoses`)).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 });
 
@@ -1159,7 +1162,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.getFlags(r.topicId).implementationBaseOID).toBe(before.flags.implementationBaseOID);
     expect(r.database.getTopic(r.topicId).branchName).toBe(before.topic.branchName);
     expect(git(r.worktree, ["rev-parse", "HEAD"])).toBe(before.head);
-    r.database.close();
+    await r.app.close();
   });
 
   it("개정 턴의 반박은 진단을 중재자에게 돌려보내고, 저장 전 정정은 옛 승인 계획으로 멈췄던 구현 단계를 되살린다(전체 재계획 없음)", { timeout: 60_000 }, async () => {
@@ -1201,7 +1204,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(after.planEpoch).toBe(before.planEpoch);
     expect(r.codex.prompts.some((prompt) => prompt.includes("반환 kind는 AUDIT"))).toBe(false);
     expect((await r.diagnoses()).map((item) => item.status)).toEqual(["superseded", "closed_no_action"]);
-    r.database.close();
+    await r.app.close();
   });
 
   it("범위 변경 뒤 이전 세대의 미해결 진단은 새 세대의 구현·인도를 막지 않는다(기록은 조회에 남는다 — host-review R1)", { timeout: 60_000 }, async () => {
@@ -1230,7 +1233,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect((await r.diagnoses()).map((item) => [item.id, item.status, item.binding.scopeGeneration])).toEqual([["DG-1", "registered", 1]]);
     const committed = await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "새 범위", paths: ["feature.txt"] });
     expect(committed.status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("진단 전용 수정 도중 추가된 진단은 같은 수정 작업(계약)에 실려 앞 턴의 열린 요청을 잃지 않는다(host-review R2)", { timeout: 60_000 }, async () => {
@@ -1267,7 +1270,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     const topic = r.database.getTopic(r.topicId);
     expect(r.database.fixContracts.list(r.topicId, topic.scopeGeneration, topic.planEpoch).map((contract) => [contract.contractId, contract.diagnosisIds, contract.status]))
       .toEqual([["FC-1", ["DG-1", "DG-2"], "open"]]);
-    r.database.close();
+    await r.app.close();
   });
 
   it("러너가 진단을 반박하면 refuted 로 기록하고 결과를 보존한 채 멈춘다 — 중재자 정정 전 재개는 막히고 같은 지시를 반복하지 않는다(host-review R3)", { timeout: 30_000 }, async () => {
@@ -1284,7 +1287,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.getTopic(r.topicId).lastError).toContain("DG-1 반박");
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(409);
     expect(r.claude.turns).toHaveLength(2);
-    r.database.close();
+    await r.app.close();
   });
 
   // 허용 오차 위반이 교정 뒤에도 남으면 absorbTurn 이 null 로 끝나 일반 반환 경로(returnDiagnosesToMediator)에 닿지 않는다 — 그 정지에서도 기록돼야 한다.
@@ -1314,7 +1317,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
         Array.isArray(event.payload?.diagnosisReturned) && (event.payload?.diagnosisReturned as string[]).includes("DG-1"))).toBe(true);
       expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(409);
       expect(r.claude.turns).toHaveLength(3);
-      r.database.close();
+      await r.app.close();
     });
   }
 
@@ -1341,7 +1344,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.getTopic(r.topicId).lastError).toContain("DG-1 반박");
     expect(r.claude.turns).toHaveLength(3);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(409);
-    r.database.close();
+    await r.app.close();
   });
 
   it("재대조가 연 허용 오차 교정 턴의 진단 반박도 수락 전에 중재자에게 돌려보낸다 — 리뷰·인도 대기로 새지 않는다(2026-09-14 감사)", { timeout: 30_000 }, async () => {
@@ -1384,7 +1387,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.codex.prompts).toHaveLength(0);
     expect(r.claude.turns).toHaveLength(4);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(409);
-    r.database.close();
+    await r.app.close();
   });
 
   it("진단 전용 수정이 반박된 뒤 수정 불필요로 정정하면 일반 수정이 아니라 최종 리뷰로 돌아간다 — 자동 수정 회차를 쓰지 않는다(2026-09-14 감사)", { timeout: 30_000 }, async () => {
@@ -1416,7 +1419,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.getFlags(r.topicId).fixPassUsed).toBe(false);
     expect((await r.diagnoses()).map((record) => record.status)).toEqual(["superseded", "closed_no_action"]);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "진단 정정 뒤 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("전체 재계획은 이전 계획에 묶인 진행 중 진단을 재확인(stale)으로 돌린다 — 새 계획에 옛 개정을 싣지 않는다(2026-09-14 감사)", { timeout: 60_000 }, async () => {
@@ -1463,7 +1466,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
       fixDiagnosis({ kind: "no_action", title: "재계획으로 무효 — 새 계획에서 다시 진단", supersedes: "DG-1" }), { mediator: true });
     expect(closed.status).toBe(201);
     expect((await r.diagnoses()).map((record) => record.status)).toEqual(["superseded", "closed_no_action"]);
-    r.database.close();
+    await r.app.close();
   });
 
   it.each(["question", "finding", "blocked"] as const)("R10 러너 요청(%s): 진단 전용 수정 작업에 열린 요청이 남으면 수정 불필요 정정을 받지 않고, 요청 해소를 지시한 정정이 같은 경로로 이어간다(host-review R10)", { timeout: 30_000 }, async (form) => {
@@ -1505,7 +1508,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.codex.prompts.at(-1)).toContain("반환 kind는 FINAL_REVIEW");
     expect(r.database.getTimeline(r.topicId).some((event) => event.payload?.resolvedRequest === openId)).toBe(true);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "요청 해소 뒤 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("진단 전용 수정이 응답 전에 끊긴 뒤 수정 불필요로 정정하면 구현 결과로 최종 리뷰를 다시 한다(host-review R11)", { timeout: 30_000 }, async () => {
@@ -1531,7 +1534,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.codex.prompts.at(-1)).toContain("반환 kind는 FINAL_REVIEW");
     expect(r.codex.prompts.at(-1)).toContain("구현을 마쳤습니다.");
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "정정 뒤 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   // 적용 뒤 곧바로 여는 재개가 막힐 조건(순차 적용을 기다리는 수정 진단이 아닌 다른 처리 대기 진단 — 여기서는 원인 미확정 조사)이면 적용 자체를 기록하지 않는다
@@ -1557,7 +1560,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
       }
       expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "진단 정리 뒤 인도", paths: ["feature.txt"] })).status).toBe(200);
       expect(r.claude.turns).toHaveLength(1);
-      r.database.close();
+      await r.app.close();
     });
   }
 
@@ -1594,7 +1597,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     const topic = r.database.getTopic(r.topicId);
     expect(r.database.fixContracts.list(r.topicId, topic.scopeGeneration, topic.planEpoch).map((contract) => [contract.contractId, contract.diagnosisIds, contract.status]))
       .toEqual([["FC-1", ["DG-1", "DG-2"], "accepted"]]);
-    r.database.close();
+    await r.app.close();
   });
 
   it("진단 전용 수정 결과가 전이 가드에 걸리면 반영 보고(fix_reported)를 남기지 않는다 — 진단은 전달됨으로 남고 retry 도 일반 수정으로 빠지지 않는다(2026-09-15 감사)", { timeout: 30_000 }, async () => {
@@ -1616,7 +1619,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.claude.turns).toHaveLength(2);
     expect(r.database.getFlags(r.topicId).fixPassUsed).toBe(false);
     expect((await r.diagnoses())[0].status).toBe("delivered");
-    r.database.close();
+    await r.app.close();
   });
 
   it("진단 턴이 응답 전에 죽으면 retry 는 이전 수락 결과로 건너뛰지 않고 진단을 다시 싣는다(host-review R5)", { timeout: 60_000 }, async () => {
@@ -1642,7 +1645,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     await r.idle("READY_TO_DELIVER");
     expect(r.claude.turns).toHaveLength(3);
     expect((await r.diagnoses())[0].history.map((entry) => entry.status)).toEqual(["registered", "applied", "delivered", "fix_reported", "resolved"]);
-    r.database.close();
+    await r.app.close();
   });
 
   it.each(["message", "evidence-root"] as const)("%s 재계획은 이전 진단을 먼저 재확인 상태로 돌리고 새 계획에 적용하지 않는다", { timeout: 60_000 }, async (trigger) => {
@@ -1716,7 +1719,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect((await r.diagnoses()).map((entry) => entry.status)).toEqual(["superseded", "closed_no_action"]);
     expect(r.database.getTopic(r.topicId).state).toBe("DRAFT");
     expect(r.claude.turns).toHaveLength(turnsBefore);
-    r.database.close();
+    await r.app.close();
   });
 
   it("진단 전용 수정 작업의 열린 요청은 허용 오차 개정으로 계획 sha 가 바뀌어도 수정 불필요 정정을 막고, 요청 해소를 지시한 정정만 같은 경로를 잇는다(2026-09-15 감사 #3)", { timeout: 30_000 }, async () => {
@@ -1786,7 +1789,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.codex.prompts.at(-1)).toContain("반환 kind는 FINAL_REVIEW");
     expect(r.database.getTimeline(r.topicId).some((event) => event.payload?.resolvedRequest === openId)).toBe(true);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "요청 해소 뒤 인도", paths: ["feature.txt", "stray.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("진단 전용 수정의 허용 오차 교정 턴이 끊긴 뒤 새 진단이 같은 수정 작업(계약)에 실려도 그 작업 checkpoint 에만 남은 반박을 refuted 로 기록하고 새 턴 없이 멈춘다 — 반박한 진단을 다시 싣지 않는다(2026-09-15 감사 #7)", { timeout: 30_000 }, async () => {
@@ -1841,7 +1844,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     // 반박이 기록됐으므로 중재자 정정 전 재개는 막힌다.
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(409);
     expect(r.claude.turns).toHaveLength(3);
-    r.database.close();
+    await r.app.close();
   });
 
   it("needs_evidence 로 돌아온 진단을 정정(supersedes)해 적용하면 누적본에 남은 닫힌 진단의 옛 증거 요청이 완료 판정을 막지 않는다 — 정정 진단 반영이 리뷰를 거쳐 인도 대기에 이른다(2026-09-15 감사 #5)", { timeout: 30_000 }, async () => {
@@ -1899,7 +1902,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.codex.prompts[0]).toContain('"id": "DG-2"');
     expect(r.codex.prompts[0]).not.toContain('"disposition": "EXTERNAL_EVIDENCE"');
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "정정 진단 반영 뒤 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   // 러너가 진단 쟁점을 미반영 처분(AGREED_ACTION)인 채 status=completed 로 돌려주면 완료가 아니다 — 수락·전이하지 않고 같은 세션의 계속 진행 턴이
@@ -1970,7 +1973,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(commit.status).toBeGreaterThanOrEqual(400);
     expect(String(commit.body.error)).toContain("READY_TO_DELIVER");
     expect(r.database.getTopic(r.topicId).state).toBe("USER_DECISION_REQUIRED");
-    r.database.close();
+    await r.app.close();
   });
 
   for (const path of ["구현 작업", "진단 전용 수정"] as const) {
@@ -2047,7 +2050,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
       expect((await r.diagnoses())[0].history.map((entry) => entry.status)).toEqual(["registered", "applied", "delivered", "fix_reported", "resolved"]);
       expect(r.database.getFlags(r.topicId).fixPassUsed).toBe(false);
       expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "진단 반영 뒤 인도", paths: ["feature.txt"] })).status).toBe(200);
-      r.database.close();
+      await r.app.close();
     });
   }
 
@@ -2132,7 +2135,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     const records = await r.diagnoses();
     expect(records.map((record) => [record.id, record.status])).toEqual([["DG-1", "superseded"], ["DG-2", "closed_no_action"]]);
     expect(records[0].history.map((entry) => entry.status)).not.toContain("plan_revised");
-    r.database.close();
+    await r.app.close();
   });
 
   it("저장만 되고 기록되지 않은 개정 계획 산출물이 최신으로 남아 있어도 새 계획 변경 진단은 승인 계획을 기준으로 개정한다 — 최신 산출물과 다르다고 적용을 막지 않는다(2026-09-15 감사 #12 후속)", { timeout: 60_000 }, async () => {
@@ -2172,7 +2175,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(/기준 SHA-256: ([0-9a-f]{64})/.exec(revision.prompt)?.[1]).toBe(approvedSHA);
     expect(revision.prompt).not.toContain(unapprovedLine);
     expect(r.database.getTopic(r.topicId).planSHA256).toBe(approvedSHA);
-    r.database.close();
+    await r.app.close();
   });
 
   it("진단 계획 개정 턴의 반박이 계약 교정 턴 사망으로 교정 원본에만 남으면 retry 는 새 개정 턴을 사지 않고 refuted 로 기록해 중재자에게 돌려보낸다(2026-09-15 감사 #14)", { timeout: 30_000 }, async () => {
@@ -2227,7 +2230,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     // 반박된 진단은 중재자 정정 전의 재개를 막는다 — 같은 지시를 다시 싣지 않는다.
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(409);
     expect(r.claude.turns).toHaveLength(3);
-    r.database.close();
+    await r.app.close();
   });
 
   it("계획 변경 진단의 개정 계획으로 여는 첫 구현 턴이 spawn 뒤 죽으면 retry 턴도 진단과 함께 개정 알림·개정 계획 전문을 다시 싣는다 — 같은 계획이라고 안내하지 않는다(2026-09-15 감사 #15)", { timeout: 60_000 }, async () => {
@@ -2290,7 +2293,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect((await r.diagnoses())[0].history.map((entry) => entry.status))
       .toEqual(["registered", "applied", "plan_revised", "delivered", "fix_reported", "resolved"]);
     expect(r.database.getTopic(r.topicId).planSHA256).toBe(revised.planSHA256);
-    r.database.close();
+    await r.app.close();
   });
 
   it("이전 범위 세대의 진단은 현재 세대에서 정정(supersedes)으로 받지 않는다 — 409 로 거부하고 현재 세대 수정 정지의 재개 단계(CLAUDE_FIX)를 바꾸지 않는다(2026-09-15 감사 #16)", { timeout: 60_000 }, async () => {
@@ -2361,7 +2364,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     await r.idle("READY_TO_DELIVER");
     expect(r.claude.turns).toHaveLength(8);
     expect(r.codex.prompts.slice(codexBefore).map((prompt) => prompt.includes("반환 kind는 FINAL_REVIEW"))).toEqual([true]);
-    r.database.close();
+    await r.app.close();
   });
 
   it("저장·승인까지 끝난 계획 변경 진단이 개정 계획의 구현 턴에서 반박되면 '저장 전 개정'으로 분류하지 않는다 — 허용 오차 개정은 미저장 사유로 막히지 않고, 다른 진단 적용은 반박된 DG-1 처리 대기만을 사유로 막힌다(2026-09-15 감사 #17)", { timeout: 60_000 }, async () => {
@@ -2438,7 +2441,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.getTopic(r.topicId).state).toBe("USER_DECISION_REQUIRED");
     expect(r.database.getFlags(r.topicId).resumeState).toBe("IMPLEMENTING");
     expect(r.claude.turns).toHaveLength(turns);
-    r.database.close();
+    await r.app.close();
   });
 
   it("진단 개정 계획 저장 직후 새 입력으로 멈추면 retry 는 저장된 개정 계획으로 감사부터 잇는다 — 개정 턴을 다시 사지 않고 전체 재계획으로 DG-1 을 재확인(stale)으로 돌리지 않는다(2026-09-15 감사 #19)", { timeout: 60_000 }, async () => {
@@ -2523,7 +2526,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(after.planRevision).toBeGreaterThanOrEqual(stopped.planRevision);
     expect(after.approvedPlanSHA256).toBeNull();
     expect(after.participants.every((participant) => participant.acknowledgedPlanSHA256 === after.planSHA256)).toBe(true);
-    r.database.close();
+    await r.app.close();
   });
 
   it("최종 리뷰 정지 쟁점을 사용자가 판정한 뒤 적용한 진단 전용 수정에서 러너가 그 결정대로 쟁점을 수정 불필요로 처분하면 수락돼 최종 리뷰를 거쳐 인도 대기·해결에 이른다 — 처분 되돌림 가드가 사용자 판정을 거부하지 않는다(2026-09-15 감사 2차 #1)", { timeout: 60_000 }, async () => {
@@ -2579,7 +2582,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.fixContracts.list(r.topicId, topic.scopeGeneration, topic.planEpoch)
       .map((contract) => [contract.route, contract.origin.stage, contract.diagnosisIds, contract.source.map((finding) => finding.id), contract.status]))
       .toEqual([["diagnosis", "READY_TO_DELIVER", ["DG-1"], [], "accepted"], ["diagnosis", "CODEX_FINAL_REVIEW", ["DG-2"], ["F-2"], "accepted"]]);
-    r.database.close();
+    await r.app.close();
   });
 
   it("최종 리뷰 정지 쟁점의 판정 필요를 유지해 멈춘 진단 전용 수정은 사용자가 그 쟁점 id 를 적은 결정을 올리고 retry 하면 러너의 수정 불필요 처분이 수락돼 최종 리뷰를 거쳐 인도 대기·해결에 이른다 — '처분을 되돌렸습니다' 정지로 되돌아가지 않는다(2026-09-15 감사 2차 #1)", { timeout: 60_000 }, async () => {
@@ -2643,7 +2646,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.fixContracts.list(r.topicId, topic.scopeGeneration, topic.planEpoch)
       .map((contract) => [contract.route, contract.diagnosisIds, contract.source.map((finding) => finding.id), contract.status]))
       .toEqual([["diagnosis", ["DG-1"], [], "accepted"], ["diagnosis", ["DG-2"], ["F-2"], "accepted"]]);
-    r.database.close();
+    await r.app.close();
   });
 
   it("수정 불필요 정정으로 최종 리뷰에 돌아가도 대조 보고는 수락된 수정 결과이고 반환된 진단 전용 수정 결과가 아니다 — 정지 쟁점 F-2 는 커버리지가 판정을 요구하고, 리뷰어가 미결로 두면 사용자 결정 없이 닫히거나 커밋되지 않는다(2026-09-15 감사 2차 #4)", { timeout: 60_000 }, async () => {
@@ -2731,7 +2734,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.fixContracts.list(r.topicId, topic.scopeGeneration, topic.planEpoch)
       .map((contract) => [contract.route, contract.source.map((finding) => finding.id), contract.status]))
       .toEqual([["review", ["F-1"], "accepted"], ["diagnosis", ["F-2"], "closed"]]);
-    r.database.close();
+    await r.app.close();
   });
 
   it("최종 리뷰 정지가 되돌린 반영 보고 진단(DG-1)의 판정은 다음 진단 전용 수정(DG-2)의 원본에 실려 러너가 처분해야 하고, 다음 최종 리뷰가 DG-1 을 판정하기 전에는 DG-1 이 해결되지도 커밋되지도 않는다(2026-09-15 감사 2차 #3)", { timeout: 60_000 }, async () => {
@@ -2808,7 +2811,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(contracts.map((contract) => [contract.contractId, contract.route, contract.diagnosisIds, contract.status]))
       .toEqual([["FC-1", "diagnosis", ["DG-1"], "accepted"], ["FC-2", "diagnosis", ["DG-2"], "accepted"]]);
     expect(contracts[1].source.map((finding) => finding.id)).toEqual(["DG-1"]);
-    r.database.close();
+    await r.app.close();
   });
 
   it("리뷰 수정 작업이 증거 대기로 멈춘 뒤 반영 보고 진단 DG-1 을 정정(supersedes)한 DG-2 를 실어 수락하면, 정정으로 닫힌 DG-1 의 옛 처분은 러너의 처분 되돌림으로 보지 않는다 — 최종 리뷰를 거쳐 인도 대기에 이르고 DG-2 가 해결된다(2026-09-15 감사 2차 #13)", { timeout: 60_000 }, async () => {
@@ -2876,7 +2879,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     const topic = r.database.getTopic(r.topicId);
     expect(r.database.fixContracts.list(r.topicId, topic.scopeGeneration, topic.planEpoch)
       .map((contract) => [contract.contractId, contract.route, contract.diagnosisIds, contract.status])).toEqual([["FC-1", "review", ["DG-2"], "accepted"]]);
-    r.database.close();
+    await r.app.close();
   });
   it("진단 전용 수정 뒤 최종 리뷰가 연 일반 수정이 응답 전에 끊기면 retry 는 그 최종 리뷰의 확정 결함 F-9 를 원본으로 수정 턴을 다시 연다 — 쟁점 0건인 첫 리뷰로 바꿔 F-9 를 버리지 않고, F-9 를 빠뜨린 결과로는 인도 대기에 이르지 않는다(2026-09-15 감사 2차 #6)", { timeout: 30_000 }, async () => {
     const r = await stoppedFinalReviewFix("final-fix-retry");
@@ -2912,7 +2915,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.fixContracts.list(r.topicId, topic.scopeGeneration, topic.planEpoch)
       .map((contract) => [contract.contractId, contract.route, contract.origin.review?.kind ?? null, contract.status]))
       .toEqual([["FC-1", "diagnosis", null, "accepted"], ["FC-2", "review", "codex-final-review", "accepted"]]);
-    r.database.close();
+    await r.app.close();
   });
 
   it("최종 리뷰가 연 일반 수정 정지에서 반영 보고(fix_reported)된 DG-1 을 정정한 수정 진단 DG-2 는 멈춘 그 수정 작업에 수정 지시로 실린다 — 다음 수정 턴이 F-9 와 DG-2 를 함께 받고 F-9 가 사라지지 않는다(2026-09-15 감사 2차 #7)", { timeout: 30_000 }, async () => {
@@ -2947,7 +2950,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.fixContracts.list(r.topicId, topic.scopeGeneration, topic.planEpoch)
       .map((contract) => [contract.contractId, contract.route, contract.diagnosisIds, contract.status]))
       .toEqual([["FC-1", "diagnosis", ["DG-1"], "accepted"], ["FC-2", "review", ["DG-2"], "accepted"]]);
-    r.database.close();
+    await r.app.close();
   });
 
   it("최종 리뷰가 연 일반 수정 정지에서 반영 보고(fix_reported)된 DG-1 을 수정 불필요로 정정해도 재개 단계는 CLAUDE_FIX 로 남는다 — 최종 리뷰로 되돌려 F-9 를 판정 없이 버리지 않고, retry 가 F-9 수정 턴을 거친 뒤에야 커밋이 열린다(2026-09-15 감사 2차 #8)", { timeout: 30_000 }, async () => {
@@ -2987,7 +2990,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.fixContracts.list(r.topicId, topic.scopeGeneration, topic.planEpoch)
       .map((contract) => [contract.contractId, contract.route, contract.status]))
       .toEqual([["FC-1", "diagnosis", "accepted"], ["FC-2", "review", "accepted"]]);
-    r.database.close();
+    await r.app.close();
   });
   it("저장만 되고 기록되지 않은 개정 계획 산출물이 최신이어도 허용 오차 개정은 현재 계획 sha 의 승인 계획을 바탕으로 넓힌다 — 미승인 문구는 개정 계획과 이후 구현·리뷰 프롬프트에 실리지 않는다(2026-09-15 감사 2차 #2)", { timeout: 60_000 }, async () => {
     const unapprovedLine = "미승인 개정 DG-1: 승인·ACK 전에 저장만 된 감사 단계 — 허용 오차 개정의 바탕이 되면 안 된다.";
@@ -3063,7 +3066,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     const records = await r.diagnoses();
     expect(records.map((record) => [record.id, record.status])).toEqual([["DG-1", "superseded"], ["DG-2", "closed_no_action"]]);
     expect(records[0].history.map((entry) => entry.status)).not.toContain("plan_revised");
-    r.database.close();
+    await r.app.close();
   });
 
   it("대체된 계획 변경 진단의 개정 턴이 재작성 한도에 막혀 남긴 교정 대기본은 정정한 새 계획 변경 진단이 재사용하지 않는다 — 추가 승인 뒤 retry 의 첫 Claude 턴은 새 진단 원문을 실은 새 개정 턴이다(2026-09-15 감사 2차 #5)", { timeout: 60_000 }, async () => {
@@ -3136,7 +3139,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.codex.prompts.filter((prompt) => prompt.includes("반환 kind는 AUDIT"))).toHaveLength(1);
     expect(r.database.getFlags(r.topicId).resumeState).toBe("CLAUDE_REVISION");
     expect(r.claude.turns).toHaveLength(3);
-    r.database.close();
+    await r.app.close();
   });
 
   it("진단 계획 개정 턴의 계약 교정이 끝나 결정 요청으로 멈춘 뒤 retry 는 교정 원본의 철회된 반박을 재생하지 않는다 — 사용자 결정을 실은 새 개정 턴을 열고 DG-1 을 refuted 로 기록하지 않는다(2026-09-15 감사 2차 #12)", { timeout: 60_000 }, async () => {
@@ -3206,7 +3209,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.codex.prompts.filter((prompt) => prompt.includes("반환 kind는 AUDIT"))).toHaveLength(1);
     expect(r.database.getFlags(r.topicId).resumeState).toBe("CLAUDE_REVISION");
     expect(r.claude.turns).toHaveLength(4);
-    r.database.close();
+    await r.app.close();
   });
 
   it("수정 작업에 실린 진단이 처분 보고 전(전달됨)이면 구현 재개(resume-implementation)는 409 로 그 진단을 알리고 재개 단계를 바꾸지 않는다 — 이어진 retry 는 교정 전 checkpoint 에만 남은 반박을 refuted 로 기록하고 새 턴 없이 멈춰 반박된 지시를 다시 싣지 않는다(2026-09-15 감사 2차 #10)", { timeout: 30_000 }, async () => {
@@ -3261,7 +3264,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     const topic = r.database.getTopic(r.topicId);
     expect(r.database.fixContracts.list(r.topicId, topic.scopeGeneration, topic.planEpoch).map((contract) => [contract.route, contract.status, contract.diagnosisIds]))
       .toEqual([["review", "open", ["DG-1"]]]);
-    r.database.close();
+    await r.app.close();
   });
 
   it("재작성 한도로 멈춘 진단 계획 개정을 수정 불필요로 정정해 재개 단계가 구현(IMPLEMENTING)으로 돌아오면 retry 는 재작성 추가 승인 없이 구현 턴을 잇는다 — 재작성 원장(사용량·한도)은 그대로다(2026-09-15 감사 2차 #11)", { timeout: 30_000 }, async () => {
@@ -3311,7 +3314,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     const after = r.database.revisions.account(r.topicId);
     expect({ used: after.used, limit: after.limit, version: after.version }).toEqual({ used: paused.used, limit: paused.limit, version: paused.version });
     expect((await r.diagnoses()).map((item) => [item.id, item.status])).toEqual([["DG-1", "superseded"], ["DG-2", "closed_no_action"]]);
-    r.database.close();
+    await r.app.close();
   });
 
   it("커밋 뒤 인도 대기에서는 수정·조사 진단 등록을 409 로 거부하고 쓸 수 있는 경로(no_action 정정·범위 변경)를 안내한다 — 적용할 수 없는 진단이 남지 않아 push·close 가 막히지 않는다(2026-09-15 감사 2차 #14)", { timeout: 30_000 }, async () => {
@@ -3351,7 +3354,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/close`)).status).toBe(200);
     expect(r.database.getTopic(r.topicId).state).toBe("CLOSED");
     expect(await r.diagnoses()).toEqual([]);
-    r.database.close();
+    await r.app.close();
   });
 
   it("진단 전용 수정의 수락은 최종 리뷰 전이·계약 수락·반영 보고(fix_reported)를 한 transaction 으로 쓴다 — 반영 보고 기록이 실패하면 전이도 남지 않아 retry 가 수락을 다시 해 반영 보고를 잃지 않고 커밋에 이른다(2026-09-15 감사 2차 #15)", { timeout: 30_000 }, async () => {
@@ -3396,7 +3399,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect((await r.diagnoses())[0].history.map((entry) => entry.status)).toEqual(["registered", "applied", "delivered", "fix_reported", "resolved"]);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "진단 수정 포함", paths: ["feature.txt"] })).status).toBe(200);
     expect(contracts()).toEqual([["diagnosis", "accepted"]]);
-    r.database.close();
+    await r.app.close();
   });
 
   it("수락 전이 transaction 은 상태·회차·계약 행·진단 기록을 함께 쓰거나 함께 버린다 — 진단 기록 하나가 거부되면 앞선 반영 보고·상태 전이·회차 소비·계약 행이 하나도 남지 않는다(2026-09-15 감사 2차 #15)", { timeout: 30_000 }, async () => {
@@ -3438,7 +3441,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(statuses()).toEqual(["registered", "fix_reported"]);
     expect(r.database.getTimeline(r.topicId).filter((event) => event.body === body)).toHaveLength(1);
     expect(r.database.fixContracts.list(r.topicId, topic.scopeGeneration, topic.planEpoch).map((contract) => [contract.contractId, contract.status])).toEqual([["FC-1", "accepted"]]);
-    r.database.close();
+    await r.app.close();
   });
 
   it("인도 대기 순차 적용 뒤 두 수정 진단을 모두 수정 불필요로 정정하면 마지막 정정이 진단 전용 수정 작업을 닫고 정지(FAILED, 재개 = 최종 리뷰)로 옮긴다 — retry 는 러너 턴 없이 지금 작업 트리를 최종 리뷰해 인도 대기에 이르고 커밋이 열린다(2026-09-15 감사 3차 #1)", { timeout: 30_000 }, async () => {
@@ -3481,7 +3484,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(reviewReportIn(r.codex.prompts[1]).summary).toBe("구현을 마쳤습니다.");
     expect(r.database.getFlags(r.topicId).reviewedHead).toBeTruthy();
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "진단 정정 뒤 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("인도 대기 순차 적용 뒤 작업에 실린 DG-1 부터 수정 불필요로 닫아도 그 정정이 진단 전용 수정 작업을 닫고 정지(FAILED, 재개 = 최종 리뷰)로 옮긴다 — 대기 중인 DG-2 가 남은 동안 retry 는 409 로 막히고, DG-2 를 닫은 뒤 retry 가 러너 턴 없이 최종 리뷰해 커밋이 열린다(2026-09-15 감사 3차 #1)", { timeout: 30_000 }, async () => {
@@ -3523,7 +3526,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.codex.prompts).toHaveLength(2);
     expect(r.codex.prompts[1]).toContain("반환 kind는 FINAL_REVIEW");
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "진단 정정 뒤 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("진단 전용 수정 정지에서 계획 변경 정정의 저장 전 개정을 수정 불필요로 되돌려 실은 진단이 모두 닫힌 진단 전용 수정 작업에 재개 단계 CLAUDE_FIX 가 복원돼도, retry 는 throw·영구 FAILED 없이 러너 턴 없이 그 작업을 닫고 지금 작업 트리를 최종 리뷰해 인도 대기에 이르고 커밋이 열린다(2026-09-15 감사 3차 #8)", { timeout: 30_000 }, async () => {
@@ -3566,7 +3569,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.fixContracts.list(r.topicId, settled.scopeGeneration, settled.planEpoch).map((contract) => [contract.contractId, contract.diagnosisIds, contract.status]))
       .toEqual([["FC-1", ["DG-1"], "closed"]]);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "진단 정정 뒤 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("실은 진단이 모두 닫힌 진단 전용 수정 작업에 CLAUDE_FIX 가 복원됐어도 그 작업의 열린 요청이 남았으면 retry 는 작업을 닫거나 최종 리뷰로 넘기지 않고 USER_DECISION_REQUIRED(재개 CLAUDE_FIX)로 멈춘다 — 요청 해소를 지시한 새 수정 진단이 같은 작업을 이어 요청을 해소한 뒤에야 인도 대기·커밋에 이른다(2026-09-15 감사 3차 #8)", { timeout: 30_000 }, async () => {
@@ -3625,7 +3628,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.getTimeline(r.topicId).some((event) => event.payload?.resolvedRequest === openId)).toBe(true);
     expect((await r.diagnoses()).map((record) => [record.id, record.status])).toEqual([["DG-1", "superseded"], ["DG-2", "superseded"], ["DG-3", "closed_no_action"], ["DG-4", "resolved"]]);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "요청 해소 뒤 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("진단 계획 개정이 저장되면 개정 전 계획에서 연 진단 전용 수정 작업은 버려진다 — 개정 계획 구현 뒤 인도 대기에서 적용한 새 수정 진단은 새 작업을 열고, 그 수정 턴은 개정 전 최종 리뷰 정지 쟁점 F-2 를 원본으로 싣지 않는다(2026-09-15 감사 3차 #12)", { timeout: 60_000 }, async () => {
@@ -3718,7 +3721,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect((await r.diagnoses()).find((record) => record.id === "DG-4")?.status).toBe("resolved");
     await closeRevisedAwayDG1(r, "개정 계획 인도");
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "개정 계획 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("최종 리뷰 정지 쟁점(F-2 수정 합의 + 사용자 판정 필요)을 원본으로 연 진단 전용 수정이 수정 불필요 정정으로 닫힌 뒤 최종 리뷰가 F-2 를 생략하면, 첫 리뷰의 같은 id 옛 처분(수정 불필요)이 승계되지 않는다 — 프롬프트는 F-2 의 최신 판정을 싣고, 누락은 교정 대상이 되어 사용자 결정 없이 인도 대기·커밋에 이르지 않는다(2026-09-15 감사 3차 #2)", { timeout: 60_000 }, async () => {
@@ -3756,7 +3759,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.fixContracts.list(r.topicId, topic.scopeGeneration, topic.planEpoch)
       .map((contract) => [contract.route, contract.status, contract.source.map((finding) => finding.id)]))
       .toEqual([["diagnosis", "accepted", []], ["diagnosis", "closed", ["F-2"]]]);
-    r.database.close();
+    await r.app.close();
   });
 
   it("최종 리뷰 정지 쟁점(F-2 수정 합의 + 사용자 판정 필요)을 원본으로 연 진단 전용 수정이 수정 불필요 정정으로 닫힌 뒤 최종 리뷰가 F-2 를 첫 리뷰 처분대로 수정 불필요로 적으면, 되돌림 가드가 옛 settled 처분이 아니라 최신 판정(수정 합의)과 대조해 멈춘다 — 사용자 결정 없이 인도 대기·커밋에 이르지 않는다(2026-09-15 감사 3차 #2)", { timeout: 60_000 }, async () => {
@@ -3776,7 +3779,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     const commit = await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "F-2 판정 없이 인도", paths: ["feature.txt"] });
     expect(commit.status).toBeGreaterThanOrEqual(400);
     expect(String(commit.body.error)).toContain("READY_TO_DELIVER");
-    r.database.close();
+    await r.app.close();
   });
 
   it("해결(resolved)된 진단 DG-1 을 뒤 최종 리뷰가 회귀(수정 합의)로 판정해 연 리뷰 수정 작업은 DG-1 을 수정 대상에 싣고, 러너가 DG-1 을 빠뜨리면 DG-1 을 지목한 교정을 요구한다 — 회귀 판정을 버린 채 수락·인도 대기에 이르지 않고, 다음 최종 리뷰가 DG-1 재반영 보고를 판정한 뒤에야 커밋된다(2026-09-15 감사 3차 #3)", { timeout: 60_000 }, async () => {
@@ -3833,7 +3836,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     const contracts = r.database.fixContracts.list(r.topicId, topic.scopeGeneration, topic.planEpoch);
     expect(contracts.map((contract) => [contract.contractId, contract.route, contract.status])).toEqual([["FC-1", "diagnosis", "accepted"], ["FC-2", "review", "accepted"]]);
     expect(contracts[1].source.map((finding) => finding.id)).toEqual(expect.arrayContaining(["DG-2", "DG-1"]));
-    r.database.close();
+    await r.app.close();
   });
 
   it("수정을 요구하는 결정('F-1 은 반드시 고쳐 주세요')은 줄 머리 OVERRULE 지시어가 아니어서 러너의 F-1 하향(수정 불필요)을 허용하지 않는다 — 수락하지 않고 F-1 을 지목해 멈추며, 최종 리뷰·인도 대기·커밋에 이르지 않는다(2026-09-15 감사 3차 #7)", { timeout: 60_000 }, async () => {
@@ -3852,7 +3855,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.getFlags(r.topicId).fixPassUsed).toBe(false);
     const topic = r.database.getTopic(r.topicId);
     expect(r.database.fixContracts.list(r.topicId, topic.scopeGeneration, topic.planEpoch).map((contract) => [contract.route, contract.status])).toEqual([["review", "open"]]);
-    r.database.close();
+    await r.app.close();
   });
 
   it("줄 머리 OVERRULE F-1 지시가 있는 결정이면 같은 러너의 F-1 하향(수정 불필요)이 수락되고 최종 리뷰를 거쳐 인도 대기·커밋에 이른다 — 지시어 한정 규칙의 양성 대조(2026-09-15 감사 3차 #7)", { timeout: 60_000 }, async () => {
@@ -3865,7 +3868,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     const finalReview = JSON.parse((await r.artifacts.readLatest(r.topicId, "codex-final-review"))!) as AgentResult;
     expect(finalReview.findings.find((finding) => finding.id === "F-1")?.disposition).toBe("AGREED_NO_ACTION");
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "F-1 은 사용자 지시로 미수정", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("계약 도입 전 엔진이 남긴 진단 전용 수정 checkpoint(fixSource diagnosis#DG-1)에서 러너 반박으로 멈춘 토픽을 수정 불필요로 정정하면 그 작업 id 그대로 진단 전용 수정 계약으로 이관·종결돼 최종 리뷰로 돌아간다 — retry 는 Claude 수정 턴 없이 최종 리뷰만 돌리고 자동 수정 회차를 쓰지 않는다(2026-09-15 감사 3차 #4)", { timeout: 30_000 }, async () => {
@@ -3888,7 +3891,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.fixContracts.list(r.topicId, topic.scopeGeneration, topic.planEpoch).map((contract) => [contract.contractId, contract.route, contract.pass, contract.status]))
       .toEqual([["diagnosis#DG-1", "diagnosis", "none", "closed"]]);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "옛 토픽 진단 정정 뒤 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("계약 도입 전 엔진이 남긴 진단 전용 수정 checkpoint(fixSource diagnosis#DG-1)에서 러너 반박으로 멈춘 토픽의 정정 수정 진단 DG-2 는 그 진단 전용 수정 작업에 실려 진단 전용 수정으로 적용된다 — 러너 프롬프트가 진단 전용 수정 머리말로 DG-2 를 싣고, 최종 리뷰를 거쳐 인도 대기에 이르러도 자동 수정 회차를 쓰지 않는다(2026-09-15 감사 3차 #6)", { timeout: 30_000 }, async () => {
@@ -3919,7 +3922,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.fixContracts.list(r.topicId, topic.scopeGeneration, topic.planEpoch).map((contract) => [contract.contractId, contract.route, contract.pass, contract.diagnosisIds, contract.status]))
       .toEqual([["diagnosis#DG-1", "diagnosis", "none", ["DG-1", "DG-2"], "accepted"]]);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "옛 토픽 정정 진단 반영", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("계약 도입 전 엔진이 인도 대기에 반쯤 적용한 진단 DG-1(적용됨·재개 CLAUDE_FIX·완료 판정 취소, 계약 없음)은 다음 진단 DG-2 적용이 여는 진단 전용 수정에 함께 실린다 — 러너 프롬프트가 두 진단을 싣고, 두 진단 모두 반영 보고·해결에 이르러 DG-1 이 적용됨으로 남지 않고 커밋이 열린다(2026-09-15 감사 3차 #11)", { timeout: 30_000 }, async () => {
@@ -3966,7 +3969,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.fixContracts.list(r.topicId, topic.scopeGeneration, topic.planEpoch).map((contract) => [contract.route, contract.diagnosisIds, contract.status]))
       .toEqual([["diagnosis", ["DG-1", "DG-2"], "accepted"]]);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "옛 반쯤 적용 진단까지 반영", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("계약 도입 전(구 엔진)에 진단 전용 수정 뒤 최종 리뷰가 연 일반 수정이 응답 전에 끊긴 토픽을 retry 하면 이관한 수정 작업의 원본은 그 최종 리뷰의 확정 결함 F-9 다 — 쟁점 0건인 첫 리뷰로 이관해 F-9 를 버리지 않고, F-9 를 빠뜨린 결과는 교정을 받아 판정 없이 인도 대기에 이르지 않는다(2026-09-15 감사 3차 #5)", { timeout: 30_000 }, async () => {
@@ -4004,7 +4007,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.fixContracts.list(r.topicId, topic.scopeGeneration, topic.planEpoch)
       .map((contract) => [contract.route, contract.origin.review?.kind ?? null, contract.source.some((finding) => finding.id === "F-9"), contract.status]))
       .toEqual([["review", "codex-final-review", true, "accepted"]]);
-    r.database.close();
+    await r.app.close();
   });
 
   it("계약 도입 전(구 엔진)의 같은 정지에서 사용자 결정을 올리고 retry 해도 최종 리뷰 #1 보다 먼저 저장된 진단 전용 수정 결과를 이 수정 작업의 결과로 재사용하지 않는다 — F-9 를 실은 수정 턴을 열고, F-9 판정 없이 인도 대기에 이르지 않는다(2026-09-15 감사 3차 #5)", { timeout: 30_000 }, async () => {
@@ -4031,7 +4034,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.codex.prompts.slice(codexBefore)).toHaveLength(1);
     expect(reviewReportIn(r.codex.prompts.at(-1)!).findings.find((finding) => finding.id === "F-9")?.disposition).toBe("RESOLVED_BY_FIX");
     expect((await r.diagnoses()).map((record) => record.status)).toEqual(["resolved"]);
-    r.database.close();
+    await r.app.close();
   });
 
   it("계약 도입 전(구 엔진)의 멈춘 수정 작업에 실린 진단이 처분 보고 전(전달됨)이면 열린 계약이 없어도 구현 재개(resume-implementation)는 409 로 그 진단을 알리고 상태·재개 단계를 바꾸지 않는다 — 재구현 뒤로 진단을 묻지 않는다(2026-09-15 감사 3차 #9)", { timeout: 30_000 }, async () => {
@@ -4072,7 +4075,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.getTimeline(r.topicId).some((event) => event.payload?.implementationResume !== undefined)).toBe(false);
     expect((await r.diagnoses())[0].history.map((entry) => entry.status)).toEqual(["registered", "applied", "delivered"]);
     expect(r.claude.turns).toHaveLength(4);
-    r.database.close();
+    await r.app.close();
   });
 
   it("계약 도입 전(구 엔진)에 리뷰 수정 결과가 수락된 토픽에서 인도 대기 중 적용한 진단 전용 수정이 끊긴 뒤 수정 불필요로 정정해 최종 리뷰로 돌아가면, 대조 보고는 수락된 옛 수정 결과('F-1 수정 보고', F-1 RESOLVED_BY_FIX)다 — 닫힌 진단 전용 계약이 생겼다고 구현 결과로 바꾸지 않고 인도 대기·커밋에 이른다(2026-09-15 감사 3차 #10)", { timeout: 30_000 }, async () => {
@@ -4113,7 +4116,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.claude.turns).toHaveLength(3);
     expect((await r.diagnoses()).map((record) => record.status)).toEqual(["superseded", "closed_no_action"]);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "정정 뒤 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("계약 도입 전(구 엔진)에 리뷰 수정이 수락되고 최종 리뷰 정지(사용자 판정 필요, 재개 CODEX_FINAL_REVIEW)에 있던 토픽에서 적용한 진단 전용 수정이 끊긴 뒤 수정 불필요로 닫혀도, 다음 최종 리뷰의 대조 보고는 수락된 옛 수정 결과다 — 수정 단계에서만 기록한 쟁점(F-8)까지 실리고 정지 쟁점 F-2 는 원본 절로 함께 실린다(2026-09-15 감사 3차 #14)", { timeout: 60_000 }, async () => {
@@ -4160,7 +4163,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(finalReview).toContain('"id": "F-2"');
     expect(r.claude.turns).toHaveLength(3);
     expect((await r.diagnoses()).map((record) => record.status)).toEqual(["superseded", "closed_no_action"]);
-    r.database.close();
+    await r.app.close();
   });
 
   it("계약 도입 전(구 엔진) 토픽에서 러너 반박으로 멈춘 진단 전용 수정(diagnosis#DG-1)을 수정 불필요로 닫은 뒤 최종 리뷰가 연 리뷰 수정(F-9)이 응답 전에 끊겼으면, retry 의 이관은 낡은 진단 checkpoint 를 잇는 진단 전용 계약이 아니라 그 최종 리뷰를 원본으로 한 리뷰 경로다 — F-9 를 실은 수정 턴을 열고 F-9 를 빠뜨리면 F-9 를 지목한 교정을 요구하며, F-9 판정 없이 인도 대기·커밋에 이르지 않는다(2026-09-15 감사 4차 #1·#2)", { timeout: 30_000 }, async () => {
@@ -4234,7 +4237,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
       .toEqual([[`codex-final-review#${finalReview.revision}`, "review", true, "accepted"]]);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "F-9 수정 뒤 인도", paths: ["feature.txt"] })).status).toBe(200);
     expect(git(r.worktree, ["show", "HEAD:feature.txt"])).toBe("F-9 수정");
-    r.database.close();
+    await r.app.close();
   });
 
   it("계약 도입 전(구 엔진) 토픽에서 러너 반박으로 멈춘 진단 전용 수정 checkpoint(diagnosis#DG-1) 뒤에 수정 불필요 정정과 통과한 최종 리뷰로 인도 대기에 이르렀으면, 그 뒤 순차 적용이 여는 진단 전용 수정은 낡은 checkpoint 의 작업 id 를 잇지 않는다 — 이관 계약은 대기 중이던 새 진단의 작업 id 이고, 낡은 누적본(DG-1 반박)에서 이어가지 않은 채 새 진단만 대조한 최종 리뷰를 거쳐 인도 대기·커밋에 이른다(2026-09-15 감사 4차 #1)", { timeout: 30_000 }, async () => {
@@ -4293,7 +4296,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.fixContracts.list(r.topicId, topic.scopeGeneration, topic.planEpoch).map((contract) => [contract.contractId, contract.route, contract.diagnosisIds, contract.status]))
       .toEqual([["diagnosis#DG-3", "diagnosis", ["DG-3", "DG-4"], "accepted"]]);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "새 진단 반영 뒤 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("계약 도입 전(구 엔진)에 리뷰 수정 결과('F-1 수정 보고')가 수락된 토픽에서 인도 대기 중 적용한 진단 전용 수정을 러너가 반박해 멈춘 뒤 수정 불필요로 정정해 최종 리뷰로 돌아가면, 대조 보고는 수락된 옛 수정 결과다 — 반박으로 멈추며 저장한 수정 결과('진단이 틀렸습니다.', 수락 기록 없음)를 보고로 싣지 않아 F-1 누락 교정 없이 인도 대기·커밋에 이른다(2026-09-15 감사 4차 #9)", { timeout: 30_000 }, async () => {
@@ -4350,7 +4353,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.claude.turns).toHaveLength(3);
     expect((await r.diagnoses()).map((record) => record.status)).toEqual(["superseded", "closed_no_action"]);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "정정 뒤 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("계획 개정을 구현한 뒤 인도 대기 순차 적용 창을 수정 불필요 정정으로 닫아(인도 대기 → 실패, 재개 = 최종 리뷰) 대기 중이던 수정 진단을 적용하면, 새 진단 전용 계약은 인도 대기에서 연 계약(원본 없음)이고 수정 턴은 개정 전 최종 리뷰의 정지 쟁점 F-2 를 싣지 않는다 — 그 수정은 되돌림 정지 없이 수락되고 최종 리뷰를 거쳐 인도 대기·커밋에 이른다(2026-09-15 감사 4차 #4)", { timeout: 60_000 }, async () => {
@@ -4400,7 +4403,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect((await r.diagnoses()).find((record) => record.id === "DG-5")?.status).toBe("resolved");
     await closeRevisedAwayDG1(r, "개정 계획 인도");
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "개정 계획 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("계획 개정을 구현한 뒤 인도 대기 순차 적용 창의 수정 진단을 모두 수정 불필요 정정으로 닫고 재시도하면, 최종 리뷰의 대조 보고는 개정 계획의 구현 결과('개정 계획대로 구현했습니다.', DG-3)다 — 개정 전에 수락된 진단 전용 계약 FC-1 의 누적본('DG-1 반영')이 아니다(2026-09-15 감사 4차 #5)", { timeout: 60_000 }, async () => {
@@ -4437,7 +4440,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.claude.turns).toHaveLength(7);
     await closeRevisedAwayDG1(r, "개정 계획 인도");
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "개정 계획 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("계획 개정을 구현한 뒤 인도 대기에서 적용한 진단 전용 수정 턴이 죽고 그 진단을 수정 불필요 정정으로 닫아 재시도하면, 최종 리뷰의 대조 보고는 개정 계획의 구현 결과다 — 계약 역순 탐색이 닫힌 FC-3·버린 FC-2 를 지나 개정 전 수락 계약 FC-1 의 누적본('DG-1 반영')에 닿지 않는다(2026-09-15 감사 4차 #8)", { timeout: 60_000 }, async () => {
@@ -4471,7 +4474,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.claude.turns).toHaveLength(8);
     await closeRevisedAwayDG1(r, "개정 계획 인도");
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "개정 계획 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("최종 리뷰 정지(F-2, 재개 = 최종 리뷰)에서 구현 재개(resume-implementation)로 다시 구현하고 첫 리뷰를 통과한 뒤 인도 대기에서 적용한 진단 전용 수정이 반박되고 수정 불필요 정정으로 닫혀 재시도하면, 최종 리뷰의 대조 보고는 재구현 결과('구현을 다시 했습니다.')다 — 구현 재개 전에 수락된 리뷰 수정 계약 FC-1 의 누적본('F-1 반영')이 아니고, 재개 전 주기의 F-1 을 커버리지·알려진 쟁점으로 삼지 않는다(2026-09-15 감사 4차 #13)", { timeout: 60_000 }, async () => {
@@ -4539,7 +4542,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.getTopic(r.topicId).state).toBe("USER_DECISION_REQUIRED");
     expect(r.database.getFlags(r.topicId).resumeState).toBe("CODEX_FINAL_REVIEW");
     expect(r.claude.turns).toHaveLength(4);
-    r.database.close();
+    await r.app.close();
   });
 
   it("OVERRULE 줄에 설명 문장이 붙은 결정('OVERRULE F-3 — F-1 은 반드시 고쳐 주세요.')은 지시 전체가 무효라 문장 속 F-1 을 면제로 세지 않는다 — 러너의 F-1 하향(수정 불필요)을 수락하지 않고 F-1 을 지목해 멈추며, 최종 리뷰·인도 대기·커밋에 이르지 않는다(2026-09-15 감사 4차 #6)", { timeout: 60_000 }, async () => {
@@ -4557,7 +4560,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.getFlags(r.topicId).fixPassUsed).toBe(false);
     const topic = r.database.getTopic(r.topicId);
     expect(r.database.fixContracts.list(r.topicId, topic.scopeGeneration, topic.planEpoch).map((contract) => [contract.route, contract.status])).toEqual([["review", "open"]]);
-    r.database.close();
+    await r.app.close();
   });
 
   it("키워드만 있는 OVERRULE 줄은 다음 줄로 넘어가지 않는다 — 다음 줄에 'F-1 은 반드시 고쳐 주세요.' 를 적은 결정은 F-1 을 면제로 세지 않아 러너의 F-1 하향을 수락하지 않고 멈추며, 최종 리뷰·커밋에 이르지 않는다(2026-09-15 감사 4차 #6)", { timeout: 60_000 }, async () => {
@@ -4569,7 +4572,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.getTimeline(r.topicId).some((event) => event.body.includes("사용자 결정이 처분 변경을 허용한 쟁점"))).toBe(false);
     const commit = await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "F-1 미수정 인도", paths: ["feature.txt"] });
     expect(commit.status).toBeGreaterThanOrEqual(400);
-    r.database.close();
+    await r.app.close();
   });
 
   it("점이 든 finding id(S6.5-GATE2 — 스키마상 유효한 운영 형식)도 줄 머리 'OVERRULE S6.5-GATE2' 결정이면 면제된다 — 러너의 S6.5-GATE2 하향(수정 불필요)이 수락 가드와 최종 리뷰 되돌림 검사를 통과해 인도 대기·커밋에 이른다(2026-09-15 감사 4차 #11)", { timeout: 60_000 }, async () => {
@@ -4596,7 +4599,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     const finalReview = JSON.parse((await r.artifacts.readLatest(r.topicId, "codex-final-review"))!) as AgentResult;
     expect(finalReview.findings.find((finding) => finding.id === "S6.5-GATE2")?.disposition).toBe("AGREED_NO_ACTION");
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "S6.5-GATE2 는 사용자 지시로 미수정", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("수락 가드의 처분 되돌림 정지는 폐기된 'id 를 적은 결정' 규칙이 아니라 줄 머리 OVERRULE 지시어를 해법으로 안내하고, 그 안내대로('OVERRULE F-1' 한 줄, 설명은 다음 줄) 결정을 올려 retry 하면 같은 정지로 돌아가지 않고 최종 리뷰를 거쳐 인도 대기·커밋에 이른다(2026-09-15 감사 4차 #3·#10)", { timeout: 60_000 }, async () => {
@@ -4626,7 +4629,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(bodies.some((body) => body.includes("사용자 결정이 처분 변경을 허용한 쟁점: F-1(AGREED_ACTION → AGREED_NO_ACTION)"))).toBe(true);
     expect(r.codex.prompts.filter((prompt) => prompt.includes("반환 kind는 FINAL_REVIEW"))).toHaveLength(1);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "F-1 은 사용자 지시로 미수정", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   // ---- 2026-09-15 감사 4차 #7·#12 (g4) ----
@@ -4724,7 +4727,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.getTopic(r.topicId).state).toBe("READY_TO_DELIVER");
     expect((await r.diagnoses()).map((record) => [record.id, record.status])).toEqual([["DG-1", "superseded"], ["DG-2", "closed_no_action"]]);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "DG-1 정정 뒤 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("첫 리뷰 경로도 같다 — 멈춘 구현에 적용한 진단 DG-1 의 반영 보고를 통과한 첫 리뷰가 반박(REFUTED)으로 판정하면 DG-1 은 해결로 기록되지 않고 반영 보고(fix_reported)로 남아 커밋이 409 로 막힌다(2026-09-15 감사 4차 #7)", { timeout: 30_000 }, async () => {
@@ -4756,7 +4759,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     const blocked = await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "DG-1 미확인 인도", paths: ["feature.txt"] });
     expect(blocked.status).toBe(409);
     expect(JSON.stringify(blocked.body)).toContain("DG-1");
-    r.database.close();
+    await r.app.close();
   });
 
   it("실은 진단이 모두 닫힌 진단 전용 수정 작업에 CLAUDE_FIX 가 복원된 채 최신 checkpoint 가 손상되면 retry 는 손상을 삼켜 열린 요청을 없는 것으로 보지 않는다 — 작업을 닫거나 최종 리뷰로 넘기지 않고 USER_DECISION_REQUIRED(재개 CLAUDE_FIX, checkpointCorrupt)로 멈춘다(2026-09-15 감사 4차 #12)", { timeout: 30_000 }, async () => {
@@ -4806,7 +4809,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.fixContracts.list(r.topicId, topic.scopeGeneration, topic.planEpoch).map((contract) => [contract.contractId, contract.status])).toEqual([["FC-1", "open"]]);
     expect(r.claude.turns).toHaveLength(3);
     expect(r.codex.prompts).toHaveLength(1);
-    r.database.close();
+    await r.app.close();
   });
 
   it("계약 도입 전(구 엔진) 토픽의 멈춘 수정 작업(열린 계약 없음)에서 최신 checkpoint 가 손상되면 retry 는 손상을 삼킨 채 계약을 추정·이관하지 않는다 — 계약 행 없이 USER_DECISION_REQUIRED(재개 CLAUDE_FIX, checkpointCorrupt)로 멈추고 러너·리뷰 턴을 열지 않는다(2026-09-15 감사 4차 #12)", { timeout: 30_000 }, async () => {
@@ -4826,7 +4829,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.claude.turns).toHaveLength(3);
     expect(r.codex.prompts).toHaveLength(codexBefore);
     expect((await r.diagnoses()).map((record) => record.status)).toEqual(["fix_reported"]);
-    r.database.close();
+    await r.app.close();
   });
 
   it("같은 손상 상태(계약 도입 전 토픽의 멈춘 수정 작업, 최신 checkpoint 손상)에서 수정 불필요 정정 등록(no_action, supersedes DG-1)은 409 로 거부된다 — 손상을 삼킨 채 계약을 추정·이관해 등록하지 않고 진단·상태·재개 단계를 바꾸지 않는다(2026-09-15 감사 4차 #12)", { timeout: 30_000 }, async () => {
@@ -4843,7 +4846,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     const topic = r.database.getTopic(r.topicId);
     expect(r.database.fixContracts.list(r.topicId, topic.scopeGeneration, topic.planEpoch)).toEqual([]);
     expect(r.database.getTimeline(r.topicId).filter((event) => event.sequence > sequence).map((event) => event.body)).toEqual([]);
-    r.database.close();
+    await r.app.close();
   });
 
   it("같은 손상 상태에서 등록해 둔 수정 진단 DG-2 의 적용(apply)도 409 로 거부된다 — 손상을 삼킨 채 계약을 추정·이관해 적용·재개하지 않고 진단·상태·재개 단계를 바꾸지 않는다(2026-09-15 감사 4차 #12)", { timeout: 30_000 }, async () => {
@@ -4861,7 +4864,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.fixContracts.list(r.topicId, topic.scopeGeneration, topic.planEpoch)).toEqual([]);
     expect(r.database.getTimeline(r.topicId).filter((event) => event.sequence > sequence).map((event) => event.body)).toEqual([]);
     expect(r.claude.turns).toHaveLength(3);
-    r.database.close();
+    await r.app.close();
   });
 
   it("최신 checkpoint 의 손상이 JSON 파손이 아니라 원장 sha 불일치(blob 변조·손상)여도 계약 도입 전 토픽의 멈춘 수정 작업에서 수정 불필요 정정 등록(no_action, supersedes DG-1)은 409 로 거부된다 — 손상을 삼킨 채 열린 계약을 판정하지 않고 등록·정정하지 않는다(2026-09-15 감사 4차 #12)", { timeout: 30_000 }, async () => {
@@ -4877,7 +4880,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     const topic = r.database.getTopic(r.topicId);
     expect(r.database.fixContracts.list(r.topicId, topic.scopeGeneration, topic.planEpoch)).toEqual([]);
     expect(r.database.getTimeline(r.topicId).filter((event) => event.sequence > sequence).map((event) => event.body)).toEqual([]);
-    r.database.close();
+    await r.app.close();
   });
 
   it("구현 재개(resume-implementation) 전 최종 리뷰의 반영 확인은 재구현 주기의 판정이 아니다 — 재구현이 DG-1 수정을 되돌리고 첫 리뷰가 DG-1 을 판정하지 않은 채 통과하면 DG-1 은 해결되지 않고 반영 보고(fix_reported)로 남아 '반영을 확인하지 않았습니다' 기록과 함께 커밋이 409 로 막히며, 수정 불필요 정정(no_action, supersedes DG-1)으로 닫은 뒤에야 커밋된다(2026-09-15 감사 5차 #1)", { timeout: 60_000 }, async () => {
@@ -4929,7 +4932,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.getTopic(r.topicId).state).toBe("READY_TO_DELIVER");
     expect((await r.diagnoses()).map((record) => [record.id, record.status])).toEqual([["DG-1", "superseded"], ["DG-2", "closed_no_action"]]);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "DG-1 정정 뒤 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("계획 개정 전 최종 리뷰의 반영 확인은 개정 계획 구현 주기의 판정이 아니다 — 개정 구현의 첫 리뷰가 DG-3 만 판정하고 통과하면 DG-1 은 해결되지 않고 반영 보고(fix_reported)로 남아 '반영을 확인하지 않았습니다' 기록과 함께 커밋이 409 로 막히며, 수정 불필요 정정(no_action, supersedes DG-1)으로 닫은 뒤에야 커밋된다(2026-09-15 감사 5차 #1)", { timeout: 60_000 }, async () => {
@@ -4960,7 +4963,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect((await r.diagnoses()).map((record) => [record.id, record.status]))
       .toEqual([["DG-1", "superseded"], ["DG-2", "superseded"], ["DG-3", "resolved"], ["DG-4", "closed_no_action"]]);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "DG-1 정정 뒤 개정 계획 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("진단 전용 계약 FC-2 원본의 합의 쟁점 F-2 를 최종 리뷰가 수정 확인 없이 닫아 되돌림 가드로 멈춘 뒤 OVERRULE 없이 무관한 진단 DG-3 을 적용·수락해도 F-2 는 다음 최종 리뷰의 원본 절에 합의 기준으로 남는다 — 대조 보고는 FC-3 의 수락 결과이고, 리뷰어가 다시 수정 불필요로 닫으면 되돌림 가드가 다시 멈춰 인도 대기·커밋에 이르지 않으며, 'OVERRULE F-2' 결정 뒤에야 인도 대기·커밋에 이른다(2026-09-15 감사 5차 #2)", { timeout: 90_000 }, async () => {
@@ -5010,7 +5013,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(await g6aSettleWithGrants(r, "g2-withdrawn-source-kept OVERRULE")).toBe("READY_TO_DELIVER");
     expect((await r.diagnoses()).map((record) => [record.id, record.status])).toEqual([["DG-1", "resolved"], ["DG-2", "resolved"], ["DG-3", "resolved"]]);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "OVERRULE F-2 뒤 인도", paths: ["feature.txt", "other.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("최종 리뷰 정지 #F1 을 원본으로 연 리뷰 수정 계약 FC-2 가 수락돼 그 정지를 소비한 뒤 다음 최종 리뷰가 죽으면(FAILED, 재개 = 최종 리뷰) 적용한 진단 DG-1 의 새 계약은 인도 대기 출처(review null)·원본 없음이다 — 소비된 정지의 F-2 를 러너 프롬프트에 다시 싣지 않고 계약 교정 턴을 사지 않는다(2026-09-15 감사 5차 #5)", { timeout: 60_000 }, async () => {
@@ -5073,7 +5076,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.claude.turns).toHaveLength(4);
     expect(r.database.getTimeline(r.topicId).filter((event) => event.sequence > applySequence)
       .some((event) => event.body.includes("검토 쟁점을 누락했습니다"))).toBe(false);
-    r.database.close();
+    await r.app.close();
   });
 
   it("통과한 최종 리뷰(참고 쟁점 F-8) 뒤 인도 대기에서 연 진단 전용 계약이 수정 불필요 정정으로 닫힌(재개 = 최종 리뷰) 다음 적용한 진단 DG-4 의 새 계약은 인도 대기 출처(review null)·원본 없음이다 — 통과 리뷰를 정지로 보지 않아 F-8 을 원본·러너 프롬프트에 동결하지 않고 교정 턴 없이 인도 대기에 이른다(2026-09-15 감사 5차 #5)", { timeout: 60_000 }, async () => {
@@ -5131,7 +5134,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
       .some((event) => event.body.includes("검토 쟁점을 누락했습니다"))).toBe(false);
     expect(settled).toBe("READY_TO_DELIVER");
     expect((await r.diagnoses()).find((record) => record.id === "DG-4")?.status).toBe("resolved");
-    r.database.close();
+    await r.app.close();
   });
 
   it("마지막 정산 뒤에 저장된 최종 리뷰 정지는 여전히 정지다 — FC-1 수락 뒤 정지 #A 에서 연 FC-2 와 FC-2 수락 뒤 되돌림 가드 정지 #B 에서 연 FC-3 은 각각 그 리뷰를 출처·결정 시작점으로 가지고, FC-2 는 #A 의 판정 필요 쟁점 F-2 를 원본으로 싣는다(2026-09-15 감사 5차 #5)", { timeout: 60_000 }, async () => {
@@ -5155,7 +5158,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(fc3.origin).toEqual({ stage: "CODEX_FINAL_REVIEW", review: { kind: "codex-final-review", revision: stopB } });
     expect(fc3.decisionFrom).toBe(stopB);
     expect(fc3.source).toEqual([]);
-    r.database.close();
+    await r.app.close();
   });
 
   // ---- 2026-09-15 감사 5차 #3·#4 (g3) ----
@@ -5225,7 +5228,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.claude.turns).toHaveLength(3);
     expect(r.codex.prompts).toHaveLength(codexBefore);
     expect(contracts()).toEqual([["FC-1", "open"]]);
-    r.database.close();
+    await r.app.close();
   }
 
   it("열린 요청이 최신 checkpoint 에만 있는 진단 전용 수정 작업(FC-1)에서 그 checkpoint 본문이 손상되면 수정 불필요 정정(no_action, supersedes DG-1)은 손상을 삼킨 채 열린 요청이 없는 것으로 보고 작업을 닫지 않는다 — 409('최신 수정 checkpoint 가 손상돼')로 거부해 FC-1 은 열린 채, 재개 단계는 CLAUDE_FIX 로 남고, 재시도는 최종 리뷰·러너 턴 없이 손상(checkpointCorrupt)으로 멈춘다(2026-09-15 감사 5차 #3)", { timeout: 30_000 }, async () => {
@@ -5261,7 +5264,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     // 요청과 무관한 등록은 받는다 — 손상은 그 checkpoint 에 기대는 판단만 막는다.
     expect((await r.call("POST", `/api/topics/${r.topicId}/diagnoses`, fixDiagnosis(), { mediator: true })).status).toBe(201);
     expect((await r.diagnoses()).map((record) => [record.id, record.status])).toEqual([["DG-1", "registered"]]);
-    r.database.close();
+    await r.app.close();
   });
 
   it("인도 대기에서 최신 checkpoint 가 손상되면 계획 변경 진단의 적용은 손상을 삼킨 채 옛 산출물의 요청만 승계한 계획 개정으로 보내지 않는다 — 409('최신 수정 checkpoint 가 손상돼 적용하지 않습니다')로 거부하고 진단·상태·완료 판정·승계 기록·러너 턴을 바꾸지 않는다(2026-09-15 감사 5차 #3)", { timeout: 30_000 }, async () => {
@@ -5287,7 +5290,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.latestArtifact(r.topicId, "diagnosis-carry-DG-1")).toBeFalsy();
     expect(r.database.getTimeline(r.topicId).filter((event) => event.sequence > sequence).map((event) => event.body)).toEqual([]);
     expect(r.claude.turns).toHaveLength(1);
-    r.database.close();
+    await r.app.close();
   });
 
   it("인도 대기에서 최신 checkpoint 가 손상돼도 통과한 최종 리뷰가 확인하지 않은 반영 보고(fix_reported) 진단을 수정 불필요 정정(no_action, supersedes DG-1)으로 닫는 등록은 받고(201) 커밋이 열린다 — 요청에 기대지 않는 종결까지 손상으로 막으면 커밋이 영구히 막힌다(2026-09-15 감사 5차 #3)", { timeout: 60_000 }, async () => {
@@ -5310,7 +5313,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.getTopic(r.topicId).state).toBe("READY_TO_DELIVER");
     expect((await r.diagnoses()).map((record) => [record.id, record.status])).toEqual([["DG-1", "superseded"], ["DG-2", "closed_no_action"]]);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "DG-1 정정 뒤 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   // 감사 5차 #4: 옛 엔진(b08210b)이 남긴 상태 — 러너가 반박해 멈춘 진단 전용 수정(DG-1, paused checkpoint fixSource diagnosis#DG-1)을 중재자가 수정 불필요
@@ -5368,7 +5371,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
       .toEqual([["diagnosis#DG-3", "diagnosis", ["DG-3"], "accepted"]]);
     expect((await r.diagnoses()).map((record) => record.status)).toEqual(["superseded", "closed_no_action", "resolved"]);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "DG-3 반영 뒤 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   // 감사 5차 #4 대조군: 옛 엔진이 남길 수 있는 상태 — 러너가 반박해 멈춘 진단 전용 수정(DG-1, paused checkpoint diagnosis#DG-1)에 계획 변경 진단 DG-2(supersedes
@@ -5411,7 +5414,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.fixContracts.list(r.topicId, topic.scopeGeneration, topic.planEpoch).map((contract) => [contract.contractId, contract.route, contract.diagnosisIds, contract.status]))
       .toEqual([["diagnosis#DG-1", "diagnosis", ["DG-1"], "closed"]]);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "정정으로 닫힌 진단 뒤 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   // ---- 2026-09-15 감사 5차 #7 (g4) ----
@@ -5473,7 +5476,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(stop).toContain("OVERRULE <id>");
     expect(stop).toContain("따옴표나 백틱으로 감싼다");
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "GATE 2 는 사용자 지시로 미수정", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   // ---- 2026-09-15 감사 6차 #1·#11 (g6a) ----
@@ -5603,7 +5606,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     const commit = await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "2주기 F-3 판정 없이 인도", paths: ["feature.txt"] });
     expect(commit.status).not.toBe(200);
     expect(r.database.getFlags(r.topicId).committedOID).toBeFalsy();
-    r.database.close();
+    await r.app.close();
   });
 
   it("계획 개정 뒤 새 작업 주기의 최종 리뷰가 이전 주기에 사용자가 판정한 쟁점과 같은 id(F-3)를 새 쟁점(RESOLVED_BY_FIX, 수정 기회 없음)으로 내면 이전 주기의 판정은 그 쟁점을 면제하지 않는다 — finalReviewNewFindingIDs=[F-3] 인터럽트로 사용자에게 보내 인도 대기·커밋에 이르지 않고, 이번 주기의 결정을 올려 재시도해야 인도 대기에 이른다(2026-09-15 감사 6차 #1)", { timeout: 120_000 }, async () => {
@@ -5624,7 +5627,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(await g6aSettleWithGrants(r, "g6a-adjudicated-cycle-new 판정")).toBe("READY_TO_DELIVER");
     expect(r.codex.prompts).toHaveLength(codexBefore);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "2주기 F-3 판정 뒤 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   // 감사 6차 #11 공통 전제: 구현 → 인도 대기 → DG-1 진단 전용 수정 수락(FC-1) → 최종 리뷰 #1 이 F-2(수정 합의 + 사용자 판정 필요)로 멈춤(재개 CODEX_FINAL_REVIEW)
@@ -5705,7 +5708,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(200);
     expect(await g6aSettleWithGrants(r, "g6a-pending-correction 추가 승인")).toBe("READY_TO_DELIVER");
     expect(r.codex.prompts).toHaveLength(beforeAnswer);
-    r.database.close();
+    await r.app.close();
   });
 
   it("대조군: 같은 전제에서 등록만 된 수정 정정 DG-4(DG-3 대체) 자신을 수정 불필요 정정 DG-6 으로 대체하면 — 사슬의 마지막 고리를 닫는 정정 — 계약의 다른 진단도 모두 닫혔으므로 FC-2 는 닫히고 재개 단계는 최종 리뷰(CODEX_FINAL_REVIEW)가 된다(2026-09-15 감사 6차 #11)", { timeout: 60_000 }, async () => {
@@ -5719,7 +5722,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.getTimeline(r.topicId).some((event) => event.body.includes("수정 불필요로 닫았습니다"))).toBe(true);
     expect((await r.diagnoses()).map((record) => [record.id, record.status])).toEqual([["DG-1", "fix_reported"], ["DG-2", "superseded"], ["DG-3", "superseded"],
       ["DG-4", "superseded"], ["DG-5", "closed_no_action"], ["DG-6", "closed_no_action"]]);
-    r.database.close();
+    await r.app.close();
   });
 
   // ---- 2026-09-15 감사 6차 #2·#4·#7 (g6b) ----
@@ -5815,7 +5818,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.getTopic(r.topicId).state).toBe("READY_TO_DELIVER");
     expect((await r.diagnoses()).map((record) => [record.id, record.status])).toEqual([["DG-1", "superseded"], ["DG-2", "closed_no_action"]]);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "손상 checkpoint 인 채 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("통과한 최종 리뷰가 확인하지 않은 반영 보고(fix_reported) 진단 DG-1 을 기록의 안내대로 수정 정정(fix, supersedes DG-1)으로 다시 고치려 해도 최신 checkpoint 가 손상돼 있으면 그 정정의 적용은 409('최신 수정 checkpoint 가 손상돼 적용하지 않습니다')로 거부된다 — 인도 대기·완료 판정·기존 계약(FC-1 수락)이 그대로이고 새 진단 전용 계약이 열리지 않아, 정정을 수정 불필요로 닫으면 커밋할 수 있다(2026-09-15 감사 6차 #2)", { timeout: 60_000 }, async () => {
@@ -5862,7 +5865,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.getTopic(r.topicId).state).toBe("READY_TO_DELIVER");
     expect((await r.diagnoses()).map((record) => [record.id, record.status])).toEqual([["DG-1", "superseded"], ["DG-2", "superseded"], ["DG-3", "closed_no_action"]]);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "DG-1 정정 뒤 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("인도 대기에서 최신 checkpoint 가 손상돼 있으면 계획 변경 진단의 적용과 조사 기록의 적용도 409 로 거부되고 아무것도 기록하지 않는다 — 인도 대기·완료 판정·재개 단계·진단 상태가 그대로이고 승계 기록·계약·러너 턴이 없어, 두 진단을 수정 불필요 정정으로 닫으면 커밋할 수 있다(2026-09-15 감사 6차 #2)", { timeout: 30_000 }, async () => {
@@ -5906,7 +5909,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect((await r.diagnoses()).map((record) => [record.id, record.status]))
       .toEqual([["DG-1", "superseded"], ["DG-2", "superseded"], ["DG-3", "closed_no_action"], ["DG-4", "closed_no_action"]]);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "손상 checkpoint 인 채 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("인도 대기에서 최신 checkpoint 의 본문 파일이 사라져도(원장 행은 남고 blob 만 유실) 통과한 최종 리뷰가 확인하지 않은 반영 보고(fix_reported) 진단을 수정 불필요 정정(no_action, supersedes DG-1)으로 닫는 등록은 500 없이 받고(201) 커밋이 열린다 — 파일 없음은 손상으로 분류돼, 관련 요청을 지정한 등록은 손상 판정 409('… 본문 파일이 없음')로 거부된다(2026-09-15 감사 6차 #4)", { timeout: 60_000 }, async () => {
@@ -5934,7 +5937,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(String(related.body.error)).toContain("최신 수정 checkpoint 가 손상돼 열린 요청을 판정할 수 없습니다");
     expect(String(related.body.error)).toContain(`누적 checkpoint #${missingRevision} 을 읽을 수 없습니다(원장 행은 있는데 본문 파일이 없음)`);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "DG-1 정정 뒤 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("열린 요청이 최신 checkpoint 에만 있는 진단 전용 수정 작업(FC-1)에서 그 checkpoint 의 본문 파일이 사라지면(원장 행은 남음) 수정 불필요 정정(no_action, supersedes DG-1)은 500 이 아니라 409('최신 수정 checkpoint 가 손상돼 … 본문 파일이 없음')로 거부된다 — FC-1 은 열린 채 재개 단계는 CLAUDE_FIX 로 남고, 결정 뒤 재시도는 일반 실패(FAILED)가 아니라 최종 리뷰·러너 턴 없이 손상 정지(USER_DECISION_REQUIRED, checkpointCorrupt)로 멈춘다(2026-09-15 감사 6차 #4)", { timeout: 30_000 }, async () => {
@@ -5968,7 +5971,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.claude.turns).toHaveLength(3);
     expect(r.codex.prompts).toHaveLength(codexBefore);
     expect(contracts()).toEqual([["FC-1", "open"]]);
-    r.database.close();
+    await r.app.close();
   });
 
   it("계획 변경 진단의 개정 계획이 승인된 뒤 최신 checkpoint 가 손상돼 있으면 구현 시작은 손상에서 멈춘다 — 러너·리뷰 턴 없이 USER_DECISION_REQUIRED(재개 IMPLEMENTING, checkpointCorrupt)이고 진단은 개정 저장(plan_revised)에 머물며, 재시도해도 같은 손상 정지로 돌아온다(2026-09-15 감사 6차 #7)", { timeout: 60_000 }, async () => {
@@ -5983,7 +5986,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
       .map((event) => event.payload?.checkpointCorrupt)).toEqual([corruptRevision]);
     expect(r.claude.turns).toHaveLength(4);
     expect((await r.diagnoses()).map((record) => record.status)).toEqual(["plan_revised"]);
-    r.database.close();
+    await r.app.close();
   });
 
   // ---- 2026-09-15 감사 6차 #3·#10 (g6c) ----
@@ -6100,7 +6103,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect((contractSourceIn(finals[0]) ?? []).map((finding) => finding.id)).not.toContain("F-8");
     expect(settled).toBe("READY_TO_DELIVER");
     expect((await r.diagnoses()).find((record) => record.id === "DG-4")?.status).toBe("resolved");
-    r.database.close();
+    await r.app.close();
   });
 
   it("인도 대기에 이른 통과 최종 리뷰(참고 쟁점 F-8) 뒤 인도 대기에서 적용한 계획 변경 진단 DG-1 의 개정 턴이 죽고(FAILED, 재개 CLAUDE_PLAN) 수정 정정 DG-2 가 재개 단계를 최종 리뷰로 되돌려도 그 통과 리뷰는 정지가 아니다 — DG-2 의 새 진단 전용 계약은 인도 대기 출처(review null)·원본 없음이고 F-8 을 러너 프롬프트·다음 최종 리뷰의 원본에 싣지 않으며 교정 턴 없이 수락돼 인도 대기에 이른다(2026-09-15 감사 6차 #10)", { timeout: 60_000 }, async () => {
@@ -6164,7 +6167,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(finals.flatMap((prompt) => (contractSourceIn(prompt) ?? []).map((finding) => finding.id))).not.toContain("F-8");
     expect(settled, r.database.getTopic(r.topicId).lastError ?? "").toBe("READY_TO_DELIVER");
     expect((await r.diagnoses()).find((record) => record.id === "DG-2")?.status).toBe("resolved");
-    r.database.close();
+    await r.app.close();
   });
 
   it("통과한 최종 리뷰(참고 쟁점 F-8)가 인도 대기에 이른 뒤에 저장된 최종 리뷰 정지는 여전히 정지다 — 인도 대기에서 적용한 DG-2 수정이 수락된 뒤 최종 리뷰 #S 가 F-2(수정 합의 + 사용자 판정 필요)로 멈추면, 그 정지에서 적용한 DG-3 의 새 계약은 #S 를 출처·결정 시작점으로 가지고 F-2 만 원본·수정 대상으로 싣는다(통과 리뷰의 F-8 은 싣지 않는다)(2026-09-15 감사 6차 #10)", { timeout: 60_000 }, async () => {
@@ -6231,7 +6234,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     const finals = r.codex.prompts.slice(codexBefore).filter((prompt) => prompt.includes("반환 kind는 FINAL_REVIEW"));
     expect(finals).toHaveLength(1);
     expect((contractSourceIn(finals[0]) ?? []).map((finding) => finding.id)).toEqual(["F-2"]);
-    r.database.close();
+    await r.app.close();
   });
 
   // ---- 2026-09-15 감사 6차 #5 (g6d) ----
@@ -6357,7 +6360,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.getTimeline(r.topicId).some((event) => event.body.includes("사용자 결정이 처분 변경을 허용한 쟁점: F-2(AGREED_ACTION → AGREED_NO_ACTION)"))).toBe(true);
     expect((await r.diagnoses()).map((record) => [record.id, record.status])).toEqual([["DG-1", "resolved"], ["DG-2", "resolved"], ["DG-3", "resolved"]]);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "OVERRULE F-2 뒤 인도", paths: ["feature.txt", "other.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("대조군: 같은 증거 정지(R2)에서 진단 없이 증거만 올리고 재시도해도 다음 최종 리뷰가 FC-2 의 합의 쟁점 F-2 를 수정 확인 없이 닫으면 되돌림 가드가 멈춘다 — 진단 적용 여부만 다른 두 경로의 판정이 같아야 한다(2026-09-15 감사 6차 #5)", { timeout: 90_000 }, async () => {
@@ -6371,7 +6374,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(await settledState(r, "g6d-evidence-control R3")).toBe("USER_DECISION_REQUIRED");
     expect(r.database.getTopic(r.topicId).lastError).toContain("수정 확인 없이 닫았습니다(F-2)");
     expect(r.database.getFlags(r.topicId).resumeState).toBe("CODEX_FINAL_REVIEW");
-    r.database.close();
+    await r.app.close();
   });
 
   it("첫 리뷰가 고치기로 합의한 F-1(AGREED_ACTION)도 최종 리뷰 증거 정지에서 적용한 진단 DG-1 의 계약 원본에 증거 필요로 동결된 판에 가려지지 않는다 — 러너가 F-1 을 수정 불필요로 내려 FC-2 가 수락되고 다음 최종 리뷰가 수정 확인 없이 닫으면 되돌림 가드가 멈춰 인도 대기·커밋에 이르지 않고, 'OVERRULE F-1' 결정 뒤에야 인도 대기·커밋에 이른다(2026-09-15 감사 6차 #5)", { timeout: 60_000 }, async () => {
@@ -6425,7 +6428,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.codex.answerConfirmations.length).toBeGreaterThanOrEqual(1);
     expect((await r.diagnoses()).map((record) => [record.id, record.status])).toEqual([["DG-1", "resolved"]]);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "OVERRULE F-1 뒤 인도", paths: ["feature.txt", "other.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   // ---- host-review R10 잔여(2026-09-15): 리뷰(Codex)가 finding 과 별개로 requestedUserDecision 으로 사용자에게 물은 질문 ----
@@ -6509,7 +6512,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     await r.idle("READY_TO_DELIVER");
     expect(r.codex.prompts).toHaveLength(codexBefore + 1);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "질문 해소 뒤 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("첫 리뷰가 사용자에게 물은 질문도 같은 계열이다 — 결정 없이 재시도해 다시 돈 첫 리뷰가 질문 없이 통과해도 인도 대기로 넘어가지 않고, 결정을 올려 재시도해야 인도 대기·커밋에 이른다(2026-09-15 host-review R10 잔여)", { timeout: 60_000 }, async () => {
@@ -6532,7 +6535,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     await r.idle("READY_TO_DELIVER");
     expect(r.codex.prompts).toHaveLength(2);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "질문 해소 뒤 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("대조군: 최종 리뷰가 질문으로 멈춘 뒤 사용자가 결정을 올리고 재시도하면 그 결정이 질문의 답이다 — 저장된 최종 코드 리뷰를 재사용해(답변 확인 턴만 실행) 인도 대기·커밋에 이른다(2026-09-15 host-review R10 잔여)", { timeout: 60_000 }, async () => {
@@ -6543,7 +6546,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     await r.idle("READY_TO_DELIVER");
     expect(r.codex.prompts).toHaveLength(codexBefore);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "결정 뒤 인도", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
   it.each(["보류하고 다른 작업만 계속", "무관한 배포 공지 작성만 승인"])("R10 답변 보존: %s — 확인 뒤에도 요청과 커밋 차단이 남고 같은 결정은 다시 호출하지 않는다", async (body) => {
     const { r } = await r10FinalQuestionStop("r10-unanswered-decision");
@@ -6561,7 +6564,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.codex.answerConfirmations).toHaveLength(1);
     expect(r.database.reviews.account(r.topicId, "implementation").used).toBe(used);
     expect(r.database.getTopic(r.topicId).lastError).toContain(R10_FINAL_QUESTION);
-    r.database.close();
+    await r.app.close();
   });
 
   it("R10 공식 구현 재개 승인은 리뷰 질문의 답변이 아니고 확인 호출도 만들지 않는다", async () => {
@@ -6574,7 +6577,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     const { pendingReviewRequests } = await import("../src/server/engine/reviewRequests");
     expect(pendingReviewRequests(r.database.getTimeline(r.topicId), topic.scopeGeneration)).toHaveLength(1);
     expect(r.codex.answerConfirmations).toHaveLength(0);
-    r.database.close();
+    await r.app.close();
   });
 
   it.each([false, true])("R10 여러 질문의 부분 답변과 이전 승인 취소를 재확인한다(revoked=%s)", async (revoked) => {
@@ -6611,7 +6614,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
       expect(r.database.getTopic(r.topicId).lastError).toContain("배포 채널?");
       expect(r.codex.answerConfirmations.at(-1)?.prompt).toContain("배포 채널?");
       expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "취소", paths: ["feature.txt"] })).status).not.toBe(200);
-      r.database.close();
+      await r.app.close();
       return;
     }
     await r.idle("READY_TO_DELIVER");
@@ -6624,7 +6627,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
       expect(turn.readablePaths).toEqual([]);
     }
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "모든 답변 확인", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it.each(["unknown-id", "unknown-decision", "duplicate", "failed"])("R10 잘못된 확인 또는 실행 실패(%s)는 요청을 보존하고 같은 입력을 재호출하지 않는다", async (mode) => {
@@ -6645,7 +6648,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.reviews.account(r.topicId, "implementation").used).toBe(used);
     expect(r.database.getTopic(r.topicId).lastError).toContain(R10_FINAL_QUESTION);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "잘못된 확인", paths: ["feature.txt"] })).status).not.toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("R12 질문 필드 없이 blocked 만 반환한 리뷰도 다음 리뷰가 생략하면 계속 커밋을 막는다", async () => {
@@ -6669,7 +6672,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     await r.idle("READY_TO_DELIVER");
     expect(r.codex.prompts).toHaveLength(2);
     expect(r.codex.answerConfirmations).toHaveLength(1);
-    r.database.close();
+    await r.app.close();
   });
 
   it("R10 답변 확인 중 새 메시지가 도착하면 이전 답변 확인 결과를 채택하지 않는다", async () => {
@@ -6686,7 +6689,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.database.getTimeline(r.topicId).some((event) => event.payload?.reviewRequestAnswers)).toBe(false);
     expect(r.database.latestArtifact(r.topicId, "codex-interrupted")).toBeTruthy();
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "취소된 답변", paths: ["feature.txt"] })).status).not.toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it.each([[false, "evidence"], [false, "note"], [true, "evidence"], [true, "note"]] as const)("R13 새 실패 자료는 저장된 리뷰를 재사용하지 않는다(최종=%s, 종류=%s)", async (finalPass, messageKind) => {
@@ -6724,7 +6727,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.codex.prompts).toHaveLength(before + 1);
     expect(r.codex.prompts.at(-1)).toContain(failure);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "실패 증거 있음", paths: ["feature.txt"] })).status).not.toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it.each(["blocked", "in_progress", "completed"] as const)("R14 남은 검토가 있는 최종 리뷰(%s)는 정상 리뷰 완료 전 재사용하지 않는다", async (status) => {
@@ -6766,7 +6769,7 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect(r.codex.prompts.at(-1)).toContain("새 자료에서 인증 계약을 검토해야 합니다.");
     expect(r.codex.prompts.at(-1)).toContain("자료는 docs/auth.md");
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "완료 리뷰 확인", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
 describe("R1/R2 delivery admission", () => {
@@ -6792,7 +6795,7 @@ describe("R1/R2 delivery admission", () => {
     expect(response.status).not.toBe(200);
     expect(git(r.worktree, ["rev-parse", "HEAD"])).toBe(before);
     expect(r.database.getFlags(r.topicId).committedOID).toBe(committedOID);
-    r.database.close();
+    await r.app.close();
   });
 
   it("R1 commit 대기 중 진단·결정은 거부하고 실패 후 잠금을 해제한다", async () => {
@@ -6818,7 +6821,7 @@ describe("R1/R2 delivery admission", () => {
     } finally { release(); }
     expect((await commit).status).not.toBe(200);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "retry", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it.each([false, true])("R2 READY 이후 승인 취소와 재승인은 코드 재리뷰 없이 복구한다(committed=%s)", async (committed) => {
@@ -6850,7 +6853,7 @@ describe("R1/R2 delivery admission", () => {
       expect(r.database.getFlags(r.topicId).pushedOID).toBe(oid);
       expect(git(remote, ["rev-parse", `refs/heads/${r.database.getTopic(r.topicId).branchName}`])).toBe(oid);
     }
-    r.database.close();
+    await r.app.close();
   });
 });
 
@@ -6917,7 +6920,7 @@ describe("R1~R8 committed delivery recheck", () => {
     expect(r.codex.answerConfirmations.map((turn) => JSON.parse(turn.prompt.split("REVIEW_ANSWER_INPUT\n")[1].split("\nEND_REVIEW_ANSWER_INPUT")[0]).requests.length)).toEqual([100, 1]);
     expect(pendingReviewRequests(r.database.getTimeline(r.topicId), 1)).toHaveLength(0);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "질문 전체 확인", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   }, 30_000);
 
   it("R13 질문 201개는 한도 정지 후 이미 확인한 200개를 반복하지 않고 남은 1개를 확인한다", async () => {
@@ -6931,7 +6934,7 @@ describe("R1~R8 committed delivery recheck", () => {
     expect(await g6aSettleWithGrants(r, "남은 질문 한 묶음 승인")).toBe("READY_TO_DELIVER");
     expect(r.codex.answerConfirmations.map((turn) => JSON.parse(turn.prompt.split("REVIEW_ANSWER_INPUT\n")[1].split("\nEND_REVIEW_ANSWER_INPUT")[0]).requests.length)).toEqual([100, 100, 1]);
     expect(r.codex.prompts).toHaveLength(1);
-    r.database.close();
+    await r.app.close();
   }, 30_000);
 
   it("R13 질문 묶음의 실제 부분 답변은 새 입력 없이 다시 묻지 않고 새 답변 뒤 분할을 재개한다", async () => {
@@ -6952,7 +6955,7 @@ describe("R1~R8 committed delivery recheck", () => {
     expect(r.codex.answerConfirmations).toHaveLength(3);
     expect(pendingReviewRequests(r.database.getTimeline(r.topicId), 1)).toHaveLength(0);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "부분 답변 해소", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   }, 30_000);
 
   it("R12 과거 결정 200개 뒤 새 결정은 과거 답변 근거와 분리해 확인한다", async () => {
@@ -6974,7 +6977,7 @@ describe("R1~R8 committed delivery recheck", () => {
     expect(input.answerEvidence.map((item: { sequence: number }) => item.sequence)).toContain(first);
     expect(r.codex.prompts).toHaveLength(1);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "과거 답변 확인", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   }, 30_000);
 
   it("R12 새 결정 401개는 예산 안에서 나누고 승인 후 남은 결정만 확인한다", async () => {
@@ -6991,7 +6994,7 @@ describe("R1~R8 committed delivery recheck", () => {
     expect(sizes()).toEqual([200, 200, 1]);
     expect(r.codex.prompts).toHaveLength(1);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "전체 확인", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   }, 30_000);
 
   it("R12 뒤 묶음의 누락 응답은 앞 판정만 보존하고 같은 입력을 재호출하거나 인도하지 않는다", async () => {
@@ -7017,7 +7020,7 @@ describe("R1~R8 committed delivery recheck", () => {
     const input = JSON.parse(r.codex.answerConfirmations.at(-1)!.prompt.split("REVIEW_ANSWER_INPUT\n")[1].split("\nEND_REVIEW_ANSWER_INPUT")[0]);
     expect(input.decisions).toHaveLength(2); // 실패한 마지막 결정과 새 결정만 남는다.
     expect(r.codex.prompts).toHaveLength(1);
-    r.database.close();
+    await r.app.close();
   }, 30_000);
 
   it("R12 앞 묶음의 변경 요구는 뒤 묶음의 false 판정으로 사라지지 않고 정상 리뷰를 요구한다", async () => {
@@ -7030,7 +7033,7 @@ describe("R1~R8 committed delivery recheck", () => {
     expect(r.codex.answerConfirmations).toHaveLength(2);
     expect(r.codex.prompts).toHaveLength(2);
     expect(bodies(r).some((body) => body.includes("코드·증거 변경을 정상 리뷰에서 확인합니다."))).toBe(true);
-    r.database.close();
+    await r.app.close();
   }, 30_000);
 
   it("R7 질문 없이 인도 대기에 이른 주제도 새 결정은 재확인 정지를 거친다 — 멈춘 동안 commit 은 거부되고, 판정 false 면 재시도 뒤 재사용한다", async () => {
@@ -7044,7 +7047,7 @@ describe("R1~R8 committed delivery recheck", () => {
     expect(since(r, sequence).some((body) => body.includes("기존 코드 판정과 커밋을 보존하고 답변을 재확인했습니다."))).toBe(true);
     expect(r.codex.prompts.length).toBe(reviewsBefore);
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "C1", paths: ["feature.txt"] })).status).toBe(200);
-    r.database.close();
+    await r.app.close();
   });
 
   it("R7·R1 질문 없이 올라온 구현 변경 요구(판정 true)는 코드 판정을 재사용하지 않고 정상 리뷰로 보낸다", async () => {
@@ -7059,7 +7062,7 @@ describe("R1~R8 committed delivery recheck", () => {
     expect(tail.some((body) => body.includes("코드·증거 변경을 정상 리뷰에서 확인합니다."))).toBe(true);
     expect(tail.some((body) => body.includes("기존 코드 판정과 커밋을 보존하고 답변을 재확인했습니다."))).toBe(false);
     expect(r.codex.prompts.length).toBeGreaterThan(reviewsBefore);
-    r.database.close();
+    await r.app.close();
   });
 
   it("R1 답변 확인이 결정을 다 판정하지 않으면 확인 결과를 받지 않고, 판정 없는 결정은 재사용 근거가 아니라 정상 리뷰로 간다", async () => {
@@ -7075,7 +7078,7 @@ describe("R1~R8 committed delivery recheck", () => {
     expect(tail.some((body) => body.includes("기존 코드 판정과 커밋을 보존하고 답변을 재확인했습니다."))).toBe(false);
     expect(r.codex.prompts.length).toBeGreaterThan(reviewsBefore);
     expect(r.database.getFlags(r.topicId).committedOID).toBe(c1);
-    r.database.close();
+    await r.app.close();
   });
 
   it("R6 한 결정이 두 질문에 답해도 판정은 결정 하나에 하나다 — 판정 true 면 답변이 몇 개든 재사용하지 않는다", async () => {
@@ -7093,7 +7096,7 @@ describe("R1~R8 committed delivery recheck", () => {
     expect(tail.some((body) => body.includes("코드·증거 변경을 정상 리뷰에서 확인합니다."))).toBe(true);
     expect(r.codex.prompts.length).toBeGreaterThan(reviewsBefore);
     expect(r.database.getFlags(r.topicId).committedOID).toBe(c1);
-    r.database.close();
+    await r.app.close();
   });
 
   it("R1 미커밋·질문 없는 주제에서 확인자가 판정을 빠뜨리면 저장된 리뷰 재사용 경로로 빠지지 않고 정상 리뷰가 돈다", async () => {
@@ -7108,7 +7111,7 @@ describe("R1~R8 committed delivery recheck", () => {
     expect(tail.some((body) => body.includes("코드·증거 변경을 정상 리뷰에서 확인합니다."))).toBe(true);
     expect(tail.some((body) => body.includes("사용자 결정을 확인해 통과한 코드 리뷰를 재사용합니다."))).toBe(false);
     expect(r.codex.prompts.length).toBeGreaterThan(reviewsBefore);   // 정상 리뷰가 실제로 돌았다
-    r.database.close();
+    await r.app.close();
   });
 
   it("R1 재확인 거절 뒤 정상 리뷰가 결과 저장 전에 실패하면 다음 재시도도 저장된 리뷰를 재사용하지 않고 리뷰를 다시 돈다", async () => {
@@ -7136,7 +7139,7 @@ describe("R1~R8 committed delivery recheck", () => {
     expect(r.codex.prompts.length).toBeGreaterThanOrEqual(reviewsBefore + 2);   // 실패 뒤 재시도가 리뷰를 다시 샀다(한도 승인 뒤)
     expect(tail.some((body) => body.includes("사용자 결정을 확인해 통과한 코드 리뷰를 재사용합니다."))).toBe(false);
     expect(tail.some((body) => body.includes("기존 코드 판정과 커밋을 보존하고 답변을 재확인했습니다."))).toBe(false);
-    r.database.close();
+    await r.app.close();
   }, 30_000);
 
   it("R9 답한 뒤 정상 리뷰가 다시 돌아 통과했어도, 질문이 다시 열리면 마지막 리뷰보다 앞선 원래 답을 인용한 확인을 받는다", async () => {
@@ -7163,7 +7166,7 @@ describe("R1~R8 committed delivery recheck", () => {
     expect(tail.some((body) => body.includes("기존 코드 판정과 커밋을 보존하고 답변을 재확인했습니다."))).toBe(true);
     expect(r.codex.prompts.length).toBe(reviewsAfter);   // 재확인만 했고 리뷰는 다시 사지 않았다
     expect(pendingReviewRequests(r.database.getTimeline(r.topicId), 1).map((item) => item.id)).not.toContain(request.id);
-    r.database.close();
+    await r.app.close();
   }, 30_000);
 
   it("R9 답한 질문이 새 결정으로 다시 열리면 확인자가 원래 답(이전 결정)을 인용해도 받아들이고 재사용한다", async () => {
@@ -7185,7 +7188,7 @@ describe("R1~R8 committed delivery recheck", () => {
     expect(r.codex.answerConfirmations).toHaveLength(2);
     expect(r.codex.prompts.length).toBe(reviewsBefore);
     expect(pendingReviewRequests(r.database.getTimeline(r.topicId), 1).map((item) => item.id)).not.toContain(request.id);
-    r.database.close();
+    await r.app.close();
   });
 
   it("R1 확인된 답변이고 판정 false 면 커밋 뒤에도 코드 판정과 커밋을 보존해 재사용한다", async () => {
@@ -7198,7 +7201,7 @@ describe("R1~R8 committed delivery recheck", () => {
     expect(since(r, sequence).some((body) => body.includes("기존 코드 판정과 커밋을 보존하고 답변을 재확인했습니다."))).toBe(true);
     expect(r.codex.prompts.length).toBe(reviewsBefore);
     expect(r.database.getFlags(r.topicId).committedOID).toBe(c1);
-    r.database.close();
+    await r.app.close();
   });
 
   it("R2 커밋 뒤 결정으로 멈춘 USER_DECISION_REQUIRED 에서도 수정·조사 진단 등록을 409 로 거부한다(상태 무관)", async () => {
@@ -7212,7 +7215,7 @@ describe("R1~R8 committed delivery recheck", () => {
     expect(investigated.status).toBe(409);
     expect(await r.diagnoses()).toEqual([]);
     expect(r.database.getTopic(r.topicId).state).toBe("USER_DECISION_REQUIRED");
-    r.database.close();
+    await r.app.close();
   });
 
   it("R3 커밋 뒤 재확인 정지 중 새 증거가 올라오면 정지를 반복하지 않고 정상 리뷰로 보내며 확정 커밋을 보존해 C2 를 잇는다", async () => {
@@ -7231,7 +7234,7 @@ describe("R1~R8 committed delivery recheck", () => {
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/commit`, { message: "C2", paths: ["second.txt"] })).status).toBe(200);
     expect(git(r.worktree, ["rev-parse", "HEAD^"])).toBe(c1);
     expect(r.database.getFlags(r.topicId).committedOID).toBe(git(r.worktree, ["rev-parse", "HEAD"]));
-    r.database.close();
+    await r.app.close();
   });
 
   it("R3 커밋 뒤 코드가 실제로 바뀌면 여전히 멈춘다(재확인만으로 push 하지 않는다)", async () => {
@@ -7242,7 +7245,7 @@ describe("R1~R8 committed delivery recheck", () => {
     await r.idle("USER_DECISION_REQUIRED");
     expect(since(r, sequence).some((body) => body.includes("확정된 커밋의 코드가 바뀌어"))).toBe(true);
     expect(r.database.getFlags(r.topicId).committedOID).toBe(c1);
-    r.database.close();
+    await r.app.close();
   });
 
   it("R8 커밋 뒤 재리뷰가 수정할 결함을 내면 수정 작업을 열지 않고 범위 변경 안내로 멈춘다(확정 커밋 보존)", async () => {
@@ -7268,7 +7271,7 @@ describe("R1~R8 committed delivery recheck", () => {
     expect(r.database.getFlags(r.topicId).committedOID).toBe(c1);
     expect(git(r.worktree, ["rev-parse", "HEAD"])).toBe(c1);
     expect(r.claude.turns).toHaveLength(1);   // 수정 턴을 열지 않았다
-    r.database.close();
+    await r.app.close();
   });
 
   // 최종 리뷰 결과가 **저장된 직후**, 엔진이 통과 판정용 진단 처분(reviewVerdicts)을 읽는 사이에 사용자 결정이 도착하는 경우(host-review 2026-09-21 5회차 R1) — 실행기의 턴 중
@@ -7313,7 +7316,7 @@ describe("R1~R8 committed delivery recheck", () => {
     expect(tail.some((body) => body.includes("결정 판정(decisionAssessments)이 결정을 다 다루지 않아"))).toBe(true);
     expect(tail.some((body) => body.includes("Codex 턴 없이 전달 준비로 넘깁니다"))).toBe(false);
     expect(r.codex.prompts.length).toBeGreaterThan(reviewsBefore);   // 최종 리뷰를 다시 샀다
-    r.database.close();
+    await r.app.close();
   }, 30_000);
 
   it("대조군: 최종 리뷰 도중 도착한 결정을 확인자가 구현 변경 요구 아님으로 판정하면 저장된 최종 리뷰를 재사용한다(리뷰 재구매 없음)", async () => {
@@ -7326,7 +7329,7 @@ describe("R1~R8 committed delivery recheck", () => {
     expect(r.codex.answerConfirmations).toHaveLength(1);
     expect(tail.some((body) => body.includes("Codex 턴 없이 전달 준비로 넘깁니다"))).toBe(true);
     expect(r.codex.prompts.length).toBe(reviewsBefore);
-    r.database.close();
+    await r.app.close();
   });
 
   it("R1 OVERRULE 지시어와 함께 적힌 구현 변경 요구는 판정이 빠지면 OVERRULE 을 근거로 통과시키지 않고 정상 리뷰로 간다", async () => {
@@ -7341,7 +7344,7 @@ describe("R1~R8 committed delivery recheck", () => {
     expect(tail.some((body) => body.includes("기존 코드 판정과 커밋을 보존하고 답변을 재확인했습니다."))).toBe(false);
     expect(tail.some((body) => body.includes("코드·증거 변경을 정상 리뷰에서 확인합니다."))).toBe(true);
     expect(r.codex.prompts.length).toBeGreaterThan(reviewsBefore);   // 정상 리뷰가 실제로 돌았다
-    r.database.close();
+    await r.app.close();
   });
 
   it("R9 한 결정이 두 질문의 답이었으면 다시 열린 재확인 입력에 그 결정을 한 번만 넣는다 — 확인자가 입력 원소마다 판정해도 중복으로 거부되지 않는다", async () => {
@@ -7373,7 +7376,7 @@ describe("R1~R8 committed delivery recheck", () => {
     expect(tail.some((body) => body.includes("기존 코드 판정과 커밋을 보존하고 답변을 재확인했습니다."))).toBe(true);
     expect(r.codex.prompts.length).toBe(reviewsAfter);
     expect(pendingReviewRequests(r.database.getTimeline(r.topicId), 1).map((item) => item.id)).not.toContain(first.id);
-    r.database.close();
+    await r.app.close();
   }, 30_000);
 });
 
@@ -7449,7 +7452,7 @@ describe("E3-3b 리뷰 재개 경로의 답변 확인 세션 복구(host-review 
     expect(await g6aSettleWithGrants(r, "f002-refused-retry")).toBe("USER_DECISION_REQUIRED");
     expect(attempts).toBe(1);
     expect(pendingReviewRequests(r.database.getTimeline(r.topicId), 1).length).toBeGreaterThan(0);
-    r.database.close();
+    await r.app.close();
   });
 
   it("F002 복구 후 부분 답변: 실패 시도만 제외하고 새 세션의 미답 확인은 다시 사지 않는다", async () => {
@@ -7465,7 +7468,7 @@ describe("E3-3b 리뷰 재개 경로의 답변 확인 세션 복구(host-review 
     expect(await g6aSettleWithGrants(r, "f002-recovered-no-repeat")).toBe("USER_DECISION_REQUIRED");
     expect(r.codex.answerConfirmations).toHaveLength(1);
     expect(pendingReviewRequests(r.database.getTimeline(r.topicId), 1).length).toBeGreaterThan(0);
-    r.database.close();
+    await r.app.close();
   });
 
   it("CODEX_REVIEW: 질문에 답한 뒤 저장 리뷰 세션이 유실되면 새 리뷰 세션으로 다시 리뷰하고, 저장 리뷰의 AGREED_ACTION 으로 수정을 열지 않는다", { timeout: 60_000 }, async () => {
@@ -7480,7 +7483,7 @@ describe("E3-3b 리뷰 재개 경로의 답변 확인 세션 복구(host-review 
     await retry(r);
     await expectRecovered(r, stored, "f002-review-answer");
     expect(r.claude.turns).toHaveLength(1);
-    r.database.close();
+    await r.app.close();
   });
 
   it("CODEX_FINAL_REVIEW: 최종 리뷰 질문에 답한 뒤 저장 리뷰 세션이 유실되면 새 리뷰 세션으로 최종 리뷰를 다시 한다", { timeout: 60_000 }, async () => {
@@ -7492,7 +7495,7 @@ describe("E3-3b 리뷰 재개 경로의 답변 확인 세션 복구(host-review 
     await retry(r);
     await expectRecovered(r, stored, "f002-final-answer");
     expect(r.claude.turns).toHaveLength(turnsBefore);
-    r.database.close();
+    await r.app.close();
   });
 
   it("인도 대기 재확인: 결정으로 재확인 정지한 뒤 저장 리뷰 세션이 유실되면 저장 판정을 재사용하지 않고 새 리뷰 세션으로 정상 리뷰한다", { timeout: 60_000 }, async () => {
@@ -7511,7 +7514,7 @@ describe("E3-3b 리뷰 재개 경로의 답변 확인 세션 복구(host-review 
     // 저장 판정 재사용("기존 코드 판정과 커밋을 보존하고 답변을 재확인했습니다")이 아니라 새 세션의 정상 리뷰가 결정을 읽었다.
     expect(r.database.getTimeline(r.topicId).some((event) => event.body.includes("기존 코드 판정과 커밋을 보존하고 답변을 재확인했습니다."))).toBe(false);
     expect(r.codex.prompts.length).toBeGreaterThan(reviewsBefore);
-    r.database.close();
+    await r.app.close();
   });
 });
 

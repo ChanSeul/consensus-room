@@ -21,7 +21,8 @@ export const PROVIDER_OPTION_SCHEMAS = {
     // Planner 전용 서버 advisor. null은 명시적 비활성화이며 추론 강도 옵션은 CLI가 지원하지 않는다.
     advisorModel: IdentifierSchema.nullable().optional(),
   }).strict(),
-  codex: z.object({}).strict(),
+  // Scheduling speed only; model, reasoning and permissions remain unchanged.
+  codex: z.object({ serviceTier: z.literal("fast").optional() }).strict(),
 } as const;
 
 type OptionProvider = keyof typeof PROVIDER_OPTION_SCHEMAS;

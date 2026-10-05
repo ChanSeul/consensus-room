@@ -13,6 +13,15 @@ const state = (ready = true): EvidenceTopicState => ({ plan: { scopeGeneration: 
 }] });
 const catalog = (): EvidenceCatalog => ({ version: "a".repeat(64), groupId: "g", roots: [], entries: [], history: [], coverage: { sources: 0, units: 0, complete: 0, pending: 0, failed: 0, candidates: 0, ready: true } });
 beforeEach(() => { vi.spyOn(api, "evidenceCatalog").mockResolvedValue(catalog()); });
+it("shows the excluded source and reason as a To-do while the engine remains ready", async () => {
+  const current = state();
+  vi.spyOn(api, "evidence").mockResolvedValue({ ...current, deferred: [{ sourceId: current.sources[0].id,
+    label: "Unavailable contract", url: current.sources[0].url, reason: "HTTP 404" }] });
+  render(<EvidencePanel topicId="t" busy={false} />);
+  const todo = await screen.findByRole("region", { name: "근거 확보 To-do", hidden: true });
+  expect(todo).toHaveTextContent("HTTP 404");
+  expect(within(todo).getByRole("link", { name: "Unavailable contract", hidden: true })).toHaveAttribute("href", current.sources[0].url);
+});
 it("places separately registered Jira descendants under their parent root instead of showing six peers", async () => {
   vi.spyOn(api,"evidence").mockResolvedValue({...state(),sources:[]});
   const labels=["Root Jira","Form policy","Photo policy","Draft policy","Backend form","Backend draft"];

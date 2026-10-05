@@ -1,3 +1,4 @@
+import { resetCycle } from "../../shared/workflowLifecycle.js";
 // 중재자 진단 서비스 — 저장·조회·적용·재개 검사·전달 기록의 책임을 한곳에 모은다(2026-09-14 진단 계획 §1).
 //
 // 흐름: 중재자가 멈춘 구현·수정(또는 인도 대기)의 실패를 진단해 등록한다(register) → 적용(apply)하면 같은 계획 안의 수정은
@@ -10,7 +11,7 @@ import {
   type DiagnosisRecord, type DiagnosisStatus, type DiagnosisTarget,
 } from "../../shared/diagnoses.js";
 import type { AgentResult, Finding, Topic, WorkflowState } from "../../shared/contracts.js";
-import { assertTransition, hashPlan } from "../../shared/workflow.js";
+import { assertTransition, hashPlan, isDeliveryResumeState } from "../../shared/workflow.js";
 import type { FixContract } from "../../shared/fixContract.js";
 import { CheckpointCorrupt, checkpointOpenRequests, requestId, workId, type WorkCheckpoint } from "./checkpoint.js";
 import { decisionRequestTexts } from "./completion.js";
@@ -50,7 +51,6 @@ function revisedAfterApply(record: DiagnosisRecord): boolean {
 function isReplanStale(record: DiagnosisRecord): boolean {
   return record.status === "stale" && record.history.at(-1)?.detail.reason === "replan";
 }
-const DELIVERY_RESUME_STATES = new Set(["IMPLEMENTING", "CODEX_REVIEW", "CLAUDE_FIX", "CODEX_FINAL_REVIEW"]);
 // 개정 계획을 아직 저장하지 않은 계획 변경 진단의 상태 — 이 동안 옛 승인 계획으로의 구현 재개·허용 오차 개정·다른 진단 적용을 막는다.
 const UNSAVED_REVISION_STATUSES: ReadonlySet<DiagnosisStatus> = new Set(["applied", "refuted", "needs_evidence"]);
 const carryKind = (id: string) => `diagnosis-carry-${id}`;
@@ -225,7 +225,7 @@ export class DiagnosisService {
         + "범위 변경(scope_change)으로 새 세대를 열어 고치세요. 열린 진단은 수정 불필요(no_action, supersedes)로 닫을 수 있습니다.");
     }
     if (topic.state === "READY_TO_DELIVER") return;
-    if (STOPPED_STATES.has(topic.state) && resume && DELIVERY_RESUME_STATES.has(resume)) return;
+    if (STOPPED_STATES.has(topic.state) && isDeliveryResumeState(resume)) return;
     throw new DiagnosisConflict(`진단은 구현·수정이 멈춘 상태(재개 단계: 구현·리뷰·수정·최종 리뷰)나 인도 대기에서만 등록합니다(현재 ${topic.state}/${resume ?? "-"}).`);
   }
 
@@ -418,7 +418,7 @@ export class DiagnosisService {
     }
     const resume = flags.resumeState;
     const fromReady = topic.state === "READY_TO_DELIVER";
-    if (!fromReady && !(STOPPED_STATES.has(topic.state) && resume && DELIVERY_RESUME_STATES.has(resume))) {
+    if (!fromReady && !(STOPPED_STATES.has(topic.state) && isDeliveryResumeState(resume))) {
       throw new DiagnosisConflict(`${topic.state}/${resume ?? "-"} 에서는 계획 변경 진단을 적용할 수 없습니다(구현·수정 정지나 인도 대기에서만).`);
     }
     const inflight = this.current(topic.id).filter((item) => item.id !== record.id && ["applied", "plan_revised", "delivered"].includes(item.status));
@@ -427,7 +427,7 @@ export class DiagnosisService {
     }
     const carry = await this.captureCarry(topic);
     // 정정으로 개정이 취소되면 돌아갈 단계. 인도 대기에서 왔으면 리뷰부터 다시 본다(완료 판정은 적용에서 취소했다).
-    const restoreResume = resume && DELIVERY_RESUME_STATES.has(resume) ? resume : (flags.fixPassUsed ? "CODEX_FINAL_REVIEW" : "CODEX_REVIEW");
+    const restoreResume = isDeliveryResumeState(resume) ? resume : (flags.fixPassUsed ? "CODEX_FINAL_REVIEW" : "CODEX_REVIEW");
     const artifact = await this.core.dependencies.artifacts.write(topic.id, carryKind(record.id), 1, JSON.stringify(carry, null, 2), { scopeGeneration: topic.scopeGeneration });
     const now = this.db.getTopic(topic.id);
     if (now.scopeGeneration !== topic.scopeGeneration || now.state !== topic.state || now.planSHA256 !== topic.planSHA256 || this.core.active.has(topic.id)) {
@@ -590,7 +590,7 @@ export class DiagnosisService {
       entries: [{ diagnosisId: record.id, status: "plan_revised", detail: { planSHA256: saved.sha256, previousPlanSHA256: saved.previousPlanSHA256, planRevision: saved.planRevision } }],
       changes: {
         planRevision: saved.planRevision, planSHA256: saved.sha256, approvedPlanSHA256: null,
-        closeoutRevisionUsed: false, fixPassUsed: false, secondFixPassUsed: false, reviewedHead: null, reviewedDiffSHA256: null,
+        ...resetCycle("plan"),
       },
       clearAcknowledgements: true,
       event: {

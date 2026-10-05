@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { GitService, normalizeCommitPaths } from "../src/server/git";
 import { SpawnCommandRunner } from "../src/server/processRunner";
+import type { CommandSpec } from "../src/server/types";
 
 const temporaryDirectories: string[] = [];
 
@@ -35,6 +36,27 @@ function makeRepository(): string {
   git(repository, ["commit", "-m", "baseline"]);
   return repository;
 }
+
+it("isolates Git cancellation across parallel action contexts and later requests", async () => {
+  const controllers = [new AbortController(), new AbortController()];
+  const pending = new Map<string, { spec: CommandSpec; finish: () => void }>();
+  const service = new GitService({ run: spec => new Promise((resolve, reject) => {
+    pending.set(spec.cwd, { spec, finish: () => resolve({ exitCode: 0, stdout: spec.cwd, stderr: "", jsonLines: [] }) });
+    spec.signal?.addEventListener("abort", () => reject(spec.signal!.reason), { once: true });
+  }) });
+  const first = service.withSignal(controllers[0].signal, () => service.head("first"));
+  const second = service.withSignal(controllers[1].signal, () => service.head("second"));
+  const rejected = expect(first).rejects.toThrow("first stopped");
+  controllers[0].abort(new Error("first stopped"));
+  pending.get("second")!.finish();
+  await rejected;
+  expect(await second).toBe("second");
+  expect(pending.get("second")!.spec.signal?.aborted).toBe(false);
+  const later = service.head("later");
+  expect(pending.get("later")!.spec.signal).toBeUndefined();
+  pending.get("later")!.finish();
+  expect(await later).toBe("later");
+});
 
 describe("전용 worktree", () => {
   it("구현을 승인하면 기준 리비전에서 detached worktree를 만들고 그 안에서만 브랜치를 만든다", async () => {

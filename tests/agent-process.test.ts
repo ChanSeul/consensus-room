@@ -6,6 +6,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { describeCommandFailure, parseAgentResult } from "../src/server/adapters/resultParser";
 import { resolutionIds } from "../src/shared/workflow";
 import { SpawnCommandRunner } from "../src/server/processRunner";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 
 const temporaryDirectories: string[] = [];
 
@@ -41,6 +43,81 @@ const finalResult = {
 };
 
 describe("CLI JSONL 처리", () => {
+  it("survives missing spawn pipes, reports EMFILE and accepts a subsequent command and file read", async () => {
+    const script = `
+      import { openSync, closeSync } from 'node:fs';
+      import { SpawnCommandRunner } from ${JSON.stringify(new URL("../src/server/processRunner.ts", import.meta.url).href)};
+      import { readUserFile } from ${JSON.stringify(new URL("../src/server/userFileReader.ts", import.meta.url).href)};
+      const held=[]; try { for (;;) held.push(openSync('/dev/null','r')); } catch {}
+      const runner = new SpawnCommandRunner();
+      const failed = await Promise.allSettled([
+        runner.run({command:process.execPath,args:['-e',''],cwd:process.cwd()}), readUserFile('/dev/null')]);
+      if (failed.some(r=>r.status!=='rejected'||r.reason.code!=='EMFILE')) throw new Error('original spawn error lost');
+      held.forEach(closeSync);
+      const next = await runner.run({command:process.execPath,args:['-e','console.log("next")'],cwd:process.cwd()});
+      if (next.exitCode!==0 || await readUserFile('/dev/null')!=='') throw new Error('recovery failed');
+      console.log('SURVIVED');
+    `;
+    const { stdout } = await promisify(execFile)("/bin/sh", ["-c", 'ulimit -n 64; exec "$@"', "sh",
+      process.execPath, "--import", "tsx", "--input-type=module", "-e", script], { cwd: process.cwd(), timeout: 15_000 });
+    expect(stdout).toContain("SURVIVED");
+  });
+  it.each([0, 3])("normal owned completion (%s) waits until surviving descendants can no longer write", async code => {
+    const root = mkdtempSync(join(tmpdir(), "consensus-normal-exit-"));
+    temporaryDirectories.push(root);
+    const pidFile = join(root, "pid");
+    const readyFile = join(root, "ready");
+    const child = `process.on('SIGTERM', () => {}); require('node:fs').writeFileSync(${JSON.stringify(readyFile)}, 'ready'); setInterval(() => {}, 1000);`;
+    const parent = `const fs = require('node:fs'); const c = require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(child)}], {stdio:'inherit'}); fs.writeFileSync(${JSON.stringify(pidFile)}, String(c.pid)); const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(readyFile)})) { console.log(JSON.stringify({type:'result'})); process.exit(${code}); } }, 10);`;
+    let pid: number | undefined;
+    try {
+      const result = await new SpawnCommandRunner().run({ command: process.execPath, args: ["-e", parent], cwd: root,
+        finalResultTimeoutMs: 300, isFinalResult: value => (value as { type?: string }).type === "result" });
+      pid = Number(readFileSync(pidFile, "utf8"));
+      expect(result.exitCode).toBe(code);
+      expect(result.terminatedAfterResult).toBeUndefined();
+      expect(isRunning(pid)).toBe(false);
+    } finally {
+      pid ??= existsSync(pidFile) ? Number(readFileSync(pidFile, "utf8")) : undefined;
+      if (pid) try { process.kill(pid, "SIGKILL"); } catch { /* already drained */ }
+    }
+  });
+
+  it.each([false, true])("own-group completion drains escaped-child pipes after exit or abort (%s)", async cancel => {
+    const controller = new AbortController();
+    let escapedPID: number | undefined;
+    let interrupted = "";
+    const script = [
+      "import json,subprocess,sys,time",
+      "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'], start_new_session=True)",
+      "print(json.dumps({'type':'last','escapedPID':child.pid,'payload':'x'*65536}),flush=True)",
+      ...(cancel ? ["time.sleep(30)"] : []),
+    ].join("\n");
+    const outcome = new SpawnCommandRunner().run({ command: "python3", args: ["-c", script], cwd: tmpdir(),
+      signal: controller.signal, onJSONLine: value => {
+        escapedPID = (value as { escapedPID: number }).escapedPID;
+        if (cancel) controller.abort(new Error("requested cancellation"));
+      }, onInterruptedOutput: output => { interrupted = output.stdout; },
+    }).then(value => ({ value }), error => ({ error }));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([outcome,
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("escaped pipe never drained")), 2500); })]);
+      if (cancel) {
+        expect(result).toHaveProperty("error.message", "requested cancellation");
+        expect(JSON.parse(interrupted).payload).toHaveLength(65536);
+      } else {
+        expect(result).toHaveProperty("value.exitCode", 0);
+        if ("value" in result) expect((result.value.jsonLines[0] as { payload: string }).payload).toHaveLength(65536);
+      }
+    } finally {
+      clearTimeout(timer);
+      if (escapedPID) try { process.kill(escapedPID, "SIGKILL"); } catch { /* fixture already gone */ }
+      controller.abort();
+      await outcome;
+    }
+  });
+
   it("가짜 CLI가 여러 조각과 잘못된 JSON을 섞어 보내도 마지막 계약 결과를 읽는다", async () => {
     const script = [
       `process.stdout.write(${JSON.stringify(`${JSON.stringify(firstResult)}\n`)});`,

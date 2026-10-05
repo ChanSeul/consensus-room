@@ -121,6 +121,24 @@ it("collects bounded snapshot evidence before returning one final plan and reser
   expect(fake.calls).toHaveLength(2);
 });
 
+it("continues planning after an unavailable evidence read without claiming it was delivered", async () => {
+  const { repo, database, git } = setup();
+  const fake = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ requests: [
+      { kind: "evidence", selector: "missing-source::body", question: "Read unavailable contract", offset: 0 },
+    ] }));
+    expect(turn.prompt).toContain("unavailable");
+    return { ...answer(step({ questions: [], complete: true })), findings: [{ id: "missing-source", severity: "INFO",
+      title: "Retrieve contract later", disposition: "DEFERRED_OUT_OF_SCOPE", requiresUserDecision: false,
+      rationale: "Dependent change excluded from this plan", evidenceRefs: [] }] };
+  });
+  const result = await guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Plan supported scope" });
+  expect(result.result.planMarkdown).toBe("Final navigation plan");
+  expect(result.result.findings[0].disposition).toBe("DEFERRED_OUT_OF_SCOPE");
+  expect(fake.calls).toHaveLength(2);
+  expect(database.planning.latest("topic")!.fragments.filter(fragment => fragment.kind === "evidence")).toEqual([]);
+});
+
 it("a budget resume can continue the last held rewrite but cannot reuse it after the plan epoch changes", async () => {
   const {root,repo,database,git}=setup();
   database.updateTopic("topic",{state:"CLAUDE_REVISION"});
@@ -176,8 +194,9 @@ it("still rejects undelivered facts in a completed checkpoint", async () => {
   expect(database.planning.latest("topic")!.finalized).toBe(false);
 });
 
-it("repairs an undelivered final citation once in the same planning session after a forced synthesis", async () => {
+it.each([false, true])("repairs an undelivered final citation in the same session (forced synthesis=%s)", async forced => {
   const { repo, database, git } = setup();
+  if (!forced) database.updateTopic("topic", { state: "CODEX_CLOSEOUT" });
   const fake = scripted(async (_turn, n) => answer(step({
     facts: n === 1 ? [{ statement: "Unsupported", refs: ["not-delivered"] }] : [],
     questions: [], complete: true,
@@ -185,7 +204,7 @@ it("repairs an undelivered final citation once in the same planning session afte
   const adapter = guardedPlanning(fake.adapter, database, git);
   await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("not delivered");
   const saved = database.planning.latest("topic")!;
-  saved.finalAttempted = true;
+  saved.finalAttempted = forced;
   database.planning.save(saved);
 
   const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
@@ -642,22 +661,157 @@ it("carries a revised closeout into the existing reviewer session after the audi
   expect(database.planning.latest("topic")!.finalized).toBe(true);
 });
 
-it.each(["unsupported citation", "oversized checkpoint"])("requests a corrected response after rejecting an %s", async reason => {
+it("requests a corrected response after rejecting an unsupported citation", async () => {
   const { repo, database, git } = setup("codex");
   const fake = scripted(async (_turn, n) => {
-    if (n === 1 && reason === "unsupported citation") return answer(step({
+    if (n === 1) return answer(step({
       facts: [{ statement: "Unsupported", refs: ["context:request"] }], questions: [], complete: true,
     }));
-    if (n === 1) return answer(step({ draft: "x".repeat(PLANNING_LIMITS.checkpointBytes + 1) }));
     return answer(step({ questions: [], complete: true }));
   }, "codex");
   const adapter = guardedPlanning(fake.adapter, database, git);
-  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow(
-    reason === "unsupported citation" ? "not delivered" : "output limit");
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("not delivered");
   expect(database.planning.latest("topic")!.responsePending).toBe(false);
   const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
   expect(result.result.planMarkdown).toBe("Final navigation plan");
   expect(fake.calls).toHaveLength(2);
+});
+
+it("repairs an oversized UTF-8 checkpoint in the same session", async () => {
+  const { repo, database, git } = setup("codex");
+  const fake = scripted(async (turn, n) => {
+    if (n === 1) {
+      return answer(step({ draft: "가".repeat(5000) }));
+    }
+    expect(turn.prompt).toContain("Checkpoint size correction:");
+    expect(turn.prompt).toContain("Do not repeat the full plan in draft");
+    return answer(step({ questions: [], complete: true }));
+  }, "codex");
+  const result = await guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Plan" });
+  expect(result.result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls).toHaveLength(2);
+  expect(fake.calls[0].prompt).toContain("not characters or tokens");
+  expect(fake.calls[1]).toMatchObject({ sessionId: "session-1" });
+  expect(database.planning.latest("topic")!.finalized).toBe(true);
+});
+
+it("recovers a saved pre-fix oversized response on retry without resetting usage", async () => {
+  const { repo, database, git } = setup("codex");
+  const fake = scripted(async (_turn, n) => n === 1
+    ? answer(step({ facts: [{ statement: "unsupported", refs: ["missing"] }], questions: [], complete: true }))
+    : answer(step({ questions: [], complete: true })), "codex");
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("not delivered");
+  const legacy = database.planning.latest("topic")!;
+  legacy.lastResponse = answer(step({ draft: "가".repeat(5000) }));
+  legacy.stopped = "Planning checkpoint exceeds its output limit; the response was preserved for mediation.";
+  database.planning.save(legacy);
+  const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+  expect(result.result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls[1]).toMatchObject({ sessionId: "session-1" });
+  expect(fake.calls[1].prompt).toContain("Checkpoint size correction:");
+  expect(database.planning.latest("topic")!.usage.inputTokens).toBe(200);
+});
+
+it("does not repeatedly purchase checkpoint size corrections after a failed correction", async () => {
+  const { repo, database, git } = setup("codex");
+  const fake = scripted(async () => answer(step({ draft: "가".repeat(5000) })), "codex");
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("after a compact response request");
+  expect(fake.calls).toHaveLength(2);
+  expect(database.planning.latest("topic")!.lastResponse!.planningStep!.draft).toBe("가".repeat(5000));
+  expect(database.planning.latest("topic")!.finalized).toBe(false);
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("already attempted");
+  expect(fake.calls).toHaveLength(2);
+});
+
+it("restores checkpoint correction after session-missing without a model turn", async () => {
+  const { repo, database, git } = setup("codex");
+  const fake = scripted(async (_turn, n) => answer(step(n === 1
+    ? { draft: "가".repeat(5000) } : { questions: [], complete: true })), "codex");
+  let lost = false;
+  const adapter = guardedPlanning({ ...fake.adapter, resumeTurn: async turn => {
+    if (!lost) {
+      lost = true;
+      turn.onProcessSpawn?.({ pid: 7, pgid: 7, executable: "fake", commandLine: "fake", startedAt: "now" });
+      throw codexSessionMissing(turn.sessionId);
+    }
+    return fake.adapter.resumeTurn(turn);
+  } }, database, git);
+  const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+  expect(result.sessionId).toBe("session-2");
+  expect(fake.calls).toHaveLength(2);
+  expect(database.planning.latest("topic")!.finalized).toBe(true);
+});
+
+it.each([10, 100])("corrects a synthesis checkpoint only when the remaining budget permits it (last input: %s)", async finalInput => {
+  const { repo, database, git } = setup("codex", 1000);
+  let calls = 0;
+  const run = async (turn: Omit<SessionTurn, "sessionId">): Promise<AgentResult> => {
+    calls++;
+    turn.onSessionCreated?.("session-1");
+    turn.onProcessSpawn?.({ pid: 7, pgid: 7, executable: "fake", commandLine: "fake", startedAt: "now" });
+    turn.onUsage?.({ inputTokens: calls === 9 ? finalInput : 100, outputTokens: 20, durationMs: 30,
+      recordKind: "final", completeness: "complete" });
+    if (calls <= 8) return answer(step({ requests: [{ kind: "file", selector: "form.swift", offset: (calls - 1) * 1000, question: "Read" }] }));
+    expect(turn.prompt).toContain("No more research is available");
+    return answer(step({ draft: calls === 9 ? "가".repeat(5000) : "Compact", questions: [], complete: true }));
+  };
+  const adapter = guardedPlanning({ role: "codex", createSession: async turn => ({ sessionId: "session-1", result: await run(turn) }),
+    resumeTurn: run, validateExistingSession: async () => true }, database, git);
+  if (finalInput === 10) {
+    expect((await adapter.createSession({ cwd: repo, prompt: "Plan" })).result.planMarkdown).toBe("Final navigation plan");
+    expect(calls).toBe(10);
+  } else {
+    await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("insufficient remaining budget");
+    expect(calls).toBe(9);
+  }
+});
+
+it("omits already delivered fragments from a checkpoint correction without losing citation receipts", async () => {
+  const { repo, database, git } = setup("codex");
+  const fragmentsIn = (turn: Omit<SessionTurn, "sessionId">) => JSON.parse(turn.prompt.split("Fragments: ").at(-1)!) as PlanningFragment[];
+  let ref = "";
+  const fake = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ requests: [{ kind: "file", selector: "form.swift", offset: 0, question: "Read" }] }));
+    if (n === 2) {
+      ref = fragmentsIn(turn)[0].id;
+      return answer(step({ draft: "가".repeat(5000) }));
+    }
+    expect(fragmentsIn(turn)).toEqual([]);
+    return answer(step({ facts: [{ statement: "Navigation retained", refs: [ref] }], questions: [], complete: true }));
+  }, "codex");
+  await guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Plan" });
+  expect(database.planning.latest("topic")!.delivered).toContain(ref);
+  expect(fake.calls).toHaveLength(3);
+});
+
+it("resends an unacknowledged required reference before adopting a cancelled oversized response", async () => {
+  const { repo, database, git } = setup("codex");
+  const event = database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CODEX_AUDIT",
+    body: "Preserve the entered address." });
+  const reference = timelineReference(event);
+  const controller = new AbortController();
+  let fragment!: PlanningFragment;
+  const fake = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ requests: [{ kind: "context", selector: reference.selector, offset: 0, question: "Read" }] }));
+    const sent = JSON.parse(turn.prompt.split("Fragments: ").at(-1)!) as PlanningFragment[];
+    if (n === 2) {
+      fragment = sent.find(f => f.selector === reference.selector)!;
+      controller.abort();
+      return answer(step({ draft: "가".repeat(5000) }));
+    }
+    expect(database.planning.referenceComplete("session-1", database.getTopic("topic"), reference)).toBe(false);
+    expect(sent.map(f => f.id)).toContain(fragment.id);
+    return answer(step({ facts: [{ statement: "Keep the address", refs: [fragment.id] }], questions: [], complete: true }));
+  }, "codex");
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  const turn = { cwd: repo, prompt: "Plan", timelineDelivery: { prompt: { inline: [], references: [reference], index: null } } };
+  await expect(adapter.createSession({ ...turn, signal: controller.signal })).rejects.toThrow();
+  expect(database.planning.referenceComplete("session-1", database.getTopic("topic"), reference)).toBe(false);
+  expect((await adapter.createSession(turn)).result.planMarkdown).toBe("Final navigation plan");
+  expect(database.planning.referenceComplete("session-1", database.getTopic("topic"), reference)).toBe(true);
+  expect(fake.calls).toHaveLength(3);
 });
 
 it("does not replay an explicitly rejected decision response with pending reads", async () => {
@@ -989,7 +1143,9 @@ it.each(["task", "instructions", "combined"])("streams oversized %s through requ
   await wrapped.createSession({ cwd: repo, prompt: contract });
   expect(received.filter(f => f.selector === "request").map(f => f.content).join("")).toBe(contract);
   if (rules) expect(received.filter(f => f.selector === "mandatory-instructions").map(f => f.content).join("")).toContain(rules);
-  expect(fake.calls.length).toBeGreaterThan(2);
+  expect(fake.calls.length).toBeGreaterThan(1);
+  expect(fake.calls.length).toBeLessThanOrEqual(4);
+  expect(new Set(received.map(f => f.id)).size).toBe(received.length);
   expect(fake.calls.every(t => Buffer.byteLength(t.prompt) < PLANNING_LIMITS.reviewPromptBytes)).toBe(true);
   expect(database.planning.latest("topic")).toMatchObject({ finalized: true, sessionId: "session-1" });
   expect(database.planning.latest("topic")?.priorAttempt).toBeUndefined();
@@ -1810,14 +1966,17 @@ it.each(["claude", "codex"] as const)("%s planning sees Figma links but cannot r
   const check = database.evidence.begin(source.id, true)!;
   database.evidence.ingest(source.id, { checkId: check.checkId, revision: "r1",
     units: [{ id: "1:2", kind: "design", content: "DO_NOT_SEND_NODE_TREE" }] });
-  const fake = scripted(async turn => {
+  const fake = scripted(async (turn, call) => {
     expect(turn.prompt).toContain(source.url);
     expect(turn.prompt).toContain("Design is implementation-time work");
     expect(turn.prompt).not.toContain("DO_NOT_SEND_NODE_TREE");
-    return answer(step({ requests: [{ kind: "evidence", selector: `${source.id}::1:2`, offset: 0, question: "Try reading design early" }] }));
+    if (call === 1) return answer(step({ requests: [{ kind: "evidence", selector: `${source.id}::1:2`, offset: 0, question: "Try reading design early" }] }));
+    expect(turn.prompt).toContain("External evidence is unavailable");
+    return answer(step({ questions: [], complete: true }));
   }, role);
-  await expect(guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Plan functional boundaries" })).rejects.toThrow();
-  expect(fake.calls).toHaveLength(1);
+  const result = await guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Plan functional boundaries" });
+  expect(result.result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls).toHaveLength(2);
   expect(database.planning.latest(topic.id)?.fragments).toEqual([]);
 });
 
@@ -2633,6 +2792,75 @@ describe("E3-2-2a timeline references", { timeout: TIMELINE_TEST_TIMEOUT_MS }, (
     await engine.shutdown();
   });
 
+  it.each([
+    { changed: false, recovered: false, tampered: false }, { changed: true, recovered: false, tampered: false },
+    { changed: false, recovered: true, tampered: false }, { changed: true, recovered: true, tampered: false },
+    { changed: false, recovered: true, tampered: true },
+  ])("public retry preserves a pending delta closeout ($changed, recovery=$recovered, artifact changed=$tampered)", async ({ changed, recovered, tampered }) => {
+    const { database, git, artifacts, settle } = referenceTopic();
+    database.upsertParticipant("topic", { role: "codex", sessionId: "pending:codex-recovery", mode: "attached", acknowledgedPlanSHA256: null });
+    const plan = `${planMarkdown("DELTA_RECOVERY")}\n\n${Array.from({ length: 100 }, (_, i) => `Section ${i}: ${"계획 본문 ".repeat(6)}`).join("\n")}\nREVISION_TARGET_BEFORE`;
+    const stopAck = (turn: Omit<SessionTurn, "sessionId">) => { if (turn.protocolOnly) throw new Error("DELTA_RECOVERY_ACK_STOP"); };
+    const claude = scripted(async turn => {
+      stopAck(turn);
+      if (turn.prompt.includes("Codex 감사에 답하고")) return { kind: "REVISION", summary: "개정", findings: [], evidenceRefs: [],
+        planEdits: [{ find: "REVISION_TARGET_BEFORE", replace: "REVISION_TARGET_AFTER" }], planningStep: step({ questions: [], complete: true }) };
+      return done(plan);
+    });
+    let closeouts = 0;
+    const codex = scripted(async turn => {
+      stopAck(turn);
+      if (turn.prompt.includes("검토할 계획 SHA-256")) return { kind: "AUDIT", summary: "감사", findings: [], evidenceRefs: [],
+        planningStep: step({ questions: [], complete: true }) };
+      closeouts += 1;
+      if (closeouts === 1) {
+        if (!recovered) expect(turn.prompt).toContain("직전 전달 이후 추가된 결정과 증거");
+        expect(turn.freshSessionPrompt).toBeTruthy();
+        turn.onUsage?.({ inputTokens: 100, outputTokens: 20, durationMs: 30, recordKind: "final", completeness: "partial" });
+      } else if (changed) expect(turn.prompt).toContain("NEW-DECISION-MARKER");
+      return { kind: "CLOSEOUT", summary: `종결 ${closeouts}`, planSHA256: database.getTopic("topic").planSHA256!,
+        findings: [], evidenceRefs: [], planningStep: step({ questions: [], complete: true }) };
+    }, "codex");
+    let oldSession = "";
+    const lostOld: AgentAdapter = { ...codex.adapter, resumeTurn: async turn => {
+      if (recovered && !oldSession && turn.prompt.includes("개정 계획 SHA-256")) {
+        expect(turn.prompt).toContain("직전 전달 이후 추가된 결정과 증거");
+        expect(turn.freshSessionPrompt).toBeTruthy();
+        oldSession = turn.sessionId;
+        throw codexSessionMissing(turn.sessionId);
+      }
+      return codex.adapter.resumeTurn(turn);
+    } };
+    const engine = new WorkflowEngine({ database, git, artifacts, claude: guardedPlanning(claude.adapter, database, git),
+      codex: guardedPlanning(lostOld, database, git) });
+    engine.startPlan("topic"); await settle();
+    expect(database.getTopic("topic").state, database.getTopic("topic").lastError ?? undefined).toBe("USER_DECISION_REQUIRED");
+    expect(database.getFlags("topic").resumeState).toBe("CODEX_CLOSEOUT");
+    const checkpoint = database.planning.latest("topic")!;
+    expect(checkpoint).toMatchObject({ responsePending: true, finalized: false });
+    const cursor = JSON.parse((await artifacts.readLatest("topic", "codex-planning-cursor"))!);
+    expect(cursor.planSHA256).not.toBe(database.getTopic("topic").planSHA256);
+    if (recovered) {
+      expect(cursor.sessionId).toBe(oldSession);
+      expect(checkpoint.sessionId).not.toBe(oldSession);
+    }
+    const previous = (await artifacts.verifiedRevision("topic", "plan", cursor.planSHA256))!;
+    if (tampered) await fsPromises.appendFile(previous.path, "\nChanged artifact after the saved response\n");
+    const recovery = database.planning.progress("topic")!.usageRecovery;
+    engine.authorizeUnknownPlanningUsage("topic", { checkpointId: recovery.checkpointId, checkpointSHA256: recovery.checkpointSHA256,
+      gapIds: recovery.gaps.filter(gap => !gap.authorization).map(gap => gap.id), acceptUnknownUsage: true,
+      reason: "Keep unknown usage explicit and adopt the saved closeout" }, "delta-recovery");
+    if (changed) await engine.postMessage("topic", "decision", "NEW-DECISION-MARKER: preserve the current acceptance contract");
+    engine.retry("topic"); await settle();
+    expect(closeouts).toBe(changed || tampered ? 2 : 1);
+    expect(await artifacts.readLatest("topic", "closeout")).toContain(`종결 ${changed || tampered ? 2 : 1}`);
+    expect(database.planning.latest("topic")).toMatchObject({ id: checkpoint.id, finalized: true, usageIncomplete: true,
+      usageGaps: [expect.objectContaining({ authorization: expect.objectContaining({ requestKey: "delta-recovery" }) })] });
+    expect(database.getTimeline("topic").filter(event => event.sequence > checkpoint.inputSequence && event.actor === "system").length)
+      .toBeGreaterThan(0);
+    await engine.shutdown();
+  });
+
   it("does not adopt a paused revision with unread required references and continues reading in the same revision checkpoint", async () => {
     const { database, git, artifacts, settle } = referenceTopic();
     database.upsertParticipant("topic", { role: "codex", sessionId: "pending:codex-e3", mode: "attached", acknowledgedPlanSHA256: null });
@@ -3088,12 +3316,31 @@ describe("E3-3a 같은 route 자동 복구와 복구 계보", () => {
 
   it("F001: 사용량이 빠진 문맥 초과(실제 계측 형태)면 복구 호출을 사지 않고 멈추고, 모델 턴이 없는 세션 유실은 같은 계측에서도 복구한다", async () => {
     const room = setup("codex");
-    const exceeded = metered(scripted(async () => answer(step({ requests: [READ] })), "codex"), { 2: contextExceeded });
+    const exceeded = metered(scripted(async (_turn, n) => answer(step(n === 1 ? { requests: [READ] } : { questions: [], complete: true })), "codex"), { 2: contextExceeded });
     await expect(guardedPlanning(exceeded.adapter, room.database, room.git).createSession({ cwd: room.repo, prompt: "Audit the plan", settings }))
       .rejects.toThrow("Usage is incomplete after the provider reported context-exceeded");
     expect(exceeded.attempts).toEqual(["create", "resume"]);
     expect(room.database.planning.latest("topic")).toMatchObject({ usageIncomplete: true, sessionId: "session-1" });
     expect(lineageOf(room.database).recoveries).toEqual([]);
+    authorizeUsageRecovery(room, exceeded.adapter);
+    const reopened = new ConsensusDatabase(join(room.root, "room.db"));
+    cleanups.push(() => reopened.close());
+    const saveCheckpoint = reopened.planning.save.bind(reopened.planning);
+    let failHandoff = true;
+    const save = vi.spyOn(reopened.planning, "save").mockImplementation(record => {
+      if (failHandoff && record.sessionId === null) { failHandoff = false; throw new Error("cannot persist handoff"); }
+      saveCheckpoint(record);
+    });
+    await expect(guardedPlanning(exceeded.adapter, reopened, room.git).createSession({ cwd: room.repo, prompt: "Audit the plan", settings }))
+      .rejects.toThrow("cannot persist handoff");
+    expect(lineageOf(reopened).recoveries).toHaveLength(0);
+    expect(reopened.planning.latest("topic")?.sessionId).toBe("session-1");
+    expect(exceeded.attempts).toEqual(["create", "resume"]);
+    save.mockRestore();
+    const resumed = await guardedPlanning(exceeded.adapter, reopened, room.git).createSession({ cwd: room.repo, prompt: "Audit the plan", settings });
+    expect(resumed.result.planMarkdown).toBe("Final navigation plan");
+    expect(exceeded.attempts).toEqual(["create", "resume", "create"]);
+    expect(lineageOf(reopened).recoveries).toHaveLength(1);
 
     const lost = setup("codex");
     const missingRun = metered(scripted(async (_turn, n) => n === 1 ? answer(step({ requests: [READ] })) : answer(step({ questions: [], complete: true })), "codex"),
@@ -4829,4 +5076,513 @@ it.each([false, true])("stops incomplete advisor usage before another call (reco
     expect(fake.calls).toHaveLength(1);
     expect(database.planning.latest("topic")?.usageIncomplete).toBe(true);
   }
+});
+
+function authorizeUsageRecovery(room: ReturnType<typeof setup>, adapter: AgentAdapter) {
+  const { database, git, root } = room;
+  const stage = database.getTopic("topic").state;
+  database.updateTopic("topic", { state: "USER_DECISION_REQUIRED", resumeState: stage });
+  const recovery = database.planning.progress("topic")!.usageRecovery;
+  new WorkflowEngine({ database, git, artifacts: new ArtifactStore(join(root, "artifacts"), database),
+    claude: adapter, codex: adapter }).authorizeUnknownPlanningUsage("topic", {
+      checkpointId: recovery.checkpointId, checkpointSHA256: recovery.checkpointSHA256,
+      gapIds: recovery.gaps.filter(gap => !gap.authorization).map(gap => gap.id),
+      acceptUnknownUsage: true, reason: "Continue with this call's usage unknown",
+    }, "explicit-recovery");
+  database.updateTopic("topic", { state: stage });
+}
+
+it.each([false, true])("usage recovery adopts only the original delivered reference receipt after reopen (changed=%s)", async changed => {
+  const room = setup("codex");
+  const { database, root, repo, git } = room;
+  const documents = [{ selector: "shared:required", content: "Mandatory acceptance contract" }];
+  const fake = scripted(async (turn, n) => {
+    if (n === 1) turn.onUsage?.({ inputTokens: 100, outputTokens: 20, durationMs: 30, recordKind: "final", completeness: "partial" });
+    return answer(step({ questions: [], complete: true }));
+  }, "codex");
+  await expect(guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Audit", planningDocuments: documents }))
+    .rejects.toThrow("Usage is incomplete");
+  const checkpoint = database.planning.latest("topic")!;
+  const reference = checkpoint.contextReferences![0];
+  expect(database.planning.referenceComplete(checkpoint.sessionId!, database.getTopic("topic"), reference)).toBe(false);
+  authorizeUsageRecovery(room, fake.adapter);
+  if (changed) documents[0].content = "Revised mandatory acceptance contract";
+  const reopened = new ConsensusDatabase(join(root, "room.db"));
+  cleanups.push(() => reopened.close());
+  const result = await guardedPlanning(fake.adapter, reopened, git).createSession({ cwd: repo, prompt: "Audit", planningDocuments: documents });
+  expect(result.result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls).toHaveLength(changed ? 2 : 1);
+  expect(reopened.planning.referenceComplete(checkpoint.sessionId!, reopened.getTopic("topic"), reference)).toBe(!changed);
+});
+
+it.each([false, true])("explicit unknown-usage recovery preserves accounting and does not waive a later gap (legacy=%s)", async legacy => {
+  const { root, repo, database, git } = setup();
+  const fake = scripted(async (turn, n) => {
+    if (n <= 2) turn.onUsage?.({ inputTokens: 100, outputTokens: 20, durationMs: 30,
+      executionId: `missing-${n}`, recordKind: "final", completeness: "partial" });
+    return answer(step(n === 1
+      ? { requests: [{ kind: "file", selector: "form.swift", question: "Read", offset: 0 }] }
+      : { questions: [], complete: true }));
+  });
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Usage is incomplete");
+  if (legacy) {
+    const checkpoint = database.planning.latest("topic")!;
+    delete checkpoint.usageGaps;
+    database.planning.save(checkpoint);
+  }
+  const engine = new WorkflowEngine({ database, git, artifacts: new ArtifactStore(join(root, "artifacts"), database),
+    claude: fake.adapter, codex: { ...fake.adapter, role: "codex" } });
+  database.updateTopic("topic", { state: "USER_DECISION_REQUIRED", resumeState: "CLAUDE_PLAN" });
+  const checkpoint = database.planning.latest("topic")!, before = structuredClone(checkpoint.usage);
+  const recovery = database.planning.progress("topic")!.usageRecovery;
+  const input = { checkpointId: recovery.checkpointId, checkpointSHA256: recovery.checkpointSHA256,
+    gapIds: recovery.gaps.map(gap => gap.id), acceptUnknownUsage: true as const, reason: "Explicitly continue with the cost unknown" };
+  expect(() => engine.authorizeUnknownPlanningUsage("topic", { ...input, checkpointSHA256: "0".repeat(64) }, "stale"))
+    .toThrow("current idle");
+  expect(() => engine.authorizeUnknownPlanningUsage("topic", { ...input, gapIds: ["another-call"] }, "wrong-call"))
+    .toThrow("unresolved usage gaps");
+  const authorized = engine.authorizeUnknownPlanningUsage("topic", input, "authorized");
+  expect(authorized).toMatchObject({ usageIncomplete: true, usage: before,
+    usageRecovery: { gaps: [expect.objectContaining({ authorization: { requestKey: "authorized", reason: input.reason, at: expect.any(String) } })] } });
+  expect(database.getTopic("topic").state).toBe("USER_DECISION_REQUIRED");
+  expect(database.planning.latest("topic")?.id).toBe(checkpoint.id);
+  database.updateTopic("topic", { state: "CLAUDE_PLAN" });
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Usage is incomplete");
+  expect(fake.calls).toHaveLength(2);
+  expect(database.planning.progress("topic")!.usageRecovery.gaps).toHaveLength(2);
+  expect(database.planning.progress("topic")!.usageRecovery.gaps[1].authorization).toBeUndefined();
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Usage is incomplete");
+  expect(fake.calls).toHaveLength(2);
+  database.updateTopic("topic", { state: "USER_DECISION_REQUIRED", resumeState: "CLAUDE_PLAN" });
+  const next = database.planning.progress("topic")!.usageRecovery;
+  engine.authorizeUnknownPlanningUsage("topic", { ...input, checkpointSHA256: next.checkpointSHA256,
+    gapIds: next.gaps.filter(gap => !gap.authorization).map(gap => gap.id) }, "second-authorization");
+  database.updateTopic("topic", { state: "CLAUDE_PLAN" });
+  const completed = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+  expect(completed.result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls).toHaveLength(2); // Adopt the preserved response instead of buying it again.
+  expect(database.planning.progress("topic")).toMatchObject({ finalized: true, usageIncomplete: true,
+    usage: { inputTokens: 200, outputTokens: 40 } });
+});
+
+it("continues guarded planning through an in-turn evidence failure without waiting for refresh", async () => {
+  const { repo, database, git } = setup();
+  const source = database.evidence.register("topic", { url: "https://team.atlassian.net/browse/APP-1", label: "Contract", mode: "connector", intervalSeconds: 900 });
+  const refresh = () => {
+    const check = database.evidence.begin(source.id, true)!;
+    database.evidence.ingest(source.id, { checkId: check.checkId, revision: "same", units: [{ id: "body", kind: "issue", content: "Contract" }] });
+  };
+  refresh();
+  const model = scripted(async (turn, n) => {
+    if (n > 1) {
+      expect(turn.prompt).toContain("let step = 0");
+      return answer(step({ questions: [], complete: true }));
+    }
+    const check = database.evidence.begin(source.id, true)!;
+    database.evidence.failed(source.id, check.checkId, "Expired while planning");
+    return answer(step({ requests: [{ kind: "file", selector: "form.swift", question: "Read ownership", offset: 0 }] }));
+  });
+  const result = await guardedPlanning(model.adapter, database, git).createSession({ cwd: repo, prompt: "Plan supported scope" });
+  expect(result.result.planMarkdown).toBe("Final navigation plan");
+  expect(model.calls).toHaveLength(2);
+  expect(database.evidence.topic(database.getTopic("topic"))).toMatchObject({ ready: true,
+    deferred: [expect.objectContaining({ sourceId: source.id, reason: "Expired while planning" })] });
+});
+
+// F003: requests must recheck availability even when the exact fragment/search was cached.
+it("excludes an in-turn failed source from cached reads and search while continuing local work", async () => {
+  const { repo, database, git } = setup();
+  const source = database.evidence.register("topic", { url: "https://team.atlassian.net/browse/APP-2", label: "Contract", mode: "connector", intervalSeconds: 300 });
+  const check = database.evidence.begin(source.id, true)!;
+  database.evidence.ingest(source.id, { checkId: check.checkId, revision: "same", units: [{ id: "body", kind: "issue", content: "UniqueContractBody" }] });
+  const requests = [{ kind: "evidence" as const, selector: `${source.id}::body`, question: "Read", offset: 0 },
+    { kind: "search" as const, selector: "evidence::UniqueContractBody", question: "Find", offset: 0 }];
+  const model = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ requests }));
+    if (n === 2) {
+      expect(turn.prompt).toContain('\\"content\\":\\"UniqueContractBody');
+      const failed = database.evidence.begin(source.id, true)!;
+      database.evidence.failed(source.id, failed.checkId, "offline");
+      const fragment = JSON.parse(turn.prompt.split("Fragments: ").at(-1)!)[0];
+      return answer(step({ facts: [{ statement: "Now unsupported", refs: [fragment.id] }],
+        requests: [...requests, { kind: "file", selector: "form.swift", question: "Local work", offset: 0 }] }));
+    }
+    expect(turn.prompt).toContain("Read request errors");
+    const fragments = JSON.parse(turn.prompt.split("Fragments: ").at(-1)!);
+    expect(fragments.some((fragment: PlanningFragment) => fragment.kind === "evidence")).toBe(false);
+    expect(fragments.find((fragment: PlanningFragment) => fragment.kind === "search")?.content).toBe("");
+    expect(fragments.find((fragment: PlanningFragment) => fragment.kind === "file")?.content).toContain("let step = 0");
+    return answer(step({ questions: [], complete: true }));
+  });
+  await guardedPlanning(model.adapter, database, git).createSession({ cwd: repo, prompt: "Plan supported scope" });
+  expect(model.calls).toHaveLength(3);
+});
+
+// F008: an unread source's availability is not a new source version or a new logical attempt.
+it("retains local facts and queued fragments on resume when an unread source becomes unavailable", async () => {
+  const { repo, database, git } = setup("codex");
+  const source = database.evidence.register("topic", { url: "https://team.atlassian.net/browse/APP-3", label: "Unread", mode: "connector", intervalSeconds: 300 });
+  const check = database.evidence.begin(source.id, true)!;
+  database.evidence.ingest(source.id, { checkId: check.checkId, revision: "same", units: [{ id: "body", kind: "issue", content: "Unrelated original" }] });
+  let fact: PlanningStep["facts"][number];
+  const model = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ requests: [{ kind: "file", selector: "form.swift", question: "Local fact", offset: 0 }] }));
+    if (n === 2) {
+      const fragment = JSON.parse(turn.prompt.split("Fragments: ").at(-1)!)[0];
+      fact = { statement: "Local navigation remains", refs: [fragment.id] };
+      return answer(step({ facts: [fact], requests: [{ kind: "file", selector: "form.swift", question: "Rest", offset: fragment.nextOffset }] }));
+    }
+    if (n === 3) throw new Error("Interrupted transport");
+    expect(turn.prompt).toContain("Local navigation remains");
+    expect(turn.prompt).toContain("let step = 0");
+    return answer(step({ facts: [fact], questions: [], complete: true }));
+  }, "codex");
+  const adapter = guardedPlanning(model.adapter, database, git);
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Interrupted transport");
+  const before = database.planning.latest("topic")!;
+  const failed = database.evidence.begin(source.id, true)!;
+  database.evidence.failed(source.id, failed.checkId, "offline");
+  await adapter.resumeTurn({ cwd: repo, prompt: "Plan", sessionId: before.sessionId! });
+  const after = database.planning.latest("topic")!;
+  expect(after.id).toBe(before.id);
+  expect(after.sourceHash).toBe(before.sourceHash);
+  expect(after.step.facts).toEqual([fact!]);
+  expect(after.round).toBeGreaterThan(before.round);
+  expect(model.calls).toHaveLength(4);
+});
+
+it.each([false, true])("restarts synthesis after its only cited source fails, bounding repeated unsupported claims (repeat=%s)", async repeat => {
+  const { repo, database, git } = setup();
+  const source = database.evidence.register("topic", { url: "https://team.atlassian.net/browse/APP-4", label: "Contract", mode: "connector", intervalSeconds: 300 });
+  const check = database.evidence.begin(source.id, true)!;
+  database.evidence.ingest(source.id, { checkId: check.checkId, revision: "same", units: [{ id: "body", kind: "issue", content: "Contract" }] });
+  let sourceRef = "";
+  const model = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ requests: [{ kind: "evidence", selector: `${source.id}::body`, question: "Read", offset: 0 }] }));
+    if (n === 2) {
+      const fragment = JSON.parse(turn.prompt.split("Fragments: ").at(-1)!)[0];
+      const failed = database.evidence.begin(source.id, true)!;
+      database.evidence.failed(source.id, failed.checkId, "offline");
+      sourceRef = fragment.id;
+      return answer(step({ facts: [{ statement: "Invalid", refs: [sourceRef] }], questions: [], complete: true }));
+    }
+    return answer(step({ facts: repeat ? [{ statement: "Invalid again", refs: [sourceRef] }] : [], questions: [], complete: true }));
+  });
+  const run = guardedPlanning(model.adapter, database, git).createSession({ cwd: repo, prompt: "Plan supported scope" });
+  if (repeat) await expect(run).rejects.toThrow("Two planning rounds produced no new evidence");
+  else await run;
+  expect(model.calls).toHaveLength(3);
+});
+
+it.each([false, true])("revalidates queued search provenance on resume (legacy=%s)", async legacy => {
+  const { repo, database, git } = setup("codex");
+  const sources = ["A", "B"].map(key => {
+    const source = database.evidence.register("topic", { url: `https://team.atlassian.net/browse/APP-${key === "A" ? 10 : 11}`, label: key, mode: "connector", intervalSeconds: 300 });
+    const check = database.evidence.begin(source.id, true)!;
+    database.evidence.ingest(source.id, { checkId: check.checkId, revision: "same", units: [{ id: "body", kind: "issue", content: key === "A" ? "UniqueSearchOriginal" : "Still available" }] });
+    return source;
+  });
+  const model = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ requests: [{ kind: "search", selector: "evidence::UniqueSearchOriginal", question: "Find", offset: 0 }] }));
+    if (n === 2) throw new Error("Transport interrupted");
+    const fragments: PlanningFragment[] = JSON.parse(turn.prompt.split("Fragments: ").at(-1)!);
+    expect(fragments.some(fragment => fragment.content.includes("UniqueSearchOriginal"))).toBe(false);
+    return answer(step({ questions: [], complete: true }));
+  }, "codex");
+  const adapter = guardedPlanning(model.adapter, database, git);
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Transport interrupted");
+  const saved = database.planning.latest("topic")!;
+  if (legacy) { delete saved.evidenceFragments; database.planning.save(saved); }
+  const check = database.evidence.begin(sources[0].id, true)!;
+  database.evidence.failed(sources[0].id, check.checkId, "offline");
+  await adapter.resumeTurn({ cwd: repo, prompt: "Plan", sessionId: saved.sessionId! });
+  expect(model.calls).toHaveLength(3);
+});
+
+it("retains shared image evidence when one matching source fails", async () => {
+  const { root, repo, database, git } = setup();
+  const imageBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lWQAAAAASUVORK5CYII=";
+  const sources = ["A", "B"].map(key => {
+    const source = database.evidence.register("topic", { url: `https://team.atlassian.net/browse/IMAGE-${key === "A" ? 10 : 11}`, label: key, mode: "connector", intervalSeconds: 300 });
+    const check = database.evidence.begin(source.id, true)!;
+    database.evidence.ingest(source.id, { checkId: check.checkId, revision: "same", units: [{ id: "render", kind: "render", content: "Image", imageBase64 }] });
+    return source;
+  });
+  const hash = database.evidence.snapshot(sources[0].id)!.units[0].imageHash!;
+  const model = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ requests: [{ kind: "image", selector: hash, question: "Inspect", offset: 0 }] }));
+    expect(turn.planningControl?.image).toBeDefined();
+    const check = database.evidence.begin(sources[0].id, true)!;
+    database.evidence.failed(sources[0].id, check.checkId, "offline");
+    return answer(step({ facts: [{ statement: "Verified image", refs: [hash] }], questions: [], complete: true }));
+  });
+  await guardedPlanning(model.adapter, database, git, undefined, join(root, "images")).createSession({ cwd: repo, prompt: "Plan" });
+  expect(model.calls).toHaveLength(2);
+  expect(database.planning.latest("topic")!.step.facts).toEqual([{ statement: "Verified image", refs: [hash] }]);
+});
+
+it.each([false, true])("retains an identical revalidated search after an unrelated source fails (resume=%s)", async resume => {
+  const { repo, database, git } = setup("codex");
+  const sources = [1, 2].map(key => {
+    const source = database.evidence.register("topic", { url: `https://team.atlassian.net/browse/SEARCH-${key}`, label: String(key), mode: "connector", intervalSeconds: 300 });
+    const check = database.evidence.begin(source.id, true)!;
+    database.evidence.ingest(source.id, { checkId: check.checkId, revision: "same", units: [{ id: "body", kind: "issue", content: key === 1 ? "RetainedMatch" : "Unrelated body" }] });
+    return source;
+  });
+  const request = { kind: "search" as const, selector: "evidence::RetainedMatch", question: "Find supported evidence", offset: 0 };
+  const failUnrelated = () => {
+    const check = database.evidence.begin(sources[1].id, true)!;
+    database.evidence.failed(sources[1].id, check.checkId, "Unrelated source unavailable");
+  };
+  let originalId = "";
+  const model = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ requests: [request] }));
+    const fragments: PlanningFragment[] = JSON.parse(turn.prompt.split("Fragments: ").at(-1)!);
+    const search = fragments.find(fragment => fragment.kind === "search")!;
+    if (n === 2) {
+      originalId = search.id;
+      if (resume) throw new Error("Transport interrupted");
+      failUnrelated();
+      return answer(step({ requests: [request] }));
+    }
+    expect(search.id).toBe(originalId);
+    expect(search.content).toContain("RetainedMatch");
+    return answer(step({ facts: [{ statement: "Matching source remains usable", refs: [search.id] }], questions: [], complete: true }));
+  }, "codex");
+  const adapter = guardedPlanning(model.adapter, database, git);
+  const first = adapter.createSession({ cwd: repo, prompt: "Plan" });
+  if (resume) {
+    await expect(first).rejects.toThrow("Transport interrupted");
+    failUnrelated();
+    await adapter.resumeTurn({ cwd: repo, prompt: "Plan", sessionId: database.planning.latest("topic")!.sessionId! });
+  } else await first;
+  expect(model.calls).toHaveLength(3);
+  expect(database.planning.latest("topic")!.step.facts).toEqual([{ statement: "Matching source remains usable", refs: [originalId] }]);
+});
+
+it("restores a rejected search after its original source recovers unchanged", async () => {
+  const { repo, database, git } = setup("codex", 100000, 10_000_000);
+  const origin = Date.now(); let elapsed = 0;
+  vi.spyOn(Date, "now").mockImplementation(() => origin + elapsed);
+  const source = database.evidence.register("topic", { url: "https://team.atlassian.net/browse/RECOVER-1", label: "Recover", mode: "connector", intervalSeconds: 300 });
+  const check = database.evidence.begin(source.id, true)!;
+  database.evidence.ingest(source.id, { checkId: check.checkId, revision: "same", units: [{ id: "body", kind: "issue", content: "RecoveredMatch" }] });
+  const hash = database.evidence.get(source.id).contentHash!;
+  const request = { kind: "search" as const, selector: "evidence::RecoveredMatch", question: "Find supported evidence", offset: 0 };
+  let originalId = "";
+  const model = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ requests: [request] }));
+    const fragments: PlanningFragment[] = JSON.parse(turn.prompt.split("Fragments: ").at(-1)!);
+    const search = fragments.find(fragment => fragment.kind === "search");
+    if (n === 2) {
+      originalId = search!.id;
+      throw new Error("Transport interrupted");
+    }
+    if (n === 3) {
+      expect(fragments.some(fragment => fragment.id === originalId)).toBe(false);
+      elapsed = database.evidence.get(source.id).nextCheckAt - origin; // Respect the retry backoff.
+      const recovery = database.evidence.begin(source.id, true)!;
+      database.evidence.unchanged(source.id, recovery.checkId, hash, "same");
+      return answer(step({ requests: [request] }));
+    }
+    expect(search?.id).toBe(originalId);
+    expect(search?.content).toContain("RecoveredMatch");
+    return answer(step({ facts: [{ statement: "Recovered evidence is usable", refs: [originalId] }], questions: [], complete: true }));
+  }, "codex");
+  const adapter = guardedPlanning(model.adapter, database, git);
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Transport interrupted");
+  elapsed = 600_001;
+  const failed = database.evidence.begin(source.id, true)!;
+  database.evidence.failed(source.id, failed.checkId, "Source inaccessible"); // Actual failure, not a refresh deadline.
+  await adapter.resumeTurn({ cwd: repo, prompt: "Plan", sessionId: database.planning.latest("topic")!.sessionId! });
+  expect(model.calls).toHaveLength(4);
+  expect(database.planning.latest("topic")!.step.facts).toEqual([{ statement: "Recovered evidence is usable", refs: [originalId] }]);
+});
+
+
+it("keeps a collected contract readable when only its refresh interval expires during planning", async () => {
+  const { repo, database, git } = setup("claude", 100000, 10_000_000);
+  const source = database.evidence.register("topic", { url: "https://team.atlassian.net/browse/APP-99", label: "Contract", mode: "connector", intervalSeconds: 900 });
+  const check = database.evidence.begin(source.id, true)!;
+  database.evidence.ingest(source.id, { checkId: check.checkId, revision: "v9", units: [{ id: "body", kind: "issue", content: "Parking contract v9" }] });
+  const checkedAt = database.evidence.get(source.id).checkedAt!;
+  const read = { kind: "evidence" as const, selector: `${source.id}::body`, question: "Read contract", offset: 0 };
+  let fact: PlanningStep["facts"][number];
+  const model = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ requests: [read] }));
+    if (n === 2) {
+      const fragment = (JSON.parse(turn.prompt.split("Fragments: ").at(-1)!) as PlanningFragment[]).find(fragment => fragment.kind === "evidence")!;
+      fact = { statement: "Parking follows v9", refs: [fragment.id] };
+      vi.spyOn(Date, "now").mockReturnValue(checkedAt + 1_900_000);
+      expect(database.evidence.fresh(database.evidence.get(source.id))).toBe(false);
+      return answer(step({ facts: [fact], requests: [read] }));
+    }
+    expect(turn.prompt).not.toContain("External evidence is unavailable");
+    expect(database.evidence.usableSources(database.getTopic("topic")).map(source => source.id)).toContain(source.id);
+    expect(database.evidence.topic(database.getTopic("topic")).deferred).toEqual([]);
+    expect(database.evidence.get(source.id).checkedAt).toBe(checkedAt);
+    return answer(step({ facts: [fact], questions: [], complete: true }));
+  });
+  const result = await guardedPlanning(model.adapter, database, git).createSession({ cwd: repo, prompt: "Plan" });
+  expect(result.result.planMarkdown).toBe("Final navigation plan");
+  expect(database.planning.latest("topic")!.step.facts).toEqual([fact!]);
+});
+
+
+it.each(["none", "artifact", "memory"])("retains independent facts only when approved premises are unchanged (changed=%s)", async changed => {
+  const { repo, database, git, root } = setup();
+  const memory = join(root, "memory");
+  mkdirSync(memory);
+  writeFileSync(join(memory, "context-router.md"), "# Router\n- [Plan](plan-notes.md)\n");
+  writeFileSync(join(memory, "plan-notes.md"), "Original planning premise");
+  const artifact = join(root, "approved-contract.md");
+  writeFileSync(artifact, "Original decision premise");
+  const sources = ["1", "2"].map(name => database.evidence.register("topic", {
+    url: `https://team.atlassian.net/browse/CHANGE-${name}`, label: name, mode: "connector", intervalSeconds: 900,
+  }));
+  const ingest = (index: number, content: string) => {
+    const check = database.evidence.begin(sources[index].id, true)!;
+    database.evidence.ingest(sources[index].id, { checkId: check.checkId, revision: content,
+      units: [{ id: "body", kind: "issue", content }] });
+  };
+  ingest(0, "Rule A v1"); ingest(1, "Rule B stable");
+  let facts: PlanningStep["facts"] = [];
+  const fake = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ requests: sources.map(source => ({ kind: "evidence", selector: `${source.id}::body`, offset: 0, question: "Read" })) }));
+    if (n === 2) {
+      const fs = JSON.parse(turn.prompt.split("Fragments: ").at(-1)!) as PlanningFragment[];
+      facts = fs.map((f, index) => ({ statement: `Independent rule ${index}`, refs: [f.id] }));
+      facts.push({ statement: "Joint conclusion", refs: fs.map(f => f.id) });
+      return answer(step({ facts, requests: [{ kind: "file", selector: "form.swift", offset: 0, question: "Local code" }] }));
+    }
+    if (n === 3) throw new Error("Interrupted after adoption");
+    const checkpoint = database.planning.latest("topic")!;
+    expect(checkpoint.step.facts).toEqual(changed !== "none" ? [] : [facts[1]]);
+    expect(checkpoint.finalized).toBe(false);
+    expect(checkpoint.delivered).not.toContain(facts[0].refs[0]);
+    expect(turn.prompt).toContain("Sources changed");
+    return answer(step({ facts: [facts[1]], questions: [], complete: true }));
+  });
+  const adapter = guardedPlanning(fake.adapter, database, git, memory);
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan", readablePaths: [artifact] })).rejects.toThrow("Interrupted after adoption");
+  const before = database.planning.latest("topic")!;
+  ingest(0, "Rule A v2");
+  if (changed === "memory") writeFileSync(join(memory, "plan-notes.md"), "Changed planning premise");
+  if (changed === "artifact") writeFileSync(artifact, "Changed decision premise");
+  await adapter.createSession({ cwd: repo, prompt: "Plan", readablePaths: [artifact] });
+  const after = database.planning.latest("topic")!;
+  expect(after.sessionId).toBe(before.sessionId);
+  expect(after.admissionId).toBe(before.admissionId);
+  expect(fake.calls).toHaveLength(4);
+});
+
+
+it("counts internal reviewer reads but not a replayed final checkpoint as new exchanges", async () => {
+  const { repo, database, git } = setup("codex");
+  const { monitorReviewProgress } = await import("../src/server/reviewProgress");
+  const fake = scripted(async (_turn, n) => answer(step(n < 5 ? {
+    requests: [{ kind: "file", selector: "form.swift", question: "Read next section", offset: (n - 1) * 4096 }],
+  } : { questions: [], complete: true })), "codex");
+  const adapter = guardedPlanning(monitorReviewProgress(fake.adapter, database), database, git);
+  const turn = { cwd: repo, prompt: "Inspect navigation", job: { role: "reviewer" as const, operation: "audit" as const } };
+  const first = await adapter.createSession(turn);
+  expect(first.result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls).toHaveLength(5);
+  const request = database.interrupts.current("topic")!;
+  expect(request.reason).toContain("계획 리뷰 왕복 5회");
+  expect(database.getTopic("topic").state).toBe("CODEX_AUDIT");
+  await adapter.resumeTurn({ ...turn, sessionId: first.sessionId });
+  expect(fake.calls).toHaveLength(5);
+  expect(database.interrupts.current("topic")!.id).toBe(request.id);
+});
+
+// Public boundary: work-group enrichment -> guarded planning -> accepted model result.
+// Stage changes must reuse acknowledged shared contracts, while a different version/session must read them.
+describe("shared planning contracts across stages", () => {
+  it("repartitions pending shared fragments when a lost session needs full task recovery", async () => {
+    const { repo, database, git } = setup();
+    const contract = "C".repeat(112459);
+    const delivered: PlanningFragment[] = [];
+    const fake = scripted(async (turn, call) => {
+      if (call === 2) throw new AgentRunError("session-missing", "claude", "Session not found",
+        { exitCode: 1, stderr: "Session not found", stdout: "" });
+      if (call >= 3) delivered.push(...JSON.parse(turn.prompt.split("Fragments: ").at(-1)!) as PlanningFragment[]);
+      return answer(step({ questions: [], complete: true }));
+    });
+    const wrapped = guardedPlanning(fake.adapter, database, git);
+    await wrapped.createSession({ cwd: repo, prompt: "Recover the complete task.",
+      planningDocuments: [{ selector: "shared:contract", content: contract }] });
+    expect(database.planning.latest("topic")!.finalized).toBe(true);
+    for (const call of fake.calls)
+      expect(Buffer.byteLength(call.prompt)).toBeLessThanOrEqual(call.planningControl!.maxPromptBytes!);
+    const content = delivered.filter(fragment => fragment.selector === "shared:contract")
+      .sort((a, b) => a.offset - b.offset).map(fragment => fragment.content).join("");
+    expect(content).toBe(contract);
+  });
+
+  it.each([1400, 4200])("batches a %i-line shared contract and reuses it across stages", async lines => {
+    const { repo, database, git } = setup();
+    const { wrapWorkGroupAdapter } = await import("../src/server/workGroupAdapter");
+    const contract = "SHARED_CONTRACT_DO_NOT_REPEAT\n".repeat(lines);
+    const budget = { mode: "observe" as const };
+    database.workGroups.create("shared", { title: "Group", goal: "Keep navigation", contracts: contract,
+      stages: [{ id: "a", kind: "work", title: "A", goal: "Plan", acceptance: "Preserve navigation", dependsOn: [], budget },
+        { id: "integration", kind: "integration", title: "Integration", goal: "Integrate", dependsOn: ["a"], budget }] }, repo, "HEAD");
+    database.workGroups.link("shared", "a", "topic", "HEAD");
+    const received: PlanningFragment[] = [];
+    const fake = scripted(async turn => {
+      received.push(...JSON.parse(turn.prompt.split("Fragments: ").at(-1)!) as PlanningFragment[]);
+      return answer(step({ questions: [], complete: true }));
+    });
+    const wrapped = wrapWorkGroupAdapter(guardedPlanning(fake.adapter, database, git), database, git);
+    const initial = await wrapped.createSession({ cwd: repo, prompt: "Initial stage instructions are available immediately." });
+    if (lines === 1400) expect(fake.calls).toHaveLength(1);
+    else expect(fake.calls.length).toBeGreaterThan(1);
+    for (const call of fake.calls)
+      expect(Buffer.byteLength(call.prompt)).toBeLessThanOrEqual(call.planningControl!.maxPromptBytes!);
+    expect(fake.calls[0].prompt).toContain("Initial stage instructions are available immediately.");
+    expect(fake.calls[0].prompt).not.toContain("The complete task is REQUIRED context");
+    const shared = received.filter(fragment => fragment.selector === "shared:work-group");
+    expect(database.planning.latest("topic")!.finalized).toBe(true);
+    const firstCalls = fake.calls.length;
+    database.updateTopic("topic", { state: "CLAUDE_REVISION" });
+    await wrapped.resumeTurn({ cwd: repo, sessionId: initial.sessionId, prompt: "Only revise the affected paragraph." });
+    expect(fake.calls).toHaveLength(firstCalls + 1);
+    const revision = fake.calls.at(-1)!.prompt;
+    expect(revision).toContain("Only revise the affected paragraph.");
+    expect(revision).not.toContain("SHARED_CONTRACT_DO_NOT_REPEAT");
+    expect(shared.map(fragment => fragment.content).join("")).toBe(database.workGroups.prompt("topic", []));
+    expect(received.filter(fragment => fragment.selector === "shared:work-group")).toHaveLength(shared.length);
+  });
+
+  it.each(["content", "session", "interrupted"] as const)("does not skip an unread shared contract after %s changes", async change => {
+    const { repo, database, git } = setup();
+    let fail = change === "interrupted";
+    const delivered: PlanningFragment[][] = [];
+    const fake = scripted(async turn => {
+      delivered.push(JSON.parse(turn.prompt.split("Fragments: ").at(-1)!) as PlanningFragment[]);
+      if (fail) throw new Error("connection interrupted before a response");
+      return answer(step({ questions: [], complete: true }));
+    });
+    const adapter = guardedPlanning(fake.adapter, database, git);
+    const documents = [{ selector: "shared:contract", content: "Confirmed common contract v1" }];
+    const first = { cwd: repo, prompt: "Initial task", planningDocuments: documents };
+    if (fail) {
+      await expect(adapter.createSession(first)).rejects.toThrow("connection interrupted");
+      expect(database.planning.latest("topic")!.finalized).toBe(false);
+      fail = false;
+      await adapter.createSession(first);
+      expect(delivered[1]).toEqual(delivered[0]);
+    } else {
+      const result = await adapter.createSession(first);
+      database.updateTopic("topic", { state: "CLAUDE_REVISION" });
+      await adapter.resumeTurn({ ...first, prompt: "Revised task", sessionId: change === "session" ? "different-session" : result.sessionId,
+        planningDocuments: change === "content" ? [{ selector: "shared:contract", content: "Confirmed common contract v2" }] : documents });
+      expect(delivered.at(-1)!.map(fragment => fragment.content)).toEqual([
+        change === "content" ? "Confirmed common contract v2" : "Confirmed common contract v1",
+      ]);
+    }
+    expect(database.planning.latest("topic")!.finalized).toBe(true);
+  });
 });

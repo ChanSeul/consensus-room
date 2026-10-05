@@ -185,6 +185,7 @@ describe("Codex 리뷰 프롬프트 — RESOLVED_BY_FIX 주장은 승계되지 �
     for (const finalPass of [false, true]) {
       const prompt = buildCodexReviewPrompt({ planMarkdown, planSHA256, implementation, finalPass, timeline: [], originalReviewFindings: finalPass ? [finding] : undefined });
       expect(prompt, String(finalPass)).toContain("RESOLVED_BY_FIX 로 주장한 쟁점은 승계되지 않습니다");
+      expect(prompt).toContain("리뷰는 미확정·근거 부족으로 제외한 항목의 조사 근거를 확인하세요");
       expect(prompt, String(finalPass)).toContain("서버가 같은 처분으로 승계합니다");
     }
   });

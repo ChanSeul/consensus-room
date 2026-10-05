@@ -812,13 +812,14 @@ export class DeliveryPipeline {
     let continuations = 0;
     let readingTurns = 0;
     let stalledContinuations = 0;
+    let previousReport: string | undefined;
     // 같은 세션의 계속 진행 턴 — 러너의 in_progress 와 필수 타임라인 완독 게이트(recheck)가 같은 경로를 쓴다. 쪽은 이 세션이 아직 받지 않은 필수
     // 구간(커서 뒤 필수 이벤트 전부 + 세션 참조 목록)에서 고르고, 반환 뒤에만 반환 세션에 인정한다(E3-2-2b).
     const continueWork = async (remainingSteps: readonly string[], send: TimelineSend, recheck: boolean): Promise<WorkState | null> => {
       const round = recheck ? ++readingTurns : ++continuations;
       const before = !recheck ? await this.core.dependencies.git.snapshot(topic.worktreePath) : null;
       const unreadBefore = this.unacknowledgedBytes(topic, workSession, send.push.required);
-      const reportBefore = progressReport(state.base);
+      const reportBefore = previousReport ?? progressReport(state.base);
       // 호출을 열기 전에 누적본을 보존한다(옛 progress 산출물은 사람·옛 소비처 호환).
       await this.core.saveAgentOutput(topic, setup.route, state.base, setup.progressKind, signal);
       await this.core.checkpoints.record(topic, {
@@ -852,7 +853,9 @@ export class DeliveryPipeline {
         const after = await this.core.dependencies.git.snapshot(topic.worktreePath);
         const unreadAfter = this.unacknowledgedBytes(topic, workSession, send.push.required);
         // Investigation may produce no file write. A changed report permits continuation, but never proves completion.
-        const reportChanged = progressReport(absorbed.base) !== reportBefore;
+        const report = progressReport(continued.result);
+        const reportChanged = report !== reportBefore;
+        previousReport = report;
         const progressed = before.head !== after.head || before.diffSHA256 !== after.diffSHA256 || unreadAfter < unreadBefore || reportChanged;
         stalledContinuations = progressed ? 0 : stalledContinuations + 1;
         this.core.event(topicId, "system", "system", progressed ? "계속 진행 턴의 파일·필수 읽기·작업 보고 중 변경이 있어 이어갑니다." : "계속 진행 턴에서 파일과 필수 읽기 진척 없이 같은 작업 보고를 반복했습니다.",

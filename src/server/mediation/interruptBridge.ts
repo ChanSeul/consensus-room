@@ -4,7 +4,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import { pathToFileURL } from "node:url";
 import { z } from "zod";
 import type { MediatorInterrupt, MediatorSession } from "../../shared/mediatorInterrupts.js";
-import { interruptMessage, sendCodexInterrupt } from "./codexInterrupt.js";
+import { interruptMessage, probeCodexSession, sendCodexInterrupt } from "./codexInterrupt.js";
 
 type Delivery = { interrupt: MediatorInterrupt; claim: string };
 export function claudeChannelNotification(item: MediatorInterrupt) {
@@ -35,8 +35,13 @@ export async function runInterruptBridge(): Promise<void> {
     return await response.json() as T;
   };
   const received = new Map<string, Delivery>();
-  const receipt = (delivery: Delivery, state: "sent" | "acknowledged" | "failed" | "unknown", error?: string) => request(
-    `topics/${delivery.interrupt.topicId}/interrupts/${delivery.interrupt.id}/receipt`, { ...session, claim: delivery.claim, state, ...(error ? { error } : {}) });
+  const wait = (ms: number) => new Promise<void>(resolve => {
+    if (abort.signal.aborted) { resolve(); return; }
+    const finish = () => { clearTimeout(timer); abort.signal.removeEventListener("abort", finish); resolve(); };
+    const timer = setTimeout(finish, ms); abort.signal.addEventListener("abort", finish, { once: true });
+  });
+  const receipt = (delivery: Delivery, state: "sent" | "acknowledged" | "failed" | "unknown", error?: string, transportUnavailable = false) => request(
+    `topics/${delivery.interrupt.topicId}/interrupts/${delivery.interrupt.id}/receipt`, { ...session, claim: delivery.claim, state, ...(error ? { error } : {}), transportUnavailable });
   let mcp: Server | null = null;
   if (provider === "claude") {
     mcp = new Server({ name: "consensus-room", version: "1.0.0" }, { capabilities: { experimental: { "claude/channel": {} }, tools: {} },
@@ -53,11 +58,23 @@ export async function runInterruptBridge(): Promise<void> {
     mcp.onclose = () => abort.abort();
     await mcp.connect(new StdioServerTransport()); await initialized;
   }
+  let subscriptionTopicId = topicId, checkedAt = 0, available = false;
+  const reportConnection = (error: string | null) => request(`topics/${encodeURIComponent(subscriptionTopicId)}/interrupts/connection`, { ...session, available: error === null, error });
   try {
     while (!abort.signal.aborted) {
       try {
+        if (Date.now() - checkedAt >= 30_000) {
+          // The server resolves the assignment's scope; never adopt a different identity/version.
+          const connection = await request<{ subscriptionTopicId: string }>(`topics/${encodeURIComponent(topicId)}/interrupts/connection?${new URLSearchParams(session)}`);
+          subscriptionTopicId = connection.subscriptionTopicId;
+          let error: string | null = null;
+          try { if (!mcp) await probeCodexSession(session.sessionId, process.env.CONSENSUS_CODEX_SOCKET); }
+          catch (failure) { error = failure instanceof Error ? failure.message : "중재 세션 연결 실패"; }
+          await reportConnection(error); available = error === null; checkedAt = Date.now();
+        }
+        if (!available) { await wait(30_000); continue; }
         const query = new URLSearchParams({ ...session, waitMs: "25000", descendants: "true" });
-        const { items } = await request<{ items: MediatorInterrupt[] }>(`topics/${encodeURIComponent(topicId)}/interrupts?${query}`);
+        const { items } = await request<{ items: MediatorInterrupt[] }>(`topics/${encodeURIComponent(subscriptionTopicId)}/interrupts?${query}`);
         for (const item of items) {
           if (abort.signal.aborted) break;
           let delivery: Delivery;
@@ -71,7 +88,11 @@ export async function runInterruptBridge(): Promise<void> {
             }
             else await sendCodexInterrupt(session.sessionId, delivery.interrupt, process.env.CONSENSUS_CODEX_SOCKET);
           } catch (error) {
-            await receipt(delivery, (error as { uncertain?: boolean }).uncertain ? "unknown" : "failed", error instanceof Error ? error.message : "전송 실패");
+            await receipt(delivery, (error as { uncertain?: boolean }).uncertain ? "unknown" : "failed", error instanceof Error ? error.message : "전송 실패", (error as { transportUnavailable?: boolean }).transportUnavailable === true);
+            if ((error as { transportUnavailable?: boolean }).transportUnavailable) {
+              available = false; checkedAt = 0;
+              await reportConnection(error instanceof Error ? error.message : "중재 세션 연결 실패"); break;
+            }
             continue;
           }
           // A lost receipt never causes another send in this process. The server expires it to unknown.
@@ -81,10 +102,7 @@ export async function runInterruptBridge(): Promise<void> {
         if (abort.signal.aborted) break;
         if ((error as { fatal?: boolean }).fatal) throw error;
         process.stderr.write("중재 인터럽트 연결을 확인하지 못했습니다. 5초 뒤 다시 연결합니다.\n");
-        await new Promise<void>(resolve => {
-          const finish = () => { clearTimeout(timer); abort.signal.removeEventListener("abort", finish); resolve(); };
-          const timer = setTimeout(finish, 5000); abort.signal.addEventListener("abort", finish, { once: true });
-        });
+        await wait(5000);
       }
     }
   } finally { await mcp?.close(); }

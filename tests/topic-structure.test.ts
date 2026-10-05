@@ -69,12 +69,13 @@ it("persists Root → Sub → Sub → leaf, blocks manager execution, and gives 
   expect((await f.app.inject({ url: `/api/topics/${root.id}/resume`, headers: { "x-consensus-token": "test" } })).json().nextActions.map((action: { action: string }) => action.action)).toEqual(["topic:create-child"]);
 });
 
-it("sources need collected originals and a current digest before Goal → Plan; changed sources invalidate that Goal", async () => {
+it("sources can establish a partial Goal with deferred originals; changed sources still invalidate that Goal", async () => {
   const f = await fixture();
   const topic = await f.create({ title: "원문 기반 구현", entry: { mode: "sources", sources: [{ url: "https://example.com/spec", label: "제품 요구사항" }] } });
   await f.attach(topic.id);
   expect((await f.post(`topics/${topic.id}/actions/plan`, {})).statusCode).toBe(409);
-  expect((await f.post(`topics/${topic.id}/goal`, { goal: "읽기 상태 표시", evidenceDigest: f.db.evidence.topic(topic).digest })).statusCode).toBeGreaterThanOrEqual(400);
+  expect((await f.post(`topics/${topic.id}/goal`, { goal: "원문 미수집 범위를 제외한 읽기 상태 표시", evidenceDigest: f.db.evidence.topic(topic).digest })).statusCode).toBe(200);
+  expect(f.db.evidence.topic(f.db.getTopic(topic.id)).deferred).toHaveLength(1);
   expect(f.calls).toHaveLength(0);
   const publish = (revision: string) => {
     const catalog = f.db.evidence.catalog.state(topic.id), root = catalog.roots[0], source = f.db.evidence.get(root.sourceId);

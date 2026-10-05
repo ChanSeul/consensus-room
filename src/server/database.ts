@@ -1,7 +1,11 @@
+import type { WorkGroup } from "../shared/workGroups.js";
+import { ContinuationStore } from "./continuationStore.js";
 import { SessionRecords } from "./sessionRecords.js";
 import { graphRecords } from "./graphRecords.js";
 import { needsMediatorAttention } from "../shared/mediatorInterrupts.js";
 import { MediatorInterruptStore } from "./mediation/interruptStore.js";
+import type { ReviewScope } from "../shared/reviews.js";
+import { reviewProgressReason } from "./reviewProgress.js";
 import { ReviewLedger } from "./reviewLedger.js";
 import { RoleRegistry } from "./roleAssignments.js";
 import { EngineDefectStore } from "./engineDefects.js";
@@ -19,6 +23,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { redactSecrets } from "../shared/workflow.js";
+import { failureResumePoint, isStopped, stopRecord } from "../shared/workflowLifecycle.js";
 import { redactRecord } from "./security.js";
 import {
   DEFAULT_AGENT_SETTINGS,
@@ -74,12 +79,15 @@ export class ConsensusDatabase {
   readonly sessions: SessionRecords;
   readonly engineDefects: EngineDefectStore;
   readonly interrupts: MediatorInterruptStore;
+  readonly continuations: ContinuationStore;
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
     this.migrate();
+    this.continuations = new ContinuationStore(this.db);
+    this.db.exec("CREATE TABLE IF NOT EXISTS review_exchanges(topic_id TEXT NOT NULL REFERENCES topics(id), scope TEXT NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(topic_id,scope));");
     this.diagnoses = new DiagnosisStore(this.db);
     this.fixContracts = new FixContractStore(this.db);
     this.evidence = new EvidenceStore(this.db);
@@ -91,7 +99,7 @@ export class ConsensusDatabase {
     this.roles = new RoleRegistry(this.db);
     this.sessions = new SessionRecords(this.db);
     this.engineDefects = new EngineDefectStore(this.db);
-    this.interrupts = new MediatorInterruptStore(this.db);
+    this.interrupts = new MediatorInterruptStore(this.db, Date.now, topicId => this.workGroupContinuation(topicId));
     this.evidence.freezeFinalized();
     this.evidence.catalog.migrateLegacy();
   }
@@ -296,6 +304,8 @@ export class ConsensusDatabase {
         PRIMARY KEY(scope, idempotency_key)
       );
       CREATE INDEX IF NOT EXISTS timeline_topic_sequence ON timeline_events(topic_id, sequence);
+      CREATE INDEX IF NOT EXISTS timeline_closed_topic_id ON timeline_events(topic_id, id DESC)
+        WHERE actor='system' AND json_extract(payload_json, '$.to')='CLOSED';
       CREATE INDEX IF NOT EXISTS artifact_topic_kind ON artifacts(topic_id, kind, revision DESC);
       CREATE UNIQUE INDEX IF NOT EXISTS one_running_action_per_topic
         ON actions(topic_id) WHERE status = 'running';
@@ -450,7 +460,19 @@ export class ConsensusDatabase {
       SELECT 1 FROM timeline_events WHERE topic_id=? AND actor='system' AND state='BRAINSTORM_READY'
         AND json_extract(payload_json, '$.brainstormCompletedActionId')=? LIMIT 1
     `).get(topicId, actionId));
+    if (state === "USER_DECISION_REQUIRED" || state === "BLOCKED_ON_EVIDENCE") return Boolean(this.db.prepare(`
+      SELECT 1 FROM timeline_events e JOIN topics t ON t.id=e.topic_id
+      WHERE e.topic_id=? AND e.scope_generation=t.scope_generation AND e.actor='system' AND e.state=?
+        AND json_extract(e.payload_json, '$.waitingCompletedActionId')=? LIMIT 1
+    `).get(topicId, state, actionId));
     return COMPLETED_TOPIC_STATES.has(state);
+  }
+
+  evidenceActionOwnsWorkflow(topicId: string, actionId: string): boolean {
+    return Boolean(this.db.prepare(`SELECT 1 FROM timeline_events e JOIN topics t ON t.id=e.topic_id
+      WHERE e.topic_id=? AND e.scope_generation=t.scope_generation
+        AND json_extract(e.payload_json, '$.evidenceRevisionPlanEpoch')=t.plan_epoch
+        AND json_extract(e.payload_json, '$.evidenceRevisionActionId')=? LIMIT 1`).get(topicId, actionId));
   }
 
   recoverInterruptedActions(): void {
@@ -461,6 +483,7 @@ export class ConsensusDatabase {
       WHERE actions.status = 'running'
     `).all() as Array<Record<string, unknown>>;
     const timestamp = now();
+    const recorded: TimelineEvent[] = [];
     this.db.exec("BEGIN IMMEDIATE");
     try {
       for (const row of interrupted) {
@@ -472,7 +495,7 @@ export class ConsensusDatabase {
             .run(passed ? "succeeded" : "cancelled", timestamp, passed ? null : "서버 재시작으로 엔진 후속 작업이 중단되었습니다.", row.id as SqlValue);
           continue;
         }
-        if (row.kind === "evidence-assessment") {
+        if (row.kind === "evidence-assessment" && !this.evidenceActionOwnsWorkflow(String(row.topic_id), String(row.id))) {
           this.db.prepare("UPDATE actions SET status = 'cancelled', finished_at = ?, error = ? WHERE id = ?")
             .run(timestamp, "서버 재시작으로 영향 검토가 중단되었습니다.", row.id as SqlValue);
           continue;
@@ -484,10 +507,12 @@ export class ConsensusDatabase {
         }
         this.db.prepare("UPDATE actions SET status = 'cancelled', finished_at = ?, error = ? WHERE id = ?")
           .run(timestamp, "서버 재시작으로 실행이 중단되었습니다.", row.id as SqlValue);
-        this.db.prepare(`
-          UPDATE topics SET resume_state = state, state = 'FAILED',
-            last_error = ?, updated_at = ? WHERE id = ?
-        `).run("서버 재시작으로 실행이 중단되었습니다.", timestamp, row.topic_id as SqlValue);
+        const topicId = String(row.topic_id);
+        const resume = failureResumePoint(String(row.state) as WorkflowState, this.getFlags(topicId).resumeState ?? null);
+        this.updateTopic(topicId, { state: "FAILED", resumeState: resume, lastError: "서버 재시작으로 실행이 중단되었습니다." });
+        recorded.push(this.insertEventInTransaction({ topicId, actor: "system", kind: "system", state: "FAILED",
+          body: "서버 재시작으로 실행이 중단되었습니다. 저장된 단계에서 재개할 수 있습니다.",
+          payload: { resumeState: resume, recoveredActionId: String(row.id) } }));
       }
       this.budgets.recoverInterruptedExecutions();
       this.db.exec("COMMIT");
@@ -495,6 +520,7 @@ export class ConsensusDatabase {
       this.db.exec("ROLLBACK");
       throw error;
     }
+    for (const event of recorded) this.emitEvent(event);
   }
 
   // planEpoch는 항상 1로 시작하고(컬럼 기본값) 이후 무효화·범위 변경만 올린다. 생성 입력에서 받지 않는다.
@@ -638,7 +664,7 @@ export class ConsensusDatabase {
     const assignments = entries.map(([key]) => `${columns[key]} = ?`);
     // 구현 세션 id 를 바꾸면 그 세션의 바인딩도 무효다 — setImplementationSession 이 새 바인딩을 곧바로 쓴다(E2b).
     if ("implementationSessionId" in changes) assignments.push("implementation_session_provider = NULL", "implementation_session_binding_json = NULL");
-    const values = entries.map(([key, value]) => key === "workEntry" ? JSON.stringify(value) : key === "fixPassUsed" ? (value ? 1 : 0) : value) as SqlValue[];
+    const values = entries.map(([key, value]) => key === "workEntry" ? JSON.stringify(value) : typeof value === "boolean" ? (value ? 1 : 0) : value) as SqlValue[];
     this.db.prepare(`UPDATE topics SET ${assignments.join(", ")}, updated_at = ? WHERE id = ?`)
       .run(...values, now(), id);
     const result = this.getTopic(id);
@@ -884,6 +910,25 @@ export class ConsensusDatabase {
     ).run(topicId);
   }
 
+  // Count returned model exchanges, not logical review admissions or usage callbacks. Persist the
+  // milestone and its interrupt together; retries/restarts never reset this topic's separate counters.
+  recordReviewExchange(expected: Topic, scope: ReviewScope): void {
+    let event: TimelineEvent | undefined;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const topic = this.getTopic(expected.id);
+      if (topic.scopeGeneration === expected.scopeGeneration && topic.planEpoch === expected.planEpoch && topic.state === expected.state) {
+        const row = this.db.prepare(`INSERT INTO review_exchanges VALUES(?,?,1)
+          ON CONFLICT(topic_id,scope) DO UPDATE SET count=count+1 RETURNING count`).get(topic.id, scope)!;
+        const count = Number(row.count);
+        if (count % 5 === 0) event = this.insertEventInTransaction({ topicId: topic.id, actor: "system", kind: "system", state: topic.state,
+          body: reviewProgressReason(scope, count), payload: { reviewProgress: { scope, count } } });
+      }
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    if (event) this.emitEvent(event);
+  }
+
   appendEvent(input: TimelineEventInput): TimelineEvent {
     let event!: TimelineEvent;
     this.db.exec("BEGIN IMMEDIATE");
@@ -906,6 +951,7 @@ export class ConsensusDatabase {
     changes: Parameters<ConsensusDatabase["updateTopic"]>[1];
     clearAcknowledgements?: boolean;
     planningMigration?: import("../shared/planningControl.js").PlanningMigration;
+    planningUsageRecovery?: { input: import("../shared/planningControl.js").PlanningUsageRecovery; requestKey: string };
     planningSessionAmendment?: { previousSHA256: string; nextSHA256: string };
     participants?: Participant[];
     events: Array<Omit<TimelineEventInput, "topicId">>;
@@ -916,7 +962,11 @@ export class ConsensusDatabase {
     // 멈췄을 때 요청은 닫혔는데 토픽이 복구 대기(USER_DECISION_REQUIRED)에 남아, 기동 복구(running 만 회수)·결과 확인·retry 어느 것으로도 빠져나오지 못했다.
     // 마감할 행이 정확히 한 건이 아니면(이미 닫힘·다른 요청) 전체를 되돌린다.
     deliveryResolution?: { action: "commit" | "push"; idempotencyKey: string; outcome: "succeeded" | "failed" };
+    // Admission must not publish an active state without its recoverable action (or vice versa).
+    startAction?: ActionRecord;
+    finishAction?: { id: string; status: "succeeded" | "failed" | "cancelled"; error?: string };
   }): Topic {
+    if (input.startAction && input.startAction.topicId !== input.topicId) throw new Error("Action admission topic mismatch");
     const recorded: TimelineEvent[] = [];
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -929,11 +979,21 @@ export class ConsensusDatabase {
         this.planning.bindSession(previous, input.planningSessionAmendment.nextSHA256, binding.sessionId, binding.inputSequence);
       }
       if (input.planningMigration) this.planning.migrateInterrupted(this.getTopic(input.topicId), input.planningMigration);
+      if (input.planningUsageRecovery) this.planning.authorizeUnknownUsage(this.getTopic(input.topicId),
+        input.planningUsageRecovery.input, input.planningUsageRecovery.requestKey);
       if (input.deliveryResolution) {
         const { action, idempotencyKey, outcome } = input.deliveryResolution;
         this.resolveUnknownDeliveryAction(input.topicId, action, idempotencyKey, outcome);
       }
+      if (input.finishAction) {
+        const action = input.finishAction;
+        const finished = this.db.prepare(`UPDATE actions SET status = ?, finished_at = ?, error = ?
+          WHERE id = ? AND topic_id = ? AND status = 'running'`)
+          .run(action.status, now(), action.error ? redactSecrets(action.error).slice(-16_000) : null, action.id, input.topicId);
+        if (Number(finished.changes) !== 1) throw new Error("Transition must finish exactly one running action of this topic");
+      }
       this.updateTopic(input.topicId, input.changes);
+      if (input.startAction) this.startAction(input.startAction);
       const at = now();
       for (const contract of input.contracts ?? []) this.fixContracts.append(input.topicId, contract, at);
       for (const entry of input.diagnosisEntries ?? []) this.diagnoses.log(input.topicId, entry.diagnosisId, entry.status, entry.detail ?? {}, at);
@@ -966,6 +1026,11 @@ export class ConsensusDatabase {
     const sequenceRow = this.db.prepare(
       "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM timeline_events WHERE topic_id = ?",
     ).get(input.topicId) as { sequence: number };
+    if (isStopped(input.state) && Object.hasOwn(input.payload ?? {}, "resumeState")) {
+      const topic = this.getTopic(input.topicId);
+      input.payload = { ...input.payload, stop: stopRecord(topic, this.getFlags(input.topicId).resumeState ?? null,
+        { sequence: sequenceRow.sequence, payload: input.payload ?? {} }) };
+    }
     const createdAt = now();
     const result = this.db.prepare(`
       INSERT INTO timeline_events(
@@ -984,18 +1049,56 @@ export class ConsensusDatabase {
     return event;
   }
 
+  // Only the latest closed stage owns the handoff. Opening a successor invalidates it,
+  // while blocked/unstarted stages and an undelivered integration remain actionable.
+  workGroupContinuation(topicId: string): { key: string; reason: string } | null {
+    const group = this.workGroups.forTopic(topicId);
+    if (!group) return null;
+    const handoff = this.workGroupHandoff(group);
+    return handoff?.topicId === topicId ? handoff : null;
+  }
+
+  private workGroupHandoff(group: WorkGroup): { topicId: string; key: string; reason: string } | null {
+    const linked = Object.values(group.links).map(link => this.getTopic(link.topicId));
+    if (!linked.length || linked.some(topic => topic.state !== "CLOSED")) return null;
+    const closedAt = (id: string) => Object.values(group.results ?? {}).find(result => result.topicId === id)?.closedAt
+      ?? linked.find(topic => topic.id === id)!.updatedAt;
+    linked.sort((a, b) => closedAt(b.id).localeCompare(closedAt(a.id)) || b.id.localeCompare(a.id));
+    // Millisecond timestamps can tie when independent stages close concurrently. The
+    // committed transition order, not UUID order, owns the live handoff.
+    const lastClose = this.db.prepare(`SELECT topic_id FROM timeline_events
+      WHERE topic_id IN (${linked.map(() => "?").join(",")}) AND actor='system'
+      AND json_extract(payload_json, '$.to')='CLOSED' ORDER BY id DESC LIMIT 1`).get(...linked.map(topic => topic.id));
+    const topicId = String(lastClose?.topic_id ?? linked[0].id);
+    const integration = group.stages.find(stage => stage.kind === "integration");
+    const result = integration && group.results?.[integration.id];
+    if (result && linked.some(topic => this.getFlags(topic.id).pushedOID === result.commitOID)) return null;
+    const legacyIntegration = integration && group.links[integration.id];
+    if (!result && legacyIntegration && group.stages.every(stage => group.links[stage.id])) {
+      const topic = this.getTopic(legacyIntegration.topicId), flags = this.getFlags(topic.id);
+      if (topic.approvedPlanSHA256 && flags.reviewedTreeOID && flags.committedOID && flags.pushedOID === flags.committedOID) return null;
+    }
+    return { topicId, key: JSON.stringify([group.id, linked.map(topic => topic.id).sort()]),
+      reason: `작업 묶음 ${group.id}의 단계가 닫혔습니다. 개별 단계 종료에서 중재를 끝내지 마세요. resume의 workGroupContinuation과 /api/work-groups를 읽고 기존 승인 범위에서 다음 단계를 열고 계획을 이어가세요. 막힌 질문은 최신 근거·기존 결정으로 확인하고 공식 개정 API로 처리하세요. 모든 단계가 끝났으면 통합 결과와 전달 상태를 확인하세요. 새 제품 결정·계획 승인·검증·push 권한은 생략하지 마세요.` };
+  }
+
   private emitEvent(event: TimelineEvent): void {
     try {
       this.events.emit(`topic:${event.topicId}`, event);
-      if (event.actor === "system" && needsMediatorAttention(event.state) || event.payload.interruptRetry) this.events.emit("mediation-change");
+      if (event.actor === "system" && needsMediatorAttention(event.state) || event.payload.interruptRetry || event.payload.reviewProgress || event.state === "CLOSED" && this.workGroupContinuation(event.topicId)) this.events.emit("mediation-change");
     } catch {
       // 구독자 오류는 이미 확정된 원장 기록을 실패나 롤백처럼 보이게 만들지 않는다.
     }
   }
 
   restoreMediatorInterrupts(): void {
-    for (const topic of this.listTopics()) {
-      if (!needsMediatorAttention(topic.state)) continue;
+    const topics = this.listTopics().filter(topic => needsMediatorAttention(topic.state));
+    // Resolve each group once, not once per historical CLOSED stage.
+    for (const group of this.workGroups.list()) {
+      const handoff = this.workGroupHandoff(group);
+      if (handoff) topics.push(this.getTopic(handoff.topicId));
+    }
+    for (const topic of topics) {
       const row = this.db.prepare(`SELECT * FROM timeline_events WHERE topic_id=? AND scope_generation=?
         AND state=? AND actor='system' ORDER BY sequence DESC LIMIT 1`).get(topic.id, topic.scopeGeneration, topic.state);
       if (row) this.interrupts.observe(topic, this.mapEvent(row), this.getFlags(topic.id).resumeState);
@@ -1111,6 +1214,7 @@ export class ConsensusDatabase {
       record.finishedAt, record.error, record.pid, record.pgid, record.processExecutable,
       record.processCommand, record.processStartedAt,
     );
+    this.interrupts.actionStarted(this.getTopic(record.topicId), record);
   }
 
   recordActionProcess(id: string, process: {
@@ -1140,6 +1244,7 @@ export class ConsensusDatabase {
     expectedScopeGeneration: number;
   }): { actionFinished: boolean; topicFailed: boolean } {
     const timestamp = now();
+    let event: TimelineEvent | undefined;
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const actionResult = this.db.prepare(`
@@ -1159,19 +1264,24 @@ export class ConsensusDatabase {
       }
       const topicResult = this.db.prepare(`
         UPDATE topics SET
-          resume_state = CASE WHEN state = 'FAILED' THEN NULL ELSE state END,
+          resume_state = ?,
           state = 'FAILED', last_error = ?, updated_at = ?
         WHERE id = ? AND scope_generation = ?
-      `).run(input.error, timestamp, input.topicId, input.expectedScopeGeneration);
+      `).run(failureResumePoint(stateRow.state as WorkflowState, this.getFlags(input.topicId).resumeState ?? null),
+        input.error, timestamp, input.topicId, input.expectedScopeGeneration);
       if (Number(topicResult.changes) !== 1) {
         throw new Error("action과 같은 범위 세대의 주제를 실패 상태로 바꿀 수 없습니다.");
       }
+      event = this.insertEventInTransaction({ topicId: input.topicId, actor: "system", kind: "system", state: "FAILED",
+        body: input.actionStatus === "cancelled" ? "실행을 중단했습니다." : `실행에 실패했습니다: ${input.error}`,
+        payload: { resumeState: this.getFlags(input.topicId).resumeState, failedActionId: input.actionId } });
       this.db.exec("COMMIT");
-      return { actionFinished: true, topicFailed: true };
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
     }
+    this.emitEvent(event);
+    return { actionFinished: true, topicFailed: true };
   }
 
   runningAction(topicId: string): ActionRecord | null {

@@ -210,7 +210,7 @@ export function WorkGroupsPanel({
                     <li key={question.id}>
                       {question.stageId ? title(question.stageId) : "묶음 전체"}{" "}
                       · {question.text}
-                      {question.blocksStart ? " · 착수 차단" : ""}
+                      {question.deferredReason ? ` · 후속 확인(To-do): ${question.deferredReason}` : question.blocksStart ? " · 착수 차단" : ""}
                     </li>
                   ))}
                 </ul>

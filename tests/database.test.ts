@@ -258,6 +258,43 @@ describe("이벤트 원장과 재시작 복구", () => {
     reopened.close();
   });
 
+  it.each(["CLAUDE_REVISION", "CODEX_CLOSEOUT", "CONSENSUS_ACK", "AWAITING_USER_APPROVAL"] as const)(
+    "근거 검토가 인계받은 %s 단계는 비정상 종료 뒤에도 정확히 복구한다", state => {
+      const { database, path } = openDatabase();
+      database.createTopic({ ...topic(), state });
+      database.startAction(runningAction("assessment", "evidence-assessment"));
+      database.appendEvent({ topicId: "topic-1", actor: "system", kind: "system", state: "AWAITING_USER_APPROVAL",
+        body: "Stored assessment handed off to plan revision", payload: {
+          evidenceRevisionId: "job", evidenceRevisionActionId: "assessment", evidenceRevisionPlanEpoch: 1,
+        } });
+      database.close();
+      const reopened = new ConsensusDatabase(path);
+      reopened.recoverInterruptedActions();
+      const completed = state === "AWAITING_USER_APPROVAL";
+      expect(reopened.getAction("assessment")?.status).toBe(completed ? "succeeded" : "cancelled");
+      expect(reopened.getTopic("topic-1").state).toBe(completed ? state : "FAILED");
+      expect(reopened.getFlags("topic-1").resumeState).toBe(completed ? null : state);
+      reopened.close();
+    },
+  );
+
+  it.each(["another-action", "previous-epoch"])("다른 인계 기록(%s)으로 현재 관찰의 복구 책임을 바꾸지 않는다", variant => {
+    const { database, path } = openDatabase();
+    database.createTopic({ ...topic(), state: "CODEX_AUDIT" });
+    database.startAction(runningAction("assessment", "evidence-assessment"));
+    database.appendEvent({ topicId: "topic-1", actor: "system", kind: "system", state: "AWAITING_USER_APPROVAL",
+      body: "Unrelated handoff", payload: { evidenceRevisionId: "job",
+        evidenceRevisionActionId: variant === "another-action" ? "old-assessment" : "assessment",
+        evidenceRevisionPlanEpoch: variant === "previous-epoch" ? 0 : 1 } });
+    database.close();
+    const reopened = new ConsensusDatabase(path);
+    reopened.recoverInterruptedActions();
+    expect(reopened.getAction("assessment")?.status).toBe("cancelled");
+    expect(reopened.getTopic("topic-1").state).toBe("CODEX_AUDIT");
+    expect(reopened.getFlags("topic-1").resumeState).toBeNull();
+    reopened.close();
+  });
+
   it("action 종료 뒤 주제 갱신이 실패하면 두 변경을 함께 되돌린다", () => {
     const { database } = openDatabase();
     database.createTopic(topic());
@@ -282,6 +319,33 @@ describe("이벤트 원장과 재시작 복구", () => {
 
     expect(database.getAction("action-1")).toMatchObject({ status: "running", finishedAt: null });
     expect(database.getTopic("topic-1")).toMatchObject({ state: "DRAFT", lastError: null });
+    database.close();
+  });
+
+  it("pause completion, resume state and event commit together or remain recoverable", () => {
+    const { database, path } = openDatabase();
+    database.createTopic({ ...topic(), state: "CLAUDE_PLAN" });
+    database.startAction(runningAction());
+    const transition = { topicId: "topic-1", changes: { state: "USER_DECISION_REQUIRED" as const, resumeState: "CLAUDE_PLAN" as const },
+      finishAction: { id: "action-1", status: "cancelled" as const, error: "usage incomplete" },
+      events: [{ actor: "system" as const, kind: "system" as const, state: "USER_DECISION_REQUIRED" as const,
+        body: "Paused", payload: { resumeState: "CLAUDE_PLAN", planningPause: true } }] };
+    const fault = new DatabaseSync(path);
+    fault.exec("CREATE TRIGGER reject_pause BEFORE INSERT ON timeline_events BEGIN SELECT RAISE(ABORT, 'pause event unavailable'); END");
+    expect(() => database.applyTopicTransition(transition)).toThrow("pause event unavailable");
+    expect(database.getTopic("topic-1").state).toBe("CLAUDE_PLAN");
+    expect(database.getAction("action-1")?.status).toBe("running");
+    expect(database.getTimeline("topic-1")).toHaveLength(0);
+    fault.exec("DROP TRIGGER reject_pause");
+    fault.close();
+    expect(() => database.applyTopicTransition({ ...transition, finishAction: { ...transition.finishAction, id: "other" } })).toThrow("running action");
+    expect(database.getTopic("topic-1").state).toBe("CLAUDE_PLAN");
+    database.applyTopicTransition(transition);
+    expect(database.getAction("action-1")?.status).toBe("cancelled");
+    expect(database.getFlags("topic-1").resumeState).toBe("CLAUDE_PLAN");
+    expect(database.getTimeline("topic-1")[0].payload).toMatchObject({ planningPause: true, resumeState: "CLAUDE_PLAN" });
+    expect(() => database.applyTopicTransition(transition)).toThrow("running action");
+    expect(database.getTimeline("topic-1")).toHaveLength(1);
     database.close();
   });
 
@@ -557,6 +621,55 @@ describe("이벤트 원장과 재시작 복구", () => {
     });
     expect(database.getFlags("topic-1").resumeState).toBe("CLAUDE_PLAN");
     database.close();
+  });
+
+  it.each(["FAILED", "USER_DECISION_REQUIRED", "BLOCKED_ON_EVIDENCE"] as const)("a recovery failure from %s retains the original resumable stage", state => {
+    const { database } = openDatabase();
+    database.createTopic(topic());
+    database.updateTopic("topic-1", { state, resumeState: "CLAUDE_PLAN" });
+    database.startAction(runningAction());
+    database.finishActionAndFailTopic({ actionId: "action-1", topicId: "topic-1", actionStatus: "failed",
+      error: "recovery setup failed", expectedScopeGeneration: 1 });
+    expect(database.getAction("action-1")?.status).toBe("failed");
+    expect(database.getTopic("topic-1").state).toBe("FAILED");
+    expect(database.getFlags("topic-1").resumeState).toBe("CLAUDE_PLAN");
+    expect(database.getTimeline("topic-1").at(-1)?.payload.stop).toMatchObject({ version: 1, resumeAt: "CLAUDE_PLAN", reason: "failure" });
+    database.close();
+  });
+
+  it.each(["FAILED", "USER_DECISION_REQUIRED", "BLOCKED_ON_EVIDENCE"] as const)("startup recovery from %s retains the original resume stage of an admitted retry", state => {
+    const { database, path } = openDatabase();
+    database.createTopic(topic());
+    database.updateTopic("topic-1", { state, resumeState: "CODEX_AUDIT" });
+    database.startAction(runningAction("retry", "retry"));
+    database.close();
+    const reopened = new ConsensusDatabase(path);
+    reopened.recoverInterruptedActions();
+    expect(reopened.getAction("retry")?.status).toBe("cancelled");
+    expect(reopened.getTopic("topic-1").state).toBe("FAILED");
+    expect(reopened.getFlags("topic-1").resumeState).toBe("CODEX_AUDIT");
+    expect(reopened.getTimeline("topic-1").at(-1)?.payload).toMatchObject({ recoveredActionId: "retry", stop: { resumeAt: "CODEX_AUDIT" } });
+    reopened.close();
+  });
+
+  it.each(["USER_DECISION_REQUIRED", "BLOCKED_ON_EVIDENCE"] as const)("startup only preserves %s when this action reached the pause", state => {
+    const { database, path } = openDatabase();
+    database.createTopic(topic());
+    database.updateTopic("topic-1", { state, resumeState: "CODEX_AUDIT" });
+    database.startAction(runningAction("finished", "retry"));
+    database.appendEvent({ topicId: "topic-1", actor: "system", kind: "system", state, body: "paused",
+      payload: { resumeState: "CODEX_AUDIT", waitingCompletedActionId: "finished" } });
+    database.close();
+    const reopened = new ConsensusDatabase(path);
+    reopened.recoverInterruptedActions();
+    expect(reopened.getAction("finished")?.status).toBe("succeeded");
+    expect(reopened.getTopic("topic-1").state).toBe(state);
+    reopened.startAction(runningAction("new-retry", "retry"));
+    reopened.recoverInterruptedActions();
+    expect(reopened.getAction("new-retry")?.status).toBe("cancelled");
+    expect(reopened.getTopic("topic-1").state).toBe("FAILED");
+    expect(reopened.getFlags("topic-1").resumeState).toBe("CODEX_AUDIT");
+    reopened.close();
   });
 
   it("재시작 복구는 사용자 판단을 기다리는 주제의 남은 action만 성공으로 닫는다", () => {

@@ -165,7 +165,8 @@ describe("실행 허용 거부의 재개와 예약 복원", () => {
     const codex = { role: "codex" as const, validateExistingSession: async () => true, resumeTurn: runCodex, createSession: async (turn: Parameters<typeof runCodex>[0]) => ({ sessionId: "x", result: await runCodex(turn) }) };
     const { WorkflowEngine } = await import("../src/server/workflow");
     const { ArtifactStore } = await import("../src/server/artifacts");
-    const engine = new WorkflowEngine({ database, artifacts: new ArtifactStore(join(root, "topics"), database), git: {} as never, claude, codex, enforceBudgets: true, maintenanceLockPath: lock });
+    const engine = new WorkflowEngine({ database, artifacts: new ArtifactStore(join(root, "topics"), database),
+      git: new GitService({ run: async () => { throw new Error("Unexpected Git command"); } }), claude, codex, enforceBudgets: true, maintenanceLockPath: lock });
     const settled = async () => { while (database.runningAction("t")) await new Promise((resolve) => setTimeout(resolve, 10)); };
     engine.startPlan("t"); await settled();
     expect(database.getTopic("t").state).toBe("USER_DECISION_REQUIRED");
@@ -213,7 +214,8 @@ describe("실행 허용 거부의 재개와 예약 복원", () => {
     const { WorkflowEngine } = await import("../src/server/workflow");
     const settled = async () => { while (database.runningAction("t")) await new Promise((resolve) => setTimeout(resolve, 10)); };
     const detail = "/usr/bin/sandbox-exec rc 71: sandbox-exec: sandbox_apply: Operation not permitted";
-    const sandboxed = new WorkflowEngine({ database, artifacts: new ArtifactStore(join(root, "topics"), database), git: {} as never, claude, codex, enforceBudgets: true, maintenanceLockPath: lock,
+    const git = new GitService({ run: async () => { throw new Error("Unexpected Git command"); } });
+    const sandboxed = new WorkflowEngine({ database, artifacts: new ArtifactStore(join(root, "topics"), database), git, claude, codex, enforceBudgets: true, maintenanceLockPath: lock,
       hostSandbox: { kind: "unavailable", detail } });
     sandboxed.startPlan("t"); await settled();
     expect(database.getTopic("t").state).toBe("USER_DECISION_REQUIRED");
@@ -222,7 +224,7 @@ describe("실행 허용 거부의 재개와 예약 복원", () => {
     expect(claudeCalls + codexCalls).toBe(0);                                          // 어떤 공급자도 부르지 않았다
     expect(database.revisions.account("t")).toMatchObject({ used: 0, firstPlanUsed: false });   // 무료 최초 계획 예약도 돌아왔다
     const resumeState = database.getFlags("t").resumeState;
-    const restarted = new WorkflowEngine({ database, artifacts: new ArtifactStore(join(root, "topics"), database), git: {} as never, claude, codex, enforceBudgets: true, maintenanceLockPath: lock,
+    const restarted = new WorkflowEngine({ database, artifacts: new ArtifactStore(join(root, "topics"), database), git, claude, codex, enforceBudgets: true, maintenanceLockPath: lock,
       hostSandbox: { kind: "available" } });
     restarted.retry("t"); await settled();
     expect(resumeState).toBe("CLAUDE_PLAN");
@@ -516,4 +518,28 @@ describe("E3-4c host-review 39d21df9 F004 — 프로토콜 턴이 만든 세션�
     expect(hasBody(stdin(runner, 2))).toBe(true);
     database.close();
   });
+});
+
+it.each(["claude", "codex"] as const)("%s CLI output schema and parser carry nullable evidenceGap classification", async provider => {
+  const root = mkdtempSync(join(tmpdir(), "evidence-gap-schema-")); temporaryDirectories.push(root);
+  const findings = ["unavailable", "insufficient", null].map((evidenceGap, index) => ({ id: `G${index}`, title: "Source gap", severity: "INFO",
+    disposition: "EXTERNAL_EVIDENCE", rationale: "Original unavailable", evidenceRefs: ["https://team.atlassian.net/browse/APP-1"], requiresUserDecision: false, evidenceGap }));
+  const result = { kind: "REVIEW", summary: "Review", findings, evidenceRefs: [], status: "blocked" };
+  let observed = false;
+  const runner: CommandRunner = { run: async spec => {
+    const flag = provider === "claude" ? "--json-schema" : "--output-schema";
+    const value = spec.args[spec.args.indexOf(flag) + 1];
+    const schema = JSON.parse(provider === "claude" ? value : readFileSync(value, "utf8"));
+    const contract = schema.properties.findings.items;
+    expect(contract.required).toContain("evidenceGap");
+    expect(contract.properties.evidenceGap.anyOf).toEqual([{ enum: ["unavailable", "insufficient"] }, { type: "null" }]);
+    observed = true;
+    return successfulResult(provider === "claude" ? [{ type: "result", subtype: "success", num_turns: 1, structured_output: result }]
+      : [{ type: "thread.started", thread_id: "review-session" }, result]);
+  } };
+  const adapter = provider === "claude" ? new ClaudeAdapter(runner)
+    : new CodexAdapter(runner, join(root, "schema.json"), join(root, "home"), undefined, {});
+  const parsed = await adapter.createSession({ cwd: root, prompt: "Review" });
+  expect(observed).toBe(true);
+  expect(parsed.result.findings.map(finding => finding.evidenceGap)).toEqual(["unavailable", "insufficient", undefined]);
 });

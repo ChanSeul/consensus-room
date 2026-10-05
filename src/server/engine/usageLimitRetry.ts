@@ -1,6 +1,7 @@
 import { parseUsageLimit } from "../../shared/usageLimit.js";
 import type { AutoRetryState } from "../types.js";
 import type { EngineCore } from "./core.js";
+import { reportBackgroundFailure } from "../backgroundTask.js";
 
 // 사용 한도(429)로 FAILED 가 된 주제를 리셋 시각에 스스로 retry 한다(2026-09-08 Codex 제안 ①). 사람이 리셋 시각까지
 // 깨어 있다가 retry 를 누르던 대기가 그대로 작업 시간이었다(S6 08:50 리셋·S9 새벽 429 실측).
@@ -172,7 +173,10 @@ export class UsageLimitRetryScheduler {
   private arm(topicId: string, at: number, attempt: number): void {
     const pending = this.pending.get(topicId);
     if (pending) this.clock.clearTimeout(pending.handle);
-    const handle = this.clock.setTimeout(() => this.fire(topicId, attempt), Math.max(0, at - this.clock.now()));
+    const handle = this.clock.setTimeout(() => {
+      try { this.fire(topicId, attempt); }
+      catch (error) { reportBackgroundFailure(`usage-retry:${topicId}`, error); }
+    }, Math.max(0, at - this.clock.now()));
     this.pending.set(topicId, { handle, at, attempt });
   }
 

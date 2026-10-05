@@ -1,39 +1,46 @@
 #!/usr/bin/env python3
-"""Render the editable Korean portfolio. Requires ReportLab and Korean TTF fonts.
+"""Render the visual Korean portfolio from its Markdown diagram blocks.
 
-Example: python3 scripts/build-portfolio.py --font-regular /path/Regular.ttf
-         --font-bold /path/Bold.ttf
-Each top-level Markdown heading starts a page; overflow is a build error.
+python3 scripts/build-portfolio.py --font-regular Regular.ttf --font-bold Bold.ttf
+All diagrams, labels and platform icons remain vectors in the PDF.
 """
-
 import argparse
 import html
+import json
+import math
 import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from reportlab.graphics import renderPDF
+from reportlab.graphics.shapes import Drawing, Group
+from reportlab.graphics.svgpath import SvgPath
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_LEFT
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
-from reportlab.platypus import Image, Paragraph, Table, TableStyle
-
+from reportlab.lib.utils import ImageReader
+from reportlab.platypus import Paragraph
 
 ROOT = Path(__file__).resolve().parents[1]
-INK = colors.HexColor('#182b43')
-TEAL = colors.HexColor('#14746f')
-MUTED = colors.HexColor('#60738a')
-LINE = colors.HexColor('#d7e2e9')
-PALE = colors.HexColor('#edf4f7')
+INK = '#183343'
+MUTED = '#576F7D'
+LINE = '#D7E3E8'
+COLORS = {'teal': ('#087F80', '#E8F5F3'), 'blue': ('#306DC0', '#EDF3FC'),
+          'coral': ('#BF674A', '#FCF0E9'), 'purple': ('#7964A7', '#F2EEF8'),
+          'gray': ('#647985', '#F0F4F6'), 'red': ('#AF4D5D', '#FCEEF0')}
+W, H = A4
+MARGIN = 42
+CW = W - 2 * MARGIN
+DIAGRAM_TOP = 187
+DIAGRAM_H = 430
 
 
-def text_markup(text):
-    text = html.escape(text)
-    return re.sub(r'https://[^\s]+', lambda m: '<link href="' + m[0] + '" color="#14746f">' + m[0] + '</link>', text)
+def color(s):
+    return colors.HexColor(s)
 
 
 def main():
@@ -46,95 +53,128 @@ def main():
     pdfmetrics.registerFont(TTFont('Portfolio', str(args.font_regular)))
     pdfmetrics.registerFont(TTFont('PortfolioBold', str(args.font_bold)))
     pdfmetrics.registerFontFamily('Portfolio', normal='Portfolio', bold='PortfolioBold')
-    styles = {
-        'title': ParagraphStyle('title', fontName='PortfolioBold', fontSize=21, leading=29, textColor=INK, wordWrap='CJK'),
-        'heading': ParagraphStyle('heading', fontName='PortfolioBold', fontSize=12, leading=18, textColor=TEAL, wordWrap='CJK'),
-        'body': ParagraphStyle('body', fontName='Portfolio', fontSize=11.3, leading=19.5, textColor=INK, wordWrap='CJK'),
-        'cell': ParagraphStyle('cell', fontName='Portfolio', fontSize=10.2, leading=16.4, textColor=INK, wordWrap='CJK'),
-        'cell_head': ParagraphStyle('cell_head', fontName='PortfolioBold', fontSize=10.2, leading=16.4, textColor=INK, wordWrap='CJK'),
-        'caption': ParagraphStyle('caption', fontName='Portfolio', fontSize=8.4, leading=13, textColor=MUTED, wordWrap='CJK', alignment=TA_LEFT),
-    }
-    pages = re.split(r'^# ', args.source.read_text(encoding='utf-8'), flags=re.M)[1:]
-    width, height = A4
-    margin = 44
-    content_width = width - margin * 2
+    icons = json.loads((args.source.parent / 'images/portfolio-icons.json').read_text())
+    pages = re.split(r'^# ', args.source.read_text(), flags=re.M)[1:]
+    specs = []
+    for section in pages:
+        title = section.split('\n', 1)[0]
+        if re.search(r'(다[.!]?|나요\?|까요\?)$', title):
+            raise ValueError('Use a concise noun title: ' + title)
+        match = re.search(r'```diagram\n(.*?)\n```', section, re.S)
+        if not match:
+            raise ValueError('Missing diagram: ' + title)
+        spec = json.loads(match[1])
+        specs.append((title, spec))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_suffix('.pending.pdf')
-    # Match the edition date in the source while keeping repeated renders identical.
-    os.environ['SOURCE_DATE_EPOCH'] = str(int(datetime(2026, 9, 27, tzinfo=timezone.utc).timestamp()))
-    doc = canvas.Canvas(str(temporary), pagesize=A4, pageCompression=1, invariant=1)
-    doc.setCreator('Consensus Room portfolio renderer')
-    doc.setTitle('AI 개발 작업의 계획·구현·검토를 이어 가는 도구')
-    doc.setAuthor('조찬슬')
-    doc.setSubject('Consensus Room 설계, 엔진 개편, 실제 파일럿과 검증 범위 — 2026-09-27')
-    doc.setKeywords('Consensus Room, 점진적 계획, 원문 조회, 역할 배정, 세션 연속성, 검증')
-    bottoms = []
-    for index, page in enumerate(pages, 1):
-        title, body = page.split('\n', 1)
-        doc.setFillColor(MUTED)
-        doc.setFont('PortfolioBold', 8)
-        doc.drawString(margin, height - 31, 'CONSENSUS ROOM  /  ENGINEERING CASE STUDY')
-        doc.setStrokeColor(LINE)
-        doc.line(margin, height - 40, width - margin, height - 40)
-        y = height - 61
+    os.environ['SOURCE_DATE_EPOCH'] = str(int(datetime(2026, 10, 5, tzinfo=timezone.utc).timestamp()))
+    c = canvas.Canvas(str(temporary), pagesize=A4, pageCompression=1, invariant=1)
+    c.setTitle('Consensus Room | AI 개발 작업 관리')
+    c.setAuthor('조찬슬')
+    c.setCreator('Consensus Room vector portfolio renderer')
+    c.setSubject('계층별 책임·승인된 연속 실행·자료 수집과 복구 | 2026-10-05')
+    c.setKeywords('Consensus Room, Claude, Codex, 워크플로, 계층 계약, 복구, 시각화')
+    counts = []
 
-        def draw(flowable, gap=13):
-            nonlocal y
-            w, h = flowable.wrap(content_width, height)
-            if y - h < 57:
-                raise ValueError(f'Page {index} overflows by {57 - (y - h):.1f}pt: {title}')
-            flowable.drawOn(doc, margin, y - h)
-            y -= h + gap
+    def rect(x, y, w, h, fill, stroke=LINE, radius=12, dashed=False):
+        c.setFillColor(color(fill)); c.setStrokeColor(color(stroke)); c.setLineWidth(.8)
+        c.setDash(3, 3) if dashed else c.setDash()
+        c.roundRect(x, H-y-h, w, h, radius, fill=1, stroke=1)
+        c.setDash()
 
-        draw(Paragraph(text_markup(title), styles['title']), 20)
-        for block in re.split(r'\n\s*\n', body.strip()):
-            if block.startswith('## '):
-                draw(Paragraph(text_markup(block[3:]), styles['heading']), 9)
-            elif block.startswith('|'):
-                rows = [[cell.strip() for cell in line.strip().strip('|').split('|')] for line in block.splitlines()]
-                rows = [row for row in rows if not all(re.fullmatch(r'[-: ]+', cell) for cell in row)]
-                column_count = len(rows[0])
-                if not all(len(row) == column_count for row in rows):
-                    raise ValueError(f'Page {index}: inconsistent table columns')
-                fractions = [0.33, 0.67] if column_count == 2 else [0.24, 0.38, 0.38]
-                if column_count not in (2, 3):
-                    raise ValueError('Only two- and three-column tables are supported')
-                data = [[Paragraph(text_markup(cell), styles['cell_head' if r == 0 else 'cell']) for cell in row] for r, row in enumerate(rows)]
-                table = Table(data, colWidths=[content_width * f for f in fractions], hAlign='LEFT')
-                table.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (-1, 0), PALE),
-                    ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-                    ('LEFTPADDING', (0, 0), (-1, -1), 10),
-                    ('RIGHTPADDING', (0, 0), (-1, -1), 10),
-                    ('TOPPADDING', (0, 0), (-1, -1), 8),
-                    ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-                    ('LINEBELOW', (0, 0), (-1, -1), 0.45, LINE),
-                ]))
-                draw(table, 18)
-            elif block.startswith('!['):
-                match = re.fullmatch(r'!\[(.*?)\]\((.*?)\)', block)
-                if not match:
-                    raise ValueError(f'Page {index}: invalid image markup')
-                picture = Image(str(args.source.parent / match[2]))
-                scale = min(content_width / picture.imageWidth, 245 / picture.imageHeight)
-                picture.drawWidth = picture.imageWidth * scale
-                picture.drawHeight = picture.imageHeight * scale
-                draw(picture, 6)
-                draw(Paragraph(text_markup(match[1]), styles['caption']), 17)
-            else:
-                draw(Paragraph(text_markup(block.replace('\n', ' ')), styles['body']))
-        bottoms.append(round(y, 1))
-        doc.setStrokeColor(LINE)
-        doc.line(margin, 42, width - margin, 42)
-        doc.setFillColor(MUTED)
-        doc.setFont('Portfolio', 8)
-        doc.drawString(margin, 27, 'CONSENSUS ROOM  |  조찬슬  |  2026.09.27')
-        doc.drawRightString(width - margin, 27, f'{index} / {len(pages)}')
-        doc.showPage()
-    doc.save()
-    temporary.replace(args.output)
-    print(f'{args.output}: {len(pages)} pages; content bottom positions: {bottoms}')
+    def text(value, x, y, w, size=11, bold=False, ink=INK, align=0, max_h=100):
+        style = ParagraphStyle('text', fontName='PortfolioBold' if bold else 'Portfolio',
+                               fontSize=size, leading=size*1.45, textColor=color(ink),
+                               wordWrap='CJK', alignment=align)
+        p = Paragraph(html.escape(value).replace('\n', '<br/>'), style)
+        _, height = p.wrap(w, max_h)
+        if height > max_h + .2:
+            raise ValueError(f'Text overflow on page {index}: {value[:60]} ({height:.1f}>{max_h})')
+        if y + height > H-10:
+            raise ValueError(f'Footer overlap on page {index}: {value[:50]}')
+        p.drawOn(c, x, H-y-height)
+        return height
 
+    def icon(name, x, y, size=25):
+        record = icons[name]
+        drawing = Drawing(size, size)
+        # SVG coordinates point down; PDF coordinates point up.
+        vx, vy, vw, vh = record.get('viewbox', [0, 0, 24, 24])
+        scale = size/max(vw, vh)
+        g = Group(); g.transform = (scale, 0, 0, -scale, (size-vw*scale)/2-vx*scale, (size+vh*scale)/2+vy*scale)
+        for j, path in enumerate(record['paths']):
+            fill = record.get('fills', [record['color']] * len(record['paths']))[j]
+            g.add(SvgPath(path, fillColor=color(fill), strokeColor=None))
+        drawing.add(g); renderPDF.draw(drawing, c, x, H-y-size)
 
-if __name__ == '__main__':
-    main()
+    def draw_element(e):
+        kind = e['kind']
+        x, y = MARGIN + e.get('x', 0), DIAGRAM_TOP + e.get('y', 0)
+        accent, pale = COLORS[e.get('color', 'teal')]
+        if kind in ('node', 'metric'):
+            w, h = e['w'], e['h']
+            rect(x, y, w, h, pale, pale)
+            tx = x+14
+            if e.get('icon'):
+                icon(e['icon'], tx, y+14, 23); tx += 32
+            label_h = text(e['label'], tx, y+14, x+w-12-tx, e.get('size', 12), True, accent, max_h=h-24)
+            if e.get('body'):
+                start = max(45 if e.get('icon') else 35, 14+label_h+8)
+                text(e['body'], x+14, y+start, w-28, e.get('body_size', 10), ink=INK, max_h=h-start-10)
+        elif kind == 'group':
+            rect(x, y, e['w'], e['h'], '#FFFFFF', LINE, dashed=True)
+            text(e['label'], x+12, y+9, e['w']-24, 9, True, MUTED, max_h=30)
+        elif kind == 'text':
+            text(e['label'], x, y, e.get('w', 150), e.get('size', 10), e.get('bold', False), e.get('ink', MUTED), e.get('align', 0), e.get('h', 80))
+        elif kind == 'arrow':
+            points = [(MARGIN+px, H-DIAGRAM_TOP-py) for px, py in e['points']]
+            c.setStrokeColor(color(accent)); c.setFillColor(color(accent)); c.setLineWidth(e.get('width', 1.5))
+            c.setDash(4, 3) if e.get('dashed') else c.setDash()
+            p = c.beginPath(); p.moveTo(*points[0])
+            for px,py in points[1:]: p.lineTo(px,py)
+            c.drawPath(p); c.setDash()
+            end, prev = points[-1], points[-2]
+            a = math.atan2(end[1]-prev[1], end[0]-prev[0]); length=6
+            p=c.beginPath(); p.moveTo(*end)
+            p.lineTo(end[0]-length*math.cos(a-.45),end[1]-length*math.sin(a-.45))
+            p.lineTo(end[0]-length*math.cos(a+.45),end[1]-length*math.sin(a+.45));p.close()
+            c.drawPath(p,fill=1,stroke=0)
+        elif kind == 'diamond':
+            w,h=e['w'],e['h'];c.setStrokeColor(color(accent));c.setFillColor(color(pale));c.setLineWidth(1)
+            p=c.beginPath();p.moveTo(x+w/2,H-y);p.lineTo(x+w,H-y-h/2);p.lineTo(x+w/2,H-y-h);p.lineTo(x,H-y-h/2);p.close();c.drawPath(p,fill=1,stroke=1)
+            text(e['label'],x+w*.17,y+h*.3,w*.66,11,True,accent,1,max_h=h*.5)
+        elif kind == 'image':
+            source = (args.source.parent / e['path']).resolve()
+            im=ImageReader(str(source));iw,ih=im.getSize();s=min(e['w']/iw,e['h']/ih)
+            c.drawImage(im,x+(e['w']-iw*s)/2,H-y-ih*s,width=iw*s,height=ih*s,mask='auto')
+        elif kind == 'bar':
+            w,h=e['w'],e['h'];cur=x
+            for part in e['parts']:
+                partw=w*part['fraction'];c.setFillColor(color(COLORS[part['color']][0]));c.rect(cur,H-y-h,partw,h,stroke=0,fill=1);cur+=partw
+        elif kind == 'icon':
+            icon(e['name'],x,y,e.get('size',25))
+        else: raise ValueError('Unknown diagram element: '+kind)
+
+    for index, (title, spec) in enumerate(specs, 1):
+        c.setFillColor(color('#FFFFFF'));c.rect(0,0,W,H,fill=1,stroke=0)
+        c.setFillColor(color('#087F80'));c.rect(0,H-8,W,8,fill=1,stroke=0)
+        text('CONSENSUS ROOM  /  '+spec['section'],MARGIN,29,CW-60,8,True,MUTED,max_h=20)
+        text(f'{index:02d}',W-MARGIN-30,26,30,14,True,'#087F80',2,max_h=22)
+        text(title,MARGIN,65,CW,24,True,max_h=72)
+        text(spec['lead'],MARGIN,130,CW,11.2,ink=MUTED,max_h=48)
+        for element in spec['elements']:
+            draw_element(element)
+        c.setStrokeColor(color(LINE));c.setLineWidth(.8);c.line(MARGIN,H-639,W-MARGIN,H-639)
+        notes=spec['notes'];gap=20; nw=(CW-gap*(len(notes)-1))/len(notes)
+        for j,note in enumerate(notes):
+            xx=MARGIN+j*(nw+gap)
+            text(note['title'],xx,658,nw,11,True,'#087F80',max_h=34)
+            text(note['body'],xx,686,nw,10.1,max_h=76)
+        text(spec.get('source',''),MARGIN,776,CW,6.8,ink=MUTED,max_h=22)
+        text('조찬슬  ·  2026.10.05',MARGIN,815,CW-60,7,ink=MUTED,max_h=12)
+        text(f'{index} / {len(specs)}',W-MARGIN-60,815,60,7,ink=MUTED,align=2,max_h=12)
+        counts.append(len(spec['elements']));c.showPage()
+    c.save();temporary.replace(args.output)
+    print(json.dumps({'pages':len(specs),'elements':sum(counts),'output':str(args.output)},ensure_ascii=False))
+
+if __name__ == '__main__': main()

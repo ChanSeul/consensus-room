@@ -1,3 +1,4 @@
+import { MediationStatus } from "./components/MediationStatus";
 import { PipelineEditor } from "./PipelineEditor";
 import { SessionGraph, GraphInspector } from "./SessionGraph";
 import type { GraphNode } from "../shared/sessionGraph";
@@ -414,6 +415,10 @@ export function App() {
         await refreshTopics();
         if (targetTopicId && selectedTopicRef.current === targetTopicId) {
           await refreshDetail(targetTopicId);
+          if (["plan", "retry", "stop"].includes(name)) {
+            const next = await api.getActivity(targetTopicId).catch(() => null);
+            if (next && selectedTopicRef.current === targetTopicId) setActivity(next);
+          }
           if ((name === "commit" || name === "push" || name === "reconcile-delivery") && selectedTopicRef.current === targetTopicId) {
             await refreshStageDelivery(targetTopicId);
           }
@@ -502,16 +507,15 @@ export function App() {
               <div className="room-header">
                 <div className="room-title-row"><h2>{selected.title}</h2><StatusBadge state={selected.state} /></div>
               </div>
-              {activity?.mediationInterrupt && <div className="mediator-interrupt" role="status">
-                <strong>중재자 호출 · {{ unconfigured: "수신 세션 미연결", waiting: "전송 대기", sending: "전송 중", sent: "세션에 전달됨", acknowledged: "중재자 수신 확인", failed: "전송 실패", unknown: "전송 결과 확인 필요" }[activity.mediationInterrupt.state]}</strong>
-                <span>{activity.mediationInterrupt.error ?? activity.mediationInterrupt.reason}</span>
-              </div>}
+              <MediationStatus activity={activity} />
               <div className="center-navigation">
                 <div className="center-tabs" role="tablist" aria-label="작업 보기">
                   <button id="graph-tab" role="tab" aria-controls="graph-panel" aria-selected={centerTab === "graph"} onClick={() => setCenterTab("graph")}>Graph</button>
                   <button id="conversation-tab" role="tab" aria-controls="conversation-panel" aria-selected={centerTab === "conversation"} onClick={() => setCenterTab("conversation")}>대화창</button>
                 </div>
                 <ExecutionControls topic={selected} busyAction={busyAction} autoRetryAt={activity?.autoRetryAt ?? null}
+                  evidenceResumePending={activity?.evidenceResumePending ?? false}
+                  continuation={activity?.continuation ?? null}
                   budgetPaused={Boolean(activity?.budget?.pause || activity?.budgetRecoveryRequired || activity?.revisionPaused || activity?.reviewPaused)}
                   onAction={(action, body) => void run(action, () => api.runAction(selected.id, action, body))} />
               </div>
@@ -611,6 +615,8 @@ function ExecutionControls({
   topic,
   busyAction,
   autoRetryAt,
+  evidenceResumePending,
+  continuation,
   budgetPaused,
   onAction,
 }: {
@@ -618,6 +624,8 @@ function ExecutionControls({
   busyAction: string | null;
   // FAILED 상태에 예약된 사용 한도 자동 재시도 시각 — 있으면 '예약 취소'(stop) 를 제공한다.
   autoRetryAt: string | null;
+  evidenceResumePending: boolean;
+  continuation: { pending: boolean; step: string; error: string | null } | null;
   budgetPaused: boolean;
   onAction: (action: string, body?: Record<string, unknown>) => void;
 }) {
@@ -625,17 +633,19 @@ function ExecutionControls({
   const codex = participantFor(topic, "codex");
   const canStart = !isTopicGroup(topic) && Boolean(workEntry(topic).goal) && topic.state === "DRAFT" && Boolean(claude && codex);
   const pendingRetry = topic.state === "FAILED" && Boolean(autoRetryAt);
-  const canStop = ACTIVE_STATES.has(topic.state) || pendingRetry;
+  const canStop = ACTIVE_STATES.has(topic.state) || pendingRetry || evidenceResumePending || continuation?.pending;
   const deliveryRecovery = topic.state === "USER_DECISION_REQUIRED" && topic.lastError?.includes("커밋 또는 push 도중");
   const canRetry = ["FAILED", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED"].includes(topic.state) && !deliveryRecovery && !budgetPaused;
 
   return (
     <section className="execution-controls" aria-label="작업 실행">
+      {evidenceResumePending && <p role="status">근거 수집이 끝나면 자동으로 재개합니다.</p>}
+      {continuation && <p role="status">{continuation.error ?? `자동 진행: ${{ evidence: "근거 검토", approve: "계획 승인 확인", implement: "구현과 리뷰", commit: "로컬 커밋", close: "단계 완료 확인", "next-plan": "다음 단계 계획" }[continuation.step] ?? continuation.step}`}</p>}
       <div className="room-actions">
         {topic.state === "BRAINSTORM_READY" ? (
           <BrainstormActions key={topic.id} connected={Boolean(claude && codex)} busy={Boolean(busyAction)} budgetPaused={budgetPaused} onAction={onAction} />
         ) : canStop ? (
-          <button className="danger-button" disabled={Boolean(busyAction)} onClick={() => onAction("stop")}>{pendingRetry ? "재시도 예약 취소" : "중단"}</button>
+          <button className="danger-button" disabled={Boolean(busyAction)} onClick={() => onAction("stop")}>{continuation?.pending ? "자동 진행 중지" : evidenceResumePending ? "자동 재개 취소" : pendingRetry ? "재시도 예약 취소" : "중단"}</button>
         ) : canRetry ? (
           <button className="secondary-button" disabled={Boolean(busyAction)} onClick={() => onAction("retry")}>다시 시도</button>
         ) : isTopicGroup(topic) ? <span className="entry-origin">하위 주제의 진행 상황을 관리합니다.</span> : (

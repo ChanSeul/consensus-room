@@ -514,3 +514,57 @@ it("discovers mediator-created roots and child progress while the selected root 
     expect(screen.getByRole("button",{name:/Root.*외부에서 시작한 큰 그림.*1\/1/})).toBeInTheDocument();
   } finally {view.unmount();vi.useRealTimers();}
 });
+
+it.each(["DRAFT", "BLOCKED_ON_EVIDENCE"] as const)("shows and cancels evidence resume in %s", async state => {
+  const topic = { ...makeTopic(), state };
+  vi.spyOn(api, "listTopics").mockResolvedValue([topic]);
+  vi.spyOn(api, "getTopic").mockResolvedValue(makeDetail(topic));
+  vi.mocked(api.getActivity).mockResolvedValue({ state, runningAction: false, lastChangeAt: null, lastChangedPath: null,
+    scanned: 0, truncated: false, autoRetryAt: null, checkedAt: "now", evidenceResumePending: true });
+  const stop = vi.spyOn(api, "runAction").mockImplementation(async () => {
+    vi.mocked(api.getActivity).mockResolvedValue({ state, runningAction: false, lastChangeAt: null, lastChangedPath: null,
+      scanned: 0, truncated: false, autoRetryAt: null, checkedAt: "now", evidenceResumePending: false });
+    return { accepted: true, actionId: "stop", topic };
+  });
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "자동 재개 취소" }));
+  await waitFor(() => expect(stop).toHaveBeenCalledWith(topic.id, "stop", undefined));
+  await waitFor(() => expect(screen.queryByRole("button", { name: "자동 재개 취소" })).not.toBeInTheDocument());
+});
+
+it("shows a queued continuation and permits stopping it before a model runs", async () => {
+  const topic = { ...makeTopic(), state: "AWAITING_USER_APPROVAL" as const };
+  vi.spyOn(api, "listTopics").mockResolvedValue([topic]);
+  vi.spyOn(api, "getTopic").mockResolvedValue(makeDetail(topic));
+  const activity = { state: topic.state, runningAction: false, lastChangeAt: null, lastChangedPath: null,
+    scanned: 0, truncated: false, autoRetryAt: null, checkedAt: "now" };
+  vi.mocked(api.getActivity).mockResolvedValue({ ...activity, continuation: { pending: true, step: "evidence", error: null } });
+  const stop = vi.spyOn(api, "runAction").mockImplementation(async () => {
+    vi.mocked(api.getActivity).mockResolvedValue({ ...activity, continuation: null });
+    return { accepted: true, actionId: "stop", topic };
+  });
+  render(<App />);
+  expect(await screen.findByText("자동 진행: 근거 검토")).toBeInTheDocument();
+  fireEvent.click(await screen.findByRole("button", { name: "자동 진행 중지" }));
+  await waitFor(() => expect(stop).toHaveBeenCalledWith(topic.id, "stop", undefined));
+  await waitFor(() => expect(screen.queryByRole("button", { name: "자동 진행 중지" })).not.toBeInTheDocument());
+});
+
+it("요청이 없어도 끊긴 중재 연결을 표시하고 전달 성공을 작업 재개로 표시하지 않는다", async () => {
+  const topic = makeTopic();
+  vi.spyOn(api, "listTopics").mockResolvedValue([topic]);
+  vi.spyOn(api, "getTopic").mockResolvedValue(makeDetail(topic));
+  vi.mocked(api.getActivity).mockResolvedValue({
+    state: "USER_DECISION_REQUIRED", runningAction: false, lastChangeAt: null, lastChangedPath: null,
+    scanned: 0, truncated: false, autoRetryAt: null, checkedAt: "2026-10-05T00:00:00Z",
+    mediationInterrupt: null,
+    mediationConnection: { state: "unavailable", subscriptionTopicId: topic.id, checkedAt: "2026-10-05T00:00:00Z", error: "제어 연결 없음" },
+    mediationIntervention: { id: "request", delivery: "sent", handlingAt: null, resumedAt: null, actionId: null, closed: false },
+  });
+  render(<App />);
+  expect(await screen.findByText("중재 연결 · 연결 불가")).toBeInTheDocument();
+  expect(screen.getByText("제어 연결 없음")).toBeInTheDocument();
+  expect(screen.getByText("중재자 처리 시작 미확인")).toBeInTheDocument();
+  expect(screen.getByText("작업 재개 미확인")).toBeInTheDocument();
+  expect(screen.queryByText(/새 작업 실행 시작:/)).not.toBeInTheDocument();
+});

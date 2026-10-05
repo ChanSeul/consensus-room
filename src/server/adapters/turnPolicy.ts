@@ -3,6 +3,7 @@ import { lstatSync, readdirSync, realpathSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { parseProviderOptions, turnAccess, turnFlags, type ProviderOptions, type TurnAccess, type TurnJob } from "../../shared/roles.js";
+import { turnContract } from "../../shared/turnContract.js";
 import { toolTreeDirectories } from "../toolTree.js";
 import type { AgentAdapter, OutputSchema, SessionTurn } from "../types.js";
 
@@ -47,7 +48,7 @@ export function turnPolicy(job: TurnJob, shape: TurnShape): TurnPolicy {
   return {
     access,
     tools,
-    planMode: Boolean(shape.planMode) && access !== "write",
+    planMode: Boolean(shape.planMode) && access !== "write" && turnContract(job).interactivePlan,
     web: tools === "read" && !shape.evidenceManaged && !isolated,
     fanout: !isolated && job.operation !== "brainstorm" && (tools === "write" || (tools === "read" && job.role === "reviewer")),
     figma: tools === "write" && Boolean(shape.figmaRequested),

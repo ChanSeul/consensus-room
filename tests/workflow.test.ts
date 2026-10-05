@@ -527,6 +527,8 @@ describe("처분 프롬프트와 단계 제약의 정합", () => {
   // 본문 언어 규칙(planBody)까지 말해야 한다.
   it("에이전트 산출물 프롬프트는 출력 언어 계약을 말한다", () => {
     for (const prompt of [planPrompt, revisionPrompt, closeoutPrompt, fixPrompt]) {
+      expect(prompt).toContain("미확정 판정 전 조사:");
+      expect(prompt).toContain("미조회·접근 실패·기술 매핑 불명확을 제품 정책 미정으로 분류하지 마세요");
       expect(prompt).toContain("title과 rationale은 영어로");
       expect(prompt).toContain("requestedUserDecision은 사용자가 직접 읽으므로 한국어로");
       expect(prompt).toContain("번역하지 말고 그대로 인용");
@@ -582,6 +584,344 @@ describe("시크릿 마스킹 확장", () => {
 
   it("일반 대문자 환경 변수는 건드리지 않는다", () => {
     expect(redactSecrets("CONSENSUS_ROOM_PORT=4317")).toBe("CONSENSUS_ROOM_PORT=4317");
+  });
+  it("masks URL and inline header credentials while preserving their enclosing syntax", () => {
+    expect(redactSecrets("https://example.test/?token=url-credential&next=kept"))
+      .toBe("https://example.test/?token=[REDACTED]&next=kept");
+    expect(redactSecrets("curl -H 'Authorization: Basic dXNlcjpwYXNz' https://example.test"))
+      .toBe("curl -H 'Authorization: [REDACTED]' https://example.test");
+    expect(redactSecrets("Request Cookie: session=inline-credential; theme=dark"))
+      .toBe("Request Cookie: session=[REDACTED]; theme=[REDACTED]");
+    expect(redactSecrets("Authorization: Basic c2VjcmV0==")).toBe("Authorization: [REDACTED]");
+    expect(redactSecrets('Authorization: Digest username="private-user", response="private-proof"'))
+      .toBe('Authorization: Digest username="[REDACTED]", response="[REDACTED]"');
+    expect(redactSecrets('https://example.test/?token=read&api_key=keychain.read()'))
+      .not.toContain('token=read');
+    expect(redactSecrets('{"headers":{"Authorization":"Basic dXNlcjpwYXNz"}}'))
+      .toBe('{"headers":{"Authorization":"[REDACTED]"}}');
+  });
+
+  it("preserves JSON escapes and masks quoted cookie values in raw headers and JSON strings", () => {
+    for (const header of ["Cookie", "Set-Cookie"]) {
+      const raw = `${header}: sid="private-session"; theme=dark`;
+      const redacted = redactSecrets(raw);
+      expect(redacted).not.toContain("private-session");
+      expect(redacted).toContain('sid="[REDACTED]"');
+      expect(redactSecrets(redacted)).toBe(redacted);
+      expect(JSON.parse(redactSecrets(JSON.stringify({ invariant: raw })))).toEqual({ invariant: redacted });
+    }
+    const invariant = 'Authorization: "Bearer <accessToken>" on every request';
+    const policy = JSON.stringify({ scopePaths: ["**"], rules: [{ paths: ["Sources/**"], invariants: [invariant] }] });
+    expect(redactSecrets(policy)).toBe(policy);
+    expect(JSON.parse(redactSecrets(policy))).toEqual(JSON.parse(policy));
+    for (const secret of ['sensitive', 'value\\"with-quote', 'trailing\\\\']) {
+      const header = `Cookie: sid=${JSON.stringify(secret)}`;
+      const nested = JSON.stringify({ note: header });
+      expect(JSON.parse(redactSecrets(nested)).note).toBe('Cookie: sid="[REDACTED]"');
+    }
+  });
+
+  it("preserves code, header placeholders and structured plan JSON while masking literal credentials", () => {
+    const samples = [
+      "func refresh(token: String) async throws -> Session",
+      "func refresh(authorization: String) async throws -> Session",
+      "func refresh(authorization: String? = nil) async throws -> Session",
+      "- `AuthService.login(password: String, token: String?)` signature stays unchanged.",
+      "| Header | Authorization: Bearer <accessToken> on every request | required |",
+      "On expiry, re-read with secret = keychain.read().",
+      '{"scopePaths":["**"],"rules":[{"paths":["Sources/**"],"invariants":["token:abc"]}]}',
+      "api_key: read only from the environment (never hard-coded).",
+    ];
+    for (const sample of samples) expect(redactSecrets(sample)).toBe(sample);
+    expect(redactSecrets('token=AbcSecret123 password=abc.def')).toBe('token=[REDACTED] password=[REDACTED]');
+    expect(JSON.parse(redactSecrets('{"token":"secret-abc","next":"kept"}'))).toEqual({ token: "[REDACTED]", next: "kept" });
+    expect(redactSecrets('let token = "literal-value"; next()')).toBe('let token = "[REDACTED]"; next()');
+  });
+
+  it("redacts literal dollar prefixes and every authorization pair without damaging outer JSON", () => {
+    for (const raw of ["password='$SYNTHETIC_VALUE'", 'Cookie: sid="$SYNTHETIC_VALUE"', "Cookie: sid=$SYNTHETIC_VALUE"]) {
+      const masked = redactSecrets(raw);
+      expect(masked).not.toContain("SYNTHETIC_VALUE");
+      expect(redactSecrets(masked)).toBe(masked);
+    }
+    expect(redactSecrets("password=$PASSWORD")).toBe("password=$PASSWORD");
+    const aws = "Authorization: AWS4-HMAC-SHA256 Credential=synthetic-key/20261005/region/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=synthetic-proof";
+    expect(redactSecrets(aws)).toBe("Authorization: AWS4-HMAC-SHA256 Credential=[REDACTED], SignedHeaders=[REDACTED], Signature=[REDACTED]");
+    for (const raw of ["Cookie: sid='VALUE", 'Cookie: sid="VALUE', "password='VALUE", "password='VALUE\"TAIL", 'Cookie: sid="VALUE\\']) {
+      const masked = redactSecrets(JSON.stringify({ invariant: raw, keep: "next" }));
+      expect(JSON.parse(masked).keep).toBe("next");
+      expect(masked).not.toContain("VALUE");
+      expect(masked).not.toContain("TAIL");
+    }
+    expect(redactSecrets("curl -H 'Cookie: sid=synthetic-value' https://example.invalid"))
+      .toBe("curl -H 'Cookie: sid=[REDACTED]' https://example.invalid");
+    expect(redactSecrets(String.raw`curl -H "Cookie: sid=synthetic\$tail" https://example.invalid`))
+      .toBe('curl -H "Cookie: sid=[REDACTED]" https://example.invalid');
+    for (const punctuation of ["&", ")", "|"]) {
+      expect(redactSecrets(`Cookie: sid=synthetic${punctuation}tail; csrf=second-value`))
+        .toBe("Cookie: sid=[REDACTED]; csrf=[REDACTED]");
+      expect(redactSecrets(`Authorization: Digest username=synthetic${punctuation}tail, response=synthetic-proof`))
+        .toBe("Authorization: Digest username=[REDACTED], response=[REDACTED]");
+    }
+    const fields = "password=private-value\n".repeat(8000);
+    expect(redactSecrets(fields)).toBe("password=[REDACTED]\n".repeat(8000));
+  });
+
+  it("uses shell, declaration and JSON contexts when redacting credentials", () => {
+    for (const raw of ["curl --data-raw 'password=$SYNTHETIC_VALUE' https://example.invalid",
+      "curl --data-raw 'x=1 password=$SYNTHETIC_VALUE'", "curl --data-raw 'x=1&password=$SYNTHETIC_VALUE'"]) {
+      const masked = redactSecrets(raw);
+      expect(masked).not.toContain("SYNTHETIC_VALUE");
+      expect(redactSecrets(masked)).toBe(masked);
+      expect(JSON.parse(redactSecrets(JSON.stringify({ command: raw })))).toEqual({ command: masked });
+    }
+    expect(redactSecrets("password=$PASSWORD")).toBe("password=$PASSWORD");
+    for (const type of ["AuthorizationHeader", "API.AuthorizationHeader?", "Result<Header, Error>", "[String: Header]"]) {
+      const signature = `func refresh(authorization: ${type} = makeHeader()) async throws -> Session`;
+      expect(redactSecrets(signature)).toBe(signature);
+      expect(JSON.parse(redactSecrets(JSON.stringify({ signature, keep: "next" })))).toEqual({ signature, keep: "next" });
+    }
+    expect(redactSecrets('func login(password: Password = "SYNTHETIC_VALUE")'))
+      .toBe('func login(password: Password = "[REDACTED]")');
+    expect(redactSecrets('function login(options = { password: "SYNTHETIC_VALUE" }, authorization: Header) {}'))
+      .toBe('function login(options = { password: "[REDACTED]" }, authorization: Header) {}');
+    expect(redactSecrets("Authorization: AuthorizationHeader")).toBe("Authorization: [REDACTED]");
+    const raw = JSON.stringify({ invariants: ['Fixture command: "OPENAI_API_KEY=SYNTHETIC_VALUE"'], keep: "next" });
+    const masked = redactSecrets(raw);
+    expect(JSON.parse(masked)).toEqual({ invariants: ['Fixture command: "OPENAI_API_KEY=[REDACTED]"'], keep: "next" });
+    expect(redactSecrets(masked)).toBe(masked);
+  });
+
+  it("retains multiline shell quoting and the complete environment value boundary", () => {
+    const cases = [
+      ["curl --data-raw 'x=1\npassword=$SYNTHETIC_VALUE'", "curl --data-raw 'x=1\npassword=[REDACTED]'"],
+      [String.raw`DB_PASSWORD=\SYNTHETIC_VALUE`, "DB_PASSWORD=[REDACTED]"],
+      ["DB_PASSWORD=one&SYNTHETIC_VALUE", "DB_PASSWORD=[REDACTED]"],
+      ["DB_PASSWORD=one|SYNTHETIC_VALUE", "DB_PASSWORD=[REDACTED]"],
+      ["curl 'DB_PASSWORD=one&SYNTHETIC_VALUE' next", "curl 'DB_PASSWORD=[REDACTED]' next"],
+      ["TLS_PRIVATE_KEY='HEADER\nSYNTHETIC_VALUE\nFOOTER'", "TLS_PRIVATE_KEY='[REDACTED]'"],
+      ["request failed (password: SYNTHETIC_VALUE)", "request failed (password: [REDACTED])"],
+    ];
+    for (const [raw, expected] of cases) {
+      expect(redactSecrets(raw)).toBe(expected);
+      const json = redactSecrets(JSON.stringify({ command: raw, keep: "next" }));
+      expect(JSON.parse(json)).toEqual({ command: expected, keep: "next" });
+      expect(redactSecrets(json)).toBe(json);
+    }
+  });
+
+  it("preserves constructor annotations and handles repeated truncated declarations", () => {
+    for (const signature of ["struct Session { init(password: Password) {} }", "init?(authorization: API.Header?) {}", "init<T>(authorization: API.Header<T>) {}",
+      "subscript(token: AccessToken) -> Value { get }", "init(check: Bool = 1 < 2, password: Password)",
+      "func login(check: Bool = 1 < 2, authorization: Header) {}"]) {
+      expect(redactSecrets(signature)).toBe(signature);
+      expect(JSON.parse(redactSecrets(JSON.stringify({ signature })))).toEqual({ signature });
+    }
+    const truncated = "func login(\n  password: Password\n".repeat(1000);
+    expect(redactSecrets(truncated)).toBe("func login(\n  password: [REDACTED]\n".repeat(1000));
+  });
+
+  it("separates declaration parameters from generic defaults and constructor member calls", () => {
+    const cases = [
+      'function make(config = factory<string, number>({password: "SYNTHETIC_VALUE"})) {}',
+      'function make(config = factory<Map<string, number>, Header>({password: "SYNTHETIC_VALUE"}), authorization: Header) {}',
+      'func make(config: Config = factory<String, Int>(password: "SYNTHETIC_VALUE"), authorization: Header) {}',
+      'let c = Credentials.init(password: "SYNTHETIC_VALUE")',
+      'let c = Credentials . init(password: "SYNTHETIC_VALUE")',
+      'let c = Credentials. /*comment*/ init(password: "SYNTHETIC_VALUE")',
+      'let c = Credentials.init(password: SYNTHETIC_VALUE)',
+      'const c = Credentials.constructor(password: "SYNTHETIC_VALUE")',
+    ];
+    for (const raw of cases) {
+      const expected = raw.replace("SYNTHETIC_VALUE", "[REDACTED]");
+      expect(redactSecrets(raw)).toBe(expected);
+      expect(redactSecrets(expected)).toBe(expected);
+      const json = redactSecrets(JSON.stringify({ signature: raw, keep: "next" }));
+      expect(JSON.parse(json)).toEqual({ signature: expected, keep: "next" });
+      expect(redactSecrets(json)).toBe(json);
+    }
+    for (const raw of ['let c = Credentials. /*comment*/ init(password: 4815162342)',
+      'let c = Credentials. // comment\n init(password: 4815162342)']) {
+      expect(redactSecrets(raw)).toBe(raw.replace("4815162342", "[REDACTED]"));
+      expect(JSON.parse(redactSecrets(JSON.stringify({ signature: raw })))).toEqual({ signature: redactSecrets(raw) });
+    }
+    for (const signature of ['class C { constructor(private readonly password: string = "SYNTHETIC_VALUE") {} }',
+      'func f(@Sensitive password: Password = "SYNTHETIC_VALUE") {}']) {
+      const expected = signature.replace("SYNTHETIC_VALUE", "[REDACTED]");
+      expect(redactSecrets(signature)).toBe(expected);
+      expect(JSON.parse(redactSecrets(JSON.stringify({ signature })))).toEqual({ signature: expected });
+      expect(redactSecrets(expected)).toBe(expected);
+    }
+    for (const signature of ['func f(password: @escaping () -> String) {}', 'func f(token: @Sendable () -> String) {}',
+      'function f(token: { value: string }) {}', 'func login(/* input */ password: Password) {}',
+      'func login(// input\n password: Password) {}',
+      'func login(/* (, = < */ password: /* type */ Password) {}',
+      'func f(@Wrapper(check: predicate()) password: Password) {}',
+      'function parse(token: "identifier" | "number") {}',
+      'class C { constructor(@Inject(token()) private readonly password: Password) {} }',
+      'class C { constructor(private /* input */ readonly password: Password) {} }']) {
+      expect(redactSecrets(signature)).toBe(signature);
+      expect(JSON.parse(redactSecrets(JSON.stringify({ signature })))).toEqual({ signature });
+    }
+    const truncatedComments = '/* input\n'.repeat(8000);
+    expect(redactSecrets(truncatedComments)).toBe(truncatedComments);
+    const commentCandidates = '// init(\n'.repeat(8000);
+    expect(redactSecrets(commentCandidates)).toBe(commentCandidates);
+    const commentedMember = `Credentials. ${commentCandidates}init(password: 4815162342)`;
+    expect(redactSecrets(commentedMember)).toBe(commentedMember.replace("4815162342", "[REDACTED]"));
+    expect(redactSecrets('func login(/* input */ password: Password = /* default */ "SYNTHETIC_VALUE") {}'))
+      .toBe('func login(/* input */ password: Password = /* default */ "[REDACTED]") {}');
+    expect(redactSecrets('function login(@Flag({ password: "SYNTHETIC_VALUE" }) password: Password) {}'))
+      .toBe('function login(@Flag({ password: "[REDACTED]" }) password: Password) {}');
+    for (const argument of ["'https://example.invalid'", "'/*'", '`https://example.invalid`', "'it\\'s /* text'", "'it\\'s ) = /* text'"]) {
+      const raw = `class C { constructor(@Inject(${argument}) private readonly password: string = "SYNTHETIC_VALUE") {} }`;
+      const expected = raw.replace("SYNTHETIC_VALUE", "[REDACTED]");
+      expect(redactSecrets(raw)).toBe(expected);
+      expect(JSON.parse(redactSecrets(JSON.stringify({ signature: raw })))).toEqual({ signature: expected });
+      expect(redactSecrets(expected)).toBe(expected);
+    }
+    for (const raw of [
+      'func login(password: String = /* outer /* inner */ note */ "SYNTHETIC_VALUE") {}',
+      'init(password: String = /* outer /* inner */ note */ "SYNTHETIC_VALUE") {}',
+      'function login(password: string = /* opener /* is text */ "SYNTHETIC_VALUE") {}',
+      'function parse(token: "identifier" | "number" = "SYNTHETIC_VALUE") {}',
+      '```swift\nfunc login(password: String = /* outer /* inner */ note */ "SYNTHETIC_VALUE") {}\n```',
+      'let c = Credentials. /* outer /* inner */ note */ init(password: "SYNTHETIC_VALUE")',
+      '`let c = Credentials. /* outer /* inner */ note */ init(password: "SYNTHETIC_VALUE")`',
+      '`func login(password: Password = /* default */ "SYNTHETIC_VALUE") {}`',
+      '/* marker /* */\nfunction login(password: string = "SYNTHETIC_VALUE") {}',
+      'Example (use `func login(password: String = /* default */ "SYNTHETIC_VALUE") {}`)',
+      'function login(password: string = `SYNTHETIC_VALUE`) {}',
+      String.raw`let label = "\(url ?? "https://example.invalid")"; Credentials.init(password: "SYNTHETIC_VALUE")`,
+      String.raw`let label = "\(url ?? "https://example.invalid")"; Credentials. /* gap */ init(password: "SYNTHETIC_VALUE")`,
+
+      '```typescript\nfunction first() {}\n```\n```swift\nCredentials. /* outer /* inner */ note */ init(password: "SYNTHETIC_VALUE")\n```',
+    ]) {
+      const expected = raw.replace("SYNTHETIC_VALUE", "[REDACTED]");
+      expect(redactSecrets(raw)).toBe(expected);
+      expect(JSON.parse(redactSecrets(JSON.stringify({ signature: raw })))).toEqual({ signature: expected });
+      expect(redactSecrets(expected)).toBe(expected);
+    }
+    for (const literal of ['`${`SYNTHETIC_VALUE`}`', '`${({ value: `SYNTHETIC_VALUE` }).value}`',
+      '`${/* comment with } */ `SYNTHETIC_VALUE`}`', String.raw`"\(value ?? "SYNTHETIC_VALUE")"`]) {
+      const swift = literal.startsWith('"');
+      const raw = `${swift ? 'func' : 'function'} login(password: ${swift ? 'String' : 'string'} = ${literal}) {}`;
+      const expected = raw.replace(literal, `${literal[0]}[REDACTED]${literal[0]}`);
+      expect(redactSecrets(raw)).toBe(expected);
+      expect(JSON.parse(redactSecrets(JSON.stringify({ signature: raw })))).toEqual({ signature: expected });
+      expect(redactSecrets(expected)).toBe(expected);
+    }
+    for (const literal of [
+      '${/\\}/.test(input) ? `SYNTHETIC_VALUE` : `fallback`}',
+      '${/[}`]/.test(input) ? `SYNTHETIC_VALUE` : `fallback`}',
+      '${/[/}]/.test(input) ? `SYNTHETIC_VALUE` : `fallback`}',
+      '${(() => { return /}/.test(input) ? `SYNTHETIC_VALUE` : `fallback`; })()}',
+      '${(8 / 2) ? `SYNTHETIC_VALUE` : `fallback`}',
+      '${(n++ / 2) ? `SYNTHETIC_VALUE` : `fallback`}',
+      '${(obj.return / 2) ? `SYNTHETIC_VALUE` : `fallback`}',
+      '${(obj?. /* member */ in / 2) ? `SYNTHETIC_VALUE` : `fallback`}',
+      '${(obj.if(input) / 2) ? `SYNTHETIC_VALUE` : `fallback`}',
+      '${(() => { if (input) /\\}\\)\\}/.test(input); return `SYNTHETIC_VALUE`; })()}',
+      '${(() => { while (input) /[}`]/.test(input); return `SYNTHETIC_VALUE`; })()}',
+      '${(() => { for (; input;) /[}`]/.test(input); return `SYNTHETIC_VALUE`; })()}',
+      '${(() => { if (input) {} /\\}\\)\\}/.test(input); return `SYNTHETIC_VALUE`; })()}',
+      '${(() => { if (input) {} else /[}`]/.test(input); return `SYNTHETIC_VALUE`; })()}',
+      '${(() => { do /[}`]/.test(input); while (input); return `SYNTHETIC_VALUE`; })()}',
+      '${(() => { function f() {} /\\}\\)\\}/.test(input); return `SYNTHETIC_VALUE`; })()}',
+      '${(() => { function f(x = (() => {})()) {} /\\}\\)\\}/.test(input); return `SYNTHETIC_VALUE`; })()}',
+      '${(() => { async function* f() {} /\\}\\)\\}/.test(input); return `SYNTHETIC_VALUE`; })()}',
+      '${(() => { class C extends Base {} /\\}\\)\\}/.test(input); return `SYNTHETIC_VALUE`; })()}',
+      '${(function() {} / 2) ? `SYNTHETIC_VALUE` : `fallback`}',
+      '${(async function() {} / 2) ? `SYNTHETIC_VALUE` : `fallback`}',
+      '${(class {} / 2) ? `SYNTHETIC_VALUE` : `fallback`}',
+      '${(() => { try {} catch {} /\\}\\)\\}/.test(input); return `SYNTHETIC_VALUE`; })()}',
+      '${(() => { try {} catch (e) {} /\\}\\)\\}/.test(input); return `SYNTHETIC_VALUE`; })()}',
+      '${(() => { label: {} /\\}\\)\\}/.test(input); return `SYNTHETIC_VALUE`; })()}',
+      '${(() => { switch (input) { case a ? b : c: {} /\\}\\)\\}/.test(input); } return `SYNTHETIC_VALUE`; })()}',
+      '${({ label: {} / 2 }) ? `SYNTHETIC_VALUE` : `fallback`}',
+      '${(π / 2) ? `SYNTHETIC_VALUE` : `fallback`}',
+      '${(한글 / 2) ? `SYNTHETIC_VALUE` : `fallback`}',
+      '${(𐊧 / 2) ? `SYNTHETIC_VALUE` : `fallback`}',
+      '${(\\u03c0 / 2) ? `SYNTHETIC_VALUE` : `fallback`}',
+      '${(value! / 2) ? `SYNTHETIC_VALUE` : `fallback`}',
+      '${(value != /[}`]/) ? `SYNTHETIC_VALUE` : `fallback`}',
+      '${({ f() { function g() {} /\\}\\)\\}/.test(input); return `SYNTHETIC_VALUE`; } }).f()}',
+      '${({ f() { label: {} /\\}\\)\\}/.test(input); return `SYNTHETIC_VALUE`; } }).f()}',
+      '${(() => { class C { static { function f() {} /\\}\\}\\}\\)\\}/.test(input); } } return `SYNTHETIC_VALUE`; })()}',
+      '${({ f(): string { function g() {} /\\}\\}\\)\\}/.test(input); return `SYNTHETIC_VALUE`; } }).f()}',
+      '${(value as NonNullable<number | null> / 2) ? `SYNTHETIC_VALUE` : `fallback`}',
+      '${(<number>value / 2) ? `SYNTHETIC_VALUE` : `fallback`}',
+      '${(<div title="quoted">{`SYNTHETIC_VALUE`}</div>)}',
+    ]) {
+      const raw = 'function login(password: string = `' + literal + '`) {}\nconst keep = 42;';
+      const expected = 'function login(password: string = `[REDACTED]`) {}\nconst keep = 42;';
+      expect(redactSecrets(raw)).toBe(expected);
+      expect(JSON.parse(redactSecrets(JSON.stringify({ signature: raw })))).toEqual({ signature: expected });
+      expect(redactSecrets(expected)).toBe(expected);
+    }
+    for (const [raw, expected] of [
+      ['class C extends B { f() { const password = `${super.foo ?? `SYNTHETIC_VALUE`}`; } }',
+        'class C extends B { f() { const password = `[REDACTED]`; } }'],
+      ['function* f() { const password = `${yield `SYNTHETIC_VALUE`}`; }',
+        'function* f() { const password = `[REDACTED]`; }'],
+      ['class C { #value; f() { const password = `${this.#value}`; } }',
+        'class C { #value; f() { const password = `[REDACTED]`; } }'],
+      ['const password = `${import.meta.url}`;\nconst keep = 42;',
+        'const password = `[REDACTED]`;\nconst keep = 42;'],
+      ['const password = `${(() => { const await = 2; return await; })()}`;\nconst keep = 42;',
+        'const password = `[REDACTED]`;\nconst keep = 42;'],
+      ['const password = `${await}`;\nconst keep = 42;',
+        'const password = `[REDACTED]`;\nconst keep = 42;'],
+      ['const password = `${await foo()}`;\nconst keep = 42;',
+        'const password = `[REDACTED]`;\nconst keep = 42;'],
+      ['const password = `${f(await)} ${((await) => await)(2)} ${({await})}`;\nconst keep = 42;',
+        'const password = `[REDACTED]`;\nconst keep = 42;'],
+      ['const password = `${010} SYNTHETIC_VALUE`;\nconst keep = 42;',
+        'const password = `[REDACTED]`;\nconst keep = 42;'],
+      ['const password = `${(() => { with (obj) { return value; } })()} SYNTHETIC_VALUE`;\nconst keep = 42;',
+        'const password = `[REDACTED]`;\nconst keep = 42;'],
+      ["'DB_PASSWORD=`${foo}`' 'DB_PASSWORD=`${bar}`'", "'DB_PASSWORD=`[REDACTED]`' 'DB_PASSWORD=`[REDACTED]`'"],
+    ]) {
+      expect(redactSecrets(raw)).toBe(expected);
+      expect(JSON.parse(redactSecrets(JSON.stringify({ source: raw })))).toEqual({ source: expected });
+      expect(redactSecrets(expected)).toBe(expected);
+    }
+    for (const suffix of ['\n💡 Follow-up\nKeep this requirement.', '\n"unfinished', '\n/* unfinished',
+      ' + "unfinished', ' + /* unfinished', '\nconst keep = 42;']) {
+      const raw = 'password=`${SYNTHETIC_VALUE}`' + suffix;
+      const expected = 'password=`[REDACTED]`' + suffix;
+      expect(redactSecrets(raw)).toBe(expected);
+      expect(JSON.parse(redactSecrets(JSON.stringify({ source: raw })))).toEqual({ source: expected });
+      expect(redactSecrets(expected)).toBe(expected);
+    }
+    for (const padding of [255, 256, 257, 511, 513]) {
+      const raw = 'password=`${foo /*' + ' '.repeat(padding) + '*/ ?? `SYNTHETIC_VALUE`}`\n💡 Follow-up';
+      const expected = 'password=`[REDACTED]`\n💡 Follow-up';
+      expect(redactSecrets(raw)).toBe(expected);
+      expect(JSON.parse(redactSecrets(JSON.stringify({ source: raw })))).toEqual({ source: expected });
+    }
+    for (const raw of ['password=`${(SYNTHETIC_VALUE}`', 'password=`${x}\\`SYNTHETIC_VALUE',
+      'password=`${import.foo} SYNTHETIC_VALUE`', 'password=`${await f(, )} SYNTHETIC_VALUE`']) {
+      expect(redactSecrets(raw)).toBe('password=`[REDACTED]');
+    }
+    for (const member of ['in', 'return', 'await', '`in`', ' /* member */ in']) {
+      const raw = 'func login(password: String = "\\(obj.' + member + ' / 2) SYNTHETIC_VALUE") {}\nlet keep = 42;';
+      const expected = 'func login(password: String = "[REDACTED]") {}\nlet keep = 42;';
+      expect(redactSecrets(raw)).toBe(expected);
+      expect(JSON.parse(redactSecrets(JSON.stringify({ source: raw })))).toEqual({ source: expected });
+      expect(redactSecrets(expected)).toBe(expected);
+    }
+    const unfinishedTemplates = 'DB_PASSWORD=`${'.repeat(1000) + 'SYNTHETIC_VALUE';
+    expect(redactSecrets(unfinishedTemplates)).toBe('DB_PASSWORD=`[REDACTED]');
+    const boundedInterpolations = "'" + 'DB_PASSWORD="\\(\n'.repeat(4000) + "'";
+    expect(redactSecrets(boundedInterpolations)).toBe("'DB_PASSWORD=\"[REDACTED]'");
+    const unfinishedInterpolations = 'func f(x: String = "\\(\n'.repeat(4000);
+    expect(redactSecrets(unfinishedInterpolations)).toBe(unfinishedInterpolations);
+    const incompleteInterpolation = String.raw`func login(password: String = "\(value ?? "SYNTHETIC_VALUE")`;
+    expect(redactSecrets(incompleteInterpolation)).not.toContain("SYNTHETIC_VALUE");
+    const truncatedDefault = 'function login(password: string = "SYNTHETIC_VALUE';
+    expect(redactSecrets(truncatedDefault)).not.toContain("SYNTHETIC_VALUE");
+    expect(JSON.parse(redactSecrets(JSON.stringify({ signature: truncatedDefault })))).toEqual({ signature: redactSecrets(truncatedDefault) });
   });
 });
 
@@ -718,6 +1058,20 @@ describe("settled 쟁점 승계(carryForwardFindings)", () => {
     expect(again.findings.find((x) => x.id === "TODO-1")!.rationale.split(CARRIED_RATIONALE_PREFIX).length).toBe(2);
   });
 
+  it("리뷰는 이연 범위와 근거 부족 판단을 자동 확정하지 않는다", () => {
+    const source = [f("deferred", "DEFERRED_OUT_OF_SCOPE"),
+      f("gap", "AGREED_NO_ACTION", { evidenceGap: "insufficient" }), f("stable", "REFUTED")];
+    const omitted = carryForwardFindings(source, [], { forReview: true });
+    expect(omitted.carried).toEqual(["stable"]);
+    expect(() => assertFindingCoverage(source, omitted.findings, "review")).toThrow("deferred, gap");
+    const reviewed = carryForwardFindings(source, [
+      f("deferred", "DEFERRED_OUT_OF_SCOPE", { rationale: "현재 사용자 제외 결정 확인" }),
+      f("gap", "AGREED_ACTION", { rationale: "갱신 원문으로 구현 가능 확인" }),
+    ], { forReview: true });
+    expect(() => assertFindingCoverage(source, reviewed.findings, "review")).not.toThrow();
+    expect(reviewed.findings.find(finding => finding.id === "gap")?.disposition).toBe("AGREED_ACTION");
+  });
+
   // 2026-09-13 Codex 지적 1: 원본마다 따로 승계하면 첫 리뷰의 AGREED_NO_ACTION 이 수정 결과의 최신 판단을 덮는다.
   it("원본이 여럿이면 최신 우선으로 합친 뒤 승계한다 — 옛 no-action 이 최신 AGREED_ACTION·RESOLVED_BY_FIX 를 덮지 않는다", () => {
     const firstReview = [f("F-1", "AGREED_NO_ACTION"), f("F-2", "AGREED_NO_ACTION")];
@@ -769,6 +1123,11 @@ describe("mergeCorrectionResult — 교정 재제출을 본 턴 결과 위에 �
     expect(result.findings.map((finding) => [finding.id, finding.disposition])).toEqual([["F-1", "AGREED_ACTION"], ["TODO-1", "DEFERRED_OUT_OF_SCOPE"]]);
     expect(result.requestedUserDecision).toBe("다른 결정");
     expect(result.summary).toBe(corrected.summary);
+  });
+  it("keeps unique earlier summaries without growing on an identical continuation", () => {
+    const correction = { ...original, summary: "Same report" };
+    const first = mergeCorrectionResult(original, correction).result;
+    expect(mergeCorrectionResult(first, correction).result.summary).toBe(first.summary);
   });
   it("본 턴에 요청 결정이 없었고 교정도 없으면 요청 결정 필드를 만들지 않는다", () => {
     const { result } = mergeCorrectionResult({ ...original, requestedUserDecision: undefined }, { kind: "IMPLEMENTATION", summary: "x", findings: [], evidenceRefs: [] });

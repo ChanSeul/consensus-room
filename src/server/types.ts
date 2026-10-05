@@ -97,8 +97,8 @@ export interface SessionTurn {
   figmaReadEnabled?: boolean;
   figmaFileKeys?: readonly string[];
   // Native tool transcript, captured by the host, never supplied by the model final answer.
-  onFigmaRequest?: (request: { tool: string; input: unknown }) => void;
-  onFigmaResult?: (observation: { tool: string; input: unknown; content: unknown; isError?: boolean }) => void;
+  onFigmaRequest?: (request: import("./evidence/readLifecycle.js").EvidenceReadRequest) => void;
+  onFigmaResult?: (observation: import("./evidence/readLifecycle.js").EvidenceReadObservation) => void;
   sessionId: string;
   prompt: string;
   // 엔진이 과제 프롬프트를 확정한 타임라인 순번. 래퍼의 비동기 대기 중 들어온 입력까지 반영했다고 기록하지 않는다.
@@ -107,6 +107,8 @@ export interface SessionTurn {
   // prompt 가 sessionId 세션이 이미 받은 내용 위의 변경분일 때만 둔다 — 과제를 다른 세션(교체·새 세션)에 전달하는 쪽은 prompt 대신 이
   // 전체 문맥 판을 쓴다. 변경분은 계산한 세션에서만 유효하다(host-review a7a9ce86 F-001).
   freshSessionPrompt?: string;
+  // Host-owned shared contracts, read once per content version and session by guarded planning.
+  planningDocuments?: readonly { selector: string; content: string }[];
   // 타임라인 참조 descriptor(E3-2-2a) — prompt·freshSessionPrompt 두 판이 실은 버전 고정 참조의 정본. 엔진이 계획 제어·세션 유지 턴에만 넘기고,
   // 계획 제어 래퍼는 이것으로만 읽을 문서를 싣는다(프롬프트 문자열을 해석하지 않는다). 과제 문자열을 바꾸는 쪽은 짝을 맞춰 바꿔야 한다.
   timelineDelivery?: TimelineDelivery;

@@ -139,6 +139,15 @@ export class WorkGroupService {
       .map((stage) => stage.id);
   }
 
+  // The read model uses the same admission checks as next(); Git validation still happens at dispatch.
+  continuation(group: WorkGroup): { groupId: string; stageId: string | null; reason: string | null } {
+    try {
+      return { groupId: group.id, stageId: this.admit(group, undefined, reservation(group)?.stageId).stage.id, reason: null };
+    } catch (error) {
+      return { groupId: group.id, stageId: null, reason: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
   async next(
     id: string,
     prepared?: (topicId: string, worktreePath: string) => void,
@@ -373,7 +382,7 @@ export class WorkGroupService {
       if (!stage.acceptance)
         return `${stage.id}: 완료 조건이 정해지지 않은 대략 단계입니다`;
       const questions = (group.questions ?? [])
-        .filter((question) => question.blocksStart && !question.resolution && (question.stageId === null || question.stageId === stage.id))
+        .filter((question) => question.blocksStart && !question.resolution && !question.deferredReason && (question.stageId === null || question.stageId === stage.id))
         .map((question) => question.id);
       return `${stage.id}: 착수를 막는 미정 질문 ${questions.join(", ")} 이 해소되지 않았습니다`;
     }

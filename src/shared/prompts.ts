@@ -48,18 +48,31 @@ function dispositionContract(kind: AgentResult["kind"]): string {
   // 리뷰 단계 여부는 처분 사용 가능 여부(fixAware)와 다른 축이다 — FINAL_REVIEW 는 fixAware 지만 앞 단계의 RESOLVED_BY_FIX 주장을
   // 승계받지 못하고 판정해야 한다(2026-09-13 Codex 지적 2: fixAware 로 묶어 최종 리뷰에서 문구가 빠졌다).
   const reviewStage = kind === "REVIEW" || kind === "FINAL_REVIEW";
+  const evidenceReviewStage = reviewStage || kind === "AUDIT" || kind === "CLOSEOUT";
   const usable = fixAware ? DISPOSITIONS : DISPOSITIONS.filter((value) => value !== "RESOLVED_BY_FIX");
   const forbidden = fixAware
     ? "이 단계는 실제 수정을 확인하는 단계이므로 RESOLVED_BY_FIX를 쓸 수 있습니다."
     : "이 단계에서 RESOLVED_BY_FIX를 쓰면 서버가 응답 전체를 거부합니다 — 아직 수정이 일어나지 않았기 때문입니다.";
   const agreedRule = agreedActionRule(kind);
-  return `처분(disposition)은 다음 값만 씁니다: ${usable.join(", ")}.
+  return `${evidenceInvestigationContract(evidenceReviewStage)}
+처분(disposition)은 다음 값만 씁니다: ${usable.join(", ")}.
 ${forbidden}
 앞 단계 쟁점 중 **행동이 필요한 것**(AGREED_ACTION·EXTERNAL_EVIDENCE·requiresUserDecision·처분 없음)은 하나도 빠짐없이 처분을 붙이세요.
 이미 판단이 끝난 쟁점(AGREED_NO_ACTION·REFUTED·DEFERRED_OUT_OF_SCOPE)은 되돌려 적지 않아도 됩니다 — 서버가 같은 처분으로 승계합니다. 처분을 **바꾸려는** 쟁점만 적으세요.${
-  reviewStage ? " 앞 단계가 RESOLVED_BY_FIX 로 주장한 쟁점은 승계되지 않습니다 — 수정이 실제로 확인되는지 반드시 판정해 적으세요." : ""} 이 단계에서 새로 발견한 쟁점은 처분을 비워 둬도 됩니다.
-EXTERNAL_EVIDENCE는 증거를 **아직 기다리는 중**일 때만 씁니다 — 이미 방에 기록된 증거로 해소된 쟁점에 이 값을 쓰면 서버가 증거 대기로 읽어 진행을 막습니다. 해소됐다면 AGREED_NO_ACTION(또는 실제 조치 합의면 AGREED_ACTION)으로 처분하세요${
+  evidenceReviewStage ? " 단, 리뷰에서는 DEFERRED_OUT_OF_SCOPE와 evidenceGap이 있는 쟁점도 자동 승계하지 않습니다. 현재 제공된 원문·사용자 결정에 비추어 같은 ID로 명시적으로 재판정하세요. 입력이 그대로이고 이전 리뷰가 확인했다면 그 검토 근거를 재사용하고 반복 수집하지 마세요. 갱신된 근거가 있으면 영향을 받는 항목만 확인하세요." : ""}${reviewStage ? " 앞 단계가 RESOLVED_BY_FIX 로 주장한 쟁점은 승계되지 않습니다 — 수정이 실제로 확인되는지 반드시 판정해 적으세요." : ""} 이 단계에서 새로 발견한 쟁점은 처분을 비워 둬도 됩니다.
+외부 근거 접근 실패·부족은 DEFERRED_OUT_OF_SCOPE로 기록하고 그 근거에만 의존하는 작업을 To-do로 보류하세요. 확보된 근거로 가능한 범위는 계속합니다. EXTERNAL_EVIDENCE는 현재 단계의 판단에 필요한 증거가 없는 경우에만 씁니다.
+계획·감사·개정·종결에서 계획 이후 수행할 구현·테스트·런타임 검증은 AGREED_ACTION으로 남기고 계획에 실행 주체·조건·성공 기준을 적으세요. 아직 실행하지 않은 미래 검증 결과를 계획 입력으로 요구하지 마세요. 이는 검증 면제나 실행 승인도, 범위 밖 이연도 아닙니다. 구현·리뷰에서는 미실행·실패한 필수 검증을 완료로 처리하지 말고 기존 권한 경계를 유지하세요.
+해소됐다면 AGREED_NO_ACTION(또는 실제 조치 합의면 AGREED_ACTION)으로 처분하세요${
   agreedRule ? ` — 단, 앞 단계가 AGREED_ACTION 으로 합의한 쟁점은 다음 규칙을 따릅니다.\n${agreedRule}` : "."}`;
+}
+
+function evidenceInvestigationContract(review: boolean): string {
+  return `미확정 판정 전 조사:
+- 미조회·접근 실패·기술 매핑 불명확을 제품 정책 미정으로 분류하지 마세요. 과거 To-do·계획의 제외 문구·에이전트 요약은 결정 부재의 근거가 아닙니다.
+- 현재 제공된 원문과 사용자 결정을 먼저 읽고, 부족한 항목만 직접 연결된 구현·스키마·기존 소비처와 대조하세요. 문서 충돌은 구현과 허용된 읽기 전용 응답으로 확인합니다. 임의 API 쓰기·빌드·권한 확대·읽기 허용 목록 우회는 하지 마세요. 실제 읽은 리비전·파일/원문 위치·확인 결과를 finding의 evidenceRefs와 rationale에 남기세요.
+- 확인 가능한 조사 작업이 남으면 현재 세션의 읽기/계속 진행 경로로 수행하세요. 기존 검토와 입력이 같으면 재사용하고 전수 재수집하지 마세요. 도구나 접근 권한이 없으면 시도한 경로·실패·의존 범위를 기록하고 해당 부분만 evidenceGap To-do로 남기며 나머지는 계속하세요. 조사하지 않은 것을 조사 완료로 표시하지 마세요.
+- 실제 사용자 선택은 조사 후에도 남는 상충 요구·새 범위·권한 결정에 한정합니다. requiresUserDecision 또는 requestedUserDecision을 쓸 때는 확인한 근거, 기존 결정으로 해소되지 않는 이유, 남은 선택을 적으세요. 승인된 범위의 기술 값 조회·매핑 확인은 새 제품 승인이 아닙니다.
+${review ? "- 리뷰는 미확정·근거 부족으로 제외한 항목의 조사 근거를 확인하세요. 제공된 원문에 답이 있으면 직접 대조해 기존 ID의 판단을 정정하고 필요한 작업을 분류하세요. 사용자 질문이나 제외 처분을 그대로 재승인하지 마세요. 원문 접근이 불가능하면 그 제한을 기록하되 정책 미정으로 단정하지 마세요." : ""}`;
 }
 
 // 처분 되돌림 가드(workflow.dispositionRegressions)가 적용되는 단계의 안내 — 종결 확인(judgeCloseout)·수정 수락(judgeFixAcceptance).
@@ -333,6 +346,8 @@ export const EXECUTION_POLICY_NOTE = [
   "실행 규칙: 스킬을 참고하되 모든 도구 작업은 현재 작업의 권한과 승인 범위를 따릅니다.",
   ENGINE_DEFECT_DEFER_POLICY,
   "웹은 검색과 공개 문서 읽기에만 씁니다. 하위 에이전트가 있다면 탐색·검증에만 쓰고 같은 파일은 한 작업자만 수정합니다.",
+  "외부 원문은 자료별 한 작업자가 필요한 범위만 수집하고 저장된 원문·출처·버전을 공유하세요. 검증자는 그 원문으로 주장과 대조하며, 구체적인 누락·모순·버전 변경이 있을 때만 해당 부분을 다시 수집합니다. 모든 조사 뒤에 전체 독립 재수집 단계를 붙이지 마세요.",
+  "병렬 작업은 입력과 소유 범위가 독립적일 때만 사용하세요. 완료 알림이나 제공된 대기 도구를 쓰고, 결과 로그·현재 시각을 짧은 간격으로 반복 조회하지 마세요. 외부 서비스가 호출 제한을 반환하면 같은 조회를 반복하지 말고 확보한 원문과 미확인 부분을 구분해 보존하세요.",
 ].join("\n");
 
 export function executionPolicyNote(engineDefectFix = false): string {
@@ -374,11 +389,11 @@ function planContract(): string {
   return [
     "최종 plan.md에는 아래 제목이 모두 있어야 합니다.",
     ...REQUIRED_PLAN_HEADINGS.map((heading) => `- ## ${heading}`),
-    "`## 허용 오차` 절에는 fenced 블록 ```tolerance {JSON} ``` 을 둡니다 — scopePaths(이 계획의 승인 경로 glob 목록)와 rules(각각 id `T-n`·title·paths(적용 영역 glob)·hunk(`insert-token`|`annotation-only`|`any`)·tokens·maxFiles·maxHunks·invariants). 규칙이 없으면 `\"rules\": []`. 설명은 의미가 충분히 전달되게 작성하세요. 기계 매칭에 쓰는 tokens는 각 80자 이하여야 합니다. 서버가 이 블록을 파싱해 구현 결과의 승인 범위 밖 변경을 git diff 로 기계 대조하므로, 술어는 diff 만으로 판정 가능해야 하고 상한은 숫자여야 합니다. 부류 예: 다른 단계 소유 파일의 격리 표기 한 줄(insert-token: nonisolated), 모듈 선언의 표기 변경(annotation-only: @Sendable). 동작 변경·우회 표기(`@unchecked Sendable`·`nonisolated(unsafe)`·`assumeIsolated`)는 규칙으로 허용하지 마세요.",
+    "`## 허용 오차` 절에는 fenced 블록 ```tolerance {JSON} ``` 을 둡니다 — scopePaths(이 계획의 승인 경로 glob 목록)와 rules(각각 id `T-n`·title·paths(적용 영역 glob)·hunk(`insert-token`|`annotation-only`|`any`)·tokens·maxFiles·maxHunks·invariants). 규칙이 없으면 `\"rules\": []`. 파일 변경이 없는 조사 계획은 `\"scopePaths\": [], \"rules\": []`로 명시하며 실제 diff도 비어 있어야 합니다. 설명은 의미가 충분히 전달되게 작성하세요. 기계 매칭에 쓰는 tokens는 각 80자 이하여야 합니다. 서버가 이 블록을 파싱해 구현 결과의 승인 범위 밖 변경을 git diff 로 기계 대조하므로, 술어는 diff 만으로 판정 가능해야 하고 상한은 숫자여야 합니다. 부류 예: 다른 단계 소유 파일의 격리 표기 한 줄(insert-token: nonisolated), 모듈 선언의 표기 변경(annotation-only: @Sendable). 동작 변경·우회 표기(`@unchecked Sendable`·`nonisolated(unsafe)`·`assumeIsolated`)는 규칙으로 허용하지 마세요.",
     DESIGN_PLANNING_CONTRACT,
     verificationScopeContract(),
     "확정되지 않은 분석 이벤트, API 계약, SDK 동작을 추정해서 만들지 마세요.",
-    "외부 증거가 없으면 EXTERNAL_EVIDENCE로 남기고 억지로 합의하지 마세요.",
+    "외부 증거가 없으면 해당 자료와 의존 작업을 DEFERRED_OUT_OF_SCOPE To-do로 남기고 나머지 범위를 계획하세요. 미확정 계약을 만들거나 제외한 작업을 완료로 보고하지 마세요.",
   ].join("\n");
 }
 
@@ -886,6 +901,7 @@ ${input.finalPass ? finalReviewContract() : "수정이 필요한 finding은 AGRE
 
 ${dispositionContract(input.finalPass ? "FINAL_REVIEW" : "REVIEW")}
 리뷰 완료 보고 계약:
+- 현재 단계의 목표·완료 조건과 실제 구현을 대조하고 누락 기능을 명시하세요. 계획의 제외 문구나 과거 To-do 자체는 사용자 범위 축소 승인이 아닙니다. 현재 단계 목표에 필요한 기능을 근거 없이 제외했다면 finding으로 보고하세요. 상위 목표 중 다른 단계에 배정된 기능은 현재 단계로 확대하지 말고 후속 범위를 구분하세요.
 - status 는 이번 리뷰의 완료 여부입니다. 필요한 검토를 끝냈으면 수정할 finding 이 남아 있어도 completed 로 보고하고 remainingSteps 는 비우세요. 구현자가 고칠 일은 findings 에 남깁니다.
 - remainingSteps 는 리뷰어가 아직 검토하지 못한 작업만 적습니다. 구현자의 수정, 그 뒤의 재검토, 이번 리뷰 범위 밖의 빌드·커밋·배포를 남은 리뷰로 적지 마세요.
 - 실제로 미검토 부분이 있으면 status=in_progress 와 remainingSteps 에 남겨야 합니다. 필수 증거를 확인하지 못했는데 완료로 바꾸거나, 실행하지 않은 검사를 통과했다고 쓰지 마세요.
@@ -1036,14 +1052,17 @@ ${runnerScopeContract()}
 // 기계 검사가 거부한 응답을 같은 세션에 돌려보내 표기만 고친 재제출을 받는다. 작업을 다시 시키는 것이
 // 아니다 — 세션 컨텍스트에 직전 작업이 전부 있으므로 결과 JSON만 계약에 맞춰 다시 방출하면 된다
 // (2026-09-01 S1.1: 계약 위반 하나로 1시간 구현 턴이 소각된 사건의 프로그램적 방지).
-export function buildContractCorrectionPrompt(violation: string): string {
+export function buildContractCorrectionPrompt(violation: string, allowedKinds?: readonly string[] | null): string {
+  const kindRule = allowedKinds && allowedKinds.length > 1
+    ? `kind는 ${allowedKinds.join(", ")} 안에서 실제 판단과 일치하는 값을 고르세요. 거부 사유가 판단 종류와 내용의 모순이면 kind도 교정하세요.`
+    : "kind는 직전 응답과 동일하게 유지하세요.";
   return `서버 기계 검사가 방금 응답을 거부했습니다.
 
 거부 사유: ${violation}
 
 작업을 다시 하지 마세요. 파일도 수정하지 마세요. 직전 턴에서 실제로 한 작업 내용 그대로,
 거부 사유가 가리키는 필드 값만 계약에 맞게 고쳐 전체 결과 JSON을 다시 반환하세요.
-kind는 직전 응답과 동일하게 유지하고, 사실과 다른 값으로 바꿔치기하지 마세요 —
+${kindRule} 사실과 다른 값으로 바꿔치기하지 마세요 —
 계약에 맞는 값 중 실제 상황을 정직하게 나타내는 값을 고르세요.`;
 }
 

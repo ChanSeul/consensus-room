@@ -1,11 +1,20 @@
 import { createHash } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { constants, createReadStream } from "node:fs";
 import { access, lstat, mkdir, readdir, readlink, realpath, rm } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
-import type { CommandRunner } from "./types.js";
+import type { CommandRunner, CommandSpec } from "./types.js";
 
 export class GitService {
+  private readonly cancellation = new AsyncLocalStorage<AbortSignal>();
   constructor(private readonly runner: CommandRunner) {}
+
+  // Shared service, isolated action lifetime. Parallel topics never overwrite each other's signal.
+  withSignal<T>(signal: AbortSignal, work: () => T): T { return this.cancellation.run(signal, work); }
+
+  private execute(spec: CommandSpec) {
+    return this.runner.run({ ...spec, signal: this.cancellation.getStore() });
+  }
 
   async createDetachedWorktree(repositoryPath: string, worktreePath: string, baseRef: string): Promise<void> {
     const repository = await realpath(repositoryPath);
@@ -26,7 +35,7 @@ export class GitService {
     await this.assertNoActiveRepositoryHooks(worktreePath);
     const current = (await this.run(worktreePath, ["branch", "--show-current"])).stdout.trim();
     if (current === branchName) return;
-    const exists = await this.runner.run({
+    const exists = await this.execute({
       command: "git", args: ["show-ref", "--verify", "--quiet", `refs/heads/${branchName}`], cwd: worktreePath,
     });
     if (exists.exitCode === 0) {
@@ -126,7 +135,7 @@ export class GitService {
       if (current !== baseTree) throw new Error("작업 트리가 단계 기준 커밋에서 바뀌어 합류 병합을 준비하지 않았습니다.");
       await this.withTemporaryIndex(worktreePath, async (environment) => {
         await this.run(worktreePath, ["read-tree", "HEAD"], undefined, environment);
-        const refreshed = await this.runner.run({ command: "git", args: ["update-index", "-q", "--refresh"], cwd: worktreePath, environment });
+        const refreshed = await this.execute({ command: "git", args: ["update-index", "-q", "--refresh"], cwd: worktreePath, environment });
         if (refreshed.exitCode !== 0 && refreshed.exitCode !== 1) throw new Error(`git update-index 실패: ${refreshed.stderr || refreshed.stdout}`);
         await this.run(worktreePath, ["read-tree", "-m", "-u", "HEAD", tree], undefined, environment);
       });
@@ -140,7 +149,7 @@ export class GitService {
   // 준비 트리를 읽기 전에 부른다(E4 2차 보완 F015) — 객체가 있으면 ref 를 보장하고, ref 가 지워져 객체가 GC 된 경우에는 같은 기준·대상으로 병합 트리를
   // 다시 계산해(결정적) 기록된 트리와 같을 때만 ref 로 되살린다. 다르면 준비를 재현할 수 없으므로 던진다(다른 트리를 준비 트리로 쓰지 않는다).
   async ensurePreparedTree(worktreePath: string, base: string, targets: readonly string[], tree: string): Promise<void> {
-    const present = await this.runner.run({ command: "git", args: ["cat-file", "-e", `${tree}^{tree}`], cwd: worktreePath, maxOutputBytes: 64 * 1024 });
+    const present = await this.execute({ command: "git", args: ["cat-file", "-e", `${tree}^{tree}`], cwd: worktreePath, maxOutputBytes: 64 * 1024 });
     if (present.exitCode !== 0 && (await this.mergeTree(worktreePath, base, targets)).tree !== tree) {
       throw new Error(`합류 병합 준비 트리 ${tree} 가 저장소에 없고, 같은 기준·합류 대상으로 다시 계산한 트리도 다릅니다. 병합 준비를 재현할 수 없습니다.`);
     }
@@ -158,7 +167,7 @@ export class GitService {
     let accumulated = base;
     let tree = "";
     for (const [index, target] of targets.entries()) {
-      const merged = await this.runner.run({
+      const merged = await this.execute({
         command: "git", args: ["merge-tree", "--write-tree", "--name-only", "-z", "--no-messages", accumulated, target],
         cwd: worktreePath, maxOutputBytes: 128 * 1024 * 1024,
       });
@@ -226,7 +235,7 @@ export class GitService {
   }
 
   async diffPlanFiles(cwd: string, previous: string, current: string): Promise<string> {
-    const result = await this.runner.run({
+    const result = await this.execute({
       command: "git", args: ["diff", "--no-index", "--no-ext-diff", "--no-textconv", "--no-color", "--", previous, current],
       cwd, maxOutputBytes: 64 * 1024 * 1024,
     });
@@ -286,7 +295,7 @@ export class GitService {
   // merge-base --is-ancestor 로 판정한다: 비후손이면 저장소 전체 이력을 걷거나 임의 상한으로 거부해야 하기 때문이다. 종료 코드 1 은
   // "조상 아님", 그 밖의 실패(없는 커밋 등)는 판정할 수 없으므로 던진다.
   async isAncestor(worktreePath: string, ancestor: string, descendant: string): Promise<boolean> {
-    const result = await this.runner.run({
+    const result = await this.execute({
       command: "git", args: ["merge-base", "--is-ancestor", ancestor, descendant], cwd: worktreePath, maxOutputBytes: 64 * 1024,
     });
     if (result.exitCode === 0) return true;
@@ -352,21 +361,21 @@ export class GitService {
   }
 
   private async assertGitRepository(repository: string): Promise<void> {
-    const result = await this.runner.run({
+    const result = await this.execute({
       command: "git", args: ["rev-parse", "--show-toplevel"], cwd: repository,
     });
     if (result.exitCode !== 0) throw new Error(`Git 저장소가 아닙니다: ${repository}`);
   }
 
   private async assertNoActiveRepositoryHooks(cwd: string): Promise<void> {
-    const configured = await this.runner.run({
+    const configured = await this.execute({
       command: "git", args: ["config", "--path", "--get", "core.hooksPath"], cwd,
       maxOutputBytes: 1024 * 1024,
     });
     if (configured.exitCode !== 0 && configured.exitCode !== 1) {
       throw new Error(`Git hook 경로를 확인하지 못했습니다: ${configured.stderr || configured.stdout}`);
     }
-    const common = await this.runner.run({
+    const common = await this.execute({
       command: "git", args: ["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd,
       maxOutputBytes: 1024 * 1024,
     });
@@ -398,12 +407,12 @@ export class GitService {
   }
 
   private async run(cwd: string, args: string[], maxOutputBytes?: number, environment?: NodeJS.ProcessEnv) {
-    const result = await this.runner.run({
+    const result = await this.execute({
       command: "git",
       args,
       cwd,
       maxOutputBytes: maxOutputBytes ?? 128 * 1024 * 1024,
-      ...(environment ? { environment } : {}),
+      environment: { ...(environment ?? process.env), GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" },
     });
     if (result.exitCode !== 0) throw new Error(`git ${args[0]} 실패: ${result.stderr || result.stdout}`);
     return result;

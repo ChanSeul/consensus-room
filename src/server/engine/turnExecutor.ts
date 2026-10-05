@@ -1,3 +1,4 @@
+import { EVIDENCE_CONTINUATION_POLICY } from "../../shared/externalEvidence.js";
 import { reviewCriteriaPrompt } from "../sessionSettings.js";
 import { invokeAdapter } from "../runtime/invoke.js";
 import { PlanningPaused, type InvocationUsage, type TimelineDelivery } from "../../shared/planningControl.js";
@@ -94,6 +95,7 @@ export class AdmissionRefused extends Error {
 }
 
 export class TurnExecutor {
+  private readonly deferredReviews = new WeakMap<AgentResult, string[]>();
   constructor(private readonly core: EngineCore) {}
 
   private adapter(provider: Provider): AgentAdapter {
@@ -185,9 +187,35 @@ export class TurnExecutor {
 
   // 모델 호출 — AgentResult 를 돌려주는 턴(계획·리뷰·구현·수정·교정·계속 진행·확인).
   async execute(request: TurnRequest): Promise<TurnOutcome> {
+    const continued = new Set<string>();
+    const retained = new Map<string, AgentResult["findings"][number]>();
+    let next = request;
+    while (true) {
+      const outcome = await this.executeOnce(next);
+      const gaps = this.deferredReviews.get(outcome.result) ?? [];
+      const fresh = gaps.filter(id => !continued.has(id));
+      if (!fresh.length) {
+        outcome.result.findings = [...[...retained.values()].filter(f => !outcome.result.findings.some(current => current.id === f.id)), ...outcome.result.findings];
+        return outcome;
+      }
+      fresh.forEach(id => continued.add(id));
+      for (const finding of outcome.result.findings.filter(f => f.disposition === "DEFERRED_OUT_OF_SCOPE")) retained.set(finding.id, finding);
+      const kind = "review-evidence-deferred";
+      const revision = (this.core.dependencies.database.latestArtifact(request.topic.id, kind)?.revision ?? 0) + 1;
+      await this.core.writeArtifact(request.topic, kind, revision, JSON.stringify(outcome.result), request.signal);
+      const prompt = `The external-source gaps below were recorded as To-do with their dependent scope excluded. Continue reviewing the supported scope in this same review ledger. Return your actual review result; do not claim unrun mandatory checks passed. Do not repeat an excluded source as a blocker.\n${JSON.stringify([...retained.values()])}`;
+      // Keep the ledger, settings, admission and usage accounts. A repeated gap buys no
+      // further call; each newly excluded registered source may advance this review once.
+      next = { ...request, session: { mode: "resume", sessionId: outcome.sessionId }, purpose: "계속 진행 턴", prompt,
+        freshSessionPrompt: `${request.freshSessionPrompt ?? request.prompt}\n${prompt}` };
+    }
+  }
+
+  private async executeOnce(request: TurnRequest): Promise<TurnOutcome> {
     this.assertRouteSupported(request);
     const admit = this.admission(request);
     await admit.async();
+    await this.core.recordEvidenceGaps(request.topic, request.signal);
     const adapter = this.adapter(request.route.provider);
     // 래퍼(증거 관리·계획 제어·예산)가 implementation·protocolOnly 를 읽는다 — job 유도값을 함께 싣는다.
     const flags = turnFlags(request.route.job);
@@ -207,9 +235,10 @@ export class TurnExecutor {
       request.topic.scopeGeneration, request.topic.planEpoch, request.topic.planSHA256, request.route.provider]]) : null;
     const criteriaSnapshot = criteriaKey ? database.sessions.criteria(criteriaKey, request.route.reviewCriteria) : null;
     const criteriaText = flags.protocolOnly ? "" : reviewCriteriaPrompt(criteriaSnapshot?.criteria);
+    const continuation = flags.protocolOnly ? "" : "\n" + EVIDENCE_CONTINUATION_POLICY;
     const base = {
       topicId: request.topic.id,
-      prompt: request.prompt + criteriaText, freshSessionPrompt: request.freshSessionPrompt === undefined ? undefined : request.freshSessionPrompt + criteriaText, cwd: request.topic.worktreePath, signal: request.signal,
+      prompt: request.prompt + criteriaText + continuation, freshSessionPrompt: request.freshSessionPrompt === undefined ? undefined : request.freshSessionPrompt + criteriaText + continuation, cwd: request.topic.worktreePath, signal: request.signal,
       inputSequence: request.inputSequence,
       timelineDelivery: request.timelineDelivery,
       ...(flags.evidenceAssessment ? { evidenceAssessment: true } : {}),
@@ -301,6 +330,29 @@ export class TurnExecutor {
     }
     request.onResponse?.(outcome);
     await this.accept(request, outcome.result);
+    await this.core.recordEvidenceGaps(request.topic, request.signal); // Includes failures first observed during this turn.
+    // EXTERNAL_EVIDENCE also represents missing mandatory test logs and confirmed tool defects.
+    // Only source-backed gaps may be converted; never downgrade those execution contracts.
+    const evidence = this.core.dependencies.database.evidence;
+    const sources = [...new Map([...evidence.list(request.topic.id),
+      ...evidence.catalog.forTopic(request.topic.id).filter(root => root.status === "approved").map(root => evidence.get(root.sourceId))]
+      .map(source => [source.id, source])).values()];
+    const deferred = outcome.result.findings.filter(finding => ["EXTERNAL_EVIDENCE", "DEFERRED_OUT_OF_SCOPE"].includes(finding.disposition ?? "") && finding.evidenceGap && !finding.requiresUserDecision &&
+      finding.evidenceRefs.length > 0 && finding.evidenceRefs.every(ref => sources.some(source =>
+        ref === source.url || ref === source.id || ref.startsWith(source.id + "::"))));
+    if (deferred.length && !outcome.result.requestedUserDecision) {
+      await this.core.recordDeferredFindings(request.topic, deferred.map(finding => ({ ...finding,
+        rationale: `${finding.rationale}\nSources: ${finding.evidenceRefs.join(" · ")}` })), "evidence", request.signal);
+      const findings = outcome.result.findings.map(finding => deferred.includes(finding)
+        ? { ...finding, disposition: "DEFERRED_OUT_OF_SCOPE" as const } : finding);
+      const unblocked = outcome.result.status === "blocked" && findings.every(finding => !finding.requiresUserDecision &&
+        ["DEFERRED_OUT_OF_SCOPE", "RESOLVED_BY_FIX", "AGREED_NO_ACTION", "REFUTED"].includes(finding.disposition ?? ""));
+      outcome.result = { ...outcome.result, findings, ...(unblocked ? { status: "in_progress" as const } : {}) };
+      if (unblocked && request.route.job.role === "reviewer" && ["review", "final-review"].includes(request.route.job.operation)) {
+        this.deferredReviews.set(outcome.result, sources.filter(source => deferred.some(finding => finding.evidenceRefs.some(ref =>
+          ref === source.url || ref === source.id || ref.startsWith(source.id + "::")))).map(source => source.id));
+      }
+    }
     return outcome;
   }
 

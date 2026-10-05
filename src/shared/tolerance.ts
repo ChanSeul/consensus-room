@@ -41,7 +41,7 @@ export const ToleranceRuleSchema = z.object({
 export type ToleranceRule = z.infer<typeof ToleranceRuleSchema>;
 
 export const TolerancePolicySchema = z.object({
-  scopePaths: z.array(z.string().trim().min(1)).min(1).max(200),
+  scopePaths: z.array(z.string().trim().min(1)).max(200),
   rules: z.array(ToleranceRuleSchema).max(50),
 }).superRefine((policy, context) => {
   const seen = new Set<string>();

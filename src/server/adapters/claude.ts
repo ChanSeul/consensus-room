@@ -1,7 +1,8 @@
+import { turnContract, turnOutputSchema } from "../../shared/turnContract.js";
 import { observeEnvironment } from "./sessionEnvironment.js";
 import { createHash, randomUUID } from "node:crypto";
 import { PlanningPaused } from "../../shared/planningControl.js";
-import { readdirSync } from "node:fs";
+import { readdirSync, lstatSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
@@ -183,7 +184,7 @@ export class ClaudeAdapter implements AgentAdapter {
     turn: Omit<SessionTurn, "sessionId"> | SessionTurn,
     sessionArgs: string[],
     newSession: boolean,
-    outputSchema: unknown = AgentResultJsonSchema,
+    outputSchema: unknown = turnOutputSchema(resolveSupportedTurn("claude", turn).job),
   ): Promise<CommandResult> {
     // 역할 정책(turnPolicy.ts)을 이 CLI 의 인자·설정으로 변환만 한다. 표현할 수 없는 정책은 조용히 바꾸지 않고 실행 전에 거부한다.
     // 하위 에이전트 팬아웃은 Workflow 로만 낸다 — Task 는 중첩 증식을 막을 수 없어 열지 않는다(위 주석).
@@ -213,7 +214,7 @@ export class ClaudeAdapter implements AgentAdapter {
       // 웹은 정책이 연 읽기 턴(policy.web)에만 연다 — 외부 증거(1차 자료) 수집이 계획 수렴의 정당한 기능이라서다.
       // 쓰기 턴은 코드 쓰기 접근과 웹이 결합해 유출 표면이 가장 커서 정책이 닫는다(2026-08-31 Codex 지적, 정책 c).
       const baseTools = "Read,Glob,Grep,Bash,Skill";
-      const { pluginDirectory, skillSourceDirectories } = await this.prepareManagedPlugin();
+      const { pluginDirectory, skillSourceDirectories, skillNames } = await this.prepareManagedPlugin();
       const args = [
         "-p",
         "--model", executionSettings.model,
@@ -250,7 +251,7 @@ export class ClaudeAdapter implements AgentAdapter {
           baseTools,
           ...(policy.tools === "write" ? ["Edit", "Write"] : []),
           ...(policy.web ? ["WebSearch", "WebFetch"] : []),
-          ...(policy.fanout ? ["Workflow"] : []),
+          ...(policy.fanout ? ["Workflow", "TaskOutput"] : []),
         ].join(","),
         ...(pluginDirectory ? ["--plugin-dir", pluginDirectory] : []),
         "--permission-mode", permissionMode,
@@ -277,10 +278,13 @@ export class ClaudeAdapter implements AgentAdapter {
       // 한 번 싣는다(매니페스트 없이). 그 뒤 resume 은 다시 매니페스트만이다.
       const injectMemory = Boolean(this.memory) && !protocolOnly && !turn.planningControl && (newSession || turn.memoryBodies === true);
       const enriched = injectMemory
-        ? await this.memory!.buildPrompt(turn.prompt, this.role, turn.signal)
+        ? await this.memory!.buildPrompt(turn.prompt, this.role, turn.signal, turnContract(job).memoryUpdates)
         : turn.planningControl ? turn.prompt : await this.withMemoryManifest(turn, protocolOnly);
       const controlled = protocolOnly || Boolean(turn.planningControl);
-      const instructionText = [EXECUTION_POLICY_NOTE, ...instructions].join("\n\n");
+      const instructionText = [EXECUTION_POLICY_NOTE,
+        ...(policy.fanout ? ["Workflow 결과는 완료 알림 또는 TaskOutput(task_id, block=true)으로 기다리세요. 로그·시각을 반복 조회하지 말고, 필요한 하위 작업이 끝난 뒤 최종 결과를 제출하세요."] : []),
+        ...(policy.tools !== "none" && skillNames.length ? [`사용 가능한 관리형 스킬(Skill에 정확한 이름 전달): ${skillNames.join(", ")}`] : []),
+        ...instructions].join("\n\n");
       const instructionHash = createHash("sha256").update(instructionText).digest("hex");
       const receiptKey = createHash("sha256").update(JSON.stringify([workspace, sessionArgs[1]])).digest("hex");
       // Keep Claude's system snapshot unchanged (including preserved thinking). Ordinary turns
@@ -408,7 +412,7 @@ export class ClaudeAdapter implements AgentAdapter {
     protocolOnly: boolean,
   ): Promise<string> {
     if (!this.memory || protocolOnly) return turn.prompt;
-    const manifest = await this.memory.buildManifest(turn.prompt, this.role, turn.signal);
+    const manifest = await this.memory.buildManifest(turn.prompt, this.role, turn.signal, turnContract(resolveSupportedTurn("claude", turn).job).memoryUpdates);
     return manifest ? `${turn.prompt}\n\n${manifest}` : turn.prompt;
   }
 
@@ -416,9 +420,10 @@ export class ClaudeAdapter implements AgentAdapter {
   private async prepareManagedPlugin(): Promise<{
     pluginDirectory: string | null;
     skillSourceDirectories: string[];
+    skillNames: string[];
   }> {
     const pluginDirectory = this.options.managedPluginDirectory;
-    if (!pluginDirectory) return { pluginDirectory: null, skillSourceDirectories: [] };
+    if (!pluginDirectory) return { pluginDirectory: null, skillSourceDirectories: [], skillNames: [] };
     const manifestDirectory = join(pluginDirectory, ".claude-plugin");
     const managedSkills = join(pluginDirectory, "skills");
     await mkdir(manifestDirectory, { recursive: true });
@@ -442,6 +447,7 @@ export class ClaudeAdapter implements AgentAdapter {
       }
     }
 
+    const skillNames = [...desired.keys()].map(name => `consensus-room:${name}`);
     const existing = await readdir(managedSkills, { withFileTypes: true });
     for (const entry of existing) {
       if (entry.name.startsWith(".")) continue;
@@ -461,7 +467,7 @@ export class ClaudeAdapter implements AgentAdapter {
     for (const [name, target] of desired) {
       await symlink(target, join(managedSkills, name), "dir");
     }
-    return { pluginDirectory, skillSourceDirectories: uniquePaths(sourceDirectories) };
+    return { pluginDirectory, skillSourceDirectories: uniquePaths(sourceDirectories), skillNames };
   }
 
 }
@@ -553,7 +559,13 @@ export function buildIsolationSettings(
     permissions: {
       allow: [
         `Read(${permissionPath(workspace)}/**)`,
-        ...(options.readablePaths ?? []).map(path => `Read(${permissionPath(path)})`),
+        ...(options.readablePaths ?? []).map(path => {
+          // Directory inputs (immutable evidence packets) are one bounded grant, not
+          // thousands of duplicated per-image CLI arguments. Do not follow symlinks.
+          let directory = false;
+          try { directory = lstatSync(path).isDirectory(); } catch { /* Missing inputs remain exact paths. */ }
+          return `Read(${permissionPath(path)}${directory ? "/**" : ""})`;
+        }),
         `Edit(${permissionPath(workspace)}/**)`,
         `Write(${permissionPath(workspace)}/**)`,
         "Glob",
@@ -564,7 +576,7 @@ export function buildIsolationSettings(
         ...(implementation ? [] : ["WebSearch", "WebFetch"]),
         "Skill",
         // 도구 목록에 Workflow가 있어도 allow 규칙이 없으면 dontAsk가 거부한다(실측: 계획 없이 열었을 때 차단됨). 팬아웃을 연 턴에서만 둔다.
-        ...(fanout ? ["Workflow"] : []),
+        ...(fanout ? ["Workflow", "TaskOutput"] : []),
         ...figmaRules.allow,
       ],
       deny: [...editRules, ...figmaRules.deny, `Read(${permissionPath(credentialPath)})`],

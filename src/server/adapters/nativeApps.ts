@@ -28,8 +28,13 @@ export async function nativeApps(command: string, authPath: string, cwd: string,
   });
   const rejectCalls = (reason = new Error("앱 연결이 종료됐습니다.")) => { for (const call of calls.values()) { clearTimeout(call.timer); call.reject(reason); } calls.clear(); };
   let ended = false;
-  const end = () => { ended = true; rejectCalls(); };
+  const end = (error?: unknown) => {
+    ended = true;
+    if (error instanceof Error) failure ??= error;
+    rejectCalls(failure instanceof Error ? failure : undefined);
+  };
   child.once("error", end); child.once("exit", end);
+  child.stdin?.on("error", error => { failure ??= error; rejectCalls(error); });
   const receive = (line: Buffer) => {
     try {
       if (Buffer.byteLength(line) > LIMIT) throw Error("MCP 응답이 32 MiB를 넘었습니다. 수집 범위를 더 작게 나누세요.");
@@ -58,9 +63,10 @@ export async function nativeApps(command: string, authPath: string, cwd: string,
       pending = Buffer.alloc(0); rejectCalls(failure as Error);
     }
   };
-  child.stdout!.on("data", onData);
+  child.stdout?.on("data", onData);
   const rpc = (method: string, params: unknown): Promise<any> => new Promise((resolve, reject) => {
-    if (ended || signal?.aborted) { reject(Error("앱 연결이 종료됐습니다.")); return; }
+    if (ended || failure || signal?.aborted) { reject(failure ?? Error("앱 연결이 종료됐습니다.")); return; }
+    if (!child.stdin) { child.once("error", reject); return; }
     const id = ++sequence;
     const timer = setTimeout(() => { calls.delete(id); reject(Error("앱 연결 응답 시간이 지났습니다.")); }, 120_000);
     calls.set(id, { resolve, reject, timer });
@@ -71,7 +77,7 @@ export async function nativeApps(command: string, authPath: string, cwd: string,
   let stopping: Promise<void> | undefined;
   const stop = () => stopping ??= (async () => {
     signal?.removeEventListener("abort", abort);
-    child.stdout!.removeListener("data", onData); rejectCalls();
+    child.stdout?.removeListener("data", onData); rejectCalls();
     if (child.pid && !ended) {
       await new Promise<void>(resolve => {
         const timer = setTimeout(() => { try { process.kill(-child.pid!, "SIGKILL"); } catch { /* already exited */ } }, 2000);

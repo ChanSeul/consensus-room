@@ -2,7 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { posix } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import type { TimelineEvent, Topic } from "../shared/contracts.js";
-import { TIMELINE_REFERENCE_UNIT, TIMELINE_REFERENCE_VERSION, type PlanningCheckpoint, type PlanningFragment, type PlanningMigration,
+import { planningUsageGaps, TIMELINE_REFERENCE_UNIT, TIMELINE_REFERENCE_VERSION, type PlanningCheckpoint, type PlanningFragment, type PlanningMigration,
+  type PlanningUsageRecovery,
   type RecoveryAnchor, type RecoveryBoundaryKind, type RecoveryLineage, type RecoveryProgress, type RecoveryVerification,
   type TimelineReference } from "../shared/planningControl.js";
 
@@ -444,6 +445,25 @@ export class PlanningStore {
     this.db.prepare("INSERT INTO planning_checkpoints VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET record_json=excluded.record_json")
       .run(record.key, record.topicId, JSON.stringify(record));
   }
+  authorizeUnknownUsage(topic: Topic, input: PlanningUsageRecovery, requestKey: string): void {
+    const record = this.latest(topic.id);
+    const flags = this.db.prepare("SELECT resume_state FROM topics WHERE id=?").get(topic.id);
+    if (!record || record.id !== input.checkpointId || planningHash(JSON.stringify(record)) !== input.checkpointSHA256 ||
+        record.scopeGeneration !== topic.scopeGeneration || record.planEpoch !== topic.planEpoch || record.planSHA256 !== topic.planSHA256 ||
+        !["FAILED", "USER_DECISION_REQUIRED", "BLOCKED_ON_EVIDENCE"].includes(topic.state) || flags?.resume_state !== record.stage ||
+        this.db.prepare("SELECT 1 FROM actions WHERE topic_id=? AND status='running'").get(topic.id)) {
+      throw new Error("Planning usage recovery requires the current idle, interrupted checkpoint.");
+    }
+    const gaps = planningUsageGaps(record), requested = new Set(input.gapIds);
+    if (requested.size !== input.gapIds.length || input.gapIds.some(id => !gaps.some(gap => gap.id === id && !gap.authorization))) {
+      throw new Error("Select unresolved usage gaps from the current checkpoint.");
+    }
+    const at = new Date().toISOString();
+    record.usageGaps = gaps.map(gap => requested.has(gap.id)
+      ? { ...gap, authorization: { requestKey, reason: input.reason, at } } : gap);
+    record.updatedAt = at;
+    this.save(record);
+  }
   latest(topicId: string, role?: "claude" | "codex"): PlanningCheckpoint | null {
     const row = this.db.prepare("SELECT record_json FROM planning_checkpoints WHERE topic_id=? AND (? IS NULL OR json_extract(record_json,'$.role')=?) ORDER BY json_extract(record_json,'$.updatedAt') DESC, rowid DESC LIMIT 1").get(topicId, role ?? null, role ?? null);
     return row ? JSON.parse(String(row.record_json)) : null;
@@ -527,6 +547,8 @@ export class PlanningStore {
     const prior = r?.priorAttempt;
     return r ? { version: r.version, checkpointId: r.id, stage: r.stage, round: r.round + (prior?.rounds ?? 0), updatedAt: r.updatedAt,
       questions: r.step.questions, stopped: r.stopped, finalized: r.finalized, usage: r.usage,
+      usageIncomplete: Boolean(r.usageIncomplete), usageRecovery: { checkpointId: r.id,
+        checkpointSHA256: planningHash(JSON.stringify(r)), gaps: planningUsageGaps(r) },
       injectedBytes: r.injectedBytes + (prior?.injectedBytes ?? 0), deliveredFragments: r.delivered.length + (prior?.deliveredFragments ?? 0),
       lastRequestInputTokens: r.lastRequestInputTokens ?? null, peakRequestInputTokens: r.peakRequestInputTokens ?? null,
       imageBytes: (r.imageBytes ?? 0) + (prior?.imageBytes ?? 0) } : null;

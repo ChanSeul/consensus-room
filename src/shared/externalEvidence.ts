@@ -61,14 +61,21 @@ export const EvidenceReviewInputSchema = z.object({
 }).strict();
 export type EvidenceReviewInput = z.infer<typeof EvidenceReviewInputSchema>;
 export interface EvidenceAssessment {
+  purpose?: "plan-review";
   id: string; topicId: string; binding: string; digest: string;
+  planRevision?: number;
   changes: Array<{ sourceId: string; before: string; after: string | null }>;
   target: Record<string, string | null>;
   status: "pending" | "running" | "complete" | "failed" | "superseded";
   createdAt: number; actionId?: string; finishedAt?: number;
   outcome?: "no-impact" | "replan" | "decision"; summary?: string;
 }
+export interface EvidenceGap { sourceId: string; label: string; url: string; reason: string }
+
+export const EVIDENCE_CONTINUATION_POLICY = "근거 접근 실패·미수집·부족은 작업 전체를 멈추는 사유가 아닙니다. 해당 자료와 그것에만 의존하는 작업을 To-do(DEFERRED_OUT_OF_SCOPE)로 남기고 확보된 근거로 가능한 범위를 계속하세요. 읽지 못한 자료·미실행 검사를 성공으로 표시하거나 제품 계약을 추정하지 마세요. 명시적 사용자 결정, 승인, 예산, 코드 결함과 실제 원문 변경 검사는 유지합니다. 외부 원문 접근 실패·부족 쟁점에는 evidenceGap=unavailable 또는 insufficient를 명시하세요. 필수 검증·코드 결함·승인 쟁점에는 evidenceGap을 붙이지 마세요. 완료 보고에 제외한 범위를 명시하세요.";
+
 export interface EvidenceTopicState {
+  deferred?: EvidenceGap[];
   assessments?: EvidenceAssessment[];
   collectionMetrics?: Record<string, number>;
 

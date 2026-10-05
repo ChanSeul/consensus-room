@@ -82,9 +82,10 @@ export class EvidenceCatalogStore {
       this.db.prepare(`INSERT INTO evidence_artifact_boundaries
         SELECT id,scope_generation,COALESCE((SELECT MAX(a.id) FROM artifacts a WHERE a.topic_id=topics.id),0) FROM topics WHERE id=?
         ON CONFLICT(topic_id,scope_generation) DO UPDATE SET artifact_id=excluded.artifact_id`).run(id);
+      this.store.resumes.invalidate(id);
       this.db.prepare(`UPDATE topics SET state=CASE WHEN state='BRAINSTORM_READY' THEN state ELSE 'DRAFT' END,plan_epoch=plan_epoch+1,plan_revision=0,plan_sha256=NULL,
         approved_plan_sha256=NULL,fix_pass_used=0,second_fix_pass_used=0,closeout_revision_used=0,implementation_session_id=NULL,implementation_session_binding_json=NULL,
-        implementation_session_provider=NULL,implementation_prompt_sequence=NULL,resume_state=NULL,last_error=NULL,reviewed_head=NULL,reviewed_diff_sha256=NULL WHERE id=?`).run(id);
+        implementation_session_provider=NULL,implementation_prompt_sequence=NULL,resume_state=NULL,last_error=NULL,reviewed_head=NULL,reviewed_diff_sha256=NULL,reviewed_tree_oid=NULL WHERE id=?`).run(id);
       for (const row of this.db.prepare("SELECT role FROM participants WHERE topic_id=?").all(id))
         this.db.prepare("UPDATE participants SET session_id=?,mode='created',acknowledged_plan_sha256=NULL,provider=NULL,binding_json=NULL WHERE topic_id=? AND role=?")
           .run(`pending:${randomUUID()}`, id, String(row.role));
@@ -366,7 +367,13 @@ export class EvidenceCatalogStore {
         }
         return partial;
       }
-      this.complete(root.id); return after;
+      // A complete host read supersedes the previous collector failure as well as its body.
+      // Keep this in the publication transaction; partial captures above must stay unusable.
+      this.store.recordCollection(before.id, {
+        status: before.contentHash === after.contentHash ? "unchanged" : "collected",
+        checkedAt: after.checkedAt!, missing: undefined, error: undefined,
+      });
+      this.complete(root.id); return this.store.get(before.id);
     });
   }
   replacePages(root: EvidenceRoot, source: EvidenceSource, expectedCursor: string | null, page: Omit<EvidenceDiscoveryPage,"cursor">): void {
