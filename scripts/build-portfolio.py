@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render the visual Korean portfolio from its Markdown diagram blocks.
+"""Render the Korean case study with prose and supporting vector diagrams.
 
 python3 scripts/build-portfolio.py --font-regular Regular.ttf --font-bold Bold.ttf
 All diagrams, labels and platform icons remain vectors in the PDF.
@@ -35,8 +35,6 @@ COLORS = {'teal': ('#087F80', '#E8F5F3'), 'blue': ('#306DC0', '#EDF3FC'),
 W, H = A4
 MARGIN = 42
 CW = W - 2 * MARGIN
-DIAGRAM_TOP = 187
-DIAGRAM_H = 430
 
 
 def color(s):
@@ -64,6 +62,12 @@ def main():
         if not match:
             raise ValueError('Missing diagram: ' + title)
         spec = json.loads(match[1])
+        spec['intro'] = section.split('\n', 1)[1].split('```diagram', 1)[0].strip()
+        body = section[match.end():].split('관련 자료:', 1)[0].strip()
+        spec['body'] = []
+        for block in re.split(r'^## ', body, flags=re.M)[1:]:
+            heading, prose = block.split('\n', 1)
+            spec['body'].append((heading, [p.strip() for p in prose.split('\n\n') if p.strip()]))
         specs.append((title, spec))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_suffix('.pending.pdf')
@@ -109,7 +113,7 @@ def main():
 
     def draw_element(e):
         kind = e['kind']
-        x, y = MARGIN + e.get('x', 0), DIAGRAM_TOP + e.get('y', 0)
+        x, y = MARGIN + e.get('x', 0), diagram_top + e.get('y', 0)
         accent, pale = COLORS[e.get('color', 'teal')]
         if kind in ('node', 'metric'):
             w, h = e['w'], e['h']
@@ -127,7 +131,7 @@ def main():
         elif kind == 'text':
             text(e['label'], x, y, e.get('w', 150), e.get('size', 10), e.get('bold', False), e.get('ink', MUTED), e.get('align', 0), e.get('h', 80))
         elif kind == 'arrow':
-            points = [(MARGIN+px, H-DIAGRAM_TOP-py) for px, py in e['points']]
+            points = [(MARGIN+px, H-diagram_top-py) for px, py in e['points']]
             c.setStrokeColor(color(accent)); c.setFillColor(color(accent)); c.setLineWidth(e.get('width', 1.5))
             c.setDash(4, 3) if e.get('dashed') else c.setDash()
             p = c.beginPath(); p.moveTo(*points[0])
@@ -161,15 +165,17 @@ def main():
         text('CONSENSUS ROOM  /  '+spec['section'],MARGIN,29,CW-60,8,True,MUTED,max_h=20)
         text(f'{index:02d}',W-MARGIN-30,26,30,14,True,'#087F80',2,max_h=22)
         text(title,MARGIN,65,CW,24,True,max_h=72)
-        text(spec['lead'],MARGIN,130,CW,11.2,ink=MUTED,max_h=48)
+        text(spec['lead'],MARGIN,112,CW,10.5,ink=MUTED,max_h=34)
+        intro_height = text(spec['intro'],MARGIN,160,CW,10.8,max_h=95)
+        diagram_top = 160 + intro_height + 20
         for element in spec['elements']:
             draw_element(element)
-        c.setStrokeColor(color(LINE));c.setLineWidth(.8);c.line(MARGIN,H-639,W-MARGIN,H-639)
-        notes=spec['notes'];gap=20; nw=(CW-gap*(len(notes)-1))/len(notes)
-        for j,note in enumerate(notes):
-            xx=MARGIN+j*(nw+gap)
-            text(note['title'],xx,658,nw,11,True,'#087F80',max_h=34)
-            text(note['body'],xx,686,nw,10.1,max_h=76)
+        y = diagram_top + spec['height'] + 23
+        for heading, paragraphs in spec['body']:
+            y += text(heading,MARGIN,y,CW,12,True,'#087F80',max_h=35) + 9
+            for paragraph in paragraphs:
+                y += text(paragraph,MARGIN,y,CW,10.8,max_h=766-y) + 9
+            y += 7
         text(spec.get('source',''),MARGIN,776,CW,6.8,ink=MUTED,max_h=22)
         text('조찬슬  ·  2026.10.05',MARGIN,815,CW-60,7,ink=MUTED,max_h=12)
         text(f'{index} / {len(specs)}',W-MARGIN-60,815,60,7,ink=MUTED,align=2,max_h=12)
