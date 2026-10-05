@@ -108,7 +108,10 @@ def main():
         g = Group(); g.transform = (scale, 0, 0, -scale, (size-vw*scale)/2-vx*scale, (size+vh*scale)/2+vy*scale)
         for j, path in enumerate(record['paths']):
             fill = record.get('fills', [record['color']] * len(record['paths']))[j]
-            g.add(SvgPath(path, fillColor=color(fill), strokeColor=None))
+            outline = record.get('outline', False)
+            g.add(SvgPath(path, fillColor=None if outline else color(fill),
+                          strokeColor=color(fill) if outline else None,
+                          strokeWidth=1.6, strokeLineCap=1, strokeLineJoin=1))
         drawing.add(g); renderPDF.draw(drawing, c, x, H-y-size)
 
     def draw_element(e):
@@ -127,8 +130,7 @@ def main():
                 text(e['body'], x+14, y+start, w-28, e.get('body_size', 10), ink=INK, max_h=h-start-10)
         elif kind == 'graph_node':
             w, h = e['w'], e['h']
-            rect(x,y,w,h,'#F3F7FA',LINE,radius=5)
-            c.setFillColor(color(accent));c.rect(x,H-y-h+8,2,h-16,fill=1,stroke=0)
+            rect(x,y,w,h,'#F3F7FA',accent,radius=5)
             tx=x+10
             if e.get('icon'):
                 icon(e['icon'],tx,y+8,18);tx+=25

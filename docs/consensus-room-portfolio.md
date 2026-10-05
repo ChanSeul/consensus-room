@@ -52,7 +52,8 @@ Codex와 Claude를 함께 사용하면서 서로 다른 강점을 확인했다. 
         "h": 57,
         "label": "전체 목표",
         "body": "공통 계약·의존 관계",
-        "color": "blue"
+        "color": "blue",
+        "icon": "role-target"
       },
       {
         "id": "now",
@@ -62,7 +63,8 @@ Codex와 Claude를 함께 사용하면서 서로 다른 강점을 확인했다. 
         "h": 57,
         "label": "현재 단계 상세화",
         "body": "앞 단계 결과로 구체화",
-        "color": "teal"
+        "color": "teal",
+        "icon": "role-plan"
       },
       {
         "id": "done",
@@ -72,7 +74,8 @@ Codex와 Claude를 함께 사용하면서 서로 다른 강점을 확인했다. 
         "h": 57,
         "label": "구현·검증",
         "body": "확인한 결과 저장",
-        "color": "purple"
+        "color": "purple",
+        "icon": "role-check"
       },
       {
         "id": "next",
@@ -82,7 +85,8 @@ Codex와 Claude를 함께 사용하면서 서로 다른 강점을 확인했다. 
         "h": 57,
         "label": "다음 단계 선택",
         "body": "미래 단계는 개요 유지",
-        "color": "gray"
+        "color": "gray",
+        "icon": "role-branch"
       }
     ],
     "edges": [
@@ -165,7 +169,8 @@ React·Vite 대시보드는 작업·계획·리뷰·예산을 보여 준다. Nod
         "h": 57,
         "label": "웹 화면",
         "body": "진행 상태·판단 근거 표시",
-        "color": "blue"
+        "color": "blue",
+        "icon": "role-screen"
       },
       {
         "id": "med",
@@ -186,7 +191,8 @@ React·Vite 대시보드는 작업·계획·리뷰·예산을 보여 준다. Nod
         "h": 65,
         "label": "작업 엔진",
         "body": "승인·상태 검사 → 계획 / 구현 / 검토 / 전달의 다음 행동",
-        "color": "teal"
+        "color": "teal",
+        "icon": "role-engine"
       },
       {
         "id": "runtime",
@@ -196,7 +202,8 @@ React·Vite 대시보드는 작업·계획·리뷰·예산을 보여 준다. Nod
         "h": 61,
         "label": "실행 런타임",
         "body": "Claude·Codex 어댑터",
-        "color": "coral"
+        "color": "coral",
+        "icon": "role-play"
       },
       {
         "id": "db",
@@ -206,7 +213,8 @@ React·Vite 대시보드는 작업·계획·리뷰·예산을 보여 준다. Nod
         "h": 61,
         "label": "SQLite·원문",
         "body": "승인·사건·내용 해시",
-        "color": "blue"
+        "color": "blue",
+        "icon": "role-database"
       },
       {
         "id": "git",
@@ -343,7 +351,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "수집 어댑터",
         "body": "요청·응답·오류",
-        "color": "coral"
+        "color": "coral",
+        "icon": "role-collect"
       },
       {
         "id": "life",
@@ -353,7 +362,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "근거 관리",
         "body": "누락·재수집 기록",
-        "color": "blue"
+        "color": "blue",
+        "icon": "role-file"
       },
       {
         "id": "judge",
@@ -363,7 +373,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "구현자·리뷰어",
         "body": "진행 범위·후속 판단",
-        "color": "purple"
+        "color": "purple",
+        "icon": "role-search"
       },
       {
         "id": "engine",
@@ -373,7 +384,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "작업 엔진",
         "body": "승인·복구·완료 검사",
-        "color": "teal"
+        "color": "teal",
+        "icon": "role-engine"
       },
       {
         "id": "continue",
@@ -383,7 +395,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "진행 조정기",
         "body": "다음 행동 예약·실행",
-        "color": "teal"
+        "color": "teal",
+        "icon": "role-refresh"
       }
     ],
     "edges": [
@@ -485,7 +498,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "역할",
         "body": "계획·구현·리뷰",
-        "color": "blue"
+        "color": "blue",
+        "icon": "role-user"
       },
       {
         "id": "profile",
@@ -495,7 +509,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "실행 프로필",
         "body": "공급자·모델·강도",
-        "color": "coral"
+        "color": "coral",
+        "icon": "role-settings"
       },
       {
         "id": "assign",
@@ -505,7 +520,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "배정",
         "body": "작업별 연결·버전",
-        "color": "teal"
+        "color": "teal",
+        "icon": "role-link"
       },
       {
         "id": "session",
@@ -515,7 +531,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "세션",
         "body": "호환되는 대화 기록",
-        "color": "purple"
+        "color": "purple",
+        "icon": "role-message"
       }
     ],
     "edges": [
@@ -595,7 +612,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "맥락 조회",
         "body": "정책·중재자 배정",
-        "color": "blue"
+        "color": "blue",
+        "icon": "role-search"
       },
       {
         "id": "resume",
@@ -605,7 +623,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "재개 상태 확인",
         "body": "승인·질문·예산",
-        "color": "teal"
+        "color": "teal",
+        "icon": "role-refresh"
       },
       {
         "id": "identity",
@@ -615,7 +634,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "현재 신원 대조",
         "body": "참여자·배정 버전",
-        "color": "purple"
+        "color": "purple",
+        "icon": "role-shield"
       },
       {
         "id": "busy",
@@ -625,7 +645,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "이미 실행 중",
         "body": "중복 시작 없이 관찰",
-        "color": "gray"
+        "color": "gray",
+        "icon": "role-clock"
       },
       {
         "id": "go",
@@ -635,7 +656,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "승인 범위 안",
         "body": "수정·재개·다음 단계",
-        "color": "teal"
+        "color": "teal",
+        "icon": "role-play"
       },
       {
         "id": "ask",
@@ -645,7 +667,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "실제 결정 필요",
         "body": "제품·권한·인증 확인",
-        "color": "coral"
+        "color": "coral",
+        "icon": "role-question"
       }
     ],
     "edges": [
@@ -755,7 +778,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "진행 예약",
         "body": "계획·권한 저장",
-        "color": "blue"
+        "color": "blue",
+        "icon": "role-clock"
       },
       {
         "id": "evidence",
@@ -765,7 +789,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "근거 검토",
         "body": "현재 계획 영향",
-        "color": "coral"
+        "color": "coral",
+        "icon": "role-search"
       },
       {
         "id": "run",
@@ -775,7 +800,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "구현·리뷰",
         "body": "승인 범위 실행",
-        "color": "purple"
+        "color": "purple",
+        "icon": "role-code"
       },
       {
         "id": "restore",
@@ -785,7 +811,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "기록 대조·복구",
         "body": "예약과 실제 실행",
-        "color": "gray"
+        "color": "gray",
+        "icon": "role-refresh"
       },
       {
         "id": "next",
@@ -795,7 +822,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "다음 계획 시작",
         "body": "새 계획 승인 확인",
-        "color": "teal"
+        "color": "teal",
+        "icon": "role-plan"
       },
       {
         "id": "done",
@@ -805,7 +833,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "로컬 완료",
         "body": "검토한 커밋",
-        "color": "teal"
+        "color": "teal",
+        "icon": "role-check"
       }
     ],
     "edges": [
@@ -916,7 +945,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "타입·계약",
         "body": "입력과 출력",
-        "color": "blue"
+        "color": "blue",
+        "icon": "role-file"
       },
       {
         "id": "code",
@@ -926,7 +956,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "파서 구현",
         "body": "같은 계약의 동작",
-        "color": "coral"
+        "color": "coral",
+        "icon": "role-code"
       },
       {
         "id": "test",
@@ -936,7 +967,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "파서 검사",
         "body": "같은 결과의 검증",
-        "color": "purple"
+        "color": "purple",
+        "icon": "role-check"
       },
       {
         "id": "result",
@@ -946,7 +978,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 61,
         "label": "하나의 완료 결과",
         "body": "파서 계약 완성: 타입·구현·검사를 함께 확인",
-        "color": "teal"
+        "color": "teal",
+        "icon": "role-check"
       },
       {
         "id": "search",
@@ -956,7 +989,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "검색 기능",
         "body": "별도의 사용자 결과",
-        "color": "blue"
+        "color": "blue",
+        "icon": "role-search"
       }
     ],
     "edges": [
@@ -1049,7 +1083,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "원문 변경",
         "body": "새 버전·내용 확인",
-        "color": "coral"
+        "color": "coral",
+        "icon": "role-file"
       },
       {
         "id": "impact",
@@ -1059,7 +1094,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "영향 판단",
         "body": "현재 계획과 대조",
-        "color": "blue"
+        "color": "blue",
+        "icon": "role-search"
       },
       {
         "id": "keep",
@@ -1069,7 +1105,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "기존 판단 유지",
         "body": "무관한 결과 보존",
-        "color": "gray"
+        "color": "gray",
+        "icon": "role-shield"
       },
       {
         "id": "revise",
@@ -1079,7 +1116,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "관련 판단 갱신",
         "body": "구현 의무와 함께 대조",
-        "color": "purple"
+        "color": "purple",
+        "icon": "role-refresh"
       },
       {
         "id": "resume",
@@ -1089,7 +1127,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "다음 행동",
         "body": "현재 계획으로 진행",
-        "color": "teal"
+        "color": "teal",
+        "icon": "role-play"
       }
     ],
     "edges": [
@@ -1200,7 +1239,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "자료 목록",
         "body": "필요한 원문의 위치",
-        "color": "blue"
+        "color": "blue",
+        "icon": "role-list"
       },
       {
         "id": "chunk",
@@ -1210,7 +1250,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "원문 조각",
         "body": "현재 버전·구간",
-        "color": "coral"
+        "color": "coral",
+        "icon": "role-file"
       },
       {
         "id": "receipt",
@@ -1220,7 +1261,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "읽음 기록",
         "body": "해시·전달 구간",
-        "color": "purple"
+        "color": "purple",
+        "icon": "role-check"
       },
       {
         "id": "more",
@@ -1230,7 +1272,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "다음 위치",
         "body": "cursor·남은 구간",
-        "color": "gray"
+        "color": "gray",
+        "icon": "role-branch"
       },
       {
         "id": "decision",
@@ -1240,7 +1283,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "최종 판단",
         "body": "필수 읽기 완료",
-        "color": "teal"
+        "color": "teal",
+        "icon": "role-check"
       }
     ],
     "edges": [
@@ -1347,7 +1391,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "위키 색인",
         "body": "관련 문서의 위치",
-        "color": "blue"
+        "color": "blue",
+        "icon": "role-list"
       },
       {
         "id": "read",
@@ -1357,7 +1402,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "본문 조회",
         "body": "실제 읽은 버전",
-        "color": "coral"
+        "color": "coral",
+        "icon": "role-search"
       },
       {
         "id": "evidence",
@@ -1367,7 +1413,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "판단 근거",
         "body": "내용·적용 범위",
-        "color": "teal"
+        "color": "teal",
+        "icon": "role-file"
       },
       {
         "id": "new",
@@ -1377,7 +1424,8 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
         "h": 57,
         "label": "새 원문 감지",
         "body": "질문·제안·결정 구분",
-        "color": "purple"
+        "color": "purple",
+        "icon": "role-refresh"
       }
     ],
     "edges": [
@@ -1497,7 +1545,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 65,
         "label": "수집·원문 보존",
         "body": "실제 요청·응답·접근 오류",
-        "color": "gray"
+        "color": "gray",
+        "icon": "role-collect"
       },
       {
         "id": "judge",
@@ -1507,7 +1556,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 65,
         "label": "근거 영향 검토",
         "body": "현재 계획과 변경 내용 대조",
-        "color": "teal"
+        "color": "teal",
+        "icon": "role-search"
       },
       {
         "id": "again",
@@ -1517,7 +1567,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "누락·재수집 기록",
         "body": "미수신과 접근 실패의 구분",
-        "color": "coral"
+        "color": "coral",
+        "icon": "role-alert"
       }
     ],
     "edges": [
@@ -1655,7 +1706,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "자료 조회",
         "body": "요청·결과 기록",
-        "color": "blue"
+        "color": "blue",
+        "icon": "role-search"
       },
       {
         "id": "decision",
@@ -1665,7 +1717,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "영향 판단",
         "body": "현재 근거로 가능한 일",
-        "color": "purple"
+        "color": "purple",
+        "icon": "role-search"
       },
       {
         "id": "run",
@@ -1675,7 +1728,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "구현·리뷰",
         "body": "확인된 범위 진행",
-        "color": "teal"
+        "color": "teal",
+        "icon": "role-code"
       },
       {
         "id": "todo",
@@ -1685,7 +1739,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "후속 목록",
         "body": "누락 자료·의존 동작",
-        "color": "coral"
+        "color": "coral",
+        "icon": "role-list"
       },
       {
         "id": "collect",
@@ -1695,7 +1750,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "재수집",
         "body": "같은 요청의 성공 응답",
-        "color": "gray"
+        "color": "gray",
+        "icon": "role-refresh"
       }
     ],
     "edges": [
@@ -1912,7 +1968,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "현재 계획",
         "body": "정규화한 내용 해시",
-        "color": "blue"
+        "color": "blue",
+        "icon": "role-plan"
       },
       {
         "id": "approval",
@@ -1922,7 +1979,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "계획 승인",
         "body": "현재 해시와 일치",
-        "color": "teal"
+        "color": "teal",
+        "icon": "role-shield"
       },
       {
         "id": "code",
@@ -1932,7 +1990,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "구현 결과",
         "body": "승인 범위의 코드",
-        "color": "coral"
+        "color": "coral",
+        "icon": "role-code"
       },
       {
         "id": "review",
@@ -1942,7 +2001,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "고정 리뷰 대상",
         "body": "기준·후보 커밋·diff",
-        "color": "purple"
+        "color": "purple",
+        "icon": "role-pin"
       },
       {
         "id": "done",
@@ -1952,7 +2012,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "로컬 완료",
         "body": "검토 트리 = 커밋 트리",
-        "color": "teal"
+        "color": "teal",
+        "icon": "role-check"
       },
       {
         "id": "find",
@@ -1962,7 +2023,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "지적 추적",
         "body": "ID·처분·근거 보존",
-        "color": "gray"
+        "color": "gray",
+        "icon": "role-list"
       }
     ],
     "edges": [
@@ -2063,7 +2125,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "역할별 권한",
         "body": "읽기·쓰기·도구 없음",
-        "color": "blue"
+        "color": "blue",
+        "icon": "role-shield"
       },
       {
         "id": "run",
@@ -2073,7 +2136,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "모델 실행",
         "body": "현재 실행 신원",
-        "color": "coral"
+        "color": "coral",
+        "icon": "role-play"
       },
       {
         "id": "accept",
@@ -2083,7 +2147,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "정상 결과 수락",
         "body": "유효한 종료·응답",
-        "color": "teal"
+        "color": "teal",
+        "icon": "role-check"
       },
       {
         "id": "reject",
@@ -2093,7 +2158,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "실패·취소 기록",
         "body": "잘린 응답·늦은 결과",
-        "color": "gray"
+        "color": "gray",
+        "icon": "role-alert"
       }
     ],
     "edges": [
@@ -2182,7 +2248,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "실행 사건",
         "body": "시작·진행·종료",
-        "color": "blue"
+        "color": "blue",
+        "icon": "role-clock"
       },
       {
         "id": "files",
@@ -2192,7 +2259,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "실제 파일",
         "body": "원문·코드·커밋",
-        "color": "coral"
+        "color": "coral",
+        "icon": "role-file"
       },
       {
         "id": "state",
@@ -2202,7 +2270,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 64,
         "label": "저장된 상태",
         "body": "실행과 결과 대조",
-        "color": "purple"
+        "color": "purple",
+        "icon": "role-database"
       },
       {
         "id": "ui",
@@ -2212,7 +2281,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 64,
         "label": "화면 표시",
         "body": "재연결 후 조회",
-        "color": "teal"
+        "color": "teal",
+        "icon": "role-screen"
       }
     ],
     "edges": [
@@ -2311,7 +2381,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "리뷰 통과",
         "body": "검토 대상 고정",
-        "color": "purple"
+        "color": "purple",
+        "icon": "role-check"
       },
       {
         "id": "local",
@@ -2321,7 +2392,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "로컬 완료",
         "body": "커밋·트리 대조",
-        "color": "teal"
+        "color": "teal",
+        "icon": "role-check"
       },
       {
         "id": "push",
@@ -2331,7 +2403,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "원격 전달",
         "body": "승인 범위의 push",
-        "color": "coral"
+        "color": "coral",
+        "icon": "role-upload"
       },
       {
         "id": "remote",
@@ -2341,7 +2414,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "원격 OID 확인",
         "body": "실제 반영 여부",
-        "color": "blue"
+        "color": "blue",
+        "icon": "role-link"
       },
       {
         "id": "result",
@@ -2351,7 +2425,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "전달 완료",
         "body": "실행 기록과 연결",
-        "color": "teal"
+        "color": "teal",
+        "icon": "role-check"
       }
     ],
     "edges": [
@@ -2456,7 +2531,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "원문 읽기",
         "body": "여러 조각·여러 호출",
-        "color": "blue"
+        "color": "blue",
+        "icon": "role-file"
       },
       {
         "id": "judge",
@@ -2466,7 +2542,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "판단·보완",
         "body": "필요한 모델 실행",
-        "color": "purple"
+        "color": "purple",
+        "icon": "role-search"
       },
       {
         "id": "result",
@@ -2476,7 +2553,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "최종 결과",
         "body": "한 번의 논리적 리뷰",
-        "color": "teal"
+        "color": "teal",
+        "icon": "role-check"
       },
       {
         "id": "usage",
@@ -2486,7 +2564,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 64,
         "label": "호출별 사용량 원장",
         "body": "입력·캐시·출력·실행시간·미제공 여부",
-        "color": "gray"
+        "color": "gray",
+        "icon": "role-chart"
       }
     ],
     "edges": [
@@ -2594,7 +2673,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "현재 검사 입력",
         "body": "코드·도구·환경·계획",
-        "color": "blue"
+        "color": "blue",
+        "icon": "role-file"
       },
       {
         "id": "compare",
@@ -2604,7 +2684,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "기존 근거 대조",
         "body": "입력 해시·통과 로그",
-        "color": "purple"
+        "color": "purple",
+        "icon": "role-search"
       },
       {
         "id": "reuse",
@@ -2614,7 +2695,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "결과 재사용",
         "body": "유효한 통과 근거",
-        "color": "teal"
+        "color": "teal",
+        "icon": "role-refresh"
       },
       {
         "id": "execute",
@@ -2624,7 +2706,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "현재 입력으로 실행",
         "body": "변경·누락·미완료",
-        "color": "coral"
+        "color": "coral",
+        "icon": "role-play"
       },
       {
         "id": "record",
@@ -2634,7 +2717,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "결과 기록",
         "body": "완료 로그·입력 해시",
-        "color": "blue"
+        "color": "blue",
+        "icon": "role-database"
       }
     ],
     "edges": [
@@ -2735,7 +2819,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "첫 단계 실행",
         "body": "현재 단계만 상세화",
-        "color": "blue"
+        "color": "blue",
+        "icon": "role-play"
       },
       {
         "id": "med",
@@ -2745,7 +2830,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "중재자 교체",
         "body": "Claude → Codex",
-        "color": "coral"
+        "color": "coral",
+        "icon": "role-user"
       },
       {
         "id": "split",
@@ -2755,7 +2841,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "미래 단계 분할",
         "body": "무관한 결과 보존",
-        "color": "purple"
+        "color": "purple",
+        "icon": "role-branch"
       },
       {
         "id": "read",
@@ -2765,7 +2852,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "큰 원문 읽기",
         "body": "조각·버전 연결",
-        "color": "blue"
+        "color": "blue",
+        "icon": "role-file"
       },
       {
         "id": "restart",
@@ -2775,7 +2863,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "서버 재시작",
         "body": "DB 60개 테이블 보존",
-        "color": "gray"
+        "color": "gray",
+        "icon": "role-refresh"
       },
       {
         "id": "deliver",
@@ -2785,7 +2874,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "통합·전달",
         "body": "5개 단계·원격 확인",
-        "color": "teal"
+        "color": "teal",
+        "icon": "role-upload"
       }
     ],
     "edges": [
@@ -2956,7 +3046,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "중지·실패",
         "body": "요청·오류 보존",
-        "color": "coral"
+        "color": "coral",
+        "icon": "role-alert"
       },
       {
         "id": "db",
@@ -2966,7 +3057,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "DB 재연결",
         "body": "예약·상태 복구",
-        "color": "blue"
+        "color": "blue",
+        "icon": "role-database"
       },
       {
         "id": "check",
@@ -2976,7 +3068,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "승인 조건 대조",
         "body": "현재 계획·범위",
-        "color": "purple"
+        "color": "purple",
+        "icon": "role-shield"
       },
       {
         "id": "resume",
@@ -2986,7 +3079,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "명시적 재개",
         "body": "같은 공식 요청",
-        "color": "teal"
+        "color": "teal",
+        "icon": "role-refresh"
       },
       {
         "id": "next",
@@ -2996,7 +3090,8 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "h": 57,
         "label": "다음 단계 계획",
         "body": "검토·로컬 완료 후",
-        "color": "teal"
+        "color": "teal",
+        "icon": "role-plan"
       }
     ],
     "edges": [
