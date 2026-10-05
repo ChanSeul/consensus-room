@@ -125,6 +125,17 @@ def main():
             if e.get('body'):
                 start = max(45 if e.get('icon') else 35, 14+label_h+8)
                 text(e['body'], x+14, y+start, w-28, e.get('body_size', 10), ink=INK, max_h=h-start-10)
+        elif kind == 'graph_node':
+            w, h = e['w'], e['h']
+            rect(x,y,w,h,'#F3F7FA',LINE,radius=5)
+            c.setFillColor(color(accent));c.rect(x,H-y-h+8,2,h-16,fill=1,stroke=0)
+            tx=x+10
+            if e.get('icon'):
+                icon(e['icon'],tx,y+8,18);tx+=25
+            label_h=text(e['label'],tx,y+8,x+w-8-tx,10.3,True,INK,max_h=30)
+            if e.get('body'):
+                start=max(27,8+label_h+4)
+                text(e['body'],x+10,y+start,w-20,8.6,ink=MUTED,max_h=h-start-4)
         elif kind == 'group':
             rect(x, y, e['w'], e['h'], '#FFFFFF', LINE, dashed=True)
             text(e['label'], x+12, y+9, e['w']-24, 9, True, MUTED, max_h=30)
@@ -159,6 +170,42 @@ def main():
             icon(e['name'],x,y,e.get('size',25))
         else: raise ValueError('Unknown diagram element: '+kind)
 
+    def draw_graph(graph):
+        nodes={n['id']:dict(n) for n in graph['nodes']}
+        if len(nodes)!=len(graph['nodes']):raise ValueError('Duplicate graph node')
+        xs=[n['x'] for n in nodes.values()]+[n['x']+n['w'] for n in nodes.values()]
+        xs += [p[0] for e in graph['edges'] for p in e.get('via',[])]
+        lo,hi=min(xs),max(xs);scale=min(1,(CW-10)/(hi-lo));offset=(CW-(hi-lo)*scale)/2
+        def xx(x):return offset+(x-lo)*scale
+        for n in nodes.values():n['x'],n['w']=xx(n['x']),n['w']*scale
+        def anchor(n,port):
+            return {'left':(n['x']-4,n['y']+n['h']/2),'right':(n['x']+n['w']+4,n['y']+n['h']/2),
+                    'top':(n['x']+n['w']/2,n['y']-4),'bottom':(n['x']+n['w']/2,n['y']+n['h']+4)}[port]
+        labels=[]
+        for edge in graph['edges']:
+            a,b=nodes[edge['source']],nodes[edge['target']]
+            points=[anchor(a,edge['source_port'])]+[(xx(px),py) for px,py in edge.get('via',[])]+[anchor(b,edge['target_port'])]
+            draw_element(dict(kind='arrow',points=points,color=edge.get('color','teal'),dashed=edge.get('dashed',False),width=1.05))
+            if edge.get('label'):
+                segments=sorted(zip(points,points[1:]),key=lambda p:math.dist(*p),reverse=True)
+                lw=pdfmetrics.stringWidth(edge['label'],'Portfolio',8.2)+8;lh=13
+                candidates=[]
+                for (ax,ay),(bx,by) in segments:
+                    for fraction in (.5,.25,.75):
+                        mx,my=ax+(bx-ax)*fraction,ay+(by-ay)*fraction
+                        if abs(bx-ax)>=abs(by-ay):candidates += [(mx-lw/2,my-18),(mx-lw/2,my+5)]
+                        else:candidates += [(mx+6,my-lh/2),(mx-lw-6,my-lh/2)]
+                occupied=[(n['x']-3,n['y']-3,n['w']+6,n['h']+6) for n in nodes.values()]+[(lx-3,ly-3,lww+6,lh+6) for lx,ly,lww,_ in labels]
+                def clear(lx,ly):
+                    return lx>=0 and lx+lw<=CW and ly>=-2 and not any(lx<ox+ow and lx+lw>ox and ly<oy+oh and ly+lh>oy for ox,oy,ow,oh in occupied)
+                position=next((p for p in candidates if clear(*p)),None)
+                if position is None:raise ValueError(f'Graph label has no clear position on page {index}: {edge["label"]}')
+                labels.append((*position,lw,edge['label']))
+        for n in nodes.values():draw_element(dict(n,kind='graph_node'))
+        for lx,ly,lw,value in labels:
+            c.setFillColor(colors.white);c.rect(MARGIN+lx,H-diagram_top-ly-13,lw,13,fill=1,stroke=0)
+            text(value,MARGIN+lx+4,diagram_top+ly,lw-8,8.2,ink=MUTED,max_h=13)
+
     for index, (title, spec) in enumerate(specs, 1):
         c.setFillColor(color('#FFFFFF'));c.rect(0,0,W,H,fill=1,stroke=0)
         c.setFillColor(color('#087F80'));c.rect(0,H-8,W,8,fill=1,stroke=0)
@@ -166,8 +213,9 @@ def main():
         text(f'{index:02d}',W-MARGIN-30,26,30,14,True,'#087F80',2,max_h=22)
         text(title,MARGIN,65,CW,24,True,max_h=72)
         text(spec['lead'],MARGIN,112,CW,10.5,ink=MUTED,max_h=34)
-        intro_height = text(spec['intro'],MARGIN,160,CW,10.8,max_h=95)
-        diagram_top = 160 + intro_height + 20
+        intro_height = text(spec['intro'],MARGIN,160,CW,10.8,max_h=95) if spec['intro'] else 0
+        diagram_top = 155 if spec.get('layout')=='cover' else 160+intro_height+20
+        if spec.get('graph'):draw_graph(spec['graph'])
         for element in spec['elements']:
             draw_element(element)
         y = diagram_top + spec['height'] + 23
@@ -179,7 +227,7 @@ def main():
         text(spec.get('source',''),MARGIN,776,CW,6.8,ink=MUTED,max_h=22)
         text('조찬슬  ·  2026.10.05',MARGIN,815,CW-60,7,ink=MUTED,max_h=12)
         text(f'{index} / {len(specs)}',W-MARGIN-60,815,60,7,ink=MUTED,align=2,max_h=12)
-        counts.append(len(spec['elements']));c.showPage()
+        counts.append(len(spec['elements'])+len(spec.get('graph',{}).get('nodes',[])));c.showPage()
     c.save();temporary.replace(args.output)
     print(json.dumps({'pages':len(specs),'elements':sum(counts),'output':str(args.output)},ensure_ascii=False))
 

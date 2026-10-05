@@ -1,36 +1,36 @@
-# AI 개발 작업 관리
-
-Claude와 Codex를 함께 쓰면서 같은 요구사항을 다시 설명하고, 한 도구의 계획을 다른 도구에 복사하고, 수정된 코드를 다시 검토시키는 일이 반복됐다. 대화가 길어질수록 어떤 계획이 승인됐는지, 리뷰가 어느 코드에 대한 것인지 확인하기도 어려워졌다.
+# Claude·Codex 공동 개발 작업 자동화
 
 ```diagram
 {
   "section": "OVERVIEW",
-  "lead": "Claude와 Codex의 계획·구현·검토, 그리고 판단에 사용한 자료를 연결한 작업 공간.",
+  "lead": "두 AI의 계획과 구현 결과를 교차 검토하고, 수정부터 다음 작업까지 이어 가는 도구.",
   "source": "세션 그래프: 역할별 참여자와 외부 원문 연결. 화면의 배정과 상태는 촬영 당시 기준.",
-  "height": 285,
+  "height": 221,
   "elements": [
     {
       "kind": "image",
       "x": 0,
       "y": 0,
       "w": 511,
-      "h": 285,
+      "h": 221,
       "path": "images/consensus-room-session-graph.png"
     }
-  ]
+  ],
+  "layout": "cover"
 }
 ```
 
-## 개발 배경과 설계 초점
+## 이 프로젝트를 시작한 계기
 
-이 도구에서 내가 설계한 핵심은 역할을 나누는 것보다 그 사이의 연결을 남기는 데 있다. 계획의 내용, 읽은 원문, 검토한 코드, 실제 커밋을 서로 연결해 다음 행동의 근거로 삼는다. AI가 구현을 수행하더라도 제품 결정과 전달 범위는 별도로 확인한다.
+Codex와 Claude를 함께 사용하면서 서로 다른 강점을 확인했다. Codex는 계획 수립과 코드 검토에, Claude는 코드 작성 속도와 완성도에 강점이 있었다. 특히 Claude의 계획과 구현 결과를 Codex가 검토하면 한 세션에서 놓친 문제를 다른 세션에서 발견하는 경우가 있었다.
 
-## 작업을 이어 가는 흐름
+처음에는 두 세션의 답변을 직접 복사해 전달했다. “Claude가 이렇게 말하는데 어떻게 생각해?”라고 Codex에 묻고, 그 답변을 다시 Claude에 보내 검토를 요청했다. 검토를 반복해 두 세션의 의견이 수렴했을 때는 근거 없는 답변이 줄고 작업 결과도 좋아졌다.
 
-전체 목표는 먼저 정하되 지금 할 단계만 상세히 계획한다. 원문은 위키와 자료 목록에서 필요할 때 나눠 읽는다. 역할에 배정한 AI를 바꿀 수 있게 하고, 계획과 구현은 호환되는 세션에서 이어 간다. 수집·판단·실행·복구의 책임을 나누고 승인된 다음 행동은 서버가 이어 간다. 완료할 때는 검토한 코드와 실제 커밋을 대조한다.
+리팩토링이 길어질수록 계획, 코드 변경, 리뷰 결과를 매번 복사해 전달하기가 번거로웠다. 최신 계획과 앞선 지적을 직접 대조해야 했고, 검토가 끝날 때마다 다음 작업도 요청해야 했다. 이 과정을 자동화하려고 서로의 결과에서 오류와 누락을 찾고 수정과 재검토를 반복하는 Consensus Room을 만들었다.
 
-관련 자료: 세션 그래프: 역할별 참여자와 외부 원문 연결. 화면의 배정과 상태는 촬영 당시 기준.
+## 시스템 개요
 
+작업 엔진은 계획·구현·검토·전달을 기록하고, 승인된 계획과 실제 코드·커밋을 연결한다. 중재자는 결정과 복구를 조율한다. 웹에서는 현재 상태와 판단 근거를 확인하며, 승인된 다음 행동은 서버가 이어 간다.
 # 전체 목표와 단계별 계획
 
 초기 흐름은 계획 단계에서 많은 요구사항과 코드를 한꺼번에 모았다. 입력이 커질 때 요약을 더 압축하거나 전달 상한을 높이는 것만으로는 해결되지 않았다. 어떤 근거가 빠졌는지 확인하기 어려웠고, 구현 시점에야 필요한 디자인 정보까지 계획에 들어갔다.
@@ -40,82 +40,99 @@ Claude와 Codex를 함께 쓰면서 같은 요구사항을 다시 설명하고, 
   "section": "PLANNING",
   "lead": "전체 방향은 먼저 정하고, 실행할 단계는 앞 단계의 실제 결과를 바탕으로 구체화.",
   "source": "",
-  "height": 166,
-  "elements": [
-    {
-      "kind": "node",
-      "x": 0.0,
-      "y": 25,
-      "w": 153.0,
-      "h": 90,
-      "label": "전체 목표",
-      "body": "공통 계약·단계 의존성",
-      "color": "blue",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          157.0,
-          70.0
+  "height": 205,
+  "elements": [],
+  "graph": {
+    "nodes": [
+      {
+        "id": "goal",
+        "x": 0,
+        "y": 6,
+        "w": 127,
+        "h": 57,
+        "label": "전체 목표",
+        "body": "공통 계약·의존 관계",
+        "color": "blue"
+      },
+      {
+        "id": "now",
+        "x": 189,
+        "y": 6,
+        "w": 137,
+        "h": 57,
+        "label": "현재 단계 상세화",
+        "body": "앞 단계 결과로 구체화",
+        "color": "teal"
+      },
+      {
+        "id": "done",
+        "x": 384,
+        "y": 6,
+        "w": 127,
+        "h": 57,
+        "label": "구현·검증",
+        "body": "확인한 결과 저장",
+        "color": "purple"
+      },
+      {
+        "id": "next",
+        "x": 189,
+        "y": 134,
+        "w": 137,
+        "h": 57,
+        "label": "다음 단계 선택",
+        "body": "미래 단계는 개요 유지",
+        "color": "gray"
+      }
+    ],
+    "edges": [
+      {
+        "source": "goal",
+        "target": "now",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "목표·범위",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "now",
+        "target": "done",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "실행",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "done",
+        "target": "next",
+        "source_port": "bottom",
+        "target_port": "right",
+        "label": "완료 결과",
+        "via": [
+          [
+            447,
+            162
+          ]
         ],
-        [
-          175.0,
-          70.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 179.0,
-      "y": 25,
-      "w": 153.0,
-      "h": 90,
-      "label": "현재 단계",
-      "body": "상세 계획·구현·검사",
-      "color": "teal",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          336.0,
-          70.0
-        ],
-        [
-          354.0,
-          70.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 358.0,
-      "y": 25,
-      "w": 153.0,
-      "h": 90,
-      "label": "다음 단계",
-      "body": "앞 단계 결과 후 구체화",
-      "color": "purple",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "text",
-      "x": 0,
-      "y": 132,
-      "w": 511,
-      "label": "현재 필요한 원문은 나눠 읽고, 아직 판단할 수 없는 미래 단계는 개요로 보존.",
-      "size": 10,
-      "h": 50
-    }
-  ]
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "next",
+        "target": "now",
+        "source_port": "top",
+        "target_port": "bottom",
+        "label": "다음 단계 계획",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      }
+    ]
+  }
 }
 ```
 
@@ -136,107 +153,162 @@ React·Vite 대시보드는 작업·계획·리뷰·예산을 보여 준다. Nod
   "section": "ARCHITECTURE",
   "lead": "상태와 권한을 판단하는 엔진, 모델을 호출하는 런타임, 사실을 보존하는 저장소.",
   "source": "src/server/runtime/ · src/server/engine/ · src/server/database.ts",
-  "height": 200,
-  "elements": [
-    {
-      "kind": "node",
-      "x": 0,
-      "y": 0,
-      "w": 138,
-      "h": 42,
-      "label": "화면·중재 CLI",
-      "body": "",
-      "color": "blue",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "text",
-      "x": 154,
-      "y": 11,
-      "w": 355,
-      "label": "작업·계획·검토 상태 표시, 결정 전달",
-      "size": 10,
-      "h": 50
-    },
-    {
-      "kind": "node",
-      "x": 0,
-      "y": 51,
-      "w": 138,
-      "h": 42,
-      "label": "작업 엔진",
-      "body": "",
-      "color": "teal",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "text",
-      "x": 154,
-      "y": 62,
-      "w": 355,
-      "label": "현재 승인·예산·완료 조건으로 다음 행동 판단",
-      "size": 10,
-      "h": 50
-    },
-    {
-      "kind": "node",
-      "x": 0,
-      "y": 102,
-      "w": 138,
-      "h": 42,
-      "label": "실행 런타임",
-      "body": "",
-      "color": "coral",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "text",
-      "x": 154,
-      "y": 113,
-      "w": 355,
-      "label": "Claude·Codex 호출, 세션·종료·사용량 반환",
-      "size": 10,
-      "h": 50
-    },
-    {
-      "kind": "node",
-      "x": 0,
-      "y": 153,
-      "w": 138,
-      "h": 42,
-      "label": "저장소·Git",
-      "body": "",
-      "color": "purple",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "text",
-      "x": 154,
-      "y": 164,
-      "w": 355,
-      "label": "SQLite의 사건 기록, 원문 해시, 실제 코드 보존",
-      "size": 10,
-      "h": 50
-    },
-    {
-      "kind": "icon",
-      "name": "claude",
-      "x": 465,
-      "y": 112,
-      "size": 22
-    },
-    {
-      "kind": "icon",
-      "name": "openai",
-      "x": 491,
-      "y": 112,
-      "size": 20
-    }
-  ]
+  "height": 288,
+  "elements": [],
+  "graph": {
+    "nodes": [
+      {
+        "id": "ui",
+        "x": 0,
+        "y": 0,
+        "w": 230,
+        "h": 57,
+        "label": "웹 화면",
+        "body": "진행 상태·판단 근거 표시",
+        "color": "blue"
+      },
+      {
+        "id": "med",
+        "x": 281,
+        "y": 0,
+        "w": 230,
+        "h": 57,
+        "label": "중재 세션",
+        "body": "결정 전달·현재 상태 확인",
+        "color": "coral",
+        "icon": "claude"
+      },
+      {
+        "id": "engine",
+        "x": 0,
+        "y": 111,
+        "w": 511,
+        "h": 65,
+        "label": "작업 엔진",
+        "body": "승인·상태 검사 → 계획 / 구현 / 검토 / 전달의 다음 행동",
+        "color": "teal"
+      },
+      {
+        "id": "runtime",
+        "x": 0,
+        "y": 224,
+        "w": 153,
+        "h": 61,
+        "label": "실행 런타임",
+        "body": "Claude·Codex 어댑터",
+        "color": "coral"
+      },
+      {
+        "id": "db",
+        "x": 180,
+        "y": 224,
+        "w": 151,
+        "h": 61,
+        "label": "SQLite·원문",
+        "body": "승인·사건·내용 해시",
+        "color": "blue"
+      },
+      {
+        "id": "git",
+        "x": 358,
+        "y": 224,
+        "w": 153,
+        "h": 61,
+        "label": "Git worktree",
+        "body": "격리 코드·검토 커밋",
+        "color": "purple",
+        "icon": "github"
+      }
+    ],
+    "edges": [
+      {
+        "source": "ui",
+        "target": "engine",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "API · 상태 조회",
+        "via": [
+          [
+            115,
+            90
+          ],
+          [
+            255,
+            90
+          ]
+        ],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "med",
+        "target": "engine",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "요청·재개",
+        "via": [
+          [
+            396,
+            79
+          ],
+          [
+            255,
+            79
+          ]
+        ],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "engine",
+        "target": "runtime",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "모델 실행",
+        "via": [
+          [
+            255,
+            198
+          ],
+          [
+            76,
+            198
+          ]
+        ],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "engine",
+        "target": "db",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "기록 저장",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "engine",
+        "target": "git",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "코드 확인",
+        "via": [
+          [
+            255,
+            198
+          ],
+          [
+            435,
+            198
+          ]
+        ],
+        "color": "teal",
+        "dashed": false
+      }
+    ]
+  }
 }
 ```
 
@@ -259,124 +331,136 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
   "section": "ARCHITECTURE",
   "lead": "수집 사실과 작업 판단을 분리하고, 다음 행동은 엔진의 공통 조건으로 실행.",
   "source": "src/server/evidence/readLifecycle.ts · src/server/workflow.ts · src/server/engine/continuation.ts",
-  "height": 240,
-  "elements": [
-    {
-      "kind": "node",
-      "x": 0,
-      "y": 0,
-      "w": 138,
-      "h": 42,
-      "label": "수집 어댑터",
-      "body": "",
-      "color": "coral",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "text",
-      "x": 154,
-      "y": 11,
-      "w": 355,
-      "label": "요청·응답·오류 등 실제로 관측한 사실",
-      "size": 10,
-      "h": 50
-    },
-    {
-      "kind": "node",
-      "x": 0,
-      "y": 51,
-      "w": 138,
-      "h": 42,
-      "label": "근거 관리",
-      "body": "",
-      "color": "blue",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "text",
-      "x": 154,
-      "y": 62,
-      "w": 355,
-      "label": "미수신·접근 실패·재수집 결과의 보존",
-      "size": 10,
-      "h": 50
-    },
-    {
-      "kind": "node",
-      "x": 0,
-      "y": 102,
-      "w": 138,
-      "h": 42,
-      "label": "구현자·리뷰어",
-      "body": "",
-      "color": "purple",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "text",
-      "x": 154,
-      "y": 113,
-      "w": 355,
-      "label": "확보한 근거로 할 일과 보류할 일의 판단",
-      "size": 10,
-      "h": 50
-    },
-    {
-      "kind": "node",
-      "x": 0,
-      "y": 153,
-      "w": 138,
-      "h": 42,
-      "label": "작업 엔진",
-      "body": "",
-      "color": "teal",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "text",
-      "x": 154,
-      "y": 164,
-      "w": 355,
-      "label": "같은 계획의 승인·복구·완료 조건 검사",
-      "size": 10,
-      "h": 50
-    },
-    {
-      "kind": "node",
-      "x": 0,
-      "y": 204,
-      "w": 138,
-      "h": 42,
-      "label": "진행 조정기",
-      "body": "",
-      "color": "gray",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "text",
-      "x": 154,
-      "y": 215,
-      "w": 355,
-      "label": "승인된 다음 행동과 실행 결과의 연결",
-      "size": 10,
-      "h": 50
-    }
-  ]
+  "height": 275,
+  "elements": [],
+  "graph": {
+    "nodes": [
+      {
+        "id": "collect",
+        "x": 0,
+        "y": 0,
+        "w": 145,
+        "h": 57,
+        "label": "수집 어댑터",
+        "body": "요청·응답·오류",
+        "color": "coral"
+      },
+      {
+        "id": "life",
+        "x": 205,
+        "y": 0,
+        "w": 145,
+        "h": 57,
+        "label": "근거 관리",
+        "body": "누락·재수집 기록",
+        "color": "blue"
+      },
+      {
+        "id": "judge",
+        "x": 205,
+        "y": 105,
+        "w": 145,
+        "h": 57,
+        "label": "구현자·리뷰어",
+        "body": "진행 범위·후속 판단",
+        "color": "purple"
+      },
+      {
+        "id": "engine",
+        "x": 0,
+        "y": 210,
+        "w": 145,
+        "h": 57,
+        "label": "작업 엔진",
+        "body": "승인·복구·완료 검사",
+        "color": "teal"
+      },
+      {
+        "id": "continue",
+        "x": 366,
+        "y": 210,
+        "w": 145,
+        "h": 57,
+        "label": "진행 조정기",
+        "body": "다음 행동 예약·실행",
+        "color": "teal"
+      }
+    ],
+    "edges": [
+      {
+        "source": "collect",
+        "target": "life",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "관측 사실",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "life",
+        "target": "judge",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "현재 근거",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "judge",
+        "target": "engine",
+        "source_port": "left",
+        "target_port": "top",
+        "label": "판단 결과",
+        "via": [
+          [
+            73,
+            134
+          ]
+        ],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "engine",
+        "target": "continue",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "허용된 행동",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "continue",
+        "target": "life",
+        "source_port": "top",
+        "target_port": "right",
+        "label": "실행·복구 기록",
+        "via": [
+          [
+            439,
+            29
+          ]
+        ],
+        "color": "teal",
+        "dashed": false
+      }
+    ]
+  }
 }
 ```
 
 ## 수집부터 실행까지의 책임
 
-수집 → 근거 관리 → 작업 판단 → 승인·완료 검사 → 다음 행동 실행으로 책임을 나눴다. 각 계층의 입력·출력을 타입과 공통 인터페이스로 정하고, 그 계약을 실제로 사용하는 경로에서 검사했다.
+수집 → 근거 관리 → 작업 판단 → 승인·완료 검사 → 다음 행동 실행으로 책임을 나눴다. 수집기는 관측한 사실을 저장하고, 작업 판단은 진행할 범위와 보류할 범위를 정한다. 진행 조정기는 승인 규칙을 복제하지 않고 작업 엔진의 공통 검사를 호출한다.
 
-## 타입 검사와 복구 경로 검증
+## 운영에서 드러난 계약 충돌
 
-수집기는 제품 결정을 내리지 않고, 진행 조정기는 승인 조건을 복제하지 않는다. 타입 검사는 인터페이스의 일치를 확인하고, 실제 Git·공개 API·DB 재연결 검사는 중지와 복구 뒤에도 같은 계약이 지켜지는지 확인한다.
+실제 근거 검토가 끝났는데도 결과를 받는 단계에서 실패한 적이 있었다. 읽기 전용 작업에 공통 지시가 메모리 저장 제안까지 요구했기 때문이다. 개별 오류를 허용하는 대신 작업 종류별 계약이 출력 형식·메모리 지시·검증을 함께 결정하도록 바꿨다.
+
+검증 전에 원본 응답과 세션·입력 위치를 보존해 같은 조사를 다시 요청하지 않고 복구할 수 있게 했다. 타입 검사에 더해 실제 API와 DB 재연결 경로에서 완료 결과가 후속 단계에 전달되는지 확인했다. 계약의 일치와 복구는 검사했으며 모델 판단의 정확성은 별도 검토 대상이다.
 
 관련 자료: src/server/evidence/readLifecycle.ts · src/server/workflow.ts · src/server/engine/continuation.ts
 
@@ -389,122 +473,94 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
   "section": "PARTICIPANTS",
   "lead": "역할은 책임, 프로필은 실행 설정, 배정은 연결 관계, 세션은 대화 기록.",
   "source": "src/shared/roles.ts · src/server/roleAssignments.ts · src/server/runtime/providers.ts",
-  "height": 175,
-  "elements": [
-    {
-      "kind": "node",
-      "x": 0.0,
-      "y": 25,
-      "w": 108.25,
-      "h": 84,
-      "label": "역할",
-      "body": "무엇을 맡는가",
-      "color": "blue",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          112.25,
-          67.0
+  "height": 191,
+  "elements": [],
+  "graph": {
+    "nodes": [
+      {
+        "id": "role",
+        "x": 0,
+        "y": 0,
+        "w": 134,
+        "h": 57,
+        "label": "역할",
+        "body": "계획·구현·리뷰",
+        "color": "blue"
+      },
+      {
+        "id": "profile",
+        "x": 377,
+        "y": 0,
+        "w": 134,
+        "h": 57,
+        "label": "실행 프로필",
+        "body": "공급자·모델·강도",
+        "color": "coral"
+      },
+      {
+        "id": "assign",
+        "x": 189,
+        "y": 103,
+        "w": 134,
+        "h": 57,
+        "label": "배정",
+        "body": "작업별 연결·버전",
+        "color": "teal"
+      },
+      {
+        "id": "session",
+        "x": 377,
+        "y": 103,
+        "w": 134,
+        "h": 57,
+        "label": "세션",
+        "body": "호환되는 대화 기록",
+        "color": "purple"
+      }
+    ],
+    "edges": [
+      {
+        "source": "role",
+        "target": "assign",
+        "source_port": "bottom",
+        "target_port": "left",
+        "label": "맡을 일",
+        "via": [
+          [
+            67,
+            132
+          ]
         ],
-        [
-          130.25,
-          67.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 134.25,
-      "y": 25,
-      "w": 108.25,
-      "h": 84,
-      "label": "프로필",
-      "body": "어떤 설정인가",
-      "color": "coral",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          246.5,
-          67.0
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "profile",
+        "target": "assign",
+        "source_port": "left",
+        "target_port": "top",
+        "label": "사용할 설정",
+        "via": [
+          [
+            256,
+            29
+          ]
         ],
-        [
-          264.5,
-          67.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 268.5,
-      "y": 25,
-      "w": 108.25,
-      "h": 84,
-      "label": "배정",
-      "body": "어디에 연결하는가",
-      "color": "teal",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          380.75,
-          67.0
-        ],
-        [
-          398.75,
-          67.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 402.75,
-      "y": 25,
-      "w": 108.25,
-      "h": 84,
-      "label": "세션",
-      "body": "어떤 대화인가",
-      "color": "purple",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "icon",
-      "name": "claude",
-      "x": 9,
-      "y": 131,
-      "size": 24
-    },
-    {
-      "kind": "icon",
-      "name": "openai",
-      "x": 47,
-      "y": 131,
-      "size": 24
-    },
-    {
-      "kind": "text",
-      "x": 86,
-      "y": 133,
-      "w": 425,
-      "label": "공급자 변경 전, 역할·옵션·이전 세션의 호환성을 확인.",
-      "size": 10,
-      "h": 50
-    }
-  ]
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "assign",
+        "target": "session",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "대화 연결",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      }
+    ]
+  }
 }
 ```
 
@@ -527,118 +583,154 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
   "section": "MEDIATION",
   "lead": "대화의 마지막 문장보다 서버의 현재 상태·허용 행동·배정 신원을 먼저 확인.",
   "source": "docs/mediation/policy.md · src/server/mediationAutonomy.ts",
-  "height": 164,
-  "elements": [
-    {
-      "kind": "node",
-      "x": 0.0,
-      "y": 25,
-      "w": 108.25,
-      "h": 88,
-      "label": "맥락 조회",
-      "body": "현재 정책과 배정",
-      "color": "blue",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          112.25,
-          69.0
+  "height": 245,
+  "elements": [],
+  "graph": {
+    "nodes": [
+      {
+        "id": "context",
+        "x": 0,
+        "y": 0,
+        "w": 136,
+        "h": 57,
+        "label": "맥락 조회",
+        "body": "정책·중재자 배정",
+        "color": "blue"
+      },
+      {
+        "id": "resume",
+        "x": 188,
+        "y": 0,
+        "w": 136,
+        "h": 57,
+        "label": "재개 상태 확인",
+        "body": "승인·질문·예산",
+        "color": "teal"
+      },
+      {
+        "id": "identity",
+        "x": 375,
+        "y": 0,
+        "w": 136,
+        "h": 57,
+        "label": "현재 신원 대조",
+        "body": "참여자·배정 버전",
+        "color": "purple"
+      },
+      {
+        "id": "busy",
+        "x": 0,
+        "y": 173,
+        "w": 145,
+        "h": 57,
+        "label": "이미 실행 중",
+        "body": "중복 시작 없이 관찰",
+        "color": "gray"
+      },
+      {
+        "id": "go",
+        "x": 183,
+        "y": 173,
+        "w": 145,
+        "h": 57,
+        "label": "승인 범위 안",
+        "body": "수정·재개·다음 단계",
+        "color": "teal"
+      },
+      {
+        "id": "ask",
+        "x": 366,
+        "y": 173,
+        "w": 145,
+        "h": 57,
+        "label": "실제 결정 필요",
+        "body": "제품·권한·인증 확인",
+        "color": "coral"
+      }
+    ],
+    "edges": [
+      {
+        "source": "context",
+        "target": "resume",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "현재 사실",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "resume",
+        "target": "identity",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "허용 행동",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "identity",
+        "target": "busy",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "실행 중",
+        "via": [
+          [
+            443,
+            104
+          ],
+          [
+            73,
+            104
+          ]
         ],
-        [
-          130.25,
-          69.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 134.25,
-      "y": 25,
-      "w": 108.25,
-      "h": 88,
-      "label": "재개 상태",
-      "body": "승인·질문·예산",
-      "color": "teal",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          246.5,
-          69.0
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "identity",
+        "target": "go",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "실행 가능",
+        "via": [
+          [
+            443,
+            128
+          ],
+          [
+            255,
+            128
+          ]
         ],
-        [
-          264.5,
-          69.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 268.5,
-      "y": 25,
-      "w": 108.25,
-      "h": 88,
-      "label": "신원 확인",
-      "body": "참여자와 버전",
-      "color": "purple",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          380.75,
-          69.0
-        ],
-        [
-          398.75,
-          69.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 402.75,
-      "y": 25,
-      "w": 108.25,
-      "h": 88,
-      "label": "다음 행동",
-      "body": "허용된 작업 실행",
-      "color": "coral",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "text",
-      "x": 0,
-      "y": 137,
-      "w": 511,
-      "label": "이미 실행 중이면 중복 시작하지 않고, 실제로 필요한 결정만 사용자에게 요청.",
-      "size": 10,
-      "h": 50
-    }
-  ]
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "identity",
+        "target": "ask",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "조건 부족",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      }
+    ]
+  }
 }
 ```
 
 ## 중재자 교체와 상태 확인
 
-대화의 마지막 문장만 보고 재개하지 않도록 현재 맥락 조회, 재개 상태 확인, 역할 배정 신원 확인 순서를 둔다. 중재자가 교체돼도 이전 승인과 질문이 사라지거나 이미 실행 중인 작업을 중복 시작하지 않게 하는 절차다.
+대화의 마지막 문장만 보고 재개하지 않도록 현재 맥락 조회, 재개 상태 확인, 역할 배정 신원 확인 순서를 둔다. 이전 승인과 질문을 유지하고 이미 실행 중인 작업을 중복 시작하지 않게 하는 절차다.
 
-## 자동 진행의 권한 범위
+## 하위 작업의 연결 누락과 복구
 
-자동 진행 정책은 매번 “계속할까요?”라고 묻는 비용을 줄인다. 그렇다고 구현자가 승인 범위를 넓히거나 리뷰 예산을 추가할 권한까지 갖는 것은 아니다. 로컬 완료, 공개 전달, 운영 설치 같은 행동은 해당 작업에 부여된 권한을 따라야 한다.
+상위 작업에는 중재 세션이 연결돼 있었지만 새 하위 작업은 미배정으로 표시됐다. 배정 조회가 자기 작업과 전역 설정만 확인해 상위 연결을 놓친 것이 원인이었다. 가장 가까운 상위 중재자 배정을 조회하되 원래 버전과 세션을 유지하도록 고쳤다.
+
+배정을 새로 만들면 기존 신원과 승인 기록이 어긋날 수 있어 조회 규칙을 수정했다. 하위 작업에 명시한 배정은 우선한다. 공개 API에서 두 단계 상속, 서버 재시작 뒤 연결 유지, 하위 재배정 뒤 이전 신원의 거부를 확인했다.
 
 관련 자료: docs/mediation/policy.md · src/server/mediationAutonomy.ts
 
@@ -651,121 +743,155 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
   "section": "CONTINUATION",
   "lead": "승인된 행동을 DB에 저장하고, 대화의 알림 수신 여부와 별도로 실행 결과를 추적.",
   "source": "src/server/engine/continuation.ts · src/server/continuationStore.ts · src/shared/workflowLifecycle.ts",
-  "height": 192,
-  "elements": [
-    {
-      "kind": "node",
-      "x": 0.0,
-      "y": 25,
-      "w": 108.25,
-      "h": 85,
-      "label": "진행 예약",
-      "body": "계획·범위 저장",
-      "color": "blue",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          112.25,
-          67.5
+  "height": 220,
+  "elements": [],
+  "graph": {
+    "nodes": [
+      {
+        "id": "reserve",
+        "x": 0,
+        "y": 0,
+        "w": 129,
+        "h": 57,
+        "label": "진행 예약",
+        "body": "계획·권한 저장",
+        "color": "blue"
+      },
+      {
+        "id": "evidence",
+        "x": 191,
+        "y": 0,
+        "w": 129,
+        "h": 57,
+        "label": "근거 검토",
+        "body": "현재 계획 영향",
+        "color": "coral"
+      },
+      {
+        "id": "run",
+        "x": 382,
+        "y": 0,
+        "w": 129,
+        "h": 57,
+        "label": "구현·리뷰",
+        "body": "승인 범위 실행",
+        "color": "purple"
+      },
+      {
+        "id": "restore",
+        "x": 0,
+        "y": 142,
+        "w": 129,
+        "h": 57,
+        "label": "기록 대조·복구",
+        "body": "예약과 실제 실행",
+        "color": "gray"
+      },
+      {
+        "id": "next",
+        "x": 191,
+        "y": 142,
+        "w": 129,
+        "h": 57,
+        "label": "다음 계획 시작",
+        "body": "새 계획 승인 확인",
+        "color": "teal"
+      },
+      {
+        "id": "done",
+        "x": 382,
+        "y": 142,
+        "w": 129,
+        "h": 57,
+        "label": "로컬 완료",
+        "body": "검토한 커밋",
+        "color": "teal"
+      }
+    ],
+    "edges": [
+      {
+        "source": "reserve",
+        "target": "evidence",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "저장 후",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "evidence",
+        "target": "run",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "진행 가능",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "run",
+        "target": "done",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "검사·리뷰 통과",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "done",
+        "target": "next",
+        "source_port": "left",
+        "target_port": "right",
+        "label": "결과 전달",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "reserve",
+        "target": "restore",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "서버 재시작",
+        "via": [],
+        "color": "teal",
+        "dashed": true
+      },
+      {
+        "source": "restore",
+        "target": "reserve",
+        "source_port": "left",
+        "target_port": "left",
+        "label": "미실행 확인",
+        "via": [
+          [
+            -20,
+            170
+          ],
+          [
+            -20,
+            29
+          ]
         ],
-        [
-          130.25,
-          67.5
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 134.25,
-      "y": 25,
-      "w": 108.25,
-      "h": 85,
-      "label": "근거 검토",
-      "body": "승인 조건 확인",
-      "color": "coral",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          246.5,
-          67.5
-        ],
-        [
-          264.5,
-          67.5
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 268.5,
-      "y": 25,
-      "w": 108.25,
-      "h": 85,
-      "label": "구현·리뷰",
-      "body": "결과 검증",
-      "color": "purple",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          380.75,
-          67.5
-        ],
-        [
-          398.75,
-          67.5
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 402.75,
-      "y": 25,
-      "w": 108.25,
-      "h": 85,
-      "label": "로컬 완료",
-      "body": "다음 계획 시작",
-      "color": "teal",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "node",
-      "x": 0,
-      "y": 132,
-      "w": 511,
-      "h": 51,
-      "label": "재시작 시 예약과 실제 실행 기록 대조",
-      "body": "",
-      "color": "gray",
-      "size": 11,
-      "body_size": 9.6
-    }
-  ]
+        "color": "gray",
+        "dashed": true
+      }
+    ]
+  }
 }
 ```
 
-## 승인된 계획의 연속 실행
+## 계획 합의 뒤 멈춘 실행 경로
 
-자동 진행을 승인한 계획은 근거 검토, 구현과 리뷰, 로컬 완료, 지정된 다음 단계의 계획 시작으로 이어진다. 새 단계의 계획 승인은 별도로 확인한다. 알림은 이 진행을 보여 주는 수단이며 실행 조건을 대신하지 않는다.
+계획 합의는 끝났지만 승인은 근거 영향 검토를 기다렸고, 자동 검토는 첫 계획의 승인 대기를 처리하지 않았다. 알림만 보내서는 채워지지 않는 공백이었다. 계획 마무리에 근거 검토를 연결하고 다음 행동의 책임을 서버로 모았다.
 
-## 실행 상태와 재개 위치의 저장
+## 승인된 계획과 재개 위치의 보존
 
-실행 시작·정지·실패의 상태와 사건을 하나의 DB 트랜잭션으로 기록한다. 저장 중 종료돼도 확정된 기록을 기준으로 복구한다. 새 실패를 무한 재시도하거나, 종료된 실행이 새 계획의 상태를 덮어쓰지 않게 한다.
+서버는 현재 계획·범위·중재자·허용 전달 범위를 저장하고 공통 승인·완료 검사를 호출한다. 근거 검토부터 구현·리뷰·로컬 완료·다음 단계의 계획 시작까지 이어 가되 새 계획의 승인은 별도로 받는다. 실행 상태와 사건도 함께 저장해 중간 종료 뒤 재개 위치가 달라지지 않게 했다.
+
+실제 API 검사에서는 한 번의 진행 요청 뒤 중간 행동을 대신 호출하지 않고 DB 재연결부터 다음 계획 시작까지 관찰했다. 모델 응답은 대역을 사용했다. 사용자 중지·새 계획·중재자 교체 시에는 늦은 응답으로 실행이 다시 시작되지 않는지도 확인했다.
 
 관련 자료: src/server/engine/continuation.ts · src/server/continuationStore.ts · src/shared/workflowLifecycle.ts
 
@@ -778,42 +904,117 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
   "section": "PLANNING",
   "lead": "같은 결과를 만드는 설계·구현·검사는 한 단계 안의 체크리스트로 구성.",
   "source": "src/shared/workGroups.ts · src/server/workGroups.ts",
-  "height": 167,
-  "elements": [
-    {
-      "kind": "node",
-      "x": 0,
-      "y": 18,
-      "w": 242,
-      "h": 100,
-      "label": "파일 단위로 분리",
-      "body": "타입 → 구현 → 테스트마다 인계",
-      "color": "gray",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "node",
-      "x": 269,
-      "y": 18,
-      "w": 242,
-      "h": 100,
-      "label": "하나의 결과로 구성",
-      "body": "파서의 입력·출력 계약 완성",
-      "color": "teal",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "text",
-      "x": 0,
-      "y": 135,
-      "w": 511,
-      "label": "검색 기능처럼 독립된 결과가 생길 때 다음 단계로 분리.",
-      "size": 10,
-      "h": 50
-    }
-  ]
+  "height": 188,
+  "elements": [],
+  "graph": {
+    "nodes": [
+      {
+        "id": "type",
+        "x": 0,
+        "y": 0,
+        "w": 128,
+        "h": 57,
+        "label": "타입·계약",
+        "body": "입력과 출력",
+        "color": "blue"
+      },
+      {
+        "id": "code",
+        "x": 191,
+        "y": 0,
+        "w": 128,
+        "h": 57,
+        "label": "파서 구현",
+        "body": "같은 계약의 동작",
+        "color": "coral"
+      },
+      {
+        "id": "test",
+        "x": 382,
+        "y": 0,
+        "w": 129,
+        "h": 57,
+        "label": "파서 검사",
+        "body": "같은 결과의 검증",
+        "color": "purple"
+      },
+      {
+        "id": "result",
+        "x": 0,
+        "y": 116,
+        "w": 319,
+        "h": 61,
+        "label": "하나의 완료 결과",
+        "body": "파서 계약 완성: 타입·구현·검사를 함께 확인",
+        "color": "teal"
+      },
+      {
+        "id": "search",
+        "x": 382,
+        "y": 120,
+        "w": 129,
+        "h": 57,
+        "label": "검색 기능",
+        "body": "별도의 사용자 결과",
+        "color": "blue"
+      }
+    ],
+    "edges": [
+      {
+        "source": "type",
+        "target": "code",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "기준",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "code",
+        "target": "test",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "검증 대상",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "test",
+        "target": "result",
+        "source_port": "bottom",
+        "target_port": "right",
+        "label": "완료",
+        "via": [
+          [
+            447,
+            95
+          ],
+          [
+            347,
+            95
+          ],
+          [
+            347,
+            147
+          ]
+        ],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "result",
+        "target": "search",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "선행 결과",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      }
+    ]
+  }
 }
 ```
 
@@ -829,99 +1030,154 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
 
 # 근거 변경과 판단 보존
 
-미래 단계를 추가·분할·병합하거나 순서를 바꿀 수 있다. 다만 이미 실행과 연결되거나 완료된 단계의 구조를 덮어써 기존 결과의 의미를 바꾸지는 않는다. 진행 중인 단계의 전제가 바뀌면 변경 기록과 재계획을 연결한다.
+미래 단계는 추가·분할·병합할 수 있지만 완료 결과의 의미를 덮어쓰지는 않는다. 진행 중 전제가 바뀌면 변경 기록과 재계획을 연결하고, 이미 조사한 사실 중 무엇이 여전히 유효한지 구분한다.
 
 ```diagram
 {
   "section": "EVIDENCE",
   "lead": "변경된 근거의 영향만 다시 확인하고, 관련 없는 결과와 기존 구현 의무는 보존.",
   "source": "",
-  "height": 167,
-  "elements": [
-    {
-      "kind": "node",
-      "x": 0.0,
-      "y": 25,
-      "w": 153.0,
-      "h": 90,
-      "label": "원문 변경",
-      "body": "새 버전·내용 확인",
-      "color": "coral",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          157.0,
-          70.0
+  "height": 234,
+  "elements": [],
+  "graph": {
+    "nodes": [
+      {
+        "id": "change",
+        "x": 0,
+        "y": 0,
+        "w": 136,
+        "h": 57,
+        "label": "원문 변경",
+        "body": "새 버전·내용 확인",
+        "color": "coral"
+      },
+      {
+        "id": "impact",
+        "x": 189,
+        "y": 0,
+        "w": 136,
+        "h": 57,
+        "label": "영향 판단",
+        "body": "현재 계획과 대조",
+        "color": "blue"
+      },
+      {
+        "id": "keep",
+        "x": 377,
+        "y": 0,
+        "w": 134,
+        "h": 57,
+        "label": "기존 판단 유지",
+        "body": "무관한 결과 보존",
+        "color": "gray"
+      },
+      {
+        "id": "revise",
+        "x": 189,
+        "y": 164,
+        "w": 136,
+        "h": 57,
+        "label": "관련 판단 갱신",
+        "body": "구현 의무와 함께 대조",
+        "color": "purple"
+      },
+      {
+        "id": "resume",
+        "x": 377,
+        "y": 164,
+        "w": 134,
+        "h": 57,
+        "label": "다음 행동",
+        "body": "현재 계획으로 진행",
+        "color": "teal"
+      }
+    ],
+    "edges": [
+      {
+        "source": "change",
+        "target": "impact",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "변경 근거",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "impact",
+        "target": "keep",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "영향 없음",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "impact",
+        "target": "revise",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "영향 있음",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "revise",
+        "target": "resume",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "검토 완료",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "keep",
+        "target": "resume",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "유효한 결과",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "revise",
+        "target": "impact",
+        "source_port": "left",
+        "target_port": "left",
+        "label": "재계획 실패",
+        "via": [
+          [
+            157,
+            193
+          ],
+          [
+            157,
+            29
+          ]
         ],
-        [
-          175.0,
-          70.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 179.0,
-      "y": 25,
-      "w": 153.0,
-      "h": 90,
-      "label": "영향 검토",
-      "body": "관련 판단만 갱신",
-      "color": "blue",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          336.0,
-          70.0
-        ],
-        [
-          354.0,
-          70.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 358.0,
-      "y": 25,
-      "w": 153.0,
-      "h": 90,
-      "label": "결과 보존",
-      "body": "무관한 결과·구현 의무",
-      "color": "teal",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "text",
-      "x": 0,
-      "y": 136,
-      "w": 511,
-      "label": "재계획에 실패하면 대기 기록을 보존하고, 이전 계획의 늦은 응답을 차단.",
-      "size": 10,
-      "h": 50
-    }
-  ]
+        "color": "coral",
+        "dashed": true
+      }
+    ]
+  }
 }
 ```
 
-## 변경 영향과 구현 의무의 보존
+## 전체 초기화에서 영향 범위 확인으로
 
-바뀐 근거가 현재 계획에 영향을 주는지 검토하고 관련 판단만 갱신한다. 기존 구현 의무는 ID뿐 아니라 내용·처분·근거까지 대조해 보존한다. 계획 이후에 수행할 구현과 검증을 현재 계획의 입력 부족으로 잘못 분류하지 않도록 구분했다.
+외부 원문 하나만 바뀌어도 채택한 사실을 모두 비워, 관계없는 자료까지 다시 조사하는 문제가 있었다. 원문이 바뀐 사실과 여러 원문을 함께 인용한 결론은 다시 확인하되, 참조가 모두 유효한 독립 사실은 보존하도록 바꿨다.
 
-## 재계획 실패와 늦은 응답
+사용자 지시·코드·선택한 메모리까지 같을 때만 이 재사용을 허용한다. 승인과 최종 결론은 새 근거의 모순 여부를 검토해야 하므로 별도로 갱신한다. 앞선 판단을 통째로 유지하는 것과 유효한 조사 결과를 재사용하는 것을 구분한 선택이다.
 
-재계획 중 오류가 나면 해당 변경을 대기 상태로 보존한다. 이전 계획으로 실행하던 응답이 늦게 도착해도 새 계획의 결과로 받아들이지 않는다. 같은 변경을 다시 처리할 때는 기존 기록과 예산을 이어 사용한다.
+## 재사용의 효과와 실패 복구
+
+두 독립 원문 중 하나만 바꾸는 검사에서 변경 원문을 인용한 결론은 제거되고 다른 사실은 유지됐다. 기존 읽음 기록과 해시를 비교하므로 보존 여부를 확인하려고 모델을 추가 호출하지 않는다. 운영 토큰 절감률은 아직 같은 조건으로 비교하지 않았다.
+
+재계획이 실패하면 변경과 재개 위치를 남긴다. 이전 실행의 늦은 응답은 새 계획의 결과로 받지 않으며 기존 기록과 사용량에서 이어 간다.
 
 # 원문의 분할 조회와 읽음 기록
 
@@ -932,92 +1188,141 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
   "section": "READING",
   "lead": "자료의 출처·버전·위치와 실제 전달 구간을 함께 보존.",
   "source": "docs/guarded-planning.md",
-  "height": 163,
-  "elements": [
-    {
-      "kind": "node",
-      "x": 0.0,
-      "y": 25,
-      "w": 153.0,
-      "h": 90,
-      "label": "자료 목록",
-      "body": "위치·현재 판단",
-      "color": "blue",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          157.0,
-          70.0
+  "height": 201,
+  "elements": [],
+  "graph": {
+    "nodes": [
+      {
+        "id": "index",
+        "x": 0,
+        "y": 0,
+        "w": 126,
+        "h": 57,
+        "label": "자료 목록",
+        "body": "필요한 원문의 위치",
+        "color": "blue"
+      },
+      {
+        "id": "chunk",
+        "x": 192,
+        "y": 0,
+        "w": 126,
+        "h": 57,
+        "label": "원문 조각",
+        "body": "현재 버전·구간",
+        "color": "coral"
+      },
+      {
+        "id": "receipt",
+        "x": 385,
+        "y": 0,
+        "w": 126,
+        "h": 57,
+        "label": "읽음 기록",
+        "body": "해시·전달 구간",
+        "color": "purple"
+      },
+      {
+        "id": "more",
+        "x": 192,
+        "y": 130,
+        "w": 126,
+        "h": 57,
+        "label": "다음 위치",
+        "body": "cursor·남은 구간",
+        "color": "gray"
+      },
+      {
+        "id": "decision",
+        "x": 385,
+        "y": 130,
+        "w": 126,
+        "h": 57,
+        "label": "최종 판단",
+        "body": "필수 읽기 완료",
+        "color": "teal"
+      }
+    ],
+    "edges": [
+      {
+        "source": "index",
+        "target": "chunk",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "조회",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "chunk",
+        "target": "receipt",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "실제 전달",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "receipt",
+        "target": "more",
+        "source_port": "bottom",
+        "target_port": "right",
+        "label": "더 읽기",
+        "via": [
+          [
+            448,
+            108
+          ],
+          [
+            352,
+            108
+          ],
+          [
+            352,
+            159
+          ]
         ],
-        [
-          175.0,
-          70.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 179.0,
-      "y": 25,
-      "w": 153.0,
-      "h": 90,
-      "label": "필요 구간 조회",
-      "body": "조각 1 → 2 → 3",
-      "color": "coral",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          336.0,
-          70.0
-        ],
-        [
-          354.0,
-          70.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 358.0,
-      "y": 25,
-      "w": 153.0,
-      "h": 90,
-      "label": "읽음 기록",
-      "body": "버전·해시·바이트 범위",
-      "color": "teal",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "text",
-      "x": 0,
-      "y": 135,
-      "w": 511,
-      "label": "필수 읽기가 남은 응답은 중간 결과로 보존하며, 실제 전달 구간만 인용.",
-      "size": 10,
-      "h": 50
-    }
-  ]
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "more",
+        "target": "chunk",
+        "source_port": "top",
+        "target_port": "bottom",
+        "label": "이어 읽기",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "receipt",
+        "target": "decision",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "필수 구간 완료",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      }
+    ]
+  }
 }
 ```
 
-## 원문 조각의 출처와 전달 기록
+## 단계가 바뀔 때 반복된 공통 계약 읽기
 
-읽은 조각에는 출처, 버전, 내용 해시, 바이트 범위, 다음 위치가 연결된다. 같은 문서의 앞부분을 반복해서 보내거나 버전이 다른 조각을 하나의 원문처럼 합치지 않도록 확인한다. 실제로 전달된 조각만 근거로 인용할 수 있다.
+10월 운영에서 근거 검토 뒤 계획 개정에 2,559초가 걸렸다. 기록에는 64,434바이트 요청서를 처음부터 다시 읽은 흔적이 있었다. 같은 공통 계약을 단계별 지시 앞에 붙여 문서 전체 해시를 바꾼 것이 원인이었다.
 
-## 컨텍스트 손실의 복구 조건
+공통 계약을 별도 필수 문서로 분리하고 세션·작업·본문 해시·읽은 구간이 같으면 완독 기록을 재사용하도록 했다. 새 단계의 지시와 출력 형식은 현재 요청에 남겼다. 필요한 지시까지 늦추지 않으면서 반복 전송을 줄이기 위한 선택이다.
 
-누적 입력 크기만으로 강제 요약이나 새 세션을 만들지 않는다. 실제 컨텍스트 한도나 세션 손실이 확인됐을 때만 제한된 체크포인트 복구를 사용한다. 공급자·모델·설정과 누적 예산을 유지한다. 자료를 읽은 기록이 사라졌다면 재조회 이유를 남긴다.
+## 재전송 감소와 안전한 재열람
+
+모델 대역을 사용한 실제 어댑터 검사에서 완독한 계약이 다음 개정 요청에 다시 실리지 않았다. 첫 전달도 조각마다 호출하지 않고 요청의 남은 공간에 여러 조각을 함께 넣었다. 내용 변경·세션 손실·응답 미확인 때는 다시 읽고, 미완독 구간은 계속 추적한다.
+
+이 결과는 재전송과 불필요한 호출 경로를 줄였다는 근거다. 2,559초는 수정 전 관측이며, 수정 후 운영 시간과 토큰의 절감률은 별도 비교가 필요하다.
 
 관련 자료: docs/guarded-planning.md
 
@@ -1030,82 +1335,99 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
   "section": "KNOWLEDGE",
   "lead": "색인에서 찾은 문서와 실제로 읽고 판단에 사용한 원문을 구분.",
   "source": "docs/memory-retrieval.md · src/server/wikiEvidence.ts",
-  "height": 169,
-  "elements": [
-    {
-      "kind": "node",
-      "x": 0.0,
-      "y": 25,
-      "w": 153.0,
-      "h": 90,
-      "label": "위키 색인",
-      "body": "관련 문서의 위치",
-      "color": "blue",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          157.0,
-          70.0
+  "height": 190,
+  "elements": [],
+  "graph": {
+    "nodes": [
+      {
+        "id": "index",
+        "x": 0,
+        "y": 0,
+        "w": 135,
+        "h": 57,
+        "label": "위키 색인",
+        "body": "관련 문서의 위치",
+        "color": "blue"
+      },
+      {
+        "id": "read",
+        "x": 190,
+        "y": 0,
+        "w": 135,
+        "h": 57,
+        "label": "본문 조회",
+        "body": "실제 읽은 버전",
+        "color": "coral"
+      },
+      {
+        "id": "evidence",
+        "x": 376,
+        "y": 0,
+        "w": 135,
+        "h": 57,
+        "label": "판단 근거",
+        "body": "내용·적용 범위",
+        "color": "teal"
+      },
+      {
+        "id": "new",
+        "x": 190,
+        "y": 125,
+        "w": 135,
+        "h": 57,
+        "label": "새 원문 감지",
+        "body": "질문·제안·결정 구분",
+        "color": "purple"
+      }
+    ],
+    "edges": [
+      {
+        "source": "index",
+        "target": "read",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "선택·조회",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "read",
+        "target": "evidence",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "출처 연결",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "new",
+        "target": "read",
+        "source_port": "top",
+        "target_port": "bottom",
+        "label": "현재 내용 확인",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "evidence",
+        "target": "new",
+        "source_port": "bottom",
+        "target_port": "right",
+        "label": "갱신 확인",
+        "via": [
+          [
+            443,
+            154
+          ]
         ],
-        [
-          175.0,
-          70.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 179.0,
-      "y": 25,
-      "w": 153.0,
-      "h": 90,
-      "label": "본문 조회",
-      "body": "실제로 읽은 버전",
-      "color": "coral",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          336.0,
-          70.0
-        ],
-        [
-          354.0,
-          70.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 358.0,
-      "y": 25,
-      "w": 153.0,
-      "h": 90,
-      "label": "판단 근거",
-      "body": "내용과 적용 범위",
-      "color": "teal",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "text",
-      "x": 0,
-      "y": 137,
-      "w": 511,
-      "label": "검색 정확도 · 근거 최신성 · 전달량 · 실제 비용은 각각 별도로 확인.",
-      "size": 10,
-      "h": 50
-    }
-  ]
+        "color": "gray",
+        "dashed": true
+      }
+    ]
+  }
 }
 ```
 
@@ -1130,140 +1452,185 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
   "section": "SOURCES",
   "lead": "등록한 출처의 변경 감지와 모델에 전달할 근거의 판단을 분리.",
   "source": "docs/external-evidence.md · src/server/evidence/",
-  "height": 278,
-  "elements": [
-    {
-      "kind": "node",
-      "x": 0,
-      "y": 0,
-      "w": 151,
-      "h": 84,
-      "label": "Slack",
-      "body": "등록한 대화",
-      "color": "coral",
-      "size": 11,
-      "body_size": 9.6,
-      "icon": "slack"
-    },
-    {
-      "kind": "node",
-      "x": 180,
-      "y": 0,
-      "w": 151,
-      "h": 84,
-      "label": "Jira",
-      "body": "본문과 댓글",
-      "color": "blue",
-      "size": 11,
-      "body_size": 9.6,
-      "icon": "jira"
-    },
-    {
-      "kind": "node",
-      "x": 360,
-      "y": 0,
-      "w": 151,
-      "h": 84,
-      "label": "Figma",
-      "body": "버전과 노드",
-      "color": "purple",
-      "size": 11,
-      "body_size": 9.6,
-      "icon": "figma"
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          76,
-          90
+  "height": 263,
+  "elements": [],
+  "graph": {
+    "nodes": [
+      {
+        "id": "slack",
+        "x": 0,
+        "y": 0,
+        "w": 149,
+        "h": 62,
+        "label": "Slack",
+        "body": "등록된 대화",
+        "color": "coral",
+        "icon": "slack"
+      },
+      {
+        "id": "jira",
+        "x": 181,
+        "y": 0,
+        "w": 149,
+        "h": 62,
+        "label": "Jira",
+        "body": "본문·댓글",
+        "color": "blue",
+        "icon": "jira"
+      },
+      {
+        "id": "figma",
+        "x": 362,
+        "y": 0,
+        "w": 149,
+        "h": 62,
+        "label": "Figma",
+        "body": "버전·노드",
+        "color": "purple",
+        "icon": "figma"
+      },
+      {
+        "id": "collect",
+        "x": 0,
+        "y": 113,
+        "w": 230,
+        "h": 65,
+        "label": "수집·원문 보존",
+        "body": "실제 요청·응답·접근 오류",
+        "color": "gray"
+      },
+      {
+        "id": "judge",
+        "x": 292,
+        "y": 113,
+        "w": 219,
+        "h": 65,
+        "label": "근거 영향 검토",
+        "body": "현재 계획과 변경 내용 대조",
+        "color": "teal"
+      },
+      {
+        "id": "again",
+        "x": 0,
+        "y": 204,
+        "w": 230,
+        "h": 57,
+        "label": "누락·재수집 기록",
+        "body": "미수신과 접근 실패의 구분",
+        "color": "coral"
+      }
+    ],
+    "edges": [
+      {
+        "source": "slack",
+        "target": "collect",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "REST / 커넥터",
+        "via": [
+          [
+            75,
+            92
+          ],
+          [
+            115,
+            92
+          ]
         ],
-        [
-          76,
-          109
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          255,
-          90
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "jira",
+        "target": "collect",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "원문 수집",
+        "via": [
+          [
+            255,
+            84
+          ],
+          [
+            115,
+            84
+          ]
         ],
-        [
-          255,
-          109
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          435,
-          90
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "figma",
+        "target": "collect",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "관련 노드",
+        "via": [
+          [
+            437,
+            99
+          ],
+          [
+            115,
+            99
+          ]
         ],
-        [
-          435,
-          109
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 0,
-      "y": 115,
-      "w": 511,
-      "h": 65,
-      "label": "수집·원문 보존",
-      "body": "등록한 모든 출처의 실제 요청과 응답을 기록",
-      "color": "gray",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          255,
-          185
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "collect",
+        "target": "judge",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "새 근거",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "collect",
+        "target": "again",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "누락·오류",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "again",
+        "target": "collect",
+        "source_port": "left",
+        "target_port": "left",
+        "label": "재수집 성공",
+        "via": [
+          [
+            -20,
+            233
+          ],
+          [
+            -20,
+            145
+          ]
         ],
-        [
-          255,
-          204
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 0,
-      "y": 210,
-      "w": 511,
-      "h": 65,
-      "label": "근거 영향 검토",
-      "body": "갱신한 원문이 현재 계획과 판단에 미치는 영향 확인",
-      "color": "teal",
-      "size": 11,
-      "body_size": 9.6
-    }
-  ]
+        "color": "coral",
+        "dashed": true
+      }
+    ]
+  }
 }
 ```
 
 ## 수집과 모델 전달의 분리
 
-수집 자체는 LLM을 호출하지 않는다. 변경분은 실행 전 근거 영향 검토와 시작·재개 입력에 연결한다. 커넥터 방식은 해당 호스트의 자료 수집이 필요하며, REST 인증과 커넥터 인증을 자동으로 같은 것으로 취급하지 않는다.
+수집 자체는 LLM을 호출하지 않는다. 변경분만 실행 전 영향 검토와 시작·재개 입력에 연결한다. Figma는 계획에서 화면 링크를 보관하고, 구현자가 화면을 만들 때 필요한 노드와 이미지를 직접 확인한다. 링크나 캐시 이미지만으로 디자인 검증을 완료했다고 판단하지 않는다.
 
-## Figma 확인 시점과 수집 실패
+## 재확인 기한과 접근 실패의 구분
 
-계획 단계는 화면별 링크를 디자인의 위치로 보관한다. 레이아웃·크기·간격·폰트·색상·노드 트리·스크린샷을 모아 계획에 옮기지 않는다. 구현자가 해당 화면을 만들 때 필요한 자료를 직접 확인한다. 링크나 캐시된 이미지가 있다는 사실만으로 디자인을 검증했다고 판단하지 않는다.
+운영 중 정상 수집된 원문이 30분 뒤 읽기 대상에서 빠져 기존 판단까지 사라졌다. 직접 조회는 성공했는데 재확인 기한을 접근 실패로 해석한 것이 원인이었다. 저장된 원문의 사용 가능 여부와 최신 확인 필요 상태를 분리했다.
 
-자료 변경이나 장기간 미확인은 실행·결과 수락 전 재검토가 필요하다. 접근 거부와 요청 제한을 최신 상태의 근거로 쓰지 않는다. 같은 본문을 다시 전달하지 않아도 API 조회나 공급자의 캐시 입력 비용은 남을 수 있다.
+기한이 지나도 정상 원문은 유지하고 재확인 요청을 남긴다. 실제 접근 오류·누락은 성공으로 바꾸지 않는다. 계획 도중 30분을 넘기는 검사에서 같은 원문과 사실을 유지한 채 완료했고, 실제 수집 실패를 거부하는 검사도 유지했다.
 
 관련 자료: docs/external-evidence.md · src/server/evidence/
 
@@ -1276,52 +1643,126 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
   "section": "RECOVERY",
   "lead": "부족한 자료에 의존하는 부분만 후속 목록으로 넘기고, 확보한 근거의 범위에서 진행.",
   "source": "src/server/evidence/readLifecycle.ts · src/server/evidence/service.ts",
-  "height": 171,
-  "elements": [
-    {
-      "kind": "node",
-      "x": 0,
-      "y": 18,
-      "w": 242,
-      "h": 100,
-      "label": "확보한 근거",
-      "body": "확인된 범위의 구현과 리뷰 진행",
-      "color": "teal",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "node",
-      "x": 269,
-      "y": 18,
-      "w": 242,
-      "h": 100,
-      "label": "부족한 자료",
-      "body": "의존 동작·오류를 후속 목록에 보존",
-      "color": "coral",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "text",
-      "x": 0,
-      "y": 135,
-      "w": 511,
-      "label": "공백 해소: 같은 요청의 성공 응답 확인. 필수 검사 실패와 제품 결정 부족은 별도 유지.",
-      "size": 10,
-      "h": 50
-    }
-  ]
+  "height": 227,
+  "elements": [],
+  "graph": {
+    "nodes": [
+      {
+        "id": "read",
+        "x": 0,
+        "y": 0,
+        "w": 135,
+        "h": 57,
+        "label": "자료 조회",
+        "body": "요청·결과 기록",
+        "color": "blue"
+      },
+      {
+        "id": "decision",
+        "x": 187,
+        "y": 0,
+        "w": 137,
+        "h": 57,
+        "label": "영향 판단",
+        "body": "현재 근거로 가능한 일",
+        "color": "purple"
+      },
+      {
+        "id": "run",
+        "x": 376,
+        "y": 0,
+        "w": 135,
+        "h": 57,
+        "label": "구현·리뷰",
+        "body": "확인된 범위 진행",
+        "color": "teal"
+      },
+      {
+        "id": "todo",
+        "x": 187,
+        "y": 153,
+        "w": 137,
+        "h": 57,
+        "label": "후속 목록",
+        "body": "누락 자료·의존 동작",
+        "color": "coral"
+      },
+      {
+        "id": "collect",
+        "x": 0,
+        "y": 153,
+        "w": 135,
+        "h": 57,
+        "label": "재수집",
+        "body": "같은 요청의 성공 응답",
+        "color": "gray"
+      }
+    ],
+    "edges": [
+      {
+        "source": "read",
+        "target": "decision",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "관측 사실",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "decision",
+        "target": "run",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "진행 가능",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "decision",
+        "target": "todo",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "근거 부족",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "todo",
+        "target": "collect",
+        "source_port": "left",
+        "target_port": "right",
+        "label": "재확인",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "collect",
+        "target": "read",
+        "source_port": "top",
+        "target_port": "bottom",
+        "label": "공백 해소",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      }
+    ]
+  }
 }
 ```
 
-## 미수신과 접근 실패의 기록
+## 한 자료의 실패가 전체 중지로 번진 사례
 
-요청했지만 응답이 없었던 경우와 실제 접근 오류를 구분한다. 둘 다 수집 성공이 아니다. 새 요청을 보내면 수집 상태를 다시 추적하고, 같은 요청의 성공 응답을 확인한 뒤에만 공백을 해소한다.
+운영 재개 턴에는 미수신 요청이 36개 있었다. Figma 한 요청이 호출 제한을 받자 나머지 35개를 읽지 못한 채 전체 실행이 멈췄다. 일반 정책은 부족한 부분을 보류하도록 했지만 디자인 도구는 이전 요청 전체의 재조회를 요구했다.
 
-## 호스트 기록과 모델 판단의 경계
+## 관측 상태와 작업 처분의 분리
 
-호스트는 누락을 저장하지만 리뷰어가 하지 않은 판단을 만들어 넣지 않는다. 구현자와 리뷰어가 같은 보류 목록을 읽고, 후속 단계에도 미해결 항목이 전달되게 했다. 링크를 지웠다는 이유만으로 누락이 해결되지는 않는다.
+응답 미수신, 실제 접근 오류, 성공 관측을 구분하고, 그 자료가 필요한 동작만 후속 목록으로 보낸다. 구현자와 리뷰어가 같은 목록을 읽도록 해 도구별 판단이 어긋나지 않게 했다. 새 읽기 요청의 성공 응답을 확인해야 공백이 해소된다.
+
+실제 Git·API·DB 재연결 검사에서 한 요청의 오류가 있어도 지원되는 코드 변경·리뷰·로컬 커밋·다음 계획으로 이어졌다. 나머지 미수신 35개는 후속 목록에 남았다. 모델 응답은 대역이며, 이 검사는 누락을 숨기지 않으면서 실행 경로를 이어 가는지를 확인한다.
 
 관련 자료: src/server/evidence/readLifecycle.ts · src/server/evidence/service.ts
 
@@ -1334,44 +1775,107 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
   "section": "SESSIONS",
   "lead": "호환되는 대화와 유효한 읽음 기록을 이어 사용하고, 검토자의 판단 맥락은 별도로 유지.",
   "source": "아이콘은 예시 배정. 역할별 공급자는 변경 가능.",
-  "height": 174,
-  "elements": [
-    {
-      "kind": "node",
-      "x": 0,
-      "y": 18,
-      "w": 242,
-      "h": 108,
-      "label": "설계·구현 대화",
-      "body": "계획 → 구현\n현재 배정과 호환될 때 재개",
-      "color": "coral",
-      "size": 11,
-      "body_size": 9.6,
-      "icon": "claude"
-    },
-    {
-      "kind": "node",
-      "x": 269,
-      "y": 18,
-      "w": 242,
-      "h": 108,
-      "label": "독립된 검토 대화",
-      "body": "첫 리뷰 → 수정 후 리뷰\n미해결 지적과 변경분 확인",
-      "color": "blue",
-      "size": 11,
-      "body_size": 9.6,
-      "icon": "openai"
-    },
-    {
-      "kind": "text",
-      "x": 0,
-      "y": 135,
-      "w": 511,
-      "label": "재사용 전 작업·역할·세션·원문 버전·전달 구간의 일치 확인.",
-      "size": 10,
-      "h": 50
-    }
-  ]
+  "height": 224,
+  "elements": [],
+  "graph": {
+    "nodes": [
+      {
+        "id": "plan",
+        "x": 0,
+        "y": 0,
+        "w": 221,
+        "h": 65,
+        "label": "계획 세션",
+        "body": "코드·요구사항·판단 맥락",
+        "color": "coral",
+        "icon": "claude"
+      },
+      {
+        "id": "implement",
+        "x": 290,
+        "y": 0,
+        "w": 221,
+        "h": 65,
+        "label": "구현 세션",
+        "body": "호환되는 대화에서 이어 구현",
+        "color": "coral",
+        "icon": "claude"
+      },
+      {
+        "id": "review",
+        "x": 0,
+        "y": 155,
+        "w": 221,
+        "h": 65,
+        "label": "첫 리뷰",
+        "body": "고정 계획·구현 독립 검토",
+        "color": "blue",
+        "icon": "openai"
+      },
+      {
+        "id": "follow",
+        "x": 290,
+        "y": 155,
+        "w": 221,
+        "h": 65,
+        "label": "후속 리뷰",
+        "body": "변경분·미해결 지적 검토",
+        "color": "blue",
+        "icon": "openai"
+      }
+    ],
+    "edges": [
+      {
+        "source": "plan",
+        "target": "implement",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "호환 시 재개",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "implement",
+        "target": "review",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "고정된 코드 전달",
+        "via": [
+          [
+            400,
+            106
+          ],
+          [
+            110,
+            106
+          ]
+        ],
+        "color": "gray",
+        "dashed": false
+      },
+      {
+        "source": "review",
+        "target": "follow",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "리뷰 맥락 유지",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "follow",
+        "target": "implement",
+        "source_port": "top",
+        "target_port": "bottom",
+        "label": "남은 수정",
+        "via": [],
+        "color": "coral",
+        "dashed": true
+      }
+    ]
+  }
 }
 ```
 
@@ -1396,97 +1900,147 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
   "section": "INTEGRITY",
   "lead": "계획 내용, 리뷰 대상, 실제 결과를 각각 고정하고 같은 대상인지 대조.",
   "source": "",
-  "height": 183,
-  "elements": [
-    {
-      "kind": "node",
-      "x": 0.0,
-      "y": 25,
-      "w": 153.0,
-      "h": 90,
-      "label": "승인 계획",
-      "body": "정규화한 내용 해시",
-      "color": "blue",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          157.0,
-          70.0
+  "height": 250,
+  "elements": [],
+  "graph": {
+    "nodes": [
+      {
+        "id": "plan",
+        "x": 0,
+        "y": 0,
+        "w": 138,
+        "h": 57,
+        "label": "현재 계획",
+        "body": "정규화한 내용 해시",
+        "color": "blue"
+      },
+      {
+        "id": "approval",
+        "x": 186,
+        "y": 0,
+        "w": 139,
+        "h": 57,
+        "label": "계획 승인",
+        "body": "현재 해시와 일치",
+        "color": "teal"
+      },
+      {
+        "id": "code",
+        "x": 373,
+        "y": 0,
+        "w": 138,
+        "h": 57,
+        "label": "구현 결과",
+        "body": "승인 범위의 코드",
+        "color": "coral"
+      },
+      {
+        "id": "review",
+        "x": 373,
+        "y": 151,
+        "w": 138,
+        "h": 57,
+        "label": "고정 리뷰 대상",
+        "body": "기준·후보 커밋·diff",
+        "color": "purple"
+      },
+      {
+        "id": "done",
+        "x": 186,
+        "y": 151,
+        "w": 139,
+        "h": 57,
+        "label": "로컬 완료",
+        "body": "검토 트리 = 커밋 트리",
+        "color": "teal"
+      },
+      {
+        "id": "find",
+        "x": 0,
+        "y": 151,
+        "w": 138,
+        "h": 57,
+        "label": "지적 추적",
+        "body": "ID·처분·근거 보존",
+        "color": "gray"
+      }
+    ],
+    "edges": [
+      {
+        "source": "plan",
+        "target": "approval",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "동일성",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "approval",
+        "target": "code",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "승인 후",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "code",
+        "target": "review",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "대상 고정",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "review",
+        "target": "done",
+        "source_port": "left",
+        "target_port": "right",
+        "label": "통과",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "review",
+        "target": "find",
+        "source_port": "bottom",
+        "target_port": "bottom",
+        "label": "지적별 처분",
+        "via": [
+          [
+            442,
+            232
+          ],
+          [
+            69,
+            232
+          ]
         ],
-        [
-          175.0,
-          70.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 179.0,
-      "y": 25,
-      "w": 153.0,
-      "h": 90,
-      "label": "고정 리뷰 대상",
-      "body": "기준·후보 커밋과 diff",
-      "color": "purple",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          336.0,
-          70.0
-        ],
-        [
-          354.0,
-          70.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 358.0,
-      "y": 25,
-      "w": 153.0,
-      "h": 90,
-      "label": "실제 완료 결과",
-      "body": "검토한 트리와 대조",
-      "color": "teal",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "node",
-      "x": 0,
-      "y": 134,
-      "w": 511,
-      "h": 42,
-      "label": "지적 ID: 수정 · 수용 · 반박 · 후속 이관을 다음 리뷰까지 보존",
-      "body": "",
-      "color": "gray",
-      "size": 11,
-      "body_size": 9.6
-    }
-  ]
+        "color": "gray",
+        "dashed": false
+      }
+    ]
+  }
 }
 ```
 
-## 계획 동일성과 리뷰 지적의 추적
+## 계획 동일성과 고정된 검토 대상
 
-리뷰에는 지적 ID와 처리 상태를 남긴다. 수정·수용·반박·범위 밖 이관을 구분하고, 응답에서 지적이 빠졌다고 해결된 것으로 처리하지 않는다. 불완전한 리뷰는 이전 지적을 지우거나 변경분 기준을 전진시키지 못한다.
+기준 커밋·후보 커밋·파일 목록·변경 내용을 고정한 뒤 검토한다. 수정 중인 폴더를 동시에 검토해 승인 대상이 달라지는 일을 막기 위해서다. 지적에는 ID와 처분을 남기고, 응답에서 빠졌다는 이유로 해결된 것으로 처리하지 않는다.
 
-## 고정된 코드와 후속 리뷰
+## 큰 계획 개정의 전달량 개선
 
-기준 커밋, 후보 커밋, 파일 목록과 변경 내용을 고정한 뒤 리뷰한다. 수정 중인 작업 폴더를 동시에 검토하면 리뷰가 끝났을 때 실제 코드가 달라질 수 있다. 후속 리뷰는 바뀐 지적과 영향을 받는 호출부를 확인하며, 매번 전체 작업을 처음부터 재감사하지 않는다.
+큰 계획의 일부만 고쳐도 긴 기존 문구를 교체 기준으로 다시 출력하는 비용이 있었다. 기준 계획 해시와 줄 범위를 지정하는 수정 형식을 추가하고, 적용 뒤 같은 최종 계획이 나오는지 확인했다. 해시·범위 검증으로 다른 버전에 잘못 적용되는 수정은 거부한다.
 
-범위 밖 개선은 다음 작업에 넘길 근거로 보존한다. 작은 개선을 계속 현재 작업에 포함해 리뷰가 끝나지 않는 흐름을 피하기 위한 선택이다.
+실제 개정의 줄 길이와 동일성을 보존한 익명화 사례에서 수정 데이터는 48,588바이트에서 38,324바이트로 21.1% 줄었다. 줄 번호를 넣는 입력은 1,464바이트 늘었고 최종 계획과 해시는 같았다. 해당 사례의 표현 크기 개선이며 실사용 토큰 절감률은 아니다.
+
+후속 리뷰는 바뀐 지적과 영향받는 호출부를 확인한다. 범위 밖 개선은 근거와 함께 다음 작업으로 넘겨 작은 개선이 현재 리뷰를 끝없이 늘리지 않게 했다.
 
 # 역할별 권한과 실행 종료
 
@@ -1497,82 +2051,103 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
   "section": "EXECUTION",
   "lead": "실행 권한·프로세스 종료·결과 형식을 모두 확인한 뒤 결과 수락.",
   "source": "src/server/processRunner.ts · src/server/processSupervisor.ts · src/server/runtime/service.ts",
-  "height": 173,
-  "elements": [
-    {
-      "kind": "node",
-      "x": 0.0,
-      "y": 25,
-      "w": 153.0,
-      "h": 90,
-      "label": "역할별 권한",
-      "body": "읽기 / 쓰기 / 도구 없음",
-      "color": "blue",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          157.0,
-          70.0
+  "height": 224,
+  "elements": [],
+  "graph": {
+    "nodes": [
+      {
+        "id": "perm",
+        "x": 0,
+        "y": 0,
+        "w": 136,
+        "h": 57,
+        "label": "역할별 권한",
+        "body": "읽기·쓰기·도구 없음",
+        "color": "blue"
+      },
+      {
+        "id": "run",
+        "x": 188,
+        "y": 0,
+        "w": 136,
+        "h": 57,
+        "label": "모델 실행",
+        "body": "현재 실행 신원",
+        "color": "coral"
+      },
+      {
+        "id": "accept",
+        "x": 375,
+        "y": 0,
+        "w": 136,
+        "h": 57,
+        "label": "정상 결과 수락",
+        "body": "유효한 종료·응답",
+        "color": "teal"
+      },
+      {
+        "id": "reject",
+        "x": 188,
+        "y": 154,
+        "w": 136,
+        "h": 57,
+        "label": "실패·취소 기록",
+        "body": "잘린 응답·늦은 결과",
+        "color": "gray"
+      }
+    ],
+    "edges": [
+      {
+        "source": "perm",
+        "target": "run",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "권한 확인",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "run",
+        "target": "accept",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "정상 종료",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "run",
+        "target": "reject",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "실패·취소",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "reject",
+        "target": "run",
+        "source_port": "left",
+        "target_port": "left",
+        "label": "명시적 재개",
+        "via": [
+          [
+            155,
+            183
+          ],
+          [
+            155,
+            29
+          ]
         ],
-        [
-          175.0,
-          70.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 179.0,
-      "y": 25,
-      "w": 153.0,
-      "h": 90,
-      "label": "실행 종료",
-      "body": "프로세스·응답 형식",
-      "color": "coral",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          336.0,
-          70.0
-        ],
-        [
-          354.0,
-          70.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 358.0,
-      "y": 25,
-      "w": 153.0,
-      "h": 90,
-      "label": "결과 수락",
-      "body": "현재 실행과 신원 일치",
-      "color": "teal",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "text",
-      "x": 0,
-      "y": 140,
-      "w": 511,
-      "label": "취소 후 도착한 응답, 잘린 JSON, 미제공 사용량을 정상 완료로 합치지 않음.",
-      "size": 10,
-      "h": 50
-    }
-  ]
+        "color": "coral",
+        "dashed": true
+      }
+    ]
+  }
 }
 ```
 
@@ -1595,72 +2170,113 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
   "section": "OBSERVABILITY",
   "lead": "실행 시간·문장 증가·완료 선언을 서로 다른 증거로 확인.",
   "source": "",
-  "height": 158,
-  "elements": [
-    {
-      "kind": "node",
-      "x": 0,
-      "y": 0,
-      "w": 138,
-      "h": 42,
-      "label": "실행 중 표시",
-      "body": "",
-      "color": "blue",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "text",
-      "x": 154,
-      "y": 11,
-      "w": 355,
-      "label": "현재 실행의 결과와 저장된 사건 기록 확인",
-      "size": 10,
-      "h": 50
-    },
-    {
-      "kind": "node",
-      "x": 0,
-      "y": 51,
-      "w": 138,
-      "h": 42,
-      "label": "문장 증가",
-      "body": "",
-      "color": "coral",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "text",
-      "x": 154,
-      "y": 62,
-      "w": 355,
-      "label": "읽은 자료·실제 파일·해당 턴의 결과 확인",
-      "size": 10,
-      "h": 50
-    },
-    {
-      "kind": "node",
-      "x": 0,
-      "y": 102,
-      "w": 138,
-      "h": 42,
-      "label": "완료 응답",
-      "body": "",
-      "color": "teal",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "text",
-      "x": 154,
-      "y": 113,
-      "w": 355,
-      "label": "검사·리뷰·로컬 커밋의 연결 확인",
-      "size": 10,
-      "h": 50
-    }
-  ]
+  "height": 195,
+  "elements": [],
+  "graph": {
+    "nodes": [
+      {
+        "id": "event",
+        "x": 0,
+        "y": 0,
+        "w": 141,
+        "h": 57,
+        "label": "실행 사건",
+        "body": "시작·진행·종료",
+        "color": "blue"
+      },
+      {
+        "id": "files",
+        "x": 0,
+        "y": 126,
+        "w": 141,
+        "h": 57,
+        "label": "실제 파일",
+        "body": "원문·코드·커밋",
+        "color": "coral"
+      },
+      {
+        "id": "state",
+        "x": 206,
+        "y": 63,
+        "w": 140,
+        "h": 64,
+        "label": "저장된 상태",
+        "body": "실행과 결과 대조",
+        "color": "purple"
+      },
+      {
+        "id": "ui",
+        "x": 411,
+        "y": 63,
+        "w": 100,
+        "h": 64,
+        "label": "화면 표시",
+        "body": "재연결 후 조회",
+        "color": "teal"
+      }
+    ],
+    "edges": [
+      {
+        "source": "event",
+        "target": "state",
+        "source_port": "right",
+        "target_port": "top",
+        "label": "사건 기록",
+        "via": [
+          [
+            276,
+            29
+          ]
+        ],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "files",
+        "target": "state",
+        "source_port": "right",
+        "target_port": "bottom",
+        "label": "결과 증거",
+        "via": [
+          [
+            276,
+            155
+          ]
+        ],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "state",
+        "target": "ui",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "현재 사실",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "ui",
+        "target": "state",
+        "source_port": "bottom",
+        "target_port": "bottom",
+        "label": "재연결",
+        "via": [
+          [
+            461,
+            170
+          ],
+          [
+            276,
+            170
+          ]
+        ],
+        "color": "gray",
+        "dashed": true
+      }
+    ]
+  }
 }
 ```
 
@@ -1683,108 +2299,127 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
   "section": "DELIVERY",
   "lead": "검토한 결과를 로컬 커밋에 연결하고, 원격 반영은 별도 OID로 확인.",
   "source": "src/server/engine/delivery.ts · src/server/git.ts",
-  "height": 166,
-  "elements": [
-    {
-      "kind": "node",
-      "x": 0.0,
-      "y": 25,
-      "w": 108.25,
-      "h": 88,
-      "label": "리뷰 통과",
-      "body": "검토 대상 고정",
-      "color": "purple",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          112.25,
-          69.0
+  "height": 242,
+  "elements": [],
+  "graph": {
+    "nodes": [
+      {
+        "id": "review",
+        "x": 0,
+        "y": 0,
+        "w": 128,
+        "h": 57,
+        "label": "리뷰 통과",
+        "body": "검토 대상 고정",
+        "color": "purple"
+      },
+      {
+        "id": "local",
+        "x": 191,
+        "y": 0,
+        "w": 128,
+        "h": 57,
+        "label": "로컬 완료",
+        "body": "커밋·트리 대조",
+        "color": "teal"
+      },
+      {
+        "id": "push",
+        "x": 383,
+        "y": 0,
+        "w": 128,
+        "h": 57,
+        "label": "원격 전달",
+        "body": "승인 범위의 push",
+        "color": "coral"
+      },
+      {
+        "id": "remote",
+        "x": 383,
+        "y": 139,
+        "w": 128,
+        "h": 57,
+        "label": "원격 OID 확인",
+        "body": "실제 반영 여부",
+        "color": "blue"
+      },
+      {
+        "id": "result",
+        "x": 191,
+        "y": 139,
+        "w": 128,
+        "h": 57,
+        "label": "전달 완료",
+        "body": "실행 기록과 연결",
+        "color": "teal"
+      }
+    ],
+    "edges": [
+      {
+        "source": "review",
+        "target": "local",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "통과 근거",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "local",
+        "target": "push",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "전달 승인",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "push",
+        "target": "remote",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "성공·응답 유실",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "remote",
+        "target": "result",
+        "source_port": "left",
+        "target_port": "right",
+        "label": "반영 확인",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "remote",
+        "target": "push",
+        "source_port": "bottom",
+        "target_port": "left",
+        "label": "미반영 확인",
+        "via": [
+          [
+            447,
+            224
+          ],
+          [
+            350,
+            224
+          ],
+          [
+            350,
+            29
+          ]
         ],
-        [
-          130.25,
-          69.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 134.25,
-      "y": 25,
-      "w": 108.25,
-      "h": 88,
-      "label": "로컬 완료",
-      "body": "실제 커밋 대조",
-      "color": "teal",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          246.5,
-          69.0
-        ],
-        [
-          264.5,
-          69.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 268.5,
-      "y": 25,
-      "w": 108.25,
-      "h": 88,
-      "label": "전달 승인",
-      "body": "대상·범위 확인",
-      "color": "coral",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          380.75,
-          69.0
-        ],
-        [
-          398.75,
-          69.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 402.75,
-      "y": 25,
-      "w": 108.25,
-      "h": 88,
-      "label": "원격 확인",
-      "body": "실제 OID 확인",
-      "color": "blue",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "text",
-      "x": 0,
-      "y": 136,
-      "w": 511,
-      "label": "푸시 응답이 유실되면 재실행에 앞서 원격 커밋과 기존 실행 기록을 대조.",
-      "size": 10,
-      "h": 50
-    }
-  ]
+        "color": "coral",
+        "dashed": true
+      }
+    ]
+  }
 }
 ```
 
@@ -1809,42 +2444,122 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
   "section": "ACCOUNTING",
   "lead": "원문 읽기 횟수, 논리적 리뷰, 실제 모델 실행을 서로 다른 값으로 기록.",
   "source": "",
-  "height": 174,
-  "elements": [
-    {
-      "kind": "node",
-      "x": 0,
-      "y": 18,
-      "w": 242,
-      "h": 100,
-      "label": "한 번의 논리적 리뷰",
-      "body": "여러 원문 읽기 → 판단·보완 → 결과",
-      "color": "blue",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "node",
-      "x": 269,
-      "y": 18,
-      "w": 242,
-      "h": 100,
-      "label": "실제 사용량 기록",
-      "body": "호출별 입력·캐시·출력·실행시간",
-      "color": "teal",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "text",
-      "x": 0,
-      "y": 135,
-      "w": 511,
-      "label": "예산·공급자 제한은 별도 적용. 누락 사용량은 0으로 만들지 않고 미제공으로 보존.",
-      "size": 10,
-      "h": 50
-    }
-  ]
+  "height": 201,
+  "elements": [],
+  "graph": {
+    "nodes": [
+      {
+        "id": "read",
+        "x": 0,
+        "y": 0,
+        "w": 128,
+        "h": 57,
+        "label": "원문 읽기",
+        "body": "여러 조각·여러 호출",
+        "color": "blue"
+      },
+      {
+        "id": "judge",
+        "x": 191,
+        "y": 0,
+        "w": 128,
+        "h": 57,
+        "label": "판단·보완",
+        "body": "필요한 모델 실행",
+        "color": "purple"
+      },
+      {
+        "id": "result",
+        "x": 383,
+        "y": 0,
+        "w": 128,
+        "h": 57,
+        "label": "최종 결과",
+        "body": "한 번의 논리적 리뷰",
+        "color": "teal"
+      },
+      {
+        "id": "usage",
+        "x": 90,
+        "y": 133,
+        "w": 331,
+        "h": 64,
+        "label": "호출별 사용량 원장",
+        "body": "입력·캐시·출력·실행시간·미제공 여부",
+        "color": "gray"
+      }
+    ],
+    "edges": [
+      {
+        "source": "read",
+        "target": "judge",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "근거 확보",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "judge",
+        "target": "result",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "판단 완료",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "read",
+        "target": "usage",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "실제 호출",
+        "via": [
+          [
+            64,
+            106
+          ],
+          [
+            255,
+            106
+          ]
+        ],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "judge",
+        "target": "usage",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "사용량 보고",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "result",
+        "target": "usage",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "누적 보존",
+        "via": [
+          [
+            447,
+            119
+          ],
+          [
+            255,
+            119
+          ]
+        ],
+        "color": "teal",
+        "dashed": false
+      }
+    ]
+  }
 }
 ```
 
@@ -1867,94 +2582,135 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
   "section": "VERIFICATION",
   "lead": "확인된 정적 검사 한 종류의 입력·도구·환경·계획·로그를 함께 대조.",
   "source": "src/server/verificationInputs.ts · src/server/verifications.ts",
-  "height": 174,
-  "elements": [
-    {
-      "kind": "node",
-      "x": 0.0,
-      "y": 25,
-      "w": 153.0,
-      "h": 90,
-      "label": "입력 대조",
-      "body": "코드·도구·환경·계획",
-      "color": "blue",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          157.0,
-          70.0
+  "height": 223,
+  "elements": [],
+  "graph": {
+    "nodes": [
+      {
+        "id": "input",
+        "x": 0,
+        "y": 0,
+        "w": 136,
+        "h": 57,
+        "label": "현재 검사 입력",
+        "body": "코드·도구·환경·계획",
+        "color": "blue"
+      },
+      {
+        "id": "compare",
+        "x": 187,
+        "y": 0,
+        "w": 138,
+        "h": 57,
+        "label": "기존 근거 대조",
+        "body": "입력 해시·통과 로그",
+        "color": "purple"
+      },
+      {
+        "id": "reuse",
+        "x": 375,
+        "y": 0,
+        "w": 136,
+        "h": 57,
+        "label": "결과 재사용",
+        "body": "유효한 통과 근거",
+        "color": "teal"
+      },
+      {
+        "id": "execute",
+        "x": 187,
+        "y": 154,
+        "w": 138,
+        "h": 57,
+        "label": "현재 입력으로 실행",
+        "body": "변경·누락·미완료",
+        "color": "coral"
+      },
+      {
+        "id": "record",
+        "x": 375,
+        "y": 154,
+        "w": 136,
+        "h": 57,
+        "label": "결과 기록",
+        "body": "완료 로그·입력 해시",
+        "color": "blue"
+      }
+    ],
+    "edges": [
+      {
+        "source": "input",
+        "target": "compare",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "조건 대조",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "compare",
+        "target": "reuse",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "모두 일치",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "compare",
+        "target": "execute",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "하나라도 불일치",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "execute",
+        "target": "record",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "검사 완료",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "record",
+        "target": "compare",
+        "source_port": "top",
+        "target_port": "bottom",
+        "label": "다음 실행의 근거",
+        "via": [
+          [
+            443,
+            114
+          ],
+          [
+            256,
+            114
+          ]
         ],
-        [
-          175.0,
-          70.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 179.0,
-      "y": 25,
-      "w": 153.0,
-      "h": 90,
-      "label": "근거 대조",
-      "body": "통과 기록과 결과 로그",
-      "color": "purple",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          336.0,
-          70.0
-        ],
-        [
-          354.0,
-          70.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 358.0,
-      "y": 25,
-      "w": 153.0,
-      "h": 90,
-      "label": "실행 또는 재사용",
-      "body": "모든 조건 일치 때 재사용",
-      "color": "teal",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "text",
-      "x": 0,
-      "y": 136,
-      "w": 511,
-      "label": "적용 사례: Swift 동시성 정책 정적 검사. 단위 테스트·빌드·UI 검사는 별도 확인.",
-      "size": 10,
-      "h": 50
-    }
-  ]
+        "color": "gray",
+        "dashed": true
+      }
+    ]
+  }
 }
 ```
 
-## 검사 결과와 입력의 일치
+## 같은 검사를 다시 실행하던 비용
 
-검사 결과를 저장하는 도중 중단됐다면 다음 실행에서 완료 여부와 근거를 복구한다. 비교할 근거가 없다는 상태를 “변경 없음”으로 처리하지 않는다. CLI가 제출한 실행 보고서와 독립적으로 확인한 실행 증거의 차이도 남는다.
+단계가 바뀔 때마다 검사 결과를 다시 구하면 입력과 도구가 같아도 실행 비용이 반복된다. 작업·계획·소스·검사기·실행 환경·로그가 모두 일치하는 결과만 재사용하도록 했다. 단순히 마지막 검사에 성공했다는 표시로는 현재 변경을 검증할 수 없기 때문이다.
 
-## 앱 실행 경험에서 정한 검증 범위
+## 저장 실패와 응답 유실의 복구
 
-Swift 6 전환 과정에서는 빌드 로그 일부나 재사용된 산출물만 보고 성공을 판단할 위험이 드러났다. WebKit 종료 과정의 오류처럼 컴파일 뒤 실행에서 나타나는 문제도 있었다. 운영체제 로그와 앱 프로세스 오류를 구분하지 않으면 잘못된 실패를 추적할 수 있었다.
+실제 CLI 프로세스 → 인증 API → DB 경로에서 저장 실패, 응답 유실, 실행 소유권 만료를 재현했다. 재시도할 때 성공 결과를 잃거나 다른 실행의 결과를 채택하지 않는지 확인했다. 입력이 같다는 비교 근거가 없으면 새 검사를 수행한다.
 
-따라서 정적 검사 캐시를 전체 단위 테스트·빌드·UI 검증의 대체물로 확장하지 않았다. 효율보다 검증 결과가 의미하는 범위를 먼저 고정한 선택이다.
+재사용 대상은 Swift 동시성 정책 정적 검사 한 종류다. 컴파일 뒤 WebKit 종료 과정에서 오류가 나타났던 경험도 있어, 정적 검사 성공을 앱 실행·UI 검증으로 확대하지 않았다. 반복 검사를 생략하는 경로는 확인했지만 운영 전체의 시간·토큰 절감량은 아직 측정하지 않았다.
 
 관련 자료: src/server/verificationInputs.ts · src/server/verifications.ts
 
@@ -1967,123 +2723,124 @@ Swift 6 전환 과정에서는 빌드 로그 일부나 재사용된 산출물만
   "section": "PILOT",
   "lead": "첫 실패는 보존하고, 엔진 중간 수정 없이 새 파일럿에서 다섯 단계와 원격 전달까지 확인.",
   "source": "docs/usage-report.md · 9월 파일럿 당시 관측 결과",
-  "height": 215,
-  "elements": [
-    {
-      "kind": "node",
-      "x": 0.0,
-      "y": 25,
-      "w": 108.25,
-      "h": 88,
-      "label": "계획·첫 단계",
-      "body": "미래 단계는 개요",
-      "color": "blue",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          112.25,
-          69.0
-        ],
-        [
-          130.25,
-          69.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 134.25,
-      "y": 25,
-      "w": 108.25,
-      "h": 88,
-      "label": "중재자 교체",
-      "body": "배정·기록 보존",
-      "color": "coral",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          246.5,
-          69.0
-        ],
-        [
-          264.5,
-          69.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 268.5,
-      "y": 25,
-      "w": 108.25,
-      "h": 88,
-      "label": "분할·원문 조회",
-      "body": "결과와 근거 연결",
-      "color": "purple",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          380.75,
-          69.0
-        ],
-        [
-          398.75,
-          69.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 402.75,
-      "y": 25,
-      "w": 108.25,
-      "h": 88,
-      "label": "통합·전달",
-      "body": "5단계·원격 확인",
-      "color": "teal",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "node",
-      "x": 0,
-      "y": 133,
-      "w": 242,
-      "h": 72,
-      "label": "엔진 비교 파일 243개",
-      "body": "실행 중 해시 유지",
-      "color": "blue",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "node",
-      "x": 269,
-      "y": 133,
-      "w": 242,
-      "h": 72,
-      "label": "대상 검사 77개",
-      "body": "통과 + 반대 검사 실패 확인",
-      "color": "teal",
-      "size": 11,
-      "body_size": 9.6
-    }
-  ]
+  "height": 224,
+  "elements": [],
+  "graph": {
+    "nodes": [
+      {
+        "id": "plan",
+        "x": 0,
+        "y": 0,
+        "w": 128,
+        "h": 57,
+        "label": "첫 단계 실행",
+        "body": "현재 단계만 상세화",
+        "color": "blue"
+      },
+      {
+        "id": "med",
+        "x": 191,
+        "y": 0,
+        "w": 128,
+        "h": 57,
+        "label": "중재자 교체",
+        "body": "Claude → Codex",
+        "color": "coral"
+      },
+      {
+        "id": "split",
+        "x": 383,
+        "y": 0,
+        "w": 128,
+        "h": 57,
+        "label": "미래 단계 분할",
+        "body": "무관한 결과 보존",
+        "color": "purple"
+      },
+      {
+        "id": "read",
+        "x": 383,
+        "y": 153,
+        "w": 128,
+        "h": 57,
+        "label": "큰 원문 읽기",
+        "body": "조각·버전 연결",
+        "color": "blue"
+      },
+      {
+        "id": "restart",
+        "x": 191,
+        "y": 153,
+        "w": 128,
+        "h": 57,
+        "label": "서버 재시작",
+        "body": "DB 60개 테이블 보존",
+        "color": "gray"
+      },
+      {
+        "id": "deliver",
+        "x": 0,
+        "y": 153,
+        "w": 128,
+        "h": 57,
+        "label": "통합·전달",
+        "body": "5개 단계·원격 확인",
+        "color": "teal"
+      }
+    ],
+    "edges": [
+      {
+        "source": "plan",
+        "target": "med",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "기록 인계",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "med",
+        "target": "split",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "단계 조정",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "split",
+        "target": "read",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "필요 근거",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "read",
+        "target": "restart",
+        "source_port": "left",
+        "target_port": "right",
+        "label": "진행 기록",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "restart",
+        "target": "deliver",
+        "source_port": "left",
+        "target_port": "right",
+        "label": "상태 복구",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      }
+    ]
+  }
 }
 ```
 
@@ -2106,61 +2863,61 @@ Swift 6 전환 과정에서는 빌드 로그 일부나 재사용된 산출물만
   "section": "MEASUREMENTS",
   "lead": "9월 파일럿의 실행량과 10월 엔진 후보 검사 결과를 나눠 기록한 검증 사례.",
   "source": "9월 27일 검사: 개발본 1,719 · Python 160 · 공개본 1,381. 새 엔진 검사와 별도 집계.",
-  "height": 179,
+  "height": 172,
   "elements": [
     {
-      "kind": "node",
+      "kind": "text",
       "x": 0,
       "y": 0,
-      "w": 151,
-      "h": 77,
-      "label": "48회",
-      "body": "실제 모델 실행",
-      "color": "blue",
-      "size": 11,
-      "body_size": 9.6
+      "w": 511,
+      "h": 25,
+      "label": "입력 토큰 22,602,633",
+      "size": 12,
+      "bold": true
     },
     {
-      "kind": "node",
-      "x": 180,
-      "y": 0,
-      "w": 151,
-      "h": 77,
-      "label": "5개 단계",
-      "body": "완료와 원격 전달",
-      "color": "teal",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "node",
-      "x": 360,
-      "y": 0,
-      "w": 151,
-      "h": 77,
-      "label": "6,566초",
-      "body": "호출별 실행시간 합계",
-      "color": "purple",
-      "size": 11,
-      "body_size": 9.6
+      "kind": "bar",
+      "x": 0,
+      "y": 37,
+      "w": 511,
+      "h": 28,
+      "parts": [
+        {
+          "fraction": 0.8023127659507634,
+          "color": "teal"
+        },
+        {
+          "fraction": 0.1976872340492366,
+          "color": "gray"
+        }
+      ]
     },
     {
       "kind": "text",
       "x": 0,
-      "y": 99,
-      "w": 511,
-      "label": "입력 22,602,633 토큰  /  그중 캐시 입력 18,134,381 토큰",
-      "size": 10.5,
-      "h": 50
+      "y": 78,
+      "w": 330,
+      "h": 32,
+      "label": "캐시 입력 18,134,381\n전체 입력에 포함",
+      "size": 10
+    },
+    {
+      "kind": "text",
+      "x": 343,
+      "y": 78,
+      "w": 168,
+      "h": 32,
+      "label": "그 밖의 입력 4,468,252",
+      "size": 10
     },
     {
       "kind": "text",
       "x": 0,
-      "y": 126,
+      "y": 128,
       "w": 511,
-      "label": "출력 620,113 토큰  ·  캐시 입력은 전체 입력에 포함된 값",
-      "size": 10.5,
-      "h": 50
+      "h": 32,
+      "label": "출력 620,113 토큰  ·  실행 48회  ·  호출 시간 합계 6,566초",
+      "size": 10
     }
   ]
 }
@@ -2187,108 +2944,123 @@ Swift 6 전환 과정에서는 빌드 로그 일부나 재사용된 산출물만
   "section": "NEXT VALIDATION",
   "lead": "멈춘 지점의 복구부터 다음 단계까지 확인하고, 운영 환경에서의 비교는 별도 수행.",
   "source": "아이콘: Simple Icons 14.0.0 (CC0) · Figma Brand Assets. 각 상표권은 해당 소유자에게 귀속.",
-  "height": 180,
-  "elements": [
-    {
-      "kind": "node",
-      "x": 0.0,
-      "y": 25,
-      "w": 108.25,
-      "h": 88,
-      "label": "중지·실패",
-      "body": "요청·오류 보존",
-      "color": "coral",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          112.25,
-          69.0
+  "height": 251,
+  "elements": [],
+  "graph": {
+    "nodes": [
+      {
+        "id": "failure",
+        "x": 0,
+        "y": 0,
+        "w": 136,
+        "h": 57,
+        "label": "중지·실패",
+        "body": "요청·오류 보존",
+        "color": "coral"
+      },
+      {
+        "id": "db",
+        "x": 188,
+        "y": 0,
+        "w": 136,
+        "h": 57,
+        "label": "DB 재연결",
+        "body": "예약·상태 복구",
+        "color": "blue"
+      },
+      {
+        "id": "check",
+        "x": 375,
+        "y": 0,
+        "w": 136,
+        "h": 57,
+        "label": "승인 조건 대조",
+        "body": "현재 계획·범위",
+        "color": "purple"
+      },
+      {
+        "id": "resume",
+        "x": 375,
+        "y": 151,
+        "w": 136,
+        "h": 57,
+        "label": "명시적 재개",
+        "body": "같은 공식 요청",
+        "color": "teal"
+      },
+      {
+        "id": "next",
+        "x": 188,
+        "y": 151,
+        "w": 136,
+        "h": 57,
+        "label": "다음 단계 계획",
+        "body": "검토·로컬 완료 후",
+        "color": "teal"
+      }
+    ],
+    "edges": [
+      {
+        "source": "failure",
+        "target": "db",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "저장 상태",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "db",
+        "target": "check",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "현재 사실",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "check",
+        "target": "resume",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "허용된 재개",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "resume",
+        "target": "next",
+        "source_port": "left",
+        "target_port": "right",
+        "label": "결과 연결",
+        "via": [],
+        "color": "teal",
+        "dashed": false
+      },
+      {
+        "source": "resume",
+        "target": "failure",
+        "source_port": "bottom",
+        "target_port": "bottom",
+        "label": "새 실패 보존",
+        "via": [
+          [
+            443,
+            235
+          ],
+          [
+            68,
+            235
+          ]
         ],
-        [
-          130.25,
-          69.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 134.25,
-      "y": 25,
-      "w": 108.25,
-      "h": 88,
-      "label": "DB 재연결",
-      "body": "예약과 상태 복구",
-      "color": "blue",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          246.5,
-          69.0
-        ],
-        [
-          264.5,
-          69.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 268.5,
-      "y": 25,
-      "w": 108.25,
-      "h": 88,
-      "label": "명시적 재개",
-      "body": "승인 범위 확인",
-      "color": "purple",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "arrow",
-      "points": [
-        [
-          380.75,
-          69.0
-        ],
-        [
-          398.75,
-          69.0
-        ]
-      ],
-      "color": "teal"
-    },
-    {
-      "kind": "node",
-      "x": 402.75,
-      "y": 25,
-      "w": 108.25,
-      "h": 88,
-      "label": "다음 계획",
-      "body": "완료 결과 연결",
-      "color": "teal",
-      "size": 11,
-      "body_size": 9.6
-    },
-    {
-      "kind": "text",
-      "x": 0,
-      "y": 137,
-      "w": 511,
-      "label": "검증 확장: 실제 외부 서비스 · 물리적 재전송 · 동일 조건 비용 비교 · 기록 손상 복구",
-      "size": 10,
-      "h": 50
-    }
-  ]
+        "color": "coral",
+        "dashed": true
+      }
+    ]
+  }
 }
 ```
 
