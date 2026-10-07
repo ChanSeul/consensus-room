@@ -1,9 +1,9 @@
 import type { TimelineEvent } from "../../shared/contracts.js";
 import { AgentResultSchema } from "../../shared/contracts.js";
 import { requestId } from "./checkpoint.js";
-import { decisionRequestTexts } from "./completion.js";
+import { decisionRequestTexts, MEDIATOR_REQUEST_PREFIX } from "./completion.js";
 
-export interface ReviewRequest { id: string; sequence: number; question: string; answerDecisionSequence?: number; checkedThrough?: number }
+export interface ReviewRequest { id: string; sequence: number; question: string; kind?: "mediator-work"; answerDecisionSequence?: number; checkedThrough?: number }
 
 // 상태를 바꾸는 자동 decision 이벤트는 질문의 답변이 아니다.
 export function reviewAnswerCandidate(event: TimelineEvent): boolean {
@@ -13,25 +13,34 @@ export function reviewAnswerCandidate(event: TimelineEvent): boolean {
     && !event.payload?.toleranceAmendment && !String(event.payload?.requestAction ?? "").startsWith("action:");
 }
 
+// decisionSequence/answerDecisionSequence are legacy receipt keys; execution requests may cite evidence.
+export function reviewAnswerForRequest(event: TimelineEvent, request: ReviewRequest): boolean {
+  return reviewAnswerCandidate(event) || (request.kind === "mediator-work" && event.actor === "user" && event.kind === "evidence");
+}
+
 // 사용자 메시지는 요청을 지우지 않는다. 해당 요청·사용자 답변을 대조한 확인 결과만 해소 기록이다.
 export function pendingReviewRequests(events: readonly TimelineEvent[], generation: number): ReviewRequest[] {
   const requests: ReviewRequest[] = [];
   let latestDecision = 0;
-  const pending = () => requests.filter((r) => r.answerDecisionSequence === undefined || (r.checkedThrough ?? 0) < latestDecision);
+  // 질문 답변은 이후 결정이 번복할 수 있어 다시 확인한다. 실행 요청의 확인은 그 실행 근거를 검증한 기록이라 이후 결정으로 다시 열리지 않는다.
+  const pending = () => requests.filter((r) => r.answerDecisionSequence === undefined
+    || (r.kind !== "mediator-work" && (r.checkedThrough ?? 0) < latestDecision));
   let lastReview: TimelineEvent | null = null;
   const decisions = new Map<number, TimelineEvent>();
-  const append = (question: string, sequence: number) => {
-    if (!pending().some((item) => item.question === question)) requests.push({ id: "R" + requestId(question, sequence), sequence, question });
+  const append = (question: string, sequence: number, kind?: ReviewRequest["kind"]) => {
+    if (!pending().some((item) => item.question === question)) requests.push({ id: "R" + requestId(question, sequence), sequence, question,
+      ...(kind ? { kind } : {}) });
   };
   for (const event of events) {
     if (event.scopeGeneration !== generation) continue;
     if (reviewAnswerCandidate(event)) { decisions.set(event.sequence, event); latestDecision = event.sequence; }
+    if (event.actor === "user" && event.kind === "evidence") decisions.set(event.sequence, event);
     if (event.actor === "system" && event.kind === "system" && Array.isArray(event.payload?.reviewRequestAnswers)) {
       for (const answer of event.payload.reviewRequestAnswers) {
         const request = requests.find((item) => item.id === answer?.requestId);
         const decision = decisions.get(answer?.decisionSequence);
         const through = event.payload.reviewAnswersThrough ?? latestDecision;
-        if (request && decision && decision.sequence > request.sequence && typeof through === "number"
+        if (request && decision && reviewAnswerForRequest(decision, request) && decision.sequence > request.sequence && typeof through === "number"
           && Number.isSafeInteger(through) && through >= latestDecision && through < event.sequence && decision.sequence <= through) {
           request.answerDecisionSequence = decision.sequence;
           request.checkedThrough = through;
@@ -45,7 +54,9 @@ export function pendingReviewRequests(events: readonly TimelineEvent[], generati
         const status = AgentResultSchema.shape.status.parse(event.payload?.status);
         const asked = AgentResultSchema.shape.requestedUserDecision.parse(event.payload?.requestedUserDecision);
         const remainingSteps = AgentResultSchema.shape.remainingSteps.parse(event.payload?.remainingSteps);
-        for (const text of decisionRequestTexts({ findings, status, requestedUserDecision: asked, remainingSteps, summary: event.body })) append(text, event.sequence);
+        const requestedMediatorAction = AgentResultSchema.shape.requestedMediatorAction.parse(event.payload?.requestedMediatorAction);
+        for (const text of decisionRequestTexts({ findings, status, requestedUserDecision: asked, requestedMediatorAction, remainingSteps, summary: event.body }))
+          append(text, event.sequence, requestedMediatorAction && text === MEDIATOR_REQUEST_PREFIX + requestedMediatorAction.trim() ? "mediator-work" : undefined);
       }
     }
     // 구버전은 출력 이벤트에 status 를 남기지 않았다. 바로 그 리뷰를 멈춘 runnerBlocked 기록으로 복구한다.

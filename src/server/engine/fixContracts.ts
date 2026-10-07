@@ -7,6 +7,7 @@ import { applyInfo, DIAGNOSIS_ID_PATTERN, type DiagnosisRecord } from "../../sha
 import { isOpen, type FixContract } from "../../shared/fixContract.js";
 import { mergeAgreedSources, mergeFindingSources, overruleDirectiveIDs } from "../../shared/workflow.js";
 import { pendingReviewRequests, type ReviewRequest } from "./reviewRequests.js";
+import { reviewEvidenceFindings } from "./findingJudgment.js";
 import type { EngineCore } from "./core.js";
 
 // 최종 리뷰의 대조 기준 — 수락된 결과만 보고로 쓰고(반환·정지로 저장된 수정 결과는 아니다), 그 뒤 수정 없이 닫힌 계약의 원본 쟁점도 싣는다.
@@ -18,6 +19,8 @@ export interface FinalReviewBase {
   sources: Finding[];
   // 그 원본 중 처분 변경이 허용된 id(사용자 판정·닫힌 진단).
   overruled: Set<string>;
+  // 정산된 리뷰 수정 계약이 러너 의무로 넘기지 않은 리뷰 증거 요청(최신 우선 병합) — 최종 리뷰가 최종 트리에서 다시 판정한다(커버리지·알려진 쟁점).
+  deferredEvidence: Finding[];
   contract: FixContract | null;
 }
 
@@ -65,14 +68,22 @@ export class FixContracts {
   }
 
   // 리뷰가 연 수정 작업 — 원본은 그 리뷰 산출물(revision)의 쟁점이다. 회차는 여는 순간 정한다(첫 회차 소비 전이면 first).
+  // 리뷰의 증거 요청(reviewEvidenceFindings — 리뷰 판정기와 같은 분할)은 러너 의무로 동결하지 않고 deferredEvidence 로 넘긴다.
   forReview(topic: Topic, review: { kind: "codex-review" | "codex-final-review"; revision: number; findings: readonly Finding[] }): FixContract {
     const flags = this.db.getFlags(topic.id);
     return {
       contractId: this.db.fixContracts.nextId(topic.id), scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch, route: "review",
       origin: { stage: review.kind === "codex-review" ? "CODEX_REVIEW" : "CODEX_FINAL_REVIEW", review: { kind: review.kind, revision: review.revision } },
-      source: review.findings.map((finding) => ({ ...finding })), diagnosisIds: [], adjudicated: [...this.adjudicatedFinalReviewIDs(topic)],
+      ...this.reviewSource(review.findings), diagnosisIds: [], adjudicated: [...this.adjudicatedFinalReviewIDs(topic)],
       decisionFrom: review.revision, pass: flags.fixPassUsed ? "second" : "first", status: "open",
     };
+  }
+
+  // 리뷰 수정 계약의 원본 분할 — 러너 의무(source)와 최종 리뷰로 넘길 증거 요청(deferredEvidence). 새 계약과 옛 작업 이관(ensureOpen)이 같이 쓴다.
+  private reviewSource(findings: readonly Finding[]): Pick<FixContract, "source" | "deferredEvidence"> {
+    const deferred = new Set(reviewEvidenceFindings(findings).map((finding) => finding.id));
+    return { source: findings.filter((finding) => !deferred.has(finding.id)).map((finding) => ({ ...finding })),
+      deferredEvidence: findings.filter((finding) => deferred.has(finding.id)).map((finding) => ({ ...finding })) };
   }
 
   // 인도 대기·최종 리뷰 정지에서 반환한 진단의 진단 전용 수정 — 열린 진단 전용 계약이 있으면 거기에 덧붙인다(정정·순차 적용은 같은 작업).
@@ -242,13 +253,14 @@ export class FixContracts {
     }
     // 합의(AGREED_ACTION)는 뒤 계약의 판정 없는 처분(EXTERNAL_EVIDENCE 등)에 가려지지 않는다(감사 6차 #5).
     const sources = mergeAgreedSources(...layers);
+    const deferredEvidence = mergeFindingSources(...cycle.settled.filter((contract) => contract.route === "review").map((contract) => contract.deferredEvidence ?? []));
     const accepted = cycle.settled.find((contract) => contract.status === "accepted") ?? null;
-    if (!accepted) return { report: await this.legacyReport(topicId, cycle), reportRevision: cycle.reportedAt, sources, overruled, contract: null };
+    if (!accepted) return { report: await this.legacyReport(topicId, cycle), reportRevision: cycle.reportedAt, sources, overruled, deferredEvidence, contract: null };
     const checkpoint = accepted.acceptId !== undefined ? await this.core.checkpoints.byRevision(topicId, accepted.acceptId) : null;
     if (!checkpoint) {
       throw new Error(`수정 작업 계약 ${accepted.contractId} 의 수락 기록(checkpoint #${accepted.acceptId ?? "?"})을 찾을 수 없습니다 — 최종 리뷰의 대조 보고를 정할 수 없어 멈춥니다.`);
     }
-    return { report: checkpoint.accumulated, reportRevision: cycle.reportedAt, sources, overruled, contract: accepted };
+    return { report: checkpoint.accumulated, reportRevision: cycle.reportedAt, sources, overruled, deferredEvidence, contract: accepted };
   }
 
   // 수락 계약이 없을 때의 대조 보고 — 이 작업 주기에 계약 도입 전(옛 엔진) 수락된 수정 결과(cycle.legacy)가 있으면 그 수락 기록(accepting checkpoint 누적본 —
@@ -317,7 +329,7 @@ export class FixContracts {
       contract = {
         contractId: `${kind}#${artifact.revision}`, scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch, route: "review",
         origin: { stage: kind === "codex-review" ? "CODEX_REVIEW" : "CODEX_FINAL_REVIEW", review: { kind, revision: artifact.revision } },
-        source: review.findings.map((finding) => ({ ...finding })),
+        ...this.reviewSource(review.findings),
         diagnosisIds: this.core.diagnoses.forWork(topicId, "CLAUDE_FIX", "work").map((record) => record.id),
         adjudicated, decisionFrom: artifact.revision, pass: flags.fixPassUsed ? "second" : "first", status: "open",
       };

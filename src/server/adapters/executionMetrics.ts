@@ -124,6 +124,7 @@ export class ExecutionMetrics {
   private sawClaudeDelta = false;
   private sawClaudeAdvisor = false;
   private readonly claudeMessages = new Map<string, Record<string, number>>();
+  private readonly claudeRequestInputs = new Map<string, { last: number; peak: number; fromIterations: boolean }>();
   private totals: Partial<Pick<TurnUsage, "inputTokens" | "cachedInputTokens" | "outputTokens">> = {};
   private metadata: Partial<Pick<TurnUsage, "costUSD" | "modelTurns" | "apiDurationMs">> = {};
   private internalRequests = 0;
@@ -197,10 +198,31 @@ export class ExecutionMetrics {
       }
       if (!previous) this.claudeAssistantRequests += 1;
       this.claudeMessages.set(id, next);
+      // Per-request input is one API request's context. With server-side advisor calls one message holds several
+      // executor requests (iterations of type "message") and the top-level usage is their sum, so count each
+      // iteration; advisor iterations stay budget-only as above. Without iterations the top-level sum is one request.
+      // Once a message reports iterations, a later top-level-only event does not replace them with the sum.
       const fields = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"];
-      if (fields.some(key => next[key] !== undefined)) {
-        this.lastRequestInputTokens = fields.reduce((sum, key) => sum + (next[key] ?? 0), 0);
-        this.peakRequestInputTokens = Math.max(this.peakRequestInputTokens ?? 0, this.lastRequestInputTokens);
+      const requestInput = (item: RecordValue | null) => {
+        const values = fields.map(key => number(item?.[key]));
+        return values.some(value => value !== undefined) && values.every(value => value === undefined || value >= 0)
+          ? values.reduce<number>((sum, value) => sum + (value ?? 0), 0) : undefined;
+      };
+      const requests = Array.isArray(usage.iterations)
+        ? usage.iterations.map(record).filter(item => item?.type === "message").map(requestInput) : [];
+      const observed = this.claudeRequestInputs.get(id);
+      if (requests.length && requests.every(value => value !== undefined)) {
+        const counts = requests as number[];
+        this.claudeRequestInputs.set(id, { last: counts.at(-1)!,
+          peak: Math.max(observed?.fromIterations ? observed.peak : 0, ...counts), fromIterations: true });
+      } else if (!observed?.fromIterations && fields.some(key => next[key] !== undefined)) {
+        const total = fields.reduce((sum, key) => sum + (next[key] ?? 0), 0);
+        this.claudeRequestInputs.set(id, { last: total, peak: Math.max(observed?.peak ?? 0, total), fromIterations: false });
+      }
+      const request = this.claudeRequestInputs.get(id);
+      if (request) {
+        this.lastRequestInputTokens = request.last;
+        this.peakRequestInputTokens = Math.max(...[...this.claudeRequestInputs.values()].map(item => item.peak));
       }
       this.internalRequests = this.claudeAssistantRequests;
       const addDelta = (target: "inputTokens" | "cachedInputTokens" | "outputTokens", keys: string[]) => {

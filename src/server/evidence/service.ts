@@ -13,6 +13,11 @@ import { evidenceHash, type EvidenceStore } from "./store.js";
 import type { EvidenceReadObservation } from "./readLifecycle.js";
 import { reportBackgroundFailure } from "../backgroundTask.js";
 
+// Providers the app reader reads only partly: its Figma tools return no comments, so every Figma page it collects reports them
+// missing (NativeEvidenceConnector). A host capture with the comments completes such a source. The evidence-catalog binding test
+// keeps this list equal to the providers whose app-reader pages report missing content.
+export const PARTIAL_NATIVE_PROVIDERS: ReadonlySet<EvidenceSource["provider"]> = new Set(["figma"]);
+
 export class EvidenceService {
   private timer?: ReturnType<typeof setInterval>;
   private readonly nativeCollections = new Map<string, Promise<void>>();
@@ -86,10 +91,10 @@ export class EvidenceService {
       let checkId: string | null = null; let committing = false;
       try {
         if (source.mode === "connector" && this.store.catalog.hostManaged(source.id) &&
-          (!this.native || (!force && cursor === null && source.collection?.status !== "error" && source.collection?.connectionKey &&
+          (this.hostOwns(source) || (!force && cursor === null && source.collection?.status !== "error" && source.collection?.connectionKey &&
             this.collectedThisPoll.get(source.id)?.key === `${source.collection.connectionKey}:${source.contentHash}` && !source.error))) {
-          if (source.mode === "connector" && this.native && source.collection?.connectionKey) {
-            const validate = (this.native as EvidenceConnector & { validateCachedSource?: (source: EvidenceSource, key: string, signal: AbortSignal) => Promise<void> }).validateCachedSource;
+          if (source.mode === "connector" && this.native && !this.hostOwns(source) && source.collection?.connectionKey) {
+            const validate =(this.native as EvidenceConnector & { validateCachedSource?: (source: EvidenceSource, key: string, signal: AbortSignal) => Promise<void> }).validateCachedSource;
             if (validate) await this.scheduler.run(evidenceGroup(source), this.abort.signal,
               () => validate.call(this.native, source, source.collection!.connectionKey!, this.abort.signal), deadline,
               ms => this.measureWait(source, ms));
@@ -162,6 +167,20 @@ export class EvidenceService {
   connection(source: EvidenceSource): { configured: boolean; error: string | null } {
     return { configured: (source.mode === "connector" ? (this.native ?? this.connector) : this.connector)?.configured?.(source) ?? false, error: source.collection?.error ?? source.error };
   }
+  // One writer per source (2026-10-07 J2). A host capture stores the host's own unit layout, so alternating it with the app
+  // reader made every switch look like a whole-source change. A source the app reader reads completely has that reader as its
+  // only writer. A source it cannot read (documents) belongs to the host. A source it reads only partly is read by the app
+  // reader until a complete host capture exists. From then on the host owns it, and the reader does not overwrite it with its
+  // incomplete read; a host capture that becomes unusable hands the source back to the reader.
+  private nativeReads(source: EvidenceSource): boolean {
+    return source.mode === "connector" && this.native !== undefined && this.native.configured?.(source) !== false;
+  }
+  private nativeOnly(source: EvidenceSource): boolean {
+    return this.nativeReads(source) && !PARTIAL_NATIVE_PROVIDERS.has(source.provider);
+  }
+  private hostOwns(source: EvidenceSource): boolean {
+    return !this.nativeReads(source) || (!this.nativeOnly(source) && this.store.usable(source));
+  }
   hostPlan(topicId: string, cursor?: string, limit = 50): EvidenceHostPlan {
     const catalog = this.store.catalog.state(topicId, { collection: true }), now = Date.now();
     const integrations = { jira: "Atlassian Rovo", confluence: "Atlassian Rovo", slack: "Slack", figma: "Figma",
@@ -180,6 +199,10 @@ export class EvidenceService {
       if (!root || root.status !== "approved" || entry.state !== "approved") return false;
       // A configured REST root keeps its selected transport. Existing host captures and unavailable REST readers use app connections.
       if (root.source.mode === "rest" && entry.source.mode === "rest" && this.connection(entry.source).configured) return false;
+      if (this.nativeOnly(entry.source)) return false;
+      // A partly-read source the app reader still owns has no complete capture: its collection can finish with content missing,
+      // so the host supplement stays offered until a complete host capture arrives.
+      if (!this.hostOwns(entry.source)) return true;
       return entry.progress !== "complete" || !this.store.fresh(entry.source) || root.nextCheckAt <= now;
     })) if (!unique.has(entry.source.id)) unique.set(entry.source.id, { rootId: entry.rootId, sourceId: entry.source.id, url: entry.source.url, label: entry.source.label,
       provider: entry.source.provider, resource: entry.source.resource, selector: entry.source.selector,
@@ -289,6 +312,8 @@ export class EvidenceService {
   }
   importHost(topicId: string, input: EvidenceHostImport): EvidenceSource {
     const before=this.store.get(input.sourceId);
+    if (this.nativeOnly(before))
+      throw Object.assign(new Error("이 원문은 서버가 같은 앱 연결로 직접 수집합니다. host-import 대신 collect 를 호출하세요."),{statusCode:409});
     const after=this.store.catalog.importHostSnapshot(topicId,input,discoverLinks(input.units,before.url));
     if (before.contentHash!==after.contentHash) this.store.catalog.afterPublication(() => this.changed(after));
     return after;
@@ -297,6 +322,14 @@ export class EvidenceService {
 
 // Cache is shared across roles/topics; delivery receipts belong to one actual model session.
 // A failed/cancelled call never acknowledges content that the model may not have received.
+// Guidance for turns that see design observations, generated from the turn's Figma permission. Only implementation
+// may read missing design context; review uses the retained observations and caches, and the mediator registers more.
+function designAccessGuidance(figmaRead: boolean, cache: readonly unknown[], observations: readonly unknown[]): string {
+  const missing = figmaRead
+    ? "Cached observations may be partial: use read-only Figma tools on the supplied link for missing design context, and screenshots only when visual verification is needed. Do not fetch the whole file. If the Figma tools or required node are unavailable, preserve the gap as To-do, exclude dependent behavior and continue supported work; never invent design values."
+    : "Figma tools are not available in this turn; do not try other tools or skills to read Figma. Use only the observations and caches below. If a design value needed for a comparison is missing from them, report the node and tool as an evidence gap for the mediator to register in the shared cache, and continue with the rest; never invent design values.";
+  return `Inspect only the Figma screen currently being implemented or reviewed. Reuse already inspected data with the same contentHash; read the cache only when needed. The observed-design references are the exact native tool responses seen by implementation, not a claim that the remote file is still current. Use those same observations for review. Older source caches are baseline references only and must not override a newer observed response. ${missing}\nOptional design cache references (not yet read): ${JSON.stringify(cache)}\nObserved design references retained in this scope (including prior plan revisions; verify their relevance to the current plan): ${JSON.stringify(observations)}`;
+}
 export function withEvidence(adapter: AgentAdapter, database: ConsensusDatabase, imageDirectory: string): AgentAdapter {
   const run = async <T>(turn: Omit<SessionTurn, "sessionId"> | SessionTurn, invoke: (enriched: typeof turn) => Promise<T>, session: (result: T) => string): Promise<T> => {
     const topic = database.topicForTurn(turn);
@@ -323,6 +356,8 @@ export function withEvidence(adapter: AgentAdapter, database: ConsensusDatabase,
     const designCache: Array<{ url: string; nodeId: string; contentHash: string; path: string }> = [];
     const designSources = database.evidence.list(topic.id).filter(source => source.provider === "figma");
     const designAccess = turn.implementation || ["CODEX_REVIEW", "CODEX_FINAL_REVIEW"].includes(topic.state);
+    // Only implementation reads Figma; the guidance below is generated from this same permission.
+    const figmaReadEnabled = Boolean(turn.implementation && designSources.length);
     if (designAccess && !turn.signal?.aborted) database.evidence.beginDesignTurn(topic);
     const observed = designAccess ? database.evidence.designObservations(topic) : [];
     const observationReferences: Array<{ hash: string; path: string }> = [];
@@ -353,7 +388,7 @@ export function withEvidence(adapter: AgentAdapter, database: ConsensusDatabase,
       }
     }
     const designGuidance = !designSources.length ? "" : designAccess
-      ? `Inspect only the Figma screen currently being implemented or reviewed. Reuse already inspected data with the same contentHash; read the cache only when needed. The observed-design references are the exact native tool responses seen by implementation, not a claim that the remote file is still current. Use those same observations for review. Older source caches are baseline references only and must not override a newer observed response. Cached observations may be partial: use read-only Figma tools on the supplied link for missing design context, and screenshots only when visual verification is needed. Do not fetch the whole file. If the Figma tools or required node are unavailable, preserve the gap as To-do, exclude dependent behavior and continue supported work; never invent design values.\nOptional design cache references (not yet read): ${JSON.stringify(designCache)}\nObserved design references retained in this scope (including prior plan revisions; verify their relevance to the current plan): ${JSON.stringify(observationReferences)}`
+      ? designAccessGuidance(figmaReadEnabled, designCache, observationReferences)
       : DESIGN_PLANNING_CONTRACT;
     const evidenceText = [designGuidance, packet.text].filter(Boolean).join("\n\n");
     if (evidenceText) {
@@ -414,7 +449,7 @@ export function withEvidence(adapter: AgentAdapter, database: ConsensusDatabase,
       onFigmaRequest: turn.implementation ? request => {
         if (!turn.signal?.aborted) database.evidence.recordDesignRead(topic, { kind: "requested", request });
       } : undefined,
-      onFigmaResult: turn.implementation ? capture : undefined, evidenceManaged: true, figmaReadEnabled: Boolean(turn.implementation && designSources.length),
+      onFigmaResult: turn.implementation ? capture : undefined, evidenceManaged: true, figmaReadEnabled,
       figmaFileKeys: designSources.map(source => source.resource),
       prompt: `${turn.prompt}${evidenceText ? `\n\n${evidenceText}` : ""}${corpusGuidance}` +
         (gaps.length ? `\nDeferred design reads (not verified design): ${JSON.stringify(gaps)}. Unreceived means unknown; unavailable means an explicit failure. Preserve these as To-do and exclude only dependent behavior. Continue the supported implementation or review. Do not automatically repeat failed reads or replay this backlog; retry only a read needed for current supported work after a relevant source/access change or explicit refresh. Completed means supported work is complete with excluded dependencies identified, never that these reads or mandatory checks succeeded.` : ""),

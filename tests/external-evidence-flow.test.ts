@@ -126,6 +126,7 @@ function fixture() {
   return { root, database, topic, source, ingest, runner, adapter, dependencies };
 }
 it.each([
+  { status: "completed" as const, requestedMediatorAction: "Run the authorized comparison" },
   { status: "blocked" as const }, { status: "in_progress" as const }, { status: "completed" as const, remainingSteps: ["Read current design"] },
 ])("incomplete evidence result cannot satisfy the approval prerequisite: %j", async incomplete => {
   const f = fixture();
@@ -162,7 +163,8 @@ it("five thousand design renders reach evidence review with bounded CLI permissi
   const imageReads = vi.spyOn(f.database.evidence, "image");
   f.adapter.createSession = async turn => {
     await turn.beforeSpawn?.(); turn.admitSync?.();
-    expect(turn.readablePaths).toHaveLength(5);
+    // The review of the revised plan also reads the previous accepted review's input and the previous plan; the count stays fixed.
+    expect(turn.readablePaths).toHaveLength(directories.length ? 7 : 5);
     expect(Buffer.byteLength(turn.prompt)).toBeLessThan(10_000);
     const settings = buildIsolationSettings(f.root, join(f.root, "action"), false, { readablePaths: turn.readablePaths }) as any;
     expect(Buffer.byteLength(JSON.stringify(settings))).toBeLessThan(20_000);
@@ -1023,6 +1025,94 @@ it("keeps implementation waiting for evidence review and drops its intent when s
   expect(f.adapter.createSession).not.toHaveBeenCalled();
 });
 
+// Delivery stopped on changed evidence: the stored review's source versions are the base of what one retry reviews.
+async function changedEvidenceStop(after: Array<{ id: string; content: string }>) {
+  const f = fixture();
+  const ingest = (revision: string, units: typeof after) => {
+    const check = f.database.evidence.begin(f.source.id, true)!;
+    f.database.evidence.ingest(f.source.id, { checkId: check.checkId, revision, units: units.map(unit => ({ ...unit, kind: "issue" as const })) });
+  };
+  ingest("before", [{ id: "get_metadata:0", content: "Currently selected nodes:\n- 9:9: Elsewhere\n" }, { id: "get_metadata:1", content: "<frame id=\"1:2\"/>" }]);
+  const plan = await f.dependencies.artifacts.write("t", "plan", 1, "Current approved plan");
+  f.database.updateTopic("t", { planSHA256: plan.sha256, approvedPlanSHA256: plan.sha256 });
+  const topic = f.database.getTopic("t");
+  f.database.evidence.review(topic, f.database.evidence.topic(topic).digest, "Checked against the plan", topic);
+  ingest("after", after);
+  f.database.updateTopic("t", { state: "BLOCKED_ON_EVIDENCE", resumeState: "IMPLEMENTING" });
+  const engine = new WorkflowEngine(f.dependencies);
+  const resumed = vi.spyOn((engine as any).delivery, "resumeDelivery").mockResolvedValue(undefined);
+  const prompts: string[] = [], packets: unknown[] = [];
+  const answer = (kind: string) => vi.mocked(f.adapter.createSession).mockImplementation(async turn => {
+    await turn.beforeSpawn?.(); turn.admitSync?.(); prompts.push(turn.prompt);
+    const packet = /변경 전후 자료 (\S+)/.exec(turn.prompt)?.[1];
+    if (packet) packets.push(JSON.parse(readFileSync(packet, "utf8")));
+    return { sessionId: "review", result: { kind, summary: `Assessed: ${kind}`, planEdits: [], findings: [], evidenceRefs: [] } as any };
+  });
+  const retry = async () => { engine.retry("t"); await vi.waitFor(() => expect(f.database.runningAction("t")).toBeNull()); };
+  return { ...f, engine, resumed, prompts, packets, answer, retry };
+}
+
+it("one retry reviews the changes since the recorded review, records it, then resumes the stored stage", async () => {
+  // The selection echo disappeared, so the remaining part moved to index 0. Unit ids are compared as recorded.
+  const f = await changedEvidenceStop([{ id: "get_metadata:0", content: "<frame id=\"1:2\"/>" }]);
+  f.answer("EVIDENCE_NO_IMPACT");
+  await f.retry();
+  expect(f.packets).toEqual([[expect.objectContaining({ sourceId: f.source.id, units: [
+    { id: "get_metadata:0", before: expect.objectContaining({ content: expect.stringContaining("Currently selected nodes") }), after: expect.objectContaining({ content: "<frame id=\"1:2\"/>" }) },
+    { id: "get_metadata:1", before: expect.objectContaining({ content: "<frame id=\"1:2\"/>" }), after: null },
+  ] })]]);
+  const topic = f.database.getTopic("t"), evidence = f.database.evidence.topic(topic);
+  expect(evidence.reviewed).toBe(true);
+  expect(f.database.evidence.reviewedManifest(topic)).toEqual({ [f.source.id]: evidence.sources[0].contentHash });
+  expect(f.resumed).toHaveBeenCalledTimes(1);
+  expect(topic.state).toBe("IMPLEMENTING");
+});
+
+it("a changed value stays in the review packet when the same values exist in other units", async () => {
+  const f = await changedEvidenceStop([{ id: "get_metadata:0", content: "Currently selected nodes:\n- 9:9: Elsewhere\n" }, { id: "get_metadata:1", content: "Currently selected nodes:\n- 9:9: Elsewhere\n" }]);
+  f.answer("EVIDENCE_NO_IMPACT");
+  await f.retry();
+  // get_metadata:1 changed to a value another unit already had; the old value also survives elsewhere.
+  expect(f.packets).toEqual([[expect.objectContaining({ units: [
+    { id: "get_metadata:1", before: expect.objectContaining({ content: "<frame id=\"1:2\"/>" }), after: expect.objectContaining({ content: expect.stringContaining("Currently selected nodes") }) },
+  ] })]]);
+});
+
+it("an impacting change stops the resumed stage for a decision before any delivery work", async () => {
+  const f = await changedEvidenceStop([{ id: "get_metadata:0", content: "<frame id=\"1:2\" removed=\"section\"/>" }]);
+  f.answer("EVIDENCE_REPLAN");
+  await f.retry();
+  const topic = f.database.getTopic("t");
+  expect(topic.state).toBe("USER_DECISION_REQUIRED");
+  expect(f.database.getFlags("t").resumeState).toBe("CLAUDE_REVISION");
+  expect(f.database.getTimeline("t").at(-1)?.payload).toMatchObject({ evidenceAssessmentDecision: true });
+  expect(f.database.evidence.topic(topic).reviewed).toBe(false);
+  expect(f.resumed).not.toHaveBeenCalled();
+});
+
+it("a retry keeps the review without a model call when only the evidence listing changed", async () => {
+  const f = await changedEvidenceStop([{ id: "get_metadata:0", content: "Currently selected nodes:\n- 9:9: Elsewhere\n" }, { id: "get_metadata:1", content: "<frame id=\"1:2\"/>" }]);
+  // A review recorded under an older catalog listing: same source versions, different digest.
+  const raw = new DatabaseSync(join(f.root, "room.sqlite"));
+  raw.prepare("UPDATE evidence_reviews SET digest=? WHERE topic_id='t'").run("0".repeat(64)); raw.close();
+  expect(f.database.evidence.topic(f.database.getTopic("t")).reviewed).toBe(false);
+  await f.retry();
+  expect(f.adapter.createSession).not.toHaveBeenCalled();
+  expect(f.database.evidence.topic(f.database.getTopic("t")).reviewed).toBe(true);
+  expect(f.resumed).toHaveBeenCalledTimes(1);
+});
+
+it("a review recorded without source versions makes the retry check the whole plan once", async () => {
+  const f = await changedEvidenceStop([{ id: "get_metadata:0", content: "<frame id=\"1:2\"/>" }]);
+  const raw = new DatabaseSync(join(f.root, "room.sqlite"));
+  raw.prepare("UPDATE evidence_reviews SET manifest=NULL WHERE topic_id='t'").run(); raw.close();
+  f.answer("EVIDENCE_NO_IMPACT");
+  await f.retry();
+  expect(f.prompts).toHaveLength(1); expect(f.prompts[0]).toContain("최초 검토도 포함");
+  expect(f.database.evidence.topic(f.database.getTopic("t")).reviewed).toBe(true);
+  expect(f.resumed).toHaveBeenCalledTimes(1);
+});
+
 it("does not retry a budget refusal on every collection poll", async () => {
   const f = await waitingPlan();
   f.complete();
@@ -1474,4 +1564,148 @@ it("an unavailable unrelated root does not hide a change to a collected source",
     expect(f.database.evidence.automation.jobs("t")[0]).toMatchObject({ status: "pending", changes: [{ sourceId: root.sourceId }] });
     expect(f.adapter.createSession).not.toHaveBeenCalled();
   } finally { await service.stop(); }
+});
+
+// 2026-10-07 evidence-review-input — a plan review is a new session. Without the previous accepted review it re-read every source and
+// decision for a one-line plan change (1fd0cc86 6판: 17분, 도구 48회).
+async function reviewPlanOnce(f: ReturnType<typeof fixture>, actionId: string, summary: string) {
+  const turns: Parameters<AgentAdapter["createSession"]>[0][] = [];
+  f.adapter.createSession = async turn => {
+    await turn.beforeSpawn?.(); turn.admitSync?.(); turns.push(turn);
+    return { sessionId: actionId, result: { kind: "EVIDENCE_NO_IMPACT", summary, status: "completed", findings: [], evidenceRefs: ["issue"] } };
+  };
+  const core = new EngineCore(f.dependencies);
+  new EvidenceAssessmentPipeline(core).reviewCurrent("t", actionId);
+  await core.active.get("t")!.completion;
+  return turns[0];
+}
+
+it("a plan review receives the previous accepted review with the plan, user input and source changes since, and judges the current plan", async () => {
+  const f = fixture();
+  const first = await f.dependencies.artifacts.write("t", "plan", 1, "## A\n- KEEP\n## B\n- OLD\n");
+  f.database.updateTopic("t", { state: "AWAITING_USER_APPROVAL", planRevision: 1, planSHA256: first.sha256, approvedPlanSHA256: null });
+  await reviewPlanOnce(f, "first-review", "First plan checked against the issue");
+  const previous = f.database.evidence.automation.jobs("t")[0];
+  expect(previous).toMatchObject({ purpose: "plan-review", status: "complete", outcome: "no-impact", planRevision: 1 });
+
+  const second = await f.dependencies.artifacts.write("t", "plan", 2, "## A\n- KEEP\n## B\n- NEW\n");
+  f.database.updateTopic("t", { planRevision: 2, planSHA256: second.sha256 });
+  f.ingest("changed");
+  const decision = f.database.appendEvent({ topicId: "t", actor: "user", kind: "decision", state: "AWAITING_USER_APPROVAL", body: "Keep the new entry", payload: {} });
+  const diff = vi.fn(async () => "PLAN-DELTA -U0");
+  f.dependencies.git.diffPlanFiles = diff;
+  const turn = await reviewPlanOnce(f, "second-review", "Second plan checked");
+
+  // Artifact paths are content-addressed: the previous-review input follows the plan, before the previous plan and the image directory.
+  const inputPath = turn.readablePaths![4];
+  const input = JSON.parse(readFileSync(inputPath, "utf8"));
+  expect(input.previousReview).toMatchObject({ assessmentId: previous.id, planRevision: 1, planSHA256: first.sha256, digest: previous.digest,
+    outcome: "no-impact", result: { kind: "EVIDENCE_NO_IMPACT", summary: "First plan checked against the issue", findings: [], evidenceRefs: ["issue"] } });
+  expect(input.current).toMatchObject({ planRevision: 2, planSHA256: second.sha256, planPath: expect.stringContaining(second.sha256) });
+  expect(diff).toHaveBeenCalledWith(f.root, input.previousReview.planPath, input.current.planPath);
+  expect(input.previousReview.planPath).toContain(first.sha256);
+  expect(input.planChanges).toBe("PLAN-DELTA -U0");
+  expect(input.newUserInputs).toEqual([decision.sequence]);
+  expect(input.sourceChanges).toEqual([expect.objectContaining({ sourceId: f.source.id,
+    units: [expect.objectContaining({ id: "issue", before: expect.objectContaining({ content: "initial" }), after: expect.objectContaining({ content: "changed" }) })] })]);
+  expect(turn.readablePaths).toEqual(expect.arrayContaining([expect.stringContaining(first.sha256)]));
+  expect(turn.prompt).toContain(`이전에 받아들인 근거 검토 결과와 그 뒤의 변경분 ${inputPath} 를 먼저 읽으세요(이전 판 1, 계획 SHA ${first.sha256}`);
+  expect(turn.prompt).toContain("현재 계획의 통과가 아닙니다");
+  expect(turn.prompt).toContain("최종 판정은 현재 계획 전체에 대해 내리세요");
+  expect(turn.prompt).not.toContain("최초 검토도 포함합니다");
+  // The verdict is still this review's own: the current plan is reviewed with its own job and receipt.
+  const current = f.database.evidence.automation.jobs("t")[0];
+  expect(current).toMatchObject({ purpose: "plan-review", status: "complete", planRevision: 2 });
+  expect(current.id).not.toBe(previous.id);
+  expect(f.database.evidence.topic(f.database.getTopic("t")).reviewed).toBe(true);
+});
+
+it("an altered previous plan is stated as unavailable and does not stop the current plan's review", async () => {
+  const f = fixture();
+  const first = await f.dependencies.artifacts.write("t", "plan", 1, "## A\n- OLD\n");
+  f.database.updateTopic("t", { state: "AWAITING_USER_APPROVAL", planRevision: 1, planSHA256: first.sha256, approvedPlanSHA256: null });
+  await reviewPlanOnce(f, "first-review", "First plan checked");
+  const second = await f.dependencies.artifacts.write("t", "plan", 2, "## A\n- NEW\n");
+  f.database.updateTopic("t", { planRevision: 2, planSHA256: second.sha256 });
+  writeFileSync(first.path, "altered");
+  const turn = await reviewPlanOnce(f, "second-review", "Second plan checked");
+  expect(turn.readablePaths).toHaveLength(6);
+  expect(JSON.parse(readFileSync(turn.readablePaths![4], "utf8")).planChanges).toBe("이전 계획 산출물을 확인하지 못했습니다. 현재 계획 전체를 대조하세요.");
+  expect(f.database.evidence.automation.jobs("t")[0]).toMatchObject({ status: "complete", planRevision: 2 });
+});
+
+it("a plan review without a previous accepted review states it and runs as a first review", async () => {
+  const f = fixture();
+  const plan = await f.dependencies.artifacts.write("t", "plan", 1, "Current plan");
+  f.database.updateTopic("t", { state: "AWAITING_USER_APPROVAL", planSHA256: plan.sha256, approvedPlanSHA256: null });
+  const turn = await reviewPlanOnce(f, "only-review", "Plan checked");
+  expect(turn.prompt).toContain("이전에 받아들인 근거 검토 결과가 없습니다. 최초 검토도 포함합니다.");
+  expect(turn.readablePaths).toHaveLength(5);
+  expect(turn.prompt).not.toContain("이전에 받아들인 근거 검토 결과와 그 뒤의 변경분");
+});
+
+// Engine review 60917216 F001: the previous review's source changes name the before image too, and the reviewer reads images only
+// from this job's directory.
+async function reviewDesignChange(f: ReturnType<typeof fixture>, options: { failedAttempt?: boolean; tamperBefore?: boolean } = {}) {
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lWQAAAAASUVORK5CYII=", "base64");
+  const frame = (label: string) => {
+    const check = f.database.evidence.begin(f.source.id, true)!;
+    f.database.evidence.ingest(f.source.id, { checkId: check.checkId, revision: label,
+      units: [{ id: "frame", kind: "render", content: "Checkout frame", imageBase64: Buffer.concat([png, Buffer.from(label)]).toString("base64") }] });
+    return f.database.evidence.sourceSnapshot(f.database.evidence.get(f.source.id))!.units[0].imageHash!;
+  };
+  const before = frame("before");
+  const first = await f.dependencies.artifacts.write("t", "plan", 1, "Follow the checkout frame");
+  f.database.updateTopic("t", { state: "AWAITING_USER_APPROVAL", planRevision: 1, planSHA256: first.sha256, approvedPlanSHA256: null });
+  const firstTurn = await reviewPlanOnce(f, "first-review", "First plan checked against the frame");
+  const after = frame("after");
+  const second = await f.dependencies.artifacts.write("t", "plan", 2, "Follow the revised checkout frame");
+  f.database.updateTopic("t", { planRevision: 2, planSHA256: second.sha256 });
+  if (options.failedAttempt) {
+    // The first attempt links the images, then its model call fails; the retry runs the same job again.
+    f.adapter.createSession = async () => { throw new Error("transient model failure"); };
+    const core = new EngineCore(f.dependencies);
+    new EvidenceAssessmentPipeline(core).reviewCurrent("t", "failed-attempt");
+    await core.active.get("t")!.completion.catch(() => {});
+  }
+  // The shared cache entry changes in place, so a link an earlier attempt made shares the new bytes.
+  if (options.tamperBefore) writeFileSync(join(firstTurn.readablePaths!.at(-1)!, "..", "evidence-images", `${before}.png`), "tampered");
+  const turn = await reviewPlanOnce(f, "second-review", "Second plan checked against the frame");
+  return { turn, before, after, input: JSON.parse(readFileSync(turn.readablePaths![4], "utf8")) };
+}
+
+it("a plan review links the before and after images of the source changes since the previous review into its own directory", async () => {
+  const f = fixture();
+  const { turn, before, after, input } = await reviewDesignChange(f);
+  expect(input.sourceChanges).toEqual([expect.objectContaining({ sourceId: f.source.id,
+    units: [expect.objectContaining({ id: "frame", before: expect.objectContaining({ imageHash: before }), after: expect.objectContaining({ imageHash: after }) })] })]);
+  expect(input.imagesUnavailable).toBeUndefined();
+  const directory = turn.readablePaths!.at(-1)!;
+  for (const hash of [before, after]) expect(readFileSync(join(directory, `${hash}.png`))).toEqual(f.database.evidence.image(hash));
+  expect(turn.prompt).toContain(`원문 unit의 imageHash에 해당하는 이미지는 ${directory}/<imageHash>.png입니다`);
+  expect(turn.prompt).toContain("변경분 단위의 변경 전·후 이미지도 같은 이미지 디렉터리에 있습니다");
+  // Read access stays this job's directory; the shared cache is never granted.
+  expect(turn.readablePaths!.filter(path => path.includes("evidence-images"))).toEqual([directory]);
+  expect(f.database.evidence.automation.jobs("t")[0]).toMatchObject({ status: "complete", planRevision: 2 });
+});
+
+it("a before image that cannot be linked is stated and does not stop the current plan's review", async () => {
+  const f = fixture();
+  const { turn, before, after, input } = await reviewDesignChange(f, { tamperBefore: true });
+  expect(input.imagesUnavailable).toEqual([{ imageHash: before, reason: expect.stringContaining("디자인 캐시") }]);
+  const directory = turn.readablePaths!.at(-1)!;
+  expect(() => statSync(join(directory, `${before}.png`))).toThrow();
+  expect(readFileSync(join(directory, `${after}.png`))).toEqual(f.database.evidence.image(after));
+  expect(f.database.evidence.automation.jobs("t")[0]).toMatchObject({ status: "complete", planRevision: 2 });
+});
+
+it("a retried plan review removes an earlier attempt's link to a before image that no longer verifies", async () => {
+  const f = fixture();
+  const { turn, before, after, input } = await reviewDesignChange(f, { failedAttempt: true, tamperBefore: true });
+  expect(f.database.evidence.automation.jobs("t")).toHaveLength(2);
+  expect(input.imagesUnavailable).toEqual([{ imageHash: before, reason: expect.stringContaining("디자인 캐시") }]);
+  const directory = turn.readablePaths!.at(-1)!;
+  expect(() => statSync(join(directory, `${before}.png`))).toThrow();
+  expect(readFileSync(join(directory, `${after}.png`))).toEqual(f.database.evidence.image(after));
+  expect(f.database.evidence.automation.jobs("t")[0]).toMatchObject({ status: "complete", planRevision: 2 });
 });

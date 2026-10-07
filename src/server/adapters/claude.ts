@@ -24,6 +24,7 @@ import { ExecutionMetrics, readClaudeUsageBaseline } from "./executionMetrics.js
 import { captureFigma } from "./figmaCapture.js";
 import { createToolTimeMeter } from "./toolTime.js";
 import { resolveSupportedTurn, runnerControlPaths } from "./turnPolicy.js";
+import { resolveHostExecutable } from "../hostRuntime.js";
 
 export interface ClaudeAdapterOptions {
   memoryReaderOptions?: MemoryReaderOptions;
@@ -189,6 +190,9 @@ export class ClaudeAdapter implements AgentAdapter {
     // 역할 정책(turnPolicy.ts)을 이 CLI 의 인자·설정으로 변환만 한다. 표현할 수 없는 정책은 조용히 바꾸지 않고 실행 전에 거부한다.
     // 하위 에이전트 팬아웃은 Workflow 로만 낸다 — Task 는 중첩 증식을 막을 수 없어 열지 않는다(위 주석).
     const { job, policy, protocolOnly, options: providerOptions } = resolveSupportedTurn("claude", turn);
+    // 실행 파일은 턴마다 PATH 에서 푼다(hostRuntime.ts). 실제 경로가 아니라 PATH 의 링크로 실행한다 — 자기 업데이트가 링크를 새 versions/<ver> 로
+    // 옮기므로 실제 경로를 쓰면 지워질 옛 버전을 가리킬 수 있다.
+    const claude = (await resolveHostExecutable("claude")).path;
     // Legacy calls without job cannot distinguish planner ACK from implementation confirmation.
     // Enable the default only for an explicit planner role; explicit profile selection still works.
     const advisorModel = job.role === "planner" && (turn.job || providerOptions.advisorModel !== undefined)
@@ -368,7 +372,7 @@ export class ClaudeAdapter implements AgentAdapter {
       const output = await this.runner.run({
         beforeSpawn: turn.beforeSpawn, admitSync: turn.admitSync,
         onInterruptedOutput: turn.onInterruptedOutput,
-        command: "claude", args, cwd: workspace, stdin: transport,
+        command: claude, args, cwd: workspace, stdin: transport,
         signal: turn.signal, onSpawn: spawned => { turn.onProcessSpawn?.(spawned); observeEnvironment(turn, "claude", policy, executionSettings, `Claude ${permissionMode}; sandbox enabled`, spawned, newSession ? "create" : "resume"); },
         onJSONLine: (value, at) => { toolTime.observe(value, at); metrics.observe(value); observeDesign(value); observeInstructionContext(value); },
         // stream-json 의 마지막 줄은 {"type":"result"} 다. 그 뒤 2분 안에 프로세스가 안 끝나면 hang 으로 보고 정리한다.

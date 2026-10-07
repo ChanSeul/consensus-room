@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,10 +11,10 @@ import { GitService } from "../src/server/git";
 import { SpawnCommandRunner } from "../src/server/processRunner";
 import { guardedPlanning } from "../src/server/guardedPlanning";
 import { BudgetController } from "../src/server/budgetController";
-import { PlanningReader, utf8Slice } from "../src/server/planningReader";
+import { InvalidPlanningOffset, isCorrectableReadError, PlanningReader, UnavailablePlanningEvidence, utf8Slice } from "../src/server/planningReader";
 import { renderDeferredFindingsDigest } from "../src/server/deferredFindingsDigest";
-import { PLANNING_LIMITS, PlanningPaused, type PlanningFragment, type PlanningStep } from "../src/shared/planningControl";
-import { buildClaudePlanPrompt, buildCodexAuditPrompt, planTimelineDelivery, timelineEventText, timelineReference } from "../src/shared/prompts";
+import { PLANNING_LIMITS, PlanningPaused, type DeferredRead, type PlanningCheckpoint, type PlanningFragment, type PlanningStep, type TimelineReference } from "../src/shared/planningControl";
+import { buildClaudePlanPrompt, buildCodexAuditPrompt, EXECUTION_POLICY_NOTE, planTimelineDelivery, timelineEventText, timelineReference } from "../src/shared/prompts";
 import { WorkflowEngine } from "../src/server/workflow";
 import { ArtifactStore } from "../src/server/artifacts";
 import type { AgentAdapter, SessionTurn, TurnUsage } from "../src/server/types";
@@ -102,6 +102,16 @@ function setup(role: "claude" | "codex" = "claude", executionInput = 100000, exe
   const git = new GitService(new SpawnCommandRunner());
   cleanups.push(() => rmSync(root, { recursive: true, force: true }), () => database.close());
   return { root, repo, database, git, topic };
+}
+// 실제 git 읽기 실패 — 고정 트리는 그대로 두고 그 파일의 blob 객체만 깨뜨린다. 스냅숏 계산(read-tree·add·write-tree)과 ls-tree 는 blob 을 읽지 않아 통과하고,
+// git show 만 실패한다. 돌려주는 함수가 원래 바이트로 되돌린다.
+function breakBlob(repo: string, file: string): () => void {
+  const oid = execFileSync("git", ["-C", repo, "hash-object", "-w", file]).toString().trim();
+  const path = join(repo, ".git", "objects", oid.slice(0, 2), oid.slice(2));
+  const original = readFileSync(path);
+  chmodSync(path, 0o644);
+  writeFileSync(path, "corrupt");
+  return () => writeFileSync(path, original);
 }
 const step = (patch: Partial<PlanningStep> = {}): PlanningStep => ({
   draft: "Preserve existing navigation", facts: [], contradictions: [], questions: ["Where is step stored?"],
@@ -827,9 +837,9 @@ it("resends an unacknowledged required reference before adopting a cancelled ove
   const controller = new AbortController();
   let fragment!: PlanningFragment;
   const fake = scripted(async (turn, n) => {
-    if (n === 1) return answer(step({ requests: [{ kind: "context", selector: reference.selector, offset: 0, question: "Read" }] }));
     const sent = JSON.parse(turn.prompt.split("Fragments: ").at(-1)!) as PlanningFragment[];
-    if (n === 2) {
+    // 필수 참조는 요청 없이 첫 패킷에 실린다 — 그 호출을 취소하고 늦게 끝낸다.
+    if (n === 1) {
       fragment = sent.find(f => f.selector === reference.selector)!;
       controller.abort();
       return answer(step({ draft: "가".repeat(5000) }));
@@ -844,7 +854,7 @@ it("resends an unacknowledged required reference before adopting a cancelled ove
   expect(database.planning.referenceComplete("session-1", database.getTopic("topic"), reference)).toBe(false);
   expect((await adapter.createSession(turn)).result.planMarkdown).toBe("Final navigation plan");
   expect(database.planning.referenceComplete("session-1", database.getTopic("topic"), reference)).toBe(true);
-  expect(fake.calls).toHaveLength(3);
+  expect(fake.calls).toHaveLength(2);
 });
 
 it("does not replay an explicitly rejected decision response with pending reads", async () => {
@@ -1010,6 +1020,8 @@ it("fulfills accepted read requests after a budget increase without repeating th
   await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("not delivered");
   const saved = database.planning.latest("topic")!;
   saved.step = step({ requests: [{ kind: "file", selector: "form.swift", question: "Continue after budget", offset: 0 }] });
+  // 채택한 단계의 읽기는 대기 읽기(readQueue)에 있다 — 범위 끝 없는 요청은 한 쪽이다.
+  saved.readQueue = [{ kind: "file", selector: "form.swift", question: "Continue after budget", offset: 0, end: 1 }];
   saved.stopped = "Planning checkpoint saved; insufficient remaining budget for synthesis.";
   saved.responsePending = false;
   database.planning.save(saved);
@@ -1032,10 +1044,12 @@ it("retains deferred reads when recovery is interrupted before fragments are sav
   await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("not delivered");
   const saved = database.planning.latest("topic")!;
   saved.step = step({ requests: [{ kind: "file", selector: "form.swift", question: "Continue after budget", offset: 0 }] });
+  // 채택한 단계의 읽기는 대기 읽기(readQueue)에 있다 — 범위 끝 없는 요청은 한 쪽이다.
+  saved.readQueue = [{ kind: "file", selector: "form.swift", question: "Continue after budget", offset: 0, end: 1 }];
   saved.stopped = "Planning checkpoint saved; insufficient remaining budget for synthesis.";
   saved.responsePending = false;
   database.planning.save(saved);
-  const read = vi.spyOn(PlanningReader.prototype, "read").mockRejectedValueOnce(new Error("Interrupted read"));
+  const read = vi.spyOn(PlanningReader.prototype, "source").mockRejectedValueOnce(new Error("Interrupted read"));
   await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Interrupted read");
   expect(database.planning.latest("topic")!.stopped).toBe(saved.stopped);
   expect(fake.calls).toHaveLength(1);
@@ -1069,16 +1083,173 @@ it("does not reserve an image when a later read in the same batch fails", async 
     { kind: "image", selector: imageHash, question: "Inspect image", offset: 0 },
     { kind: "file", selector: "form.swift", question: "Inspect form", offset: 0 },
   ] });
+  saved.readQueue = saved.step.requests.map(({ kind, selector, question, offset }) => ({ kind, selector, question, offset, end: offset + 1 }));
   saved.stopped = "Planning checkpoint saved; insufficient remaining budget for synthesis.";
   saved.responsePending = false;
   database.planning.save(saved);
-  const read = vi.spyOn(PlanningReader.prototype, "read").mockRejectedValueOnce(new Error("Interrupted file read"));
+  const read = vi.spyOn(PlanningReader.prototype, "source").mockRejectedValueOnce(new Error("Interrupted file read"));
   await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Interrupted file read");
   read.mockRestore();
   expect(database.planning.latest("topic")!.imageHash).toBeUndefined();
   const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
   expect(result.result.planMarkdown).toBe("Final navigation plan");
   expect(fake.calls).toHaveLength(2);
+});
+
+// 1fd0cc86 체크포인트 13c5518d(2026-10-07): 4KiB 넘는 매니페스트 안내("Read context:manifest in chunks.")를 따라 모델이 selector 에 kind 접두어를
+// 넣어 {kind: context, selector: context:manifest} 를 청했다. 옛 패커는 이 대기 읽기를 실을 때마다 정지해 retry 가 모델을 부르지 못했다(seq 402·406·410).
+// 저장된 그 대기 읽기는 retry 때 요청 오류로 돌아오고, 앞의 정상 읽기는 실리고, 계획이 이어진다.
+it("returns a queued unpinned selector as a request error on retry and continues the plan", async () => {
+  const { repo, database, git } = setup();
+  let errors: Array<{ request: { kind: string; selector: string }; message: string }> = [];
+  let served: PlanningFragment[] = [];
+  let manifest = "";
+  const fake = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ facts: [{ statement: "Unsupported", refs: ["context:request"] }],
+      questions: [], complete: true }));
+    if (n === 2) {
+      errors = JSON.parse(turn.prompt.split("Read request errors: ")[1]!.split("\n")[0]!);
+      served = JSON.parse(turn.prompt.split("Fragments: ").at(-1)!);
+      // 돌려받은 형식대로 고쳐 다시 청한다 — 교정의 완료는 알림이 아니라 다음 유효 요청이 실제로 실리는 것이다.
+      return answer(step({ requests: [{ kind: "context", selector: "manifest", question: "Snapshot file list", offset: 0, end: null }] }));
+    }
+    manifest = (JSON.parse(turn.prompt.split("Fragments: ").at(-1)!) as PlanningFragment[])
+      .filter(fragment => fragment.kind === "context" && fragment.selector === "manifest").map(fragment => fragment.content).join("");
+    return answer(step({ questions: [], complete: true }));
+  });
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("not delivered");
+  const saved = database.planning.latest("topic")!;
+  // 13c5518d 의 모양: 채택한 단계의 읽기가 대기 읽기로 옮겨졌고(정상 읽기 뒤에 접두어 selector), 남은 읽기 때문에 멈춰 있다.
+  saved.step = step();
+  saved.readQueue = [
+    { kind: "file", selector: "form.swift", question: "Read the form", offset: 0, end: 1 },
+    { kind: "context", selector: "context:manifest", question: "Snapshot file list", offset: 0, end: null },
+  ];
+  saved.stopped = "Planning checkpoint accepted; deferred reads pending.";
+  saved.responsePending = false;
+  database.planning.save(saved);
+  const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+  expect(result.result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls).toHaveLength(3);
+  expect(manifest).toContain("context:request");
+  expect(errors).toEqual([expect.objectContaining({ request: expect.objectContaining({ kind: "context", selector: "context:manifest" }) })]);
+  expect(errors[0]!.message).toContain("not in the pinned manifest");
+  expect(errors[0]!.message).toContain("the manifest itself is kind=context selector=manifest");
+  expect(served.some(fragment => fragment.selector === "form.swift")).toBe(true);
+  expect(database.planning.latest("topic")).toMatchObject({ finalized: true, readQueue: [] });
+});
+
+// 4KiB 넘는 매니페스트는 본문 대신 읽기 안내 한 줄로 나간다. 그 줄의 kind·selector 를 그대로 옮긴 요청이 매니페스트를 싣는다(R1).
+it("words the manifest instruction so that following it literally reads the manifest", async () => {
+  const { repo, database, git } = setup();
+  const source = database.evidence.register("topic", { url: "https://team.slack.com/archives/C123/p1789709010013729",
+    label: "Many units", mode: "connector", intervalSeconds: 900 });
+  const check = database.evidence.begin(source.id, true)!;
+  database.evidence.ingest(source.id, { checkId: check.checkId, revision: "r1",
+    units: Array.from({ length: 40 }, (_, index) => ({ id: `unit-${index}`, kind: "message" as const, content: `Message ${index}` })) });
+  let instruction = "";
+  let manifest = "";
+  const fake = scripted(async (turn, n) => {
+    if (n === 1) {
+      instruction = turn.prompt.split("\nManifest: ")[1]!.split("\n")[0]!;
+      const [, kind, selector] = /^Read kind=(\w+) selector=(\S+) in chunks\.$/.exec(instruction) ?? [];
+      return answer(step({ requests: [{ kind: kind as "context", selector: selector!, question: "List the sources", offset: 0, end: null }] }));
+    }
+    expect(turn.prompt).not.toContain("Read request errors");
+    manifest = (JSON.parse(turn.prompt.split("Fragments: ").at(-1)!) as PlanningFragment[])
+      .filter(fragment => fragment.kind === "context" && fragment.selector === "manifest").map(fragment => fragment.content).join("");
+    return answer(step({ questions: [], complete: true }));
+  });
+  await guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Plan" });
+  expect(instruction).toBe("Read kind=context selector=manifest in chunks.");
+  expect(fake.calls).toHaveLength(2);
+  expect(manifest).toContain(`evidence:${source.id}::unit-0`);
+});
+
+// 13c5518d 와 같은 모양(같은 digest, 초안·사실 6·전달 38·세션, 정상 읽기 뒤 접두어 selector 가 남은 대기 읽기 2)을 합성한다. 요청 오류 처리는 진척을
+// 지우지 않는다 — 다음 회차가 같은 세션에서 같은 초안·사실·전달 기록으로 열리고, 그 응답이 이어서 채택된다(Codex 조건: 유효한 조사·초안·세션 유지).
+it("keeps the draft, facts, delivered fragments and session when a stored unpinned read is rejected", async () => {
+  const { repo, database, git } = setup("codex");
+  const delivered = Array.from({ length: 38 }, (_, index) => createHash("sha256").update(`delivered-${index}`).digest("hex"));
+  const progress = step({ draft: "Integration audit draft ".repeat(70), questions: ["Which checks ran?", "Which stage owns the progress line?"],
+    facts: Array.from({ length: 6 }, (_, index) => ({ statement: `Fact ${index}`, refs: [delivered[index]!] })) });
+  let during: { draft: string; facts: number; delivered: string[]; sessionId?: string | null; checkpoint: PlanningStep; resumed?: string;
+    errors: Array<{ request: { selector: string } }>; queue: unknown } | null = null;
+  const fake = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ facts: [{ statement: "Unsupported", refs: ["context:request"] }], questions: [], complete: true }));
+    const record = database.planning.latest("topic")!;
+    during = { draft: record.step.draft, facts: record.step.facts.length, delivered: [...record.delivered], sessionId: record.sessionId,
+      checkpoint: JSON.parse(turn.prompt.split("\nCheckpoint: ")[1]!.split("\n")[0]!), resumed: (turn as { sessionId?: string }).sessionId,
+      errors: JSON.parse(turn.prompt.split("Read request errors: ")[1]!.split("\n")[0]!), queue: record.readQueue };
+    return answer(step({ ...progress, questions: [], complete: true }));
+  }, "codex");
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  await expect(adapter.createSession({ cwd: repo, prompt: "Audit" })).rejects.toThrow("not delivered");
+  const saved = database.planning.latest("topic")!;
+  const sessionId = saved.sessionId;
+  saved.step = progress;
+  saved.delivered = delivered;
+  saved.readQueue = [
+    { kind: "file", selector: "form.swift", question: "Read the form", offset: 0, end: 1 },
+    { kind: "context", selector: "context:manifest", question: "Snapshot file list", offset: 0, end: null },
+  ];
+  saved.stopped = "Planning checkpoint accepted; deferred reads pending.";
+  saved.responsePending = false;
+  database.planning.save(saved);
+  await adapter.createSession({ cwd: repo, prompt: "Audit" });
+  expect(fake.calls).toHaveLength(2);
+  expect(during).toMatchObject({ draft: progress.draft, facts: 6, sessionId, resumed: sessionId,
+    checkpoint: expect.objectContaining({ draft: progress.draft, facts: progress.facts }) });
+  expect(during!.delivered).toEqual(expect.arrayContaining(delivered));
+  expect(during!.errors.map(entry => entry.request.selector)).toEqual(["context:manifest"]);
+  expect(database.planning.latest("topic")).toMatchObject({ finalized: true, sessionId, readQueue: [] });
+});
+
+// 운영 재개 경로(master 실측 2026-10-07): 13c5518d 의 digest 와 지금 digest 가 달라, 배포 뒤 retry 는 원문 변경 초기화가 대기 읽기를 먼저 비운다.
+// 그 뒤 R1 이 하는 일은 재오염 방지다 — 초기화 뒤 새 안내 문구를 그대로 따라 쓴 요청이 매니페스트를 싣는다.
+it("after a source-change reset, a request that follows the manifest instruction reads the manifest", async () => {
+  const { repo, database, git } = setup("codex");
+  const source = database.evidence.register("topic", { url: "https://team.slack.com/archives/C123/p1789709010013729",
+    label: "Many units", mode: "connector", intervalSeconds: 900 });
+  const units = (revision: string) => Array.from({ length: 40 }, (_, index) => ({ id: `unit-${index}`, kind: "message" as const,
+    content: index === 0 ? `Message 0 ${revision}` : `Message ${index}` }));
+  const ingest = (revision: string) => {
+    const check = database.evidence.begin(source.id, true)!;
+    database.evidence.ingest(source.id, { checkId: check.checkId, revision, units: units(revision) });
+  };
+  ingest("r1");
+  let instruction = "";
+  let manifest = "";
+  const fake = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ facts: [{ statement: "Unsupported", refs: ["context:request"] }], questions: [], complete: true }));
+    if (n === 2) {
+      // 초기화가 저장된 잘못된 요청을 먼저 비웠다 — 요청 오류로 돌아오지 않는다.
+      expect(turn.prompt).not.toContain("Read request errors");
+      instruction = turn.prompt.split("\nManifest: ")[1]!.split("\n")[0]!;
+      const [, kind, selector] = /^Read kind=(\w+) selector=(\S+) in chunks\.$/.exec(instruction) ?? [];
+      return answer(step({ requests: [{ kind: kind as "context", selector: selector!, question: "List the sources", offset: 0, end: null }] }));
+    }
+    expect(turn.prompt).not.toContain("Read request errors");
+    manifest = (JSON.parse(turn.prompt.split("Fragments: ").at(-1)!) as PlanningFragment[])
+      .filter(fragment => fragment.kind === "context" && fragment.selector === "manifest").map(fragment => fragment.content).join("");
+    return answer(step({ questions: [], complete: true }));
+  }, "codex");
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  await expect(adapter.createSession({ cwd: repo, prompt: "Audit" })).rejects.toThrow("not delivered");
+  const saved = database.planning.latest("topic")!;
+  saved.step = step({ draft: "Audit draft before the source change" });
+  saved.readQueue = [{ kind: "context", selector: "context:manifest", question: "Snapshot file list", offset: 0, end: null }];
+  saved.stopped = "Planning checkpoint accepted; deferred reads pending.";
+  saved.responsePending = false;
+  database.planning.save(saved);
+  ingest("r2");
+  expect(database.evidence.topic(database.getTopic("topic")).digest).not.toBe(saved.evidenceDigest);
+  await adapter.createSession({ cwd: repo, prompt: "Audit" });
+  expect(fake.calls).toHaveLength(3);
+  expect(instruction).toBe("Read kind=context selector=manifest in chunks.");
+  expect(manifest).toContain(`evidence:${source.id}::unit-0`);
+  expect(database.planning.latest("topic")).toMatchObject({ finalized: true, readQueue: [] });
 });
 
 it("does not recover budget-paused reads from a previous user contract", async () => {
@@ -1185,6 +1356,107 @@ it.each(["task", "instructions", "combined"])("streams oversized %s through requ
   expect(() => database.budgets.assertAvailable(["topic"])).not.toThrow();
 }, 30000);
 
+it("does not reload a task by reference after the same session received it inline following a new decision", async () => {
+  const { repo, database, git } = setup("codex");
+  const oversized = "TASK_V1\n" + "한글 contract 내용.\n".repeat(4000);
+  const decision = "Keep the address screen unchanged";
+  const revised = `TASK_V2 ${decision}\n` + "짧은 과제.\n".repeat(200);
+  const packets: PlanningFragment[][] = [];
+  const fake = scripted(async (turn, n) => {
+    packets.push(JSON.parse(turn.prompt.split("Fragments: ").at(-1)!));
+    if (n === 1) {
+      expect(turn.prompt).toContain("selector=request");
+      return answer(step({ draft: "Reading the task" }));
+    }
+    if (n === 2) throw new Error("connection interrupted");
+    return answer(step({ questions: [], complete: true }));
+  }, "codex");
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  await expect(adapter.createSession({ cwd: repo, prompt: oversized })).rejects.toThrow("interrupted");
+  expect(database.planning.latest("topic")!.taskReference?.selector).toBe("request");
+  // 새 결정이 체크포인트를 초기화하고, 줄어든 과제는 첫 패킷에 인라인으로 통째로 실린다 — 앞선 판의 과제 참조로 같은 본문을 다시 싣지 않는다.
+  database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CODEX_AUDIT", body: decision });
+  await adapter.createSession({ cwd: repo, prompt: revised });
+  expect(fake.calls).toHaveLength(3);
+  expect(fake.calls[2].prompt).toContain(revised);
+  expect(fake.calls[2].prompt).toContain("Sources changed");
+  expect(packets[2].filter(fragment => fragment.selector === "request")).toEqual([]);
+  const record = database.planning.latest("topic")!;
+  expect(record.finalized).toBe(true);
+  expect(record.taskReference).toBeUndefined();
+});
+
+// 엔진 리뷰 F002 — 결정과 함께 청한 과제 범위 읽기는 이연 읽기로 남는다. 결정 뒤 같은 과제가 인라인으로 통째로 실리면 그 읽기도 채워진다: 패커가 같은 과제를 다시
+// 싣지 않고(공간이 남을 때), 다 싣지 못한 이연 읽기로 complete 를 강등하지도 않는다(패킷이 거의 찰 때).
+it.each([["room is left", 200], ["the packet is nearly full", 5930]])("treats reads of the task as satisfied once the same task is sent inline after a decision (%s)", async (_label, lines) => {
+  const { repo, database, git } = setup("codex");
+  const oversized = "TASK_V1\n" + "한글 contract 내용.\n".repeat(4000);
+  const decision = "Keep the address screen unchanged";
+  const revised = `TASK_V2 ${decision}\n` + "짧은 과제.\n".repeat(lines);
+  const packets: PlanningFragment[][] = [];
+  const fake = scripted(async (turn, n) => {
+    packets.push(JSON.parse(turn.prompt.split("Fragments: ").at(-1)!));
+    if (n === 1) return { ...answer(step({ requests: [{ kind: "context", selector: "request", question: "Read the address section", offset: 0, end: null }] })),
+      requestedUserDecision: "Keep the address screen?" };
+    if (n === 2) expect(turn.prompt).toContain(revised);
+    return answer(step({ questions: [], complete: true }));
+  }, "codex");
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  await adapter.createSession({ cwd: repo, prompt: oversized });
+  expect(database.planning.latest("topic")!.deferredReads).toMatchObject([{ kind: "context", selector: "request" }]);
+  database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CODEX_AUDIT", body: decision });
+  await adapter.createSession({ cwd: repo, prompt: revised });
+  expect(fake.calls).toHaveLength(2);
+  expect(packets[1].filter(fragment => fragment.selector === "request")).toEqual([]);
+  const record = database.planning.latest("topic")!;
+  expect(record.finalized).toBe(true);
+  expect(record.deferredReads).toBeUndefined();
+});
+
+// 엔진 리뷰 F003 — 인라인 과제의 읽기 충족은 전달을 확인한 뒤 확정한다. 어댑터가 입력을 전달하기 전에 실패하면 과제 참조·이연 읽기가 그대로 남아, 같은 세션
+// retry 가 변경분이 아니라 전체 판을 다시 고르고 그 판을 실제로 받은 뒤에만 완료를 채택한다.
+it("keeps the full-context task obligation when the adapter fails before delivering the inline task", async () => {
+  const { repo, database, git } = setup("codex");
+  const fullV1 = "FULL_V1\n" + "한글 contract 내용.\n".repeat(4000);
+  const decision = "Keep the address screen unchanged";
+  const fullV2 = `FULL_V2 ${decision}\n` + "전체 문맥 과제.\n".repeat(100);
+  const deltaV2 = `DELTA_V2 ${decision}`;
+  const fake = scripted(async (_turn, n) => {
+    if (n === 1) return answer(step({ draft: "Previous audit", questions: [], complete: true }));
+    if (n === 2) return { ...answer(step({ requests: [{ kind: "context", selector: "request-fresh", question: "Read the address section", offset: 0, end: null }] })),
+      requestedUserDecision: "Keep the address screen?" };
+    return answer(step({ questions: [], complete: true }));
+  }, "codex");
+  let lost = false, failBeforeDelivery = false;
+  const adapter = guardedPlanning({ ...fake.adapter, resumeTurn: async turn => {
+    if (lost) { lost = false; throw codexSessionMissing(turn.sessionId); }
+    if (failBeforeDelivery) { failBeforeDelivery = false; throw new Error("codex executable check failed"); }
+    return fake.adapter.resumeTurn(turn);
+  } }, database, git);
+  await adapter.createSession({ cwd: repo, prompt: "Audit the previous plan" });
+  database.updateTopic("topic", { planSHA256: "b".repeat(64) });
+  // 세션 유실 복구로 새 세션에 전체 판이 가고, 넘치는 전체 판은 과제 참조(request-fresh)가 된다. 모델은 그 범위 읽기와 결정을 함께 청한다.
+  lost = true;
+  await adapter.resumeTurn({ cwd: repo, prompt: "DELTA_V1", freshSessionPrompt: fullV1, sessionId: "session-1" });
+  const session = database.planning.latest("topic")!.sessionId!;
+  expect(database.planning.latest("topic")).toMatchObject({ taskReference: { selector: "request-fresh" },
+    deferredReads: [{ kind: "context", selector: "request-fresh" }] });
+  database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CODEX_AUDIT", body: decision });
+  const retry = { cwd: repo, prompt: deltaV2, freshSessionPrompt: fullV2, sessionId: session };
+  failBeforeDelivery = true;
+  await expect(adapter.resumeTurn(retry)).rejects.toThrow("executable check failed");
+  expect(fake.calls).toHaveLength(2);
+  expect(database.planning.latest("topic")).toMatchObject({ taskReference: { selector: "request-fresh" },
+    deferredReads: [{ kind: "context", selector: "request-fresh" }] });
+  await adapter.resumeTurn(retry);
+  expect(fake.calls).toHaveLength(3);
+  expect(fake.calls[2].prompt).toContain(fullV2);
+  const record = database.planning.latest("topic")!;
+  expect(record.finalized).toBe(true);
+  expect(record.taskReference).toBeUndefined();
+  expect(record.deferredReads).toBeUndefined();
+});
+
 it("does not promote a completed claim with unanswered questions", async () => {
   const { repo, database, git } = setup();
   const fake = scripted(async () => answer(step({ complete: true })));
@@ -1197,6 +1469,48 @@ it("detects worktree changes between model response and adoption", async () => {
   const fake = scripted(async () => { writeFileSync(join(repo, "new.swift"), "new state"); return answer(step({ questions: [], complete: true })); });
   await expect(guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Working tree changed");
   expect(database.planning.latest("topic")!.finalized).toBe(false);
+});
+
+// 한 요청의 출력이 한도(2 MiB)를 넘는 것은 요청 범위로 정해지는 오류라 교정 가능한 요청 오류다(R1). git 실패·시간 초과는 정지로 남고, 정지 문구는
+// 막힌 것·영향·보존·다음 행동을 말한다.
+it("classifies an oversized snapshot read as a request error and a git failure as a hard stop", async () => {
+  const { repo, git } = setup();
+  writeFileSync(join(repo, "big.txt"), "line of filler text\n".repeat(120_000));
+  const tree = await git.writeWorkingTree(repo, "test");
+  const large = await new PlanningReader(repo, tree, new Map()).read({ kind: "file", selector: "big.txt", question: "Read", offset: 0 })
+    .catch((error: unknown) => error);
+  expect(isCorrectableReadError(large)).toBe(true);
+  expect((large as Error).message).toContain("Snapshot read output exceeds the 2 MiB limit for one request.");
+  const failure = await new PlanningReader(join(repo, "missing-root"), tree, new Map())
+    .read({ kind: "file", selector: "form.swift", question: "Read", offset: 0 }).catch((error: unknown) => error);
+  expect(failure).toBeInstanceOf(PlanningPaused);
+  expect(isCorrectableReadError(failure)).toBe(false);
+  // git 실패는 retry 가 다시 읽는다 — "retry 만으로는 같은 정지"인 거절과 다음 행동이 다르다(R1 엔진 리뷰 F002).
+  expect((failure as Error).message).toMatch(/git failed or timed out\)\. This read was not delivered and the planning round is paused; the checkpoint, its logical attempt, session and queued reads are kept\. A retry runs the read again and continues without new input once git works or answers in time\. If the same failure repeats, post a decision or evidence/);
+  expect((failure as Error).message).not.toContain("A plain retry repeats this stop");
+});
+
+// 과대 출력 요청은 요청 오류로 돌아오고, 모델이 좁힌 검색이 실려 계획이 이어진다.
+it("returns an oversized read as a request error and serves the narrowed search that follows", async () => {
+  const { repo, database, git } = setup();
+  writeFileSync(join(repo, "big.txt"), "line of filler text\n".repeat(120_000) + "NEEDLE_LINE kept here\n");
+  let errors: Array<{ request: { selector: string }; message: string }> = [];
+  let found: PlanningFragment[] = [];
+  const fake = scripted(async (turn, n) => {
+    if (n === 1) return answer(step({ requests: [{ kind: "file", selector: "big.txt", question: "Read the whole file", offset: 0 }] }));
+    if (n === 2) {
+      errors = JSON.parse(turn.prompt.split("Read request errors: ")[1]!.split("\n")[0]!);
+      return answer(step({ requests: [{ kind: "search", selector: "big.txt::NEEDLE_LINE", question: "Find the relevant line", offset: 0 }] }));
+    }
+    found = (JSON.parse(turn.prompt.split("Fragments: ").at(-1)!) as PlanningFragment[]).filter(fragment => fragment.kind === "search");
+    return answer(step({ questions: [], complete: true }));
+  });
+  await guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Plan" });
+  expect(fake.calls).toHaveLength(3);
+  expect(errors).toEqual([expect.objectContaining({ request: expect.objectContaining({ selector: "big.txt" }),
+    message: expect.stringContaining("exceeds the 2 MiB limit") })]);
+  expect(found.map(fragment => fragment.content).join("")).toContain("NEEDLE_LINE kept here");
+  expect(database.planning.latest("topic")).toMatchObject({ finalized: true, readQueue: [] });
 });
 
 it("reads dirty snapshot content, rejects symlinks/credential paths and paginates UTF-8 without losing bytes", async () => {
@@ -1245,7 +1559,9 @@ describe("directory planning read recovery", () => {
       if (n === (interrupted ? 3 : 2)) {
         if (deferred) {
           expect(turn.prompt).toContain("Sources changed");
-          expect(database.planning.latest("topic")!.deferredReads).toBeUndefined();
+          // 미룬 디렉터리 읽기는 원문 오류로 돌아오고, 그 응답을 채택할 때 이연 읽기에서 빠진다(R1 엔진 리뷰 996f4af6 — 패킹 때 빼지 않는다).
+          expect(turn.prompt).toContain("directory");
+          expect(database.planning.latest("topic")!.deferredReads?.map(read => read.selector)).toEqual([selector]);
         } else {
           expect(turn.prompt).toContain("Read request errors:");
           expect(turn.prompt).toContain("directory");
@@ -1270,6 +1586,7 @@ describe("directory planning read recovery", () => {
     const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
     expect(result.result.planMarkdown).toBe("Final navigation plan");
     expect(database.planning.latest("topic")!.finalized).toBe(true);
+    expect(database.planning.latest("topic")!.deferredReads).toBeUndefined();
     expect(fake.calls).toHaveLength(interrupted ? 4 : 3);
   });
 });
@@ -1333,10 +1650,14 @@ describe("invalid planning read offsets", () => {
     const fake = scripted(async (_turn, n) => n < 3
       ? answer(step({ requests: [{ kind: "file", selector: "form.swift", question: "Read text", offset: n === 1 ? 1 : 0 }] }))
       : answer(step({ questions: [], complete: true })));
-    const read = PlanningReader.prototype.read;
-    const legacy = vi.spyOn(PlanningReader.prototype, "read").mockImplementation(function (this: PlanningReader, request) {
-      if (request.offset === 1) throw new PlanningPaused("Invalid UTF-8 continuation offset; reuse the returned nextOffset.");
-      return read.call(this, request);
+    // 예전 읽기는 잘못된 offset 을 일반 PlanningPaused 로 던져 멈췄다 — 그 쪽만 그렇게 던지는 원문으로 재현한다.
+    const source = PlanningReader.prototype.source;
+    const legacy = vi.spyOn(PlanningReader.prototype, "source").mockImplementation(async function (this: PlanningReader, request) {
+      const real = await source.call(this, request);
+      return { ...real, page: (offset: number) => {
+        if (offset === 1) throw new PlanningPaused("Invalid UTF-8 continuation offset; reuse the returned nextOffset.");
+        return real.page(offset);
+      } };
     });
     await expect(guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("Invalid UTF-8");
     const before = database.planning.latest("topic")!;
@@ -1433,18 +1754,51 @@ describe("invalid planning read offsets", () => {
     expect(database.planning.latest("topic")).toMatchObject({ id: paused.id, admissionId: paused.admissionId, finalized: true });
   });
 
-  it.each([".env", "../outside", "link.swift", "missing.swift", "form.swift/"])("keeps %s as a hard failure", async selector => {
+  // 자격증명·스냅숏 밖 경로는 즉시 정지로 남는다.
+  // 정지 문구는 막힌 것·영향·보존한 것·다음 행동을 말하고, 그 다음 행동이 실제로 통한다: retry 만으로는 같은 정지이고, 결정을 올린 뒤 retry 는 같은 시도를
+  // 대기 읽기 없이 이어 모델이 다음 응답을 낸다.
+  it.each([".env", "../outside"])("keeps %s as a hard failure", async selector => {
+    const { repo, database, git } = setup();
+    writeFileSync(join(repo, "form.swift"), "한글🙂");
+    const fake = scripted(async (_turn, n) => n === 1 ? answer(step({ requests: [
+      { kind: "file", selector: "form.swift", question: "Invalid offset", offset: 1 },
+      { kind: "file", selector, question: "Must remain denied", offset: 0 },
+    ] })) : answer(step({ questions: [], complete: true })));
+    const adapter = guardedPlanning(fake.adapter, database, git);
+    const stop = /approved snapshot and exclude credential paths\. This read was not delivered and the planning round is paused; the checkpoint, its logical attempt, session and queued reads are kept\. A plain retry repeats this stop.*post a decision or evidence/;
+    await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow(stop);
+    expect(fake.calls).toHaveLength(1);
+    const paused = database.planning.latest("topic")!;
+    expect(paused.finalized).toBe(false);
+    await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow(stop);
+    expect(fake.calls).toHaveLength(1);
+    database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CLAUDE_PLAN", body: "Do not read credential files." });
+    const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+    expect(result.result.planMarkdown).toBe("Final navigation plan");
+    expect(fake.calls).toHaveLength(2);
+    expect(database.planning.latest("topic")).toMatchObject({ id: paused.id, admissionId: paused.admissionId, finalized: true });
+  });
+
+  // 고정 트리의 정규 파일이 아닌 경로(심볼릭 링크·없는 파일·파일 뒤 '/')는 요청만으로 정해지는 대상 오류다(R1) — 본문을 싣지 않고 요청 오류로 돌려주고
+  // 대기 읽기에서 뺀다. 대기 읽기에 남겨 정지하면 retry 마다 같은 정지가 된다.
+  it.each(["link.swift", "missing.swift", "form.swift/"])("returns %s as a request error without serving it", async selector => {
     const { repo, database, git } = setup();
     writeFileSync(join(repo, "form.swift"), "한글🙂");
     symlinkSync("form.swift", join(repo, "link.swift"));
-    const fake = scripted(async () => answer(step({ requests: [
-      { kind: "file", selector: "form.swift", question: "Invalid offset", offset: 1 },
-      { kind: "file", selector, question: "Must remain denied", offset: 0 },
-    ] })));
-    await expect(guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Plan" }))
-      .rejects.toThrow(/approved snapshot|regular files/);
-    expect(fake.calls).toHaveLength(1);
-    expect(database.planning.latest("topic")!.finalized).toBe(false);
+    let errors: Array<{ request: { selector: string }; message: string }> = [];
+    let served: PlanningFragment[] = [];
+    const fake = scripted(async (turn, n) => {
+      if (n === 1) return answer(step({ requests: [{ kind: "file", selector, question: "Must not be served", offset: 0 }] }));
+      errors = JSON.parse(turn.prompt.split("Read request errors: ")[1]!.split("\n")[0]!);
+      served = JSON.parse(turn.prompt.split("Fragments: ").at(-1)!);
+      return answer(step({ questions: [], complete: true }));
+    });
+    await guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Plan" });
+    expect(fake.calls).toHaveLength(2);
+    expect(errors).toEqual([expect.objectContaining({ request: expect.objectContaining({ selector }),
+      message: "Only regular files in the pinned tree may be read." })]);
+    expect(served.some(fragment => fragment.kind === "file")).toBe(false);
+    expect(database.planning.latest("topic")).toMatchObject({ finalized: true, readQueue: [] });
   });
 });
 
@@ -2124,9 +2478,8 @@ describe("E3-2-2a timeline references", { timeout: TIMELINE_TEST_TIMEOUT_MS }, (
     const controller = new AbortController();
     let cited!: PlanningFragment;
     const model = scripted(async (turn, call) => {
-      if (call === 1) return answer(step({ requests: [{ kind: "context", selector: reference.selector,
-        offset: 0, question: "Read the owner's decision" }] }));
-      if (call === 2) {
+      // 필수 결정 참조는 요청 없이 첫 패킷에 실린다(읽기 패커) — 모델은 받은 조각을 그 응답에서 인용한다.
+      if (call === 1) {
         cited = (JSON.parse(turn.prompt.split("Fragments: ").at(-1)!) as PlanningFragment[])
           .find(fragment => fragment.selector === reference.selector)!;
         expect(cited.content).toBe(timelineEventText(event));
@@ -2137,7 +2490,7 @@ describe("E3-2-2a timeline references", { timeout: TIMELINE_TEST_TIMEOUT_MS }, (
         expect(JSON.parse(turn.prompt.split("Fragments: ").at(-1)!)).toEqual([]);
       }
       return { ...answer(step({ facts: [{ statement: "Preserve the entered address", refs: [cited.id] }], questions: [], complete: true })),
-        ...(cancel && call > 2 ? { requestedUserDecision: "Approve the unacknowledged decision" } : {}) };
+        ...(cancel && call > 1 ? { requestedUserDecision: "Approve the unacknowledged decision" } : {}) };
     }, role);
     const adapter = guardedPlanning(model.adapter, database, git);
     const first = adapter.resumeTurn({ cwd: repo, sessionId: "existing-planner", prompt: "Read the decision before planning",
@@ -2160,7 +2513,7 @@ describe("E3-2-2a timeline references", { timeout: TIMELINE_TEST_TIMEOUT_MS }, (
     const sourceHash = database.planning.latest("topic")!.sourceHash;
     expect((await adapter.resumeTurn(next)).planMarkdown).toBe("Final navigation plan");
     expect(database.planning.latest("topic")!.sourceHash).toBe(sourceHash);
-    expect(model.calls).toHaveLength(3);
+    expect(model.calls).toHaveLength(2);
   });
 
   it.each(["replacement session", "different scope", "changed event", "cancelled delivery"] as const)(
@@ -2201,7 +2554,8 @@ describe("E3-2-2a timeline references", { timeout: TIMELINE_TEST_TIMEOUT_MS }, (
     engine.startPlan("topic"); await settle();
 
     const references = [timelineReference(engineDecision), timelineReference(engineEvidence)];
-    const first = model.calls[0].prompt;
+    // 과제 본문은 원문 대신 참조만 싣는다 — 필수 참조의 쪽은 읽기 패커가 같은 패킷의 조각(Fragments)으로 싣는다.
+    const first = model.calls[0].prompt.split("Fragments: ")[0];
     for (const reference of references) expect(first).toContain(reference.selector);
     expect(first).toContain("[참조·필수]");
     expect(first).not.toContain(decision.slice(0, 300));
@@ -2223,14 +2577,15 @@ describe("E3-2-2a timeline references", { timeout: TIMELINE_TEST_TIMEOUT_MS }, (
   // E3-4a: 예전에는 한 시도의 고정 회차(8 + 정리 1) 때문에 문서 하나를 약 46KB 까지만 읽고 멈췄다. 회차 상한이 없어져 같은 시도에서 끝까지 읽는다.
   it("reads a required decision that needs more read rounds than the former fixed cap to the end within one attempt", async () => {
     const { database, git, artifacts, settle } = referenceTopic();
-    const decision = database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "DRAFT", body: korean(30_000) });
+    // 읽기 패커는 회차마다 패킷 남은 공간을 채우므로, 예전 고정 회차(8 + 1)보다 많은 회차가 필요하도록 그만큼 큰 결정(약 600KB)을 쓴다.
+    const decision = database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "DRAFT", body: korean(200_000) });
     const reference = timelineReference(decision);
-    expect(reference.bytes).toBeGreaterThan(PLANNING_LIMITS.promptBytes);
+    expect(reference.bytes).toBeGreaterThan((FORMER_RESEARCH_ROUNDS + 1) * PLANNING_LIMITS.promptBytes);
     const model = readingModel(planMarkdown("E3_2_2A_OVER"));
     const engine = new WorkflowEngine({ database, git, artifacts, claude: guardedPlanning(model.adapter, database, git), codex: stopAudit().adapter });
     try {
       engine.startPlan("topic"); await settle();
-      expect(model.calls[0].prompt).not.toContain(decision.body.slice(0, 300));
+      expect(model.calls[0].prompt.split("Fragments: ")[0]).not.toContain(decision.body.slice(0, 300));
       expect(model.calls.length).toBeGreaterThan(FORMER_RESEARCH_ROUNDS + 1);
       expect(model.calls.some(call => call.prompt.includes("No more research is available"))).toBe(false);
       expect(model.calls.every(call => Buffer.byteLength(call.prompt) < PLANNING_LIMITS.promptBytes)).toBe(true);
@@ -2248,10 +2603,13 @@ describe("E3-2-2a timeline references", { timeout: TIMELINE_TEST_TIMEOUT_MS }, (
   // E3-4a Q-A2: 끝 조각을 먼저 읽고 가운데가 빈 채 낸 완료는 거절하지 않고 중간 단계로 강등한다 — 같은 시도에서 호스트가 남은 필수 구간을 청해 싣고 다시 판단한다.
   it("does not accept completion after the last fragment was read first or a middle range is missing, and reads the gap in the same attempt", async () => {
     const { database, git, artifacts, settle } = referenceTopic();
-    const decision = database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "DRAFT", body: "x".repeat(24_000) });
+    // 읽기 패커는 필수 참조를 첫 패킷부터 남은 공간에 싣는다 — 두 패킷(각 64KiB 이하)에 다 싣지 못할 만큼 큰 결정이라야 둘째 호출이 끝 조각을 받고도
+    // 가운데가 빈 채 완료를 낼 수 있다. last 는 일부러 쪽 경계(6,692)가 아닌 위치다 — 임의 위치의 끝 조각을 먼저 읽은 원래 모양을 그대로 둔다.
+    const decision = database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "DRAFT", body: "x".repeat(200_000) });
     const reference = timelineReference(decision);
     const last = Math.floor((reference.bytes - 1) / 6000) * 6000;
     let forced = true;
+    let gapStart = -1;
     const model = readingModel(planMarkdown("E3_2_2A_GAP"), (_turn, call, state) => {
       if (call === 1) return answer(step({ requests: [
         { kind: "context", selector: reference.selector, offset: last, question: "Read the end first" },
@@ -2260,17 +2618,24 @@ describe("E3-2-2a timeline references", { timeout: TIMELINE_TEST_TIMEOUT_MS }, (
       if (forced && call === 2) {
         forced = false;
         expect(state.received.get(reference.selector)?.get(last)?.nextOffset).toBeNull();
+        // 끝 조각은 받았지만 앞에서부터 이어 받은 구간은 끝에 닿지 않았다 — 가운데가 빈 이 상태에서 완료를 낸다.
+        const read = assembled(state.received, reference.selector);
+        expect(read.complete).toBe(false);
+        gapStart = read.next;
         return done(planMarkdown("E3_2_2A_GAP"));
       }
       return undefined;
     });
     const engine = new WorkflowEngine({ database, git, artifacts, claude: guardedPlanning(model.adapter, database, git), codex: stopAudit().adapter });
     engine.startPlan("topic"); await settle();
-    // 둘째 응답(가운데가 빈 완료)은 채택되지 않고 강등됐다 — 셋째 호출의 checkpoint 는 complete=false 이고, 모델이 청하지 않은 첫 공백 구간을 호스트가 실었다.
-    const gapStart = model.received.get(reference.selector)!.get(0)!.nextOffset!;
+    // 둘째 응답(가운데가 빈 완료)은 채택되지 않고 강등됐다 — 셋째 호출의 checkpoint 는 complete=false 이고, 모델이 청하지 않은 첫 공백 구간부터 호스트가 실었다.
+    expect(gapStart).toBeGreaterThan(0);
+    expect(gapStart).toBeLessThan(last);
     expect(model.calls[2].prompt).toContain('"complete":false');
-    const third = JSON.parse(model.calls[2].prompt.split("Fragments: ").at(-1)!) as PlanningFragment[];
-    expect(third.map(fragment => [fragment.selector, fragment.offset])).toEqual([[reference.selector, gapStart]]);
+    const third = (JSON.parse(model.calls[2].prompt.split("Fragments: ").at(-1)!) as PlanningFragment[])
+      .filter(fragment => fragment.selector === reference.selector);
+    expect(third.length).toBeGreaterThan(0);
+    expect(third[0].offset).toBe(gapStart);
     expect(database.getTopic("topic").lastError ?? "").not.toContain("not fully read");
     expect(database.planning.referenceComplete("claude-existing", database.getTopic("topic"), reference)).toBe(true);
     expect(assembled(model.received, reference.selector)).toMatchObject({ complete: true, text: timelineEventText(decision) });
@@ -2287,8 +2652,9 @@ describe("E3-2-2a timeline references", { timeout: TIMELINE_TEST_TIMEOUT_MS }, (
     let entered!: () => void;
     const pending = new Promise<void>(resolve => { entered = resolve; });
     let lateOffset = -1;
+    // 필수 결정 참조는 요청 없이 첫 패킷부터 실린다(읽기 패커) — offset 0 을 실은 첫 호출이 취소를 무시하고 늦게 끝난다.
     const model = readingModel(planMarkdown("E3_2_2A_LATE"), async (turn, call, state) => {
-      if (call !== 2) return undefined;
+      if (call !== 1) return undefined;
       lateOffset = [...state.received.get(reference.selector)!.keys()][0];
       entered();
       await new Promise<void>(resolve => { release = resolve; });
@@ -2391,8 +2757,10 @@ describe("E3-2-2a timeline references", { timeout: TIMELINE_TEST_TIMEOUT_MS }, (
 
   it("resumes the same session after a database reopen without resending acknowledged ranges", async () => {
     const { root, database, git, artifacts } = referenceTopic();
-    const decision = database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "DRAFT", body: korean(12_000) });
+    // 읽기 패커는 회차마다 패킷 남은 공간(64KiB 미만)을 채운다 — 세 회차에 다 실리지 않을 만큼 큰 결정이어야 4번째 호출이 인정 전 쪽을 싣고 실패한다.
+    const decision = database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "DRAFT", body: korean(80_000) });
     const reference = timelineReference(decision);
+    expect(reference.bytes).toBeGreaterThan(3 * PLANNING_LIMITS.promptBytes);
     let fail = true;
     const model = readingModel(planMarkdown("E3_2_2A_RESTART"), (_turn, call) => {
       if (fail && call === 4) { fail = false; throw new Error("E3_2_2A_TRANSPORT"); }
@@ -2508,8 +2876,15 @@ describe("E3-2-2a timeline references", { timeout: TIMELINE_TEST_TIMEOUT_MS }, (
       engine.retry("topic"); await settle();
       const retried = model.calls.slice(before);
       expect(retried.length).toBeGreaterThan(0);
-      expect(retried[0].prompt).toContain(timelineReference(decision).selector);
-      expect(retried[0].prompt).not.toContain(late.slice(0, 300));
+      const selector = timelineReference(decision).selector;
+      expect(retried[0].prompt).toContain(selector);
+      // 큰 결정은 원문으로 덧붙지 않는다 — 읽기 패커가 요청 없이 첫 패킷부터 그 참조의 쪽(조각)으로만 싣는다.
+      const fragmentsAt = retried[0].prompt.lastIndexOf("Fragments: ");
+      expect(retried[0].prompt.slice(0, fragmentsAt)).not.toContain(late.slice(0, 300));
+      const carrying = (JSON.parse(retried[0].prompt.slice(fragmentsAt + "Fragments: ".length)) as PlanningFragment[])
+        .filter(fragment => fragment.content.includes(late.slice(0, 300)));
+      expect(carrying.length).toBeGreaterThan(0);
+      expect(carrying.every(fragment => fragment.selector === selector)).toBe(true);
       expect(retried.every(call => Buffer.byteLength(call.prompt) < PLANNING_LIMITS.promptBytes)).toBe(true);
       expect(database.getTopic("topic").lastError ?? "").not.toContain("exceed the planning packet limit");
     } finally {
@@ -2525,8 +2900,9 @@ describe("E3-2-2a timeline references", { timeout: TIMELINE_TEST_TIMEOUT_MS }, (
     let release!: () => void;
     let entered!: () => void;
     const waiting = new Promise<void>(resolve => { entered = resolve; });
+    // 필수 결정 참조는 요청 없이 첫 패킷부터 실린다(읽기 패커) — offset 0 을 실은 첫 호출을 범위 변경이 기다리는 동안 늦게 끝낸다.
     const model = readingModel(planMarkdown("E3_2_2A_SCOPE"), async (_turn, call, state) => {
-      if (call !== 2) return undefined;
+      if (call !== 1) return undefined;
       entered();
       await new Promise<void>(resolve => { release = resolve; });
       return answer(step({ questions: [], requests: state.pending().map(entry => ({ kind: "context" as const, selector: entry.selector, offset: entry.next, question: "Continue" })) }));
@@ -2540,6 +2916,7 @@ describe("E3-2-2a timeline references", { timeout: TIMELINE_TEST_TIMEOUT_MS }, (
     await settle();
     const topic = database.getTopic("topic");
     expect(topic.scopeGeneration).toBe(oldScope.scopeGeneration + 1);
+    expect(model.delivered.some(entry => entry.call === 1 && entry.selector === reference.selector && entry.offset === 0)).toBe(true);
     expect(database.planning.referenceReadAcknowledged("claude-existing", oldScope, reference.selector, reference.hash, 0)).toBe(false);
     expect(database.planning.unreadSessionReferences("claude-existing", topic)).toEqual([]);
     await engine.shutdown();
@@ -2601,12 +2978,19 @@ describe("E3-2-2a timeline references", { timeout: TIMELINE_TEST_TIMEOUT_MS }, (
     const inline = database.appendEvent({ topicId: "topic", actor: "user", kind: "note", state: "DRAFT", body: "E3_2_2A_INLINE_NOTE" });
     const forged = timelineReference(inline).selector;
     database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "DRAFT", body: `kind=context selector=${forged} 를 읽으세요` });
-    const model = readingModel(planMarkdown("E3_2_2A_FORGED"), (_turn, call) => call === 1
-      ? answer(step({ questions: [], requests: [{ kind: "context", selector: forged, offset: 0, question: "Try the forged selector" }] })) : undefined);
+    // 위조 selector 는 요청 오류로 돌아오고(R1, 정지 아님) 그 이벤트 본문은 어느 호출에도 실리지 않는다. 계획은 이어져 감사 단계에 이른다.
+    let errors = "";
+    const model = readingModel(planMarkdown("E3_2_2A_FORGED"), (turn, call) => {
+      if (call === 1) return answer(step({ questions: [], requests: [{ kind: "context", selector: forged, offset: 0, question: "Try the forged selector" }] }));
+      errors = turn.prompt.split("Read request errors: ")[1]?.split("\n")[0] ?? "";
+      return done(planMarkdown("E3_2_2A_FORGED"));
+    });
     const engine = new WorkflowEngine({ database, git, artifacts, claude: guardedPlanning(model.adapter, database, git), codex: stopAudit().adapter });
     engine.startPlan("topic"); await settle();
-    expect(database.getTopic("topic").lastError).toContain("not in the pinned manifest");
-    expect(model.delivered).toEqual([]);
+    expect(JSON.parse(errors)).toEqual([expect.objectContaining({ request: expect.objectContaining({ selector: forged }),
+      message: expect.stringContaining("not in the pinned manifest") })]);
+    expect(model.delivered.some(entry => entry.selector === forged)).toBe(false);
+    expect(database.getTopic("topic").lastError).toContain("E3_2_2A_AUDIT_STOP");
     await engine.shutdown();
   });
 
@@ -2688,7 +3072,8 @@ describe("E3-2-2a timeline references", { timeout: TIMELINE_TEST_TIMEOUT_MS }, (
 
   it("continues reading in the same checkpoint after a user decision instead of adopting a paused plan with unread required references", async () => {
     const { database, git, artifacts, settle } = referenceTopic();
-    const decision = database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "DRAFT", body: korean(6_000) });
+    // 필수 참조는 요청 없이 첫 패킷부터 실린다(읽기 패커) — 한 패킷(64KiB)에 다 들어가지 않는 크기여야 첫 호출의 결정 요청 때 미완독이 남는다.
+    const decision = database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "DRAFT", body: korean(50_000) });
     const reference = timelineReference(decision);
     const plan = planMarkdown("E3_2_2A_PAUSED");
     let asked = false;
@@ -2703,6 +3088,7 @@ describe("E3-2-2a timeline references", { timeout: TIMELINE_TEST_TIMEOUT_MS }, (
     engine.startPlan("topic"); await settle();
     const paused = database.getTopic("topic");
     expect(paused.state).toBe("USER_DECISION_REQUIRED");
+    expect(database.planning.referenceComplete("claude-existing", paused, reference)).toBe(false);
     const checkpoint = database.latestPlannerCheckpoint("topic", "claude")!;
     await engine.postMessage("topic", "decision", "E3_2_2A 원래 방향으로 계속 읽어 주세요");
     engine.retry("topic"); await settle();
@@ -2718,7 +3104,9 @@ describe("E3-2-2a timeline references", { timeout: TIMELINE_TEST_TIMEOUT_MS }, (
   it("does not close a revision checkpoint that asked for a user decision while required references are unread", async () => {
     const { repo, database, git } = setup();
     database.updateTopic("topic", { state: "CLAUDE_REVISION" });
-    const decision = database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CLAUDE_REVISION", body: korean(6_000) });
+    // 필수 참조는 요청 없이 첫 패킷부터 실린다(읽기 패커) — 세 패킷 이상 필요한 크기(약 23쪽, 64KiB 패킷당 최대 8쪽)여야 첫 호출의 결정 요청 때와
+    // 결정 뒤 첫 완료 때 미완독이 남아, 열린 체크포인트와 완료 강등을 실제로 거친다.
+    const decision = database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CLAUDE_REVISION", body: korean(50_000) });
     const delivery = planTimelineDelivery([decision]);
     const reference = delivery.references[0];
     const fake = scripted(async (_turn, call) => call === 1
@@ -2921,7 +3309,8 @@ describe("E3-2-2a timeline references", { timeout: TIMELINE_TEST_TIMEOUT_MS }, (
       if (turn.prompt.includes("검토할 계획 SHA-256")) auditStage = "audit";
       if (turn.prompt.includes("개정 계획 SHA-256")) auditStage = "closeout";
       if (auditStage === "audit" && !decision) {
-        decision = korean(6_000);
+        // 필수 참조는 요청 없이 첫 패킷부터 실린다(읽기 패커) — 개정 첫 호출의 한 패킷(64KiB)에 다 들어가지 않는 크기여야 결정 요청 때 미완독이 남는다.
+        decision = korean(50_000);
         await engine.postMessage("topic", "decision", decision);
       }
       if (state.pending().length) return undefined;
@@ -3003,16 +3392,25 @@ describe("E3-2-2a timeline references", { timeout: TIMELINE_TEST_TIMEOUT_MS }, (
 
   it("preserves an acknowledged tail while filling an earlier gap without duplicate delivery", async () => {
     const { database, git, artifacts, settle } = referenceTopic();
-    const row = database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "DRAFT", body: "x".repeat(18_000) });
+    // 읽기 패커는 필수 참조를 첫 패킷부터 남은 공간에 싣는다 — 두 패킷에 다 싣지 못할 만큼 큰 결정이라야 끝 쪽이 먼저 인정된 뒤 그 앞 공백을 채운다.
+    const row = database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "DRAFT", body: "x".repeat(200_000) });
     const reference = timelineReference(row);
+    // 호스트가 자르는 마지막 쪽의 시작(쪽 내용 6,692 바이트) — 모델이 먼저 청한 끝 쪽이 호스트 쪽과 신원(selector·offset)이 같아야 다시 싣지 않는지 볼 수 있다.
+    const tail = Math.floor((reference.bytes - 1) / 6_692) * 6_692;
     const model = readingModel(planMarkdown("F006_TAIL"), (_turn, call) => call === 1
-      ? answer(step({ requests: [{ kind: "context", selector: reference.selector, offset: 13_384, question: "Read the tail first" }] }))
+      ? answer(step({ requests: [{ kind: "context", selector: reference.selector, offset: tail, question: "Read the tail first" }] }))
       : undefined);
     const engine = new WorkflowEngine({ database, git, artifacts, claude: guardedPlanning(model.adapter, database, git), codex: stopAudit().adapter });
     engine.startPlan("topic"); await settle();
     expect(database.getTopic("topic").lastError).toBe("E3_2_2A_AUDIT_STOP");
     expect(assembled(model.received, reference.selector)).toMatchObject({ complete: true, text: timelineEventText(row) });
-    expect(model.delivered.filter(part => part.selector === reference.selector).map(part => part.offset)).toEqual([13_384, 0, 6_692]);
+    const parts = model.delivered.filter(part => part.selector === reference.selector);
+    // 끝 쪽은 첫 응답의 요청으로 둘째 호출에 한 번 실려 인정됐고, 그 앞 공백은 셋째 호출부터 채웠다.
+    expect(parts.filter(part => part.offset === tail).map(part => part.call)).toEqual([2]);
+    expect(parts.some(part => part.call > 2 && part.offset < tail)).toBe(true);
+    // 공백을 채우는 동안 인정된 끝 쪽을 포함해 어떤 쪽도 두 번 싣지 않는다 — 모든 쪽이 정확히 한 번씩이다.
+    expect(parts.map(part => part.offset).sort((left, right) => left - right))
+      .toEqual(Array.from({ length: tail / 6_692 + 1 }, (_, index) => index * 6_692));
     expect(model.calls.every(turn => !turn.prompt.includes("Required timeline references not yet fully read"))).toBe(true);
     expect(await artifacts.readLatest("topic", "plan")).toContain("F006_TAIL");
     await engine.shutdown();
@@ -3020,15 +3418,20 @@ describe("E3-2-2a timeline references", { timeout: TIMELINE_TEST_TIMEOUT_MS }, (
 
   it("rereads only the cancelled range while preserving an acknowledged tail beyond the same gap", async () => {
     const { database, git, artifacts, settle } = referenceTopic();
-    const row = database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "DRAFT", body: "x".repeat(18_000) });
+    // 읽기 패커는 필수 참조를 첫 패킷부터 싣는다 — 세 패킷에 다 싣지 못할 만큼 큰 결정이라야 셋째(취소되는) 호출이 인정된 끝 쪽 앞의 공백 구간을 싣는다.
+    const row = database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "DRAFT", body: "x".repeat(200_000) });
     const reference = timelineReference(row);
+    // 호스트가 자르는 마지막 쪽의 시작(쪽 내용 6,692 바이트) — 모델이 먼저 청한 끝 쪽이 호스트 쪽과 같은 신원이다.
+    const tail = Math.floor((reference.bytes - 1) / 6_692) * 6_692;
+    let cancelled: number[] = [];
     let entered!: () => void, release!: () => void;
     const pending = new Promise<void>(resolve => { entered = resolve; });
     const model = readingModel(planMarkdown("F006_MIXED"), async (turn, call, state) => {
-      if (call === 1) return answer(step({ requests: [{ kind: "context", selector: reference.selector, offset: 13_384, question: "Read the tail first" }] }));
+      if (call === 1) return answer(step({ requests: [{ kind: "context", selector: reference.selector, offset: tail, question: "Read the tail first" }] }));
       if (call === 4) {
+        // 다시 읽을 위치 안내는 취소된 호출의 쪽만 offset 순으로 든다(4KiB 안이라 뒤에 남은 수 안내가 붙지 않는다).
         const status = turn.prompt.split("\n").find(line => line.startsWith("Required timeline references not yet fully read"))!;
-        expect(JSON.parse(status.slice(status.indexOf("again: ") + 7))).toEqual([{ selector: reference.selector, offset: 0 }]);
+        expect(JSON.parse(status.slice(status.indexOf("again: ") + 7))).toEqual(cancelled.map(offset => ({ selector: reference.selector, offset })));
       }
       if (call !== 3) return undefined;
       entered();
@@ -3040,12 +3443,21 @@ describe("E3-2-2a timeline references", { timeout: TIMELINE_TEST_TIMEOUT_MS }, (
     engine.startPlan("topic"); await pending;
     engine.stop("topic"); release(); await settle();
     const stopped = database.getTopic("topic");
-    expect(database.planning.referenceReadAcknowledged("claude-existing", stopped, reference.selector, reference.hash, 13_384)).toBe(true);
-    expect(database.planning.referenceReadAcknowledged("claude-existing", stopped, reference.selector, reference.hash, 0)).toBe(false);
+    // 취소를 무시하고 늦게 반환된 셋째 호출이 실은 공백 구간 — 인정하지 않는다. 그 뒤의 끝 쪽은 둘째 호출에서 인정된 그대로다.
+    cancelled = model.delivered.filter(part => part.call === 3 && part.selector === reference.selector).map(part => part.offset)
+      .sort((left, right) => left - right);
+    expect(cancelled.length).toBeGreaterThan(0);
+    expect(cancelled.at(-1)!).toBeLessThan(tail);
+    expect(database.planning.referenceReadAcknowledged("claude-existing", stopped, reference.selector, reference.hash, tail)).toBe(true);
+    for (const offset of cancelled)
+      expect(database.planning.referenceReadAcknowledged("claude-existing", stopped, reference.selector, reference.hash, offset)).toBe(false);
     engine.retry("topic"); await settle();
     expect(database.getTopic("topic").lastError).toBe("E3_2_2A_AUDIT_STOP");
     expect(assembled(model.received, reference.selector)).toMatchObject({ complete: true, text: timelineEventText(row) });
-    expect(model.delivered.filter(part => part.selector === reference.selector).map(part => part.offset)).toEqual([13_384, 0, 6_692, 0]);
+    // 취소된 구간의 쪽만 한 번 더 싣고, 인정된 끝 쪽을 포함한 나머지 쪽은 한 번만 싣는다.
+    const pages = Array.from({ length: tail / 6_692 + 1 }, (_, index) => index * 6_692);
+    expect(model.delivered.filter(part => part.selector === reference.selector).map(part => part.offset).sort((left, right) => left - right))
+      .toEqual([...pages, ...cancelled].sort((left, right) => left - right));
     expect(database.planning.referenceComplete("claude-existing", database.getTopic("topic"), reference)).toBe(true);
     expect(await artifacts.readLatest("topic", "plan")).toContain("F006_MIXED");
     await engine.shutdown();
@@ -4161,18 +4573,21 @@ describe("E3-4a 완료 강등과 이연 읽기", () => {
   const decide = (database: ConsensusDatabase) =>
     database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CLAUDE_PLAN", body: "The form owns the step value" });
 
-  it("F002: deferred reads left over by the batch limit demote a completed response until they are served", async () => {
+  // 세 쪽짜리 범위 셋과 한 쪽 범위 하나(form.swift 78,000 바이트) — 계획 패킷(64KiB)의 남은 공간에는 앞의 범위들만 들어가 마지막 범위의 첫 쪽이 남는다.
+  const PAGE = 6_692;
+  const LEFTOVER = 9 * PAGE;
+  const DEFERRED_RANGES = [0, 3 * PAGE, 6 * PAGE, LEFTOVER].map((offset, index) => ({ kind: "file" as const, selector: "form.swift",
+    question: `Read range ${index}`, offset, end: index === 3 ? offset + PAGE : offset + 3 * PAGE }));
+  it("F002: deferred reads left over by the packet space demote a completed response until they are served", async () => {
     const { repo, database, git } = setup();
-    // 한 조각(8KiB)씩 네 구간 — 24KiB 묶음에 셋만 들어간다.
-    const READS = [0, 7_000, 14_000, 21_000].map(offset => ({ kind: "file" as const, selector: "form.swift", question: `Read at ${offset}`, offset }));
     const fake = scripted(async (_turn, n) => {
-      if (n === 1) return { ...answer(step({ requests: READS })), requestedUserDecision: "Who owns the step value?" };
+      if (n === 1) return { ...answer(step({ requests: DEFERRED_RANGES })), requestedUserDecision: "Who owns the step value?" };
       if (n === 2) return answer(step({ questions: [], complete: true, facts: [{ statement: "Unverified", refs: ["not-delivered"] }] }));
       if (n === 3) {
         const checkpoint = database.planning.latest("topic")!;
         expect(checkpoint).toMatchObject({ finalized: false, demotedComplete: { requests: 0, unreadRequired: 0, deferred: 1 }, step: { complete: false } });
         expect(checkpoint.lastResponse?.planningStep?.complete).toBe(true);
-        expect(checkpoint.deferredReads!.map(read => read.offset)).toEqual([21_000]);
+        expect(checkpoint.deferredReads!.map(read => read.offset)).toEqual([LEFTOVER]);
         // 남은 이연 읽기가 이어질 읽기라, 강등된 완료의 미전달 인용은 거절하지 않고 버린 뒤 다시 쓰게 한다(청한 읽기가 남은 중간 단계와 같다).
         expect(checkpoint.step.facts).toEqual([]);
       }
@@ -4184,8 +4599,10 @@ describe("E3-4a 완료 강등과 이연 읽기", () => {
     const result = await adapter.resumeTurn({ cwd: repo, prompt: "Plan with decision", sessionId: "planning-session" });
     expect(result.planMarkdown).toBe("Final navigation plan");
     expect(fake.calls).toHaveLength(3);
-    expect(fragmentsIn(fake.calls[1]).map(fragment => fragment.offset)).toEqual([0, 7_000, 14_000]);
-    expect(fragmentsIn(fake.calls[2]).map(fragment => fragment.offset)).toEqual([21_000]);
+    // 결정 뒤 첫 패킷은 남은 공간까지 앞 범위들을 채우고, 강등된 완료 뒤 패킷이 남은 이연 읽기의 첫 쪽을 싣는다.
+    expect(fragmentsIn(fake.calls[1]).map(fragment => fragment.offset)).not.toContain(LEFTOVER);
+    expect(fragmentsIn(fake.calls[1]).length).toBeGreaterThan(5);
+    expect(fragmentsIn(fake.calls[2]).map(fragment => fragment.offset)).toContain(LEFTOVER);
     const final = database.planning.latest("topic")!;
     expect(final.finalized).toBe(true);
     expect(final.deferredReads).toBeUndefined();
@@ -4196,13 +4613,12 @@ describe("E3-4a 완료 강등과 이연 읽기", () => {
   // 남은 이연 읽기부터 싣는다(r3 B 와 같은 뜻). 실행 예산 1,000(호출당 100): 여덟 번 뒤 soft limit, 아홉째가 정리다.
   it("F002: a budget-forced synthesis is not adopted while deferred reads remain and a retry after a grant serves them first", async () => {
     const { repo, database, git } = setup("claude", 1000);
-    writeFileSync(join(repo, "form.swift"), "let step = 0\n".repeat(20_000));
-    const READS = [0, 7_000, 14_000, 21_000].map(offset => ({ kind: "file" as const, selector: "form.swift", question: `Read at ${offset}`, offset }));
-    // 모델이 매 회차 큰 조각 셋을 청해 묶음을 채운다 — 남은 이연 읽기 하나는 정리 전까지 실리지 못한다.
-    const rounds = (n: number) => [0, 1, 2].map(i => ({ kind: "file" as const, selector: "form.swift", question: `Round ${n}`,
-      offset: 30_000 + ((n - 2) * 3 + i) * 7_000 }));
+    writeFileSync(join(repo, "form.swift"), "let step = 0\n".repeat(100_000));
+    // 모델이 매 회차 패킷을 채우는 범위를 새로 청한다 — 대기 읽기가 이연 읽기보다 먼저 실려, 남은 이연 읽기 하나는 정리 전까지 실리지 못한다.
+    const rounds = (n: number) => [{ kind: "file" as const, selector: "form.swift", question: `Round ${n}`,
+      offset: 100_000 + (n - 2) * 70_000, end: 100_000 + (n - 1) * 70_000 }];
     const fake = scripted(async (turn, n) => {
-      if (n === 1) return { ...answer(step({ requests: READS })), requestedUserDecision: "Who owns the step value?" };
+      if (n === 1) return { ...answer(step({ requests: DEFERRED_RANGES })), requestedUserDecision: "Who owns the step value?" };
       if (turn.prompt.includes("No more research is available") || n > 9) return answer(step({ questions: [], complete: true }));
       return answer(step({ requests: rounds(n) }));
     });
@@ -4215,13 +4631,14 @@ describe("E3-4a 완료 강등과 이연 읽기", () => {
     expect(fake.calls[8].prompt).toContain("No more research is available");
     const paused = database.planning.latest("topic")!;
     expect(paused).toMatchObject({ finalized: false, finalAttempted: true, demotedComplete: { requests: 0, unreadRequired: 0, deferred: 1 } });
-    expect(paused.deferredReads!.map(read => read.offset)).toEqual([21_000]);
+    expect(paused.deferredReads!.map(read => read.offset)).toEqual([LEFTOVER]);
     database.budgets.grant("topic", "f002-raise", { execution: { inputTokens: 3000, outputTokens: 10000, durationMs: 100000 },
       total: { inputTokens: 300000, outputTokens: 30000, durationMs: 300000 } }, database.budgets.account("topic")!.version);
     const result = await adapter.resumeTurn({ cwd: repo, prompt: "Plan with decision", sessionId: "planning-session" });
     expect(result.planMarkdown).toBe("Final navigation plan");
     expect(fake.calls).toHaveLength(10);
-    expect(fragmentsIn(fake.calls[9]).map(fragment => fragment.offset)).toEqual([21_000]);
+    // 정리 응답은 완료였으므로 앞선 회차 범위의 나머지는 더 사지 않는다 — 남은 이연 읽기만 싣는다.
+    expect(fragmentsIn(fake.calls[9]).map(fragment => fragment.offset)).toEqual([LEFTOVER]);
     expect(database.planning.latest("topic")).toMatchObject({ id: paused.id, finalized: true });
     expect(database.planning.latest("topic")!.deferredReads).toBeUndefined();
   });
@@ -4243,7 +4660,8 @@ describe("E3-4a 완료 강등과 이연 읽기", () => {
     // 실은 조각은 호출이 끊겨 채택되지 않았다 — 이연 읽기는 그대로 남는다.
     const carried = database.planning.latest("topic")!;
     expect(carried.fragments.map(fragment => fragment.offset)).toEqual([DEFERRED.offset]);
-    expect(carried.deferredReads).toEqual([{ ...DEFERRED, hash: expect.stringMatching(/^[a-f0-9]{64}$/) }]);
+    // 범위 끝 없이 청한 요청은 한 쪽 범위(end = offset + 1)로 정규화해 이연한다.
+    expect(carried.deferredReads).toEqual([{ ...DEFERRED, end: DEFERRED.offset + 1, hash: expect.stringMatching(/^[a-f0-9]{64}$/) }]);
     writeFileSync(join(repo, "form.swift"), "let step = 42\n".repeat(6000));
     const result = await adapter.resumeTurn({ cwd: repo, prompt: "Plan with decision", sessionId: "planning-session" });
     expect(result.planMarkdown).toBe("Final navigation plan");
@@ -4325,7 +4743,7 @@ describe("E3-4a 완료 강등과 이연 읽기", () => {
     await adapter.resumeTurn({ cwd: repo, prompt: "Plan", sessionId: "planning-session" });
     const decided = database.planning.latest("topic")!;
     expect(decided.delivered).toContain(firstId);
-    expect(decided.deferredReads).toEqual([{ ...REREAD, hash: expect.stringMatching(/^[a-f0-9]{64}$/) }]);
+    expect(decided.deferredReads).toEqual([{ ...REREAD, end: REREAD.offset + 1, hash: expect.stringMatching(/^[a-f0-9]{64}$/) }]);
     decide(database);
     await adapter.resumeTurn({ cwd: repo, prompt: "Plan with decision", sessionId: "planning-session" });
     expect(fake.calls).toHaveLength(3);
@@ -4400,11 +4818,10 @@ describe("E3-5 허용 색인에서 위키 추가 검색", () => {
         }
         throw new Error("connection interrupted");
       }
-      if (n === 3 && mode !== "replay") {
-        if (mode === "mixed") expect(fragmentsIn(turn).some(fragment => fragment.selector === "form.swift")).toBe(true);
-        return answer(step({ requests: [{ ...request, offset: 0 }] }));
-      }
-      expect(n).toBe(mode === "replay" ? 3 : 4);
+      // 다시 대조한 이연 읽기(바뀐 원문의 첫 쪽)는 오류를 돌려준 요청을 모델이 고치기를 기다리지 않고 다음 패킷에 실린다(읽기 패커). 남아 있던 정상 조각도
+      // 함께 실린다.
+      expect(n).toBe(3);
+      if (mode === "mixed") expect(fragmentsIn(turn).some(fragment => fragment.selector === "form.swift")).toBe(true);
       expect(fragmentsIn(turn).find(fragment => fragment.selector === "alpha.md")?.content).toContain("ALPHA_BODY_V2");
       return answer(step({ questions: [], complete: true }));
     });
@@ -4418,7 +4835,7 @@ describe("E3-5 허용 색인에서 위키 추가 검색", () => {
     write("alpha.md", ALPHA_V2);
     const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
     expect(result.result.planMarkdown).toBe("Final navigation plan");
-    expect(fake.calls).toHaveLength(mode === "replay" ? 3 : 4);
+    expect(fake.calls).toHaveLength(3);
     expect(database.planning.latest("topic")!.deferredReads).toBeUndefined();
     expect(database.getTimeline("topic").some(event => event.payload?.deferredReadChanged)).toBe(true);
   });
@@ -4445,13 +4862,14 @@ describe("E3-5 허용 색인에서 위키 추가 검색", () => {
       if (n === 2) {
         expect(turn.prompt).toContain("Read request errors:");
         interruptAdoption = true;
-        const largeReads = decision ? [] : [0, 7000, 14000].map(offset => ({ ...READ_FORM, offset }));
+        // 패킷 남은 공간을 다 채우는 범위 읽기(form.swift 78,000 바이트) — 이연 재읽기가 같은 패킷에 들어갈 자리가 없다.
+        const largeReads = decision ? [] : [{ ...READ_FORM, end: null }];
         return { ...answer(step({ requests: [...largeReads, { ...request, rereadReason: "Compaction lost the previously delivered text" }] })),
           ...(decision ? { requestedUserDecision: "Second decision" } : {}) };
       }
       if (!decision && n === 3) {
-        // The batch is full; completing without repeating the request must still deliver the deferred reread.
-        expect(fragmentsIn(turn).map(fragment => fragment.selector)).toEqual(["form.swift", "form.swift", "form.swift"]);
+        // The packet is full; completing without repeating the request must still deliver the deferred reread.
+        expect(new Set(fragmentsIn(turn).map(fragment => fragment.selector))).toEqual(new Set(["form.swift"]));
         return answer(step({ questions: [], complete: true }));
       }
       expect(fragmentsIn(turn).find(fragment => fragment.selector === "alpha.md")?.content).toContain("ALPHA_BODY_V2");
@@ -4751,18 +5169,30 @@ describe("E3-5 허용 색인에서 위키 추가 검색", () => {
     expect(fake.calls).toHaveLength(4);
   });
 
+  // 목록 밖 요청은 정지 대신 요청 오류로 돌아온다(R1). 다른 역할 문서와 없는 문서는 같은 문구를 받아 존재 여부가 드러나지 않고, 본문은 어느 호출에도 실리지 않는다.
   it("never lists or serves documents of the other role's folder", async () => {
     const { repo, database, git } = setup("codex");
     const { dir } = wiki();
+    let errors: Array<{ request: { selector: string }; message: string }> = [];
     const fake = scripted(async (turn, n) => {
       if (n === 1) return answer(step({ requests: [{ kind: "memory", selector: INDEX, question: "Find", offset: 0 }] }));
-      expect(indexRows(fragmentsIn(turn)[0]).map(row => row.path)).toEqual(["plan-notes.md", "alpha.md", "beta.md", "codex-only/steps.md"]);
-      return answer(step({ requests: [{ kind: "memory", selector: "claude-only/steps.md", question: "Peek", offset: 0 }] }));
+      if (n === 2) {
+        expect(indexRows(fragmentsIn(turn)[0]).map(row => row.path)).toEqual(["plan-notes.md", "alpha.md", "beta.md", "codex-only/steps.md"]);
+        return answer(step({ requests: [{ kind: "memory", selector: "claude-only/steps.md", question: "Peek", offset: 0 },
+          { kind: "memory", selector: "nowhere/never.md", question: "Peek", offset: 0 }] }));
+      }
+      errors = JSON.parse(turn.prompt.split("Read request errors: ")[1]!.split("\n")[0]!);
+      return answer(step({ questions: [], complete: true }));
     }, "codex");
-    await expect(guardedPlanning(fake.adapter, database, git, dir).createSession({ cwd: repo, prompt: "Plan" }))
-      .rejects.toThrow("not in the pinned manifest");
-    expect(fake.calls).toHaveLength(2);
-    expect(fake.calls.some(call => call.prompt.includes("claude-only/steps.md") || call.prompt.includes("CLAUDE_ONLY_STEPS"))).toBe(false);
+    await guardedPlanning(fake.adapter, database, git, dir).createSession({ cwd: repo, prompt: "Plan" });
+    expect(fake.calls).toHaveLength(3);
+    expect(errors.map(entry => entry.request.selector)).toEqual(["claude-only/steps.md", "nowhere/never.md"]);
+    expect(errors[0]!.message).toContain("not in the pinned manifest");
+    expect(errors[0]!.message).toBe(errors[1]!.message);
+    // 그 경로는 모델이 보낸 요청을 오류로 되돌려 줄 때만 보인다 — 색인·매니페스트에 오르지 않는다.
+    expect(fake.calls.slice(0, 2).some(call => call.prompt.includes("claude-only/steps.md"))).toBe(false);
+    expect(fake.calls.some(call => call.prompt.includes("CLAUDE_ONLY_STEPS"))).toBe(false);
+    expect(database.planning.latest("topic")).toMatchObject({ finalized: true, readQueue: [] });
   });
 
   it("records an additional document inherited by a later checkpoint of the same session so its change is still detected", async () => {
@@ -4794,6 +5224,190 @@ describe("E3-5 허용 색인에서 위키 추가 검색", () => {
     await expect(wrapped.resumeTurn({ cwd: repo, prompt: "Revise", sessionId: first.sessionId }))
       .rejects.toThrow("Checkpoint cites evidence that was not delivered.");
     expect(fake.calls).toHaveLength(5);
+  });
+});
+
+// ---- 상시 참조 문서(standingReferencePath) ----
+// 공개 경계: guardedPlanning(adapter, …, standingReferencePath) — 사용자 지시문이 가리키는 문서 하나를 kind=context selector=<절대 경로> 로 싣는다.
+// 허용 색인 문서(E3-5)처럼 sourceHash 뒤에 실려, 설정을 더하거나 읽지 않은 판이 바뀌어도 진행 중 시도를 초기화하지 않는다. 실은 판만 standingReads 로 대조한다.
+describe("상시 참조 문서를 필요할 때 읽는 context 로 싣기", () => {
+  const sha = (text: string) => createHash("sha256").update(text, "utf8").digest("hex");
+  const fragmentsIn = (turn: Omit<SessionTurn, "sessionId">) => JSON.parse(turn.prompt.split("Fragments: ").at(-1)!) as PlanningFragment[];
+  type ManifestItem = { id: string; hash: string; bytes: number; required?: boolean };
+  const manifestIn = (turn: Omit<SessionTurn, "sessionId">) => JSON.parse(turn.prompt.split("\nManifest: ")[1]!.split("\n")[0]!) as ManifestItem[];
+  const REFERENCE_V1 = "# 설계 철학\nREFERENCE_BODY_V1\n";
+  const REFERENCE_V2 = REFERENCE_V1.replace("REFERENCE_BODY_V1", "REFERENCE_BODY_V2");
+  const READ_FORM = { kind: "file" as const, selector: "form.swift", question: "Read form", offset: 0 };
+  const readReference = (selector: string) => ({ kind: "context" as const, selector, question: "Read the design philosophy", offset: 0 });
+  // 리더는 부모 경로에 심볼릭 링크가 있으면 읽지 않는다 — macOS tmpdir(/var → /private/var)을 실제 경로로 바꿔 쓴다.
+  function standingFile() {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "guarded-standing-")));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const path = join(dir, "design-philosophy.md");
+    writeFileSync(path, REFERENCE_V1);
+    return { dir, path, write: (text: string) => writeFileSync(path, text) };
+  }
+
+  it("lists the configured document in the manifest as optional without pinning it in sourceHash", async () => {
+    const { repo, database, git } = setup();
+    const { path } = standingFile();
+    const entry = { id: `context:${path}`, hash: sha(REFERENCE_V1), bytes: Buffer.byteLength(REFERENCE_V1), required: false };
+    let shown: ManifestItem[] = [];
+    const fake = scripted(async (turn, n) => {
+      if (n === 1) {
+        shown = manifestIn(turn);
+        return answer(step({ requests: [{ kind: "context", selector: "manifest", question: "List sources", offset: 0 }] }));
+      }
+      // 매니페스트 문서(context:manifest)에도 같은 항목이 실린다.
+      expect(JSON.parse(fragmentsIn(turn).map(fragment => fragment.content).join(""))).toContainEqual(entry);
+      return answer(step({ questions: [], complete: true }));
+    });
+    await guardedPlanning(fake.adapter, database, git, undefined, undefined, path).createSession({ cwd: repo, prompt: "Plan" });
+    expect(fake.calls).toHaveLength(2);
+    expect(shown).toContainEqual(entry);
+    // 필수 입력이 아니다 — 요청하지 않으면 본문을 싣지 않는다.
+    expect(fake.calls.some(turn => fragmentsIn(turn).some(fragment => fragment.selector === path))).toBe(false);
+    // sourceHash 는 표시용 항목을 뺀 고정 목록의 해시다.
+    expect(database.planning.latest("topic")!.sourceHash).toBe(sha(JSON.stringify(shown.filter(item => item.id !== entry.id))));
+  });
+
+  it.each(["symbolic link", "missing file"])("skips a configured document it cannot read (%s) and keeps planning", async kind => {
+    const { repo, database, git } = setup();
+    const { dir, path } = standingFile();
+    const configured = join(dir, kind === "symbolic link" ? "linked.md" : "missing.md");
+    if (kind === "symbolic link") symlinkSync(path, configured);
+    const fake = scripted(async turn => {
+      expect(manifestIn(turn).map(item => item.id)).not.toContain(`context:${configured}`);
+      return answer(step({ questions: [], complete: true }));
+    });
+    const result = await guardedPlanning(fake.adapter, database, git, undefined, undefined, configured).createSession({ cwd: repo, prompt: "Plan" });
+    expect(result.result.planMarkdown).toBe("Final navigation plan");
+    expect(database.planning.latest("topic")!.standingReads).toBeUndefined();
+  });
+
+  // 파일 접근이 막혀도(권한·내려받기 대기로 읽기 기한 초과) 문서를 아직 읽지 않은 시도는 멈추지 않는다. 실은 판에 기대는 시도는 판을 대조할 수 없어 멈춘다
+  // — 원문 변경으로 초기화해 사실을 버리지 않는다.
+  it("skips a blocked document until the attempt relies on it, then stops instead of discarding its facts", async () => {
+    const { repo, database, git } = setup();
+    const { path } = standingFile();
+    cleanups.push(() => chmodSync(path, 0o644));
+    let referenceId = "";
+    const fake = scripted(async (turn, n) => {
+      if (n === 1) return answer(step({ requests: [readReference(path)] }));
+      if (n === 2) {
+        referenceId = fragmentsIn(turn)[0]!.id;
+        return answer(step({ facts: [{ statement: "Design rule", refs: [referenceId] }], requests: [READ_FORM] }));
+      }
+      if (n === 3) throw new Error("connection interrupted");
+      expect(manifestIn(turn).map(item => item.id)).not.toContain(`context:${path}`);
+      return answer(step({ questions: [], complete: true }));
+    });
+    const adapter = guardedPlanning(fake.adapter, database, git, undefined, undefined, path);
+    await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("interrupted");
+    chmodSync(path, 0o000);
+    await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("User file access blocked");
+    expect(fake.calls).toHaveLength(3);
+    expect(database.planning.latest("topic")!).toMatchObject({ standingReads: { [path]: sha(REFERENCE_V1) },
+      step: expect.objectContaining({ facts: [{ statement: "Design rule", refs: [referenceId] }] }) });
+    // 이 문서에 기대지 않는 새 시도(다른 토픽)는 막힌 문서를 싣지 않고 계속한다.
+    const other = setup();
+    const result = await guardedPlanning(fake.adapter, other.database, other.git, undefined, undefined, path).createSession({ cwd: other.repo, prompt: "Plan" });
+    expect(result.result.planMarkdown).toBe("Final navigation plan");
+    expect(fake.calls).toHaveLength(4);
+  });
+
+  it("serves a kind=context request for the configured path with the body pinned for this run and records its version", async () => {
+    const { repo, database, git } = setup();
+    const { path } = standingFile();
+    let referenceId = "";
+    const fake = scripted(async (turn, n) => {
+      if (n === 1) return answer(step({ requests: [readReference(path)] }));
+      const fragments = fragmentsIn(turn);
+      expect(fragments).toMatchObject([{ kind: "context", selector: path, offset: 0, nextOffset: null, hash: sha(REFERENCE_V1), content: REFERENCE_V1 }]);
+      referenceId = fragments[0]!.id;
+      return answer(step({ questions: [], complete: true, facts: [{ statement: "Design rule", refs: [referenceId] }] }));
+    });
+    const result = await guardedPlanning(fake.adapter, database, git, undefined, undefined, path).createSession({ cwd: repo, prompt: "Plan" });
+    expect(result.result.planMarkdown).toBe("Final navigation plan");
+    const final = database.planning.latest("topic")!;
+    expect(final.step.facts).toEqual([{ statement: "Design rule", refs: [referenceId] }]);
+    expect(final.standingReads).toEqual({ [path]: sha(REFERENCE_V1) });
+  });
+
+  // 운영 반영 때의 경계 — 문서 설정이 없던 서버가 만든 미완료 체크포인트가, 설정을 더한 서버에서 사실을 잃지 않고 이어 간다. 목록 밖 요청을 처리하는 경로를
+  // 거치지 않는다(그 경로는 따로 바뀐다).
+  it("keeps an in-progress checkpoint when the document is configured later or changes before it is read", async () => {
+    const { repo, database, git } = setup();
+    const { path, write } = standingFile();
+    let formId = "", referenceId = "";
+    const fake = scripted(async (turn, n) => {
+      const fragments = fragmentsIn(turn);
+      if (n === 1) return answer(step({ requests: [READ_FORM] }));
+      if (n === 2) {
+        formId = fragments[0]!.id;
+        return answer(step({ facts: [{ statement: "Form step", refs: [formId] }], requests: [{ ...READ_FORM, offset: fragments[0]!.nextOffset! }] }));
+      }
+      if (n === 3) throw new Error("connection interrupted");
+      expect(turn.prompt).not.toContain("Sources changed");
+      expect(turn.prompt).toContain('"statement":"Form step"');
+      if (n === 4) {
+        expect(manifestIn(turn)).toContainEqual(expect.objectContaining({ id: `context:${path}`, hash: sha(REFERENCE_V1), required: false }));
+        throw new Error("connection interrupted");
+      }
+      if (n === 5) return answer(step({ facts: [{ statement: "Form step", refs: [formId] }], requests: [readReference(path)] }));
+      const reference = fragments.find(fragment => fragment.selector === path);
+      expect(reference).toMatchObject({ kind: "context", hash: sha(REFERENCE_V2), content: REFERENCE_V2 });
+      referenceId = reference!.id;
+      return answer(step({ questions: [], complete: true, facts: [{ statement: "Form step", refs: [formId] }, { statement: "Design rule", refs: [referenceId] }] }));
+    });
+    await expect(guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("interrupted");
+    const before = database.planning.latest("topic")!;
+    expect(before.step.facts).toEqual([{ statement: "Form step", refs: [formId] }]);
+    const configured = guardedPlanning(fake.adapter, database, git, undefined, undefined, path);
+    await expect(configured.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("interrupted");
+    write(REFERENCE_V2);
+    const result = await configured.createSession({ cwd: repo, prompt: "Plan" });
+    expect(result.result.planMarkdown).toBe("Final navigation plan");
+    expect(fake.calls).toHaveLength(6);
+    const after = database.planning.latest("topic")!;
+    expect(after).toMatchObject({ admissionId: before.admissionId, sourceHash: before.sourceHash, standingReads: { [path]: sha(REFERENCE_V2) } });
+    expect(after.step.facts).toEqual([{ statement: "Form step", refs: [formId] }, { statement: "Design rule", refs: [referenceId] }]);
+  });
+
+  it("stops when a read document changes during planning and revalidates against the new body at the next run", async () => {
+    const { repo, database, git } = setup();
+    const { path, write } = standingFile();
+    let staleId = "";
+    const fake = scripted(async (turn, n) => {
+      const fragments = fragmentsIn(turn);
+      if (n === 1) return answer(step({ requests: [readReference(path)] }));
+      if (n === 2) {
+        staleId = fragments[0]!.id;
+        write(REFERENCE_V2);
+        return answer(step({ facts: [{ statement: "Design rule v1", refs: [staleId] }], requests: [READ_FORM] }));
+      }
+      if (n === 3) {
+        expect(turn.prompt).toContain("Sources changed");
+        expect(fragments).toEqual([]);
+        return answer(step({ requests: [readReference(path)] }));
+      }
+      expect(database.planning.latest("topic")!.step.facts).toEqual([]);
+      // 같은 selector·offset 이라도 조각 캐시가 옛 판을 돌려주지 않는다.
+      expect(fragments).toMatchObject([{ selector: path, offset: 0, hash: sha(REFERENCE_V2), content: REFERENCE_V2 }]);
+      return answer(step({ questions: [], complete: true, facts: [{ statement: "Design rule v2", refs: [fragments[0]!.id] }] }));
+    });
+    const adapter = guardedPlanning(fake.adapter, database, git, undefined, undefined, path);
+    await expect(adapter.createSession({ cwd: repo, prompt: "Plan" })).rejects.toThrow("A standing reference document read during planning changed.");
+    const before = database.planning.latest("topic")!;
+    // 실은 판은 적혔고, 호출 중 원문이 바뀌어 그 응답은 채택하지 않았다(현재성 검사가 채택 전에 멈춘다).
+    expect(before.standingReads).toEqual({ [path]: sha(REFERENCE_V1) });
+    expect(before).toMatchObject({ responsePending: true, step: expect.objectContaining({ facts: [] }) });
+    const result = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+    expect(result.result.planMarkdown).toBe("Final navigation plan");
+    expect(fake.calls).toHaveLength(4);
+    const after = database.planning.latest("topic")!;
+    expect(after).toMatchObject({ admissionId: before.admissionId, standingReads: { [path]: sha(REFERENCE_V2) } });
+    expect(after.delivered).not.toContain(staleId);
   });
 });
 
@@ -4833,6 +5447,37 @@ describe("E3 후속 리뷰 F008 계약 위반으로 무효화한 결정 응답",
   const reservations = (database: ConsensusDatabase) => ({ rewrites: database.revisions.account("topic").used,
     firstPlanUsed: database.revisions.account("topic").firstPlanUsed, reviews: database.reviews.account("topic", "planning").used });
   const stopAudit = () => scripted(async () => { throw new Error("F008_AUDIT_STOP"); }, "codex");
+
+  it("public audit retry preserves a mediator-only checkpoint without buying revision or another turn", async () => {
+    const { database, git, artifacts, settle } = engineTopic("pending:mediator-audit");
+    const plan = contractPlan("MEDIATOR_AUDIT");
+    const claude = scripted(async (_turn, n) => {
+      if (n === 1) return { ...answer(step({ questions: [], complete: true })), planMarkdown: plan };
+      throw new Error("STOP_AFTER_RESUMED_AUDIT");
+    });
+    const codex = scripted(async (_turn, n) => ({ kind: "AUDIT", summary: "Audit", findings: [], evidenceRefs: [],
+      ...(n === 1 ? { requestedMediatorAction: "Run authorized external verification" } : {}),
+      planningStep: step({ questions: n === 1 ? ["Need verification"] : [], complete: n !== 1 }) }), "codex");
+    const engine = new WorkflowEngine({ database, git, artifacts, claude: guardedPlanning(claude.adapter, database, git),
+      codex: guardedPlanning(codex.adapter, database, git) });
+    try {
+      engine.startPlan("topic"); await settle();
+      const open = database.planning.latest("topic", "codex")!;
+      expect(open).toMatchObject({ stage: "CODEX_AUDIT", finalized: false, awaitingDecision: true });
+      const before = reservations(database);
+      // Without the mediator's execution evidence the public retry is refused before any action or model turn.
+      expect(() => engine.retry("topic")).toThrow("중재자 실행 대기 중입니다");
+      await settle();
+      expect(claude.calls).toHaveLength(1);
+      expect(codex.calls).toHaveLength(1);
+      expect(database.getFlags("topic").resumeState).toBe("CODEX_AUDIT");
+      await engine.postMessage("topic", "evidence", "Authorized verification evidence supplied");
+      engine.retry("topic"); await settle();
+      expect(codex.calls).toHaveLength(2);
+      expect(database.planning.latest("topic", "codex")).toMatchObject({ id: open.id, admissionId: open.admissionId, sessionId: open.sessionId, finalized: true });
+      expect(database.reviews.account("topic", "planning").used).toBe(before.reviews);
+    } finally { await engine.shutdown(); }
+  });
 
   it.each(["task", "instructions"])("public retry resumes unread oversized %s after a user decision on the same audit attempt", async source => {
     const { repo, database, git, artifacts, settle } = engineTopic("pending:input-queue-audit");
@@ -5617,5 +6262,1158 @@ describe("shared planning contracts across stages", () => {
       ]);
     }
     expect(database.planning.latest("topic")!.finalized).toBe(true);
+  });
+});
+
+it("mediator work returns after one planning call and resumes the same open checkpoint on evidence", async () => {
+  const { repo, database, git } = setup();
+  const fake = scripted(async (_turn, call) => call === 1
+    ? { ...answer(step()), status: "blocked", requestedMediatorAction: "Read authorized external evidence" }
+    : answer(step({ questions: [], complete: true })));
+  const adapter = guardedPlanning(fake.adapter, database, git);
+  const first = await adapter.createSession({ cwd: repo, prompt: "Plan" });
+  expect(first.result.requestedMediatorAction).toBe("Read authorized external evidence");
+  expect(fake.calls).toHaveLength(1);
+  const checkpoint = database.planning.latest("topic")!;
+  expect(checkpoint).toMatchObject({ finalized: false, awaitingDecision: true });
+  expect((await adapter.createSession({ cwd: repo, prompt: "Plan" })).result).toEqual(first.result);
+  expect(fake.calls).toHaveLength(1);
+  database.appendEvent({ topicId: "topic", actor: "user", kind: "evidence", state: "CLAUDE_PLAN", body: "Current evidence supplied" });
+  expect((await adapter.createSession({ cwd: repo, prompt: "Plan" })).result.planMarkdown).toBe("Final navigation plan");
+  expect(fake.calls).toHaveLength(2);
+  expect(database.planning.latest("topic")).toMatchObject({ id: checkpoint.id, admissionId: checkpoint.admissionId, finalized: true });
+});
+
+// 계획 리뷰 왕복 루프(1fd0cc86 감사 1·2 — 55·45라운드) — 라운드 읽기 패커의 계약. 읽기는 쪽 단위(id·hash·offset)로 자르고, 한 회차에 싣는 양은 별도 묶음
+// 한도 없이 실측한 패킷 남은 공간이 정한다. 모델 요청은 범위(offset~end, end=null 은 원문 끝)이고 다 싣지 못한 나머지는 다음 응답이 다시 청하지 않아도
+// 대기 읽기로 이어 싣는다. 필수 참조(과제·공유 계약·결정 참조)는 요청 없이 같은 패커가 싣고, 완독 판정은 전달 인정 기록 그대로다.
+describe("round read packer", () => {
+  type Read = { alias: string; kind: string; required: boolean; start: number; end: number; eof: boolean; pages: number };
+  const FIXTURE = JSON.parse(readFileSync(join(import.meta.dirname, "fixtures", "planning-1fd0cc86-audit-reads.json"), "utf8")) as
+    { fragmentBytes: number; audits: Record<string, { reads: Read[] }> };
+  // JSON 이스케이프가 없는 ASCII 줄 — 쪽 경계가 운영 기록과 같다(쪽 = 6,692 바이트).
+  const filler = (alias: string, bytes: number) => {
+    const line = `${alias} replay line ${"x".repeat(40)}\n`;
+    return line.repeat(Math.ceil(bytes / line.length) + 1).slice(0, bytes);
+  };
+  const fragmentsOf = (turn: Omit<SessionTurn, "sessionId">) => JSON.parse(turn.prompt.split("Fragments: ").at(-1)!) as PlanningFragment[];
+  // 받은 쪽을 offset 순으로 이어 [start, end) 를 빈틈없이 덮었는가(end=null 은 원문 끝 — 마지막 쪽 nextOffset null).
+  const covers = (parts: ReadonlyMap<number, PlanningFragment> | undefined, start: number, end: number | null) => {
+    for (let offset = start; ;) {
+      const fragment = parts?.get(offset);
+      if (!fragment) return false;
+      if (fragment.nextOffset === null || (end !== null && fragment.nextOffset >= end)) return true;
+      offset = fragment.nextOffset;
+    }
+  };
+  function commit(repo: string, files: Record<string, string>) {
+    for (const [path, content] of Object.entries(files)) {
+      mkdirSync(join(repo, path, ".."), { recursive: true });
+      writeFileSync(join(repo, path), content);
+    }
+    execFileSync("git", ["-C", repo, "add", "."]);
+    execFileSync("git", ["-C", repo, "commit", "-qm", "replay sources"]);
+  }
+
+  // 운영 DB 의 감사 세션 전달 조각 기록(planning_session_fragments, rowid 순 = 전달 순)에서 원문 없이 종류·크기·필수 여부·읽기 순서만 뽑은 fixture 로
+  // 같은 바이트를 같은 순서로 청한다. 필수 문서는 바이트 그대로 필수 참조로 싣는다 — 과제(감사 2, 패킷을 넘어 과제 참조가 된다)와 공유 계약은 그 경로로,
+  // 결정·색인·지시문은 같은 크기의 결정 참조로 바꾼다(테스트 환경이 그 문서의 크기를 정하지 못한다). 모델 요청 읽기는 같은 크기의 파일·산출물이다.
+  // 옛 계약(요청당 한 쪽·묶음 24KiB·필수 참조당 한 쪽)에서는 라운드 수가 가장 긴 순차 문서의 쪽수 이상이었다(41·42쪽). 여기서는 호스트가 아는 읽기가
+  // 남아 있는 한 매 패킷이 다음 쪽을 더 실을 수 없을 만큼 차고, 라운드 수는 전달 바이트를 패킷 공간으로 나눈 값으로 정해진다. 운영 시간·토큰 절감은
+  // 이 대역 재생으로 측정하지 않는다.
+  it.each(["audit-1", "audit-2"])("replays the %s reads of topic 1fd0cc86 in rounds set by bytes and packet space", async name => {
+    const reads = FIXTURE.audits[name]!.reads;
+    const { root, repo, database, git } = setup("codex");
+    const files: Record<string, string> = {};
+    const artifacts: string[] = [];
+    const references: TimelineReference[] = [];
+    const documents: Array<{ selector: string; content: string }> = [];
+    let prompt = "Audit the plan.";
+    type ModelRead = { kind: "file" | "artifact" | "context"; selector: string; offset: number; end: number | null; rereadReason?: string };
+    const modelReads: ModelRead[] = [];
+    for (const read of reads) {
+      const bytes = read.end - read.start;
+      if (read.alias.startsWith("task-")) {
+        prompt = filler(read.alias, read.end);
+        if (!read.required) modelReads.push({ kind: "context", selector: "request", offset: 0, end: null, rereadReason: "Compaction lost the task text" });
+      } else if (read.alias.startsWith("shared-contract-")) {
+        documents.push({ selector: `shared:${read.alias}`, content: filler(read.alias, read.end) });
+      } else if (read.required) {
+        const header = `[${database.getTimeline("topic").length + 1}] user/decision\n`;
+        const event = database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CODEX_AUDIT",
+          body: filler(read.alias, Math.max(1, bytes - Buffer.byteLength(header))) });
+        references.push(timelineReference(event));
+      } else if (read.kind === "artifact") {
+        const path = join(root, "artifacts", `${read.alias}.md`);
+        mkdirSync(join(root, "artifacts"), { recursive: true });
+        writeFileSync(path, filler(read.alias, read.eof ? read.end : read.end + 2000));
+        artifacts.push(path);
+        modelReads.push({ kind: "artifact", selector: path, offset: read.start, end: read.eof ? null : read.end });
+      } else {
+        const path = `replay/${read.alias}.txt`;
+        files[path] = filler(read.alias, read.eof ? read.end : read.end + 2000);
+        modelReads.push({ kind: "file", selector: path, offset: read.start, end: read.eof ? null : read.end });
+      }
+    }
+    commit(repo, files);
+    const received = new Map<string, Map<number, PlanningFragment>>();
+    const ids = new Set<string>();
+    const calls: Array<{ promptBytes: number; fragmentBytes: number; loaded: number; known: number }> = [];
+    let duplicates = 0, delivered = 0, known = 0, next = 0;
+    const requiredBytes = references.reduce((sum, reference) => sum + reference.bytes, 0) +
+      documents.reduce((sum, document) => sum + Buffer.byteLength(document.content), 0) +
+      (reads.some(read => read.alias.startsWith("task-") && read.required) ? Buffer.byteLength(prompt) : 0);
+    const readBytes = (read: ModelRead) => (read.end ?? (read.kind === "context" ? Buffer.byteLength(prompt)
+      : read.kind === "artifact" ? Buffer.byteLength(readFileSync(read.selector)) : Buffer.byteLength(files[read.selector]!))) - read.offset;
+    known = requiredBytes;
+    const fake = scripted(async turn => {
+      const arrived = fragmentsOf(turn);
+      for (const fragment of arrived) {
+        if (ids.has(fragment.id)) duplicates++;
+        ids.add(fragment.id);
+        delivered += Buffer.byteLength(fragment.content);
+        const key = `${fragment.kind}:${fragment.selector}`;
+        if (!received.has(key)) received.set(key, new Map());
+        received.get(key)!.set(fragment.offset, fragment);
+      }
+      calls.push({ promptBytes: Buffer.byteLength(turn.prompt), fragmentBytes: Buffer.byteLength(JSON.stringify(arrived)), loaded: delivered, known });
+      const requests = modelReads.slice(next, next + PLANNING_LIMITS.requests);
+      next += requests.length;
+      known += requests.reduce((sum, read) => sum + readBytes(read), 0);
+      const mine = modelReads.slice(0, next).every(read => covers(received.get(`${read.kind}:${read.selector}`), read.offset, read.end));
+      if (next >= modelReads.length && mine) return answer(step({ questions: [], complete: true }));
+      return answer(step({ questions: [], requests: requests.map(read => ({ ...read, question: "Audit evidence" })) }));
+    }, "codex");
+    const adapter = guardedPlanning(fake.adapter, database, git);
+    const result = await adapter.createSession({ cwd: repo, prompt, readablePaths: artifacts, planningDocuments: documents,
+      timelineDelivery: { prompt: { inline: [], references, index: null } } });
+    expect(result.result.planMarkdown).toBe("Final navigation plan");
+    // 모든 쪽이 한 번씩만 실렸고, 모델 요청 범위와 필수 참조가 빈틈없이 덮였다 — 필수 참조의 완독 판정은 전달 인정 기록(referenceComplete) 그대로다.
+    expect(duplicates).toBe(0);
+    for (const read of modelReads) expect(covers(received.get(`${read.kind}:${read.selector}`), read.offset, read.end)).toBe(true);
+    const record = database.planning.latest("topic")!;
+    const topic = database.getTopic("topic");
+    for (const reference of [...references, ...record.contextReferences!, ...(record.taskReference ? [record.taskReference] : [])]) {
+      expect(database.planning.referenceComplete(record.sessionId!, topic, reference)).toBe(true);
+    }
+    // 호스트가 아는 읽기가 아직 남아 있던 패킷은 다음 쪽을 더 실을 수 없을 만큼 찼다 — 라운드 수를 정하는 것은 패킷 공간이다.
+    const room = PLANNING_LIMITS.reviewPromptBytes - Buffer.byteLength(EXECUTION_POLICY_NOTE) - PLANNING_LIMITS.fragmentBytes;
+    for (const call of calls) if (call.loaded < call.known) expect(call.promptBytes).toBeGreaterThan(room);
+    const longest = Math.max(...reads.map(read => read.pages));
+    const overhead = Math.max(...calls.slice(1).map(call => call.promptBytes - call.fragmentBytes));
+    const space = PLANNING_LIMITS.reviewPromptBytes - Buffer.byteLength(EXECUTION_POLICY_NOTE) - overhead;
+    // 모델은 회차당 요청 4건씩 청하므로 요청을 다 내는 데 걸리는 회차(ceil(읽기 수/4))와 전달 바이트/패킷 공간 가운데 큰 쪽에 마무리 한 회차를 더한 값이 상한이다.
+    const bound = Math.max(Math.ceil(modelReads.length / PLANNING_LIMITS.requests), Math.ceil(delivered / space)) + 2;
+    expect(fake.calls.length).toBeLessThanOrEqual(bound);
+    expect(fake.calls.length).toBeLessThan(longest / 2);
+  }, 120_000);
+
+  it("reads a requested range through end, a null end through the source end, and a missing end as one legacy page", async () => {
+    const { repo, database, git } = setup("codex");
+    commit(repo, { "docs/a.txt": filler("a", 30_000), "docs/b.txt": filler("b", 20_000), "docs/c.txt": filler("c", 20_000) });
+    let arrived: PlanningFragment[] = [];
+    const fake = scripted(async (turn, call) => {
+      if (call === 1) return answer(step({ requests: [
+        { kind: "file", selector: "docs/a.txt", question: "First two pages", offset: 0, end: 13_384 },
+        { kind: "file", selector: "docs/b.txt", question: "Whole file", offset: 0, end: null },
+        { kind: "file", selector: "docs/c.txt", question: "Legacy single page", offset: 0 },
+      ] }));
+      arrived = fragmentsOf(turn);
+      return answer(step({ questions: [], complete: true }));
+    }, "codex");
+    await guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Audit" });
+    expect(fake.calls).toHaveLength(2);
+    const offsets = (selector: string) => arrived.filter(fragment => fragment.selector === selector).map(fragment => fragment.offset);
+    expect(offsets("docs/a.txt")).toEqual([0, 6_692]);
+    expect(offsets("docs/b.txt")).toEqual([0, 6_692, 13_384]);
+    expect(arrived.find(fragment => fragment.selector === "docs/b.txt" && fragment.offset === 13_384)!.nextOffset).toBeNull();
+    expect(offsets("docs/c.txt")).toEqual([0]);
+  });
+
+  it("keeps reads that did not fit the packet and continues them without another request", async () => {
+    const { repo, database, git } = setup("codex");
+    const sizes = [60_000, 50_000, 40_000, 30_000];
+    commit(repo, Object.fromEntries(sizes.map((size, index) => [`docs/${index}.txt`, filler(`doc${index}`, size)])));
+    const received = new Map<string, Map<number, PlanningFragment>>();
+    const ids: string[] = [];
+    const fake = scripted(async (turn, call) => {
+      for (const fragment of fragmentsOf(turn)) {
+        ids.push(fragment.id);
+        if (!received.has(fragment.selector)) received.set(fragment.selector, new Map());
+        received.get(fragment.selector)!.set(fragment.offset, fragment);
+      }
+      if (call === 1) return answer(step({ requests: sizes.map((_, index) => ({ kind: "file" as const, selector: `docs/${index}.txt`,
+        question: "Read the whole file", offset: 0, end: null })) }));
+      // 다시 청하지 않는다 — 남은 범위는 대기 읽기로 이어 실린다.
+      expect(turn.prompt).toContain("Queued reads");
+      return sizes.every((_, index) => covers(received.get(`docs/${index}.txt`), 0, null))
+        ? answer(step({ questions: [], complete: true })) : answer(step());
+    }, "codex");
+    await guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Audit" });
+    expect(new Set(ids).size).toBe(ids.length);
+    // 180,000 바이트를 96KiB 패킷으로 — 요청 회차 1 + 전달 2~3 회차. 옛 계약(쪽당 한 회차)이면 가장 긴 파일만 9회차였다.
+    expect(fake.calls.length).toBeLessThanOrEqual(4);
+    expect(database.planning.latest("topic")!.readQueue).toEqual([]);
+  });
+
+  // 대기 읽기는 retry 를 넘어 남으므로, 실을 때마다 같은 정지를 던지는 항목이 남으면 retry 가 모델을 다시 부르지 못한다. 고정 이미지가 아닌 이미지 요청은
+  // 다른 요청 오류와 같이 모델에게 돌려주고 대기 읽기에서 뺀다(사전 검증 b55bd39 class).
+  it("returns a malformed image request as a request error and drops it from the queue", async () => {
+    const { repo, database, git } = setup("codex");
+    const fake = scripted(async (turn, call) => {
+      if (call === 1) return answer(step({ requests: [{ kind: "image", selector: "deadbeef", question: "Look at the design", offset: 0, end: null }] }));
+      expect(turn.prompt).toContain("Read request errors");
+      expect(turn.prompt).toContain("deadbeef");
+      return answer(step({ questions: [], complete: true }));
+    }, "codex");
+    await guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Audit" });
+    expect(fake.calls).toHaveLength(2);
+    const record = database.planning.latest("topic")!;
+    expect(record.finalized).toBe(true);
+    expect(record.readQueue).toEqual([]);
+  });
+
+  it("ends queued reads when the model completes, but demotes a completion that requests more", async () => {
+    const { repo, database, git } = setup("codex");
+    commit(repo, { "docs/long.txt": filler("long", 300_000), "docs/extra.txt": filler("extra", 5_000) });
+    const fake = scripted(async (_turn, call) => {
+      if (call === 1) return answer(step({ requests: [{ kind: "file", selector: "docs/long.txt", question: "Scan", offset: 0, end: null }] }));
+      // 완료 응답이 새 읽기를 청하면 강등해 그 읽기를 싣는다(E3-4a). 대기 읽기 나머지는 완료를 막지 않는다.
+      if (call === 2) return answer(step({ questions: [], complete: true, requests: [{ kind: "file", selector: "docs/extra.txt",
+        question: "One more", offset: 0, end: null }] }));
+      return answer(step({ questions: [], complete: true }));
+    }, "codex");
+    await guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Audit" });
+    expect(fake.calls).toHaveLength(3);
+    expect(fragmentsOf(fake.calls[2]!).some(fragment => fragment.selector === "docs/extra.txt")).toBe(true);
+    const record = database.planning.latest("topic")!;
+    expect(record.finalized).toBe(true);
+    expect(record.readQueue).toEqual([]);
+    // 300,000 바이트 가운데 실린 것은 세 패킷 분량뿐이다 — 완료한 시도는 나머지를 사지 않는다.
+    expect(new Set([...fake.calls.flatMap(fragmentsOf)].filter(fragment => fragment.selector === "docs/long.txt").map(fragment => fragment.offset)).size)
+      .toBeLessThan(45);
+  });
+
+  it("defers queued ranges with a decision request and resumes them from the unread page after the decision", async () => {
+    const { repo, database, git } = setup("codex");
+    commit(repo, { "docs/long.txt": filler("long", 150_000) });
+    const offsets: number[][] = [];
+    const fake = scripted(async (turn, call) => {
+      offsets.push(fragmentsOf(turn).filter(fragment => fragment.selector === "docs/long.txt").map(fragment => fragment.offset));
+      if (call === 1) return answer(step({ requests: [{ kind: "file", selector: "docs/long.txt", question: "Scan", offset: 0, end: null }] }));
+      if (call === 2) return { ...answer(step()), requestedUserDecision: "Which flow is authoritative?" };
+      return answer(step({ questions: [], complete: true }));
+    }, "codex");
+    const adapter = guardedPlanning(fake.adapter, database, git);
+    const first = await adapter.createSession({ cwd: repo, prompt: "Audit" });
+    expect(first.result.requestedUserDecision).toBe("Which flow is authoritative?");
+    const waiting = database.planning.latest("topic")!;
+    const resumeAt = Math.max(...offsets[1]!) + 6_692;
+    expect(waiting.readQueue).toEqual([]);
+    expect(waiting.deferredReads).toEqual([expect.objectContaining({ selector: "docs/long.txt", offset: resumeAt, end: null })]);
+    database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CODEX_AUDIT", body: "The new flow is authoritative." });
+    await adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId });
+    // 결정 뒤 첫 패킷은 읽지 않은 쪽부터 잇는다(이미 받은 쪽은 다시 싣지 않는다).
+    expect(offsets[2]![0]).toBe(resumeAt);
+    expect(offsets.flat()).toHaveLength(new Set(offsets.flat()).size);
+  });
+
+  // 결정 요청과 함께 미룬 읽기의 버전을 얻지 못한 오류는 원문 부재로 지우지 않고 나눈다(R1 엔진 리뷰 F001). 요청만으로 정해지는 오류는 결정 뒤 첫 회차에
+  // 모델에게 요청 오류로 돌려주고 이연 읽기에서 뺀다.
+  it("returns a read deferred with a decision request as a request error after the decision and drops it from the deferred reads", async () => {
+    const { repo, database, git } = setup("codex");
+    let errors: Array<{ request: { selector: string }; message: string }> = [];
+    let served: PlanningFragment[] = [];
+    const fake = scripted(async (turn, call) => {
+      if (call === 1) return { ...answer(step({ requests: [
+        { kind: "context", selector: "context:manifest", question: "Snapshot file list", offset: 0 },
+        { kind: "file", selector: "form.swift", question: "Read the form", offset: 0, end: 1 },
+      ] })), requestedUserDecision: "Which flow is authoritative?" };
+      errors = JSON.parse(turn.prompt.split("Read request errors: ")[1]?.split("\n")[0] ?? "[]");
+      served = fragmentsOf(turn);
+      return answer(step({ questions: [], complete: true }));
+    }, "codex");
+    const adapter = guardedPlanning(fake.adapter, database, git);
+    const first = await adapter.createSession({ cwd: repo, prompt: "Audit" });
+    expect(first.result.requestedUserDecision).toBe("Which flow is authoritative?");
+    expect(database.planning.latest("topic")!.deferredReads?.map(read => read.selector)).toEqual(["context:manifest", "form.swift"]);
+    database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CODEX_AUDIT", body: "The new flow is authoritative." });
+    await adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId });
+    expect(fake.calls).toHaveLength(2);
+    expect(errors).toEqual([expect.objectContaining({ request: expect.objectContaining({ selector: "context:manifest" }),
+      message: expect.stringContaining("not in the pinned manifest") })]);
+    expect(served.some(fragment => fragment.selector === "form.swift")).toBe(true);
+    const record = database.planning.latest("topic")!;
+    expect(record.finalized).toBe(true);
+    expect(record.deferredReads ?? []).toEqual([]);
+    // 미룰 때부터 읽을 수 없던 요청은 원문 부재가 아니다.
+    expect(database.getTimeline("topic").some(event => event.payload?.deferredReadMissing)).toBe(false);
+  });
+
+  // 리뷰어 재현(R1 엔진 리뷰 F001): 요청 오류와 채택 전 complete=true 응답이 남은 재개에서 이연 읽기의 git 읽기가 실패하면, 저장된 완료를 채택하지 않고
+  // 이연 읽기의 버전·위치를 그대로 둔 채 정지한다. 장애가 풀리면 입력 변경 없이 retry 가 그 읽기를 실어 완료한다.
+  it("does not adopt a stored completion while a deferred read's git read fails, and keeps its version and offset", async () => {
+    const { repo, database, git } = setup("codex");
+    const fake = scripted(async (turn, call) => {
+      if (call === 1) return { ...answer(step({ requests: [{ kind: "file", selector: "form.swift", question: "Read the form", offset: 100, end: 200 }] })),
+        requestedUserDecision: "Which flow is authoritative?" };
+      expect(fragmentsOf(turn).some(fragment => fragment.selector === "form.swift")).toBe(true);
+      return answer(step({ questions: [], complete: true }));
+    }, "codex");
+    const adapter = guardedPlanning(fake.adapter, database, git);
+    const first = await adapter.createSession({ cwd: repo, prompt: "Audit" });
+    const saved = database.planning.latest("topic")!;
+    const deferred = saved.deferredReads!;
+    expect(deferred).toEqual([expect.objectContaining({ selector: "form.swift", offset: 100, hash: expect.stringMatching(/^[a-f0-9]{64}$/) })]);
+    saved.awaitingDecision = undefined;
+    saved.readErrors = [{ request: { kind: "file", selector: "missing.swift", question: "Peek", offset: 0 }, message: "Only regular files in the pinned tree may be read." }];
+    saved.lastResponse = answer(step({ questions: [], complete: true }));
+    saved.responsePending = true;
+    database.planning.save(saved);
+    const restore = breakBlob(repo, "form.swift");
+    await expect(adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId }))
+      .rejects.toThrow(/^Deferred read kind=file selector=form\.swift offset=100 is blocked: Snapshot read unavailable for this request \(git failed or timed out\)\./);
+    expect(fake.calls).toHaveLength(1);
+    const paused = database.planning.latest("topic")!;
+    expect(paused.finalized).toBe(false);
+    expect(paused.deferredReads).toEqual(deferred);
+    restore();
+    await adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId });
+    expect(fake.calls).toHaveLength(2);
+    expect(database.planning.latest("topic")).toMatchObject({ id: paused.id, finalized: true });
+  });
+
+  // 결정 대기 중 원문이 바뀌고 재대조의 git 읽기가 실패해도 옛 버전·위치를 지키므로, 복구 뒤 재대조가 버전 변경을 보고 처음부터 다시 읽는다(옛 위치를 버전
+  // 확인 없이 새 원문에서 읽지 않는다).
+  it("revalidates a deferred read after its failed git read recovers and rereads a changed source from offset 0", async () => {
+    const { repo, database, git } = setup("codex");
+    const offsets: number[][] = [];
+    const fake = scripted(async (turn, call) => {
+      offsets.push(fragmentsOf(turn).filter(fragment => fragment.selector === "form.swift").map(fragment => fragment.offset));
+      if (call === 1) return { ...answer(step({ requests: [{ kind: "file", selector: "form.swift", question: "Read the form", offset: 1000, end: 2000 }] })),
+        requestedUserDecision: "Which flow is authoritative?" };
+      expect(fragmentsOf(turn).find(fragment => fragment.selector === "form.swift")!.content.startsWith("let step = 42")).toBe(true);
+      return answer(step({ questions: [], complete: true }));
+    }, "codex");
+    const adapter = guardedPlanning(fake.adapter, database, git);
+    const first = await adapter.createSession({ cwd: repo, prompt: "Audit" });
+    const from = database.planning.latest("topic")!.deferredReads![0]!.hash;
+    writeFileSync(join(repo, "form.swift"), "let step = 42\n".repeat(6000));
+    const restore = breakBlob(repo, "form.swift");
+    database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CODEX_AUDIT", body: "The new flow is authoritative." });
+    await expect(adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId })).rejects.toThrow(/^Deferred read kind=file selector=form\.swift offset=1000/);
+    expect(database.planning.latest("topic")!.deferredReads).toEqual([expect.objectContaining({ offset: 1000, hash: from })]);
+    restore();
+    await adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId });
+    expect(fake.calls).toHaveLength(2);
+    expect(offsets[1]![0]).toBe(0);
+    expect(offsets[1]).not.toContain(1000);
+    const change = database.getTimeline("topic").find(event => event.payload?.deferredReadChanged)!;
+    expect(change.payload?.deferredReadChanged).toEqual([expect.objectContaining({ selector: "form.swift", from })]);
+  });
+
+  // 결정마다 쌓이는 이연 읽기의 원문 단위 오류는 패커처럼 회차 공간 안에서만 돌려준다(R1 엔진 리뷰 ed4061ac F003). 나눠 보내는 회차는 모델의 무진척으로 세지
+  // 않는다(996f4af6 F003). 리뷰어 재현 규모 — 스키마 안 160건(selector 약 494자, 질문 한글 500자), 모델은 매번 새 요청 없이 complete — 는 여러 회차에 한 번씩
+  // 모두 전달되고, 전달 전에는 완료가 강등되며, 무진척 정지 없이 마지막 묶음 뒤 완료가 채택된다.
+  it("returns 160 deferred source errors over several rounds without a no-progress stop and adopts the completion after the last batch", async () => {
+    const { repo, database, git } = setup("codex");
+    const selectors = Array.from({ length: 160 }, (_, index) => `missing/${"a".repeat(480)}-${String(index).padStart(3, "0")}`);
+    const rounds: string[][] = [];
+    const fake = scripted(async (turn, call) => {
+      if (call === 1) return { ...answer(step({ requests: [{ kind: "file", selector: "form.swift", question: "Read the form", offset: 0, end: 1 }] })),
+        requestedUserDecision: "Which flow is authoritative?" };
+      const errors = JSON.parse(turn.prompt.split("Read request errors: ")[1]?.split("\n")[0] ?? "[]") as Array<{ request: { selector: string } }>;
+      rounds.push(errors.map(entry => entry.request.selector));
+      return answer(step({ questions: [], complete: true }));
+    }, "codex");
+    const adapter = guardedPlanning(fake.adapter, database, git);
+    const first = await adapter.createSession({ cwd: repo, prompt: "Audit" });
+    const saved = database.planning.latest("topic")!;
+    saved.deferredReads = selectors.map(selector => ({ kind: "context" as const, selector, offset: 0, end: null, question: "가".repeat(500), hash: null }));
+    database.planning.save(saved);
+    database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CODEX_AUDIT", body: "The new flow is authoritative." });
+    await adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId });
+    expect(fake.calls.every(turn => Buffer.byteLength(turn.prompt) <= PLANNING_LIMITS.reviewPromptBytes)).toBe(true);
+    expect(rounds.length).toBeGreaterThan(3);
+    expect(rounds.every(batch => batch.length > 0)).toBe(true);
+    expect(rounds.flat().sort()).toEqual([...selectors].sort());
+    expect(database.planning.latest("topic")).toMatchObject({ finalized: true });
+    expect(database.planning.latest("topic")!.deferredReads ?? []).toEqual([]);
+    expect(database.getTimeline("topic").some(event => event.payload?.deferredReadMissing)).toBe(false);
+  });
+
+  // 결정 대기 중 존재하는 원문이 바이너리로 바뀌면 원문 부재가 아니다(R1 엔진 리뷰 F004) — 부재로 적지 않고 오류를 모델에게 돌려준다.
+  it("returns a deferred source that became binary as a request error without recording it missing", async () => {
+    const { repo, database, git } = setup("codex");
+    writeFileSync(join(repo, "notes.txt"), "plain notes\n");
+    let errors: Array<{ request: { selector: string }; message: string }> = [];
+    const fake = scripted(async (turn, call) => {
+      if (call === 1) return { ...answer(step({ requests: [{ kind: "file", selector: "notes.txt", question: "Read the notes", offset: 0 }] })),
+        requestedUserDecision: "Which flow is authoritative?" };
+      errors = JSON.parse(turn.prompt.split("Read request errors: ")[1]?.split("\n")[0] ?? "[]");
+      return answer(step({ questions: [], complete: true }));
+    }, "codex");
+    const adapter = guardedPlanning(fake.adapter, database, git);
+    const first = await adapter.createSession({ cwd: repo, prompt: "Audit" });
+    expect(database.planning.latest("topic")!.deferredReads![0]!.hash).toMatch(/^[a-f0-9]{64}$/);
+    writeFileSync(join(repo, "notes.txt"), Buffer.from([0x00, 0x01, 0x02, 0x03]));
+    database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CODEX_AUDIT", body: "The new flow is authoritative." });
+    await adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId });
+    expect(fake.calls).toHaveLength(2);
+    expect(errors).toEqual([expect.objectContaining({ request: expect.objectContaining({ selector: "notes.txt" }),
+      message: "Binary files require a separately approved visual source." })]);
+    expect(database.getTimeline("topic").some(event => event.payload?.deferredReadMissing)).toBe(false);
+    expect(database.planning.latest("topic")).toMatchObject({ finalized: true });
+  });
+
+  // 미룬 자격증명 경로는 원문 부재로 지우지 않고 이연 읽기 정지로 멈춘다. 결정·근거는 이연 읽기를 지우지 못하므로 문구는 그것을 약속하지 않고 범위 변경을
+  // 안내한다 — retry 만으로도, 결정 뒤 retry 로도 같은 정지(모델 호출 없음)이고 이연 목록은 그대로다.
+  it("stops on a deferred credential path with a deferred-read message that points to a scope change", async () => {
+    const { repo, database, git } = setup("codex");
+    const fake = scripted(async (_turn, call) => call === 1
+      ? { ...answer(step({ requests: [{ kind: "file", selector: ".env", question: "Must remain denied", offset: 0 }] })),
+        requestedUserDecision: "Which flow is authoritative?" }
+      : answer(step({ questions: [], complete: true })), "codex");
+    const adapter = guardedPlanning(fake.adapter, database, git);
+    const first = await adapter.createSession({ cwd: repo, prompt: "Audit" });
+    const deferred = database.planning.latest("topic")!.deferredReads;
+    expect(deferred?.map(read => read.selector)).toEqual([".env"]);
+    database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CODEX_AUDIT", body: "The new flow is authoritative." });
+    const stop = /^Deferred read kind=file selector=\.env offset=0 is blocked: Planning reads must stay in the approved snapshot and exclude credential paths\. This deferred read keeps the attempt from completing; the deferred reads, their versions and the checkpoint are kept\. A plain retry repeats this stop, and a decision or evidence does not clear a deferred read; open a new attempt with a scope change \(scope_change\)\./;
+    for (const decision of [false, false, true]) {
+      if (decision) database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CODEX_AUDIT", body: "Do not read credential files." });
+      const failure = await adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId }).then(() => null, (error: unknown) => error as Error);
+      expect(failure?.message).toMatch(stop);
+      expect(failure?.message).not.toContain("post a decision or evidence that directs");
+      expect(fake.calls).toHaveLength(1);
+      expect(database.planning.latest("topic")!.deferredReads).toEqual(deferred);
+    }
+  });
+
+  // 대기 조각이 남아 재대조를 건너뛴 run 에서도, 패커의 이연 루프가 만난 git 실패는 이연 읽기 정지 문구로 멈추고 이연 목록을 그대로 둔다.
+  it("stops with the deferred-read message when the packer meets a git failure on a deferred read without revalidation", async () => {
+    const { repo, database, git } = setup("codex");
+    writeFileSync(join(repo, "other.txt"), "other notes\n");
+    const fake = scripted(async (_turn, call) => call === 1
+      ? { ...answer(step({ requests: [{ kind: "file", selector: "form.swift", question: "Read the form", offset: 0, end: 1 }] })),
+        requestedUserDecision: "Which flow is authoritative?" }
+      : answer(step({ questions: [], complete: true })), "codex");
+    const adapter = guardedPlanning(fake.adapter, database, git);
+    const first = await adapter.createSession({ cwd: repo, prompt: "Audit" });
+    const saved = database.planning.latest("topic")!;
+    const deferred = saved.deferredReads;
+    // 대기 조각 — 같은 고정 트리에서 읽은 다른 파일의 쪽이 아직 전달되지 않은 채 남았다. 재대조(대기 조각이 없을 때만)를 건너뛴다.
+    const tree = await git.writeWorkingTree(repo, "pending");
+    saved.fragments = [await new PlanningReader(repo, tree, new Map()).read({ kind: "file", selector: "other.txt", question: "Read", offset: 0 })];
+    saved.awaitingDecision = undefined;
+    database.planning.save(saved);
+    const restore = breakBlob(repo, "form.swift");
+    await expect(adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId }))
+      .rejects.toThrow(/^Deferred read kind=file selector=form\.swift offset=0 is blocked: Snapshot read unavailable for this request \(git failed or timed out\)\..*Retry without new input once git works/);
+    restore();
+    expect(fake.calls).toHaveLength(1);
+    expect(database.planning.latest("topic")!.deferredReads).toEqual(deferred);
+  });
+
+  // 리뷰어 재현(R1 엔진 리뷰 996f4af6 F005): 정상 이연 읽기의 쪽이 패킷을 채워 잘못된 selector 가 자리 없이 남은 채 호출 전에 실패하면, retry 는 대기 조각
+  // 때문에 재대조를 건너뛴다. 패커가 그 자리에서 오류 클래스로 판정해 오류를 한 번만 돌려주고, 그 응답을 채택할 때 이연 읽기에서 뺀다 — 같은 오류의 반복도,
+  // 무진척 정지도 없다.
+  it("returns a held deferred source error once on a retry that skips revalidation for pending fragments", async () => {
+    const { repo, database, git } = setup("codex");
+    commit(repo, { "docs/long.txt": filler("long", 150_000) });
+    const errors: string[] = [];
+    const fake = scripted(async (turn, call) => {
+      if (call === 1) return { ...answer(step({ requests: [
+        { kind: "file", selector: "docs/long.txt", question: "Scan", offset: 0, end: null },
+        { kind: "context", selector: "context:manifest", question: "Snapshot file list", offset: 0 },
+      ] })), requestedUserDecision: "Which flow is authoritative?" };
+      if (call === 2) throw new Error("Runner exited before the response");
+      const returned = JSON.parse(turn.prompt.split("Read request errors: ")[1]?.split("\n")[0] ?? "[]") as Array<{ request: { selector: string } }>;
+      errors.push(...returned.map(entry => entry.request.selector));
+      return answer(step({ questions: [], complete: true }));
+    }, "codex");
+    const adapter = guardedPlanning(fake.adapter, database, git);
+    const first = await adapter.createSession({ cwd: repo, prompt: "Audit" });
+    database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CODEX_AUDIT", body: "The new flow is authoritative." });
+    await expect(adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId })).rejects.toThrow("Runner exited before the response");
+    const pending = database.planning.latest("topic")!;
+    expect(pending.fragments.length).toBeGreaterThan(1);
+    expect(pending.deferredReads?.map(read => read.selector)).toContain("context:manifest");
+    // 자리가 없어 보류된 상태로 둔다 — 패커는 패킷이 찬 뒤에도 남은 공간에 지금 원문 오류를 싣는다(4a9ad48e). 이 재현은 그 공간도 없던 경우다.
+    pending.readErrors = undefined;
+    database.planning.save(pending);
+    await adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId });
+    expect(errors).toEqual(["context:manifest"]);
+    const record = database.planning.latest("topic")!;
+    expect(record.finalized).toBe(true);
+    expect(record.deferredReads ?? []).toEqual([]);
+  });
+
+  // 대기 조각이 남아 재대조를 건너뛴 run 에서도, 미룰 때 버전이 있던 원문이 고정 트리에 없으면 패커가 재대조와 같은 판정으로 원문 부재로 적고 뺀다(R1 엔진
+  // 리뷰 996f4af6 F005) — 요청 오류로 돌려주지 않는다.
+  it("records a deferred source missing from the pinned tree as missing in the packer when revalidation is skipped", async () => {
+    const { repo, database, git } = setup("codex");
+    writeFileSync(join(repo, "other.txt"), "other notes\n");
+    let errors: unknown[] = [];
+    const fake = scripted(async (turn, call) => {
+      if (call === 1) return { ...answer(step({ requests: [{ kind: "file", selector: "form.swift", question: "Read the form", offset: 0, end: 1 }] })),
+        requestedUserDecision: "Which flow is authoritative?" };
+      errors = JSON.parse(turn.prompt.split("Read request errors: ")[1]?.split("\n")[0] ?? "[]");
+      return answer(step({ questions: [], complete: true }));
+    }, "codex");
+    const adapter = guardedPlanning(fake.adapter, database, git);
+    const first = await adapter.createSession({ cwd: repo, prompt: "Audit" });
+    const saved = database.planning.latest("topic")!;
+    saved.deferredReads = [{ kind: "file", selector: "gone.swift", offset: 0, end: 1, question: "Read the old form", hash: "a".repeat(64) }];
+    // 대기 조각 — 같은 고정 트리에서 읽은 다른 파일의 쪽이 아직 전달되지 않은 채 남았다. 재대조(대기 조각이 없을 때만)를 건너뛴다.
+    const tree = await git.writeWorkingTree(repo, "pending");
+    saved.fragments = [await new PlanningReader(repo, tree, new Map()).read({ kind: "file", selector: "other.txt", question: "Read", offset: 0 })];
+    saved.awaitingDecision = undefined;
+    database.planning.save(saved);
+    await adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId });
+    expect(fake.calls).toHaveLength(2);
+    expect(errors).toEqual([]);
+    const missing = database.getTimeline("topic").filter(event => event.payload?.deferredReadMissing);
+    expect(missing.map(event => event.payload?.deferredReadMissing)).toEqual([[{ kind: "file", selector: "gone.swift", offset: 0 }]]);
+    const record = database.planning.latest("topic")!;
+    expect(record.finalized).toBe(true);
+    expect(record.deferredReads ?? []).toEqual([]);
+  });
+
+  // 원문 단위 오류를 실은 호출이 응답 전에 실패한 뒤 원문이 바뀌면, 원문 변경 초기화가 readErrors 를 비워도 그 이연 읽기는 남아 새 스냅숏에서 다시 판정된다
+  // (R1 엔진 리뷰 996f4af6 — 이연 읽기는 오류를 받은 응답을 채택할 때 뺀다). 이제 읽히는 원문은 처음부터 실린다.
+  it("keeps a deferred read whose source error was packed when the call fails and the source then changes", async () => {
+    const { repo, database, git } = setup("codex");
+    let packed: unknown[] = [];
+    let served: PlanningFragment[] = [];
+    const fake = scripted(async (turn, call) => {
+      if (call === 1) return { ...answer(step({ requests: [{ kind: "file", selector: "late.swift", question: "Read the late form", offset: 0 }] })),
+        requestedUserDecision: "Which flow is authoritative?" };
+      if (call === 2) {
+        packed = JSON.parse(turn.prompt.split("Read request errors: ")[1]?.split("\n")[0] ?? "[]");
+        throw new Error("Runner exited before the response");
+      }
+      served = fragmentsOf(turn);
+      return answer(step({ questions: [], complete: true }));
+    }, "codex");
+    const adapter = guardedPlanning(fake.adapter, database, git);
+    const first = await adapter.createSession({ cwd: repo, prompt: "Audit" });
+    expect(database.planning.latest("topic")!.deferredReads).toEqual([expect.objectContaining({ selector: "late.swift", hash: null })]);
+    database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CODEX_AUDIT", body: "The new flow is authoritative." });
+    await expect(adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId })).rejects.toThrow("Runner exited before the response");
+    expect(packed).toEqual([expect.objectContaining({ request: expect.objectContaining({ selector: "late.swift" }) })]);
+    writeFileSync(join(repo, "late.swift"), "let late = true\n");
+    await adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId });
+    expect(fake.calls).toHaveLength(3);
+    expect(served.find(fragment => fragment.selector === "late.swift")?.content).toBe("let late = true\n");
+    const record = database.planning.latest("topic")!;
+    expect(record.finalized).toBe(true);
+    expect(record.deferredReads ?? []).toEqual([]);
+  });
+
+  // 무진척 한도(stalled=2)에 닿은 체크포인트에 전달할 이연 원문 오류가 남아 있으면, retry 의 패커가 그 오류를 싣고 게이트가 호출을 막지 않는다. 그 응답의 채택이
+  // 읽기를 빼므로 이 통과는 이연 목록만큼으로 한정된다(R1 엔진 리뷰 996f4af6 F003).
+  it("lets a retry at the no-progress limit deliver pending deferred source errors and complete", async () => {
+    const { repo, database, git } = setup("codex");
+    let errors: Array<{ request: { selector: string } }> = [];
+    const fake = scripted(async (turn, call) => {
+      if (call === 1) return { ...answer(step({ requests: [{ kind: "context", selector: "context:manifest", question: "Snapshot file list", offset: 0 }] })),
+        requestedUserDecision: "Which flow is authoritative?" };
+      errors = JSON.parse(turn.prompt.split("Read request errors: ")[1]?.split("\n")[0] ?? "[]");
+      return answer(step({ questions: [], complete: true }));
+    }, "codex");
+    const adapter = guardedPlanning(fake.adapter, database, git);
+    const first = await adapter.createSession({ cwd: repo, prompt: "Audit" });
+    const saved = database.planning.latest("topic")!;
+    saved.awaitingDecision = undefined;
+    saved.stalled = 2;
+    database.planning.save(saved);
+    await adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId });
+    expect(fake.calls).toHaveLength(2);
+    expect(errors.map(entry => entry.request.selector)).toEqual(["context:manifest"]);
+    expect(database.planning.latest("topic")).toMatchObject({ finalized: true, stalled: 0 });
+    expect(database.planning.latest("topic")!.deferredReads ?? []).toEqual([]);
+  });
+
+  // 이연 원문 오류만 실린 호출의 응답이 채택 전에 끊긴 뒤 재생하면, 재대조가 그 전달을 같은 오류 클래스로 다시 판정해 진척으로 인정한다(R1 엔진 리뷰 996f4af6
+  // F003) — 직전 stalled=1 이어도 무진척 정지 없이 저장된 완료가 채택된다.
+  it("counts a replayed response that only received deferred source errors as progress at stalled=1", async () => {
+    const { repo, database, git } = setup("codex");
+    const fake = scripted(async (_turn, call) => call === 1
+      ? { ...answer(step({ requests: [{ kind: "context", selector: "context:manifest", question: "Snapshot file list", offset: 0 }] })),
+        requestedUserDecision: "Which flow is authoritative?" }
+      : answer(step({ questions: [], complete: true })), "codex");
+    const adapter = guardedPlanning(fake.adapter, database, git);
+    const first = await adapter.createSession({ cwd: repo, prompt: "Audit" });
+    const saved = database.planning.latest("topic")!;
+    expect(saved.deferredReads?.map(read => read.selector)).toEqual(["context:manifest"]);
+    saved.awaitingDecision = undefined;
+    saved.stalled = 1;
+    // 재생 응답의 진척은 이연 원문 오류 전달뿐이다 — 채택된 단계와 질문 수가 같아 해소 질문으로도 세지 않는다.
+    saved.step = { ...saved.step, questions: [] };
+    // 저장된 항목은 패커가 실은 그대로다 — 리더가 지금 같은 요청에 내는 오류 문구(전달 증거는 같은 키·같은 문구, 36fb50d6 F006).
+    const request = { kind: "context" as const, selector: "context:manifest", question: "Snapshot file list", offset: 0 };
+    const tree = await git.writeWorkingTree(repo, "pending");
+    const message = await new PlanningReader(repo, tree, new Map()).read(request).then(() => "", (error: Error) => error.message);
+    expect(message).toMatch(/^Requested source is not in the pinned manifest\. /);
+    saved.readErrors = [{ request, message }];
+    saved.lastResponse = answer(step({ questions: [], complete: true }));
+    saved.responsePending = true;
+    database.planning.save(saved);
+    await adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId });
+    expect(fake.calls).toHaveLength(1);
+    expect(database.planning.latest("topic")).toMatchObject({ finalized: true, stalled: 0 });
+    expect(database.planning.latest("topic")!.deferredReads ?? []).toEqual([]);
+  });
+
+  // 이연 이미지 읽기도 같은 오류 클래스 판정을 받는다(R1 엔진 리뷰 996f4af6). 재대조와 패커가 같은 오류를 던진다.
+  const imageEvidence = (database: ConsensusDatabase) => {
+    const source = database.evidence.register("topic", { url: "https://team.atlassian.net/browse/IMAGE-20", label: "Image", mode: "connector", intervalSeconds: 300 });
+    const check = database.evidence.begin(source.id, true)!;
+    database.evidence.ingest(source.id, { checkId: check.checkId, revision: "r1", units: [{ id: "render", kind: "render", content: "Image",
+      imageBase64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lWQAAAAASUVORK5CYII=" }] });
+    return { source, hash: database.evidence.snapshot(source.id)!.units[0].imageHash! };
+  };
+  const imageDecision = (request: { selector: string; offset: number }, later: (turn: Omit<SessionTurn, "sessionId">, call: number) => AgentResult) =>
+    scripted(async (turn, call) => call === 1
+    ? { ...answer(step({ requests: [{ kind: "image", question: "Inspect the render", ...request }] })), requestedUserDecision: "Which flow is authoritative?" }
+    : later(turn, call), "codex");
+  const readErrorsOf = (turn: Omit<SessionTurn, "sessionId">) =>
+    JSON.parse(turn.prompt.split("Read request errors: ")[1]?.split("\n")[0] ?? "[]") as Array<{ request: { selector: string; offset: number }; message: string }>;
+
+  it("returns a deferred image whose evidence became unavailable as a source error, not missing", async () => {
+    const { root, repo, database, git } = setup("codex");
+    const { source, hash } = imageEvidence(database);
+    let errors: ReturnType<typeof readErrorsOf> = [];
+    const fake = imageDecision({ selector: hash, offset: 0 }, turn => { errors = readErrorsOf(turn); return answer(step({ questions: [], complete: true })); });
+    const adapter = guardedPlanning(fake.adapter, database, git, undefined, join(root, "images"));
+    const first = await adapter.createSession({ cwd: repo, prompt: "Audit" });
+    expect(database.planning.latest("topic")!.deferredReads).toEqual([expect.objectContaining({ selector: hash, hash })]);
+    const check = database.evidence.begin(source.id, true)!;
+    database.evidence.failed(source.id, check.checkId, "offline");
+    database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CODEX_AUDIT", body: "The new flow is authoritative." });
+    await adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId });
+    expect(fake.calls).toHaveLength(2);
+    expect(errors).toEqual([expect.objectContaining({ request: expect.objectContaining({ selector: hash }),
+      message: expect.stringContaining("External evidence is unavailable in this snapshot.") })]);
+    expect(database.getTimeline("topic").some(event => event.payload?.deferredReadMissing)).toBe(false);
+    expect(database.planning.latest("topic")).toMatchObject({ finalized: true });
+    expect(database.planning.latest("topic")!.deferredReads ?? []).toEqual([]);
+  });
+
+  it("returns a deferred image hash that was never pinned as a source error, not missing", async () => {
+    const { root, repo, database, git } = setup("codex");
+    const unpinned = "f".repeat(64);
+    let errors: ReturnType<typeof readErrorsOf> = [];
+    const fake = imageDecision({ selector: unpinned, offset: 0 }, turn => { errors = readErrorsOf(turn); return answer(step({ questions: [], complete: true })); });
+    const adapter = guardedPlanning(fake.adapter, database, git, undefined, join(root, "images"));
+    const first = await adapter.createSession({ cwd: repo, prompt: "Audit" });
+    expect(database.planning.latest("topic")!.deferredReads).toEqual([expect.objectContaining({ selector: unpinned, hash: null })]);
+    database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CODEX_AUDIT", body: "The new flow is authoritative." });
+    await adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId });
+    expect(fake.calls).toHaveLength(2);
+    expect(errors).toEqual([{ request: expect.objectContaining({ selector: unpinned, offset: 0 }), message: "Image requests must select one pinned imageHash at offset=0." }]);
+    expect(database.getTimeline("topic").some(event => event.payload?.deferredReadMissing)).toBe(false);
+    expect(database.planning.latest("topic")).toMatchObject({ finalized: true });
+  });
+
+  // 위치 오류(offset≠0)는 이연 읽기에 남고, 고친 요청이 채택되면 그 위치를 이어받는다(host-review 39d21df9 F002 계약 — 4e38c35 에서도 통과하는 회귀 계약).
+  it("keeps a deferred image request at a nonzero offset as a position error until its corrected request is adopted", async () => {
+    const { root, repo, database, git } = setup("codex");
+    const { hash } = imageEvidence(database);
+    let errors: ReturnType<typeof readErrorsOf> = [];
+    const fake = imageDecision({ selector: hash, offset: 3 }, (turn, call) => {
+      if (call === 2) {
+        errors = readErrorsOf(turn);
+        expect(database.planning.latest("topic")!.deferredReads).toEqual([expect.objectContaining({ selector: hash, offset: 3 })]);
+        return answer(step({ questions: [], complete: true, requests: [{ kind: "image", selector: hash, question: "Inspect the render", offset: 0 }] }));
+      }
+      expect(turn.planningControl?.image).toBeDefined();
+      return answer(step({ questions: [], complete: true }));
+    });
+    const adapter = guardedPlanning(fake.adapter, database, git, undefined, join(root, "images"));
+    const first = await adapter.createSession({ cwd: repo, prompt: "Audit" });
+    database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CODEX_AUDIT", body: "The new flow is authoritative." });
+    await adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId });
+    expect(fake.calls).toHaveLength(3);
+    expect(errors).toEqual([{ request: expect.objectContaining({ selector: hash, offset: 3 }), message: "Image requests must select one pinned imageHash at offset=0." }]);
+    expect(database.getTimeline("topic").some(event => event.payload?.deferredReadMissing)).toBe(false);
+    expect(database.planning.latest("topic")).toMatchObject({ finalized: true });
+    expect(database.planning.latest("topic")!.deferredReads ?? []).toEqual([]);
+  });
+
+  // 리뷰어 재현(R1 엔진 리뷰 36fb50d6 F006): 위치 오류 항목과 채택 전 complete 응답이 남은 재개에서 그 근거가 일시 불가해지면(digest 는 그대로라 재생이 남는다),
+  // 지금 관측한 오류(근거 불가)는 저장된 응답이 받은 오류(위치 오류)가 아니다. 저장된 완료로 의무를 지우지 않고, 다음 호출이 새 오류를 전달한 뒤에야 완료한다.
+  const unavailableContract = (database: ConsensusDatabase) => {
+    const source = database.evidence.register("topic", { url: "https://team.atlassian.net/browse/APP-31", label: "Contract", mode: "connector", intervalSeconds: 300 });
+    const check = database.evidence.begin(source.id, true)!;
+    database.evidence.ingest(source.id, { checkId: check.checkId, revision: "same", units: [{ id: "body", kind: "issue", content: "한글🙂" }] });
+    return { source, selector: `${source.id}::body` };
+  };
+  const positionErrorThenUnavailable = async (replay: boolean) => {
+    const { repo, database, git } = setup("codex");
+    const { source, selector } = unavailableContract(database);
+    const errors: Array<ReturnType<typeof readErrorsOf>> = [];
+    const fake = scripted(async (turn, call) => {
+      if (call === 1) return { ...answer(step({ requests: [{ kind: "evidence", selector, question: "Read the contract", offset: 100_000 }] })),
+        requestedUserDecision: "Which flow is authoritative?" };
+      errors.push(readErrorsOf(turn));
+      return answer(step({ questions: [], complete: true }));
+    }, "codex");
+    const adapter = guardedPlanning(fake.adapter, database, git);
+    const first = await adapter.createSession({ cwd: repo, prompt: "Audit" });
+    const saved = database.planning.latest("topic")!;
+    expect(saved.deferredReads).toEqual([expect.objectContaining({ selector, offset: 100_000, hash: expect.stringMatching(/^[a-f0-9]{64}$/) })]);
+    saved.awaitingDecision = undefined;
+    saved.readErrors = [{ request: { kind: "evidence", selector, question: "Read the contract", offset: 100_000 }, message: new InvalidPlanningOffset().message }];
+    if (replay) {
+      saved.lastResponse = answer(step({ questions: [], complete: true }));
+      saved.responsePending = true;
+    }
+    database.planning.save(saved);
+    const digest = database.evidence.topic(database.getTopic("topic")).digest;
+    const failed = database.evidence.begin(source.id, true)!;
+    database.evidence.failed(source.id, failed.checkId, "offline");
+    expect(database.evidence.topic(database.getTopic("topic")).digest).toBe(digest);
+    await adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId });
+    return { database, fake, errors, selector };
+  };
+  const unavailableError = (selector: string) => ({ request: expect.objectContaining({ selector, offset: 100_000 }),
+    message: expect.stringContaining("External evidence is unavailable in this snapshot.") });
+
+  it("does not adopt a stored completion when a deferred read with a stored position error is now unavailable on replay", async () => {
+    const { database, fake, errors, selector } = await positionErrorThenUnavailable(true);
+    // 재생은 완료로 채택되지 않았다 — 다음 호출이 근거 불가 오류를 받은 뒤 완료한다.
+    expect(fake.calls).toHaveLength(2);
+    expect(errors).toEqual([[unavailableError(selector)]]);
+    expect(database.planning.latest("topic")).toMatchObject({ finalized: true });
+    expect(database.planning.latest("topic")!.deferredReads ?? []).toEqual([]);
+  });
+
+  // 같은 계열, 패커 경로(36fb50d6·61a2038a F006): 같은 요청 키에 다른 문구의 항목(앞선 관측)이 남아 있으면, 새 패킷은 그 항목을 지금 오류로 바꿔 싣는다. 그
+  // 호출이 지금 오류를 받았으므로 그 전달만 세고, 옛 위치 오류는 다시 싣지 않는다.
+  it("replaces a stale entry under the same request key with the packer's current source error and counts only that delivery", async () => {
+    const { database, fake, errors, selector } = await positionErrorThenUnavailable(false);
+    expect(fake.calls).toHaveLength(2);
+    expect(errors).toEqual([[unavailableError(selector)]]);
+    expect(database.planning.latest("topic")).toMatchObject({ finalized: true });
+    expect(database.planning.latest("topic")!.deferredReads ?? []).toEqual([]);
+  });
+
+  // 리뷰어 재현(R1 엔진 리뷰 61a2038a F006): 모델이 이연 읽기의 위치 오류를 고치지 않아 무진척 한도(stalled=2)로 멈춘 뒤 그 근거가 일시 불가해지면(digest 그대로,
+  // 전달 조각 없음 — 카운터 초기화 없음), retry 의 새 패킷은 옛 위치 오류 대신 지금 오류를 싣는다. 그 전달로 게이트가 열려 모델이 지금 오류를 받고 완료한다.
+  it("carries the current source error instead of a stale position error after a no-progress stop so the gate opens on retry", async () => {
+    const { repo, database, git } = setup("codex");
+    const { source, selector } = unavailableContract(database);
+    const errors: Array<ReturnType<typeof readErrorsOf>> = [];
+    const fake = scripted(async (turn, call) => {
+      if (call === 1) return { ...answer(step({ requests: [{ kind: "evidence", selector, question: "Read the contract", offset: 100_000 }] })),
+        requestedUserDecision: "Which flow is authoritative?" };
+      errors.push(readErrorsOf(turn));
+      return answer(step({ questions: [], complete: true }));
+    }, "codex");
+    const adapter = guardedPlanning(fake.adapter, database, git);
+    const first = await adapter.createSession({ cwd: repo, prompt: "Audit" });
+    database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CODEX_AUDIT", body: "The new flow is authoritative." });
+    await expect(adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId })).rejects.toThrow("Two planning rounds produced no new evidence");
+    const stopped = database.planning.latest("topic")!;
+    expect(stopped).toMatchObject({ stalled: 2, finalized: false });
+    expect(stopped.readErrors).toEqual([{ request: expect.objectContaining({ selector, offset: 100_000 }), message: new InvalidPlanningOffset().message }]);
+    expect(errors.every(batch => batch.length === 1 && batch[0]!.message === new InvalidPlanningOffset().message)).toBe(true);
+    const calls = fake.calls.length;
+    const digest = database.evidence.topic(database.getTopic("topic")).digest;
+    const failed = database.evidence.begin(source.id, true)!;
+    database.evidence.failed(source.id, failed.checkId, "offline");
+    expect(database.evidence.topic(database.getTopic("topic")).digest).toBe(digest);
+    await adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId });
+    expect(fake.calls).toHaveLength(calls + 1);
+    expect(errors.at(-1)).toEqual([unavailableError(selector)]);
+    expect(database.planning.latest("topic")).toMatchObject({ finalized: true, stalled: 0 });
+    expect(database.planning.latest("topic")!.deferredReads ?? []).toEqual([]);
+  });
+
+  // 리뷰어 재현(R1 엔진 리뷰 3dcfed97 F006): 이연 위치 오류가 패킷 한도 가까이 저장된 채 무진척 한도(stalled=2)로 멈춘 뒤 근거가 일시 불가해지면, 지금 오류(근거
+  // 불가)는 저장된 위치 오류보다 17바이트 길어 남은 8바이트에 교체 하나도 들어가지 않는다. 이번 회차에 아직 싣지 않은 이연 읽기의 저장 항목을 뒤에서부터 내려
+  // 자리를 만들어 지금 오류를 싣고, 그 전달로 게이트가 열린다. 내린 읽기는 의무로 남아 다음 회차에 지금 오류를 받는다.
+  it("holds stale deferred error entries so a longer current error fits at the no-progress limit", async () => {
+    const { repo, database, git } = setup("codex");
+    const { source, selector } = unavailableContract(database);
+    const calls: Array<{ errors: ReturnType<typeof readErrorsOf>; room: number }> = [];
+    const fake = scripted(async (turn, call) => {
+      if (call === 1) return { ...answer(step({ requests: [{ kind: "evidence", selector, question: "Read", offset: 100_000 }] })),
+        requestedUserDecision: "Which flow is authoritative?" };
+      calls.push({ errors: readErrorsOf(turn),
+        room: turn.planningControl!.maxPromptBytes! - Buffer.byteLength([EXECUTION_POLICY_NOTE, turn.prompt].join("\n\n")) });
+      return answer(step({ questions: [], complete: true }));
+    }, "codex");
+    const adapter = guardedPlanning(fake.adapter, database, git);
+    const first = await adapter.createSession({ cwd: repo, prompt: "Audit" });
+    const saved = database.planning.latest("topic")!;
+    const hash = saved.deferredReads![0]!.hash;
+    saved.deferredReads = Array.from({ length: 600 }, (_, index) =>
+      ({ kind: "evidence" as const, selector, offset: 100_000 + index, end: null, question: "Read", hash }));
+    database.planning.save(saved);
+    database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CODEX_AUDIT", body: "The new flow is authoritative." });
+    await expect(adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId })).rejects.toThrow("Two planning rounds produced no new evidence");
+    const stopped = database.planning.latest("topic")!;
+    const last = calls.at(-1)!;
+    expect(stopped.stalled).toBe(2);
+    expect(stopped.readErrors).toHaveLength(last.errors.length);
+    expect(stopped.readErrors!.length).toBeLessThan(600);
+    expect(stopped.readErrors!.every(entry => entry.message === new InvalidPlanningOffset().message)).toBe(true);
+    // 남은 공간을 8바이트로 맞춘다(체크포인트 초안을 늘림) — 지금 오류로 바꾼 항목 하나도 그대로는 들어가지 않는다.
+    expect(last.room).toBeGreaterThanOrEqual(8);
+    stopped.step = { ...stopped.step, draft: stopped.step.draft + "a".repeat(last.room - 8) };
+    database.planning.save(stopped);
+    const digest = database.evidence.topic(database.getTopic("topic")).digest;
+    const failed = database.evidence.begin(source.id, true)!;
+    database.evidence.failed(source.id, failed.checkId, "offline");
+    expect(database.evidence.topic(database.getTopic("topic")).digest).toBe(digest);
+    const before = calls.length;
+    await adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId });
+    expect(fake.calls.every(turn => Buffer.byteLength(turn.prompt) <= PLANNING_LIMITS.reviewPromptBytes)).toBe(true);
+    const unavailable = (entry: ReturnType<typeof readErrorsOf>[number]) => entry.message.includes("External evidence is unavailable in this snapshot.");
+    // retry 의 첫 호출은 지금 오류를 싣는다(게이트가 열림). 나머지 읽기는 다음 회차들에 지금 오류를 받는다.
+    expect(calls[before]!.errors.some(unavailable)).toBe(true);
+    const received = calls.slice(before).flatMap(call => call.errors).filter(unavailable).map(entry => entry.request.offset);
+    expect(new Set(received).size).toBe(600);
+    expect(database.planning.latest("topic")).toMatchObject({ finalized: true });
+    expect(database.planning.latest("topic")!.deferredReads ?? []).toEqual([]);
+  });
+
+  // 리뷰어 재현(R1 엔진 리뷰 4a9ad48e F006)과 처리 순서 무관성: 이연 근거 위치 오류가 패킷 한도까지 저장된 채 stalled=2 로 멈추고 남은 공간이 8바이트일 때 한 근거만
+  // 일시 불가해지면, 바뀐 읽기가 앞·가운데·뒤에 있든 앞선 위치 오류가 패킷을 채운 뒤에 있든 retry 의 첫 호출이 그 지금 오류를 싣고 게이트가 열린다. 저장 항목은
+  // 패커가 이연 읽기 순서대로 적으므로, 이연 읽기와 저장 항목을 같은 순서로 옮기면 그 순서로 멈춘 상태와 같다. 모델이 고치지 않은 나머지 위치 오류는 진척이
+  // 아니므로, 지금 오류를 전달한 뒤에는 같은 무진척 규칙으로 다시 멈춘다.
+  it.each(["front", "middle", "end", "after-full"] as const)("carries a current source error at the no-progress limit wherever its read sits (%s)", async place => {
+    const { repo, database, git } = setup("codex");
+    const { selector: stable } = unavailableContract(database);
+    const changing = database.evidence.register("topic", { url: "https://team.atlassian.net/browse/APP-32", label: "Changing", mode: "connector", intervalSeconds: 300 });
+    const ingest = database.evidence.begin(changing.id, true)!;
+    database.evidence.ingest(changing.id, { checkId: ingest.checkId, revision: "same", units: [{ id: "body", kind: "issue", content: "한글🙂" }] });
+    const target = `${changing.id}::body`;
+    expect(target.length).toBe(stable.length);
+    const calls: Array<{ errors: ReturnType<typeof readErrorsOf>; room: number }> = [];
+    const fake = scripted(async (turn, call) => {
+      if (call === 1) return { ...answer(step({ requests: [
+        { kind: "evidence", selector: target, question: "Read", offset: 100_000 },
+        { kind: "evidence", selector: stable, question: "Read", offset: 100_000 },
+      ] })), requestedUserDecision: "Which flow is authoritative?" };
+      calls.push({ errors: readErrorsOf(turn),
+        room: turn.planningControl!.maxPromptBytes! - Buffer.byteLength([EXECUTION_POLICY_NOTE, turn.prompt].join("\n\n")) });
+      return answer(step({ questions: [], complete: true }));
+    }, "codex");
+    const adapter = guardedPlanning(fake.adapter, database, git);
+    const first = await adapter.createSession({ cwd: repo, prompt: "Audit" });
+    const saved = database.planning.latest("topic")!;
+    const [changed, kept] = saved.deferredReads!;
+    expect([changed!.selector, kept!.selector]).toEqual([target, stable]);
+    saved.deferredReads = [changed!, ...Array.from({ length: 599 }, (_, index) => ({ ...kept!, offset: 100_000 + index }))];
+    database.planning.save(saved);
+    database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CODEX_AUDIT", body: "The new flow is authoritative." });
+    await expect(adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId })).rejects.toThrow("Two planning rounds produced no new evidence");
+    const stopped = database.planning.latest("topic")!;
+    const packed = stopped.readErrors!;
+    expect(stopped.stalled).toBe(2);
+    expect(packed.length).toBeLessThan(600);
+    expect(packed[0]!.request.selector).toBe(target);
+    expect(packed.every(entry => entry.message === new InvalidPlanningOffset().message)).toBe(true);
+    const reads = [...stopped.deferredReads!];
+    const entries = [...packed];
+    const [movedRead] = reads.splice(0, 1);
+    const [movedEntry] = entries.splice(0, 1);
+    if (place === "after-full") {
+      // 바뀔 읽기를 이연 읽기 끝으로 — 그 순서로 멈췄다면 패킷에는 앞 읽기들의 위치 오류만 찼다(같은 크기 항목).
+      entries.push({ ...entries[0]!, request: { ...entries[0]!.request, offset: reads[packed.length - 1]!.offset } });
+      reads.push(movedRead!);
+    } else {
+      const at = place === "front" ? 0 : place === "middle" ? Math.floor(packed.length / 2) : packed.length - 1;
+      reads.splice(at, 0, movedRead!);
+      entries.splice(at, 0, movedEntry!);
+    }
+    stopped.deferredReads = reads;
+    stopped.readErrors = entries;
+    // 남은 공간을 8바이트로 맞춘다 — 근거 불가 문구는 위치 오류 문구보다 길어 바뀐 읽기의 항목 하나도 그대로는 들어가지 않는다.
+    const last = calls.at(-1)!;
+    expect(last.room).toBeGreaterThanOrEqual(8);
+    stopped.step = { ...stopped.step, draft: stopped.step.draft + "a".repeat(last.room - 8) };
+    database.planning.save(stopped);
+    const digest = database.evidence.topic(database.getTopic("topic")).digest;
+    const failed = database.evidence.begin(changing.id, true)!;
+    database.evidence.failed(changing.id, failed.checkId, "offline");
+    expect(database.evidence.topic(database.getTopic("topic")).digest).toBe(digest);
+    const before = calls.length;
+    await expect(adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId })).rejects.toThrow("Two planning rounds produced no new evidence");
+    expect(fake.calls.every(turn => Buffer.byteLength(turn.prompt) <= PLANNING_LIMITS.reviewPromptBytes)).toBe(true);
+    // retry 의 첫 호출이 바뀐 읽기의 지금 오류를 싣는다(게이트가 열림).
+    expect(calls.length).toBeGreaterThan(before);
+    expect(calls[before]!.errors.filter(entry => entry.request.selector === target)).toEqual([{ request: expect.objectContaining({ selector: target, offset: 100_000 }),
+      message: expect.stringContaining("External evidence is unavailable in this snapshot.") }]);
+    // 그 읽기는 지금 오류를 받은 응답의 채택으로 이연 의무에서 빠지고, 고치지 않은 위치 오류 599개는 의무로 남아 다시 무진척으로 멈춘다.
+    const after = database.planning.latest("topic")!;
+    expect(after.deferredReads!.some(read => read.selector === target)).toBe(false);
+    expect(after.deferredReads).toHaveLength(599);
+    expect(after.stalled).toBe(2);
+  });
+
+  // 리뷰어 재현(R1 엔진 리뷰 1b74b3db F009): 이번 run 의 전달 집합에 남은 옛 표식은 탐색 종료의 증거가 아니다. B 의 원문 오류는 재대조가 전달 집합에 넣었지만
+  // 패킷이 넘쳐 그 항목이 내려졌고(의무는 남음), 뒤에 B 는 다시 읽히고 그 뒤의 C 가 접근 불가해진다. stalled=2 회차의 포화 뒤 탐색은 B 를 오류 없이 관측해도
+  // 멈추지 않고 C 의 지금 오류를 실어 게이트를 연다(종료는 게이트와 같은 판정). 리뷰어는 세션 복구 뒤 크기 교정의 보류로 같은 상태를 만들었다.
+  it("does not end the post-full scan on a stale sent mark when a later read has the current source error", async () => {
+    const { repo, database, git } = setup("codex");
+    const { selector: filler } = unavailableContract(database);
+    const register = (key: string) => {
+      const source = database.evidence.register("topic", { url: `https://team.atlassian.net/browse/APP-${key}`, label: key, mode: "connector", intervalSeconds: 300 });
+      const check = database.evidence.begin(source.id, true)!;
+      database.evidence.ingest(source.id, { checkId: check.checkId, revision: "same", units: [{ id: "body", kind: "issue", content: `${key} body` }] });
+      return { source, selector: `${source.id}::body` };
+    };
+    const later = register("40");
+    const last = register("41");
+    // 실패한 원문은 재확인 대기(최소 300초)가 지나야 다시 확인할 수 있다 — 되살리는 확인만 시계를 그 뒤로 옮겨 같은 본문으로 수집한다(digest 그대로).
+    const restore = (id: string, content: string) => {
+      const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 301_000);
+      try {
+        const check = database.evidence.begin(id, true)!;
+        database.evidence.ingest(id, { checkId: check.checkId, revision: "same", units: [{ id: "body", kind: "issue", content }] });
+      } finally { clock.mockRestore(); }
+    };
+    const fail = (id: string) => { const check = database.evidence.begin(id, true)!; database.evidence.failed(id, check.checkId, "offline"); };
+    const calls: Array<{ errors: ReturnType<typeof readErrorsOf>; room: number }> = [];
+    let flipAt = Number.POSITIVE_INFINITY;
+    const fake = scripted(async (turn, call) => {
+      if (call === 1) return { ...answer(step({ requests: [
+        { kind: "evidence", selector: filler, question: "Read", offset: 100_000 },
+        { kind: "evidence", selector: later.selector, question: "Read", offset: 0 },
+        { kind: "evidence", selector: last.selector, question: "Read", offset: 0 },
+      ] })), requestedUserDecision: "Which flow is authoritative?" };
+      calls.push({ errors: readErrorsOf(turn),
+        room: turn.planningControl!.maxPromptBytes! - Buffer.byteLength([EXECUTION_POLICY_NOTE, turn.prompt].join("\n\n")) });
+      // retry 의 첫 호출 뒤 B 는 다시 읽히고 C 는 접근 불가해진다(digest 그대로).
+      if (call === flipAt) { restore(later.source.id, "40 body"); fail(last.source.id); }
+      return answer(step({ questions: [], complete: true }));
+    }, "codex");
+    const adapter = guardedPlanning(fake.adapter, database, git);
+    const first = await adapter.createSession({ cwd: repo, prompt: "Audit" });
+    const saved = database.planning.latest("topic")!;
+    const [position, b, c] = saved.deferredReads!;
+    expect([position!.selector, b!.selector, c!.selector]).toEqual([filler, later.selector, last.selector]);
+    saved.deferredReads = [...Array.from({ length: 600 }, (_, index) => ({ ...position!, offset: 100_000 + index })), b!, c!];
+    database.planning.save(saved);
+    database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CODEX_AUDIT", body: "The new flow is authoritative." });
+    // 위치 오류가 패킷을 채운 채 멈춘다 — B·C 는 그 뒤라 이연 루프에 닿지 않는다.
+    await expect(adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId })).rejects.toThrow("Two planning rounds produced no new evidence");
+    const stopped = database.planning.latest("topic")!;
+    const packed = stopped.readErrors!;
+    expect(packed.every(entry => entry.request.selector === filler && entry.message === new InvalidPlanningOffset().message)).toBe(true);
+    // 앞선 호출이 B 의 근거 불가 오류를 실은 채 끝났다 — 저장 항목 끝에 B 를 둔다. 남은 공간보다 20바이트 넘치게 해 run 시작 회차의 재편성이 B 의 항목만 내린다.
+    const entryB = { request: { ...packed[0]!.request, selector: later.selector, offset: 0 }, message: new UnavailablePlanningEvidence().message };
+    const room = calls.at(-1)!.room;
+    const grow = Buffer.byteLength(JSON.stringify(entryB)) + 1;
+    stopped.readErrors = [...packed, entryB];
+    stopped.step = { ...stopped.step, draft: stopped.step.draft + "a".repeat(Math.max(0, room - grow + 20)) };
+    stopped.stalled = 0;
+    database.planning.save(stopped);
+    fail(later.source.id);
+    const before = calls.length;
+    flipAt = fake.calls.length + 1;
+    await expect(adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId })).rejects.toThrow("Two planning rounds produced no new evidence");
+    expect(fake.calls.every(turn => Buffer.byteLength(turn.prompt) <= PLANNING_LIMITS.reviewPromptBytes)).toBe(true);
+    const retry = calls.slice(before);
+    // run 시작 회차는 B 의 항목을 내린 채 진행했다(전달로 세지 않음). stalled=2 회차의 탐색은 B 를 지나 C 의 지금 오류를 싣는다.
+    expect(retry[0]!.errors.some(entry => entry.request.selector === later.selector)).toBe(false);
+    const delivered = retry.findIndex(call => call.errors.some(entry => entry.request.selector === last.selector &&
+      entry.message === new UnavailablePlanningEvidence().message));
+    expect(delivered).toBe(2);
+    const after = database.planning.latest("topic")!;
+    expect(after.deferredReads!.some(read => read.selector === last.selector)).toBe(false);
+    expect(after.deferredReads!.some(read => read.selector === later.selector)).toBe(true);
+  });
+
+  // 리뷰어 재현(R1 엔진 리뷰 dbb43131 F008): 정상 파일 600개의 이연 읽기로 패킷이 차는 보통 회차(무진척 게이트를 지나는 패킷)는 포화 뒤 탐색 없이 지금 패킷을
+  // 전달한다. 원문 읽기는 실은 파일과 자리가 없어 멈춘 파일 하나만큼이고, 남은 파일은 미리 읽지 않고 다음 회차에 의무로 남는다.
+  it("does not read the remaining deferred sources when ordinary fragments fill the packet", async () => {
+    const { repo, database, git } = setup("codex");
+    const selectors = Array.from({ length: 600 }, (_, index) => `docs/many/${String(index).padStart(3, "0")}.txt`);
+    commit(repo, Object.fromEntries(selectors.map((selector, index) => [selector, filler(`many${index}`, 6_000)])));
+    writeFileSync(join(repo, "other.txt"), "other notes\n");
+    const source = vi.spyOn(PlanningReader.prototype, "source");
+    let reads = -1;
+    let delivered: PlanningFragment[] = [];
+    let baseline = 0;
+    const fake = scripted(async (turn, call) => {
+      if (call === 1) return { ...answer(step({ requests: [{ kind: "file", selector: "form.swift", question: "Read the form", offset: 0, end: 1 }] })),
+        requestedUserDecision: "Which flow is authoritative?" };
+      reads = source.mock.calls.length - baseline;
+      delivered = fragmentsOf(turn).filter(fragment => fragment.selector.startsWith("docs/many/"));
+      throw new Error("Stop after the first packed round");
+    }, "codex");
+    const adapter = guardedPlanning(fake.adapter, database, git);
+    const first = await adapter.createSession({ cwd: repo, prompt: "Audit" });
+    const saved = database.planning.latest("topic")!;
+    const tree = await git.writeWorkingTree(repo, "pending");
+    const reader = new PlanningReader(repo, tree, new Map());
+    const deferred: DeferredRead[] = [];
+    for (const selector of selectors) {
+      deferred.push({ kind: "file", selector, offset: 0, end: null, question: "Read", hash: (await reader.read({ kind: "file", selector, question: "Read", offset: 0 })).hash });
+    }
+    saved.deferredReads = deferred;
+    // 대기 조각 — 재대조(대기 조각이 없을 때만)를 건너뛰어, 이 회차의 원문 읽기를 패커의 것만으로 센다.
+    saved.fragments = [await reader.read({ kind: "file", selector: "other.txt", question: "Read", offset: 0 })];
+    saved.awaitingDecision = undefined;
+    database.planning.save(saved);
+    baseline = source.mock.calls.length;
+    await expect(adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId })).rejects.toThrow("Stop after the first packed round");
+    expect(delivered.length).toBeGreaterThan(0);
+    expect(new Set(delivered.map(fragment => fragment.selector)).size).toBe(delivered.length);
+    // 실은 파일마다 한 번, 자리가 없어 멈춘 파일 한 번 — 남은 파일은 읽지 않는다.
+    expect(reads).toBe(delivered.length + 1);
+    expect(database.planning.latest("topic")!.deferredReads).toHaveLength(600);
+  });
+
+  // 리뷰어 재현(R1 엔진 리뷰 36fb50d6 F007): 이연 원문 오류 묶음이 패킷 한도 가까이 찬 회차에 모델이 과대 체크포인트를 내면, 크기 교정 회차는 패커를 건너뛰고
+  // 교정 안내가 더해진다(항목 하나가 교정 안내보다 작아 남은 공간이 안내를 담지 못한다). 같은 세션은 그 오류를 이미 받았으므로 다시 싣지 않고(기록은 그대로),
+  // 교정 호출이 한도 안에서 진행해 그 전달을 인정받는다. 남은 오류는 다음 회차에 한 번씩 전달되고, 의무는 그때까지 남는다.
+  const nearLimitErrors = (count: number) => Array.from({ length: count }, (_, index) => `artifact::/missing/${String(index).padStart(3, "0")}::x`);
+  const deferSearches = (database: ConsensusDatabase, selectors: readonly string[]) => {
+    const saved = database.planning.latest("topic")!;
+    saved.deferredReads = selectors.map(selector => ({ kind: "search" as const, selector, offset: 0, end: null, question: "Find", hash: null }));
+    database.planning.save(saved);
+    database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CODEX_AUDIT", body: "The new flow is authoritative." });
+  };
+  const decisionThen = (later: (turn: Omit<SessionTurn, "sessionId">, call: number) => AgentResult) => scripted(async (turn, call) => call === 1
+    ? { ...answer(step({ requests: [{ kind: "file", selector: "form.swift", question: "Read the form", offset: 0, end: 1 }] })), requestedUserDecision: "Which flow is authoritative?" }
+    : later(turn, call), "codex");
+
+  it("runs a size correction after a near-limit batch of deferred source errors without resending them", async () => {
+    const { repo, database, git } = setup("codex");
+    const selectors = nearLimitErrors(600);
+    const rounds: string[][] = [];
+    const fake = decisionThen((turn, call) => {
+      rounds.push(readErrorsOf(turn).map(entry => entry.request.selector));
+      return call === 2 ? answer(step({ draft: "가".repeat(5000) })) : answer(step({ questions: [], complete: true }));
+    });
+    const adapter = guardedPlanning(fake.adapter, database, git);
+    const first = await adapter.createSession({ cwd: repo, prompt: "Audit" });
+    deferSearches(database, selectors);
+    await adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId });
+    expect(fake.calls.every(turn => Buffer.byteLength(turn.prompt) <= PLANNING_LIMITS.reviewPromptBytes)).toBe(true);
+    expect(rounds[0]!.length).toBeGreaterThan(0);
+    expect(rounds[0]!.length).toBeLessThan(selectors.length);
+    // 교정 호출(세 번째)은 오류를 다시 싣지 않는다.
+    expect(fake.calls[2]!.prompt).toContain("Checkpoint size correction");
+    expect(fake.calls[2]!.prompt).not.toContain("Read request errors:");
+    expect(rounds.flat().sort()).toEqual([...selectors].sort());
+    expect(database.planning.latest("topic")).toMatchObject({ finalized: true });
+    expect(database.planning.latest("topic")!.deferredReads ?? []).toEqual([]);
+  });
+
+  // 같은 계열(36fb50d6 F007): 교정 호출에서 세션이 유실돼 새 세션으로 교정하면, 새 세션은 그 오류를 받은 적이 없다. 넘치는 만큼 이연 읽기의 오류 항목을 내리고
+  // (의무는 이연 읽기에 남는다) 교정 호출이 한도 안에서 진행한다. 내린 오류는 다음 회차에 다시 전달된다.
+  it("drops regenerable deferred error entries to fit a size correction in a recovered session", async () => {
+    const { repo, database, git } = setup("codex");
+    const selectors = nearLimitErrors(600);
+    const delivered: string[][] = [];
+    let oversized = false;
+    let lost = false;
+    const fake = decisionThen((turn, call) => {
+      delivered.push(readErrorsOf(turn).map(entry => entry.request.selector));
+      if (call === 2) { oversized = true; return answer(step({ draft: "가".repeat(5000) })); }
+      return answer(step({ questions: [], complete: true }));
+    });
+    const adapter = guardedPlanning({ ...fake.adapter, resumeTurn: async turn => {
+      if (oversized && !lost) {
+        lost = true;
+        turn.onProcessSpawn?.({ pid: 7, pgid: 7, executable: "fake", commandLine: "fake", startedAt: "now" });
+        throw codexSessionMissing(turn.sessionId);
+      }
+      return fake.adapter.resumeTurn(turn);
+    } }, database, git);
+    const first = await adapter.createSession({ cwd: repo, prompt: "Audit" });
+    deferSearches(database, selectors);
+    await adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: first.sessionId });
+    expect(lost).toBe(true);
+    expect(fake.calls.every(turn => Buffer.byteLength(turn.prompt) <= PLANNING_LIMITS.reviewPromptBytes)).toBe(true);
+    // 새 세션의 교정 호출은 오류 일부를 싣는다 — 넘치는 항목은 내려 다음 회차로 넘어간다.
+    const correction = fake.calls[2]!;
+    expect(correction.prompt).toContain("Checkpoint size correction");
+    expect(delivered[1]!.length).toBeGreaterThan(0);
+    expect(delivered[1]!.length).toBeLessThan(delivered[0]!.length);
+    expect(new Set(delivered.slice(1).flat())).toEqual(new Set(selectors));
+    expect(database.planning.latest("topic")).toMatchObject({ finalized: true });
+    expect(database.planning.latest("topic")!.deferredReads ?? []).toEqual([]);
+  });
+
+  // 리뷰어 재현(R1 엔진 리뷰 61a2038a F007): stalled=2 에서 이연 원문 오류로 열린 호출이 과대 체크포인트를 내고 교정 중 세션이 유실되면, 새 세션의 교정 회차는
+  // 100,000바이트 과제 전체를 다시 싣는다. 과제를 참조로 바꾼 뒤에야 실제 초과분이 정해진다 — 그 전에 오류를 내리면 참조화가 만든 공간에 실을 오류가 없어
+  // 게이트가 닫혔다. 참조화 뒤 남는 공간에 오류를 실어 교정 호출이 열리고, 과제를 끝까지 읽은 뒤 완료한다.
+  it("references the task before dropping deferred error entries in a recovered size correction at the no-progress limit", async () => {
+    const { repo, database, git } = setup("codex");
+    const task = `Audit the navigation flow. ${"Keep every existing contract. ".repeat(3_400)}`.slice(0, 100_000);
+    expect(Buffer.byteLength(task)).toBe(100_000);
+    const selectors = nearLimitErrors(20);
+    const delivered: string[][] = [];
+    let oversized = false;
+    let lost = false;
+    const fake = decisionThen((turn, call) => {
+      delivered.push(readErrorsOf(turn).map(entry => entry.request.selector));
+      if (call === 2) { oversized = true; return answer(step({ draft: "가".repeat(5000) })); }
+      return answer(step({ questions: [], complete: true }));
+    });
+    const adapter = guardedPlanning({ ...fake.adapter, resumeTurn: async turn => {
+      if (oversized && !lost) {
+        lost = true;
+        turn.onProcessSpawn?.({ pid: 7, pgid: 7, executable: "fake", commandLine: "fake", startedAt: "now" });
+        throw codexSessionMissing(turn.sessionId);
+      }
+      return fake.adapter.resumeTurn(turn);
+    } }, database, git);
+    const first = await adapter.createSession({ cwd: repo, prompt: task });
+    const saved = database.planning.latest("topic")!;
+    saved.awaitingDecision = undefined;
+    saved.stalled = 2;
+    saved.deferredReads = selectors.map(selector => ({ kind: "search" as const, selector, offset: 0, end: null, question: "Find", hash: null }));
+    database.planning.save(saved);
+    await adapter.resumeTurn({ cwd: repo, prompt: task, sessionId: first.sessionId });
+    expect(lost).toBe(true);
+    expect(fake.calls.every(turn => Buffer.byteLength(turn.prompt) <= PLANNING_LIMITS.reviewPromptBytes)).toBe(true);
+    // 새 세션의 교정 호출 — 과제는 참조로 실리고, 참조화 뒤 남는 공간에 이연 오류가 모두 실린다.
+    const correction = fake.calls[2]!;
+    expect(correction.prompt).toContain("Checkpoint size correction");
+    expect(correction.prompt).toContain("The complete task is REQUIRED context");
+    expect([...delivered[1]!].sort()).toEqual([...selectors].sort());
+    expect(database.planning.latest("topic")).toMatchObject({ finalized: true });
+    expect(database.planning.latest("topic")!.deferredReads ?? []).toEqual([]);
+  });
+
+  it("loads a required decision reference in the first packet without a model request", async () => {
+    const { repo, database, git } = setup("codex");
+    const event = database.appendEvent({ topicId: "topic", actor: "user", kind: "decision", state: "CODEX_AUDIT", body: filler("decision", 30_000) });
+    const reference = timelineReference(event);
+    const fake = scripted(async () => answer(step({ questions: [], complete: true })), "codex");
+    await guardedPlanning(fake.adapter, database, git).createSession({ cwd: repo, prompt: "Audit",
+      timelineDelivery: { prompt: { inline: [], references: [reference], index: null } } });
+    // 옛 계약은 이 30KB 결정을 강등된 완료마다 한 쪽씩 다섯 회차에 실었다.
+    expect(fake.calls).toHaveLength(1);
+    expect(fragmentsOf(fake.calls[0]!).filter(fragment => fragment.selector === reference.selector)).toHaveLength(5);
+    const record = database.planning.latest("topic")!;
+    expect(database.planning.referenceComplete(record.sessionId!, database.getTopic("topic"), reference)).toBe(true);
+  });
+
+  it("moves an unserved request saved before the queue existed into one-page legacy reads", async () => {
+    const { repo, database, git } = setup("codex");
+    commit(repo, { "docs/legacy.txt": filler("legacy", 20_000) });
+    const fake = scripted(async (turn, call) => call === 1 ? answer(step()) : answer(step({ questions: [], complete: true })), "codex");
+    const adapter = guardedPlanning(fake.adapter, database, git);
+    await adapter.createSession({ cwd: repo, prompt: "Audit" });
+    // 배포 전 체크포인트: 채택된 단계의 요청이 아직 실리지 않은 채(PENDING_READS) 멈췄고 대기 읽기 필드가 없다.
+    const saved = database.planning.latest("topic")! as PlanningCheckpoint;
+    delete saved.readQueue;
+    Object.assign(saved, { finalized: false, finalResult: undefined, responsePending: false, fragments: [],
+      stopped: "Planning checkpoint accepted; deferred reads pending.",
+      step: { ...saved.step, complete: false, requests: [{ kind: "file", selector: "docs/legacy.txt", question: "Read", offset: 0 }] } });
+    database.planning.save(saved);
+    await adapter.resumeTurn({ cwd: repo, prompt: "Audit", sessionId: saved.sessionId! });
+    expect(fragmentsOf(fake.calls.at(-1)!).filter(fragment => fragment.selector === "docs/legacy.txt").map(fragment => fragment.offset)).toEqual([0]);
   });
 });

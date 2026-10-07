@@ -234,9 +234,11 @@ export class GitService {
     return (await this.run(repositoryPath, ["rev-parse", "--verify", `${ref}^{commit}`])).stdout.trim();
   }
 
+  // 계획 본문은 문단 하나가 한 줄이라 기본 문맥 3줄이 바뀌지 않은 문단을 통째로 다시 싣는다(2026-10-07 실측: 변경분 77,401B 대 전문 81,214B).
+  // 문맥 없이(-U0) 바뀐 줄의 전·후만 싣고, 위치는 @@ 줄 번호와 변경분 머리의 두 정본 경로로 찾는다.
   async diffPlanFiles(cwd: string, previous: string, current: string): Promise<string> {
     const result = await this.execute({
-      command: "git", args: ["diff", "--no-index", "--no-ext-diff", "--no-textconv", "--no-color", "--", previous, current],
+      command: "git", args: ["diff", "--no-index", "--no-ext-diff", "--no-textconv", "--no-color", "-U0", "--", previous, current],
       cwd, maxOutputBytes: 64 * 1024 * 1024,
     });
     if (result.exitCode !== 0 && result.exitCode !== 1) throw new Error("계획 변경분을 계산하지 못했습니다.");

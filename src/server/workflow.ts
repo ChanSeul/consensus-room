@@ -52,6 +52,8 @@ import type { MediatorIdentity, TurnJob } from "../shared/roles.js";
 import type { StageDecision, StageResult } from "../shared/workGroups.js";
 import { resolvePriorResults } from "./workGroupService.js";
 import type { TimelineEvent } from "../shared/contracts.js";
+import type { VerificationProfileId } from "../shared/planChecks.js";
+import type { VerificationOutcome } from "./verifications.js";
 // 재개 정보의 다음 허용 작업 — blocker 는 실제 액션의 사전 검사가 던지는 문구, deferredChecks 는 실행 때만 할 수 있는 검사(엔진 개편 E1).
 export interface ResumeAction {
   action: string;
@@ -93,7 +95,11 @@ export type HostSandboxStatus =
 export interface WorkflowDependencies {
   database: ConsensusDatabase;
   artifacts: ArtifactStore;
-  verifications?: { receipts(topicId: string): Promise<{ text: string; readablePaths: string[] }> };
+  // 계획 필수 검사의 엔진 실행(수락 경계 게이트)과 리뷰 영수증 — VerificationService.
+  verifications?: {
+    receipts(topicId: string, declared?: readonly VerificationProfileId[]): Promise<{ text: string; readablePaths: string[] }>;
+    ensure(topicId: string, profileId: VerificationProfileId, signal?: AbortSignal): Promise<VerificationOutcome>;
+  };
   git: GitService;
   claude: AgentAdapter;
   codex: AgentAdapter;
@@ -655,6 +661,12 @@ export class WorkflowEngine {
     // 계획 단계 재시도는 전체 재계획이 재확인으로 돌린 진단에 막히지 않는다(host-review R9) — 재개 단계를 함께 넘긴다.
     this.core.diagnoses.assertResumable(topicId, "재시도(retry)", resume);
     const interruption = currentStopEvent(topic, resume ?? null, this.core.dependencies.database.getTimeline(topicId));
+    // 중재자 실행 대기(계획·구현·수정·리뷰가 함께 쓰는 정지 표식 waitingFor=mediator)는 그 정지 뒤 실행 근거(evidence)가 올라와야 재개한다. 근거 없이
+    // 재개하면 같은 러너·리뷰를 다시 사서 같은 요청을 반복한다(2026-10-06 통합 검증 1fd0cc86: 구현 러너 6회 재호출). 재개 진입점 한 곳에서 막는다 — 자동
+    // 재시도(사용 한도)도 이 경로다. 중재자가 재개 단계를 다른 단계로 바꾼 정지는 이 대기가 아니다.
+    if (topic.state === "USER_DECISION_REQUIRED" && interruption?.payload?.waitingFor === "mediator" && interruption.payload.resumeState === resume &&
+        !this.core.dependencies.database.getTimeline(topicId, interruption.sequence).some(event => event.actor === "user" && event.kind === "evidence"))
+      throw new Error(`중재자 실행 대기 중입니다. 요청한 실행의 근거(evidence)를 올린 뒤 재개하세요 — ${interruption.body}`);
     // 리뷰 한도 정지는 **그 리뷰 단계를 재개할 때만** 막는다. 중재자가 resume_state 를 다른 단계(예: 러너가 중간 보고를
     // 완료 형식으로 닫아 리뷰로 넘어간 것을 IMPLEMENTING 으로 되돌림, 2026-09-14 S11)로 바꿨으면 리뷰 승인은 필요 없다.
     if(interruption?.payload?.reviewPause && topic.state==="USER_DECISION_REQUIRED" && interruption.payload.resumeState===resume)
@@ -821,8 +833,9 @@ export class WorkflowEngine {
       return this.restartPlanning(topic, "계획 실행을 처음부터 재시도합니다.", actionId);
     }
     if (isDeliveryResumeState(resume)) {
-      return this.core.startAction(topicId, "retry", (signal) => this.delivery.resumeDelivery(topicId, resume, signal), actionId,
-        { to: resume, message: "중단된 구현 단계를 재시도합니다." });
+      return this.core.startAction(topicId, "retry", async (signal) => {
+        if (await new EvidenceAssessmentPipeline(this.core).reviewForResume(topicId, signal)) await this.delivery.resumeDelivery(topicId, resume, signal);
+      }, actionId, { to: resume, message: "중단된 구현 단계를 재시도합니다." });
     }
     throw new Error(`재시도를 지원하지 않는 단계입니다: ${resume}`);
   }

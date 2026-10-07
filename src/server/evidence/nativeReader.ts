@@ -3,11 +3,12 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { nativeApps } from "../adapters/nativeApps.js";
+import { resolveHostExecutable } from "../hostRuntime.js";
 import { EvidenceFetchError } from "./connectors.js";
 
 export const APP_READS = {
   slack: { id: "asdk_app_69a1d78e929881919bba0dbda1f6436d", names: ["slack.slack_read_channel", "slack.slack_read_thread", "slack.slack_read_user_profile"] },
-  atlassian: { id: "asdk_app_6a83901dde988191b3f3cefdcc19acfa", names: ["atlassian_rovo.getJiraIssue", "atlassian_rovo.searchJiraIssuesUsingJql", "atlassian_rovo.getConfluenceContent", "atlassian_rovo.executeRead", "atlassian_rovo.atlassianUserInfo"] },
+  atlassian: { id: "asdk_app_6a83901dde988191b3f3cefdcc19acfa", names: ["atlassian.getJiraIssue", "atlassian.searchJiraIssuesUsingJql", "atlassian.getConfluenceContent", "atlassian.executeRead", "atlassian.atlassianUserInfo"] },
   sheets: { id: "connector_5f3c8c41a1e54ad7a76272c89e2554fa", names: ["google_drive.get_spreadsheet_metadata", "google_drive.get_spreadsheet_cells", "google_drive.get_spreadsheet_comments"] },
   figma: { id: "connector_68df038e0ba48191908c8434991bbac2", names: ["figma.whoami", "figma.get_design_context", "figma.get_metadata", "figma.get_variable_defs", "figma.get_screenshot"] },
 } as const;
@@ -25,7 +26,7 @@ export interface AppReader {
 }
 const identityFlights = new WeakMap<AppReader, Map<AppProvider, Promise<ReaderIdentity>>>();
 const configKey = (config: NativeReaderConfig) => JSON.stringify([config.googleDriveLinkId, Object.entries(config.accountIds ?? {}).sort()]);
-const identityTool = (provider: AppProvider) => provider === "slack" ? "slack.slack_read_user_profile" : provider === "figma" ? "figma.whoami" : "atlassian_rovo.atlassianUserInfo";
+const identityTool = (provider: AppProvider) => provider === "slack" ? "slack.slack_read_user_profile" : provider === "figma" ? "figma.whoami" : "atlassian.atlassianUserInfo";
 function identityAccount(raw: unknown): string {
   const identity = appData(raw), who = identity.whoami ?? identity;
   const account = who.accountId ?? who.id ?? who.email ?? who.user?.id ?? who.profile?.email ?? who.user?.profile?.email ??
@@ -80,7 +81,7 @@ export class NativeAppReader implements AppReader {
   private readonly epochs = new Map<AppProvider, number>();
   private readonly identities = new Map<AppProvider, Promise<ReaderIdentity>>();
   private readonly cached = new Map<AppProvider, ReaderIdentity>();
-  constructor(private readonly directory: string, private readonly command: string, private readonly authPath = join(homedir(), ".codex", "auth.json"),
+  constructor(private readonly directory: string, private readonly authPath = join(homedir(), ".codex", "auth.json"),
     private readonly metric: (provider: AppProvider, name: IdentityMetric, value: number) => void = () => {}) {}
   async config(): Promise<NativeReaderConfig> {
     try {
@@ -152,10 +153,12 @@ export class NativeAppReader implements AppReader {
     const state = await this.state(), generation = this.generation(provider, state.signature);
     const app = APP_READS[provider];
     if (!(app.names as readonly string[]).includes(name)) throw new EvidenceFetchError("허용되지 않은 수집 도구입니다.");
-    if (name === "atlassian_rovo.executeRead" && !["listJiraIssueComments", "listJiraIssueRemoteIssueLinks", "getConfluenceContentDescendants", "listConfluenceComments"].includes(String(args.name))) throw new EvidenceFetchError("허용되지 않은 원문 읽기 작업입니다.");
+    if (name === "atlassian.executeRead" && !["listJiraIssueComments", "listJiraIssueRemoteIssueLinks", "getConfluenceContentDescendants", "listConfluenceComments"].includes(String(args.name))) throw new EvidenceFetchError("허용되지 않은 원문 읽기 작업입니다.");
     let client = this.clients.get(provider);
     if (!client) {
-      client = nativeApps(this.command, this.authPath, this.directory, { [app.id]: [...app.names] }, this.controller.signal);
+      // codex 는 연결을 새로 열 때마다 푼다(hostRuntime.ts) — 부팅 때 고정하면 CLI 링크가 옮겨진 뒤 서버를 재시작해야만 회복됐다. 실패한 연결은 아래 catch 가 캐시에서 뺀다.
+      client = resolveHostExecutable("codex")
+        .then(codex => nativeApps(codex.realPath, this.authPath, this.directory, { [app.id]: [...app.names] }, this.controller.signal));
       this.clients.set(provider, client);
     }
     try {

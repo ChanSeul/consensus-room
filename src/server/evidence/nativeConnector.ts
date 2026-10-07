@@ -15,6 +15,7 @@ function column(index: number): string {
   return result;
 }
 function content(value: unknown): string { return typeof value === "string" ? value : stableJSON(value); }
+const figmaSelectionEcho = (part: Data): boolean => part?.type === "text" && typeof part.text === "string" && /^\s*Currently selected nodes:/.test(part.text);
 function unit(id: string, kind: EvidenceUnitInput["kind"], value: unknown, author?: string, changedAt?: string): EvidenceUnitInput {
   return { id, kind, content: content(value), ...(author ? { author } : {}), ...(changedAt ? { changedAt } : {}) };
 }
@@ -131,10 +132,10 @@ export class NativeEvidenceConnector implements EvidenceConnector {
     if (provider === "atlassian") {
       const [site, key] = source.resource.split("/");
       const cloudId = `https://${site}`;
-      const read = (name: string, inputs: Data) => call("atlassian_rovo.executeRead", { cloudId, name, inputs, view: "full" });
+      const read = (name: string, inputs: Data) => call("atlassian.executeRead", { cloudId, name, inputs, view: "full" });
       if (source.provider === "jira") {
         if (!cursor.phase) {
-          const data = await call("atlassian_rovo.getJiraIssue", { cloudId, issueIdOrKey: key, view: "full", responseContentFormat: "html" });
+          const data = await call("atlassian.getJiraIssue", { cloudId, issueIdOrKey: key, view: "full", responseContentFormat: "html" });
           if (!data.key && !data.fields && !data.issue) throw new EvidenceFetchError("Jira 이슈 본문이 없습니다.");
           const issue = data.issue ?? data;
           const updated = issue.fields?.updated ?? issue.updated;
@@ -152,20 +153,20 @@ export class NativeEvidenceConnector implements EvidenceConnector {
           return page(comments.map(c => unit(`comment:${c.id}`, "comment", normalized(c), c.author?.accountId, c.updated)), end < data.total ? { phase: "comments", start: end, total: data.total, updated: cursor.updated } : { phase: "children", updated: cursor.updated });
         }
         if (cursor.phase === "children") {
-          const data = await call("atlassian_rovo.searchJiraIssuesUsingJql", { cloudId, jql: `parent = "${key}" ORDER BY key`, maxResults: 100, fields: ["summary"], ...(cursor.token ? { nextPageToken: cursor.token } : {}) });
+          const data = await call("atlassian.searchJiraIssuesUsingJql", { cloudId, jql: `parent = "${key}" ORDER BY key`, maxResults: 100, fields: ["summary"], ...(cursor.token ? { nextPageToken: cursor.token } : {}) });
           const issues = requireArray(data.issues, "Jira 하위 티켓");
           if (!data.isLast && !data.nextPageToken) throw new EvidenceFetchError("Jira 하위 티켓 페이지가 완전하지 않습니다.");
           return page([], data.nextPageToken ? { phase: "children", token: data.nextPageToken, updated: cursor.updated } : { phase: "remote", updated: cursor.updated }, issues.map(issue => ({ url: `https://${site}/browse/${issue.key}`, label: issue.key, unitId: key, relation: "child" as const })));
         }
         const data = await read("listJiraIssueRemoteIssueLinks", { issueIdOrKey: key });
         const links = requireArray(Array.isArray(data) ? data : data.links ?? data.remoteIssueLinks, "Jira 외부 링크");
-        const verified = await call("atlassian_rovo.getJiraIssue", { cloudId, issueIdOrKey: key, fields: ["updated"], view: "full" });
+        const verified = await call("atlassian.getJiraIssue", { cloudId, issueIdOrKey: key, fields: ["updated"], view: "full" });
         const end = verified.issue ?? verified;
         if (typeof cursor.updated !== "string" || (end.fields?.updated ?? end.updated) !== cursor.updated) throw new EvidenceFetchError("수집 중 Jira 원문이 바뀌었습니다. 처음부터 다시 확인합니다.", 300, true);
         return page([unit("remote-links", "issue", normalized(links))], null, links.filter(link => link.object?.url).map(link => ({ url: link.object.url, label: link.object.title ?? link.object.url, unitId: "remote-links", relation: "link" as const })));
       }
       if (!cursor.phase) {
-        const data = await call("atlassian_rovo.getConfluenceContent", { cloudId, content_id: key, detail: "full", content_format: "html" });
+        const data = await call("atlassian.getConfluenceContent", { cloudId, content_id: key, detail: "full", content_format: "html" });
         if (!data.body && !data.content) throw new EvidenceFetchError("Confluence 본문이 없습니다.");
         const canonical = normalized(data);
         if (canonical.metadata) delete canonical.metadata.totalViews;
@@ -188,7 +189,10 @@ export class NativeEvidenceConnector implements EvidenceConnector {
     const allowed = ["get_metadata", "get_design_context", "get_variable_defs", "get_screenshot"];
     if (!allowed.includes(tool)) throw new EvidenceFetchError("알 수 없는 Figma 수집 단계입니다.");
     const data = await call(`figma.${tool}`, { ...args, ...(tool === "get_design_context" ? { excludeScreenshot: true, disableCodeConnect: true } : {}) }, true);
-    const parts = requireArray(data.content, "Figma 원문");
+    // The desktop server echoes the app's current selection as an extra part. It describes what the user
+    // clicked, not the requested node, so it is not source content. Numbering only the kept parts keeps its
+    // presence from shifting the other unit ids.
+    const parts = requireArray(data.content, "Figma 원문").filter(part => !figmaSelectionEcho(part));
     const units = parts.map((part, index) => {
       if (part.type === "image") {
         if (part.mimeType !== "image/png") throw new EvidenceFetchError("Figma 이미지 형식을 확인하세요.");

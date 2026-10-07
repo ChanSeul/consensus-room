@@ -1,6 +1,12 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import type { Topic } from "../shared/contracts";
+import type { Topic, WorkflowState } from "../shared/contracts";
 import { ENTRY_COPY, isTopicGroup, topicAncestors, topicForest, workEntry, type TopicNode } from "../shared/topicStructure";
+
+export const WORKING_STATES = new Set<WorkflowState>([
+  "BRAINSTORMING",
+  "CLAUDE_PLAN", "CODEX_AUDIT", "CLAUDE_REVISION", "CODEX_CLOSEOUT", "CONSENSUS_ACK",
+  "IMPLEMENTING", "CODEX_REVIEW", "CLAUDE_FIX", "CODEX_FINAL_REVIEW",
+]);
 
 export function EntryGuide() {
   return <section className="entry-guide" aria-label="작업 시작 방식">
@@ -15,6 +21,16 @@ export function EntryGuide() {
 export function TopicTree({ topics, selectedId, onSelect, status }: { topics: Topic[]; selectedId: string | null; onSelect: (id: string) => void; status?: (topic: Topic) => ReactNode }) {
   const forest = useMemo(() => topicForest(topics), [topics]);
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set(topics.filter(isTopicGroup).map(topic => topic.id)));
+  const initialized = useRef(false);
+  useEffect(() => {
+    if (initialized.current || topics.length === 0) return;
+    initialized.current = true;
+    const hidden = new Set(topics.filter(isTopicGroup).map(topic => topic.id));
+    for (const topic of topics.filter(topic => !isTopicGroup(topic) && WORKING_STATES.has(topic.state))) {
+      for (const parent of topicAncestors(topic, topics)) hidden.delete(parent.id);
+    }
+    setCollapsed(hidden);
+  }, [topics]);
   const revealedSelection = useRef<string | null | undefined>(undefined);
   useEffect(() => {
     if (revealedSelection.current === selectedId) return;

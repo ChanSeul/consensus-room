@@ -3,6 +3,8 @@ import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { agentEnvironment } from "../security.js";
+import { createTailBuffer } from "../processRunner.js";
+import { redactSecrets } from "../../shared/workflow.js";
 const LIMIT = 32 * 1024 * 1024;
 
 // Transport only: callers cannot start a model turn or invoke unlisted tools.
@@ -23,9 +25,13 @@ export async function nativeApps(command: string, authPath: string, cwd: string,
     ].join("\n"), { mode: 0o600 });
   } catch (error) { await rm(home, { recursive: true, force: true }); throw error; }
   const child = spawn(command, ["app-server", "--strict-config", "--stdio"], {
-    cwd, detached: true, stdio: ["pipe", "pipe", "ignore"],
+    cwd, detached: true, stdio: ["pipe", "pipe", "pipe"],
     env: agentEnvironment({ CODEX_HOME: home }),
   });
+  // 연결이 응답 전에 끊기면 사유(dyld·인증·설정 오류)는 stderr 에만 있다 — 꼬리를 남겨 종료 오류에 싣는다.
+  const stderr = createTailBuffer(4096);
+  child.stderr?.setEncoding("utf8").on("data", (chunk: string) => stderr.push(chunk));
+  const stderrClosed = new Promise<void>(resolve => { if (child.stderr) child.stderr.once("close", () => resolve()); else resolve(); });
   const rejectCalls = (reason = new Error("앱 연결이 종료됐습니다.")) => { for (const call of calls.values()) { clearTimeout(call.timer); call.reject(reason); } calls.clear(); };
   let ended = false;
   const end = (error?: unknown) => {
@@ -33,7 +39,16 @@ export async function nativeApps(command: string, authPath: string, cwd: string,
     if (error instanceof Error) failure ??= error;
     rejectCalls(failure instanceof Error ? failure : undefined);
   };
-  child.once("error", end); child.once("exit", end);
+  child.once("error", end);
+  child.once("exit", (code, exitSignal) => {
+    ended = true;
+    // exit 시점에는 stderr 파이프가 아직 열려 있을 수 있다. 닫힐 때까지(손자 프로세스가 붙잡으면 길어야 1초) 기다린 뒤 대기 호출을 사유와 함께 거부한다.
+    void Promise.race([stderrClosed, new Promise(resolve => setTimeout(resolve, 1000).unref())]).then(() => {
+      const tail = stderr.join().trim();
+      failure ??= new Error(redactSecrets(`앱 연결이 종료됐습니다(${exitSignal ?? `exit ${code}`})${tail ? `: ${tail}` : "."}`));
+      rejectCalls(failure as Error);
+    });
+  });
   child.stdin?.on("error", error => { failure ??= error; rejectCalls(error); });
   const receive = (line: Buffer) => {
     try {

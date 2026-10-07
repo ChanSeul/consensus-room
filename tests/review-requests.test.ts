@@ -58,3 +58,32 @@ describe("R2 confirmed answer revocation", () => {
     expect(pendingReviewRequests(records, 1)).toEqual([]);
   });
 });
+
+it("execution evidence resolves only its verified mediator request, never a policy question", () => {
+  const records = [question(), event(2, "codex", "agent_output", { resultKind: "REVIEW", findings: [],
+    requestedMediatorAction: "Run the authorized render" }), event(3, "user", "evidence", {}, "Render passed")];
+  const [policy, work] = pendingReviewRequests(records, 1);
+  expect(work.kind).toBe("mediator-work");
+  expect(pendingReviewRequests(records, 1)).toHaveLength(2);
+  const receipt = (sequence: number) => event(4, "system", "system", {
+    reviewRequestAnswers: [policy, work].map(request => ({ requestId: request.id, decisionSequence: sequence })), reviewAnswersThrough: 3 });
+  expect(pendingReviewRequests([...records, receipt(3)], 1).map(r => r.id)).toEqual([policy.id]);
+  expect(pendingReviewRequests([event(0, "user", "evidence"), ...records, receipt(0)], 1)).toHaveLength(2);
+  expect(pendingReviewRequests([records[0], records[1], { ...records[2], scopeGeneration: 2 }, receipt(3)], 1)).toHaveLength(2);
+});
+
+it("a verified mediator request stays resolved after an unrelated later decision", () => {
+  const records = [event(2, "codex", "agent_output", { resultKind: "REVIEW", findings: [], status: "completed",
+    requestedMediatorAction: "Run the authorized render" }), event(3, "user", "evidence", {}, "Render passed")];
+  const [work] = pendingReviewRequests(records, 1);
+  const verified = [...records, event(4, "system", "system", { reviewRequestAnswers: [{ requestId: work.id, decisionSequence: 3 }],
+    reviewAnswersThrough: 3, mediatorExecutionReview: true })];
+  expect(pendingReviewRequests(verified, 1)).toEqual([]);
+  expect(pendingReviewRequests([...verified, event(5, "user", "decision", {}, "Unrelated wording preference")], 1)).toEqual([]);
+  // A policy question answered by the same decision stays re-checkable by later decisions.
+  const policy = [question(1), ...verified.slice(0, 2)];
+  const [asked] = pendingReviewRequests(policy, 1).filter(request => request.kind !== "mediator-work");
+  const answered = [...policy, event(6, "user", "decision", {}, "채널 A"), event(7, "system", "system", {
+    reviewRequestAnswers: [{ requestId: asked.id, decisionSequence: 6 }], reviewAnswersThrough: 6 })];
+  expect(pendingReviewRequests([...answered, event(8, "user", "decision", {}, "채널 B로 번복")], 1).map(request => request.id)).toContain(asked.id);
+});

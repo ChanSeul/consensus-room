@@ -1,11 +1,16 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { AgentResult, Topic } from "../../shared/contracts.js";
 import type { EvidenceAssessment, EvidenceSource } from "../../shared/externalEvidence.js";
-import { evidenceHash, stableJSON } from "./store.js";
+import { evidenceHash, sourceManifest, stableJSON, type SourceManifest as Manifest } from "./store.js";
 
-type Manifest = Record<string, string | null>;
+// Sources whose content version differs. A source absent from `before` is new content (before null).
+export function changesBetween(before: Manifest, target: Manifest): EvidenceAssessment["changes"] {
+  return [...new Set([...Object.keys(before), ...Object.keys(target)])].filter(id => (before[id] ?? null) !== (target[id] ?? null))
+    .map(sourceId => ({ sourceId, before: before[sourceId] ?? null, after: target[sourceId] ?? null }));
+}
 export interface AssessmentReceipt { sessionId: string; routeBinding: string; planRevision: number; inputSequence: number; raw: AgentResult; accepted?: AgentResult; consumedAt?: number; resolutionActionId?: string }
 const binding = (topic: Topic) => stableJSON([topic.scopeGeneration, topic.planEpoch, topic.planSHA256]);
+const changeJobId = (topic: Topic, before: Manifest, target: Manifest) => evidenceHash(stableJSON([topic.id, binding(topic), topic.planRevision, before, target]));
 export class EvidenceAutomationStore {
   constructor(private readonly db: DatabaseSync) {
     db.exec(`CREATE TABLE IF NOT EXISTS evidence_auto_baselines(topic_id TEXT PRIMARY KEY,binding TEXT NOT NULL,manifest TEXT NOT NULL);
@@ -47,7 +52,7 @@ export class EvidenceAutomationStore {
     const existing = this.jobs(topic.id).find(job => job.id === id);
     if (existing) return existing;
     const job: EvidenceAssessment = { id, topicId: topic.id, binding: binding(topic), planRevision: topic.planRevision, digest, purpose: "plan-review",
-      changes: [], target: Object.fromEntries(sources.map(source => [source.id, source.contentHash])), status: "pending", createdAt: Date.now() };
+      changes: [], target: sourceManifest(sources), status: "pending", createdAt: Date.now() };
     this.save(job); return job;
   }
   retryPlanReview(topic: Topic, sources: EvidenceSource[], digest: string): void {
@@ -58,7 +63,7 @@ export class EvidenceAutomationStore {
   observe(topic: Topic, sources: EvidenceSource[], digest: string, retainMissing: readonly string[] = []): EvidenceAssessment | null {
     for (const job of this.jobs(topic.id).filter(job => job.status === "pending" && job.planRevision !== topic.planRevision))
       this.save({ ...job, status: "superseded" });
-    const target = Object.fromEntries(sources.map(source => [source.id, source.contentHash]));
+    const target = sourceManifest(sources);
     const previous = this.db.prepare("SELECT binding,manifest FROM evidence_auto_baselines WHERE topic_id=?").get(topic.id);
     if (!previous || previous.binding !== binding(topic) || topic.state === "CLOSED" || !topic.planSHA256) {
       for (const job of this.jobs(topic.id).filter(job => job.status === "pending" &&
@@ -72,9 +77,8 @@ export class EvidenceAutomationStore {
     // First complete observations establish a baseline; they are not edits to a previously observed source.
     for (const [id, hash] of Object.entries(target)) if (!before[id]) before[id] = hash;
     this.baseline(topic, before);
-    const changes = Object.keys(before).filter(id => before[id] && before[id] !== (target[id] ?? null))
-      .map(sourceId => ({ sourceId, before: before[sourceId]!, after: target[sourceId] ?? null }));
-    const id = evidenceHash(stableJSON([topic.id, binding(topic), topic.planRevision, before, target]));
+    const changes = changesBetween(before, target);
+    const id = changeJobId(topic, before, target);
     for (const old of this.jobs(topic.id).filter(job => job.status === "pending" && job.id !== id && job.purpose !== "plan-review")) this.save({ ...old, status: "superseded" });
     if (!changes.length) return null;
     const existing = this.jobs(topic.id).find(job => job.id === id);
@@ -84,6 +88,22 @@ export class EvidenceAutomationStore {
       return null;
     }
     const job: EvidenceAssessment = { id, topicId: topic.id, binding: binding(topic), planRevision: topic.planRevision, digest, changes, target, status: "pending", createdAt: Date.now() };
+    this.save(job); return job;
+  }
+  // An explicit resume reviews what changed since the plan's recorded review. The id is the observed change job's id
+  // over the same manifests, so a completed observation of exactly this change is reused instead of bought again.
+  reviewSince(topic: Topic, reviewed: Manifest, sources: EvidenceSource[], digest: string, retainMissing: readonly string[] = []): EvidenceAssessment | null {
+    this.recover(topic.id);
+    const target = sourceManifest(sources);
+    for (const id of retainMissing) if (!(id in target) && reviewed[id]) target[id] = reviewed[id];
+    const changes = changesBetween(reviewed, target);
+    if (!changes.length) return null;
+    const id = changeJobId(topic, reviewed, target);
+    const existing = this.jobs(topic.id).find(job => job.id === id);
+    if (existing?.status === "complete") return existing;
+    // The resume is the explicit request: a failed or superseded review of this change runs again.
+    const job: EvidenceAssessment = { id, topicId: topic.id, binding: binding(topic), planRevision: topic.planRevision, digest, changes, target,
+      status: "pending", createdAt: existing?.createdAt ?? Date.now() };
     this.save(job); return job;
   }
   start(job: EvidenceAssessment, actionId: string): boolean {

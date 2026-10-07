@@ -63,3 +63,22 @@ it("propagates already cancelled reads through every memory entry point", async 
     await expect(read()).rejects.toBe(reason);
   }
 });
+
+// 10-05 1fd0cc86: brew 가 node keg 를 바꾸는 동안 리더 자식이 dyld 단계에서 SIGABRT 로 죽었다. 파일 접근 차단이 아니라 호스트 런타임 고장이고, 사유(stderr)가 남아야 한다.
+it("classifies a reader runtime that dies before replying as a host runtime failure and keeps its stderr", async () => {
+  const dir = root(), bin = root();
+  writeFileSync(join(bin, "node"), "#!/bin/sh\necho 'dyld[1]: Library not loaded: /opt/homebrew/opt/simdjson/lib/libsimdjson.33.dylib' >&2\nkill -ABRT $$\n", { mode: 0o755 });
+  writeFileSync(join(dir, "AGENTS.md"), "rule");
+  // 리더는 읽을 때마다 PATH 의 node 를 띄운다(hostRuntime.ts) — PATH 앞에 가짜 런타임을 둔다.
+  const path = process.env.PATH;
+  process.env.PATH = `${bin}:${path ?? ""}`;
+  let failure: unknown;
+  try {
+    failure = await readAppliedInstructions({ workspace: dir, fileName: "AGENTS.md", injectWorkspaceFile: true }).catch((error: unknown) => error);
+  } finally {
+    if (path === undefined) delete process.env.PATH; else process.env.PATH = path;
+  }
+  expect(failure).not.toBeInstanceOf(UserFileAccessBlocked);
+  expect(failure).toMatchObject({ name: "HostRuntimeUnavailable" });
+  expect((failure as Error).message).toContain("libsimdjson.33.dylib");
+});

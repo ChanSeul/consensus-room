@@ -45,6 +45,9 @@ const spawned = (turn: SessionTurn) => turn.onProcessSpawn?.({ pid: 4242, pgid: 
 class ScriptedClaude implements AgentAdapter {
   readonly role = "claude" as const;
   readonly turns: ClaudeTurn[] = [];
+  // 확인형 교정(처분 하향 확인, 2026-10-06)의 질문 — 시나리오 단계를 소비하지 않고 직전 결과를 그대로 다시 내 철회를 확인한다. turns 가 아니라 여기 기록한다.
+  readonly confirmations: string[] = [];
+  private last: AgentResult | null = null;
   constructor(private readonly steps: Step[]) {}
   async validateExistingSession() { return true; }
   private created = 0;
@@ -58,11 +61,16 @@ class ScriptedClaude implements AgentAdapter {
   async resumeTurn(turn: SessionTurn) { return this.next("resume", turn); }
   private next(mode: ClaudeTurn["mode"], turn: SessionTurn): AgentResult {
     spawned(turn);
+    if (this.last && turn.prompt.includes("처분 하나를 확인합니다")) {
+      this.confirmations.push(turn.prompt);
+      return this.last;
+    }
     const recorded = { mode, prompt: turn.prompt, protocolOnly: Boolean(turn.protocolOnly), planMode: Boolean(turn.planMode), readablePaths: turn.readablePaths ?? [] };
     this.turns.push(recorded);
     const step = this.steps.shift();
     if (!step) throw new Error(`예상하지 않은 Claude 턴 #${this.turns.length}: ${turn.prompt.slice(0, 160)}`);
-    return step(recorded);
+    this.last = step(recorded);
+    return this.last;
   }
 }
 
@@ -1617,6 +1625,9 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(200);
     await r.idle("USER_DECISION_REQUIRED");
     expect(r.claude.turns).toHaveLength(2);
+    // 하향은 같은 세션에 한 번 되물었고(러너가 철회를 확인), 재시도는 저장된 수락 직전 결과로 다시 묻지 않는다.
+    expect(r.claude.confirmations).toHaveLength(1);
+    expect(r.claude.confirmations[0]).toContain("DG-1");
     expect(r.database.getFlags(r.topicId).fixPassUsed).toBe(false);
     expect((await r.diagnoses())[0].status).toBe("delivered");
     await r.app.close();
@@ -6366,12 +6377,11 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
   it("대조군: 같은 증거 정지(R2)에서 진단 없이 증거만 올리고 재시도해도 다음 최종 리뷰가 FC-2 의 합의 쟁점 F-2 를 수정 확인 없이 닫으면 되돌림 가드가 멈춘다 — 진단 적용 여부만 다른 두 경로의 판정이 같아야 한다(2026-09-15 감사 6차 #5)", { timeout: 90_000 }, async () => {
     const { r } = await g6dEvidenceStop("g6d-evidence-control");
     expect((await r.call("POST", `/api/topics/${r.topicId}/messages`, { kind: "evidence", body: "게이트 로그: logs/gate2.log — F-2 경로 확인용" })).status).toBe(200);
+    const used = r.database.reviews.account(r.topicId, "implementation").used;
     expect((await r.call("POST", `/api/topics/${r.topicId}/actions/retry`)).status).toBe(200);
-    await r.idle("USER_DECISION_REQUIRED");
-    expect(r.database.getTopic(r.topicId).lastError).toContain("리뷰 한도에 도달했습니다");
-    const { version } = r.database.reviews.account(r.topicId, "implementation");
-    expect((await r.call("POST", `/api/topics/${r.topicId}/actions/review-resume`, { scope: "implementation", version })).status).toBe(200);
+    // 증거 정지는 판정 아님(리뷰 원장 paused) — 같은 트리의 재시도는 같은 원장·같은 예약으로 다시 판정해 리뷰 한도를 새로 쓰지 않는다(2026-10-06).
     expect(await settledState(r, "g6d-evidence-control R3")).toBe("USER_DECISION_REQUIRED");
+    expect(r.database.reviews.account(r.topicId, "implementation").used).toBe(used);
     expect(r.database.getTopic(r.topicId).lastError).toContain("수정 확인 없이 닫았습니다(F-2)");
     expect(r.database.getFlags(r.topicId).resumeState).toBe("CODEX_FINAL_REVIEW");
     await r.app.close();
@@ -6589,6 +6599,9 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
       }
     }
     const r = await room("r10-partial-answer", [], { codexInstance: new TwoQuestions() });
+    // 결정을 청한 리뷰는 판정 아님(원장 paused)이라 결정 없는 재시도의 리뷰는 같은 예약을 잇는다(2026-10-06) — 답변 확인이 한도에 닿는 지점을 종전과 맞추려고
+    // 구현 리뷰 한도를 2로 둔다(리뷰 1회 + 답변 확인 1회 뒤 두 번째 답변 확인이 한도에 걸린다).
+    r.database.reviews.configure(r.topicId, "implementation", 2, r.database.reviews.account(r.topicId, "implementation").version);
     r.claude["steps"].push(() => { writeFileSync(join(r.worktree, "feature.txt"), "구현\n"); return result("IMPLEMENTATION", "완료", { status: "completed" }); });
     await r.call("POST", `/api/topics/${r.topicId}/actions/implement`);
     await r.idle("USER_DECISION_REQUIRED");
@@ -6738,8 +6751,8 @@ describe("중재자 진단 — 작업을 보존하는 계획 개정(2단계)과 
         if (turn.prompt.includes("서버 기계 검사가 방금 응답을 거부했습니다") && this.lastIncomplete) {
           spawned(turn);
           this.prompts.push(turn.prompt);
-          // completed + 남은 검토의 모순만 바로잡는다. 자료 없이 남은 검토를 완료한 척하지 않는다.
-          return { ...this.lastIncomplete, status: "in_progress" };
+          // 완료 보고 계약대로 바로잡는다 — 자료 없이 남은 검토를 완료한 척하지 않고, 끝내지 못한 이유를 요청 필드(사용자 결정)로 밝힌다(D2).
+          return { ...this.lastIncomplete, status: "in_progress", requestedUserDecision: "인증 계약 자료가 어디 있는지 알려 주세요." };
         }
         const review = await super.resumeTurn(turn);
         if (review.kind !== "FINAL_REVIEW") return review;

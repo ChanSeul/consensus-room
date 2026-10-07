@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { maxCharacters } from "./textLimits.js";
 
 // 허용 오차(tolerance) — 승인 범위 밖 변경을 "파일 단위 결정" 대신 "부류 규칙 + 기계 술어 + 원장" 으로 허용한다.
 // 2026-09-08 사용자 요청: 러너가 구현 중 만나는 범위 밖 요구(다른 단계 소유 파일의 표기 한 줄 등)마다 멈추면
@@ -53,8 +54,8 @@ export const TolerancePolicySchema = z.object({
 export type TolerancePolicy = z.infer<typeof TolerancePolicySchema>;
 
 export const ToleranceLedgerEntrySchema = z.object({
-  ruleId: z.string().trim().min(1).max(20),
-  file: z.string().trim().min(1).max(500),
+  ruleId: maxCharacters(z.string().trim().min(1), 20),
+  file: maxCharacters(z.string().trim().min(1), 500),
   // 설명용 메모는 실행 판단에 쓰지 않는다 — 길이로 턴을 거부하지 않는다(R08·F09). 저장 크기는 원장 행 수(정책)가 제한한다.
   note: z.string().default(""),
 });

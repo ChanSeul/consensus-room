@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import { HostRuntimeUnavailable, resolveHostExecutable } from "./hostRuntime.js";
+import { createTailBuffer } from "./processRunner.js";
 
 export class UserFileAccessBlocked extends Error {
   constructor(readonly path: string, detail: string) {
@@ -72,11 +74,19 @@ async function read(request: Request, options: UserFileReadOptions): Promise<str
   options.signal?.throwIfAborted();
   const timeoutMs = options.timeoutMs ?? 5000;
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("User file deadline must be positive and finite.");
+  // 리더 런타임은 읽을 때마다 PATH 에서 푼다 — 부팅 때의 process.execPath 는 brew 가 node keg 를 바꾸면 사라진다(2026-10-05).
+  // 워커는 node:fs/promises·node:path·process·setTimeout·Buffer·JSON 만 쓰므로 서버와 node 버전이 달라도 된다.
+  const node = (await resolveHostExecutable("node")).realPath;
   return new Promise((resolve, reject) => {
     const env = { ...process.env };
     delete env.NODE_OPTIONS;
-    const child = spawn(process.execPath, ["-e", worker, JSON.stringify({ ...request, deadlineMs: timeoutMs })], { env, stdio: ["ignore", "pipe", "ignore"] });
-    child.once("error", reject);
+    const child = spawn(node, ["-e", worker, JSON.stringify({ ...request, deadlineMs: timeoutMs })], { env, stdio: ["ignore", "pipe", "pipe"] });
+    // 기동 실패(dyld abort·ENOENT)의 사유는 stderr 에만 있다 — 꼬리를 남긴다.
+    const stderr = createTailBuffer(4096);
+    child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk.toString("utf8")));
+    // 실행 파일 자체를 쓸 수 없을 때(해석 직후 keg 가 지워진 경쟁 등)만 런타임 고장이다. fd 고갈(EMFILE) 같은 서버 자원 오류는 원래 오류 그대로 둔다.
+    child.once("error", (error: NodeJS.ErrnoException) =>
+      reject(error.code === "ENOENT" || error.code === "EACCES" ? new HostRuntimeUnavailable("node", node, error.message) : error));
     if (!child.stdout) return;
     const chunks: Buffer[] = [];
     const outputLimit = request.operation === "memoryBatch" ? 1024 + request.paths!.length * request.maxBytes! * 16 : 2 * 1024 * 1024;
@@ -99,7 +109,8 @@ async function read(request: Request, options: UserFileReadOptions): Promise<str
       clearTimeout(timer);
       options.signal?.removeEventListener("abort", abort);
       if (failure !== undefined) { reject(failure); return; }
-      if (code !== 0) { reject(new UserFileAccessBlocked(request.path, signal ?? `reader exited ${code}`)); return; }
+      // 워커는 정상이면 JSON 한 줄을 쓰고 0 으로 끝난다. 우리가 멈추지 않은 비정상 종료는 파일 접근이 아니라 런타임 고장이다.
+      if (code !== 0) { reject(new HostRuntimeUnavailable("node", node, `${signal ?? `exit ${code}`}: ${stderr.join().trim() || "(no stderr)"}`)); return; }
       try {
         const reply = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { value?: string | null; error?: { code: string; path: string } };
         if (reply.error) {

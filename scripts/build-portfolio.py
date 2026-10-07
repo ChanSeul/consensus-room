@@ -71,12 +71,12 @@ def main():
         specs.append((title, spec))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_suffix('.pending.pdf')
-    os.environ['SOURCE_DATE_EPOCH'] = str(int(datetime(2026, 10, 5, tzinfo=timezone.utc).timestamp()))
+    os.environ['SOURCE_DATE_EPOCH'] = str(int(datetime(2026, 10, 6, tzinfo=timezone.utc).timestamp()))
     c = canvas.Canvas(str(temporary), pagesize=A4, pageCompression=1, invariant=1)
     c.setTitle('Consensus Room | AI 개발 작업 관리')
     c.setAuthor('조찬슬')
     c.setCreator('Consensus Room vector portfolio renderer')
-    c.setSubject('계층별 책임·승인된 연속 실행·자료 수집과 복구 | 2026-10-05')
+    c.setSubject('계층별 책임·승인된 연속 실행·자료 수집과 복구·자동화의 한계 | 2026-10-06')
     c.setKeywords('Consensus Room, Claude, Codex, 워크플로, 계층 계약, 복구, 시각화')
     counts = []
 
@@ -227,7 +227,7 @@ def main():
                 y += text(paragraph,MARGIN,y,CW,10.8,max_h=766-y) + 9
             y += 7
         text(spec.get('source',''),MARGIN,776,CW,6.8,ink=MUTED,max_h=22)
-        text('조찬슬  ·  2026.10.05',MARGIN,815,CW-60,7,ink=MUTED,max_h=12)
+        text('조찬슬  ·  2026.10.06',MARGIN,815,CW-60,7,ink=MUTED,max_h=12)
         text(f'{index} / {len(specs)}',W-MARGIN-60,815,60,7,ink=MUTED,align=2,max_h=12)
         counts.append(len(spec['elements'])+len(spec.get('graph',{}).get('nodes',[])));c.showPage()
     c.save();temporary.replace(args.output)

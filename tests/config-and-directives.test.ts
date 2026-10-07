@@ -63,6 +63,24 @@ describe("데이터 디렉터리 환경변수 방어(2026-09-08 빈 DB 사고)",
   });
 });
 
+describe("상시 참조 문서 설정", () => {
+  it.each([undefined, "", "  "])("환경변수가 없거나 비어 있으면(%j) 싣지 않는다", value => {
+    vi.stubEnv("CONSENSUS_ROOM_STANDING_REFERENCE", value);
+    expect(loadConfig({ dataDirectory: tmpdir() }).standingReferencePath).toBeNull();
+  });
+
+  it("정규화된 절대 경로는 지시문 링크와 같은 문자열 그대로 쓴다", () => {
+    const path = "/Users/someone/Library/Mobile Documents/com~apple~CloudDocs/shared/design-philosophy.md";
+    vi.stubEnv("CONSENSUS_ROOM_STANDING_REFERENCE", path);
+    expect(loadConfig({ dataDirectory: tmpdir() }).standingReferencePath).toBe(path);
+  });
+
+  it.each(["docs/design-philosophy.md", "/Users/someone/../design-philosophy.md", "/Users/someone/docs/"])("정규화된 절대 경로가 아니면 기동을 거부한다(%s)", value => {
+    vi.stubEnv("CONSENSUS_ROOM_STANDING_REFERENCE", value);
+    expect(() => loadConfig({ dataDirectory: tmpdir() })).toThrow("정규화된 절대 경로");
+  });
+});
+
 describe("재계획 지시 판정(2026-09-07 'REPLAN 아님' 사고)", () => {
   it("줄 머리 또는 본문 끝의 REPLAN 만 지시로 본다", () => {
     expect(replanDirective("REPLAN — 전제가 바뀌었다")).toBe(true);

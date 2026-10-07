@@ -6,57 +6,40 @@ import { parseArgs, promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 import { z } from "zod";
 import { defaultDataDirectory } from "./config.js";
-import { executeVerification } from "./verificationRunner.js";
 import { STATIC_PROFILE_ID, STATIC_SCRIPT_SHA256, staticProfileSchema } from "./verificationInputs.js";
-import type { PreparedVerification, VerificationCompletion, VerificationRun } from "./verifications.js";
+import { driveVerification, type PreparedVerification, type VerificationCompletion, type VerificationRun } from "./verifications.js";
 
 type Request = <T>(path: string, body?: unknown, key?: string) => Promise<T>;
 
+// 중재자 CLI 의 정적 검사 — 엔진과 같은 드라이버(verifications.driveVerification)를 인증 API 로 돈다. 완료 등록 전에 결과를 보류 파일로 남겨 등록 응답이
+// 유실돼도 --complete 로 같은 실행을 재등록한다.
 export async function runMediatorVerification(topicId: string, request: Request, pendingDirectory: string, signal?: AbortSignal) {
   const base = `/api/topics/${encodeURIComponent(topicId)}/verifications`;
-  let prepared: PreparedVerification;
-  while (true) {
-    if (signal?.aborted) throw new Error("검사 대기가 취소되었습니다.");
-    prepared = await request<PreparedVerification>(`${base}/prepare`, {}, randomUUID());
-    if (prepared.disposition !== "busy") break;
-    const deadline = Date.now() + 95_000;
-    while (Date.now() < deadline) {
-      await wait(300, signal);
-      const runs = await request<VerificationRun[]>(base);
-      const current = runs.find((run) => run.id === prepared.run.id);
-      if (!current) throw new Error("대기 중인 검사 기록이 사라졌습니다.");
-      if (current.status === "running") continue;
-      if (current.status === "failed") return { reused: false, run: current };
-      break;
-    }
-  }
-  if (prepared.disposition === "reused") return { reused: true, run: prepared.run };
-  if (!prepared.execution) throw new Error("검사 실행 명세가 없습니다.");
-  const completion = await executeVerification(prepared.execution, signal);
-  await mkdir(pendingDirectory, { recursive: true, mode: 0o700 });
-  const path = join(pendingDirectory, `${prepared.run.id}.json`);
-  const temporary = `${path}.${randomUUID()}.tmp`;
-  await writeFile(temporary, JSON.stringify({ topicId, runId: prepared.run.id, completion }), { mode: 0o600 });
-  await rename(temporary, path);
-  const run = await request<VerificationRun>(`${base}/${prepared.run.id}/complete`, completion, prepared.run.id);
-  await unlink(path);
-  return { reused: false, run };
+  const pendingPath = (runId: string) => join(pendingDirectory, `${runId}.json`);
+  const result = await driveVerification({
+    prepare: () => request<PreparedVerification>(`${base}/prepare`, {}, randomUUID()),
+    list: () => request<VerificationRun[]>(base),
+    complete: async (runId, completion) => {
+      const run = await request<VerificationRun>(`${base}/${runId}/complete`, completion, runId);
+      await unlink(pendingPath(runId));
+      return run;
+    },
+  }, signal, async (run, completion) => {
+    await mkdir(pendingDirectory, { recursive: true, mode: 0o700 });
+    const path = pendingPath(run.id);
+    const temporary = `${path}.${randomUUID()}.tmp`;
+    await writeFile(temporary, JSON.stringify({ topicId, runId: run.id, completion }), { mode: 0o600 });
+    await rename(temporary, path);
+  });
+  // 정적 검사의 입력에는 등록된 검사 스크립트가 늘 있다 — 대상 없음은 입력 수집이 깨졌다는 뜻이다.
+  if ("noTargets" in result) throw new Error("정적 검사 입력이 없습니다.");
+  return result;
 }
 
 function reportExpiredLease(run: VerificationRun): void {
   if (run.status === "timed_out" && !run.completionSHA256) {
     process.stderr.write("검사 실행의 90초 리스가 만료되어 완료 결과를 등록하지 않았습니다. --topic으로 새 검사를 시작하세요.\n");
   }
-}
-
-async function wait(ms: number, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted) throw new Error("검사 대기가 취소되었습니다.");
-  await new Promise<void>((resolveWait, reject) => {
-    const finish = () => { signal?.removeEventListener("abort", abort); resolveWait(); };
-    const timer = setTimeout(finish, ms);
-    const abort = () => { clearTimeout(timer); signal?.removeEventListener("abort", abort); reject(new Error("검사 대기가 취소되었습니다.")); };
-    signal?.addEventListener("abort", abort, { once: true });
-  });
 }
 
 async function installProfile(dataDirectory: string, python: string) {

@@ -1,6 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { describe, it, expect } from "vitest";
-import { BudgetLedger } from "../src/server/budgetLedger";
+import { BudgetBlocked, BudgetLedger } from "../src/server/budgetLedger";
 import { calibrateBudget } from "../src/shared/budgets";
 const policy = {execution:{inputTokens:100,outputTokens:20,durationMs:10000},total:{inputTokens:200,outputTokens:40,durationMs:30000}};
 it("explicitly resumes a finished execution without enlarging or refunding any allowance",()=>{
@@ -23,6 +23,28 @@ it("explicitly resumes a finished execution without enlarging or refunding any a
  expect(()=>ledger.resumeExecution("t","exhausted","next",2)).toThrow("누적 예산");
  expect(()=>ledger.resumeExecution("t","resume","next",2)).toThrow("같은 요청 키");
  expect(()=>ledger.assertAvailable(["t"])).toThrow();db.close();
+});
+it("names why a new execution cannot open: a live run waits, unsettled usage needs confirmation, the budget needs a decision",()=>{
+ const db=new DatabaseSync(":memory:"),ledger=new BudgetLedger(db);ledger.configure("t",policy,"test",0);
+ const refusal=()=>{try{ledger.assertAvailable(["t"]);return null;}catch(error){return error instanceof BudgetBlocked?[error.reason,error.message]:String(error);}};
+ ledger.start({id:"live",accounts:["t"],stage:"IMPLEMENTING",role:"claude",model:"m",effort:"xhigh",startedAt:0,dispatchStarted:true});
+ // Started but not yet entered by its run: no live run vouches for it.
+ expect(refusal()).toEqual(["unsettled","집계가 끝나지 않은 실행이 있습니다. 중단된 실행을 확인하고 재개하세요."]);
+ ledger.enter("live");
+ expect(refusal()).toEqual(["running","같은 예산 계정의 다른 실행이 진행 중입니다. 그 실행이 끝난 뒤 다시 시작하세요."]);
+ expect(()=>ledger.start({id:"next",accounts:["t"],stage:"IMPLEMENTING",role:"claude",model:"m",effort:"xhigh",startedAt:1})).toThrow("진행 중");
+ ledger.leave("live");
+ expect(refusal()?.[0]).toBe("unsettled");
+ // A reopened ledger (next server) has no live run at all.
+ expect((()=>{try{new BudgetLedger(db).assertAvailable(["t"]);}catch(error){return (error as BudgetBlocked).reason;}})()).toBe("unsettled");
+ expect(ledger.resumeStep(["t"])).toBe("중단된 실행의 집계를 확인한 뒤 재개하세요.");
+ ledger.enter("live");
+ expect(ledger.resumeStep(["t"])).toBe("같은 예산 계정의 다른 실행이 끝난 뒤 재개하세요.");
+ ledger.leave("live");
+ ledger.observe("live",{inputTokens:250},2,true);
+ expect(refusal()?.[0]).toBe("budget");
+ expect(ledger.resumeStep(["t"])).toBe("토큰·시간 예산도 추가한 뒤 재개하세요.");
+ expect(ledger.resumeStep(["fresh"])).toBeNull();db.close();
 });
 it("resuming one account cannot release a shared account or an unfinished overlapping execution",()=>{
  const db=new DatabaseSync(":memory:"),ledger=new BudgetLedger(db);

@@ -261,3 +261,40 @@ it("reconciles captured CLI advisor execution and disabled resume without rebill
     baseline = { sessionId: result.session_id!, modelUsage: result.modelUsage!, totalCostUSD: result.total_cost_usd!, totalAPIDuration: result.duration_api_ms! };
   }
 });
+
+describe("request input with advisor iterations", () => {
+  // With server-side advisor calls the top-level usage of one message sums its executor requests; count each request.
+  it("uses the largest executor iteration of the captured CLI advisor run", () => {
+    const meter = new ExecutionMetrics("claude", 1, "test", "max", false, Date.now());
+    for (const event of advisorFixture.runs[0].events) meter.observe(event);
+    const usage = meter.snapshot({ toolDurationMs: 0, toolCalls: 0 }, "final");
+    expect([usage.lastRequestInputTokens, usage.peakRequestInputTokens]).toEqual([2958, 2958]);
+    expect(usage.inputTokens).toBe(9754);
+  });
+
+  it("does not report the summed executor iterations of a production planning response as one request", () => {
+    // Usage of a fable planning response with one advisor call (runner transcript c1877317, 2026-10-07 01:13).
+    const meter = new ExecutionMetrics("claude", 1, "test", "max", true, Date.now());
+    meter.observe({ type: "stream_event", event: { type: "message_start", message: { id: "m", usage: {
+      input_tokens: 2, cache_read_input_tokens: 443473, cache_creation_input_tokens: 45158, output_tokens: 1 } } } });
+    meter.observe({ type: "stream_event", event: { type: "message_delta", usage: {
+      input_tokens: 4, cache_read_input_tokens: 932104, cache_creation_input_tokens: 47739, output_tokens: 33737, iterations: [
+        { type: "message", input_tokens: 2, cache_read_input_tokens: 443473, cache_creation_input_tokens: 45158, output_tokens: 784 },
+        { type: "advisor_message", input_tokens: 489562, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 13426 },
+        { type: "message", input_tokens: 2, cache_read_input_tokens: 488631, cache_creation_input_tokens: 2581, output_tokens: 32953 },
+      ] } } });
+    meter.observe({ type: "assistant", message: { id: "m", usage: {
+      input_tokens: 4, cache_read_input_tokens: 932104, cache_creation_input_tokens: 47739, output_tokens: 33737 } } });
+    const usage = meter.snapshot({ toolDurationMs: 0, toolCalls: 0 }, "progress");
+    expect([usage.lastRequestInputTokens, usage.peakRequestInputTokens]).toEqual([491214, 491214]);
+    expect(usage.inputTokens).toBe(4 + 932104 + 47739 + 489562);
+  });
+
+  it("falls back to the top-level usage when iterations are empty", () => {
+    const meter = new ExecutionMetrics("claude", 1, "test", "max", true, Date.now());
+    meter.observe({ type: "assistant", message: { id: "m", usage: {
+      input_tokens: 2, cache_read_input_tokens: 343017, cache_creation_input_tokens: 2481, output_tokens: 417, iterations: [] } } });
+    const usage = meter.snapshot({ toolDurationMs: 0, toolCalls: 0 }, "progress");
+    expect([usage.lastRequestInputTokens, usage.peakRequestInputTokens]).toEqual([345500, 345500]);
+  });
+});

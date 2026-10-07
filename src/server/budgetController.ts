@@ -86,12 +86,14 @@ export class BudgetController {
         const accounts=this.ledger.observe(id,observed);
         const paused=accounts.find(a=>a.pause);
         if(paused?.pause && Date.now()>=paused.pause.deadline) {
-          failure=new BudgetBlocked(paused.id,paused.pause.reason); controller.abort(failure);
+          failure=new BudgetBlocked(paused.id,"budget",paused.pause.reason); controller.abort(failure);
         }
       } catch(error) { failure=error; controller.abort(error); }
     };
     const timer=setInterval(()=>observe({}),1000);
     try {
+      // Live from here until finally: a same-account start meanwhile is refused as running, not as unsettled usage.
+      this.ledger.enter(id);
       const result=await invoke({...preparedTurn,executionBudget,signal:controller.signal,
         // Persist before spawn (not merely in its callback), closing the crash-between-spawn-and-record gap.
         admitSync:()=>{turn.admitSync?.();this.ledger.markDispatching(id);},
@@ -116,8 +118,13 @@ export class BudgetController {
       throw failure??error;
     } finally {
       clearInterval(timer);turn.signal?.removeEventListener("abort",abort);
-      this.ledger.observe(id,{...observed,durationMs:Date.now()-startedAt},Date.now(),
-        !turn.requiresFinalUsage || finalUsage || !this.ledger.execution(id).dispatchStarted);
+      try {
+        this.ledger.observe(id,{...observed,durationMs:Date.now()-startedAt},Date.now(),
+          !turn.requiresFinalUsage || finalUsage || !this.ledger.execution(id).dispatchStarted);
+      } finally {
+        // An unfinished execution after this is unsettled usage, never a live one, even if the observation threw.
+        this.ledger.leave(id);
+      }
     }
   }
 }

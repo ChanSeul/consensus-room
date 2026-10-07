@@ -64,7 +64,8 @@ export interface EvidenceAssessment {
   purpose?: "plan-review";
   id: string; topicId: string; binding: string; digest: string;
   planRevision?: number;
-  changes: Array<{ sourceId: string; before: string; after: string | null }>;
+  // before null: content added since the base (a new source, or one first collected after it).
+  changes: Array<{ sourceId: string; before: string | null; after: string | null }>;
   target: Record<string, string | null>;
   status: "pending" | "running" | "complete" | "failed" | "superseded";
   createdAt: number; actionId?: string; finishedAt?: number;

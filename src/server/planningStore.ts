@@ -70,7 +70,9 @@ export interface ReviewLedgerIdentity {
 
 // 코드 리뷰 원장(E3-4c) — 논리 리뷰 한 번의 호스트 소유 기록. id 가 곧 ReviewLedger 예약 ID 다(읽기·최종 판정 호출이 같은 ID 로 예약해 리뷰 1회).
 // 인정 구간은 여기 두지 않는다 — 세션별 전달 인정(planning_reference_reads)이 정본이고, 같은 세션은 남은 공백부터 잇는다.
-// status: open(판정 전) → judged(최종 판정 호출이 판정을 돌려줌 — 이 ID 는 닫힌다) → completed(완료 리뷰 + 원장 전 구간 인정 + 같은 tree/계약).
+// status: open(판정 전) → paused(판정 호출이 돌아왔지만 판정 아님 — 근거·결정·중재자 대기, 판정 전 필수 구간 미인정, 분류 전 중단. 같은 신원의 재개가 같은 ID·같은
+// 예약으로 다시 연다) → completed(리뷰 판정기가 판정에 도달 — 수정·통과·판정 대기 정지. 이 ID 는 닫힌다). judged 는 옛 행(판정 반환이면 무조건 닫던 시절)의
+// 읽기 전용 값이며 닫힘으로 본다.
 // 세션별 수신 기록(E3-4c host-review 39d21df9 F003·F004) — 원장(논리 리뷰 1회)과 별개로 "그 세션이 무엇을 받았는가"를 세션 id 로 둔다. 프로토콜 턴(도구·지시문·
 // 메모리 없음 — ack·완료 확인·답변 확인·리뷰 읽기)이 만든 세션만 기록을 가진다: 만든 순간 두 수신이 모두 없다. 기록이 없는 세션(일반 턴이 만든 세션, 배포 전
 // 세션)은 종전 의미 그대로 둘 다 받은 것으로 본다 — 이미 쓰던 세션에 본문을 다시 싣지 않는다.
@@ -96,9 +98,14 @@ export interface ReviewLedgerRecord extends ReviewLedgerIdentity {
   spawned: boolean;
   // 정상 반환한 읽기 호출 수(원장 단위 누적 — 재시도·세션 복구로 늘어난 추가 호출도 센다).
   reads: number;
-  status: "open" | "judged" | "completed";
+  status: "open" | "paused" | "judged" | "completed";
   createdAt: string;
   updatedAt: string;
+}
+
+// 같은 신원의 재개가 이어 쓸 수 있는 원장(판정 전·판정 아님). 원장 열기(openReviewLedger)와 재개의 예약 보유 판정(core.heldReviewLedger)이 같은 정의를 쓴다.
+export function isResumableReviewLedger(record: Pick<ReviewLedgerRecord, "status">): boolean {
+  return record.status === "open" || record.status === "paused";
 }
 
 export class PlanningStore {
@@ -255,14 +262,24 @@ export class PlanningStore {
   }
   // ---- 코드 리뷰 원장(E3-4c) — 논리 리뷰 한 번 = 호스트 소유 ID 하나 = 리뷰 1회 예약. 주제마다 가장 최근에 연 원장 한 행만 살아 있다. ----
 
-  // 지금 논리 리뷰의 원장. 가장 최근 원장이 판정 전(open)이고 신원이 같으면 그것을 잇는다(재시작·DB 다시 열기·재시도·세션 복구가 같은 ID·같은 예약을
-  // 쓴다). 판정이 끝났거나(judged·completed — 같은 ID 로 판정을 되풀이하지 않는다) 신원이 다르면(새 tree·새 계약·다른 리뷰 종류) 새 ID 로 연다. 옛 원장은
-  // 더 이상 최신이 아니므로 다시 이어지지 않는다(tree 가 되돌아가도 새 원장이다). 한 INSERT 라 중간 상태가 없다.
-  openReviewLedger(identity: ReviewLedgerIdentity): ReviewLedgerRecord {
+  // 같은 신원의 재개가 이어 쓸 원장 — 가장 최근 원장이 판정 전(open)이거나 판정 아님으로 멈췄고(paused) 신원(리뷰 종류·범위 세대·계획 epoch·계획 SHA·
+  // 검토 tree·보고판)이 같을 때만 그것, 아니면 null. 부수효과가 없다 — 원장 열기와 재개의 예약 보유 판정이 이 조회 하나를 쓴다. 판정에 도달해 닫혔거나
+  // (completed, 옛 행의 judged) 신원이 다르면(새 tree·새 계약·다른 리뷰 종류) 새 논리 리뷰다. 옛 원장은 더 이상 최신이 아니므로 다시 이어지지 않는다
+  // (tree 가 되돌아가도 새 원장이다).
+  resumableReviewLedger(identity: ReviewLedgerIdentity): ReviewLedgerRecord | null {
     const latest = this.latestReviewLedger(identity.topicId);
-    if (latest && latest.status === "open" && latest.kind === identity.kind && latest.scopeGeneration === identity.scopeGeneration
+    return latest && isResumableReviewLedger(latest) && latest.kind === identity.kind && latest.scopeGeneration === identity.scopeGeneration
       && latest.planEpoch === identity.planEpoch && latest.planSHA256 === identity.planSHA256 && latest.reviewedTree === identity.reviewedTree
-      && latest.reportRevision === identity.reportRevision) return latest;
+      && latest.reportRevision === identity.reportRevision ? latest : null;
+  }
+  // 지금 논리 리뷰의 원장 — 이어 쓸 원장이 있으면 그것(판정 아님으로 멈춘 원장은 open 으로 되살린다 — 같은 ID 라 ReviewLedger 예약은 멱등, 리뷰 횟수를 새로
+  // 쓰지 않는다), 없으면 새 ID 로 연다(한 INSERT 라 중간 상태가 없다). 재시작·DB 다시 열기·재시도·세션 복구가 같은 ID·같은 예약을 쓴다.
+  openReviewLedger(identity: ReviewLedgerIdentity): ReviewLedgerRecord {
+    const resumable = this.resumableReviewLedger(identity);
+    if (resumable) {
+      if (resumable.status === "paused") this.updateReviewLedger(resumable.id, (record) => record.status === "paused" && Boolean(record.status = "open"));
+      return this.reviewLedger(resumable.id)!;
+    }
     const at = new Date().toISOString();
     const record: ReviewLedgerRecord = { ...identity, id: randomUUID(), createdSessions: [], session: null, spawned: false, reads: 0, status: "open",
       createdAt: at, updatedAt: at };
@@ -298,11 +315,12 @@ export class PlanningStore {
   noteReviewLedgerRead(id: string, sessionId: string): void {
     this.updateReviewLedger(id, (record) => { record.reads += 1; record.session = sessionId; return true; });
   }
-  // 최종 판정 호출이 판정을 돌려줬다 — 완료 여부와 무관하게 이 ID 는 닫힌다(다음 리뷰는 새 ID·새 예약).
-  judgeReviewLedger(id: string): void {
-    this.updateReviewLedger(id, (record) => record.status === "open" && Boolean(record.status = "judged"));
+  // 판정 호출이 돌아왔지만 아직 판정이 아니다(돌아온 직후 분류 전, 판정 전 필수 구간 미인정, 리뷰 판정기의 근거·결정·중재자 대기) — 같은 신원의 재개가 같은
+  // ID 로 이어 판정한다(새 리뷰 1회를 예약하지 않는다). 판정에 도달해 닫힌 원장은 되돌리지 않는다.
+  pauseReviewLedger(id: string): void {
+    this.updateReviewLedger(id, (record) => record.status === "open" && Boolean(record.status = "paused"));
   }
-  // 완료 판정(완료 리뷰 + 원장 전 구간 인정 + 같은 tree/계약) — 이때만 리뷰 커서·완료 산출물·재사용이 열린다.
+  // 리뷰 판정기가 판정에 도달했다(수정·통과·판정 대기 정지) — 이 ID 는 닫히고 다음 리뷰는 새 ID·새 예약이다.
   completeReviewLedger(id: string): void {
     this.updateReviewLedger(id, (record) => record.status !== "completed" && Boolean(record.status = "completed"));
   }

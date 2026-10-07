@@ -241,7 +241,7 @@ function createJSONLineBuffer(): JSONLineBuffer {
 
 // 문자열 이어붙이기(current + chunk)는 8MB 상한에서 chunk마다 전체를 복사해 O(n^2)가 된다(감사 최적화 지적).
 // 조각 배열에 쌓고 상한을 넘으면 앞에서 버리는 ring 방식으로 바꾸고, 문자열은 종료 시 한 번만 합친다.
-interface TailBuffer {
+export interface TailBuffer {
   push(chunk: string): void;
   join(): string;
 }
@@ -256,7 +256,8 @@ function notifyJSONLine(spec: CommandSpec, value: unknown): void {
   }
 }
 
-function createTailBuffer(limit: number): TailBuffer {
+// 자식 출력의 상한 있는 꼬리 — 실행기·리더·앱 연결이 같은 구현을 쓴다.
+export function createTailBuffer(limit: number): TailBuffer {
   const chunks: string[] = [];
   let size = 0;
   return {

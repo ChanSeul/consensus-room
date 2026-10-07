@@ -1,8 +1,8 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import * as fsPromises from "node:fs/promises";
-import { isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { afterEach } from "vitest";
 import { describe, expect, it, vi } from "vitest";
 
@@ -16,6 +16,7 @@ import { DatabaseSync } from "node:sqlite";
 import { BudgetLedger } from "../src/server/budgetLedger";
 import { BudgetController } from "../src/server/budgetController";
 import { ExecutionMetrics, readClaudeUsageBaseline } from "../src/server/adapters/executionMetrics";
+import { hostCliPath } from "./setup/hostExecutables";
 
 vi.mock("node:fs/promises", async importOriginal => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
@@ -302,8 +303,11 @@ describe("에이전트별 권한 경계", () => {
     const request = schema.properties.planningStep.properties.requests.items;
     expect(request.required).toContain("rereadReason");
     expect(request.properties.rereadReason.anyOf).toContainEqual({ type: "null" });
+    // 범위 끝도 반드시 밝힌다 — null 은 원문 끝까지다(필드가 없는 값은 배포 전 저장 요청의 한 쪽 계약으로만 남는다).
+    expect(request.required).toContain("end");
+    expect(request.properties.end.anyOf).toContainEqual({ type: "null" });
     expect(PlanningStepSchema.safeParse({ draft: "", facts: [], contradictions: [], questions: [],
-      requests: [{ kind: "file", selector: "form.swift", question: "Check", offset: 0, rereadReason: null }],
+      requests: [{ kind: "file", selector: "form.swift", question: "Check", offset: 0, end: null, rereadReason: null }],
       complete: false }).success).toBe(true);
   });
 
@@ -438,6 +442,100 @@ describe("에이전트별 권한 경계", () => {
     expect(runner.calls[1].args).toContain("fast-review-thread");
     expect(runner.calls[2].args.some(arg => arg.startsWith("service_tier=") || arg.startsWith("features.fast_mode="))).toBe(false);
   });
+
+  // 2026-10-03 f82dbc0e seq 119: Codex 리뷰의 승인된 swiftc -parse 가 xcrun 캐시 쓰기 거부로 permissionDenied 로 끝났다. Claude 는 모든 턴에 턴별 임시
+  // 디렉터리를 TMPDIR 로 주고 그 경로만 쓰기로 연다(claude.ts actionTemp) — Codex 도 같은 계약이어야 한다.
+  it.each([false, true])("Codex 턴도 턴별 임시 디렉터리를 TMPDIR 로 받고 프로필은 그 경로만 쓰기로 열며 턴이 끝나면 지운다(쓰기 턴: %s)", async (implementation) => {
+    let seen: { tmp?: string; real?: string; cache?: string; existed?: boolean; existedLater?: boolean; config?: string } = {};
+    const runner: CommandRunner = { run: async spec => {
+      const tmp = spec.environment?.TMPDIR;
+      seen = { tmp, real: tmp && existsSync(tmp) ? realpathSync(tmp) : undefined, cache: spec.environment?.XDG_CACHE_HOME, existed: tmp ? existsSync(tmp) : false,
+        config: readFileSync(join(String(spec.environment?.CODEX_HOME), "config.toml"), "utf8") };
+      // 실행이 이어지는 동안에도 남아 있어야 한다 — 반환을 await 하지 않으면 finally 가 이 사이에 지운다.
+      await new Promise(resolve => setTimeout(resolve, 20));
+      seen.existedLater = tmp ? existsSync(tmp) : false;
+      return successfulResult([{ type: "thread.started", thread_id: "codex-thread-1" }, planResult]);
+    } };
+    const { adapter } = codexAdapter(runner);
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "codex-action-temp-")));
+    try {
+      await adapter.createSession({ prompt: "검토해 주세요.", cwd, ...(implementation ? { implementation: true, job: { role: "implementer" as const, operation: "implement" as const } } : {}) });
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+    expect(seen.tmp).toBeDefined();
+    expect(seen.existed).toBe(true);
+    expect(seen.existedLater).toBe(true);
+    expect(seen.real).toBe(seen.tmp);   // 쓰기 경로에 링크가 있으면 Codex CLI 가 거부한다(prepareManagedHome 주석)
+    expect(seen.cache).toBe(join(seen.tmp!, "cache"));
+    expect(seen.config).toContain(`${JSON.stringify(seen.tmp)} = "write"`);
+    expect(existsSync(seen.tmp!)).toBe(false);
+  });
+
+  it("Codex 실행이 실패해도 턴별 임시 디렉터리를 지우고, 격리 턴(운영 도구)·도구 없는 턴은 임시 디렉터리를 받지 않아 기존 경계를 그대로 쓴다", async () => {
+    let failed: string | undefined;
+    const failing: CommandRunner = { run: async spec => { failed = spec.environment?.TMPDIR; throw new Error("provider crashed"); } };
+    await expect(codexAdapter(failing).adapter.createSession({ prompt: "검토해 주세요.", cwd: "/tmp" })).rejects.toThrow("provider crashed");
+    expect(failed).toBeDefined();
+    expect(existsSync(failed!)).toBe(false);
+    let isolated: { tmp?: string; config?: string } = {};
+    const recording: CommandRunner = { run: async spec => {
+      isolated = { tmp: spec.environment?.TMPDIR, config: readFileSync(join(String(spec.environment?.CODEX_HOME), "config.toml"), "utf8") };
+      return successfulResult([{ type: "thread.started", thread_id: "codex-thread-1" }, planResult]);
+    } };
+    await codexAdapter(recording).adapter.createSession({ prompt: "Review", cwd: "/tmp", isolated: true, job: { role: "reviewer", operation: "audit" } });
+    expect(isolated.tmp).toBeUndefined();
+    expect(isolated.config).not.toContain('= "write"');
+    // 도구 없는 확인 턴은 임시 파일을 쓸 명령이 없다 — 쓰기 항목을 더하지 않아 CLI 의 권한 안내도 read-only 로 남는다.
+    isolated = {};
+    await codexAdapter(recording).adapter.createSession({ prompt: "ACK", cwd: "/tmp", protocolOnly: true, job: { role: "reviewer", operation: "ack" } });
+    expect(isolated.tmp).toBeUndefined();
+    expect(isolated.config).not.toContain('= "write"');
+  });
+
+  it("턴별 임시 디렉터리를 지우지 못해도 턴의 결과를 그대로 돌려준다(정리는 최선 노력)", async () => {
+    let locked = "";
+    const runner: CommandRunner = { run: async spec => {
+      // 도구가 남긴 읽기 전용 트리 — rm(recursive, force) 가 EACCES 로 실패한다.
+      locked = join(spec.environment!.TMPDIR!, "readonly");
+      mkdirSync(locked); writeFileSync(join(locked, "file"), "x"); chmodSync(locked, 0o555);
+      return successfulResult([{ type: "thread.started", thread_id: "codex-thread-1" }, planResult]);
+    } };
+    try {
+      const created = await codexAdapter(runner).adapter.createSession({ prompt: "검토해 주세요.", cwd: "/tmp" });
+      expect(created.sessionId).toBe("codex-thread-1");
+    } finally {
+      if (locked) { chmodSync(locked, 0o755); rmSync(dirname(locked), { recursive: true, force: true }); }
+    }
+  });
+
+  // 실제 CLI 검사(opt-in, 모델 호출 없음) — 검토 프로필로 띄운 실제 sandbox 안에서 턴별 TMPDIR 에 쓰고 xcrun swiftc -parse 가 통과하며, 그 밖에는 못 쓴다.
+  // 실제 codex 의 자기 재실행 경로가 프로필에 있어야 하므로 어댑터가 호스트 PATH 로 풀게 한다(hostCliPath).
+  it.skipIf(!process.env.CONSENSUS_CODEX_SANDBOX_TEST || process.platform !== "darwin")("실제 Codex sandbox: 검토 턴의 승인된 구문 검사가 턴별 TMPDIR 에서 통과하고 그 밖 쓰기는 막힌다", async () => {
+    vi.stubEnv("PATH", hostCliPath());
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "codex-tmpdir-sandbox-")));
+    writeFileSync(join(cwd, "ok.swift"), "let value = 1\n");
+    const results: Record<string, ReturnType<typeof spawnSync>> = {};
+    let actionTemp = "";
+    const runner: CommandRunner = { run: async spec => {
+      actionTemp = spec.environment!.TMPDIR!;
+      const run = (script: string, ...args: string[]) => spawnSync(spec.command, ["sandbox", "-P", "consensus-review", "-C", cwd,
+        "/bin/sh", "-c", script, "probe", ...args], { cwd, env: spec.environment, encoding: "utf8", timeout: 60000 });
+      results.temp = run('printf probe > "$TMPDIR/probe" && cat "$TMPDIR/probe"');
+      results.parse = run("xcrun swiftc -parse ok.swift");
+      results.outside = run('printf probe > "$1"', join(dirname(actionTemp), `outside-${Date.now()}`));
+      // CLI 가 모델에게 보이는 요약은 workspace-write 로 바뀌지만(쓰기 항목이 하나라도 있으면), 집행은 경로별 프로필이라 작업 폴더는 읽기만이다.
+      results.workspace = run('printf probe > "$1"', join(cwd, "edited.swift"));
+      return successfulResult([{ type: "thread.started", thread_id: "codex-thread-1" }, planResult]);
+    } };
+    try {
+      await codexAdapter(runner).adapter.createSession({ prompt: "검토해 주세요.", cwd });
+    } finally { vi.unstubAllEnvs(); rmSync(cwd, { recursive: true, force: true }); }
+    expect(results.temp.status, String(results.temp.stderr)).toBe(0);
+    expect(String(results.temp.stdout)).toBe("probe");
+    expect(results.parse.status, String(results.parse.stderr)).toBe(0);
+    expect(results.outside.status, String(results.outside.stderr)).not.toBe(0);
+    expect(results.workspace.status, String(results.workspace.stderr)).not.toBe(0);
+    expect(existsSync(actionTemp)).toBe(false);
+  }, 120000);
 
   it("Codex 턴은 사용자 홈이 아니라 앱이 관리하는 CODEX_HOME으로 실행한다", async () => {
     const runner = new RecordingRunner(successfulResult([
@@ -2030,6 +2128,8 @@ it.each([
   writeFileSync(join(cwd, "AGENTS.md"), "KEEP_PLANNING_INSTRUCTIONS_F004");
   const previousHome = process.env.CODEX_HOME;
   process.env.CODEX_HOME = join(codexHome, "fixture-user");
+  // opt-in 실제 CLI 검사는 어댑터가 호스트의 실제 codex 를 풀어야 한다 — spec.command 를 그대로 실행한다.
+  if (process.env.CONSENSUS_CODEX_SANDBOX_TEST) vi.stubEnv("PATH", hostCliPath());
   try {
     await adapter.createSession({ prompt: "Check the current role", cwd, job: entry.job });
     const config = readFileSync(join(adapter.managedHomeFor(cwd), "config.toml"), "utf8");
@@ -2051,6 +2151,7 @@ it.each([
       }
     }
   } finally {
+    vi.unstubAllEnvs();
     if (previousHome === undefined) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = previousHome;
   }
@@ -2141,6 +2242,7 @@ describe("E2e-3 승인 경로만 쓰기 — 어댑터 공개 호출", () => {
   // 격리·비격리 턴과 일반 clone·연결 worktree 를 모두 본다 — 비격리 턴 설정은 공통 Git 디렉터리를 읽기에 넣던 경로라 설정 파싱·메타데이터 거부를
   // 따로 확인해야 하고(host-review E2e-3 1차 F001), 연결 worktree 의 .git 은 파일이며 메타데이터는 작업 폴더 밖 원본 저장소(공통 디렉터리)에 있다.
   it.skipIf(!process.env.CONSENSUS_CODEX_SANDBOX_TEST)("실제 Codex sandbox: 승인 경로만 쓰고, 그 밖·Git 메타데이터·지시문은 막으며, 격리 턴은 저장소 지시문을 입력에 싣지 않는다", async () => {
+    vi.stubEnv("PATH", hostCliPath());
     const { root, work, outside } = candidate();
     const linked = join(root, "linked-worktree");
     execFileSync("git", ["-C", work, "worktree", "add", "-q", "-b", "linked", linked], { stdio: "pipe" });

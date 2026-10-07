@@ -20,7 +20,9 @@ import { parseTolerancePolicy, ToleranceFormatError } from "../src/shared/tolera
 import { REQUIRED_PLAN_HEADINGS, type AgentResult, type Finding } from "../src/shared/contracts";
 import { hashPlan, normalizePlan, redactSecrets } from "../src/shared/workflow";
 import { agentRunError } from "../src/server/adapters/resultParser";
-import { PlanningPaused } from "../src/shared/planningControl";
+import { PlanningPaused, type PlanningStep } from "../src/shared/planningControl";
+import { guardedPlanning } from "../src/server/guardedPlanning";
+import type { SessionTurn } from "../src/server/types";
 
 const temporaryDirectories: string[] = [];
 
@@ -988,7 +990,7 @@ describe("가짜 에이전트 전체 계획 왕복", () => {
     database.close();
   });
 
-  it("Codex 종결이 고치기로 합의한 쟁점을 강등하면 합의로 닫지 않고 사용자 판단을 기다린다", async () => {
+  it("Codex 종결이 고치기로 합의한 쟁점을 강등하면 같은 세션에 한 번 되묻고, 같은 처분이면 합의로 닫지 않고 사용자 판단을 기다린다", async () => {
     const revised = validPlan("수정 합의를 담은 개정 계획");
     const revisedSHA = hashPlan(`${revised.trim()}\n`);
     const { database, engine, claude, codex } = makePlanningEngine({
@@ -1018,6 +1020,14 @@ describe("가짜 에이전트 전체 계획 왕복", () => {
           findings: [finding("F-1", "고치기로 합의한 결함", { severity: "HIGH", disposition: "AGREED_NO_ACTION" })],
           evidenceRefs: [],
         },
+        // 확인 질문의 답 — 철회를 확인한다(같은 처분).
+        {
+          kind: "CLOSEOUT",
+          summary: "철회를 확인한 종료",
+          planSHA256: revisedSHA,
+          findings: [finding("F-1", "고치기로 합의한 결함", { severity: "HIGH", disposition: "AGREED_NO_ACTION" })],
+          evidenceRefs: [],
+        },
         { kind: "ACK", summary: "해시 확인", planSHA256: revisedSHA, findings: [], evidenceRefs: [] },
       ],
     });
@@ -1035,7 +1045,38 @@ describe("가짜 에이전트 전체 계획 왕복", () => {
     // retry가 전체 재계획으로 떨어져 그때까지의 개정을 전부 버린다.
     expect(database.getFlags("topic-1").resumeState).toBe("CODEX_CLOSEOUT");
     expect(claude.calls).toHaveLength(2);
-    expect(codex.calls).toHaveLength(2);
+    expect(codex.calls).toHaveLength(3);
+    expect(codex.calls[2]).toContain("처분 하나를 확인합니다");
+    expect(codex.calls[2]).toContain("F-1");
+    database.close();
+  });
+
+  // 2026-10-06 사용자 결정(03d5beec 종결·32e69740 #38): "반영됐다" 를 AGREED_NO_ACTION 으로 적은 종결은 철회가 아니다 — 한 번 되물어 합의 유지로 고치면 멈추지 않는다.
+  it("Codex 종결이 반영된 합의를 AGREED_NO_ACTION 으로 내려도 되묻는 답이 AGREED_ACTION 을 유지하면 합의로 닫는다", async () => {
+    const revised = validPlan("수정 합의를 담은 개정 계획");
+    const revisedSHA = hashPlan(`${revised.trim()}\n`);
+    const agreed = finding("F-1", "고치기로 합의한 결함", { severity: "HIGH", disposition: "AGREED_ACTION" });
+    const { database, engine, codex } = makePlanningEngine({
+      slug: "closeout-downgrade-confirmed",
+      claudeResults: [
+        { kind: "PLAN", summary: "첫 계획", planMarkdown: validPlan("첫 계획"), findings: [], evidenceRefs: [] },
+        { kind: "REVISION", summary: "고치기로 합의한 개정", planMarkdown: revised, findings: [agreed], evidenceRefs: [] },
+        { kind: "ACK", summary: "해시 확인", planSHA256: revisedSHA, findings: [], evidenceRefs: [] },
+      ],
+      codexResults: [
+        { kind: "AUDIT", summary: "감사", findings: [finding("F-1", "고치기로 합의한 결함", { severity: "HIGH", disposition: undefined })], evidenceRefs: [] },
+        { kind: "CLOSEOUT", summary: "반영을 확인한 종료", planSHA256: revisedSHA,
+          findings: [finding("F-1", "고치기로 합의한 결함", { severity: "HIGH", disposition: "AGREED_NO_ACTION", rationale: "개정에 반영됐습니다." })], evidenceRefs: [] },
+        { kind: "CLOSEOUT", summary: "합의 유지", planSHA256: revisedSHA, findings: [agreed], evidenceRefs: [] },
+        { kind: "ACK", summary: "해시 확인", planSHA256: revisedSHA, findings: [], evidenceRefs: [] },
+      ],
+    });
+    engine.startPlan("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+
+    expect(database.getTopic("topic-1")).toMatchObject({ state: "AWAITING_USER_APPROVAL", lastError: null });
+    expect(codex.calls[2]).toContain("처분 하나를 확인합니다");
+    expect(database.getTimeline("topic-1").some((event) => (event.body ?? "").includes("처분을 되돌렸습니다"))).toBe(false);
     database.close();
   });
 
@@ -1253,7 +1294,7 @@ describe("리뷰 finding 보존", () => {
     database.close();
   });
 
-  it("Claude 보완이 고치기로 합의한 쟁점을 강등하면 최종 리뷰로 넘기지 않는다", async () => {
+  it("Claude 보완이 고치기로 합의한 쟁점을 강등하면 같은 세션에 한 번 되묻고, 같은 처분이면 최종 리뷰로 넘기지 않는다", async () => {
     const agreed = finding("F-1", "첫 리뷰가 고치기로 한 결함", { disposition: "AGREED_ACTION" });
     const { database, engine } = await makeReviewRecovery({
       resumeState: "CLAUDE_FIX",
@@ -1262,6 +1303,12 @@ describe("리뷰 finding 보존", () => {
       claudeResults: [{
         kind: "FIX", status: "completed",
         summary: "처분을 되돌린 보완",
+        findings: [finding("F-1", "첫 리뷰가 고치기로 한 결함", { disposition: "AGREED_NO_ACTION" })],
+        evidenceRefs: [],
+      }, {
+        // 확인 질문의 답 — 철회를 확인한다(같은 처분).
+        kind: "FIX", status: "completed",
+        summary: "철회를 확인한 보완",
         findings: [finding("F-1", "첫 리뷰가 고치기로 한 결함", { disposition: "AGREED_NO_ACTION" })],
         evidenceRefs: [],
       }],
@@ -1280,10 +1327,36 @@ describe("리뷰 finding 보존", () => {
       state: "USER_DECISION_REQUIRED",
       lastError: expect.stringContaining("F-1"),
     });
+    expect(database.getTimeline("topic-1").some((event) => (event.body ?? "").includes("합의 철회로 읽히는 처분을 같은 세션에 1회 되묻습니다"))).toBe(true);
     expect(database.getFlags("topic-1")).toMatchObject({
       resumeState: "CLAUDE_FIX",
       fixPassUsed: false,
     });
+    database.close();
+  });
+
+  it("Claude 보완이 반영을 AGREED_NO_ACTION 으로 적어도 되묻는 답이 RESOLVED_BY_FIX 면 최종 리뷰로 넘어간다", async () => {
+    const agreed = finding("F-1", "첫 리뷰가 고치기로 한 결함", { disposition: "AGREED_ACTION" });
+    const resolved = finding("F-1", "첫 리뷰가 고치기로 한 결함", { disposition: "RESOLVED_BY_FIX" });
+    const claude = new QueuedAdapter("claude", [
+      { kind: "FIX", status: "completed", summary: "반영했습니다", evidenceRefs: [],
+        findings: [finding("F-1", "첫 리뷰가 고치기로 한 결함", { disposition: "AGREED_NO_ACTION", rationale: "이미 반영돼 있습니다." })] },
+      { kind: "FIX", status: "completed", summary: "수정 확인", findings: [resolved], evidenceRefs: [] },
+    ]);
+    const { database, engine } = await makeReviewRecovery({
+      resumeState: "CLAUDE_FIX",
+      implementationFindings: [agreed],
+      originalReviewFindings: [agreed],
+      claude,
+      codexResult: { kind: "FINAL_REVIEW", summary: "수정을 확인한 최종 리뷰", findings: [resolved], evidenceRefs: [] },
+    });
+
+    engine.retry("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+
+    expect(database.getTopic("topic-1").state).toBe("READY_TO_DELIVER");
+    expect(claude.calls[1]).toContain("처분 하나를 확인합니다");
+    expect(database.getTimeline("topic-1").some((event) => Array.isArray(event.payload?.downgradedFindingIDs))).toBe(false);
     database.close();
   });
 
@@ -2067,8 +2140,9 @@ describe("개정은 planEdits 패치로 계획을 고칠 수 있다", () => {
       ],
       codexResults: [
         { kind: "AUDIT", summary: "감사", findings: [finding("F-1", "합의된 결함", { severity: "HIGH", disposition: undefined })], evidenceRefs: [] },
-        // 1차 closeout이 처분을 되돌린다 → 서버가 거부해야 한다
+        // 1차 closeout이 처분을 되돌린다 → 한 번 되물어도 같은 처분(철회 확인) → 서버가 거부해야 한다
         { kind: "CLOSEOUT", summary: "종결", planSHA256: revisedSHA, findings: [regressed], evidenceRefs: [] },
+        { kind: "CLOSEOUT", summary: "철회 확인", planSHA256: revisedSHA, findings: [regressed], evidenceRefs: [] },
         { kind: "CLOSEOUT", summary: "종결", planSHA256: revisedSHA, findings: [agreed], evidenceRefs: [] },
         { kind: "ACK", summary: "확인", planSHA256: revisedSHA, findings: [], evidenceRefs: [] },
       ],
@@ -2081,6 +2155,8 @@ describe("개정은 planEdits 패치로 계획을 고칠 수 있다", () => {
     expect(topic.lastError ?? "").toContain("처분을 되돌렸습니다(F-1)");
     expect(database.getFlags("topic-1").resumeState).toBe("CODEX_CLOSEOUT");
 
+    // 레거시(비-guarded) 종결의 확인 교정은 별도 호출이라 계획 리뷰 1회를 쓴다(계약 교정과 같은 회계) — 한도를 1회 더 승인한다.
+    database.reviews.grant("topic-1", "planning", "legacy-confirm", database.reviews.account("topic-1", "planning").version);
     engine.retry("topic-1");
     await waitForActionCompletion(database, "topic-1");
 
@@ -3309,8 +3385,9 @@ describe("종결 확인의 새 쟁점 → 개정 2회차", () => {
       ],
       [
         { kind: "CLOSEOUT", summary: "종결 3회차 — 또 필수 쟁점", planSHA256: fourthSHA, findings: [closeoutNew2, closeoutNew3], evidenceRefs: [] },
-        // 1회차(감사 답변)에서 합의한 A-1 을 조치 없음으로 내린다.
+        // 1회차(감사 답변)에서 합의한 A-1 을 조치 없음으로 내린다 — 한 번 되물어도 같은 처분이다.
         { kind: "CLOSEOUT", summary: "종결 4회차 — 1회차 합의 되돌림", planSHA256: fifthSHA, findings: [auditRegressed, closeoutNew3], evidenceRefs: [] },
+        { kind: "CLOSEOUT", summary: "종결 4회차 — 되돌림 확인", planSHA256: fifthSHA, findings: [auditRegressed, closeoutNew3], evidenceRefs: [] },
       ],
     );
     engine.startPlan("topic-1");
@@ -3334,6 +3411,10 @@ describe("종결 확인의 새 쟁점 → 개정 2회차", () => {
     engine.retry("topic-1"); await waitForActionCompletion(database, "topic-1");
     expect(engine.reviewPaused("topic-1")).toBe("planning");
     database.reviews.grant("topic-1", "planning", "extra-closeout-4", database.reviews.account("topic-1", "planning").version);
+    engine.retry("topic-1"); await waitForActionCompletion(database, "topic-1");
+    // 레거시(비-guarded) 종결의 확인 교정은 별도 호출이라 계획 리뷰 1회를 쓴다(계약 교정과 같은 회계) — 한도를 1회 더 승인한다. 승인 뒤 재시도는 저장된 응답의 확인 교정을 같은 세션에서 잇는다.
+    expect(engine.reviewPaused("topic-1")).toBe("planning");
+    database.reviews.grant("topic-1", "planning", "extra-confirm-4", database.reviews.account("topic-1", "planning").version);
     engine.retry("topic-1"); await waitForActionCompletion(database, "topic-1");
 
     // 두 번째 추가 개정(개정 4회차)까지 돌았고, 종결 4회차가 1회차 합의 A-1 을 내린 것을 되돌림 가드가 잡았다(합의로 닫혀 ACK 턴으로 가지 않는다).
@@ -4220,8 +4301,9 @@ describe("개정 2회차 뒤 종결 확인의 처분 되돌림 — 결정 뒤 �
         { kind: "AUDIT", summary: "감사", findings: [finding("F-1", "합의된 결함", { severity: "HIGH", disposition: undefined })], evidenceRefs: [] },
         // 1차 종결: 새 필수 쟁점 → 개정 2회차
         { kind: "CLOSEOUT", summary: "종결 1", planSHA256: revisedSHA, findings: [agreed, fresh], evidenceRefs: [] },
-        // 2차 종결: F-1 처분을 되돌린다 → 가드
+        // 2차 종결: F-1 처분을 되돌린다 → 한 번 되물어도 같은 처분(철회 확인) → 가드
         { kind: "CLOSEOUT", summary: "종결 2", planSHA256: revisedSHA, findings: [regressed, fresh], evidenceRefs: [] },
+        { kind: "CLOSEOUT", summary: "종결 2 — 되돌림 확인", planSHA256: revisedSHA, findings: [regressed, fresh], evidenceRefs: [] },
         ...extraCodex,
         { kind: "ACK", summary: "확인", planSHA256: revisedSHA, findings: [], evidenceRefs: [] },
       ],
@@ -4231,6 +4313,11 @@ describe("개정 2회차 뒤 종결 확인의 처분 되돌림 — 결정 뒤 �
   it("결정이 올라오면 저장된 종결로 곧장 ACK 한다 — 종결 턴 재구매 없음", async () => {
     const { database, engine } = secondRoundRegression("closeout-regression-round2-decision");
     engine.startPlan("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+    // 레거시(비-guarded) 종결의 확인 교정은 별도 호출이라 계획 리뷰 1회를 쓴다(계약 교정과 같은 회계) — 한도를 1회 더 승인한다.
+    expect(engine.reviewPaused("topic-1")).toBe("planning");
+    database.reviews.grant("topic-1", "planning", "legacy-confirm", database.reviews.account("topic-1", "planning").version);
+    engine.retry("topic-1");
     await waitForActionCompletion(database, "topic-1");
     let topic = database.getTopic("topic-1");
     expect(topic.state).toBe("USER_DECISION_REQUIRED");
@@ -4261,13 +4348,18 @@ describe("개정 2회차 뒤 종결 확인의 처분 되돌림 — 결정 뒤 �
       [{ kind: "REVISION", summary: "추가 개정(F-1 재기재)", planEdits: [], findings: [agreed], evidenceRefs: [] }]);
     engine.startPlan("topic-1");
     await waitForActionCompletion(database, "topic-1");
+    // 레거시(비-guarded) 종결의 확인 교정은 별도 호출이라 계획 리뷰 1회를 쓴다(계약 교정과 같은 회계) — 한도를 1회 더 승인한다.
+    expect(engine.reviewPaused("topic-1")).toBe("planning");
+    database.reviews.grant("topic-1", "planning", "legacy-confirm", database.reviews.account("topic-1", "planning").version);
+    engine.retry("topic-1");
+    await waitForActionCompletion(database, "topic-1");
     expect(database.getTopic("topic-1").state).toBe("USER_DECISION_REQUIRED");
 
     engine.retry("topic-1");
     await waitForActionCompletion(database, "topic-1");
 
     expect(engine.reviewPaused("topic-1")).toBe("planning");
-    database.reviews.grant("topic-1","planning","regression-closeout",2);
+    database.reviews.grant("topic-1","planning","regression-closeout",database.reviews.account("topic-1", "planning").version);
     engine.retry("topic-1");await waitForActionCompletion(database,"topic-1");
 
     const topic = database.getTopic("topic-1");
@@ -4275,8 +4367,10 @@ describe("개정 2회차 뒤 종결 확인의 처분 되돌림 — 결정 뒤 �
     expect(topic.state).toBe("AWAITING_USER_APPROVAL");
     const bodies = database.getTimeline("topic-1").map((event) => event.body ?? "");
     expect(bodies.some((body) => body.includes("허용되지 않은 상태 전이"))).toBe(false);
-    expect(bodies.filter((body) => body.includes("의견 수렴을 종료할 수 있는지")).length).toBe(4); // 거절된 호출의 단계 진입 포함
-    expect(database.reviews.account("topic-1","planning").used).toBe(4);
+    // 거절된 호출의 단계 진입 포함 — 레거시 확인 교정이 한도에 걸려 멈춘 뒤의 재진입 1회가 더해진다.
+    expect(bodies.filter((body) => body.includes("의견 수렴을 종료할 수 있는지")).length).toBe(5);
+    // 감사·종결 1·종결 2·확인 교정(레거시는 호출마다 1회)·종결 3.
+    expect(database.reviews.account("topic-1","planning").used).toBe(5);
     expect(bodies.some((body) => body.includes("추가 개정") && body.includes("F-1"))).toBe(true);
     database.close();
   });
@@ -5112,12 +5206,12 @@ it("감사 교정은 다른 원문 ID를 잘못 붙인 원본을 정상 교정 �
 });
 
 
-it("stops identical continuation reports even when the accumulated report includes older text", async () => {
+it.each([false, true])("stops continuation reports without actual progress (omitted steps: %s)", async (omitSteps) => {
   const pending = { kind: "FIX" as const, findings: [], evidenceRefs: [], status: "in_progress" as const,
     remainingSteps: ["Finish the same pending work"] };
   const claude = new QueuedAdapter("claude", [
     { ...pending, summary: "Initial investigation" },
-    ...Array.from({ length: 3 }, () => ({ ...pending, summary: "Still investigating" })),
+    ...Array.from({ length: 3 }, (_, i) => ({ ...pending, ...(omitSteps ? { remainingSteps: undefined } : {}), summary: `Still investigating round ${i + 1}` })),
   ]);
   const codex = new QueuedAdapter("codex", []);
   const { database, engine } = await makeReviewRecovery({ resumeState: "CLAUDE_FIX",
@@ -5129,7 +5223,7 @@ it("stops identical continuation reports even when the accumulated report includ
   expect(database.getTopic("topic-1")).toMatchObject({ state: "USER_DECISION_REQUIRED" });
   expect(database.getTopic("topic-1").lastError).toContain("같은 작업 보고를 반복");
   expect(database.getFlags("topic-1").resumeState).toBe("CLAUDE_FIX");
-  expect(claude.calls).toHaveLength(4);
+  expect(claude.calls).toHaveLength(3);
   expect(codex.calls).toHaveLength(0);
   database.close();
 });
@@ -5147,4 +5241,305 @@ it("does not age out a live or unrecognized maintenance owner", () => {
   writeFileSync(path, JSON.stringify({ pid: 2147483647, at }));
   expect(() => core.assertNoMaintenanceLock()).not.toThrow();
   database.close();
+});
+
+
+it("hands mediator execution off without purchasing another runner or review turn", async () => {
+  const claude = new QueuedAdapter("claude", [{ kind: "FIX", summary: "Code ready for render verification", findings: [], evidenceRefs: [],
+    status: "in_progress", requestedMediatorAction: "Run the authorized render gate and return its evidence",
+    remainingSteps: ["Update UI test selectors after render verification"] }]);
+  const codex = new QueuedAdapter("codex", []);
+  const { database, engine } = await makeReviewRecovery({ resumeState: "CLAUDE_FIX",
+    implementationFindings: [], originalReviewFindings: [],
+    codexResult: { kind: "REVIEW", summary: "unused", findings: [], evidenceRefs: [] }, claude, codex });
+  database.setImplementationSession("topic-1", "claude-implementation-session");
+  engine.retry("topic-1");
+  await waitForActionCompletion(database, "topic-1");
+  expect(database.getTopic("topic-1")).toMatchObject({ state: "USER_DECISION_REQUIRED" });
+  expect(database.getTopic("topic-1").lastError).toContain("중재자 실행 대기");
+  expect(database.getTimeline("topic-1").some(event => event.payload?.waitingFor === "mediator")).toBe(true);
+  expect(database.getFlags("topic-1").resumeState).toBe("CLAUDE_FIX");
+  expect(claude.calls).toHaveLength(1);
+  expect(codex.calls).toHaveLength(0);
+  database.close();
+});
+
+
+it("retry without mediator evidence is refused without re-invoking the waiting runner", async () => {
+  const waiting: AgentResult = { kind: "FIX", summary: "Code ready for render verification", findings: [], evidenceRefs: [],
+    status: "in_progress", requestedMediatorAction: "Run the authorized render gate and return its evidence",
+    remainingSteps: ["Update UI test selectors after render verification"] };
+  const claude = new QueuedAdapter("claude", [waiting, waiting]);
+  const codex = new QueuedAdapter("codex", []);
+  const { database, engine } = await makeReviewRecovery({ resumeState: "CLAUDE_FIX",
+    implementationFindings: [], originalReviewFindings: [],
+    codexResult: { kind: "REVIEW", summary: "unused", findings: [], evidenceRefs: [] }, claude, codex });
+  database.setImplementationSession("topic-1", "claude-implementation-session");
+  engine.retry("topic-1");
+  await waitForActionCompletion(database, "topic-1");
+  expect(claude.calls).toHaveLength(1);
+  const actions = database.getTimeline("topic-1").length;
+  expect(() => engine.retry("topic-1")).toThrow("중재자 실행 대기 중입니다");
+  database.appendEvent({ topicId: "topic-1", actor: "user", kind: "decision", state: "USER_DECISION_REQUIRED", body: "Render not run yet" });
+  expect(() => engine.retry("topic-1")).toThrow("중재자 실행 대기 중입니다");
+  expect(claude.calls).toHaveLength(1);
+  expect(database.getTimeline("topic-1")).toHaveLength(actions + 1);
+  // The mediator's execution evidence lets the same stage resume once.
+  database.appendEvent({ topicId: "topic-1", actor: "user", kind: "evidence", state: "USER_DECISION_REQUIRED", body: "Render gate passed: 4 segments" });
+  engine.retry("topic-1");
+  await waitForActionCompletion(database, "topic-1");
+  expect(claude.calls).toHaveLength(2);
+  expect(database.getFlags("topic-1").resumeState).toBe("CLAUDE_FIX");
+  database.close();
+});
+
+// 2026-10-06 사용자 결정(종결 합의 하향 — 03d5beec·32e69740): 운영 기본값인 계획 제어(guarded planning) 단계의 종결 확인이 앞 단계 합의를 내리면 같은 체크포인트
+// (같은 admission·세션)를 한 번 다시 실행해 되묻는다. 새 논리 시도·새 리뷰 예약이 아니고, 확인 턴은 자료를 더 읽지 않는다(읽기를 청하면 거부하고 중재 대기).
+describe("계획 제어 단계의 종결 합의 하향 확인", () => {
+  const TOLERANCE = '\n```tolerance\n{"scopePaths":["**"],"rules":[]}\n```';
+  const contractPlan = (marker: string) => REQUIRED_PLAN_HEADINGS
+    .map((heading) => `## ${heading}\n\n${marker} ${heading}${heading === "허용 오차" ? TOLERANCE : ""}`).join("\n\n");
+  const step = (patch: Partial<PlanningStep> = {}): PlanningStep => ({
+    draft: "Plan", facts: [], contradictions: [], questions: [], requests: [], complete: true, ...patch,
+  });
+  const CONFIRM = "Confirm the final dispositions";
+
+  function scripted(role: "claude" | "codex", callback: (turn: Omit<SessionTurn, "sessionId">, call: number) => AgentResult) {
+    const calls: Array<Omit<SessionTurn, "sessionId">> = [];
+    const run = async (turn: Omit<SessionTurn, "sessionId">, resumed?: string) => {
+      calls.push(turn);
+      const id = resumed ?? `${role}-session-${calls.length}`;
+      turn.onSessionCreated?.(id);
+      turn.onProcessSpawn?.({ pid: 123, pgid: 123, executable: "fake", commandLine: "fake", startedAt: "now" });
+      turn.onUsage?.({ inputTokens: 100, outputTokens: 20, durationMs: 30, recordKind: "final", completeness: "complete" });
+      return { sessionId: id, result: callback(turn, calls.length) };
+    };
+    const adapter: AgentAdapter = { role, createSession: run, resumeTurn: async (turn) => (await run(turn, turn.sessionId)).result,
+      validateExistingSession: async () => true };
+    return { adapter, calls };
+  }
+
+  // confirmAnswer(attempt): 확인 질문을 받은 뒤의 Codex 응답 — attempt 는 확인 시작부터 센 호출 순번(1부터). options.closeout 은 확인 전 종결 단계의 Codex
+  // 응답(call 은 Codex 호출 순번, 종결은 2부터)을 바꾼다(없으면 F-1 을 AGREED_NO_ACTION 으로 내린 완료 종결 한 번). options.executionInputTokens 는 체크포인트당
+  // 실행 입력 예산이다(호출당 100 — 예산 soft limit 에 닿는 회차를 고른다).
+  function guardedRoom(slug: string, confirmAnswer: (attempt: number) => AgentResult,
+    options: { closeout?: (revisedSHA: string, call: number) => AgentResult; executionInputTokens?: number } = {}) {
+    const root = mkdtempSync(join(tmpdir(), `consensus-room-${slug}-`));
+    temporaryDirectories.push(root);
+    const repo = join(root, "repo");
+    execFileSync("git", ["init", "-q", repo]);
+    execFileSync("git", ["-C", repo, "config", "user.name", "Test"]);
+    execFileSync("git", ["-C", repo, "config", "user.email", "test@example.invalid"]);
+    // 여러 회차가 서로 다른 구간을 읽을 수 있게 길게 둔다.
+    writeFileSync(join(repo, "form.swift"), "let step = 0\n".repeat(6000));
+    execFileSync("git", ["-C", repo, "add", "."]);
+    execFileSync("git", ["-C", repo, "commit", "-qm", "fixture"]);
+    const database = new ConsensusDatabase(join(root, "room.db"));
+    database.createTopic({ id: "topic", slug, title: "종결 확인", repositoryPath: repo, worktreePath: repo, baseRef: "HEAD", branchName: null,
+      state: "DRAFT", scopeGeneration: 1, planRevision: 0, planSHA256: null, approvedPlanSHA256: null,
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), lastError: null });
+    database.revisions.configure("topic", 3, database.revisions.account("topic").version);
+    for (const scope of ["planning", "implementation"] as const) database.reviews.configure("topic", scope, 3, database.reviews.account("topic", scope).version);
+    database.planning.enable("topic");
+    database.budgets.configure("topic", { execution: { inputTokens: options.executionInputTokens ?? 100000, outputTokens: 10000, durationMs: 100000 },
+      total: { inputTokens: 300000, outputTokens: 30000, durationMs: 300000 } }, "test");
+    for (const [role, sessionId] of [["claude", "claude-existing"], ["codex", "codex-existing"]] as const) {
+      database.upsertParticipant("topic", { role, sessionId, mode: "attached", acknowledgedPlanSHA256: null });
+    }
+    const first = contractPlan("FIRST");
+    const revised = contractPlan("REVISED");
+    const revisedSHA = hashPlan(`${revised.trim()}\n`);
+    const agreed = finding("F-1", "고치기로 합의한 결함", { severity: "HIGH", disposition: "AGREED_ACTION" });
+    const claude = scripted("claude", (turn, n) => n === 1
+      ? { kind: "PLAN", summary: "계획", planMarkdown: first, findings: [], evidenceRefs: [], planningStep: step() }
+      : n === 2
+        ? { kind: "REVISION", summary: "개정", planMarkdown: revised, findings: [agreed], evidenceRefs: [], planningStep: step() }
+        : { kind: "ACK", summary: "확인", planSHA256: /[0-9a-f]{64}/.exec(turn.prompt)?.[0] ?? revisedSHA, findings: [], evidenceRefs: [] });
+    let confirming = 0;
+    let sessionSHA = "";
+    const codex = scripted("codex", (turn, n) => {
+      // ACK(프로토콜 턴)는 확인 흐름이 아니다. 확인 턴은 과제 본문을 다시 싣지 않으므로("Continue the task already in this session.") 가짜 Codex 도
+      // 세션 기억이 아니라 이 호출의 본문에서 계획 SHA 를 읽는다 — 첫 확인 턴 본문에 없으면 빈 값을 내 계약 위반이 된다. 확인 회차가 끝난 뒤의 보통
+      // 회차는 이어 가기라 본문에 SHA 가 없을 수 있다 — 그때는 같은 세션이 앞선 확인 턴에서 받은 값을 쓴다(세션 기억).
+      if (!turn.protocolOnly && (confirming > 0 || turn.prompt.includes(CONFIRM))) {
+        sessionSHA = /SHA-256\(([0-9a-f]{64})\)/.exec(turn.prompt)?.[1] ?? sessionSHA;
+        return { ...confirmAnswer(++confirming), planSHA256: sessionSHA };
+      }
+      if (n === 1) return { kind: "AUDIT", summary: "감사", findings: [finding("F-1", "고치기로 합의한 결함", { severity: "HIGH", disposition: undefined })],
+        evidenceRefs: [], planningStep: step() };
+      if (n >= 2 && !turn.protocolOnly && options.closeout) return options.closeout(revisedSHA, n);
+      if (n === 2) return { kind: "CLOSEOUT", summary: "반영 확인", planSHA256: revisedSHA, evidenceRefs: [], planningStep: step(),
+        findings: [finding("F-1", "고치기로 합의한 결함", { severity: "HIGH", disposition: "AGREED_NO_ACTION", rationale: "개정에 반영됐습니다." })] };
+      return { kind: "ACK", summary: "확인", planSHA256: revisedSHA, findings: [], evidenceRefs: [] };
+    });
+    const git = new GitService(new SpawnCommandRunner());
+    const artifacts = new ArtifactStore(join(root, "artifacts"), database);
+    const engine = new WorkflowEngine({ database, git, artifacts, claude: guardedPlanning(claude.adapter, database, git),
+      codex: guardedPlanning(codex.adapter, database, git) });
+    // 계획 제어는 단계마다 Git 스냅숏을 떠서 다른 계획 테스트(2초)보다 오래 걸린다.
+    const settle = async () => {
+      const deadline = Date.now() + 20_000;
+      while (database.runningAction("topic")) {
+        if (Date.now() > deadline) throw new Error("계획 제어 action 이 끝나지 않았습니다.");
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      }
+    };
+    return { database, engine, claude, codex, settle, revisedSHA, agreed, repo };
+  }
+
+  // 종결 호출(2번째 Codex 호출)과 확인 호출(3번째)의 체크포인트·admission·세션·리뷰 예약.
+  function confirmationCall(room: ReturnType<typeof guardedRoom>) {
+    const closeoutCheckpoint = room.database.planning.latest("topic", "codex")!;
+    return { closeoutCheckpoint, prompt: room.codex.calls[2]?.prompt ?? "" };
+  }
+
+  it("확인 답이 합의를 유지하면 같은 체크포인트·admission·세션에서 끝나고 새 리뷰 예약 없이 합의로 닫힌다", async () => {
+    const room = guardedRoom("guarded-closeout-confirm", () => ({ kind: "CLOSEOUT", summary: "합의 유지",
+      evidenceRefs: [], planningStep: step(), findings: [finding("F-1", "고치기로 합의한 결함", { severity: "HIGH", disposition: "AGREED_ACTION" })] }));
+    try {
+      room.engine.startPlan("topic"); await room.settle();
+      expect(room.database.getTopic("topic")).toMatchObject({ state: "AWAITING_USER_APPROVAL", lastError: null });
+      const { closeoutCheckpoint, prompt } = confirmationCall(room);
+      expect(prompt).toContain(CONFIRM);
+      expect(prompt).toContain("F-1");
+      // 확인 턴 본문이 결과가 확인해 적을 계획 SHA 를 싣는다(세션 기억에 맡기지 않는다).
+      expect(prompt).toContain(`SHA-256(${room.revisedSHA})`);
+      // 확인은 종결 호출과 같은 세션을 잇는다.
+      expect((room.codex.calls[2] as SessionTurn).sessionId).toBe((room.codex.calls[1] as SessionTurn).sessionId);
+      const marker = room.database.getTimeline("topic").find((event) => event.payload?.resultConfirmation)!;
+      expect(marker.payload!.resultConfirmation).toMatchObject({ checkpointId: closeoutCheckpoint.id, admissionId: closeoutCheckpoint.admissionId, stage: "CODEX_CLOSEOUT" });
+      expect(closeoutCheckpoint).toMatchObject({ stage: "CODEX_CLOSEOUT", finalized: true });
+      // 감사·종결 2회만 — 확인 호출은 같은 admission 이라 새 리뷰 예약이 없다.
+      expect(room.database.reviews.account("topic", "planning").used).toBe(2);
+      expect(room.database.getTimeline("topic").some((event) => (event.body ?? "").includes("처분을 되돌렸습니다"))).toBe(false);
+    } finally { await room.engine.shutdown(); room.database.close(); }
+  });
+
+  it("확인 답이 같은 하향이면 종전대로 되돌림 정지로 멈추고, 그 확인은 같은 시도 안의 한 번뿐이다(새 예약 없음)", async () => {
+    const room = guardedRoom("guarded-closeout-withdraw", () => ({ kind: "CLOSEOUT", summary: "철회 확인",
+      evidenceRefs: [], planningStep: step(),
+      findings: [finding("F-1", "고치기로 합의한 결함", { severity: "HIGH", disposition: "AGREED_NO_ACTION", rationale: "철회합니다." })] }));
+    try {
+      room.engine.startPlan("topic"); await room.settle();
+      expect(room.database.getTopic("topic")).toMatchObject({ state: "USER_DECISION_REQUIRED", lastError: expect.stringContaining("처분을 되돌렸습니다(F-1)") });
+      expect(room.database.getFlags("topic").resumeState).toBe("CODEX_CLOSEOUT");
+      expect(room.codex.calls).toHaveLength(3);
+      expect(room.database.reviews.account("topic", "planning").used).toBe(2);
+      // 확인 응답에는 다시 묻지 않는다 — 확인 기록은 이 체크포인트에 한 번이고, 체크포인트는 확인 답으로 확정됐다.
+      const confirmations = room.database.getTimeline("topic").filter((event) => event.payload?.resultConfirmation);
+      expect(confirmations).toHaveLength(1);
+      expect(room.database.planning.latest("topic", "codex")).toMatchObject({
+        id: (confirmations[0].payload!.resultConfirmation as { checkpointId: string }).checkpointId, finalized: true });
+    } finally { await room.engine.shutdown(); room.database.close(); }
+  });
+
+  it("확인 턴이 자료 읽기를 청하면 그 읽기를 싣지도 모델을 다시 부르지도 않고, 체크포인트를 보존한 채 중재를 기다린다", async () => {
+    // 확인 질문에 답하지 않고 파일을 청한다 → 확인 회차는 모델 호출 한 번이라, 래퍼가 그 읽기를 싣거나 다시 부르기 전에 멈춘다(합동 리뷰 a4628d1d F007 —
+    // 예전에는 래퍼가 읽기를 싣고 다시 부른 뒤에야 그 답을 버렸다).
+    const room = guardedRoom("guarded-closeout-reads", (attempt) => {
+      if (attempt > 1) throw new Error("F007_SECOND_CONFIRMATION_CALL");
+      return { kind: "CLOSEOUT", summary: "더 읽겠습니다", evidenceRefs: [], findings: [], planningStep: step({ complete: false, questions: ["Need the file"],
+        requests: [{ kind: "file", selector: "form.swift", question: "Re-read before confirming", offset: 0 }] }) };
+    });
+    try {
+      room.engine.startPlan("topic"); await room.settle();
+      const topic = room.database.getTopic("topic");
+      expect(topic.state).toBe("USER_DECISION_REQUIRED");
+      expect(topic.lastError).toContain("Disposition confirmation requested reads");
+      // 감사·종결·확인 3회 — 확인 응답이 청한 읽기 뒤의 재호출이 없고, 청한 파일은 세션에 전달되지 않았다.
+      expect(room.codex.calls.filter((call) => !call.protocolOnly).map((call) => call.prompt.includes(CONFIRM))).toEqual([false, false, true]);
+      const session = (room.codex.calls[2] as SessionTurn).sessionId;
+      expect(room.database.planning.deliveredToSession(session).some((fragment) => fragment.selector === "form.swift")).toBe(false);
+      // 같은 체크포인트가 확인 질문과 청한 읽기를 남긴 채 열려 있다 — 표식은 지워 다음 retry 는 보통 회차로 잇는다(확인은 결과당 1회).
+      const checkpoint = room.database.planning.latest("topic", "codex")!;
+      expect(checkpoint).toMatchObject({ stage: "CODEX_CLOSEOUT", finalized: false });
+      expect(checkpoint.confirmationRound).toBeUndefined();
+      expect(checkpoint.step.questions[0]).toContain("Answer the disposition confirmation without new reads");
+      expect(checkpoint.readQueue?.map((read) => read.selector)).toEqual(["form.swift"]);
+      expect(room.database.reviews.account("topic", "planning").used).toBe(2);
+    } finally { await room.engine.shutdown(); room.database.close(); }
+  });
+
+  it("결정을 청하며 읽기를 남긴 종결의 하향은 확인하지 않는다 — 결정 대기와 이연 읽기를 그대로 둔 채 종결 단계에서 멈춘다", async () => {
+    // 합동 리뷰 a4628d1d F008 — 예전에는 확인이 시작돼 다시 연 체크포인트가 결정 대기를 지웠고, 결정 전에 이연 읽기가 확인 호출에 실려 나갔다.
+    const room = guardedRoom("guarded-closeout-decision", () => { throw new Error("F008_NO_CONFIRMATION_CALL"); }, { closeout: (revisedSHA) => ({
+      kind: "CLOSEOUT", summary: "결정이 필요합니다", planSHA256: revisedSHA, evidenceRefs: [], requestedUserDecision: "Who owns the step value?",
+      findings: [finding("F-1", "고치기로 합의한 결함", { severity: "HIGH", disposition: "AGREED_NO_ACTION", rationale: "결정에 따라 다릅니다." })],
+      planningStep: step({ complete: false, questions: ["Who owns the step value?"],
+        requests: [{ kind: "file", selector: "form.swift", question: "Read after the decision", offset: 0 }] }) }) });
+    try {
+      room.engine.startPlan("topic"); await room.settle();
+      expect(room.database.getTimeline("topic").some((event) => event.payload?.resultConfirmation)).toBe(false);
+      expect(room.codex.calls.filter((call) => !call.protocolOnly)).toHaveLength(2);
+      expect(room.database.getTopic("topic")).toMatchObject({ state: "USER_DECISION_REQUIRED", lastError: "Who owns the step value?" });
+      expect(room.database.getFlags("topic").resumeState).toBe("CODEX_CLOSEOUT");
+      const checkpoint = room.database.planning.latest("topic", "codex")!;
+      expect(checkpoint).toMatchObject({ stage: "CODEX_CLOSEOUT", finalized: false, awaitingDecision: true });
+      expect(checkpoint.deferredReads?.map((read) => read.selector)).toEqual(["form.swift"]);
+    } finally { await room.engine.shutdown(); room.database.close(); }
+  });
+
+  // 확인 회차가 끝난 뒤의 보통 조사 응답 — 감사·개정이 남긴 F-1 합의를 유지하기 전, 확인과 무관한 검색을 하나 더 청한다(합동 리뷰 ccda575f F007).
+  const intermediate = (): AgentResult => ({ kind: "CLOSEOUT", summary: "더 찾겠습니다", evidenceRefs: [], findings: [],
+    planningStep: step({ complete: false, questions: ["Need the owner"], requests: [{ kind: "search", selector: "form.swift::step", question: "Find the owner", offset: 0 }] }) });
+  const kept = (): AgentResult => ({ kind: "CLOSEOUT", summary: "읽고 유지", evidenceRefs: [], planningStep: step(),
+    findings: [finding("F-1", "고치기로 합의한 결함", { severity: "HIGH", disposition: "AGREED_ACTION" })] });
+  const confirmationReadStops = (room: ReturnType<typeof guardedRoom>) => room.database.getTimeline("topic")
+    .filter((event) => (event.body ?? "").includes("Disposition confirmation requested reads")).length;
+
+  it("예산 정리 회차의 확인 응답이 미완료로 정지해도 확인 회차는 끝난다 — 증액 뒤 retry 의 보통 중간 응답은 읽기를 받아 이어 간다", async () => {
+    // 체크포인트 실행 입력 예산 1,000(호출당 100): 종결이 일곱 회차를 읽고 여덟째에 F-1 을 내려 확인이 열리면, 확인 호출(아홉째)만 soft limit 의 정리
+    // 회차다(사용 800 ≥ 80%, 정리 예약 125 가 남는다).
+    let attempts = 0;
+    const room = guardedRoom("guarded-closeout-synthesis", (attempt) => {
+      attempts = attempt;
+      return attempt === 1
+        ? { kind: "CLOSEOUT", summary: "정리하지 못했습니다", evidenceRefs: [], findings: [], planningStep: step({ complete: false, questions: ["Need the file"],
+          requests: [{ kind: "file", selector: "form.swift", question: "Re-read before confirming", offset: 5000 }] }) }
+        : attempt === 2 ? intermediate() : kept();
+    }, { executionInputTokens: 1000, closeout: (revisedSHA, call) => call < 9
+      ? { kind: "CLOSEOUT", summary: "읽는 중", evidenceRefs: [], findings: [], planningStep: step({ complete: false, questions: ["Keep reading"],
+        requests: [{ kind: "file", selector: "form.swift", question: "Continue", offset: (call - 2) * 100 }] }) }
+      : { kind: "CLOSEOUT", summary: "반영 확인", planSHA256: revisedSHA, evidenceRefs: [], planningStep: step(),
+        findings: [finding("F-1", "고치기로 합의한 결함", { severity: "HIGH", disposition: "AGREED_NO_ACTION", rationale: "개정에 반영됐습니다." })] } });
+    try {
+      room.engine.startPlan("topic"); await room.settle();
+      expect(room.database.getTopic("topic")).toMatchObject({ state: "USER_DECISION_REQUIRED",
+        lastError: expect.stringContaining("Synthesis did not produce a complete plan") });
+      expect(attempts).toBe(1);
+      expect(room.codex.calls.at(-1)!.prompt).toContain("No more research is available");
+      // 정리 실패 정지도 확인 응답의 처리다 — 회차가 끝나 표식이 없고, 확인 질문은 다음 retry 를 위해 남는다.
+      const paused = room.database.planning.latest("topic", "codex")!;
+      expect(paused.confirmationRound).toBeUndefined();
+      expect(paused.step.questions[0]).toContain("Answer the disposition confirmation without new reads");
+      room.database.budgets.grant("topic", "raise-after-confirmation-synthesis", { execution: { inputTokens: 100000, outputTokens: 10000, durationMs: 100000 },
+        total: { inputTokens: 300000, outputTokens: 30000, durationMs: 300000 } }, room.database.budgets.account("topic")!.version);
+      room.engine.retry("topic"); await room.settle();
+      // 증액 뒤 보통 조사: 중간 응답이 청한 검색을 싣고 다시 불러 합의 유지로 닫혔다 — 끝난 확인 표식으로 멈추지 않았다.
+      expect(confirmationReadStops(room)).toBe(0);
+      expect(room.database.getTopic("topic")).toMatchObject({ state: "AWAITING_USER_APPROVAL", lastError: null });
+      expect(attempts).toBe(3);
+    } finally { await room.engine.shutdown(); room.database.close(); }
+  });
+
+  it("확인 호출이 응답 없이 끊겨 남은 확인 회차는 원문 변경 초기화가 끝낸다 — retry 의 보통 중간 응답은 읽기를 받아 이어 간다", async () => {
+    const room = guardedRoom("guarded-closeout-source", (attempt) => {
+      if (attempt === 1) throw new Error("F007_CONFIRMATION_CALL_FAILED");
+      return attempt === 2 ? intermediate() : kept();
+    });
+    try {
+      room.engine.startPlan("topic"); await room.settle();
+      expect(room.database.getTopic("topic")).toMatchObject({ state: "FAILED", lastError: expect.stringContaining("F007_CONFIRMATION_CALL_FAILED") });
+      // 응답이 없으면 회차는 남는다 — 원문이 그대로면 retry 가 같은 확인 호출을 같은 제한으로 다시 한다.
+      expect(room.database.planning.latest("topic", "codex")!.confirmationRound).toContain("Answer the disposition confirmation without new reads");
+      writeFileSync(join(room.repo, "form.swift"), "let step = 1\n");
+      room.engine.retry("topic"); await room.settle();
+      expect(confirmationReadStops(room)).toBe(0);
+      expect(room.database.getTopic("topic")).toMatchObject({ state: "AWAITING_USER_APPROVAL", lastError: null });
+      const answers = room.codex.calls.filter((call) => !call.protocolOnly).slice(2);
+      expect(answers).toHaveLength(3);
+      expect(answers[1].prompt).toContain("Sources changed");
+      expect(room.database.planning.latest("topic", "codex")!.confirmationRound).toBeUndefined();
+    } finally { await room.engine.shutdown(); room.database.close(); }
+  });
 });

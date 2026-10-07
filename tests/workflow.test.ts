@@ -253,6 +253,10 @@ describe("Codex 종결 판정", () => {
     expect(classifyCloseout(result).state).toBe("USER_DECISION_REQUIRED");
   });
 
+  it("mediator handoff cannot become consensus", () => {
+    expect(classifyCloseout(closeout({ requestedMediatorAction: "Read the authorized render" })).state).toBe("USER_DECISION_REQUIRED");
+  });
+
   it("실제로 고치기로 합의한 결함이 있을 때만 한 번의 수정 단계가 필요하다", () => {
     expect(shouldRunFixPass([finding({ disposition: "AGREED_ACTION" })])).toBe(true);
     expect(shouldRunFixPass([finding({ disposition: "AGREED_NO_ACTION" })])).toBe(false);

@@ -13,7 +13,8 @@ import { ClaudeAdapter } from "../src/server/adapters/claude";
 import { CodexAdapter } from "../src/server/adapters/codex";
 import { ReviewBlocked } from "../src/server/reviewLedger";
 import { pendingReviewRequests } from "../src/server/engine/reviewRequests";
-import { WorkflowEngine } from "../src/server/workflow";
+import { WorkflowEngine, type WorkflowDependencies } from "../src/server/workflow";
+import type { VerificationOutcome, VerificationRun } from "../src/server/verifications";
 import { REQUIRED_PLAN_HEADINGS, type AgentResult } from "../src/shared/contracts";
 import { EXECUTION_POLICY_NOTE, timelineEventText, timelineReference } from "../src/shared/prompts";
 import { hashPlan } from "../src/shared/workflow";
@@ -960,7 +961,7 @@ function koreanDecision(chars: number, seed: string): string {
   return body;
 }
 
-async function pagedTopic(label: string, decisions: readonly string[]) {
+async function pagedTopic(label: string, decisions: readonly string[], options: { plan?: string } = {}) {
   const root = mkdtempSync(join(tmpdir(), `consensus-room-pages-${label}-`));
   temporaryDirectories.push(root);
   const repository = join(root, "repository");
@@ -977,7 +978,7 @@ async function pagedTopic(label: string, decisions: readonly string[]) {
   const databasePath = join(data, "room.sqlite");
   let database = new ConsensusDatabase(databasePath);
   let artifacts = new ArtifactStore(join(data, "topics"), database);
-  const plan = validPlan();
+  const plan = options.plan ?? validPlan();
   const planSHA256 = hashPlan(plan);
   const topicId = "e3220b00-2222-4333-8444-555555555555";
   const timestamp = "2026-09-26T00:00:00.000Z";
@@ -994,8 +995,8 @@ async function pagedTopic(label: string, decisions: readonly string[]) {
   const topic = { id: topicId, scopeGeneration: 1 };
   return {
     topicId, topic, worktree, references, get database() { return database; }, get artifacts() { return artifacts; },
-    engine: (claude: AgentAdapter, codex: AgentAdapter, enforceBudgets = false) =>
-      new WorkflowEngine({ database, artifacts, git: gitService, claude, codex, enforceBudgets }),
+    engine: (claude: AgentAdapter, codex: AgentAdapter, enforceBudgets = false, verifications?: WorkflowDependencies["verifications"]) =>
+      new WorkflowEngine({ database, artifacts, git: gitService, claude, codex, enforceBudgets, ...(verifications ? { verifications } : {}) }),
     reopen: () => {
       database.close();
       database = new ConsensusDatabase(databasePath);
@@ -1550,6 +1551,7 @@ describe("E3-2-2b host-review 1차 보완(55f3795 F001~F003)", { timeout: DELIVE
 type LedgerStep = {
   // 판정·읽기 호출의 응답을 바꾼다(없으면 읽기 = ACK, 판정 = 문제 없는 REVIEW·FINAL_REVIEW, 답변 확인 = 모든 질문에 마지막 결정으로 답함).
   result?: AgentResult;
+  reply?: (turn: Omit<SessionTurn, "sessionId">) => AgentResult;
   // resume 중 CLI 가 알린 다른 세션 id, create 면 만들 세션 id.
   sessionId?: string;
   missing?: boolean;
@@ -1612,6 +1614,7 @@ class LedgerCodex implements AgentAdapter {
   }
 
   private reply(step: LedgerStep, turn: Omit<SessionTurn, "sessionId">): AgentResult {
+    if (step.reply) return step.reply(turn);
     if (step.result) return step.result;
     const operation = turn.job?.operation;
     if (operation === "review-read") return result("ACK", "리뷰 읽기 쪽을 받았습니다.");
@@ -1833,15 +1836,29 @@ describe("E3-4c 코드 리뷰 다중 호출 원장", { timeout: DELIVERY_TEST_TI
       ...(blocker === "incomplete" ? { status: "in_progress", remainingSteps: ["리뷰어가 테스트 실패 경로를 아직 확인하지 못했습니다."] }
         : blocker === "decision" ? { remainingSteps: [], requestedUserDecision: "승인된 범위를 넓힐지 결정해 주세요." }
           : { remainingSteps: [], findings: [{ ...reviewFinding("AGREED_ACTION"), disposition: "EXTERNAL_EVIDENCE" }] }) };
-    const codex = new LedgerCodex([{ result: first }, { result: corrected }]);
-    room.engine(claude, codex).startImplementation(room.topicId);
+    const passing: AgentResult = { ...result("REVIEW", "남은 검토를 마쳤습니다.", []), status: "completed" };
+    const codex = new LedgerCodex([{ result: first }, { result: corrected }, { result: passing }]);
+    const engine = room.engine(claude, codex);
+    engine.startImplementation(room.topicId);
     await room.idle();
 
-    expect(room.database.getTopic(room.topicId).state).toBe(blocker === "evidence" ? "BLOCKED_ON_EVIDENCE" : "USER_DECISION_REQUIRED");
+    // 교정 뒤에도 요청 필드 없는 미완료(in_progress)면 계약 위반 실패다(D2) — 정지 상태는 결정·증거 대기가 아니라 실패이고, 원장은 열린 채 남는다.
+    expect(room.database.getTopic(room.topicId).state).toBe(blocker === "incomplete" ? "FAILED"
+      : blocker === "evidence" ? "BLOCKED_ON_EVIDENCE" : "USER_DECISION_REQUIRED");
     expect(claude.calls.map(call => call.operation)).toEqual(["implement"]);
     expect(operationsOf(codex.calls)).toEqual(["create:review", "resume:contract-correction"]);
     expect(reviewUsed(room)).toBe(1);
-    expect(room.database.planning.latestReviewLedger(room.topicId)?.status).toBe(blocker === "incomplete" ? "judged" : "completed");
+    const ledger = room.database.planning.latestReviewLedger(room.topicId)!;
+    // 판정 아님(결정·증거 대기)은 멈춰 두고(paused) 같은 ID 로 재개한다. 계약 위반 실패는 원장을 연 채(open) 둔다.
+    expect(ledger.status).toBe(blocker === "incomplete" ? "open" : "paused");
+    if (blocker === "incomplete") {
+      // 재시도는 같은 원장·같은 예약으로 리뷰를 다시 하고 새 리뷰 1회를 사지 않는다.
+      engine.retry(room.topicId);
+      await room.idle();
+      expect(codex.calls.at(-1)!.reviewLedger).toBe(ledger.id);
+      expect(reviewUsed(room)).toBe(1);
+      expect(room.database.planning.latestReviewLedger(room.topicId)).toMatchObject({ id: ledger.id, status: "completed" });
+    }
     room.database.close();
   });
 
@@ -1864,7 +1881,7 @@ describe("E3-4c 코드 리뷰 다중 호출 원장", { timeout: DELIVERY_TEST_TI
     room.database.close();
   });
 
-  it("미완료 판정은 원장을 닫되 커서·완료·저장 리뷰로 수정 열기의 근거가 아니다 — 질문은 agent_output 으로 보존되고, 결정 뒤 재시도는 새 원장으로 다시 판정한다", async () => {
+  it("결정을 청한 미완료 리뷰는 판정 아님(paused)이라 커서·완료·저장 리뷰로 수정 열기의 근거가 아니다 — 질문은 agent_output 으로 보존되고, 결정 뒤 재시도는 같은 원장·같은 예약으로 다시 판정한다", async () => {
     const room = await pagedTopic("ledger-incomplete", [koreanDecision(1_000, "r")]);
     const claude = new PagingClaude(room.worktree);
     const question = "배포 채널을 정해 주세요.";
@@ -1877,7 +1894,7 @@ describe("E3-4c 코드 리뷰 다중 호출 원장", { timeout: DELIVERY_TEST_TI
 
     expect(room.database.getTopic(room.topicId).state).toBe("USER_DECISION_REQUIRED");
     const first = room.database.planning.latestReviewLedger(room.topicId)!;
-    expect(first.status).toBe("judged");
+    expect(first.status).toBe("paused");
     // 원문·질문은 기존 agent_output 계약으로 보존된다(리뷰 요청 목록이 그 이벤트에서 질문을 읽는다).
     expect(room.database.latestArtifact(room.topicId, "codex-review")).not.toBeNull();
     const topic = room.database.getTopic(room.topicId);
@@ -1892,10 +1909,14 @@ describe("E3-4c 코드 리뷰 다중 호출 원장", { timeout: DELIVERY_TEST_TI
     expect(claude.calls.map((call) => call.operation)).toEqual(["implement"]);
     expect(operationsOf(codex.calls)).toEqual(["create:review", "resume:answer-confirmation", "resume:review"]);
     expect(codex.calls[2].prompt).toContain("이전 코드 리뷰는 미완료입니다");
+    // 트리·계약이 같으므로 같은 논리 리뷰다 — 멈춘 원장을 되살려 같은 ID 로 판정하고 리뷰 횟수를 새로 쓰지 않는다.
     const second = room.database.planning.latestReviewLedger(room.topicId)!;
-    expect(second.id).not.toBe(first.id);
+    expect(second.id).toBe(first.id);
     expect(second.status).toBe("completed");
-    expect(codex.calls[2].reviewLedger).toBe(second.id);
+    expect(codex.calls[2].reviewLedger).toBe(first.id);
+    // 판정 호출은 첫 원장의 예약을 그대로 쓴다. 나머지 1회는 답변 확인 호출의 예약이다 — 답변 확인을 질문 낸 리뷰 원장에 귀속하는 일은 별도 작업
+    // (delivery answerRoute, 세션 1)이라 여기서는 판정 호출이 새로 예약하지 않았다는 것만 고정한다.
+    expect(reviewUsed(room)).toBe(2);
     expect(room.database.getCodexReviewPromptSequence(room.topicId)).not.toBeNull();
     expect(room.database.getTopic(room.topicId).state).toBe("READY_TO_DELIVER");
     room.database.close();
@@ -1938,17 +1959,18 @@ describe("E3-4c 코드 리뷰 다중 호출 원장", { timeout: DELIVERY_TEST_TI
     room.database.close();
   });
 
-  it("리뷰 읽기 호출이 ACK 가 아닌 판정을 내면 판정으로 쓰지 않고 멈추며, 실은 쪽의 인정은 보존해 재시도가 남은 구간부터 잇는다", async () => {
+  it.each([false, true])("리뷰 읽기 호출의 판정 또는 중재 요청은 멈추며 재시도는 남은 구간부터 잇는다 (mediator: %s)", async mediator => {
     const { room } = await largeReviewRoom("ledger-invalid-ack");
     const claude = new PagingClaude(room.worktree);
-    const codex = new LedgerCodex([{ result: result("REVIEW", "읽기 호출에서 판정했습니다.", [reviewFinding("AGREED_ACTION")]) }]);
+    const codex = new LedgerCodex([{ result: mediator ? { ...result("ACK", "중재 요청", []), requestedMediatorAction: "Run check" }
+      : result("REVIEW", "읽기 호출에서 판정했습니다.", [reviewFinding("AGREED_ACTION")]) }]);
     const engine = room.engine(claude, codex);
     engine.startImplementation(room.topicId);
     await room.idle();
 
     expect(operationsOf(codex.calls)).toEqual(["create:review-read"]);
     const stop = room.database.getTimeline(room.topicId).at(-1)!;
-    expect(stop.payload?.reviewReadInvalid).toEqual({ round: 1, kind: "REVIEW" });
+    expect(stop.payload?.reviewReadInvalid).toEqual({ round: 1, kind: mediator ? "ACK" : "REVIEW" });
     expect(room.database.latestArtifact(room.topicId, "codex-review")).toBeNull();
     expect(room.database.getTimeline(room.topicId).some((event) => event.actor === "codex" && event.kind === "agent_output")).toBe(false);
     const sent = pagesIn(codex.calls[0].prompt);
@@ -2141,4 +2163,320 @@ it.each(["changed","expired"])("interrupted commit recovery retains its request-
     expect(database.evidence.sourceSnapshot(state.sources[0])!.units[0].content).toBe("approved before commit");
     await expect(engine.push(f.topicId)).resolves.toBe(oid);
   } finally {clock?.mockRestore();database.close();}
+});
+
+
+it("a completed review requesting mediator work cannot become ready to deliver and retains its request", async () => {
+  const room = await pagedTopic("review-mediator-handoff", []);
+  const claude = new PagingClaude(room.worktree);
+  const action = "Run the authorized render gate";
+  const codex = new LedgerCodex([{ result: { ...result("REVIEW", "Review needs render evidence", []),
+    status: "completed", requestedMediatorAction: action } }]);
+  room.engine(claude, codex).startImplementation(room.topicId);
+  await room.idle();
+  expect(room.database.getTopic(room.topicId).state, room.database.getTopic(room.topicId).lastError ?? undefined).toBe("USER_DECISION_REQUIRED");
+  expect(room.database.getFlags(room.topicId).resumeState).toBe("CODEX_REVIEW");
+  const events = room.database.getTimeline(room.topicId);
+  expect(events.some(event => event.payload?.waitingFor === "mediator")).toBe(true);
+  expect(pendingReviewRequests(events, room.database.getTopic(room.topicId).scopeGeneration)
+    .map(request => request.question)).toEqual([`중재자 실행 요청: ${action}`]);
+  expect(claude.calls.map(call => call.operation)).toEqual(["implement"]);
+  expect(operationsOf(codex.calls)).toEqual(["create:review"]);
+  const log = join(room.worktree, "render-proof.log");
+  writeFileSync(log, "render verified: 4 distinct segment IDs");
+  const evidence = room.database.appendEvent({ topicId: room.topicId, actor: "user", kind: "evidence", state: "USER_DECISION_REQUIRED", body: `Inspect ${log}` });
+  codex.steps.push({ reply: turn => {
+    expect(turn.job?.operation).toBe("review");
+    expect(turn.protocolOnly).not.toBe(true);
+    expect(turn.prompt).toContain(log);
+    const requests = JSON.parse(turn.prompt.split("BEGIN_MEDIATOR_REVIEW_REQUESTS\n")[1].split("\nEND_MEDIATOR_REVIEW_REQUESTS")[0]);
+    expect(readFileSync(log, "utf8")).toBe("render verified: 4 distinct segment IDs");
+    return { ...result("REVIEW", "Read and verified the render log", []), status: "completed",
+      reviewDecisionAnswers: [{ requestId: requests[0].id, decisionSequence: evidence.sequence }] };
+  } });
+  room.engine(claude, codex).retry(room.topicId);
+  await room.idle();
+  expect(room.database.getTopic(room.topicId).state, room.database.getTopic(room.topicId).lastError ?? undefined).toBe("READY_TO_DELIVER");
+  expect(pendingReviewRequests(room.database.getTimeline(room.topicId), room.database.getTopic(room.topicId).scopeGeneration)).toEqual([]);
+  expect(codex.calls.some(call => call.operation === "answer-confirmation")).toBe(false);
+  room.database.close();
+});
+
+it("a review that verifies earlier mediator work and asks for more keeps the verification and waits for the new request", async () => {
+  const room = await pagedTopic("mediator-invalid-answer", []);
+  const claude = new PagingClaude(room.worktree);
+  const codex = new LedgerCodex([{ result: { ...result("REVIEW", "Render required", []),
+    status: "completed", requestedMediatorAction: "Run render" } }]);
+  const engine = room.engine(claude, codex);
+  engine.startImplementation(room.topicId);
+  await room.idle();
+  const evidence = room.database.appendEvent({ topicId: room.topicId, actor: "user", kind: "evidence", state: "USER_DECISION_REQUIRED", body: "Render report" });
+  const [request] = pendingReviewRequests(room.database.getTimeline(room.topicId), room.database.getTopic(room.topicId).scopeGeneration);
+  codex.steps.push({ result: { ...result("REVIEW", "Need more work", []), status: "completed", requestedMediatorAction: "Inspect screenshot",
+    reviewDecisionAnswers: [{ requestId: request.id, decisionSequence: evidence.sequence }], decisionAssessments: [] } });
+  engine.retry(room.topicId);
+  await room.idle();
+  expect(room.database.getTopic(room.topicId).state, room.database.getTopic(room.topicId).lastError ?? undefined).toBe("USER_DECISION_REQUIRED");
+  const pending = pendingReviewRequests(room.database.getTimeline(room.topicId), room.database.getTopic(room.topicId).scopeGeneration);
+  expect(pending.map(r => r.id)).not.toContain(request.id);
+  expect(pending.map(r => r.question)).toEqual(["중재자 실행 요청: Inspect screenshot"]);
+  expect(room.database.getTimeline(room.topicId).some(event => event.payload?.mediatorExecutionReview === true
+    && (event.payload.reviewRequestAnswers as Array<{ requestId?: string }> | undefined)?.[0]?.requestId === request.id)).toBe(true);
+  expect(() => engine.retry(room.topicId)).toThrow("중재자 실행 대기 중입니다");
+  room.database.close();
+});
+
+it("a stored completed review cannot open a fix while mediator evidence remains unverified", async () => {
+  const room = await pagedTopic("mediator-stored-fix", []);
+  const claude = new PagingClaude(room.worktree);
+  const codex = new LedgerCodex([{ result: { ...result("REVIEW", "Need verification before fix", [reviewFinding("AGREED_ACTION")]),
+    status: "completed", requestedMediatorAction: "Verify authorized render" } }]);
+  const engine = room.engine(claude, codex);
+  engine.startImplementation(room.topicId); await room.idle();
+  room.database.appendEvent({ topicId: room.topicId, actor: "user", kind: "decision", state: "USER_DECISION_REQUIRED", body: "Unrelated policy remains unchanged" });
+  expect(() => engine.retry(room.topicId)).toThrow("중재자 실행 대기 중입니다");
+  expect(room.database.getTopic(room.topicId).state, room.database.getTopic(room.topicId).lastError ?? undefined).toBe("USER_DECISION_REQUIRED");
+  expect(room.database.getFlags(room.topicId).resumeState).toBe("CODEX_REVIEW");
+  expect(claude.calls.map(call => call.operation)).toEqual(["implement"]);
+  expect(operationsOf(codex.calls)).toEqual(["create:review"]);
+  const proof = room.database.appendEvent({ topicId: room.topicId, actor: "user", kind: "evidence", state: "USER_DECISION_REQUIRED", body: "Unverified render file" });
+  codex.steps.push({ result: { ...result("REVIEW", "Proof not sufficient", [reviewFinding("AGREED_ACTION")]), status: "completed" } });
+  engine.retry(room.topicId); await room.idle();
+  expect(claude.calls.map(call => call.operation)).toEqual(["implement"]);
+  expect(room.database.getTopic(room.topicId).state, room.database.getTopic(room.topicId).lastError ?? undefined).toBe("USER_DECISION_REQUIRED");
+  const calls = codex.calls.length;
+  expect(() => engine.retry(room.topicId)).toThrow("중재자 실행 대기 중입니다");
+  expect(codex.calls).toHaveLength(calls);
+  expect(pendingReviewRequests(room.database.getTimeline(room.topicId), room.database.getTopic(room.topicId).scopeGeneration)).toHaveLength(1);
+  room.database.close();
+});
+
+it("resolving mediator work does not re-confirm a pending policy question without new input", async () => {
+  const room = await pagedTopic("mediator-partial-confirmation", []);
+  const claude = new PagingClaude(room.worktree);
+  const codex = new LedgerCodex([{ result: { ...result("REVIEW", "Need policy and render", []), status: "completed",
+    requestedUserDecision: "Choose policy", requestedMediatorAction: "Verify render" } }]);
+  const engine = room.engine(claude, codex);
+  engine.startImplementation(room.topicId); await room.idle();
+  room.database.appendEvent({ topicId: room.topicId, actor: "user", kind: "decision", state: "USER_DECISION_REQUIRED", body: "Policy remains undecided" });
+  const proof = room.database.appendEvent({ topicId: room.topicId, actor: "user", kind: "evidence", state: "USER_DECISION_REQUIRED", body: "Render proof" });
+  codex.steps.push({ reply: turn => ({ ...answerAll(turn.prompt), reviewDecisionAnswers: [] }) });
+  codex.steps.push({ reply: turn => {
+    const [request] = JSON.parse(turn.prompt.split("BEGIN_MEDIATOR_REVIEW_REQUESTS\n")[1].split("\nEND_MEDIATOR_REVIEW_REQUESTS")[0]);
+    return { ...result("REVIEW", "Render verified, policy unanswered", []), status: "completed",
+      reviewDecisionAnswers: [{ requestId: request.id, decisionSequence: proof.sequence }] };
+  } });
+  engine.retry(room.topicId); await room.idle();
+  expect(room.database.getTopic(room.topicId).state, room.database.getTopic(room.topicId).lastError ?? undefined).toBe("USER_DECISION_REQUIRED");
+  expect(pendingReviewRequests(room.database.getTimeline(room.topicId), room.database.getTopic(room.topicId).scopeGeneration).map(r => r.question)).toEqual(["Choose policy"]);
+  expect(codex.calls.filter(call => call.operation === "answer-confirmation")).toHaveLength(1);
+  engine.retry(room.topicId); await room.idle();
+  expect(codex.calls.filter(call => call.operation === "answer-confirmation")).toHaveLength(1);
+  room.database.close();
+});
+
+
+it("a review that verifies mediator evidence and also asks a policy question keeps the verification", async () => {
+  const room = await pagedTopic("mediator-verify-then-policy", []);
+  const claude = new PagingClaude(room.worktree);
+  const codex = new LedgerCodex([{ result: { ...result("REVIEW", "Need render", []), status: "completed", requestedMediatorAction: "Verify render" } }]);
+  const engine = room.engine(claude, codex);
+  engine.startImplementation(room.topicId); await room.idle();
+  const proof = room.database.appendEvent({ topicId: room.topicId, actor: "user", kind: "evidence", state: "USER_DECISION_REQUIRED", body: "Render proof" });
+  codex.steps.push({ reply: turn => {
+    const [request] = JSON.parse(turn.prompt.split("BEGIN_MEDIATOR_REVIEW_REQUESTS\n")[1].split("\nEND_MEDIATOR_REVIEW_REQUESTS")[0]);
+    return { ...result("REVIEW", "Render verified; release channel still undecided", []), status: "completed", requestedUserDecision: "Choose release channel",
+      reviewDecisionAnswers: [{ requestId: request.id, decisionSequence: proof.sequence }] };
+  } });
+  engine.retry(room.topicId); await room.idle();
+  expect(pendingReviewRequests(room.database.getTimeline(room.topicId), room.database.getTopic(room.topicId).scopeGeneration)
+    .map(request => request.question)).toEqual(["Choose release channel"]);
+  const policyAnswer = room.database.appendEvent({ topicId: room.topicId, actor: "user", kind: "decision", state: "USER_DECISION_REQUIRED", body: "Use channel A" });
+  codex.steps.push({ reply: turn => answerAll(turn.prompt) });
+  codex.steps.push({ result: { ...result("REVIEW", "Channel A applied", []), status: "completed" } });
+  engine.retry(room.topicId); await room.idle();
+  const waitsAfterAnswer = room.database.getTimeline(room.topicId).filter(event => event.sequence > policyAnswer.sequence && event.payload?.waitingFor === "mediator");
+  expect(waitsAfterAnswer.map(event => event.body)).toEqual([]);
+  room.database.close();
+});
+
+// 2026-10-06 사용자 결정 — 계획이 ```checks 로 선언한 실행 검사는 엔진이 수락 경계에서 직접 실행한다. 러너가 고칠 실패는 같은 세션의 계속 진행으로, 같은 입력의
+// 반복 실패·호스트 문제는 결과를 보존한 정지로 간다. 리뷰는 그 영수증만 소비한다(리뷰어 좌석이 실행하지 않는다).
+describe("계획 필수 검사 게이트(수락 경계)", { timeout: DELIVERY_TEST_TIMEOUT_MS }, () => {
+  const checksPlan = () => validPlan().replace("## 테스트\n\n검증할 내용",
+    '## 테스트\n\n검증할 내용\n\n```checks\n{"version":1,"items":[{"id":"C-1","kind":"verification","profile":"swift-parse"}]}\n```');
+  const run = (status: VerificationRun["status"], inputSHA256 = "input-1"): VerificationRun => ({
+    id: "00000000-0000-4000-8000-0000000000c1", topicId: "t", cacheKey: "k", profileId: "swift-parse", executor: "engine", status,
+    scopeGeneration: 1, planEpoch: 0, planSHA256: "p", inputSHA256, toolSHA256: "tool", startedAt: 0,
+  });
+  const failed = (inputSHA256 = "input-1"): VerificationOutcome => ({ status: "failed", run: run("failed", inputSHA256),
+    log: { stdout: "", stderr: "Modules/Feature.swift:3:1: error: expected '}' in struct" } });
+  const succeeded: VerificationOutcome = { status: "succeeded", run: run("succeeded", "input-2"), reused: false };
+  function fakeVerifications(outcome: () => Promise<VerificationOutcome>) {
+    return {
+      ensure: vi.fn(async (_topicId: string, _profile: string) => outcome()),
+      receipts: vi.fn(async (_topicId: string, declared: readonly string[] = []) => ({
+        text: declared.length ? `호스트 실행 검사 영수증(테스트): ${declared.join(",")} 성공` : "", readablePaths: [] })),
+    };
+  }
+
+  it("러너 몫의 실패는 같은 세션의 필수 검사 계속 진행으로 돌려보내고, 통과한 뒤에만 리뷰한다 — 리뷰는 선언된 프로필의 영수증을 받는다", async () => {
+    const room = await pagedTopic("plan-check-fix", [], { plan: checksPlan() });
+    const claude = new PagingClaude(room.worktree);
+    const codex = new LedgerCodex();
+    const outcomes = [failed(), succeeded];
+    const verifications = fakeVerifications(async () => outcomes.shift()!);
+    room.engine(claude, codex, false, verifications).startImplementation(room.topicId);
+    await room.idle();
+
+    expect(room.database.getTopic(room.topicId).state).toBe("READY_TO_DELIVER");
+    expect(claude.calls.map((call) => call.operation)).toEqual(["implement", "continue"]);
+    expect(claude.calls[1].prompt).toContain("승인 계획이 선언한 필수 검사가 이 작업 트리에서 실패해");
+    expect(claude.calls[1].prompt).toContain("Modules/Feature.swift:3:1: error");
+    expect(claude.calls[1].prompt).toContain("중재자에게 실행을 요청할 필요는 없습니다");
+    expect(verifications.ensure).toHaveBeenCalledTimes(2);
+    expect(verifications.ensure.mock.calls.every(([, profile]) => profile === "swift-parse")).toBe(true);
+    const turn = room.database.getTimeline(room.topicId).find((event) => event.payload?.planCheckTurn === 1)!;
+    expect(turn.body).toContain("계획 필수 검사(C-1)가 이 작업 트리에서 실패해");
+    expect(verifications.receipts).toHaveBeenCalledWith(room.topicId, ["swift-parse"]);
+    expect(codex.calls[0].prompt).toContain("호스트 실행 검사 영수증(테스트): swift-parse 성공");
+    expect(codex.calls[0].prompt).toContain("이 리뷰 좌석은 읽기 전용입니다");
+    room.database.close();
+  });
+
+  it("같은 입력으로 같은 실패가 2회 연속 반복되면 결과를 보존한 채 멈춘다(무한 계속 진행 없음)", async () => {
+    const room = await pagedTopic("plan-check-stall", [], { plan: checksPlan() });
+    const claude = new PagingClaude(room.worktree);
+    const codex = new LedgerCodex();
+    const verifications = fakeVerifications(async () => failed());
+    room.engine(claude, codex, false, verifications).startImplementation(room.topicId);
+    await room.idle();
+
+    const topic = room.database.getTopic(room.topicId);
+    expect(topic.state).toBe("USER_DECISION_REQUIRED");
+    expect(topic.lastError).toContain("2회 연속 같은 입력으로 실패했습니다");
+    expect(claude.calls.map((call) => call.operation)).toEqual(["implement", "continue", "continue"]);
+    expect(codex.calls).toHaveLength(0);
+    expect(room.database.getTimeline(room.topicId).some((event) => event.payload?.planChecksStalled === true)).toBe(true);
+    room.database.close();
+  });
+
+  it("호스트 문제(실행 불가)는 러너에게 보내지 않고 바로 멈추며, 재시도는 쓰기 턴 없이 저장된 결과로 검사부터 다시 한다", async () => {
+    const room = await pagedTopic("plan-check-host", [], { plan: checksPlan() });
+    const claude = new PagingClaude(room.worktree);
+    const codex = new LedgerCodex();
+    let hostReady = false;
+    const verifications = fakeVerifications(async () => {
+      if (!hostReady) throw new Error("swiftc 를 찾을 수 없습니다(xcrun --find swiftc)");
+      return succeeded;
+    });
+    const engine = room.engine(claude, codex, false, verifications);
+    engine.startImplementation(room.topicId);
+    await room.idle();
+
+    let topic = room.database.getTopic(room.topicId);
+    expect(topic.state).toBe("USER_DECISION_REQUIRED");
+    expect(topic.lastError).toContain("판정하지 못해");
+    expect(topic.lastError).toContain("swiftc 를 찾을 수 없습니다");
+    expect(claude.calls.map((call) => call.operation)).toEqual(["implement"]);
+    expect(codex.calls).toHaveLength(0);
+
+    hostReady = true;
+    engine.retry(room.topicId);
+    await room.idle();
+    topic = room.database.getTopic(room.topicId);
+    expect(topic.state).toBe("READY_TO_DELIVER");
+    expect(claude.calls.map((call) => call.operation)).toEqual(["implement"]);
+    expect(room.database.getTimeline(room.topicId).some((event) => event.payload?.planChecksRetry !== undefined)).toBe(true);
+    room.database.close();
+  });
+
+  it("checks 블록이 없는 계획(이 계약 전 승인 계획 포함)은 검사를 부르지 않고, 리뷰 영수증도 선언 없이 묻는다", async () => {
+    const room = await pagedTopic("plan-check-none", []);
+    const claude = new PagingClaude(room.worktree);
+    const codex = new LedgerCodex();
+    const verifications = fakeVerifications(async () => { throw new Error("부르면 안 됩니다"); });
+    room.engine(claude, codex, false, verifications).startImplementation(room.topicId);
+    await room.idle();
+
+    expect(room.database.getTopic(room.topicId).state).toBe("READY_TO_DELIVER");
+    expect(verifications.ensure).not.toHaveBeenCalled();
+    expect(verifications.receipts).toHaveBeenCalledWith(room.topicId, []);
+    expect(room.database.getTimeline(room.topicId).some((event) => event.payload?.planCheckTurn !== undefined)).toBe(false);
+    room.database.close();
+  });
+});
+
+// 2026-10-06 사용자 결정(수정 먼저) — 완료 리뷰에 확정 결함과 외부 증거 요청이 함께 있으면 수정부터 한다. 증거 요청은 수정 작업 계약(deferredEvidence)에 실려
+// 러너 의무에서 빠지고, 최종 리뷰가 최종 트리에서 다시 판정한다. 두 번째 수정 회차로 넘어가도 남은 증거 요청은 계약을 따라간다(D3). 증거만 있으면 종전대로 멈춘다.
+describe("수정 먼저와 넘긴 증거 요청(deferredEvidence)", { timeout: DELIVERY_TEST_TIMEOUT_MS }, () => {
+  class ScriptClaude implements AgentAdapter {
+    readonly role = "claude" as const;
+    readonly calls: Array<{ operation: string; prompt: string }> = [];
+    constructor(private readonly worktree: string, private readonly steps: AgentResult[]) {}
+    async createSession(turn: Omit<SessionTurn, "sessionId">) {
+      const reply = this.next(turn);
+      turn.onSessionCreated?.("claude-script");
+      return { sessionId: "claude-script", result: reply };
+    }
+    async resumeTurn(turn: SessionTurn) { return this.next(turn); }
+    async validateExistingSession() { return true; }
+    private next(turn: Omit<SessionTurn, "sessionId">): AgentResult {
+      this.calls.push({ operation: turn.job?.operation ?? "", prompt: turn.prompt });
+      const step = this.steps.shift();
+      if (!step) throw new Error(`예상하지 않은 Claude 호출 #${this.calls.length}: ${turn.job?.operation}`);
+      writeFileSync(join(this.worktree, "feature.txt"), `변경 ${this.calls.length}\n`);
+      return step;
+    }
+  }
+  const evidence: AgentResult["findings"][number] = { id: "E-1", title: "디자인 원문 대조", severity: "MEDIUM", disposition: "EXTERNAL_EVIDENCE",
+    rationale: "Figma 원문을 대조해야 판정할 수 있습니다.", evidenceRefs: [], requiresUserDecision: false };
+  const defect2 = (disposition: "AGREED_ACTION" | "RESOLVED_BY_FIX"): AgentResult["findings"][number] => ({ ...reviewFinding(disposition), id: "F-2", title: "두 번째 결함" });
+  const completed = (base: AgentResult): AgentResult => ({ ...base, status: "completed" });
+  const DEFERRED_FIX = "리뷰가 요청한 외부 증거(이 수정의 의무가 아닙니다";
+  const DEFERRED_REVIEW = "수정 단계로 넘기지 않은 리뷰 증거 요청";
+
+  it("확정 결함 + 증거 요청이면 수정부터 하고, 넘긴 증거 요청은 두 번째 수정 회차까지 계약을 따라가 최종 트리에서 판정된다", async () => {
+    const room = await pagedTopic("fix-first-deferred", []);
+    const claude = new ScriptClaude(room.worktree, [
+      completed(result("IMPLEMENTATION", "구현했습니다.")),
+      completed(result("FIX", "F-1 을 고쳤습니다.", [reviewFinding("RESOLVED_BY_FIX")])),
+      completed(result("FIX", "F-2 를 고쳤습니다.", [reviewFinding("RESOLVED_BY_FIX"), defect2("RESOLVED_BY_FIX")])),
+    ]);
+    const codex = new LedgerCodex([
+      { result: completed(result("REVIEW", "결함 1건과 증거 요청 1건", [reviewFinding("AGREED_ACTION"), evidence])) },
+      { result: completed(result("FINAL_REVIEW", "F-1 확인, 새 결함과 증거 요청 유지", [reviewFinding("RESOLVED_BY_FIX"), evidence, defect2("AGREED_ACTION")])) },
+      { result: completed(result("FINAL_REVIEW", "모두 확인", [reviewFinding("RESOLVED_BY_FIX"), defect2("RESOLVED_BY_FIX"),
+        { ...evidence, disposition: "AGREED_NO_ACTION", rationale: "최종 트리에서 원문과 일치합니다." }])) },
+    ]);
+    room.engine(claude, codex).startImplementation(room.topicId);
+    await room.idle();
+
+    expect(room.database.getTopic(room.topicId).state).toBe("READY_TO_DELIVER");
+    expect(claude.calls.map((call) => call.operation)).toEqual(["implement", "fix", "fix"]);
+    // 두 수정 회차 모두 증거 요청을 의무가 아닌 참고로 받는다(D3: 두 번째 회차까지 유지).
+    for (const call of claude.calls.slice(1)) {
+      expect(call.prompt).toContain(DEFERRED_FIX);
+      expect(call.prompt).toContain("E-1");
+    }
+    const finals = codex.judgments().filter((call) => call.operation === "final-review");
+    expect(finals).toHaveLength(2);
+    for (const call of finals) expect(call.prompt).toContain(DEFERRED_REVIEW);
+    expect(room.database.getTimeline(room.topicId).some((event) => event.state === "BLOCKED_ON_EVIDENCE")).toBe(false);
+    room.database.close();
+  });
+
+  it("확정 결함 없이 증거 요청만 있으면 수정하지 않고 증거 대기로 멈춘다", async () => {
+    const room = await pagedTopic("evidence-only", []);
+    const claude = new ScriptClaude(room.worktree, [completed(result("IMPLEMENTATION", "구현했습니다."))]);
+    const codex = new LedgerCodex([{ result: completed(result("REVIEW", "증거 요청만", [evidence])) }]);
+    room.engine(claude, codex).startImplementation(room.topicId);
+    await room.idle();
+
+    expect(room.database.getTopic(room.topicId)).toMatchObject({ state: "BLOCKED_ON_EVIDENCE", lastError: expect.stringContaining("Figma 원문") });
+    expect(claude.calls.map((call) => call.operation)).toEqual(["implement"]);
+    // 증거 정지는 판정 아님 — 원장은 멈춘 채 같은 ID 로 재개된다.
+    expect(room.database.planning.latestReviewLedger(room.topicId)?.status).toBe("paused");
+    room.database.close();
+  });
 });

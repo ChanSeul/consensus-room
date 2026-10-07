@@ -14,7 +14,7 @@ import type { ActionRecord } from "../src/server/types";
 const C_LOCALE_START_TIME = /^[A-Za-z]{3} [A-Za-z]{3}\s+\d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/;
 
 describe("재시작 프로세스 감독", () => {
-  it("PID·PGID·명령·시작 시각이 모두 같을 때 기록된 process group만 종료한다", async () => {
+  it("PID·PGID·시작 시각이 모두 같을 때 기록된 process group만 종료한다", async () => {
     const identity: ProcessIdentity = {
       pgid: 4201,
       commandLine: "claude --resume session-1",
@@ -34,6 +34,33 @@ describe("재시작 프로세스 감독", () => {
     await new ProcessSupervisor(control).recover([actionFor(identity)]);
 
     expect(signals).toEqual([{ pid: 4201, pgid: 4201, signal: "SIGTERM" }]);
+  });
+
+  it("#! 래퍼가 exec해 command line만 바뀐 같은 프로세스를 종료한다", async () => {
+    // spawn 직후 기록은 /bin/sh 래퍼 단계, 재시작 때 관측은 래퍼가 exec한 실제 CLI다 — PID·PGID·시작 시각은 같다.
+    const recorded: ProcessIdentity = {
+      pgid: 4201,
+      commandLine: "/bin/sh /Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex exec --json -",
+      startedAt: "Sun Aug 23 14:00:00 2026",
+    };
+    const executed: ProcessIdentity = {
+      ...recorded,
+      commandLine: "/Applications/ChatGPT.app/Contents/Resources/CodexCLI.app/Contents/MacOS/codex exec --json -",
+    };
+    let running = true;
+    const signals: NodeJS.Signals[] = [];
+    const reports: ProcessRecoveryReport[] = [];
+    const control: ProcessControl = {
+      inspect: () => running ? executed : null,
+      terminateGroup: (_pid, _pgid, signal) => { signals.push(signal); running = false; },
+      wait: async () => {},
+    };
+
+    await new ProcessSupervisor(control, (report) => { reports.push(report); })
+      .recover([actionFor(recorded, "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex")]);
+
+    expect(signals).toEqual(["SIGTERM"]);
+    expect(reports.map((report) => report.outcome)).toEqual(["terminated"]);
   });
 
   it("엔진 후속 action의 승인된 host-review 경로만 회수한다", async () => {

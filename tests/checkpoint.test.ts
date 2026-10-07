@@ -160,3 +160,47 @@ describe("R10 runner request preservation", () => {
     expect(resolved.openRequests).toEqual([]);
   });
 });
+
+
+it("mediator execution is a durable handoff even when the runner reports in_progress", () => {
+  const input = result({ status: "in_progress", requestedMediatorAction: "Run the approved simulator gate",
+    remainingSteps: ["Update E2E after the moderator returns render evidence"] });
+  const first = accumulate(null, input, [], 10);
+  expect(first.openRequests).toHaveLength(1);
+  expect(completionVerdict(first.result, { openRequests: first.openRequests, decisionAfterRequest: false }))
+    .toMatchObject({ kind: "await-input", reason: "mediator-work" });
+  const next = accumulate(first.result, result({ status: "completed" }), first.openRequests, 20);
+  expect(completionVerdict(next.result, { openRequests: next.openRequests, decisionAfterRequest: false }).kind).toBe("await-input");
+  const resolved = accumulate(next.result, result({ status: "completed", resolvesRequestedDecision: true,
+    resolvedRequestId: first.openRequests[0].id }), next.openRequests, 30);
+  expect(resolved.openRequests).toEqual([]);
+  expect(resolved.result.requestedMediatorAction).toBeUndefined();
+  expect(completionVerdict(resolved.result, { openRequests: [], decisionAfterRequest: true }).kind).toBe("completed");
+});
+
+
+it("an unrelated decision resolution does not clear a mediator handoff", () => {
+  const a = accumulate(null, result({ requestedUserDecision: "Choose a policy", status: "blocked" }), [], 10);
+  const b = accumulate(a.result, result({ requestedMediatorAction: "Run a permitted check", status: "blocked" }), a.openRequests, 20);
+  const c = accumulate(b.result, result({ status: "completed", resolvesRequestedDecision: true,
+    resolvedRequestId: a.openRequests[0].id }), b.openRequests, 30);
+  expect(c.openRequests).toHaveLength(1);
+  expect(completionVerdict(c.result, { openRequests: c.openRequests, decisionAfterRequest: true }))
+    .toMatchObject({ kind: "await-input", reason: "mediator-work" });
+});
+
+
+it("restores the remaining mediator request after resolving a newer request or inheriting only the ledger", () => {
+  const a = accumulate(null, result({ status: "blocked", requestedMediatorAction: "Check render A" }), [], 10);
+  const b = accumulate(a.result, result({ status: "blocked", requestedMediatorAction: "Check render B" }), a.openRequests, 20);
+  const c = accumulate(b.result, result({ status: "completed", resolvesRequestedDecision: true,
+    resolvedRequestId: b.openRequests[1].id }), b.openRequests, 30);
+  for (const state of [c, accumulate(null, result({ status: "completed" }), c.openRequests, 40)]) {
+    expect(state.openRequests).toEqual(a.openRequests);
+    expect(state.result.requestedMediatorAction).toBe("Check render A");
+    expect(completionVerdict(state.result, { openRequests: state.openRequests, decisionAfterRequest: true }))
+      .toMatchObject({ kind: "await-input", reason: "mediator-work" });
+    expect(checkpointOpenRequests({ accumulated: state.result, openRequests: state.openRequests, inputSequence: 40 }))
+      .toEqual(a.openRequests);
+  }
+});

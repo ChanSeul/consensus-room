@@ -234,6 +234,57 @@ describe("실행 허용 거부의 재개와 예약 복원", () => {
     expect(database.reviews.account("t", "planning").used).toBe(0);
     database.close();
   });
+
+  it("HR-01: 리더 런타임이 응답 없이 죽으면 FAILED 가 아니라 host-runtime 정지로 멈추고, 런타임이 돌아온 뒤 retry 는 같은 단계를 잇는다", async () => {
+    const root = mkdtempSync(join(tmpdir(), "consensus-room-host-runtime-")); temporaryDirectories.push(root);
+    const bin = mkdtempSync(join(tmpdir(), "consensus-room-fake-node-")); temporaryDirectories.push(bin);
+    writeFileSync(join(bin, "node"), "#!/bin/sh\necho 'dyld[1]: Library not loaded: /opt/homebrew/opt/simdjson/lib/libsimdjson.33.dylib' >&2\nkill -ABRT $$\n", { mode: 0o755 });
+    const database = new ConsensusDatabase(join(root, "room.sqlite"));
+    const at = new Date().toISOString();
+    database.createTopic({ id: "t", slug: "t", title: "t", repositoryPath: root, baseRef: "develop", worktreePath: root, branchName: null, state: "DRAFT", scopeGeneration: 1, planRevision: 0, planSHA256: null, approvedPlanSHA256: null, createdAt: at, updatedAt: at, lastError: null });
+    for (const role of ["claude", "codex"] as const) database.upsertParticipant("t", { role, sessionId: `${role}-session`, mode: "attached", acknowledgedPlanSHA256: null });
+    database.budgets.configure("t", { execution: { inputTokens: 1000, outputTokens: 1000, durationMs: 60000 }, total: { inputTokens: 100000, outputTokens: 100000, durationMs: 600000 } }, "probe");
+    const lock = join(root, "maintenance.json");
+    const { REQUIRED_PLAN_HEADINGS } = await import("../src/shared/contracts");
+    const { readAppliedInstructions } = await import("../src/server/projectInstructions");
+    const plan = REQUIRED_PLAN_HEADINGS.map((h) => `## ${h}\n\n${h}${h === "허용 오차" ? '\n\n```tolerance\n{"scopePaths":["owned.txt"],"rules":[]}\n```' : ""}`).join("\n\n");
+    let broken = true, claudeCalls = 0, codexCalls = 0;
+    // 어댑터가 공급자를 부르기 전에 지시문을 읽는 경로(claude.ts:268 과 같은 위치)를 실제 리더로 재현한다.
+    const readInstructions = async (signal?: AbortSignal) => {
+      const read = () => readAppliedInstructions({ workspace: root, fileName: "CLAUDE.md", injectWorkspaceFile: true, signal });
+      if (!broken) return read();
+      // 리더는 읽을 때마다 PATH 의 node 를 띄운다(hostRuntime.ts) — 업그레이드 중인 keg 를 PATH 앞의 가짜 런타임으로 재현한다.
+      const path = process.env.PATH;
+      process.env.PATH = `${bin}:${path ?? ""}`;
+      try { return await read(); } finally { if (path === undefined) delete process.env.PATH; else process.env.PATH = path; }
+    };
+    const runClaude = async (turn: { beforeSpawn?: () => void | Promise<void>; admitSync?: () => void; signal?: AbortSignal }) => {
+      await readInstructions(turn.signal);
+      await turn.beforeSpawn?.(); turn.admitSync?.(); claudeCalls++;
+      return { kind: "PLAN" as const, summary: "plan", planMarkdown: plan, findings: [], evidenceRefs: [] };
+    };
+    const claude = { role: "claude" as const, validateExistingSession: async () => true, resumeTurn: runClaude, createSession: async (turn: Parameters<typeof runClaude>[0]) => ({ sessionId: "c", result: await runClaude(turn) }) };
+    // HS-01 과 같다 — 감사는 유지보수 잠금으로 spawn 직전에 멈춰, retry 뒤 흐름이 감사까지 이어졌음을 끝에서 확인한다.
+    const runCodex = async (turn: { beforeSpawn?: () => void | Promise<void>; admitSync?: () => void }) => { codexCalls++; writeFileSync(lock, JSON.stringify({ at: new Date().toISOString(), reason: "probe" })); await turn.beforeSpawn?.(); turn.admitSync?.(); throw new Error("unexpected spawn"); };
+    const codex = { role: "codex" as const, validateExistingSession: async () => true, resumeTurn: runCodex, createSession: async (turn: Parameters<typeof runCodex>[0]) => ({ sessionId: "x", result: await runCodex(turn) }) };
+    const { WorkflowEngine } = await import("../src/server/workflow");
+    const settled = async () => { while (database.runningAction("t")) await new Promise((resolve) => setTimeout(resolve, 10)); };
+    const engine = new WorkflowEngine({ database, artifacts: new ArtifactStore(join(root, "topics"), database),
+      git: new GitService({ run: async () => { throw new Error("Unexpected Git command"); } }), claude, codex, enforceBudgets: true, maintenanceLockPath: lock });
+    engine.startPlan("t"); await settled();
+    expect(database.getTopic("t").state).toBe("USER_DECISION_REQUIRED");
+    const stop = database.getTimeline("t").find((event) => event.payload?.admissionRefused === "host-runtime");
+    expect(stop?.body).toContain("libsimdjson.33.dylib");
+    expect(stop?.body).not.toContain("User file access blocked");
+    expect(claudeCalls + codexCalls).toBe(0);
+    expect(database.revisions.account("t")).toMatchObject({ used: 0, firstPlanUsed: false });   // spawn 전 실패라 무료 최초 계획 예약이 돌아왔다
+    broken = false;   // brew 업그레이드가 끝났다 — 서버 재시작 없이 retry 한다
+    engine.retry("t"); await settled();
+    expect(claudeCalls).toBe(1);
+    expect(codexCalls).toBe(1);
+    expect(database.getFlags("t").resumeState).toBe("CODEX_AUDIT");
+    database.close();
+  });
 });
 
 describe("서버 샌드박스 판정 — app.probeNestedSandbox", () => {
@@ -332,7 +383,7 @@ describe("E3-4c 코드 리뷰 원장 — 예산 래퍼의 예약·되돌림과 �
     room.database.close();
   });
 
-  it("원장 신원: 판정 전 같은 신원은 같은 ID(DB 다시 열기 포함), 판정·새 tree·새 계약·다른 리뷰 종류는 새 ID 이고 옛 원장은 다시 이어지지 않는다", () => {
+  it("원장 신원: 판정 전·판정 아님(paused)의 같은 신원은 같은 ID(DB 다시 열기 포함), 판정 도달·새 tree·새 계약·다른 리뷰 종류는 새 ID 이고 옛 원장은 다시 이어지지 않는다", () => {
     const room = reviewRoom();
     const planning = () => room.database.planning;
     const first = planning().openReviewLedger(identity);
@@ -344,11 +395,19 @@ describe("E3-4c 코드 리뷰 원장 — 예산 래퍼의 예약·되돌림과 �
     planning().noteReviewLedgerSession(first.id, "s1");
     planning().noteReviewLedgerRead(first.id, "s1");
     expect(planning().reviewLedger(first.id)).toMatchObject({ createdSessions: ["s1"], reads: 1, session: "s1" });
-    // 판정이 돌아오면 닫힌다 — 같은 신원도 새 원장이다(같은 ID 로 판정을 되풀이하지 않는다).
-    planning().judgeReviewLedger(first.id);
+    // 판정 아님으로 멈추면(paused) 같은 신원의 재개가 같은 ID 를 되살린다 — 예약을 새로 하지 않는다.
+    planning().pauseReviewLedger(first.id);
+    expect(planning().reviewLedger(first.id)?.status).toBe("paused");
+    expect(planning().resumableReviewLedger(identity)?.id).toBe(first.id);
+    expect(planning().reviewLedger(first.id)?.status).toBe("paused"); // 조회는 부수효과가 없다.
+    expect(planning().openReviewLedger(identity)).toMatchObject({ id: first.id, status: "open" });
+    // 판정에 도달하면 닫힌다 — 같은 신원도 새 원장이다(같은 ID 로 판정을 되풀이하지 않는다).
+    planning().completeReviewLedger(first.id);
+    planning().pauseReviewLedger(first.id); // 닫힌 원장은 되돌리지 않는다.
+    expect(planning().reviewLedger(first.id)?.status).toBe("completed");
+    expect(planning().resumableReviewLedger(identity)).toBeNull();
     const second = planning().openReviewLedger(identity);
     expect(second.id).not.toBe(first.id);
-    expect(planning().reviewLedger(first.id)?.status).toBe("judged");
     planning().completeReviewLedger(second.id);
     expect(planning().reviewLedger(second.id)?.status).toBe("completed");
     const third = planning().openReviewLedger(identity);

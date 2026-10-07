@@ -17,6 +17,11 @@ import { SqliteEvidenceReadLifecycle, type EvidenceReadLifecycle, type EvidenceR
 const fail = (message: string): never => { throw Object.assign(new Error(message), { statusCode: 409 }); };
 type Binding = Pick<Topic, "id" | "scopeGeneration" | "planEpoch" | "planSHA256">;
 const binding = (topic: Binding) => stableJSON([topic.scopeGeneration, topic.planEpoch, topic.planSHA256]);
+// Source id → content version. Reviews and change assessments compare these, never list digests.
+export type SourceManifest = Record<string, string | null>;
+export function sourceManifest(sources: readonly EvidenceSource[]): SourceManifest {
+  return Object.fromEntries(sources.map(source => [source.id, source.contentHash]));
+}
 
 // 한 소비처에 아직 전달하지 않은 항목(E3-1). 단위는 offset(코드 포인트)부터 남은 구간이다.
 type PendingEntry =
@@ -137,7 +142,7 @@ export class EvidenceStore {
       CREATE TABLE IF NOT EXISTS evidence_units(hash TEXT PRIMARY KEY, record TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS evidence_images(hash TEXT PRIMARY KEY, bytes BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS evidence_topics(topic_id TEXT NOT NULL REFERENCES topics(id), source_id TEXT NOT NULL REFERENCES evidence_sources(id), PRIMARY KEY(topic_id,source_id));
-      CREATE TABLE IF NOT EXISTS evidence_reviews(topic_id TEXT PRIMARY KEY REFERENCES topics(id), binding TEXT NOT NULL, digest TEXT NOT NULL, reason TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS evidence_reviews(topic_id TEXT PRIMARY KEY REFERENCES topics(id), binding TEXT NOT NULL, digest TEXT NOT NULL, reason TEXT NOT NULL, manifest TEXT);
       CREATE TABLE IF NOT EXISTS evidence_mediator_consumers(consumer TEXT PRIMARY KEY, manifest TEXT NOT NULL, ack_id TEXT);
       CREATE TABLE IF NOT EXISTS evidence_mediator_acks(consumer TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY(consumer,id));
       CREATE TABLE IF NOT EXISTS evidence_mediator_batches(consumer TEXT PRIMARY KEY, id TEXT NOT NULL, manifest TEXT NOT NULL, packet TEXT NOT NULL);
@@ -152,6 +157,9 @@ export class EvidenceStore {
       CREATE TABLE IF NOT EXISTS evidence_mediator_source_receipts(consumer TEXT NOT NULL, source_id TEXT NOT NULL, PRIMARY KEY(consumer,source_id));
       CREATE TABLE IF NOT EXISTS evidence_mediator_legacy(consumer TEXT PRIMARY KEY);
     `);
+    // Reviews recorded before this column carry no source versions; their next change review covers the whole plan.
+    if (!(db.prepare("PRAGMA table_info(evidence_reviews)").all() as Array<Record<string, unknown>>).some(column => column.name === "manifest"))
+      db.exec("ALTER TABLE evidence_reviews ADD COLUMN manifest TEXT");
     for (const table of [RUNNER_TABLES.units, RUNNER_TABLES.progress, RUNNER_TABLES.sources,
       MEDIATOR_TABLES.units, MEDIATOR_TABLES.progress, MEDIATOR_TABLES.sources]) {
       db.exec(`CREATE INDEX IF NOT EXISTS ${table}_topic ON ${table}(json_extract(consumer,'$[0]')) WHERE json_valid(consumer)`);
@@ -601,11 +609,16 @@ export class EvidenceStore {
     if (binding(topic) !== binding({ id: topic.id, ...expectedPlan })) fail("확인한 계획이 바뀌었습니다. 현재 계획과 원문을 다시 대조하세요.");
     if (!topic.planSHA256 || digest !== current.digest || !current.ready) fail("현재 계획과 최신 원문을 확인한 뒤 다시 검토 완료로 표시하세요.");
     if (!reason.trim()) throw new Error("변경이 현재 계획에 미치는 영향을 적어 주세요.");
-    this.db.prepare("INSERT INTO evidence_reviews(topic_id,binding,digest,reason) VALUES (?,?,?,?) ON CONFLICT(topic_id) DO UPDATE SET binding=excluded.binding,digest=excluded.digest,reason=excluded.reason")
-      .run(topic.id, binding(topic), digest, redactSecrets(reason).slice(0, 2000));
+    this.db.prepare("INSERT INTO evidence_reviews(topic_id,binding,digest,reason,manifest) VALUES (?,?,?,?,?) ON CONFLICT(topic_id) DO UPDATE SET binding=excluded.binding,digest=excluded.digest,reason=excluded.reason,manifest=excluded.manifest")
+      .run(topic.id, binding(topic), digest, redactSecrets(reason).slice(0, 2000), stableJSON(sourceManifest(current.sources)));
     const frozen = this.frozen(topic);
     if (frozen) this.db.prepare("UPDATE evidence_frozen_topics SET record=? WHERE binding=?")
       .run(JSON.stringify({ ...frozen, reviewed: true }),stableJSON([topic.id,binding(topic)]));
+  }
+  // Source versions the current plan was last reviewed against — the base of the next change review.
+  reviewedManifest(topic: Binding): SourceManifest | null {
+    const row = this.db.prepare("SELECT binding,manifest FROM evidence_reviews WHERE topic_id=?").get(topic.id);
+    return row?.binding === binding(topic) && typeof row.manifest === "string" ? JSON.parse(row.manifest) : null;
   }
   assertReady(topic: Binding, reviewed = true): void {
     const state = this.topic(topic);

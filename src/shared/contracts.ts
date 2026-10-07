@@ -8,10 +8,24 @@ import { z } from "zod";
 import { WorkEntryInputSchema, WorkEntrySchema } from "./topicStructure.js";
 import { PlanningStepSchema, PlanningStepJsonSchema, CodexPlanningStepJsonSchema } from "./planningControl.js";
 import { ToleranceLedgerEntrySchema } from "./tolerance";
+import { characterLimit, maxCharacters } from "./textLimits.js";
 
 // 확인 입력 분할과 응답 스키마가 같은 호출당 상한을 쓴다.
 export const REVIEW_DECISION_BATCH_LIMIT = 200;
 export const REVIEW_ANSWER_BATCH_LIMIT = 100;
+
+// 서버 계약과 CLI 출력 스키마가 같이 읽는 한도(R4) — 서버만 거부하는 한도는 모델이 볼 수 없어 CLI 는 받고 서버 파서만 응답 전체를 버렸다
+// (2026-10-07 1fd0cc86 seq 360: 근거 검토의 remainingSteps 항목 505자). 문자열 길이는 JSON Schema 처럼 코드 포인트로 세는 상한(textLimits.ts maxCharacters)을
+// 두고 CLI 스키마가 characterLimit 로 읽는다.
+// 계획·파일·메모리에 그대로 적용되는 값(planEdits[], planLineEdits, memoryUpdates[], PlanRepair edits)에는 현재 상태와 대조되는 해시 패턴만 싣고,
+// 개수·길이·최솟값 한도는 서버에만 둔다 — Codex 는 구조화 출력 한도를 생성 단계에서 값을 바꿔 맞추므로(잘라 내거나 지어냄), 거부될 응답이
+// 소리 없이 틀린 적용이 된다(memoryUpdates content " " 덮어쓰기, startLine 0 → 1). 일치는 tests/agent-result-schema-limits.test.ts 가 지킨다.
+const ENGINE_DEFECT_LIMIT = 50;
+const REMAINING_STEPS_LIMIT = 50;
+const RemainingStepSchema = maxCharacters(z.string(), 500);
+const SHA256_HEX = /^[a-f0-9]{64}$/;
+// .trim().min(1) 의 CLI 표현 — 공백이 아닌 문자 하나 이상(JS 정규식의 \s 와 trim 은 같은 공백 집합이다).
+const NON_BLANK = "\\S";
 
 export const WORKFLOW_STATES = [
   "DRAFT",
@@ -111,9 +125,9 @@ export type Finding = z.infer<typeof FindingSchema>;
 
 export const MemoryUpdateSchema = z.object({
   path: z.string().trim().min(1).max(240),
-  expectedSHA256: z.string().regex(/^[a-f0-9]{64}$/).nullable(),
+  expectedSHA256: z.string().regex(SHA256_HEX).nullable(),
   content: z.string().min(1).max(200_000),
-  reason: z.string().trim().min(1).max(1_000),
+  reason: maxCharacters(z.string().trim().min(1), 1_000),
 });
 export type MemoryUpdate = z.infer<typeof MemoryUpdateSchema>;
 
@@ -127,7 +141,7 @@ export const PlanEditSchema = z.object({
 export type PlanEdit = z.infer<typeof PlanEditSchema>;
 
 export const PlanLineEditsSchema = z.object({
-  baseSHA256: z.string().regex(/^[a-f0-9]{64}$/),
+  baseSHA256: z.string().regex(SHA256_HEX),
   edits: z.array(z.object({
     startLine: z.number().int().min(1),
     endLineExclusive: z.number().int().min(1),
@@ -137,14 +151,15 @@ export const PlanLineEditsSchema = z.object({
 export type PlanLineEdits = z.infer<typeof PlanLineEditsSchema>;
 
 export const PlanRepairSchema = z.object({
-  baseSHA256: z.string().regex(/^[a-f0-9]{64}$/),
+  baseSHA256: z.string().regex(SHA256_HEX),
   edits: z.array(PlanEditSchema.strict()).min(1).max(200),
 }).strict();
 export type PlanRepair = z.infer<typeof PlanRepairSchema>;
+// 교정(적용 값)의 개수·길이·최솟값 한도는 서버에만 둔다(위 R4 주석).
 export const PlanRepairJsonSchema = {
   type: "object", additionalProperties: false, required: ["baseSHA256", "edits"],
   properties: {
-    baseSHA256: { type: "string", pattern: "^[a-f0-9]{64}$" },
+    baseSHA256: { type: "string", pattern: SHA256_HEX.source },
     edits: { type: "array", items: {
       type: "object", additionalProperties: false, required: ["find", "replace"],
       properties: { find: { type: "string" }, replace: { type: "string" } },
@@ -171,20 +186,23 @@ export const AgentResultSchema = z.object({
   planMarkdown: z.string().min(1).optional(),
   planEdits: z.array(PlanEditSchema).max(200).optional(),
   planLineEdits: PlanLineEditsSchema.optional(),
-  planSHA256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  planSHA256: z.string().regex(SHA256_HEX).optional(),
   findings: z.array(FindingSchema).default([]),
-  engineDefects: z.array(EngineDefectReportSchema).max(50).optional(),
+  engineDefects: z.array(EngineDefectReportSchema).max(ENGINE_DEFECT_LIMIT).optional(),
   evidenceRefs: z.array(z.string()).default([]),
   requestedUserDecision: z.string().min(1).optional(),
+  // Execution already delegated to the mediator is a handoff, not more runner work or new user approval.
+  requestedMediatorAction: z.string().trim().min(1).optional(),
   // 2026-09-14 Codex 감사 D01: 완료 판단을 요청 필드 유무(프롬프트 해석)에만 맡기지 않는다. 구현·수정 결과가 명시하는 진행 상태 —
   // completed(계획의 모든 단계 끝) · in_progress(단계가 남았고 같은 세션에서 계속) · blocked(사람·중재자 입력 필요). 없으면 종전 규칙.
   status: z.enum(["completed", "in_progress", "blocked"]).optional(),
-  remainingSteps: z.array(z.string().max(500)).max(50).optional(),
+  remainingSteps: z.array(RemainingStepSchema).max(REMAINING_STEPS_LIMIT).optional(),
   // 허용 오차 교정 재제출이 본 턴의 요청 결정을 **해소**했음을 명시한다(예: 범위 밖 변경을 전부 되돌려 질문이 사라짐, Codex 감사 R07).
   resolvesRequestedDecision: z.boolean().optional(),
   // 해소 표식이 가리키는 요청 id(서버가 정지 메시지·재개 프롬프트에 적어 준 `Q-xxxxxxxx`). **id 가 없거나 열린 요청과 다르면 서버는 어떤
-  // 요청도 닫지 않는다**(PLAN §2: 해소 표식은 해당 요청에 결속). 빈 문자열은 거부하지 않고 `resolutionIds` 가 버린다 — 구조화 출력 스키마
-  // (AgentResultJsonSchema)는 minLength 를 못 걸어 모델이 낸 "" 하나가 응답 전체를 폐기시켰다(2026-09-21 사전 검증 #2).
+  // 요청도 닫지 않는다**(PLAN §2: 해소 표식은 해당 요청에 결속). 빈 문자열은 거부하지 않고 `resolutionIds` 가 버린다 — CLI 스키마에 없는
+  // 서버 한도 때문에 모델이 낸 "" 하나가 응답 전체를 폐기시켰다(2026-09-21 사전 검증 #2). 두 공급자는 minLength 를 받지만(2026-10-07 실측),
+  // 빈 id 는 어느 요청도 닫지 않으므로 그대로 받는다.
   resolvedRequestId: z.string().optional(),
   // 한 응답이 여러 열린 요청을 해소할 때의 id 목록(2026-09-21: S11 인도 단계에서 stale 중복 요청 28건을 응답당 하나씩만 닫아야 해 러너 턴 28번이
   // 필요했다). 단수 resolvedRequestId 와 합쳐 **열린 요청과 일치하는 것만 각각** 닫고, 일치하지 않는 id 는 이벤트로 기록한다. 게이트는 여전히
@@ -466,22 +484,32 @@ export type ActionResponse = z.infer<typeof ActionResponseSchema>;
 // 모델 호출 전에 400 invalid_json_schema로 죽고, Codex는 그 오류를 stdout에만 쓰고 stderr는 비운 채
 // exit 1이라 "Codex 실행 실패(1): "만 남는다(2026-08-29 실측). 그래서 선택 필드도 required에 넣고
 // 선택성은 null 허용으로 표현한다. Claude(--json-schema)는 이 규칙을 강제하지 않아 이전까지 통과했다.
+// 한도는 서버 계약과 같은 값을 싣는다(R4 — 파일 머리의 한도 주석).
+const defect = EngineDefectReportSchema.shape;
+const ledger = ToleranceLedgerEntrySchema.shape;
+const memory = MemoryUpdateSchema.shape;
 export const AgentResultJsonSchema = {
   type: "object",
   additionalProperties: false,
   required: [
     "kind", "summary", "planMarkdown", "planEdits", "planLineEdits", "planSHA256",
-    "findings", "engineDefects", "evidenceRefs", "requestedUserDecision", "memoryUpdates", "toleranceLedger",
+    "findings", "engineDefects", "evidenceRefs", "requestedUserDecision", "requestedMediatorAction", "memoryUpdates", "toleranceLedger",
     "status", "remainingSteps", "resolvesRequestedDecision", "resolvedRequestId", "resolvedRequestIds", "reviewDecisionAnswers", "decisionAssessments",
   ],
   properties: {
     kind: { enum: AgentResultSchema.shape.kind.options },
-    engineDefects: { anyOf: [{ type: "array", maxItems: 50, items: {
+    engineDefects: { anyOf: [{ type: "array", maxItems: ENGINE_DEFECT_LIMIT, items: {
       type: "object", additionalProperties: false, required: ["key", "title", "evidence", "workaround"],
-      properties: { key: { type: "string" }, title: { type: "string" }, evidence: { type: "string" }, workaround: { type: "string" } },
+      properties: {
+        key: { type: "string", minLength: 1, maxLength: characterLimit(defect.key), pattern: NON_BLANK },
+        title: { type: "string", minLength: 1, maxLength: characterLimit(defect.title), pattern: NON_BLANK },
+        evidence: { type: "string", minLength: 1, maxLength: characterLimit(defect.evidence), pattern: NON_BLANK },
+        workaround: { type: "string", maxLength: characterLimit(defect.workaround.unwrap()) },
+      },
     } }, { type: "null" }] },
-    summary: { type: "string" },
-    planMarkdown: { anyOf: [{ type: "string" }, { type: "null" }] },
+    summary: { type: "string", minLength: 1 },
+    planMarkdown: { anyOf: [{ type: "string", minLength: 1 }, { type: "null" }] },
+    // 적용 값 — 개수·길이·최솟값 한도는 서버에만 둔다(파일 머리의 R4 주석). planLineEdits·memoryUpdates 도 같다.
     planEdits: {
       anyOf: [
         {
@@ -502,14 +530,14 @@ export const AgentResultJsonSchema = {
     planLineEdits: { anyOf: [{
       type: "object", additionalProperties: false, required: ["baseSHA256", "edits"],
       properties: {
-        baseSHA256: { type: "string" },
+        baseSHA256: { type: "string", pattern: SHA256_HEX.source },
         edits: { type: "array", items: {
           type: "object", additionalProperties: false, required: ["startLine", "endLineExclusive", "replacement"],
           properties: { startLine: { type: "integer" }, endLineExclusive: { type: "integer" }, replacement: { type: "string" } },
         } },
       },
     }, { type: "null" }] },
-    planSHA256: { anyOf: [{ type: "string" }, { type: "null" }] },
+    planSHA256: { anyOf: [{ type: "string", pattern: SHA256_HEX.source }, { type: "null" }] },
     findings: {
       type: "array",
       items: {
@@ -517,11 +545,11 @@ export const AgentResultJsonSchema = {
         additionalProperties: false,
         required: ["id", "title", "severity", "disposition", "rationale", "evidenceRefs", "requiresUserDecision", "evidenceGap", "planImpact"],
         properties: {
-          id: { type: "string" },
-          title: { type: "string" },
+          id: { type: "string", minLength: 1 },
+          title: { type: "string", minLength: 1 },
           severity: { enum: ["BLOCKER", "HIGH", "MEDIUM", "LOW", "INFO"] },
           disposition: { anyOf: [{ enum: [...DISPOSITIONS] }, { type: "null" }] },
-          rationale: { type: "string" },
+          rationale: { type: "string", minLength: 1 },
           evidenceRefs: { type: "array", items: { type: "string" } },
           requiresUserDecision: { type: "boolean" },
           evidenceGap: { anyOf: [{ enum: ["unavailable", "insufficient"] }, { type: "null" }] },
@@ -530,15 +558,17 @@ export const AgentResultJsonSchema = {
       },
     },
     evidenceRefs: { type: "array", items: { type: "string" } },
-    requestedUserDecision: { anyOf: [{ type: "string" }, { type: "null" }] },
+    requestedUserDecision: { anyOf: [{ type: "string", minLength: 1 }, { type: "null" }] },
+    requestedMediatorAction: { anyOf: [{ type: "string", minLength: 1, pattern: NON_BLANK }, { type: "null" }] },
     status: { anyOf: [{ enum: ["completed", "in_progress", "blocked"] }, { type: "null" }] },
-    remainingSteps: { anyOf: [{ type: "array", items: { type: "string" } }, { type: "null" }] },
+    remainingSteps: { anyOf: [{ type: "array", maxItems: REMAINING_STEPS_LIMIT, items: { type: "string", maxLength: characterLimit(RemainingStepSchema) } },
+      { type: "null" }] },
     resolvesRequestedDecision: { anyOf: [{ type: "boolean" }, { type: "null" }] },
     resolvedRequestId: { anyOf: [{ type: "string" }, { type: "null" }] },
     resolvedRequestIds: { anyOf: [{ type: "array", maxItems: RESPONSE_RESOLVED_IDS_LIMIT, items: { type: "string" } }, { type: "null" }] },
     reviewDecisionAnswers: { anyOf: [{ type: "array", maxItems: REVIEW_ANSWER_BATCH_LIMIT, items: {
       type: "object", additionalProperties: false, required: ["requestId", "decisionSequence"],
-      properties: { requestId: { type: "string" }, decisionSequence: { type: "integer", minimum: 1 } },
+      properties: { requestId: { type: "string", minLength: 1 }, decisionSequence: { type: "integer", minimum: 1 } },
     } }, { type: "null" }] },
     // 결정별 판정 — 구조화 출력 규칙대로 required + null 허용(host-review 2026-09-21 R5: properties 에만 넣으면 invalid_json_schema 로 호출 전에 죽는다).
     decisionAssessments: { anyOf: [{ type: "array", maxItems: REVIEW_DECISION_BATCH_LIMIT, items: {
@@ -556,8 +586,8 @@ export const AgentResultJsonSchema = {
             additionalProperties: false,
             required: ["ruleId", "file", "note"],
             properties: {
-              ruleId: { type: "string" },
-              file: { type: "string" },
+              ruleId: { type: "string", minLength: 1, maxLength: characterLimit(ledger.ruleId), pattern: NON_BLANK },
+              file: { type: "string", minLength: 1, maxLength: characterLimit(ledger.file), pattern: NON_BLANK },
               note: { type: "string" },
             },
           },
@@ -575,9 +605,9 @@ export const AgentResultJsonSchema = {
             required: ["path", "expectedSHA256", "content", "reason"],
             properties: {
               path: { type: "string" },
-              expectedSHA256: { anyOf: [{ type: "string" }, { type: "null" }] },
+              expectedSHA256: { anyOf: [{ type: "string", pattern: SHA256_HEX.source }, { type: "null" }] },
               content: { type: "string" },
-              reason: { type: "string" },
+              reason: { type: "string", minLength: 1, maxLength: characterLimit(memory.reason), pattern: NON_BLANK },
             },
           },
         },

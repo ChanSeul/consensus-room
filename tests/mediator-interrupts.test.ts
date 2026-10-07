@@ -10,8 +10,10 @@ import { loadConfig } from "../src/server/config";
 import { buildApp, listenReady } from "../src/server/app";
 import { DEFAULT_AGENT_SETTINGS, type WorkflowState } from "../src/shared/contracts";
 import { interruptTarget } from "../src/server/mediation/interruptRoutes";
-import { deliverCodexInterrupt, probeCodexSession, sendCodexInterrupt, type CodexRPC } from "../src/server/mediation/codexInterrupt";
+import { deliverCodexInterrupt, interruptMessage, resolveCodexTransport, sendCodexInterrupt, type CodexRPC } from "../src/server/mediation/codexInterrupt";
 import { claudeChannelNotification } from "../src/server/mediation/interruptBridge";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import type { MediatorInterrupt } from "../src/shared/mediatorInterrupts";
 
 vi.mock("node:child_process", async importOriginal => {
@@ -251,7 +253,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
 });
 `, { mode: 0o700 });
   vi.stubEnv("PATH", `${root}:${process.env.PATH}`);
-  await expect(sendCodexInterrupt("mediator-session", item)).rejects.toMatchObject({
+  await expect(sendCodexInterrupt({ kind: "app-server" }, "mediator-session", item)).rejects.toMatchObject({
     uncertain: afterSend, transportUnavailable: !afterSend,
   });
 });
@@ -269,7 +271,7 @@ it.each([false, true])("classifies a write callback failure before the stream er
     } }),
   });
   vi.mocked(childProcess.spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof childProcess.spawn>);
-  await expect(sendCodexInterrupt("mediator-session", item)).rejects.toMatchObject({ uncertain: afterSend, transportUnavailable: !afterSend });
+  await expect(sendCodexInterrupt({ kind: "app-server" }, "mediator-session", item)).rejects.toMatchObject({ uncertain: afterSend, transportUnavailable: !afterSend });
 });
 
 // Adapter replies -> durable milestone -> authenticated mediator API. Real model diagnosis/repair
@@ -293,7 +295,7 @@ it("checks every five returned review exchanges across retries and restart witho
   expect((await waiting).json().items).toHaveLength(1);
   const fifth = (await f.get()).json().items[0];
   expect(fifth.reason).toContain("계획 리뷰 왕복 5회");
-  expect(fifth.reason).toContain("문제를 수정한 뒤 작업을 재개");
+  expect(fifth.reason).toContain("기존 중재·공식 복구로 풀 수 있는 문제인지");
   expect(f.db.getTopic("topic-1").state).toBe("CODEX_AUDIT");
   const claim = (await f.post(fifth.id, "claim")).json().claim;
   expect((await f.post(fifth.id, "receipt", { claim, state: "sent" })).statusCode).toBe(200);
@@ -451,37 +453,153 @@ it("preserves a delivered and handled stop through a no-impact evidence assessme
     mediationIntervention: { id, actionId: "assessment-replan", resumedAt: expect.any(String), closed: true } });
 });
 
-it("a connection probe reads the assigned session without sending a model turn", async () => {
-  const calls: string[] = [];
+// A control-socket proxy child: answers like an app-server whose session has `status`, exits before answering like a
+// proxy with no app-server behind the socket (`status` null), or stays up without answering (`"hang"`).
+function fakeProxy(status: string | null, calls: string[] = []) {
   const child = Object.assign(new EventEmitter(), {
     stdout: new PassThrough(), stderr: new PassThrough(), kill: vi.fn(),
     stdin: new Writable({ write(chunk, _encoding, callback) {
       const request = JSON.parse(chunk.toString()); calls.push(request.method); callback();
+      if (status === null) { queueMicrotask(() => child.emit("exit", 1, null)); return; }
+      if (status === "hang") return;
       if (request.id) queueMicrotask(() => child.stdout.write(JSON.stringify({ id: request.id,
-        result: request.method === "thread/read" ? { thread: { id: "mediator-session", status: { type: "active" } } } : {},
+        result: request.method === "thread/read" ? { thread: { id: "mediator-session", status: { type: status } } } : {},
       }) + "\n"));
     } }),
   });
   vi.mocked(childProcess.spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof childProcess.spawn>);
-  await probeCodexSession("mediator-session", "/tmp/explicit.sock");
+  return child;
+}
+
+it("a connection check reads the assigned session without sending a model turn", async () => {
+  const calls: string[] = [];
+  fakeProxy("active", calls);
+  await expect(resolveCodexTransport("mediator-session", "/tmp/explicit.sock")).resolves.toEqual({ kind: "app-server", socket: "/tmp/explicit.sock" });
   expect(calls).toEqual(["initialize", "initialized", "thread/read"]);
   expect(childProcess.spawn).toHaveBeenCalledWith("codex", ["app-server", "proxy", "--sock", "/tmp/explicit.sock"], expect.anything());
 });
 
 it.each([
-  { available: true, race: null }, { available: false, race: null },
-  { available: true, race: "claim" }, { available: true, race: "receipt" }, { available: true, race: "parent" },
-] as const)("bridge preserves authorized parent delivery from a closed leaf: $available / $race", async ({ available, race }) => {
+  { name: "no shared app-server answers the default socket", status: null, socket: undefined, transport: { kind: "queue" } },
+  { name: "the configured socket is unreachable", status: null, socket: "/tmp/explicit.sock", failure: "Codex 제어 연결을 사용할 수 없습니다" },
+  { name: "a shared app-server does not host the session", status: "notLoaded", socket: undefined, failure: "로드되지 않았거나" },
+] as Array<{ name: string; status: string | null; socket?: string; transport?: { kind: "queue" }; failure?: string }>)("decides the delivery route once without queueing a message when $name", async ({ status, socket, transport, failure }) => {
+  fakeProxy(status);
+  const spawned = vi.mocked(childProcess.spawn).mock.calls.length;
+  const resolved = resolveCodexTransport("mediator-session", socket);
+  if (transport) await expect(resolved).resolves.toEqual(transport);
+  else await expect(resolved).rejects.toMatchObject({ transportUnavailable: true, message: expect.stringContaining(failure ?? "") });
+  expect(vi.mocked(childProcess.spawn).mock.calls.slice(spawned).map(call => call[1]?.[0])).toEqual(["app-server"]);
+});
+
+it("treats a shared app-server that never answers initialize as unavailable, not as absent", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    fakeProxy("hang");
+    const resolved = expect(resolveCodexTransport("mediator-session")).rejects.toMatchObject({ timedOut: true, controlUnavailable: false });
+    await vi.advanceTimersByTimeAsync(10_000);
+    await resolved;
+  } finally { vi.useRealTimers(); }
+});
+
+it("keeps a missing codex CLI unavailable instead of routing to the queue", async () => {
+  const empty = mkdtempSync(join(tmpdir(), "room-no-codex-"));
+  cleanups.push(async () => { rmSync(empty, { recursive: true, force: true }); });
+  vi.stubEnv("PATH", empty);
+  await expect(resolveCodexTransport("mediator-session")).rejects.toMatchObject({ transportUnavailable: true, cliUnavailable: true, message: expect.stringContaining("codex CLI") });
+  await expect(sendCodexInterrupt({ kind: "queue" }, "mediator-session", item)).rejects.toMatchObject({ transportUnavailable: true, message: expect.stringContaining("codex CLI") });
+});
+
+it.each([
+  { exitCode: 0, server: "none", outcome: "sent" },
+  { exitCode: 1, server: "none", outcome: "refused" },
+  { exitCode: 1, server: "idle", outcome: "rerouted" },
+  { exitCode: 1, server: "notLoaded", outcome: "rerouted" },
+] as const)("queues one notice for the app without starting a shared daemon: exit $exitCode, shared server $server -> $outcome", async ({ exitCode, server, outcome }) => {
+  const root = mkdtempSync(join(tmpdir(), "room-queue-")), calls = join(root, "calls.jsonl");
+  cleanups.push(async () => { rmSync(root, { recursive: true, force: true }); });
+  writeFileSync(join(root, "codex"), `#!/usr/bin/env node
+const fs=require('node:fs'), argv=process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify(argv) + '\\n');
+if (argv[0] === 'queue') process.exit(${exitCode});
+if (${JSON.stringify(server)} === 'none') process.exit(1);
+require('node:readline').createInterface({input:process.stdin}).on('line', line => { const request = JSON.parse(line);
+  if (request.id) process.stdout.write(JSON.stringify({id:request.id,result:request.method==='thread/read'?{thread:{id:'mediator-session',status:{type:${JSON.stringify(server)}}}}:{}})+'\\n'); });
+`, { mode: 0o700 });
+  vi.stubEnv("PATH", `${root}:${process.env.PATH}`);
+  const failure = await sendCodexInterrupt({ kind: "queue" }, "mediator-session", item).then(() => null, (error: Error & { uncertain?: boolean; transportUnavailable?: boolean }) => error);
+  const flags = { uncertain: failure?.uncertain, transportUnavailable: failure?.transportUnavailable };
+  if (outcome === "sent") expect(failure).toBeNull();
+  // Still no shared server: the CLI itself refused, a counted failure that is neither reconnectable nor unknown.
+  else if (outcome === "refused") { expect(failure?.message).toContain("대기열 추가를 거부"); expect(flags).toEqual({ uncertain: undefined, transportUnavailable: undefined }); }
+  // A shared server appeared after the route was decided: nothing was queued and the next check re-routes it.
+  else { expect(failure?.message).toContain("전달 경로가 바뀌었습니다"); expect(flags).toEqual({ uncertain: undefined, transportUnavailable: true }); }
+  expect(readFileSync(calls, "utf8").trim().split("\n").map(line => JSON.parse(line))).toEqual([
+    ["queue", "--disable", "daemon_auto_start", "--thread", "mediator-session", "--message", interruptMessage(item)],
+    ...(outcome === "sent" ? [] : [["app-server", "proxy"]]),
+  ]);
+});
+
+it("never treats an enqueue that timed out or was killed as a resendable pre-send failure", async () => {
+  const child = () => {
+    const fake = Object.assign(new EventEmitter(), { kill: vi.fn() });
+    vi.mocked(childProcess.spawn).mockReturnValueOnce(fake as unknown as ReturnType<typeof childProcess.spawn>);
+    return fake;
+  };
+  const killed = child(), signalled = sendCodexInterrupt({ kind: "queue" }, "mediator-session", item);
+  killed.emit("exit", null, "SIGTERM");
+  await expect(signalled).rejects.toMatchObject({ uncertain: true });
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    const hung = child(), pending = expect(sendCodexInterrupt({ kind: "queue" }, "mediator-session", item)).rejects.toMatchObject({ uncertain: true });
+    await vi.advanceTimersByTimeAsync(20_000);
+    await pending;
+    expect(hung.kill).toHaveBeenCalled();
+  } finally { vi.useRealTimers(); }
+});
+
+// Runs the real bridge process against the fixture server with a fake `codex` CLI on PATH. The fake answers the
+// control proxy like an app-server hosting the session (or exits like a proxy without one), accepts `codex queue`,
+// and records every call. Add server hooks before calling: the server starts listening here.
+async function startCodexBridge(f: Awaited<ReturnType<typeof fixture>>, { appServer, topicId, env = {} }: { appServer: boolean; topicId: string; env?: Record<string, string> }) {
+  const bin = mkdtempSync(join(tmpdir(), "room-bridge-")), calls = join(bin, "calls.jsonl");
+  const clockFile = join(bin, "clock"), clockPreload = join(bin, "clock.cjs");
+  writeFileSync(clockFile, "0");
+  writeFileSync(clockPreload, `const originalNow=Date.now; Date.now=()=>originalNow()+Number(require('node:fs').readFileSync(${JSON.stringify(clockFile)}, 'utf8'));`);
+  writeFileSync(calls, "");
+  writeFileSync(join(bin, "codex"), `#!/usr/bin/env node
+const fs=require('node:fs'), argv=process.argv.slice(2);
+if(argv[0]==='queue'){fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify({method:'queue',argv})+'\\n');process.exit(0);}
+require('node:readline').createInterface({input:process.stdin}).on('line', line=>{
+ const request=JSON.parse(line);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify({...request,argv})+'\\n');
+ if (!${appServer}) process.exit(1);
+ if(request.id)process.stdout.write(JSON.stringify({id:request.id,result:request.method==='thread/read'?{thread:{id:'mediator-session',status:{type:'idle'}}}:{}})+'\\n');
+});\n`, { mode: 0o700 });
+  const address = await listenReady(f.app, { port: 0, host: "127.0.0.1" });
+  const bridge = childProcess.spawn(process.execPath, ["--require", clockPreload, "--import", "tsx", "src/server/mediation/interruptBridge.ts", "codex"], {
+    cwd: process.cwd(), stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, CONSENSUS_ROOM_URL: address,
+      CONSENSUS_ROOM_TOKEN: "test", CONSENSUS_ROOM_TOPIC_ID: topicId, CONSENSUS_MEDIATOR: "owner@1", CONSENSUS_MEDIATOR_SESSION_ID: "mediator-session", ...env },
+  });
+  let stderr = ""; bridge.stderr!.on("data", data => { stderr += data; });
+  cleanups.push(async () => {
+    if (bridge.exitCode === null && bridge.signalCode === null) { const exit = new Promise<void>(resolve => bridge.once("exit", () => resolve())); bridge.kill(); await exit; }
+    rmSync(bin, { recursive: true, force: true });
+  });
+  return { bridge, clockFile, stderr: () => stderr,
+    calls: () => readFileSync(calls, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)) };
+}
+
+it.each([
+  { appServer: true, race: null }, { appServer: false, race: null },
+  { appServer: true, race: "claim" }, { appServer: true, race: "receipt" }, { appServer: true, race: "parent" },
+] as const)("bridge preserves authorized parent delivery from a closed leaf: app-server $appServer / $race", async ({ appServer, race }) => {
   const f = await fixture();
   const originalTarget = interruptTarget(f.db, f.topic.id)!.key;
   f.db.createTopic({ ...f.topic, id: "closed", slug: "closed", parentTopicId: f.topic.id, state: "CLOSED" });
   f.db.createTopic({ ...f.topic, id: "integration", slug: "integration", parentTopicId: f.topic.id });
   f.db.applyTopicTransition({ topicId: "integration", changes: { state: "USER_DECISION_REQUIRED", resumeState: "IMPLEMENTING" },
     events: [{ actor: "system", kind: "system", state: "USER_DECISION_REQUIRED", body: "범위 확인" }] });
-  const bin = mkdtempSync(join(tmpdir(), "room-bridge-")), calls = join(bin, "calls.jsonl");
-  const clockFile = join(bin, "clock"), clockPreload = join(bin, "clock.cjs"), connectionPaths: string[] = [];
-  writeFileSync(clockFile, "0");
-  writeFileSync(clockPreload, `const originalNow=Date.now; Date.now=()=>originalNow()+Number(require('node:fs').readFileSync(${JSON.stringify(clockFile)}, 'utf8'));`);
+  const connectionPaths: string[] = [];
   let raced = false;
   f.app.addHook("onRequest", async request => {
     if (request.method === "GET" && request.url.includes("/interrupts/connection?")) connectionPaths.push(request.url.split("?")[0]);
@@ -494,51 +612,83 @@ it.each([
       f.pause("IMPLEMENTING");
     }
   });
-  writeFileSync(calls, "");
-  writeFileSync(join(bin, "codex"), `#!/usr/bin/env node
-const fs=require('node:fs');require('node:readline').createInterface({input:process.stdin}).on('line', line=>{
- const request=JSON.parse(line);fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify(request)+'\\n');
- if (!${available}) process.exit(1);
- if(request.id)process.stdout.write(JSON.stringify({id:request.id,result:request.method==='thread/read'?{thread:{id:'mediator-session',status:{type:'idle'}}}:{}})+'\\n');
-});\n`, { mode: 0o700 });
-  const address = await listenReady(f.app, { port: 0, host: "127.0.0.1" });
-  const bridge = childProcess.spawn(process.execPath, ["--require", clockPreload, "--import", "tsx", "src/server/mediation/interruptBridge.ts", "codex"], {
-    cwd: process.cwd(), stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, CONSENSUS_ROOM_URL: address,
-      CONSENSUS_ROOM_TOKEN: "test", CONSENSUS_ROOM_TOPIC_ID: "closed", CONSENSUS_MEDIATOR: "owner@1", CONSENSUS_MEDIATOR_SESSION_ID: "mediator-session" },
-  });
-  let bridgeError = ""; bridge.stderr!.on("data", data => { bridgeError += data; });
-  cleanups.push(async () => {
-    if (bridge.exitCode === null && bridge.signalCode === null) { const exit = new Promise<void>(resolve => bridge.once("exit", () => resolve())); bridge.kill(); await exit; }
-    rmSync(bin, { recursive: true, force: true });
-  });
-  await vi.waitFor(() => expect(f.db.interrupts.connection(originalTarget, f.topic.id).state, bridgeError).toBe(available ? "connected" : "unavailable"), { timeout: 5000 });
+  const run = await startCodexBridge(f, { appServer, topicId: "closed" });
+  // Without a shared app-server the session is reachable through the app-consumed queue, so the connection holds.
+  await vi.waitFor(() => expect(f.db.interrupts.connection(originalTarget, f.topic.id).state, run.stderr()).toBe("connected"), { timeout: 5000 });
   if (race) {
-    if (race === "parent") await vi.waitFor(() => expect(bridge.exitCode).toBe(1), { timeout: 5000 });
+    if (race === "parent") await vi.waitFor(() => expect(run.bridge.exitCode).toBe(1), { timeout: 5000 });
     else {
-      await vi.waitFor(() => expect(f.db.interrupts.status(f.topic.id, originalTarget)?.state, bridgeError).toBe("sent"), { timeout: 5000 });
-      expect(bridge.exitCode, bridgeError).toBeNull();
+      await vi.waitFor(() => expect(f.db.interrupts.status(f.topic.id, originalTarget)?.state, run.stderr()).toBe("sent"), { timeout: 5000 });
+      expect(run.bridge.exitCode, run.stderr()).toBeNull();
     }
     expect(raced).toBe(true);
     expect(connectionPaths).toContain("/api/topics/topic-1/interrupts/connection");
     expect(f.db.interrupts.status("integration", interruptTarget(f.db, "integration")!.key)?.state).toBe("waiting");
-    const turns = readFileSync(calls, "utf8").trim().split("\n").map(line => JSON.parse(line)).filter(r => ["turn/start", "turn/steer"].includes(r.method));
+    const turns = run.calls().filter(r => ["turn/start", "turn/steer"].includes(r.method));
     expect(turns).toHaveLength(race === "parent" ? 0 : race === "receipt" ? 2 : 1);
     if (race !== "parent") expect(turns.at(-1).params.input[0].text).toContain("/api/topics/topic-1/resume");
     return;
   }
-  if (available) await vi.waitFor(() => expect(f.db.interrupts.status("integration", interruptTarget(f.db, "integration")!.key)?.state).toBe("sent"), { timeout: 5000 });
-  else expect(f.db.interrupts.status("integration", interruptTarget(f.db, "integration")!.key)?.state).toBe("waiting");
-  const requests = readFileSync(calls, "utf8").trim().split("\n").map(line => JSON.parse(line));
-  expect(requests.filter(r => ["turn/start", "turn/steer"].includes(r.method))).toHaveLength(available ? 1 : 0);
+  await vi.waitFor(() => expect(f.db.interrupts.status("integration", interruptTarget(f.db, "integration")!.key)?.state, run.stderr()).toBe("sent"), { timeout: 5000 });
+  const requests = run.calls();
+  expect(requests.filter(r => ["turn/start", "turn/steer"].includes(r.method))).toHaveLength(appServer ? 1 : 0);
+  expect(requests.filter(r => r.method === "queue").map(r => r.argv)).toEqual(appServer ? [] : [
+    ["queue", "--disable", "daemon_auto_start", "--thread", "mediator-session", "--message", expect.stringContaining("/api/topics/integration/resume")],
+  ]);
   expect(requests.some(r => r.method === "thread/start" || r.method === "thread/resume" || r.method === "turn/interrupt")).toBe(false);
-  if (available) {
+  if (appServer) {
     f.db.roles.assign({ scope: "topic:closed", role: "mediator", operation: "", participant: "child-owner",
       profileId: "mediator-profile", sessionId: "child-session", expectedVersion: 0, note: "independent child mediator" });
-    writeFileSync(clockFile, "31000");
+    writeFileSync(run.clockFile, "31000");
     f.pause("IMPLEMENTING"); // Wake the existing long poll; the next connection probe is due.
-    await vi.waitFor(() => expect(connectionPaths, bridgeError).toContain("/api/topics/topic-1/interrupts/connection"), { timeout: 5000 });
+    await vi.waitFor(() => expect(connectionPaths, run.stderr()).toContain("/api/topics/topic-1/interrupts/connection"), { timeout: 5000 });
     await vi.waitFor(() => expect(f.db.interrupts.status(f.topic.id, interruptTarget(f.db, f.topic.id)!.key)?.state).toBe("sent"), { timeout: 5000 });
-    expect(bridge.exitCode, bridgeError).toBeNull();
+    expect(run.bridge.exitCode, run.stderr()).toBeNull();
     expect(connectionPaths.filter(path => path === "/api/topics/closed/interrupts/connection")).toHaveLength(1);
   }
+});
+
+it("records an unreachable session on each claimed request and reclaims it without spending attempts", async () => {
+  // The store reads the clock it was built with; advance it with real time plus an explicit offset.
+  const realNow = Date.now; let offset = 0;
+  vi.spyOn(Date, "now").mockImplementation(() => realNow() + offset);
+  const f = await fixture(); f.pause();
+  const target = interruptTarget(f.db, f.topic.id)!.key, id = f.db.interrupts.current(f.topic.id)!.id;
+  const run = await startCodexBridge(f, { appServer: false, topicId: f.topic.id, env: { CONSENSUS_CODEX_SOCKET: "/tmp/room-missing-control.sock" } });
+  const delivery = () => f.db.interrupts.current(f.topic.id)?.deliveries[target];
+  await vi.waitFor(() => expect(delivery(), run.stderr()).toMatchObject({ state: "failed", transportUnavailable: true, attempts: 0 }), { timeout: 5000 });
+  expect(f.db.interrupts.connection(target, f.topic.id)).toMatchObject({ state: "unavailable", error: expect.stringContaining("제어 연결을 사용할 수 없습니다") });
+  expect(f.db.interrupts.status(f.topic.id, target)).toMatchObject({ id, state: "failed", error: expect.stringContaining("제어 연결을 사용할 수 없습니다") });
+  const first = delivery()!;
+  await vi.waitFor(() => expect(f.db.events.listenerCount("mediation-change")).toBeGreaterThan(0), { timeout: 5000 });
+  offset = 60_001; f.db.events.emit("mediation-change"); // The pre-send retry window passed; wake the long poll.
+  await vi.waitFor(() => expect(delivery()?.claim, run.stderr()).not.toBe(first.claim), { timeout: 5000 });
+  await vi.waitFor(() => expect(delivery()).toMatchObject({ state: "failed", transportUnavailable: true, attempts: 0 }), { timeout: 5000 });
+  expect(run.calls().filter(r => ["queue", "turn/start", "turn/steer"].includes(r.method))).toEqual([]);
+  expect(run.calls().every(r => r.argv.includes("/tmp/room-missing-control.sock"))).toBe(true);
+});
+
+it("the Claude channel bridge still delivers through the same loop and records the acknowledgement", async () => {
+  const f = await fixture();
+  f.db.roles.createProfile({ id: "claude-profile", provider: "claude", model: "test-model", effort: "medium", options: {} });
+  const assignment = f.db.roles.assign({ scope: "global", role: "mediator", operation: "", profileId: "claude-profile", participant: "claude-owner",
+    sessionId: "claude-session", expectedVersion: 1, note: "claude mediator" });
+  const target = interruptTarget(f.db, f.topic.id)!.key;
+  const address = await listenReady(f.app, { port: 0, host: "127.0.0.1" });
+  const notifications: Array<{ method: string; params?: { meta?: Record<string, string> } }> = [];
+  const client = new Client({ name: "mediator-test", version: "1.0.0" });
+  client.fallbackNotificationHandler = async notification => { notifications.push(notification as typeof notifications[number]); };
+  const env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined));
+  await client.connect(new StdioClientTransport({ command: process.execPath, args: ["--import", "tsx", "src/server/mediation/interruptBridge.ts", "claude"],
+    cwd: process.cwd(), stderr: "ignore", env: { ...env, CONSENSUS_ROOM_URL: address, CONSENSUS_ROOM_TOKEN: "test", CONSENSUS_ROOM_TOPIC_ID: f.topic.id,
+      CONSENSUS_MEDIATOR: `claude-owner@${assignment.version}`, CONSENSUS_MEDIATOR_SESSION_ID: "claude-session" } }));
+  cleanups.push(async () => { await client.close(); });
+  await vi.waitFor(() => expect(f.db.interrupts.connection(target, f.topic.id)).toMatchObject({ state: "connected", error: null }), { timeout: 5000 });
+  f.pause();
+  await vi.waitFor(() => expect(notifications.map(notification => notification.method)).toEqual(["notifications/claude/channel"]), { timeout: 5000 });
+  const interruptId = notifications[0].params!.meta!.interrupt_id;
+  expect(interruptId).toBe(f.db.interrupts.current(f.topic.id)!.id);
+  await vi.waitFor(() => expect(f.db.interrupts.status(f.topic.id, target)?.state).toBe("sent"), { timeout: 5000 });
+  await client.callTool({ name: "consensus_interrupt_ack", arguments: { interruptId } });
+  expect(f.db.interrupts.status(f.topic.id, target)?.state).toBe("acknowledged");
 });

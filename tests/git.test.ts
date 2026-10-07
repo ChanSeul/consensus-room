@@ -472,3 +472,17 @@ describe("합류 병합 준비와 병합 커밋", () => {
     await expect(service.ensurePreparedTree(repository, a, [b], "0".repeat(40))).rejects.toThrow("병합 준비를 재현할 수 없습니다");
   });
 });
+
+// 2026-10-07 입력 효율화 ① — 계획 본문은 문단 하나가 한 줄이라 기본 문맥 3줄이 바뀌지 않은 문단을 감사·종결 확인 변경분에 통째로 다시 실었다.
+it("계획 변경분은 문맥 줄 없이 바뀐 줄의 전·후와 @@ 위치만 싣는다", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "consensus-room-plan-diff-"));
+  temporaryDirectories.push(directory);
+  const plan = (paragraph: string) => ["## 앞 절", "- KEEP-BEFORE 문단", "## 바뀌는 절", paragraph, "## 뒤 절", "- KEEP-AFTER 문단", ""].join("\n");
+  writeFileSync(join(directory, "previous.md"), plan("- OLD-PARAGRAPH 문단"));
+  writeFileSync(join(directory, "current.md"), plan("- NEW-PARAGRAPH 문단"));
+  const patch = await new GitService(new SpawnCommandRunner())
+    .diffPlanFiles(directory, join(directory, "previous.md"), join(directory, "current.md"));
+  expect(patch).toMatch(/^@@ -4 \+4 @@/m);
+  expect(patch).toContain("\n-- OLD-PARAGRAPH 문단\n+- NEW-PARAGRAPH 문단");
+  for (const unchanged of ["KEEP-BEFORE", "KEEP-AFTER", "바뀌는 절"]) expect(patch).not.toContain(unchanged);
+});

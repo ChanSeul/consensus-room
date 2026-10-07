@@ -14,6 +14,7 @@ import {
   buildDiagnosisPlanRevisionPrompt,
   buildPlanAckPrompt,
   planTimelineDelivery,
+  dispositionConfirmationQuestion,
 } from "../../shared/prompts.js";
 import { applyInfo, diagnosisFinding, type DiagnosisRecord } from "../../shared/diagnoses.js";
 import {
@@ -39,7 +40,7 @@ import { bindingOf, legacyBinding, resolveRoute, sameBinding, UnsupportedRoute, 
 import type { StoredArtifact } from "../types.js";
 import type { EngineCore } from "./core.js";
 import { preparePlanningContext } from "./planningContext.js";
-import { auditRevisionFindings, classifyCloseoutAdditions, judgeCloseout } from "./findingJudgment.js";
+import { auditRevisionFindings, classifyCloseoutAdditions, closeoutConfirmationIds, judgeCloseout } from "./findingJudgment.js";
 
 const IMPLEMENTATION_NOTE_PREFIX = "구현 노트로 승계(엔진 자동, 개정 생략): ";
 
@@ -360,7 +361,7 @@ export class PlanningPipeline {
     if (!checkpoint || checkpoint.finalized || checkpoint.stage !== stage || !checkpoint.awaitingDecision) return false;
     if (checkpoint.scopeGeneration !== topic.scopeGeneration || checkpoint.planEpoch !== topic.planEpoch ||
         checkpoint.planSHA256 !== topic.planSHA256) return false;
-    if (!checkpoint.deferredReads?.length && !checkpoint.synthesisIncomplete && !unreadRequiredTimeline(database, checkpoint).length &&
+    if (!checkpoint.deferredReads?.length && !checkpoint.synthesisIncomplete && !checkpoint.lastResponse?.requestedMediatorAction && !unreadRequiredTimeline(database, checkpoint).length &&
         !unreadRequiredInputs(database, checkpoint).length) return false;
     let route: TurnRoute;
     try { route = resolveRoute(database, topic, RESUMING_JOB[stage]); }
@@ -899,11 +900,19 @@ export class PlanningPipeline {
         this.core.assertKind(r, "CLOSEOUT");
         assertFindingCoverage(revision.findings, r.findings, "Codex closeout");
       },
+      // 합의 하향은 같은 시도에서 한 번 되묻는다 — 그래도 같은 처분이면 아래 되돌림 정지가 종전대로 멈춘다(판정은 같은 judgeCloseout). 되돌림 정지에 닿기 전에
+      // 다른 길로 가는 결과(중재자 실행 대기, 필수 쟁점의 추가 개정)는 묻지 않는다 — 그 하향은 정지 사유가 아니다.
+      confirm: (r) => {
+        const ids = closeoutConfirmationIds(knownFindings, r);
+        return ids.length > 0 ? dispositionConfirmationQuestion("CLOSEOUT", ids) : null;
+      },
+      resultPlanSHA256: storedRevisedPlan.sha256,
     });
     await this.core.saveAgentOutput(topic, closeoutRoute, closeout, "closeout", signal);
     if (this.core.interruptForNewUserInput(topic, context.inputSequence)) return;
     if (closeout.planSHA256 === storedRevisedPlan.sha256) await context.accept(signal, prompt);
     if (this.core.interruptForNewUserInput(topic, context.inputSequence)) return;
+    if (closeout.requestedMediatorAction && this.core.pauseForResult(topicId, closeout, "CODEX_CLOSEOUT", "중재자 작업이 필요합니다.")) return;
     // 아직 자료를 읽어야 하는 종결(결정을 청하며 읽기 의무를 남긴 열린 계획 제어 체크포인트)은 확정 결과가 아니다 — 후속 목록·구현 노트 기록, 필수 쟁점
     // 분류(개정 2회차·추가 개정 결정), 처분 되돌림·합의 판정으로 소비하기 전에 이 단계로 멈춘다(host-review 39d21df9 3차 F007). 재개 단계는 종결이라, 결정 뒤
     // retry 가 같은 종결 체크포인트에서 대기 읽기를 싣고, 그 뒤 나온 완료 종결을 아래 판정이 종전대로 분류한다. 예전에는 필수 쟁점 분류가 먼저 돌아 재개
@@ -977,6 +986,7 @@ export class PlanningPipeline {
     const stored = await this.storedPlanForResume(topicId);
     const closeout = await this.core.latestResult(topicId, "closeout");
     if (closeout.planSHA256 !== stored.sha256) throw new Error("저장된 closeout의 계획 해시가 현재 plan.md와 다릅니다.");
+    if (closeout.requestedMediatorAction && this.core.pauseForResult(topicId, closeout, "CODEX_CLOSEOUT", "중재자 작업이 필요합니다.")) return;
     if (current.state === "USER_DECISION_REQUIRED") {
       const regressed = dispositionRegressions(await this.roundKnownFindings(topicId), closeout.findings);
       this.core.event(topicId, "system", "system",

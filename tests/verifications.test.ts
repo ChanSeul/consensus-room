@@ -12,6 +12,7 @@ import { runMediatorVerification } from "../src/server/verificationCli";
 import { executeVerification } from "../src/server/verificationRunner";
 import { collectStaticInputs, inputSHA, STATIC_PROFILE_ID, STATIC_SCRIPT, STATIC_SCRIPT_SHA256, toolSHA } from "../src/server/verificationInputs";
 import { VerificationService, type VerificationCompletion, type PreparedVerification, type VerificationRun } from "../src/server/verifications";
+import { resolveHostExecutable } from "../src/server/hostRuntime";
 
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
@@ -248,6 +249,64 @@ describe("정적 검사 실행 기록", () => {
     expect(JSON.parse((await cli("--topic", "topic-1")).stdout)).toMatchObject({ status: "succeeded", reused: false });
     expect(JSON.parse((await cli("--topic", "topic-1")).stdout)).toMatchObject({ status: "succeeded", reused: true });
   }, 30_000);
+});
+
+// 계획 필수 검사 swift-parse(2026-10-06) — 엔진이 수락 경계에서 직접 실행한다. 검사 대상은 작업 트리에서 바뀐 Swift 파일이고, 실행 파일은 호스트 전제의 단일
+// 소유자(hostRuntime)가 푼다. 툴체인이 없는 호스트에서는 건너뛴다(그 경우 게이트는 호스트 문제로 정지한다 — plan-checks.test).
+const swiftToolchain = await resolveHostExecutable("swiftc").then(() => true, () => false);
+describe.skipIf(!swiftToolchain)("swift-parse 엔진 실행", () => {
+  async function swiftParse(changed: string[]) {
+    const f = await fixture();
+    const paths = { current: changed };
+    const service = new VerificationService(f.database, f.artifacts, f.data, undefined, { changedPaths: async () => paths.current });
+    return { ...f, service, paths };
+  }
+
+  it("바뀐 Swift 파일만 복사본에서 구문 검사하고, 성공은 같은 입력에서 재사용하며 선언된 프로필의 영수증에 엔진 실행으로 적힌다", { timeout: 120_000 }, async () => {
+    const f = await swiftParse(["Modules/Feature.swift", "README.md"]);
+    // 이름이 같은 파일 둘(드라이버 모드는 거부한다)도 frontend 모드로 한 번에 검사한다.
+    await mkdir(join(f.worktree, "SampleApp/Step5"), { recursive: true });
+    await writeFile(join(f.worktree, "SampleApp/Step5/Feature.swift"), "struct Step5 {}\n");
+    f.paths.current = [...f.paths.current, "SampleApp/Step5/Feature.swift"];
+    const first = await f.service.ensure("topic-1", "swift-parse");
+    expect(first).toMatchObject({ status: "succeeded", reused: false });
+    if (first.status !== "succeeded") return;
+    expect(first.run).toMatchObject({ profileId: "swift-parse", executor: "engine" });
+    expect(await f.service.ensure("topic-1", "swift-parse")).toMatchObject({ status: "succeeded", reused: true, run: { id: first.run.id } });
+    const receipts = await f.service.receipts("topic-1", ["swift-parse"]);
+    expect(receipts.text).toContain(`swift-parse: 성공`);
+    expect(receipts.text).toContain("엔진이 이 작업 트리에서 실행");
+    expect(receipts.text).toContain("입력 파일 2개");
+    expect(receipts.readablePaths).toHaveLength(1);
+    // 선언하지 않은 정적 검사는 성공 기록이 없으므로 영수증에 없다.
+    expect(receipts.text).not.toContain(STATIC_PROFILE_ID);
+  });
+
+  it("구문 오류는 실패로 기록되고 가린 로그에 파일·줄이 남는다 — 실패는 재사용하지 않는다", { timeout: 120_000 }, async () => {
+    const f = await swiftParse(["Modules/Broken.swift"]);
+    await writeFile(join(f.worktree, "Modules/Broken.swift"), "func broken( {\n");
+    const failed = await f.service.ensure("topic-1", "swift-parse");
+    expect(failed.status).toBe("failed");
+    if (failed.status !== "failed") return;
+    expect(`${failed.log?.stderr}${failed.log?.stdout}`).toMatch(/Modules\/Broken\.swift:\d+:\d+: error/);
+    const receipts = await f.service.receipts("topic-1", ["swift-parse"]);
+    expect(receipts.text).toContain("지금 트리의 성공 기록이 없습니다(마지막 결과 failed");
+    await writeFile(join(f.worktree, "Modules/Broken.swift"), "func broken() {}\n");
+    expect((await f.service.ensure("topic-1", "swift-parse")).status).toBe("succeeded");
+  });
+
+  it("바뀐 Swift 파일이 없으면 실행·기록 없이 대상 없음이고, 선언된 영수증은 그 사실을 적는다", async () => {
+    const f = await swiftParse(["README.md", "Modules/Deleted.swift"]);
+    expect(await f.service.ensure("topic-1", "swift-parse")).toEqual({ status: "no-targets" });
+    expect(f.service.list("topic-1")).toEqual([]);
+    expect((await f.service.receipts("topic-1", ["swift-parse"])).text).toContain("swift-parse: 지금 트리에 검사할 입력이 없습니다");
+    expect((await f.service.receipts("topic-1")).text).toBe("");
+  });
+
+  it("작업 트리 밖 경로는 검사 입력으로 받지 않는다", async () => {
+    const f = await swiftParse(["../outside.swift"]);
+    await expect(f.service.ensure("topic-1", "swift-parse")).rejects.toThrow("작업 트리 밖");
+  });
 });
 
 describe("중재자 검사 프로세스 종료", () => {

@@ -422,7 +422,7 @@ describe("E3-4c 코드 리뷰 원장과 사용 한도 자동 재시도", () => {
     const room = await lastAllowanceReview("judged");
     const { database, clock, codex, topicId } = room;
     expect(clock.timers).toHaveLength(1);
-    database.planning.judgeReviewLedger(database.planning.latestReviewLedger(topicId)!.id);
+    database.planning.completeReviewLedger(database.planning.latestReviewLedger(topicId)!.id);
     expect(room.engine.budgetResumeBlocker(topicId)).toContain("리뷰");
     clock.fire();
     await waitForIdle(database, topicId);

@@ -44,6 +44,7 @@ import { ArtifactStore } from "./artifacts.js";
 import { loadConfig, type ServerConfig } from "./config.js";
 import { ConsensusDatabase } from "./database.js";
 import { EngineDefectInput, EngineDefectWorker } from "./engineDefects.js";
+import { EngineDefectClosureSchema } from "../shared/engineDefects.js";
 import { GitService } from "./git.js";
 import { redactRecord, safeError } from "./security.js";
 import { redactSecrets } from "../shared/workflow.js";
@@ -119,7 +120,8 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   const database = dependencies.database ?? new ConsensusDatabase(config.databasePath);
   const artifacts = new ArtifactStore(config.topicsDirectory, database);
   const git = new GitService(dependencies.runner);
-  const verifications = new VerificationService(database, artifacts, config.dataDirectory);
+  // swift-parse 의 검사 대상은 그때그때의 Git 상태다 — 화면용 시간 캐시(readChangedPaths)가 아니라 GitService 를 그대로 준다.
+  const verifications = new VerificationService(database, artifacts, config.dataDirectory, undefined, git);
   const evidence = new EvidenceService(database.evidence, dependencies.evidenceConnector ?? new RestEvidenceConnector(evidenceCredentials()), source => {
     for (const topic of database.listTopics()) {
       if (topic.state === "CLOSED" || !database.evidence.list(topic.id).some(item => item.id === source.id)) continue;
@@ -133,8 +135,8 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     database,
     artifacts,
     git,
-    claude: guardedPlanning(withEvidence(monitorReviewProgress(guardRunnerControl(dependencies.claude), database), database, join(config.dataDirectory, "evidence-images")), database, git, config.memoryDirectory, join(config.dataDirectory, "evidence-images")),
-    codex: guardedPlanning(withEvidence(monitorReviewProgress(guardRunnerControl(dependencies.codex), database), database, join(config.dataDirectory, "evidence-images")), database, git, config.memoryDirectory, join(config.dataDirectory, "evidence-images")),
+    claude: guardedPlanning(withEvidence(monitorReviewProgress(guardRunnerControl(dependencies.claude), database), database, join(config.dataDirectory, "evidence-images")), database, git, config.memoryDirectory, join(config.dataDirectory, "evidence-images"), config.standingReferencePath),
+    codex: guardedPlanning(withEvidence(monitorReviewProgress(guardRunnerControl(dependencies.codex), database), database, join(config.dataDirectory, "evidence-images")), database, git, config.memoryDirectory, join(config.dataDirectory, "evidence-images"), config.standingReferencePath),
     verifications,
     memory: new ProjectMemoryStore(config.memoryDirectory),
     executionLimits: config.executionLimits,
@@ -396,6 +398,13 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       throw Object.assign(new Error("중단된 엔진 결함 재개는 사용자만 요청할 수 있습니다."), { statusCode: 403 });
     }
     return engineDefects.retry(request.params.id);
+  });
+  // Closing takes a defect out of the queue for good. The mediator reports defects, so it must not be able to hide one.
+  app.post<{ Params: { id: string } }>("/api/engine-defects/:id/close", async request => {
+    if (request.headers["x-consensus-actor"] === "mediator") {
+      throw Object.assign(new Error("엔진 결함 종결은 사용자만 요청할 수 있습니다."), { statusCode: 403 });
+    }
+    return engineDefects.close(request.params.id, EngineDefectClosureSchema.parse(request.body));
   });
   // 프로필 역할 적합성(plan §2.5 "프로필 조회·검증", E2c) — 배정하면 역할·작업마다 실행할 수 있는지와 사유. 경로 판정과 같은 함수로 계산한다.
   app.get<{ Params: { id: string } }>("/api/agent-profiles/:id/suitability", async (request) => {
@@ -733,10 +742,8 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
         const input=ReviewGrantInputSchema.parse(request.body);
         if(workflow.reviewPaused(topicId)!==input.scope)throw new Error("추가 승인이 필요한 리뷰 중단 상태가 아닙니다.");
         database.reviews.grant(topicId,input.scope,idempotencyKey,input.version);
-        let budgetBlocked=false;
-        const group=database.workGroups.forTopic(topicId);
-        try {database.budgets.assertAvailable(group?[topicId,group.id]:[topicId]);} catch {budgetBlocked=true;}
-        response=budgetBlocked?{...accepted(actionId,database.getTopic(topicId)),resumeBlocked:"리뷰 1회를 추가했습니다. 토큰·시간 예산도 추가한 뒤 재개하세요."}
+        const blocked=budgetResumeStep(database,topicId);
+        response=blocked?{...accepted(actionId,database.getTopic(topicId)),resumeBlocked:`리뷰 1회를 추가했습니다. ${blocked}`}
           :accepted(workflow.retry(topicId,actionId),database.getTopic(topicId));
       }
       else if(action === "amend-tolerance") {
@@ -748,10 +755,8 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
         const input=RevisionGrantInputSchema.parse(request.body);
         if(!workflow.revisionPaused(topicId))throw new Error("추가 승인이 필요한 계획 재작성 중단 상태가 아닙니다.");
         database.revisions.grant(topicId,idempotencyKey,input.version);
-        let budgetBlocked=false;
-        const group=database.workGroups.forTopic(topicId);
-        try {database.budgets.assertAvailable(group?[topicId,group.id]:[topicId]);} catch {budgetBlocked=true;}
-        if(budgetBlocked)response={...accepted(actionId,database.getTopic(topicId)),resumeBlocked:"재작성 1회를 추가했습니다. 토큰·시간 예산도 추가한 뒤 재개하세요."};
+        const blocked=budgetResumeStep(database,topicId);
+        if(blocked)response={...accepted(actionId,database.getTopic(topicId)),resumeBlocked:`재작성 1회를 추가했습니다. ${blocked}`};
         else response=accepted(database.getTopic(topicId).state==="DRAFT"?workflow.startPlan(topicId,actionId):workflow.retry(topicId,actionId),database.getTopic(topicId));
       }
       else if (action === "budget-configure" || action === "budget-resume") {
@@ -887,6 +892,12 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
 }
 
 // actionId null: 실행을 열지 않았다(예: 등록된 다른 수정 진단의 적용을 기다리는 순차 적용).
+// What a topic's budget accounts still need before it can resume; null when it can resume now.
+function budgetResumeStep(database: ConsensusDatabase, topicId: string): string | null {
+  const group = database.workGroups.forTopic(topicId);
+  return database.budgets.resumeStep(group ? [topicId, group.id] : [topicId]);
+}
+
 function accepted(actionId: string | null, topic: ReturnType<ConsensusDatabase["getTopic"]>) {
   return { accepted: true, actionId, topic };
 }

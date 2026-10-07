@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, expect, it, vi } from "vitest";
 import { BudgetController } from "../src/server/budgetController";
-import { BudgetLedger } from "../src/server/budgetLedger";
+import { BudgetBlocked, BudgetLedger } from "../src/server/budgetLedger";
 import type { AgentAdapter, SessionTurn } from "../src/server/types";
 const policy={execution:{inputTokens:10,outputTokens:10,durationMs:100000},total:{inputTokens:50,outputTokens:50,durationMs:300000}};
 afterEach(()=>vi.useRealTimers());
@@ -78,6 +78,32 @@ it("관측 저장이 실패해도 토큰을 복구하고 다음 호출을 막는
  await expect(wrapped.resumeTurn({cwd:"/tmp",prompt:"test",sessionId:"s"})).rejects.toThrow();
  expect(ledger.account("t")?.used.inputTokens).toBe(20);
  await expect(wrapped.resumeTurn({cwd:"/tmp",prompt:"test",sessionId:"s"})).rejects.toThrow();db.close();
+});
+
+it("refuses a same-account start as running only while a run is live; a run that ends without final usage leaves it unsettled",async()=>{
+ const db=new DatabaseSync(":memory:"),ledger=new BudgetLedger(db);ledger.configure("t",policy,"test");
+ const reason=()=>{try{ledger.assertAvailable(["t"]);return null;}catch(error){return (error as BudgetBlocked).reason;}};
+ const result={kind:"ACK" as const,summary:"done",findings:[],evidenceRefs:[]};
+ let release!:()=>void;const seen:Array<string|null>=[];
+ const adapter:AgentAdapter={role:"codex",validateExistingSession:async()=>false,resumeTurn:async()=>result,createSession:async t=>{
+  t.admitSync?.();seen.push(reason());await new Promise<void>(resolve=>{release=resolve;});return {sessionId:"s",result};}};
+ const wrapped=new BudgetController(ledger,()=>({topicId:"t",accounts:["t"],stage:"ENGINE_DEFECT_REVIEW"}),async()=>{}).wrap(adapter);
+ const run=wrapped.createSession({cwd:"/tmp",prompt:"review",requiresFinalUsage:true});
+ await vi.waitFor(()=>expect(seen).toEqual(["running"]));
+ release();await run;
+ // The run ended without the final usage it requires: the execution stays open, and no live run vouches for it.
+ expect(reason()).toBe("unsettled");db.close();
+});
+it("leaves the live set even when the final observation throws",async()=>{
+ const db=new DatabaseSync(":memory:"),ledger=new BudgetLedger(db);ledger.configure("t",policy,"test");
+ const original=ledger.observe.bind(ledger);
+ vi.spyOn(ledger,"observe").mockImplementation((...args)=>{if(args[3]!==undefined)throw new Error("storage failure");return original(...args);});
+ const result={kind:"ACK" as const,summary:"done",findings:[],evidenceRefs:[]};
+ const adapter:AgentAdapter={role:"claude",validateExistingSession:async()=>true,createSession:async()=>({sessionId:"s",result}),resumeTurn:async()=>result};
+ const wrapped=new BudgetController(ledger,()=>({topicId:"t",accounts:["t"],stage:"ACK"}),async()=>{}).wrap(adapter);
+ await expect(wrapped.resumeTurn({cwd:"/tmp",prompt:"test",sessionId:"s"})).rejects.toThrow("storage failure");
+ vi.restoreAllMocks();
+ expect((()=>{try{ledger.assertAvailable(["t"]);return null;}catch(error){return (error as BudgetBlocked).reason;}})()).toBe("unsettled");db.close();
 });
 
 it("charges two topics sharing cwd to their explicit accounts",async()=>{

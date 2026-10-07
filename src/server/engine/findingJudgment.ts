@@ -1,4 +1,6 @@
 import type { AgentResult, Finding } from "../../shared/contracts.js";
+import { resultPause, type ResultPause } from "./completion.js";
+import type { ReviewRequest } from "./reviewRequests.js";
 import {
   classifyCloseout,
   dispositionRegressions,
@@ -96,7 +98,7 @@ export interface ReviewJudgmentInput {
   finalPass: boolean;
   implementation: AgentResult;
   originalReview: AgentResult | null;
-  base: { sources: readonly Finding[]; overruled: ReadonlySet<string> } | null;
+  base: { sources: readonly Finding[]; overruled: ReadonlySet<string>; deferredEvidence?: readonly Finding[] } | null;
   adjudicated: ReadonlySet<string>;
   userOverruled: ReadonlySet<string>;
 }
@@ -117,8 +119,10 @@ export function judgeReview(input: ReviewJudgmentInput): ReviewJudgment {
   // 최종 리뷰에서 처음 등장한 쟁점은 Claude가 고칠 기회가 없었다. RESOLVED_BY_FIX로 표시해도
   // 실제 수정이 없었으므로, closeout의 신규 쟁점 규칙과 똑같이 처분과 무관하게 사용자 판단으로 보낸다.
   // 이월 쟁점은 fix와 첫 리뷰 양쪽에 같은 ID로 있으므로 합집합을 ID로 접어야 newFindingIDs의 중복 검사에 걸리지 않는다.
+  // 수정 단계로 넘기지 않은 리뷰 증거 요청(deferredEvidence)도 알려진 쟁점이다 — 최종 리뷰가 다시 판정할 대상이지 새 쟁점이 아니다.
   const knownFindings = [...new Map(
-    [...input.implementation.findings, ...(input.originalReview?.findings ?? []), ...(input.base?.sources ?? [])].map((finding) => [finding.id, finding]),
+    [...input.implementation.findings, ...(input.originalReview?.findings ?? []), ...(input.base?.sources ?? []), ...(input.base?.deferredEvidence ?? [])]
+      .map((finding) => [finding.id, finding]),
   ).values()];
   // 사용자 결정이 이미 소비한 신규 쟁점(adjudicated)은 다시 사용자에게 보내지 않는다.
   const addedIDs = new Set(newFindingIDs(knownFindings, review.findings, "Codex final review").filter((id) => !input.adjudicated.has(id)));
@@ -139,6 +143,101 @@ export function judgeReview(input: ReviewJudgmentInput): ReviewJudgment {
   const agreed = mergeAgreedSources(input.base?.sources, input.originalReview?.findings);
   const withdrawn = [...new Set(dispositionRegressions(agreed, review.findings, overruled))];
   return { added, deferredNew, askUser, overruled, agreed, withdrawn, remaining };
+}
+
+// 리뷰가 검토를 끝냈는가 — 커서 전진·저장 리뷰 재사용(canReuseReview)·이전 리뷰의 남은 검토 승계·판정기가 같은 정의를 쓴다.
+export function reviewCompleted(review: Pick<AgentResult, "status" | "remainingSteps">): boolean {
+  return review.status !== "blocked" && review.status !== "in_progress" && !review.remainingSteps?.length;
+}
+
+// 리뷰가 판단 근거를 요청한 쟁점 — 외부 증거(EXTERNAL_EVIDENCE)·처분 없음. 사용자 결정이 필요한 쟁점은 결정 정지 몫이라 넣지 않는다.
+// 리뷰 판정기(증거 정지·수정 먼저)와 수정 작업 계약(FixContracts.forReview — 러너 의무에서 빼고 최종 리뷰로 넘김)이 같은 분할을 쓴다.
+export function reviewEvidenceFindings(findings: readonly Finding[]): Finding[] {
+  return findings.filter((finding) => !finding.requiresUserDecision && (!finding.disposition || finding.disposition === "EXTERNAL_EVIDENCE"));
+}
+
+// 리뷰 결과의 완료 보고 계약 — 위반이면 core.turn 의 check 가 같은 세션·같은 리뷰 원장에서 1회 교정한다(교정 뒤에도 위반이면 계약 위반 실패, 원장은 열린 채
+// 같은 예약으로 재시도된다). 리뷰는 검토를 끝내 completed 로 보고하거나, 끝내지 못한 이유를 요청 필드(requestedMediatorAction·requestedUserDecision·
+// 외부 증거 처분)로 밝힌다 — remainingSteps 만 남긴 미완료는 남은 일의 주체(리뷰어·구현자·중재자)를 엔진이 가를 수 없어 판정할 수 없다(2026-10-02
+// 86a5b979: 중재자 파싱 로그를 남은 검토로 적어 '리뷰 미완료' 사용자 결정 정지, 2026-09-28 095651bf: 구현자 수정을 남은 검토로 적음).
+export function reviewContractViolation(review: AgentResult): string | null {
+  if (review.status === "completed" && review.remainingSteps?.length) {
+    return "리뷰 status=completed 와 remainingSteps 가 모순됩니다. remainingSteps 는 리뷰어가 아직 검토하지 못한 작업만 적습니다. "
+      + "리뷰를 끝냈다면 구현자의 수정·후속 재검토는 findings 에 보존하고 remainingSteps 를 비우세요. "
+      + "실제 미검토 부분이 있으면 status=in_progress 로 정정하고 남은 검토를 유지하세요. 실제 사용자 결정·외부 증거 요청은 지우지 마세요.";
+  }
+  if (review.status === "in_progress" && !resultPause(review) && reviewEvidenceFindings(review.findings).length === 0) {
+    return "리뷰 status=in_progress 인데 검토를 끝내지 못한 이유를 요청 필드로 밝히지 않았습니다. 남은 검토를 이 응답에서 마쳐 status=completed 로 보고하세요. "
+      + "직접 확인할 수 없는 실행·자료가 필요하면 requestedMediatorAction 에 필요한 실행과 반환 증거를, 판정 근거가 없는 쟁점은 EXTERNAL_EVIDENCE 로, "
+      + "사용자 선택이 필요하면 requestedUserDecision 으로 적으세요. remainingSteps 에 외부 실행·자료 요청이나 구현자의 일을 적지 마세요.";
+  }
+  return null;
+}
+
+// 판정기 입력 — 저장된 리뷰를 다시 판정할 때(openFixFromStoredReview·finalizeStoredFinalReview)는 리뷰 뒤 사용자 결정이 그 리뷰의 결정 요청에 답했다는
+// 재사용 전제(ownRequestsAnswered)와, 최종 리뷰의 판정 대기 쟁점(신규·철회)도 그 결정으로 판정이 끝났다는 전제(decisionsAdjudicate)를 호출자가 정한다.
+export type ReviewFixAvailability = "available" | "used" | "exhausted" | "committed";
+export interface ReviewVerdictContext {
+  finalPass: boolean;
+  judgment: ReviewJudgment;
+  // 해소되지 않은 중재자 실행 요청(리뷰 요청 원장의 mediator-work — 이 리뷰가 낸 것 포함).
+  mediatorWork: readonly ReviewRequest[];
+  // 자동 수정 회차·확정 커밋으로 정해지는 수정 가능 여부.
+  fix: ReviewFixAvailability;
+  ownRequestsAnswered?: boolean;
+  decisionsAdjudicate?: boolean;
+}
+export type ReviewVerdict =
+  | { kind: "await-mediator"; requests: readonly ReviewRequest[]; action?: string }
+  | { kind: "await-decision"; pause: Extract<ResultPause, { kind: "decision" }> }
+  | { kind: "await-evidence"; message: string; findings: Finding[] }
+  // 요청 필드 없이 끝나지 않은 리뷰 — 새 리뷰는 완료 보고 계약(reviewContractViolation)이 교정해 여기 오지 않는다. 계약 전에 저장된 리뷰만 해당한다.
+  | { kind: "incomplete"; remainingSteps: string[] }
+  | { kind: "new-final-findings"; ids: string[] }
+  | { kind: "withdrawn"; ids: string[] }
+  | { kind: "fix-blocked"; reason: Exclude<ReviewFixAvailability, "available">; ids: string[] }
+  | { kind: "fix"; ids: string[]; deferredEvidence: Finding[] }
+  | { kind: "pass" };
+
+// 판정에 도달했는가 — 리뷰 원장을 닫는다(completed). 대기(중재자·결정·증거)는 판정 아님이라 원장을 멈춰 두고 같은 ID 로 재개한다.
+export function reviewVerdictReached(verdict: ReviewVerdict): boolean {
+  return verdict.kind !== "await-mediator" && verdict.kind !== "await-decision" && verdict.kind !== "await-evidence" && verdict.kind !== "incomplete";
+}
+
+// 리뷰 결과 → 다음 전이. 새 리뷰(runReviewOnce)와 저장 리뷰 재사용(openFixFromStoredReview·finalizeStoredFinalReview)이 이 함수 하나로 판정한다.
+// 규칙(위에서부터 먼저 맞는 것):
+//   중재자 실행 요청(이 리뷰 또는 해소되지 않은 원장 요청) ...... 중재자 대기
+//   사용자 결정 요청·blocked·결정 필요 쟁점 ....................... 결정 대기(저장 리뷰는 그 뒤 결정이 답했으면 건너뜀)
+//   끝나지 않은 리뷰 ................................................ 증거 요청이 있으면 증거 대기, 없으면 미완료(부분 검토로 수정·통과하지 않는다 — E3-4c)
+//   증거 요청 쟁점: 완료 리뷰 + 확정 결함 + 수정 가능 ............... 수정 먼저 — 증거 요청은 계약에 넘겨 최종 리뷰가 최종 트리에서 재판정(2026-10-06 사용자 결정)
+//                  그 밖 ............................................ 증거 대기(최종 리뷰의 신규·철회 판정보다 앞 — 종전 정지 순서)
+//   최종 리뷰의 신규 판정 대기 쟁점·합의 철회 ...................... 판정 대기 정지(판정 도달)
+//   확정 결함 ....................................................... 수정(가능하면, 넘긴 증거 요청과 함께) 또는 수정 불가 정지
+//   그 밖 ........................................................... 통과
+export function reviewVerdict(review: AgentResult, context: ReviewVerdictContext): ReviewVerdict {
+  const action = review.requestedMediatorAction?.trim();
+  if (action || context.mediatorWork.length > 0) return { kind: "await-mediator", requests: context.mediatorWork, ...(action ? { action } : {}) };
+  const pause = resultPause(review);
+  if (pause?.kind === "decision" && !context.ownRequestsAnswered) return { kind: "await-decision", pause };
+  const evidence = reviewEvidenceFindings(review.findings);
+  if (!reviewCompleted(review)) {
+    return evidence.length > 0 ? awaitEvidence(evidence) : { kind: "incomplete", remainingSteps: [...(review.remainingSteps ?? [])] };
+  }
+  const fixIds = context.judgment.remaining;
+  if (evidence.length > 0 && !(fixIds.length > 0 && context.fix === "available")) return awaitEvidence(evidence);
+  if (context.finalPass && !context.decisionsAdjudicate) {
+    if (context.judgment.askUser.length > 0) return { kind: "new-final-findings", ids: context.judgment.askUser.map((finding) => finding.id) };
+    if (context.judgment.withdrawn.length > 0) return { kind: "withdrawn", ids: context.judgment.withdrawn };
+  }
+  if (fixIds.length > 0) {
+    return context.fix === "available" ? { kind: "fix", ids: fixIds, deferredEvidence: evidence } : { kind: "fix-blocked", reason: context.fix, ids: fixIds };
+  }
+  return { kind: "pass" };
+}
+
+function awaitEvidence(findings: Finding[]): ReviewVerdict {
+  return { kind: "await-evidence", findings,
+    message: findings.find((finding) => finding.disposition === "EXTERNAL_EVIDENCE")?.rationale ?? "코드 리뷰 결과에 외부 증거가 필요합니다." };
 }
 
 // 리뷰 판정이 남긴 미해결 — runReview 가 멈추거나 수정 회차로 보내는 쟁점: 되돌림·최종 리뷰 신규 판정 대기·결정·증거 필요·수정할 확정 결함.
@@ -164,6 +263,19 @@ export interface FixAcceptanceJudgment { downgraded: string[]; uncovered: Findin
 export function judgeFixAcceptance(source: readonly Finding[], fixFindings: readonly Finding[], overruled: ReadonlySet<string>): FixAcceptanceJudgment {
   const answered = new Set(fixFindings.map((finding) => finding.id));
   return { downgraded: dispositionRegressions(source, fixFindings, overruled), uncovered: source.filter((finding) => !answered.has(finding.id)) };
+}
+
+// 확인형 교정(2026-10-06 사용자 결정)의 대상 — 합의 하향이 되돌림 정지에 닿을 결과의 하향 id. 비면 묻지 않는다. 종결은 요청한 정지(중재자 실행·사용자
+// 결정·외부 증거)가 있거나 필수 쟁점의 추가 개정으로 가는 결과를, 수정은 완료를 보고하지 않았거나 요청한 정지가 있는 결과(다음 턴·정지가 먼저다)와 중재자에게
+// 돌아가는 진단(반박·증거 요청)을 묻지 않는다. 결정을 청하며 읽기를 남긴 종결을 확인하면 다시 연 체크포인트가 결정 대기를 지워 결정 전에 이연 읽기와 모델
+// 호출이 나간다(합동 리뷰 a4628d1d F008). 판정은 각 정지와 같은 함수(resultPause·judgeCloseout·judgeFixAcceptance)다.
+export function closeoutConfirmationIds(known: readonly Finding[], closeout: AgentResult): string[] {
+  const judgment = judgeCloseout(known, closeout);
+  return resultPause(closeout) !== null || judgment.essential.length > 0 ? [] : judgment.regressed;
+}
+export function fixConfirmationIds(source: readonly Finding[], fix: AgentResult, overruled: ReadonlySet<string>, returned: ReadonlySet<string>): string[] {
+  if (fix.status !== "completed" || resultPause(fix) !== null) return [];
+  return judgeFixAcceptance(source, fix.findings, overruled).downgraded.filter((id) => !returned.has(id));
 }
 
 // 수정 결과가 남긴 미해결 — 되돌림(수락 가드로 멈춤), 아직 다루지 않은 원본 쟁점, 러너 보고의 판정 끝나지 않은 처분(수정 완료 주장 포함).

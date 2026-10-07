@@ -63,3 +63,17 @@ it("moves running and blocked badges to the nearest visible row and preserves co
   fireEvent.click(screen.getByRole("button", { name: "Sub 하위 주제" }));
   expect(screen.getByText("IMPLEMENTING").closest("button")).toHaveTextContent("실행 작업");
 });
+it("reveals active leaf paths on initial load only, leaving idle branches collapsed", () => {
+  const root = topic("r", "Root", null, true), sub = topic("s", "Sub", "r", true);
+  const idleRoot = topic("i", "Idle", null, true), idle = topic("j", "대기 작업", "i");
+  const active = { ...topic("a", "실행 중 말단", "s"), state: "IMPLEMENTING" as const };
+  const topics = [root, sub, active, idleRoot, idle];
+  const props = { selectedId: null, onSelect: vi.fn() };
+  const view = render(<TopicTree {...props} topics={[]} />);
+  view.rerender(<TopicTree {...props} topics={topics} />);
+  expect(screen.getByText("실행 중 말단")).toBeInTheDocument();
+  expect(screen.queryByText("대기 작업")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Root 하위 주제" }));
+  view.rerender(<TopicTree {...props} topics={topics.map(item => ({ ...item }))} />);
+  expect(screen.queryByText("실행 중 말단")).not.toBeInTheDocument();
+});

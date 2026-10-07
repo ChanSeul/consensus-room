@@ -7,7 +7,7 @@ import { EvidencePanel } from "./EvidencePanel";
 import { RevisionPanel } from "./RevisionPanel";
 import { WorkGroupsPanel } from "./WorkGroupsPanel";
 import { BudgetPanel } from "./BudgetPanel";
-import { EntryGuide, TopicOverview, TopicTree } from "./TopicStructure";
+import { EntryGuide, TopicOverview, TopicTree, WORKING_STATES } from "./TopicStructure";
 import { isTopicGroup, workEntry, topicAncestors } from "../shared/topicStructure";
 import {
   FormEvent,
@@ -116,12 +116,6 @@ const ACTIVE_STATES = new Set<WorkflowState>([
   "CODEX_REVIEW",
   "CLAUDE_FIX",
   "CODEX_FINAL_REVIEW",
-]);
-
-const WORKING_STATES = new Set<WorkflowState>([
-  "BRAINSTORMING",
-  "CLAUDE_PLAN", "CODEX_AUDIT", "CLAUDE_REVISION", "CODEX_CLOSEOUT", "CONSENSUS_ACK",
-  "IMPLEMENTING", "CODEX_REVIEW", "CLAUDE_FIX", "CODEX_FINAL_REVIEW",
 ]);
 
 // 러너 생존 표시: 작업 트리에서 마지막으로 바뀐 파일과 그 시각. 10분 넘게 조용하면 주의 색.

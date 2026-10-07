@@ -48,14 +48,14 @@ export class ProcessSupervisor {
   }
 
   private async terminateIfOwned(action: ActionRecord): Promise<void> {
-    const { pid, pgid, processCommand, processExecutable, processStartedAt } = action;
-    if (!pid || pid <= 1 || !pgid || pgid <= 1 || !processCommand || !processStartedAt) {
+    const { pid, pgid, processExecutable, processStartedAt } = action;
+    if (!pid || pid <= 1 || !pgid || pgid <= 1 || !processStartedAt) {
       this.report({ outcome: "ineligible", action, observed: null, detail: "원장 행에 종료 판정에 필요한 신원이 없습니다." });
       return;
     }
     // 어댑터가 실제 경로로 spawn하므로(예: /Applications/ChatGPT.app/.../codex) 원장에는 절대 경로가
     // 남는다. 문자열 전체 비교는 그 행을 전부 ineligible로 만들어 재시작 회수가 무력화된다(감사 ⑤).
-    // basename만 보는 것은 isSameProcess가 command line·시작 시각까지 대조하므로 안전하다.
+    // basename은 종료해도 되는 CLI를 고르는 정책 필터다. 같은 프로세스인지는 isSameProcess가 PGID·시작 시각으로 정한다.
     const executableName = processExecutable ? basename(processExecutable) : "";
     if (executableName !== "claude" && executableName !== "codex" &&
         !(action.kind === "engine-defect" && this.engineReviewExecutable && processExecutable === this.engineReviewExecutable)) {
@@ -78,7 +78,7 @@ export class ProcessSupervisor {
         this.report({ outcome: "already-gone", action, observed: null });
         return;
       }
-      if (!isSameProcess(observed, pgid, processCommand, processStartedAt)) {
+      if (!isSameProcess(observed, pgid, processStartedAt)) {
         this.report({ outcome: "identity-mismatch", action, observed });
         return;
       }
@@ -87,7 +87,7 @@ export class ProcessSupervisor {
       while (Date.now() < deadline) {
         // leader만 보면 SIGTERM을 무시한 자식이 남아도 terminated로 기록된다(감사 ⑤).
         // leader 신원을 이미 확인하고 우리가 신호를 보낸 group이므로 비어질 때까지가 종료다.
-        if (this.groupFullyGone(pid, pgid, processCommand, processStartedAt)) {
+        if (this.groupFullyGone(pid, pgid, processStartedAt)) {
           this.report({ outcome: "terminated", action, observed });
           return;
         }
@@ -97,7 +97,7 @@ export class ProcessSupervisor {
       // SIGKILL도 비동기다 — 즉시 조회하면 곧 죽을 프로세스가 생존자로 잡히고, 반대로 진짜 생존을
       // 놓친 채 killed로 기록한다(2026-08-31 Codex 지적). 짧게 소진을 기다린 뒤 판정한다.
       const killDeadline = Date.now() + 500;
-      while (Date.now() < killDeadline && !this.groupFullyGone(pid, pgid, processCommand, processStartedAt)) {
+      while (Date.now() < killDeadline && !this.groupFullyGone(pid, pgid, processStartedAt)) {
         await this.control.wait(50);
       }
       const survivors = this.control.listGroup?.(pgid) ?? [];
@@ -118,13 +118,13 @@ export class ProcessSupervisor {
     }
   }
 
-  private stillRunning(pid: number, pgid: number, expectedCommand: string, startedAt: string): boolean {
+  private stillRunning(pid: number, pgid: number, startedAt: string): boolean {
     const current = this.control.inspect(pid);
-    return current !== null && isSameProcess(current, pgid, expectedCommand, startedAt);
+    return current !== null && isSameProcess(current, pgid, startedAt);
   }
 
-  private groupFullyGone(pid: number, pgid: number, expectedCommand: string, startedAt: string): boolean {
-    if (this.stillRunning(pid, pgid, expectedCommand, startedAt)) return false;
+  private groupFullyGone(pid: number, pgid: number, startedAt: string): boolean {
+    if (this.stillRunning(pid, pgid, startedAt)) return false;
     // listGroup을 지원하지 않는 환경에서는 기존처럼 leader 기준으로 판정한다.
     return (this.control.listGroup?.(pgid) ?? []).length === 0;
   }
@@ -142,13 +142,11 @@ export class ProcessSupervisor {
   }
 }
 
-function isSameProcess(
-  current: ProcessIdentity,
-  pgid: number,
-  expectedCommand: string,
-  startedAt: string,
-): boolean {
-  return current.pgid === pgid && current.commandLine === expectedCommand && current.startedAt === startedAt;
+// PID(조회 키)·PGID·시작 시각이 프로세스 신원이다. exec는 이 셋을 유지하고 command line만 바꾼다 —
+// #! 래퍼(예: codex-cli/bin/codex의 /bin/sh → CodexCLI.app 바이너리)는 spawn 직후 기록과 나중 관측의
+// command line이 달라 같은 프로세스를 다른 프로세스로 오판한다. command line은 감사용 기록으로만 남긴다.
+function isSameProcess(current: ProcessIdentity, pgid: number, startedAt: string): boolean {
+  return current.pgid === pgid && current.startedAt === startedAt;
 }
 
 // 신원 불일치로 회수를 건너뛴 사실이 조용히 묻히지 않도록 기본 보고는 stderr에 남긴다.

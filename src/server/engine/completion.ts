@@ -15,12 +15,33 @@ import type { AgentResult } from "../../shared/contracts.js";
 // 열린 요청 — id 는 문구와 제시 시점(sequence)으로 만든다: 같은 질문을 나중에 다시 하면 새 요청, 아직 열린 채 다시 하면 같은 요청.
 export interface OpenRequest { id: string; text: string; askedAfterSequence: number }
 
+export const MEDIATOR_REQUEST_PREFIX = "중재자 실행 요청: ";
+
 // 정지를 만드는 모든 사용자 요청을 같은 형태로 보존한다. 이후 응답에서 표시가 사라져도 열린 요청은 남는다.
-export function decisionRequestTexts(result: Pick<AgentResult, "requestedUserDecision" | "findings" | "status" | "summary" | "remainingSteps">): string[] {
-  const requests = [result.requestedUserDecision?.trim(),
+export function decisionRequestTexts(result: Pick<AgentResult, "requestedUserDecision" | "requestedMediatorAction" | "findings" | "status" | "summary" | "remainingSteps">): string[] {
+  const requests = [result.requestedUserDecision?.trim(), result.requestedMediatorAction?.trim() ? `${MEDIATOR_REQUEST_PREFIX}${result.requestedMediatorAction.trim()}` : undefined,
     ...result.findings.filter((finding) => finding.requiresUserDecision).map((finding) => finding.rationale.trim() || finding.title.trim())];
   if (result.status === "blocked" && !requests.some(Boolean)) requests.push(`러너가 막힘(blocked)으로 정지했습니다 — ${result.summary} — 남은 단계: ${(result.remainingSteps ?? []).join(" · ") || "(명시 없음)"}`);
   return [...new Set(requests.filter((text): text is string => Boolean(text)))];
+}
+
+// 결과 하나가 요청한 정지 — 중재자 실행 · 사용자 결정(blocked 포함) · 외부 증거. 계획·감사·개정·종결·ACK(core.pauseForResult)와 코드 리뷰 판정기
+// (findingJudgment.reviewVerdict)가 같은 판정을 쓴다. 어느 정지 상태·문구로 옮길지는 core.stopForPause 하나가 정한다.
+export type ResultPause =
+  | { kind: "mediator"; action: string }
+  | { kind: "decision"; message: string | undefined; blocked: boolean; remainingSteps: string[] }
+  | { kind: "evidence"; message: string };
+export function resultPause(result: Pick<AgentResult, "requestedMediatorAction" | "requestedUserDecision" | "findings" | "status" | "remainingSteps">): ResultPause | null {
+  const action = result.requestedMediatorAction?.trim();
+  if (action) return { kind: "mediator", action };
+  const remainingSteps = result.remainingSteps ?? [];
+  const blocked = result.status === "blocked"
+    ? `러너가 막힘(blocked)으로 정지했습니다 — 남은 단계: ${remainingSteps.join(" · ") || "(명시 없음)"}` : undefined;
+  const decision = result.requestedUserDecision ?? blocked ?? result.findings.find((finding) => finding.requiresUserDecision)?.rationale;
+  if (decision) return { kind: "decision", message: decision, blocked: result.status === "blocked", remainingSteps };
+  const evidence = result.findings.find((finding) => finding.disposition === "EXTERNAL_EVIDENCE");
+  if (evidence) return { kind: "evidence", message: evidence.rationale };
+  return null;
 }
 
 export function renderOpenRequests(requests: readonly OpenRequest[]): string {
@@ -30,7 +51,7 @@ export function renderOpenRequests(requests: readonly OpenRequest[]): string {
 export type CompletionVerdict =
   | { kind: "completed" }
   | { kind: "continue"; remainingSteps: string[] }
-  | { kind: "await-input"; reason: "blocked" | "requested-decision" | "finding-decision" | "external-evidence"; message: string; requests?: OpenRequest[] }
+  | { kind: "await-input"; reason: "mediator-work" | "blocked" | "requested-decision" | "finding-decision" | "external-evidence"; message: string; requests?: OpenRequest[] }
   | { kind: "needs-confirmation"; reason: "status-missing" | "contradiction" | "open-request-after-decision"; message: string; requests?: OpenRequest[] };
 
 export interface VerdictContext {
@@ -48,6 +69,8 @@ export type AcceptedResult = AgentResult & { readonly [acceptedBrand]: true };
 
 export function completionVerdict(result: AgentResult, context: VerdictContext): CompletionVerdict {
   const remaining = result.remainingSteps ?? [];
+  if (result.requestedMediatorAction?.trim()) return { kind: "await-input", reason: "mediator-work",
+    message: `중재자 실행 대기 — ${result.requestedMediatorAction.trim()}`, requests: [...context.openRequests] };
   if (result.status === "blocked") {
     const requests = [...context.openRequests];
     const asked = requests.length ? `\n${renderOpenRequests(requests)}` : "";

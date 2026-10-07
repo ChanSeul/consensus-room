@@ -572,3 +572,11 @@ it("중단된 실제 프로세스의 출력을 종료 완료 경계에서 보존
   await expect(task).rejects.toThrow("budget stop");
   expect(saved?.stdout).toContain('"ready":true');expect(saved?.truncated).toBe(false);
 });
+
+
+it("parses mediator execution handoffs and nullable provider output", () => {
+  const base = { kind: "IMPLEMENTATION", summary: "Ready for render verification", findings: [], evidenceRefs: [], status: "in_progress" };
+  expect(parseAgentResult([{ ...base, requestedMediatorAction: "Run the approved simulator gate" }], "").requestedMediatorAction)
+    .toBe("Run the approved simulator gate");
+  expect(parseAgentResult([{ ...base, requestedMediatorAction: null }], "").requestedMediatorAction).toBeUndefined();
+});

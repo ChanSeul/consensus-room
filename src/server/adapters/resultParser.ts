@@ -11,7 +11,7 @@ import type { AgentRunErrorCode } from "../../shared/planningControl.js";
 const OPTIONAL_KEYS = [
   "planningStep",
   "engineDefects",
-  "planMarkdown", "planEdits", "planLineEdits", "planSHA256", "requestedUserDecision", "memoryUpdates", "findings", "evidenceRefs",
+  "planMarkdown", "planEdits", "planLineEdits", "planSHA256", "requestedUserDecision", "requestedMediatorAction", "memoryUpdates", "findings", "evidenceRefs",
   "toleranceLedger", "status", "remainingSteps", "resolvesRequestedDecision", "resolvedRequestId", "resolvedRequestIds", "reviewDecisionAnswers", "decisionAssessments",
 ] as const;
 

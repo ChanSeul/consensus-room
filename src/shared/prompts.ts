@@ -3,6 +3,7 @@ import type { DiagnosisPrompt } from "./diagnoses";
 import type { AgentResult, DeferredFinding, Finding, ImplementationNote, TimelineEvent } from "./contracts";
 import type { TolerancePolicy } from "./tolerance";
 import { DISPOSITIONS, FIX_AWARE_KINDS, REQUIRED_PLAN_HEADINGS } from "./contracts";
+import { planChecksGuide } from "./planChecks";
 import { TIMELINE_DELIVERY_LIMITS, TIMELINE_REFERENCE_UNIT, TIMELINE_REFERENCE_VERSION, TIMELINE_REQUIRED_KINDS,
   type TimelineDeliveryPlan, type TimelineIndexReference, type TimelineReference } from "./planningControl";
 import { ACTIONABLE_SEVERITIES, DOWNGRADED_DISPOSITIONS, sha256 } from "./workflow";
@@ -53,7 +54,7 @@ function dispositionContract(kind: AgentResult["kind"]): string {
   const forbidden = fixAware
     ? "이 단계는 실제 수정을 확인하는 단계이므로 RESOLVED_BY_FIX를 쓸 수 있습니다."
     : "이 단계에서 RESOLVED_BY_FIX를 쓰면 서버가 응답 전체를 거부합니다 — 아직 수정이 일어나지 않았기 때문입니다.";
-  const agreedRule = agreedActionRule(kind);
+  const agreedRule = agreementRule(kind);
   return `${evidenceInvestigationContract(evidenceReviewStage)}
 처분(disposition)은 다음 값만 씁니다: ${usable.join(", ")}.
 ${forbidden}
@@ -75,18 +76,25 @@ function evidenceInvestigationContract(review: boolean): string {
 ${review ? "- 리뷰는 미확정·근거 부족으로 제외한 항목의 조사 근거를 확인하세요. 제공된 원문에 답이 있으면 직접 대조해 기존 ID의 판단을 정정하고 필요한 작업을 분류하세요. 사용자 질문이나 제외 처분을 그대로 재승인하지 마세요. 원문 접근이 불가능하면 그 제한을 기록하되 정책 미정으로 단정하지 마세요." : ""}`;
 }
 
-// 처분 되돌림 가드(workflow.dispositionRegressions)가 적용되는 단계의 안내 — 종결 확인(judgeCloseout)·수정 수락(judgeFixAcceptance).
-// 최종 리뷰는 finalReviewContract 가 같은 규칙을 말한다. 하향 처분과 조치 대상 심각도는 가드와 같은 상수에서 만든다.
-// 안내가 "해소됐다면 AGREED_NO_ACTION" 뿐이라 종결 확인이 개정으로 반영된 합의 쟁점을 그 값으로 닫아 멈췄다(2026-09-28 CP1 32e69740 P-5).
-function agreedActionRule(kind: AgentResult["kind"]): string | null {
+// 합의 유지 규칙 — 처분 되돌림 가드(workflow.dispositionRegressions)가 판정하는 단계(감사의 planImpact, 종결 확인 judgeCloseout, 수정 수락 judgeFixAcceptance,
+// 최종 리뷰 철회)가 한 문단을 공유한다. 하향 처분과 조치 대상 심각도는 가드와 같은 상수에서 만든다. "반영됐다 = AGREED_NO_ACTION" 으로 읽혀 종결·수정이 합의를
+// 철회한 것으로 멈췄다(2026-09-28 CP1 32e69740 P-5, 03d5beec 종결). 종결·수정은 하향이면 같은 세션에 한 번 되묻는다(2026-10-06 사용자 결정, core.enforceResultContract confirm).
+function agreementRule(kind: AgentResult["kind"]): string | null {
   const downgrade = `${DOWNGRADED_DISPOSITIONS.join("·")} 로 바꾸거나 심각도를 조치 대상(${ACTIONABLE_SEVERITIES.join("·")}) 밖으로 낮추면`;
-  if (kind === "CLOSEOUT") {
-    return `Claude의 처분이 AGREED_ACTION 인 쟁점(합의한 조치)은 개정 반영을 확인했어도 AGREED_ACTION 을 유지하세요 — 이행 의무는 구현으로 넘어가고 구현 리뷰가 확인합니다. ${downgrade} 서버가 합의 철회로 읽어 합의 종결 없이 사용자 판단을 기다립니다.`;
-  }
-  if (kind === "FIX") {
-    return `수정 대상 중 AGREED_ACTION 인 쟁점을 ${downgrade} 서버가 합의 철회로 읽어 최종 리뷰로 넘기지 않고 사용자 판단을 기다립니다.`;
-  }
-  return null;
+  const keep: Partial<Record<AgentResult["kind"], string>> = {
+    AUDIT: "계획에 충분히 반영돼 구현·실행 검증만 남았으면 같은 ID·심각도·AGREED_ACTION 을 유지하고 planImpact=implementation 을 적으세요(rationale·evidenceRefs 에 현재 계획의 해당 절과 확인 근거). 현재 계획의 누락·모순·변경이 필요하면 같은 ID 라도 planImpact=revision 입니다. 새 결함·심각도가 높아진 결함·사용자 결정이 필요한 항목에는 implementation 을 쓰지 말고, 구분을 확인하지 못하면 null 로 두세요. 이전 응답의 planImpact 를 현재 계획 검토 없이 승계하지 마세요.",
+    CLOSEOUT: "개정 반영을 확인했어도 AGREED_ACTION 을 유지하세요 — 이행 의무는 구현으로 넘어가고 구현 리뷰가 확인합니다.",
+    FIX: "실제로 고쳤거나 이미 고쳐져 있음을 이 작업 트리에서 확인했으면 RESOLVED_BY_FIX, 아직 남았으면 AGREED_ACTION 을 유지하세요.",
+    FINAL_REVIEW: "수정을 직접 확인했으면 RESOLVED_BY_FIX, 아직 남아 있으면 AGREED_ACTION 을 유지하세요.",
+  };
+  const consequence: Partial<Record<AgentResult["kind"], string>> = {
+    AUDIT: "완료나 수정 검증으로 바꾸지 마세요 — 반영됐다는 사실은 철회가 아닙니다.",
+    CLOSEOUT: `${downgrade} 서버가 합의 철회로 읽어 같은 세션에 한 번 되묻고, 그래도 같은 처분이면 합의 종결 없이 사용자 판단을 기다립니다.`,
+    FIX: `${downgrade} 서버가 합의 철회로 읽어 같은 세션에 한 번 되묻고, 그래도 같은 처분이면 최종 리뷰로 넘기지 않고 사용자 판단을 기다립니다.`,
+    FINAL_REVIEW: `요구 자체를 철회하려면 ${DOWNGRADED_DISPOSITIONS.join(", ")} 중 하나를 쓰되, 그 경우 자동으로 전달 준비로 넘어가지 않고 사용자 판단을 기다립니다.`,
+  };
+  if (!keep[kind]) return null;
+  return `합의 유지 규칙(앞 단계가 AGREED_ACTION 으로 합의한 쟁점): ${keep[kind]} ${consequence[kind]}`;
 }
 
 // 심각도 정책(2026-09-13 사용자 규칙): 계획 개정은 BLOCKER/HIGH 만 연다. MEDIUM 이하는 개정 없이 구현 노트로 러너에게 간다.
@@ -126,7 +134,7 @@ function renderDeferredFindings(findings: readonly DeferredFinding[] | undefined
     body = [
       ...index,
       ...(rest ? [`- … 외 ${rest}건(인라인 예산을 넘어 색인을 생략했습니다 — 원문 산출물에 모두 있습니다)`] : []),
-      `근거 전문 ${findings.length}건은 원문 산출물에 보존되어 있습니다: kind=artifact selector=${sourcePath}. 전체를 순서대로 읽는 필수 과제가 아닙니다. 현재 변경·계획 또는 새 증거와 관련된 쟁점만 kind=search selector=artifact::${sourcePath}::<ID 또는 관련 키워드> 로 찾고, 반환된 offset에서 kind=artifact로 해당 항목의 원문을 읽으세요. 항목이 조각 경계를 넘으면 nextOffset을 따라 해당 항목이 끝날 때까지만 읽으세요. 검색 결과 자체는 원문 확인이 아닙니다. 계획 제어가 없는 턴이면 같은 경로의 파일(${sourcePath})에서 필요한 항목을 찾아 읽으세요.`,
+      `근거 전문 ${findings.length}건은 원문 산출물에 보존되어 있습니다: kind=artifact selector=${sourcePath}. 전체를 순서대로 읽는 필수 과제가 아닙니다. 현재 변경·계획 또는 새 증거와 관련된 쟁점만 kind=search selector=artifact::${sourcePath}::<ID 또는 관련 키워드> 로 찾고, 검색 결과의 offset·end 를 그대로 kind=artifact 요청의 offset·end 로 쓰면 그 항목 전체가 실립니다(end 는 그 항목의 끝입니다). 검색 결과 자체는 원문 확인이 아닙니다. 계획 제어가 없는 턴이면 같은 경로의 파일(${sourcePath})에서 필요한 항목을 찾아 읽으세요.`,
     ].join("\n");
   }
   return stage === "plan"
@@ -245,7 +253,7 @@ function renderTimelineDelivery(events: readonly TimelineEvent[], plan: Timeline
   const required = plan.references.filter((reference) => reference.required).length;
   const guide = [
     `[참조 안내] 이벤트 ${plan.references.length}개(필수 ${required}개)는 크거나 많아 원문 대신 버전 고정 참조로 실었습니다.`,
-    "계획 제어 읽기(kind=context, selector 그대로)로 offset 0 부터 돌려받은 nextOffset 을 따라 nextOffset 이 null 이 될 때까지 읽으세요.",
+    "계획 제어 읽기(kind=context, selector 그대로)로 offset 0, end null 을 청하면 호스트가 끝까지 이어 싣습니다. 필수 참조는 청하지 않아도 호스트가 남은 패킷 공간에 이어 싣습니다.",
     "필수(결정·범위 변경) 참조를 끝까지 읽기 전에는 complete=true 를 낼 수 없습니다.",
     ...(plan.index ? [`참조 목록은 색인 kind=context selector=${plan.index.selector} (${plan.index.bytes} bytes, 한 줄에 참조 하나)에 있습니다. 색인을 끝까지 읽고 각 참조를 읽으세요.`] : []),
   ].join("\n");
@@ -348,6 +356,8 @@ export const EXECUTION_POLICY_NOTE = [
   "웹은 검색과 공개 문서 읽기에만 씁니다. 하위 에이전트가 있다면 탐색·검증에만 쓰고 같은 파일은 한 작업자만 수정합니다.",
   "외부 원문은 자료별 한 작업자가 필요한 범위만 수집하고 저장된 원문·출처·버전을 공유하세요. 검증자는 그 원문으로 주장과 대조하며, 구체적인 누락·모순·버전 변경이 있을 때만 해당 부분을 다시 수집합니다. 모든 조사 뒤에 전체 독립 재수집 단계를 붙이지 마세요.",
   "병렬 작업은 입력과 소유 범위가 독립적일 때만 사용하세요. 완료 알림이나 제공된 대기 도구를 쓰고, 결과 로그·현재 시각을 짧은 간격으로 반복 조회하지 마세요. 외부 서비스가 호출 제한을 반환하면 같은 조회를 반복하지 말고 확보한 원문과 미확인 부분을 구분해 보존하세요.",
+  // advisor 는 대화 전체를 캐시 없이 다시 읽는다. 계획자에게만 켜지므로(claude.ts) 다른 역할·Codex 턴에서는 이 줄이 모델 동작을 바꾸지 않는다.
+  "Advisor (if available): call it only at a decision point — a design judgment, resolving conflicting evidence, or right before returning complete=true. Do not call it in a response that requests reads, or while required context is still being loaded; gather first.",
 ].join("\n");
 
 export function executionPolicyNote(engineDefectFix = false): string {
@@ -390,6 +400,7 @@ function planContract(): string {
     "최종 plan.md에는 아래 제목이 모두 있어야 합니다.",
     ...REQUIRED_PLAN_HEADINGS.map((heading) => `- ## ${heading}`),
     "`## 허용 오차` 절에는 fenced 블록 ```tolerance {JSON} ``` 을 둡니다 — scopePaths(이 계획의 승인 경로 glob 목록)와 rules(각각 id `T-n`·title·paths(적용 영역 glob)·hunk(`insert-token`|`annotation-only`|`any`)·tokens·maxFiles·maxHunks·invariants). 규칙이 없으면 `\"rules\": []`. 파일 변경이 없는 조사 계획은 `\"scopePaths\": [], \"rules\": []`로 명시하며 실제 diff도 비어 있어야 합니다. 설명은 의미가 충분히 전달되게 작성하세요. 기계 매칭에 쓰는 tokens는 각 80자 이하여야 합니다. 서버가 이 블록을 파싱해 구현 결과의 승인 범위 밖 변경을 git diff 로 기계 대조하므로, 술어는 diff 만으로 판정 가능해야 하고 상한은 숫자여야 합니다. 부류 예: 다른 단계 소유 파일의 격리 표기 한 줄(insert-token: nonisolated), 모듈 선언의 표기 변경(annotation-only: @Sendable). 동작 변경·우회 표기(`@unchecked Sendable`·`nonisolated(unsafe)`·`assumeIsolated`)는 규칙으로 허용하지 마세요.",
+    planChecksGuide(),
     DESIGN_PLANNING_CONTRACT,
     verificationScopeContract(),
     "확정되지 않은 분석 이벤트, API 계약, SDK 동작을 추정해서 만들지 마세요.",
@@ -400,10 +411,7 @@ function planContract(): string {
 function finalReviewContract(): string {
   return [
     "이것은 한 번의 수정 뒤 최종 검토입니다. 같은 증거의 반복 지적은 하지 마세요.",
-    "첫 리뷰에서 AGREED_ACTION이던 쟁점은 수정을 직접 확인했으면 RESOLVED_BY_FIX로 처분하세요.",
-    "아직 남아 있으면 AGREED_ACTION을 그대로 유지하세요.",
-    "요구 자체를 철회하려면 AGREED_NO_ACTION, REFUTED, DEFERRED_OUT_OF_SCOPE 중 하나를 쓰되,",
-    "그 경우 자동으로 전달 준비로 넘어가지 않고 사용자 판단을 기다립니다.",
+    "첫 리뷰에서 AGREED_ACTION이던 쟁점은 아래 처분 계약의 합의 유지 규칙을 따릅니다.",
     "이번 검토에서 처음 발견한 쟁점은 RESOLVED_BY_FIX 로 닫지 말고 **분류**하세요:",
     "- 승인 범위 안의 확정 결함·이번 수정으로 생긴 결함 → AGREED_ACTION (남은 수정 회차 안에서 바로 수정됩니다)",
     "- 이번 범위 밖 개선 제안 → DEFERRED_OUT_OF_SCOPE (후속 목록에 기록되고 전달을 막지 않습니다)",
@@ -495,12 +503,13 @@ ${dispositionContract("AUDIT")}
 
 계획의 사실 오류, 빠진 실패 경로, 승인 경계 위반, 검증할 수 없는 주장, 과도한 범위를 찾으세요.
 \`## 허용 오차\` 블록도 검토하세요: 규칙 술어가 diff 만으로 기계 판정 가능한지, 상한이 있는지, 동작 변경이나 우회 표기를 허용하지 않는지, 소유 단계의 불변식(예: 소유 폴더 진단 0 유지)을 적었는지.
+필수 검사 선언(\`\`\`checks)도 검토하세요: 계획이 구현 수락이나 코드 리뷰 통과의 조건으로 적은 실행 검사가 선언 가능한 kind 라면 블록에 선언돼 있는지, 읽기 전용 리뷰어 좌석이 직접 실행해야 하는 검사를 리뷰 의무로 적지 않았는지, 선언할 수 없는 무거운 검사(빌드·Simulator·E2E)는 중재자 게이트로 실행 주체·조건을 적었는지.
+${planChecksGuide()}
 각 finding은 근거와 재현·검증 방법을 적고, 아직 처분하지 마세요. 반환 kind는 AUDIT입니다.
 
 위에 나열된 Claude의 쟁점 ID(${(input.claudePlan?.findings ?? []).map((finding) => finding.id).join(", ") || "없음"})는
 하나도 빠뜨리지 말고 같은 ID로 반환 findings에 다시 담으세요. 서버가 ID 누락을 기계적으로 검사해 응답을 거부합니다.
-각 항목에는 그 쟁점을 검증한 결과를 rationale에 적고, 새로 발견한 결함은 새 ID로 추가하세요.
-계획 수정과 구현 의무를 구분하세요. 기존 AGREED_ACTION이 현재 계획에 충분히 반영되어 구현·실행 검증만 남았다면 같은 ID·심각도·AGREED_ACTION을 유지하고 planImpact=implementation을 명시하세요. rationale과 evidenceRefs에는 현재 계획의 해당 절과 확인 근거를 적으세요. 완료나 수정 검증으로 바꾸지 마세요. 현재 계획의 누락·모순·변경이 필요하면 같은 ID라도 planImpact=revision입니다. 새 결함, 심각도가 높아진 결함, 사용자 결정·승인 필요 항목에는 implementation을 쓰지 마세요. 구분을 확인하지 못하면 null로 두세요. 이전 응답의 planImpact를 현재 계획 검토 없이 승계하지 마세요.`;
+각 항목에는 그 쟁점을 검증한 결과를 rationale에 적고, 새로 발견한 결함은 새 ID로 추가하세요.`;
 }
 
 export function buildClaudeRevisionPrompt(input: {
@@ -574,6 +583,7 @@ export function buildDiagnosisPlanRevisionPrompt(input: {
 }): string {
   const ids = input.diagnoses.map((item) => item.id).join(", ");
   const changed = input.carry.changedPaths;
+  const reported = reportShownInTimeline(input.carry.lastSummary, input.timeline ?? [], input.timelineDelivery);
   return `이 단계에서는 코드를 수정하지 마세요. 중재자 진단(${ids})이 **승인된 계획의 변경**을 요구합니다 — 승인 범위·접근·검증 기준 가운데 진단이 요구하는 부분만 고친 개정 계획을 만듭니다.
 구현은 이미 진행 중입니다. 작업 트리의 변경은 그대로 보존되고(구현 기준 커밋·브랜치 불변), 개정 계획은 Codex 감사·종결 확인·두 에이전트 ACK·사용자 승인을 거친 뒤에만 구현으로 돌아갑니다.
 
@@ -585,7 +595,8 @@ ${input.knownPlan ? `이 세션에서 작성한 기존 계획 SHA-256: ${input.k
 ${planRevisionDiagnoses(input.diagnoses)}
 진행 중인 구현의 상태(서버 기록):
 - 구현 기준 이후 바뀐 파일(${changed.length}개): ${changed.length ? `${changed.slice(0, 200).join(", ")}${changed.length > 200 ? " …" : ""}` : "(없음)"}
-- 직전 보고 요약: ${input.carry.lastSummary ? clip(input.carry.lastSummary, 2_000) : "(없음)"}
+- 직전 보고 요약: ${reported !== null ? `아래 '방에 추가된 결정과 증거'의 [${reported}] 원문과 같습니다(여기에 다시 싣지 않습니다).`
+    : input.carry.lastSummary ? clip(input.carry.lastSummary, 2_000) : "(없음)"}
 - 직전 계획 기준 남은 단계: ${input.carry.remainingSteps.length ? input.carry.remainingSteps.map((step) => clip(step, 500)).join(" · ") : "(명시 없음)"}
 - 검증된 허용 오차 원장 ${input.carry.verifiedLedgerRows}행(개정 계획의 허용 오차 규칙으로 구현 재개 때 다시 대조합니다)
 ${input.carry.openRequests.length ? `열린 요청(개정 뒤 구현으로 그대로 이어집니다 — 개정으로 닫히지 않습니다):\n${input.carry.openRequests.map((request) => `- [${request.id}] ${clip(request.text, 1_000)}`).join("\n")}\n` : ""}
@@ -602,6 +613,17 @@ ${dispositionContract("REVISION")}
 ${outputLanguageContract({ planBody: true })}
 ${planContract()}
 ${planEditsContract()}`;
+}
+
+// 직전 보고가 같은 과제의 타임라인 절에 자르지 않은 원문으로 실리는 agent_output 이벤트 순번(2026-10-07 실측: DG-4 개정 과제가 같은 보고를 상태 절에
+// 3,547B 더 실었다). 참조 모드는 인라인 이벤트, 기존 렌더는 절단 없이 남는 이벤트(whole)만 인정한다. 참조로만 실리거나 없으면 null — 요약을 그대로 싣는다.
+// 본문이 요약과 같을 때만 고른다 — 포함으로 고르면 그 요약을 인용한 다른 보고(예: Codex 리뷰의 반박)를 '같은 원문'으로 가리켰다(사전 검증).
+function reportShownInTimeline(summary: string | null, events: readonly TimelineEvent[], delivery: TimelineDeliveryPlan | undefined): number | null {
+  const text = summary?.trim();
+  if (!text) return null;
+  const shown = new Set(delivery ? delivery.inline : renderTimelineManifest(events).whole);
+  const event = [...events].reverse().find((item) => item.kind === "agent_output" && shown.has(item.sequence) && item.body.trim() === text);
+  return event?.sequence ?? null;
 }
 
 function planRevisionDiagnoses(items: readonly DiagnosisPrompt[]): string {
@@ -669,8 +691,15 @@ ${outputLanguageContract({ planBody: false })}
 - 같은 근거로 이미 결론 난 지적 → 다시 내지 마세요.
 - 제품 결정·범위 변경이 필요한 문제 → requiresUserDecision=true.
 새 결함 때문에 requestedUserDecision 을 쓰지 마세요 — 분류가 다음 행동을 정합니다.
-외부 증거나 사용자 판단이 남으면 정확히 표시하고, 그렇지 않으면 이 SHA를 planSHA256에 넣어 확인하세요.
+${resultPlanIdentity(input.revisedPlanSHA256)}
 반환 kind는 CLOSEOUT입니다.`;
+}
+
+// 결과가 판정하는 계획의 신원(planSHA256 확인) — 종결 확인 프롬프트와, 그 결과를 같은 세션에서 다시 받는 후속 턴(계약 교정·처분 확인·계획 제어의
+// 교정·확인 질문)이 같은 문장을 싣는다. 후속 턴은 과제 본문을 다시 싣지 않으므로("Continue the task already in this session.") SHA 를 세션 기억에
+// 맡기면 압축 뒤 빈 값·다른 값이 계약 위반으로 멈춘다(2026-10-06 r3 재현).
+export function resultPlanIdentity(planSHA256: string): string {
+  return `외부 증거나 사용자 판단이 남으면 정확히 표시하고, 그렇지 않으면 이 계획의 SHA-256(${planSHA256})을 planSHA256에 넣어 확인하세요.`;
 }
 
 // 이 프롬프트는 대화 이력 없는 일회용 세션에서 실행된다. 그래서 판단에 필요한 것을 전부 담는다 —
@@ -715,8 +744,8 @@ function mediationDecisionContract(): string {
 export function stopPolicyContract(): string {
   return `정지 정책 — requestedUserDecision 은 드물게 씁니다:
 - 승인 범위 밖 변경이 필요한 자리는 먼저 계획의 \`## 허용 오차\` 규칙과 대조하세요. **규칙 술어를 만족하면 구현하고 반환 JSON 의 toleranceLedger 에 {ruleId, file, note} 로 적으세요**(서버가 git diff 로 대조하며, 원장에 없는 범위 밖 변경은 되돌리게 합니다). 규칙 밖(다른 단계가 소유한 파일의 다른 변경, 모듈 선언, 우회 표기가 필요한 자리)은 **코드를 건드리지 말고 to-do 로 남기고 계속**하세요. 원장·보고서에 진단 정체성·원인 선언·필요한 변경·권장 형태를 한 줄로 적고 다음 일로 갑니다. 현재 완료 조건과 무관한 항목 때문에 턴을 끝내지 마세요. 필수 조건을 막으면 그 근거와 필요한 범위 결정을 보고하고 완료로 제출하지 마세요. 범위 밖을 미리 구현하는 것도 금지입니다(리뷰가 되돌리게 합니다).
-- requestedUserDecision 으로 턴을 끝내는 경우는 다음과 같습니다: (1) 중재자가 실행해야 하는 게이트(시뮬레이터·xcodebuild 등 러너가 돌릴 수 없는 단계), (2) 계획의 전제가 계측으로 반박돼 남은 작업의 방향이 갈릴 때, (3) 되돌리기 어려운 변경(외부 계약·동작 변경)을 피할 수 없을 때. 승인된 작업이 남은 채 턴을 마칠 때는 requestedUserDecision 없이 status=in_progress 와 remainingSteps 로 보고하세요. 서버가 같은 세션에서 이어갑니다.
-- **완료 선언 계약**: 결과 JSON 의 \`status\` 로 진행 상태를 명시하세요 — \`completed\`(계획의 모든 단계가 끝남 → 서버가 즉시 Codex 리뷰로 넘김) · \`in_progress\`(단계가 남았고 같은 세션에서 계속 — \`remainingSteps\` 에 남은 단계를 적으면 서버가 곧바로 "계속 진행" 턴을 엽니다) · \`blocked\`(중재자·사용자 입력이 필요해 정지, \`remainingSteps\` + requestedUserDecision). \`status\` 는 필수입니다 — 없으면 서버가 완료로 보지 않고 읽기 전용 확인 턴을 엽니다. 중간 보고·진행 상황 정리를 completed 로 내지 마세요(2026-09-14 S11: 완료 형식 중간 보고가 두 번 리뷰로 흘렀습니다).
+- 중재자가 실행해야 하는 게이트(시뮬레이터·xcodebuild 등 러너가 돌릴 수 없는 단계)를 기다리면 requestedMediatorAction 에 필요한 실행과 반환 증거를 적고 status=blocked 로 인계하세요. 사용자 승인을 다시 묻거나 status=in_progress 로 같은 러너를 호출하지 마세요. requestedUserDecision 으로 턴을 끝내는 경우는 다음과 같습니다: (1) 계획의 전제가 계측으로 반박돼 남은 작업의 방향이 갈릴 때, (2) 되돌리기 어려운 변경(외부 계약·동작 변경)을 피할 수 없을 때. 러너 자신이 바로 실행할 수 있는 승인된 작업이 남은 채 턴을 마칠 때만 requestedUserDecision 없이 status=in_progress 와 remainingSteps 로 보고하세요. 서버가 같은 세션에서 이어갑니다.
+- **완료 선언 계약**: 결과 JSON 의 \`status\` 로 진행 상태를 명시하세요 — \`completed\`(계획의 모든 단계가 끝남 → 서버가 즉시 Codex 리뷰로 넘김) · \`in_progress\`(단계가 남았고 같은 세션에서 계속 — \`remainingSteps\` 에 남은 단계를 적으면 서버가 곧바로 "계속 진행" 턴을 엽니다) · \`blocked\`(중재자·사용자 입력이 필요해 정지, \`remainingSteps\` + requestedUserDecision 또는 requestedMediatorAction). \`status\` 는 필수입니다 — 없으면 서버가 완료로 보지 않고 읽기 전용 확인 턴을 엽니다. 중간 보고·진행 상황 정리를 completed 로 내지 마세요(2026-09-14 S11: 완료 형식 중간 보고가 두 번 리뷰로 흘렀습니다).
 - to-do 는 원장·보고서 표와 함께 **반환 findings 에도** 남기세요: id \`TODO-n\`, disposition \`DEFERRED_OUT_OF_SCOPE\`, rationale 에 진단 정체성·원인 선언·필요한 변경·권장 형태. 방이 후속 목록에 기록합니다. 현재 완료 조건을 막지 않는 항목의 후속 토픽·다음 계획 포함·폐기 선택은 현재 인도의 선행 조건이 아닙니다. 별도 범위 결정 전에는 후속 목록에 보존하세요.
 - 그 경우에도 **한 턴에 한 번, 턴 끝에 모아서** 요청하세요. 요청 전에 결정과 무관한 일을 전부 끝내고, 요청문에는 실측 값·후보·권고를 적어 한 번의 답으로 끝나게 하세요.
 - **턴은 도구 호출 없는 텍스트 응답으로 끝납니다**(-p 모드). "기다리겠다"·"끝나면 확인하겠다" 같은 말만 쓰고 멈추면 그 순간 결과 제출이 강제돼 **미완 작업이 그대로 제출**됩니다. 기다림은 말이 아니라 도구 호출로 하세요: 긴 명령은 포그라운드로 timeout 을 넉넉히(최대 600000ms) 주고, 300초를 넘겨 백그라운드로 밀렸으면 \`sleep 60\` 뒤 로그 파일 tail 을 **도구 호출로 반복**하세요. 샌드박스에서 \`ps\`·\`/tmp\` 쓰기는 막히므로 대기 조건은 로그 파일의 종료 줄로 잡으세요. 결과 JSON 은 완료 기준(검증 로그 줄)이 손에 있을 때만 내세요.`;
@@ -829,6 +858,7 @@ export function buildCodexReviewPrompt(input: {
   resumedSession?: boolean;
   planningFindings?: readonly Finding[];
   planningEvidenceRefs?: readonly string[];
+  mediatorRequests?: readonly { id: string; sequence: number; question: string }[];
   verificationReceipts?: string;
   // 최종 리뷰: 직전 리뷰 이후 실제로 바뀐 파일과 패치(2026-09-07 Codex 피드백 ①). 있으면 재검토 범위를 이것으로 좁힌다.
   deltaSinceLastReview?: { files: readonly string[]; patch: string } | null;
@@ -843,6 +873,8 @@ export function buildCodexReviewPrompt(input: {
   // 최종 리뷰: 수정 작업 계약의 원본 쟁점(최종 리뷰 정지 쟁점·되돌린 진단 판정 등). 서버가 이 id 들의 처분을 요구하므로 프롬프트에도 싣는다 — 싣지 않으면
   // 리뷰어가 모른 채 답해 누락 교정을 한 번 더 사고 그 교정이 리뷰 한도를 소비했다(2026-09-15 감사 2차 후속).
   fixSourceFindings?: readonly Finding[];
+  // 최종 리뷰: 수정 단계로 넘기지 않은 리뷰 증거 요청(FinalReviewBase.deferredEvidence) — 서버가 이 id 들의 처분을 요구한다.
+  deferredEvidence?: readonly Finding[];
   // 타임라인 참조·쪽(E3-2-2b) — 판정 호출은 이 세션에 남은 필수 쪽을 모두 싣는다. 한 호출의 쪽 예산을 넘는 앞부분은 엔진이 판정 전 리뷰 읽기 호출로 먼저
   // 실었다(E3-4c — 이 세션이 이미 받은 구간은 다시 싣지 않는다). 없으면 기존 표시다.
   timelinePush?: TimelinePush;
@@ -874,7 +906,10 @@ ${input.planMarkdown}
   // "최신 판정" 이 아니라 합의 기준이라 적는다.
   const fixSource = (input.fixSourceFindings ?? []).length === 0 ? ""
     : `진단 전용 수정 작업의 원본 쟁점(최종 리뷰 정지 쟁점·되돌린 진단 판정 — 고치기로 합의한 기준입니다. 같은 id 가 위 보고에 다른 처분으로 있어도 이 기준을 지금 코드로 다시 판정해 id 마다 처분을 붙이세요):\n${JSON.stringify(input.fixSourceFindings, null, 2)}\n`;
-  return `당신은 읽기 전용 코드 검토자입니다. 파일을 수정하지 마세요.
+  const executionRequests = input.mediatorRequests?.length
+    ? `\n중재자 실행 요청을 새 evidence와 대조하세요. 메시지에 파일 경로가 있으면 허용된 원문/이미지/로그를 실제로 읽으세요. 파일 접근 실패·미실행·단순 성공 주장은 해소가 아닙니다. 확인한 요청만 reviewDecisionAnswers에 {requestId, decisionSequence}로 적으세요. decisionSequence는 여기서는 요청 이후 evidence 이벤트 순번입니다. 정책 질문/decision은 이 표식으로 해소하지 마세요. 미해소 요청은 보존됩니다.\nBEGIN_MEDIATOR_REVIEW_REQUESTS\n${JSON.stringify(input.mediatorRequests)}\nEND_MEDIATOR_REVIEW_REQUESTS\n`
+    : "";
+  return `${executionRequests}당신은 읽기 전용 코드 검토자입니다. 파일을 수정하지 마세요.
 
 ${plan}
 
@@ -887,7 +922,7 @@ ${JSON.stringify(input.implementation, null, 2)}
 
 ${input.verificationReceipts ?? ""}
 
-${reviewDiagnosesSection(input.diagnoses)}${originalFindings}${fixSource}${delta}${input.tolerance ? `\n허용 오차 대조(서버가 git diff 로 판정한 결과 — 승인 범위 밖 변경은 이 결과와 원장으로 판정하세요; 원장에 있고 술어를 만족하는 hunk 는 범위 이탈이 아닙니다):\n${input.tolerance}\n` : ""}
+${reviewDiagnosesSection(input.diagnoses)}${originalFindings}${fixSource}${deferredEvidenceForReview(input.deferredEvidence)}${delta}${input.tolerance ? `\n허용 오차 대조(서버가 git diff 로 판정한 결과 — 승인 범위 밖 변경은 이 결과와 원장으로 판정하세요; 원장에 있고 술어를 만족하는 hunk 는 범위 이탈이 아닙니다):\n${input.tolerance}\n` : ""}
 ${input.resumedSession ? "이 리뷰 세션의 직전 턴 이후 방에 추가된 사용자 결정과 증거(그 전 것은 이 세션이 이미 받았습니다):" : "방에 추가된 사용자 결정과 증거:"}
 ${input.timelinePush
     ? `${renderPushedTimeline(input.timeline, input.timelinePush, input.resumedSession ? "(직전 리뷰 턴 이후 새 결정·증거 없음)" : "(아직 메시지가 없습니다.)")}${
@@ -906,10 +941,20 @@ ${dispositionContract(input.finalPass ? "FINAL_REVIEW" : "REVIEW")}
 - status 는 이번 리뷰의 완료 여부입니다. 필요한 검토를 끝냈으면 수정할 finding 이 남아 있어도 completed 로 보고하고 remainingSteps 는 비우세요. 구현자가 고칠 일은 findings 에 남깁니다.
 - remainingSteps 는 리뷰어가 아직 검토하지 못한 작업만 적습니다. 구현자의 수정, 그 뒤의 재검토, 이번 리뷰 범위 밖의 빌드·커밋·배포를 남은 리뷰로 적지 마세요.
 - 실제로 미검토 부분이 있으면 status=in_progress 와 remainingSteps 에 남겨야 합니다. 필수 증거를 확인하지 못했는데 완료로 바꾸거나, 실행하지 않은 검사를 통과했다고 쓰지 마세요.
+${reviewExecutionContract()}
 - 승인 범위에서 고칠 수 있는 확정 지적은 AGREED_ACTION 으로 전달하세요. 이미 내려진 결정이나 일반 수정 착수 승인을 requestedUserDecision 으로 다시 묻지 마세요. 새로운 범위·제품 결정이나 외부 증거가 정말 필요하면 기존 결정과 무엇이 다른지 근거를 적고 요청을 유지하세요.
 ${outputLanguageContract({ planBody: false })}
 
 반환 kind는 ${input.finalPass ? "FINAL_REVIEW" : "REVIEW"}입니다.`;
+}
+
+// 리뷰어의 실행 검사 계약(2026-10-06) — 리뷰 좌석은 읽기 전용이라 실행 검사를 돌리지 못한다(2026-10-03 f82dbc0e swiftc -parse permissionDenied → 증거 정지 →
+// 중재자 재실행 → 같은 코드 재리뷰). 실행 증명은 엔진이 수락 경계에서 실행한 영수증뿐이고, 계획에 선언이 없으면 필수 실행 검사가 없다.
+function reviewExecutionContract(): string {
+  return `- 실행 검사: 이 리뷰 좌석은 읽기 전용입니다. 컴파일러·빌드·테스트·스크립트 같은 실행 검사를 직접 돌리지 마세요. 실행 증명은 위의 "호스트 실행 검사 영수증"과 방에 올라온 증거 이벤트뿐입니다.
+- 승인 계획이 \`\`\`checks 로 선언한 검사는 서버가 구현·수정 결과를 받아들이기 직전에 이 작업 트리에서 실행했고, 실패한 결과는 리뷰로 넘어오지 않습니다. 영수증을 그 검사의 증명으로 쓰고 같은 검사의 실행 증거를 다시 요구하지 마세요. 선언된 검사인데 영수증에 지금 트리의 성공 기록이 없다고 적혀 있으면 그 사실을 EXTERNAL_EVIDENCE 쟁점으로 적으세요.
+- 계획에 \`\`\`checks 블록이 없으면 필수 실행 검사가 없는 계획입니다. 실행 결과가 없다는 이유만으로 EXTERNAL_EVIDENCE·requestedMediatorAction·remainingSteps 를 내지 말고 코드·diff·영수증으로 판정하세요. 빌드·Simulator·E2E 는 중재자 게이트가 따로 실행합니다.
+- remainingSteps 에는 이 리뷰가 아직 검토하지 못한 부분만 적습니다. 방 밖 자료가 판정에 필요하면 그 쟁점의 EXTERNAL_EVIDENCE 처분으로, 중재자의 실행이 필요하면 requestedMediatorAction 으로 냅니다 — remainingSteps 에 외부 실행·증거 요청을 적지 마세요.`;
 }
 
 // 코드 리뷰의 리뷰 읽기 호출(E3-4c, job reviewer/review-read) — 이 리뷰에 필요한 필수 결정·범위 변경 원문이 한 리뷰 호출의 쪽 예산을 넘을 때, 판정 전에
@@ -920,6 +965,25 @@ export function buildReviewReadPrompt(input: { round: number; finalPass: boolean
 이번 호출에서는 아래 쪽을 읽고 이어질 리뷰를 위해 기억만 하세요. 코드·파일을 조사하거나 판정하지 마세요 — 도구가 열려 있지 않고, 리뷰 판정(${input.finalPass ? "FINAL_REVIEW" : "REVIEW"})은 남은 쪽·계획·구현 보고와 함께 오는 마지막 리뷰 호출에서만 합니다.
 반환 kind 는 ACK 이고 summary 는 한 문장, findings 는 빈 배열입니다. requestedUserDecision·판정·처분을 적지 마세요.
 ${timelinePagesSection(input.pages, "review", true)}`;
+}
+
+// 수정 턴에 보이는, 러너 의무가 아닌 리뷰 증거 요청(2026-10-06 사용자 결정 "수정 먼저") — 의존하는 수정은 추측하지 않고 최종 리뷰의 증거 판정에 맡긴다.
+function deferredEvidenceForFix(findings: readonly Finding[] | undefined): string {
+  if (!findings?.length) return "";
+  return `
+리뷰가 요청한 외부 증거(이 수정의 의무가 아닙니다 — 최종 리뷰가 수정 뒤 트리에서 증거와 함께 다시 판정합니다):
+${renderFindingIndex(findings)}
+- 이 id 들은 findings 에 적지 마세요(서버가 수정 보고에서 뺍니다).
+- 위 수정 대상 중 이 증거에 의존해 지금 확정할 수 없는 것은 추측해 고치지 말고 AGREED_ACTION 을 유지한 채 rationale 에 의존하는 증거 id 를 적으세요. 증거와 무관한 수정은 그대로 끝내세요.
+`;
+}
+
+// 최종 리뷰에 싣는, 수정 단계로 넘기지 않은 리뷰 증거 요청 — 서버가 이 id 들의 처분을 요구한다(FinalReviewBase.deferredEvidence 커버리지).
+function deferredEvidenceForReview(findings: readonly Finding[] | undefined): string {
+  if (!findings?.length) return "";
+  return `수정 단계로 넘기지 않은 리뷰 증거 요청(수정 러너의 의무가 아니었습니다 — 지금 트리와 방의 증거로 id 마다 다시 판정해 처분을 붙이세요. 여전히 판단 근거가 없으면 EXTERNAL_EVIDENCE 를 유지하세요):
+${JSON.stringify(findings, null, 2)}
+`;
 }
 
 // 리뷰어에게 주는 중재자 진단 원문(host-review R4) — 러너의 반영 보고(RESOLVED_BY_FIX)를 원본 지시·검증 기준과 대조해 판정하게 한다.
@@ -952,22 +1016,30 @@ ${requests.map((request) => `- [${request.id}] ${request.text}`).join("\n")}
 
 // 완료 선언 계약(구현·수정 공통) — status 는 필수이며 없으면 서버가 읽기 전용 확인 턴(최대 1회)을 열고, 그래도 불명확하면 보존한 채 멈춘다.
 export function completionStatusContract(): string {
-  return `완료 선언 계약: 결과 JSON 의 \`status\` 를 **반드시** 적으세요 — \`completed\`(계획의 모든 단계가 끝남, remainingSteps 없음) · \`in_progress\`(단계가 남았고 같은 세션에서 계속 — \`remainingSteps\` 필수) · \`blocked\`(중재자·사용자 입력이 필요해 정지 — \`remainingSteps\` + requestedUserDecision). status 가 없거나 completed 인데 remainingSteps 가 있으면 서버는 완료로 보지 않고 읽기 전용 확인 턴을 1회 열며, 그래도 불명확하면 결과를 보존한 채 멈춥니다. 중간 보고를 completed 로 내지 마세요.`;
+  return `중재자 실행 인계: 남은 선행 단계가 다른 실행자(중재자)의 빌드·Simulator·검증이면 requestedMediatorAction 에 필요한 작업·반환 증거를 명시하고 status=blocked 로 제출하세요. 서버는 in_progress 라고 잘못 표시돼도 이 요청을 우선하여 같은 러너를 재호출하지 않습니다. 인계도 열린 요청 id 로 보존되며 결과를 받은 뒤 resolvesRequestedDecision + resolvedRequestIds 로 해소하세요. 사용자 결정은 requestedUserDecision 에만 적습니다.
+계획 필수 검사: 승인 계획에 \`\`\`checks 블록이 있으면 서버가 결과를 받아들이기 직전에 그 검사를 이 작업 트리에서 직접 실행합니다 — 실패하면 실패 로그와 함께 같은 세션으로 돌려보냅니다. 그 검사의 실행을 requestedMediatorAction 으로 요청하거나 그 결과를 기다리며 blocked 로 멈추지 마세요.
+완료 선언 계약: 결과 JSON 의 \`status\` 를 **반드시** 적으세요 — \`completed\`(계획의 모든 단계가 끝남, remainingSteps 없음) · \`in_progress\`(단계가 남았고 같은 세션에서 계속 — \`remainingSteps\` 필수) · \`blocked\`(중재자·사용자 입력이 필요해 정지 — \`remainingSteps\` + requestedUserDecision 또는 requestedMediatorAction). status 가 없거나 completed 인데 remainingSteps 가 있으면 서버는 완료로 보지 않고 읽기 전용 확인 턴을 1회 열며, 그래도 불명확하면 결과를 보존한 채 멈춥니다. 중간 보고를 completed 로 내지 마세요.`;
 }
 
 // 러너가 status=in_progress 로 멈춘 뒤 같은 세션에서 여는 "계속 진행" 턴 — 새 결정이 아니라 남은 단계의 이행 요청이다(D01).
 // timeline: 이 세션이 아직 받지 않은 필수 타임라인 쪽(E3-2-2b). recheck 면 러너가 완료를 보고했지만 필수 구간이 남아 최종 채택·검증 전에 잇는 턴이다(J2) —
 // 남은 구간을 읽고 이미 만든 결과를 재대조·보완하게 한다. 필수 읽기 턴은 계속 진행 상한을 쓰지 않아 회차만 표시한다(round = 필수 읽기 회차, E3-4b).
+// planChecks: 러너가 완료를 보고했지만 계획 필수 검사(```checks)가 이 작업 트리에서 실패해 수락하지 않은 턴이다(round = 필수 검사 회차) — 실패 내용을 고치게 한다.
 export function buildContinuationPrompt(
   remainingSteps: readonly string[], round: number, kind: "IMPLEMENTATION" | "FIX" = "IMPLEMENTATION",
   openRequests?: readonly OpenRequestPrompt[], timeline?: TimelinePages & { recheck: boolean },
+  planChecks?: ReadonlyArray<{ id: string; detail: string }>,
 ): string {
-  const opening = timeline?.recheck
+  const opening = planChecks?.length
+    ? `직전 결과가 완료를 보고했지만, 승인 계획이 선언한 필수 검사가 이 작업 트리에서 실패해 서버가 결과를 받아들이지 않았습니다(필수 검사 ${round}회차). 아래 실패 내용을 같은 승인 범위에서 고친 뒤 다시 status=completed 로 보고하세요. 서버가 수락 직전에 같은 검사를 다시 실행합니다 — 검사를 직접 실행하거나 중재자에게 실행을 요청할 필요는 없습니다. 검사 입력이 바뀌지 않은 채 같은 실패가 반복되면 서버가 멈춥니다. 실패가 승인 범위 밖의 수정을 요구하면 고치지 말고 requestedUserDecision 으로 그 사실을 알리고 status=blocked 로 답하세요. 반환 kind 는 ${kind} 입니다.`
+    : timeline?.recheck
     ? `직전 결과가 완료를 보고했지만, 이 세션이 아직 받지 않은 필수 타임라인 구간(사용자 결정·범위 변경 원문)이 남아 서버가 최종 채택·검증 전에 이어갑니다(필수 읽기 ${round}회차). 아래 쪽을 읽고, 이미 만든 결과를 그 결정과 다시 대조해 어긋나는 곳을 같은 승인 범위에서 보완한 뒤 다시 완료를 보고하세요. 어긋남이 없으면 대조한 근거를 evidenceRefs 에 남기고 status=completed 로 답하세요. 반환 kind 는 ${kind} 입니다.`
     : `직전 결과가 status=in_progress 였습니다(계속 진행 ${round}회차). 같은 승인 범위에서 남은 단계를 이어서 수행하세요. 횟수 때문에 작업을 쪼개지 마세요. 파일 변경과 필수 읽기 진척 없이 같은 보고를 반복하면 서버가 멈춥니다. 반환 kind 는 ${kind} 입니다.`;
+  const pending = planChecks?.length
+    ? `실패한 필수 검사(서버 실행 결과):\n${planChecks.map((check) => `- ${check.detail}`).join("\n")}`
+    : `남은 단계(직전 제출):\n${remainingSteps.length ? remainingSteps.map((step) => `- ${step}`).join("\n") : "- (명시 없음 — 계획의 다음 단계)"}`;
   return `${opening}
-남은 단계(직전 제출):
-${remainingSteps.length ? remainingSteps.map((step) => `- ${step}`).join("\n") : "- (명시 없음 — 계획의 다음 단계)"}
+${pending}
 ${timelinePagesSection(timeline, "work", false)}${openRequestsSection(openRequests)}
 규칙: 결과 JSON 은 이번 턴까지 누적된 보고입니다(직전 findings·evidenceRefs 는 서버가 병합해 보존합니다). ${completionStatusContract()} 허용 오차 원장(toleranceLedger)은 **이번 턴에 새로 생기거나 바뀐 범위 밖 변경만** {ruleId, file, note} 로 적으세요 — 앞 턴에서 서버가 받아들인 행은 같은 파일이 그대로 바뀐 채면 서버가 승계하므로 다시 적지 않습니다(한 번 응답의 원장은 500행까지).
 
@@ -999,6 +1071,7 @@ ${openRequestsSection(input.openRequests)}
 ${input.decisionsSince.length ? `열린 요청 뒤에 도착한 결정·증거:\n${since.text}\n` : ""}
 답할 것 — 같은 kind(${input.kind})로 전체 결과 JSON 을 다시 반환하되 다음 필드만 바꿉니다:
 - \`status\`: completed(모든 단계 끝, remainingSteps 비움) · in_progress(남은 단계를 remainingSteps 에) · blocked(입력 필요).
+- 중재자의 실행 결과가 먼저 필요하면 \`requestedMediatorAction\`에 필요한 실행·증거를 적고 blocked로 인계하세요.
 - 열린 요청이 있으면 \`resolvesRequestedDecision: true\` + 위 결정으로 해소된 요청 id 전부를 \`resolvedRequestIds\` 에(하나뿐이면 \`resolvedRequestId\` 도 됩니다). 보류·미해소 요청은 나열하지 말고 그대로 둡니다.
 findings·evidenceRefs·summary 는 저장된 값을 그대로 유지하세요(처분도 그대로). 확신이 없으면 completed 라고 적지 마세요 — 서버가 결과를 보존한 채 사람에게 넘깁니다.
 
@@ -1009,6 +1082,8 @@ ${dispositionContract(input.kind)}`;
 export function buildClaudeFixPrompt(input: {
   planMarkdown: string;
   reviewFindings: readonly Finding[];
+  // 리뷰가 요청한 외부 증거 중 이 수정의 의무가 아닌 것(FixContract.deferredEvidence) — 최종 리뷰가 최종 트리에서 다시 판정한다.
+  deferredEvidence?: readonly Finding[];
   timeline: readonly TimelineEvent[];
   // 구현 세션을 이어 쓰는 수정 턴: 계획 본문 생략 + 직전 턴 이후 이벤트만(2026-09-08 Codex 제안 ⑥). 세션 유실로 새 세션이면 false.
   resumedSession?: boolean;
@@ -1028,7 +1103,7 @@ ${input.resumedSession ? `승인된 계획 SHA-256: ${input.planSHA256 ?? "(미�
 
 수정 대상:
 ${JSON.stringify(input.reviewFindings, null, 2)}
-
+${deferredEvidenceForFix(input.deferredEvidence)}
 ${continuedTimelineHeading(input.resumedSession, "방에 추가된 사용자 결정과 증거:")}
 ${workTimeline(input.timeline, input.timelinePush, continuedTimelineEmpty(input.resumedSession))}
 ${decisionsSection(input.decisionsPath)}
@@ -1053,7 +1128,7 @@ ${runnerScopeContract()}
 // 기계 검사가 거부한 응답을 같은 세션에 돌려보내 표기만 고친 재제출을 받는다. 작업을 다시 시키는 것이
 // 아니다 — 세션 컨텍스트에 직전 작업이 전부 있으므로 결과 JSON만 계약에 맞춰 다시 방출하면 된다
 // (2026-09-01 S1.1: 계약 위반 하나로 1시간 구현 턴이 소각된 사건의 프로그램적 방지).
-export function buildContractCorrectionPrompt(violation: string, allowedKinds?: readonly string[] | null): string {
+export function buildContractCorrectionPrompt(violation: string, allowedKinds?: readonly string[] | null, planSHA256?: string | null): string {
   const kindRule = allowedKinds && allowedKinds.length > 1
     ? `kind는 ${allowedKinds.join(", ")} 안에서 실제 판단과 일치하는 값을 고르세요. 거부 사유가 판단 종류와 내용의 모순이면 kind도 교정하세요.`
     : "kind는 직전 응답과 동일하게 유지하세요.";
@@ -1064,7 +1139,27 @@ export function buildContractCorrectionPrompt(violation: string, allowedKinds?: 
 작업을 다시 하지 마세요. 파일도 수정하지 마세요. 직전 턴에서 실제로 한 작업 내용 그대로,
 거부 사유가 가리키는 필드 값만 계약에 맞게 고쳐 전체 결과 JSON을 다시 반환하세요.
 ${kindRule} 사실과 다른 값으로 바꿔치기하지 마세요 —
-계약에 맞는 값 중 실제 상황을 정직하게 나타내는 값을 고르세요.`;
+계약에 맞는 값 중 실제 상황을 정직하게 나타내는 값을 고르세요.${planSHA256 ? `\n${resultPlanIdentity(planSHA256)}` : ""}`;
+}
+
+// 합의 하향 확인 질문(2026-10-06 사용자 결정) — 종결 확인·수정 결과가 앞 단계의 AGREED_ACTION 을 내렸을 때 엔진이 같은 세션에 한 번 되묻는 내용.
+// 판정은 workflow.dispositionRegressions(종결 judgeCloseout.regressed, 수정 judgeFixAcceptance.downgraded)이고 규칙 문장은 처분 계약의 합의 유지 규칙이다.
+export function dispositionConfirmationQuestion(kind: "CLOSEOUT" | "FIX", ids: readonly string[]): string {
+  return `앞 단계가 AGREED_ACTION 으로 합의한 쟁점 ${ids.join(", ")} 의 처분을 이번 응답이 내렸거나 심각도를 조치 대상 밖으로 낮췄습니다. ${agreementRule(kind)}`;
+}
+
+// 확인형 교정 턴(계약 위반 아님) — 같은 세션에 확인 질문을 돌려주고 처분만 다시 받는다. 같은 처분으로 다시 내면 서버가 확인한 철회로 받는다. 처분을 다시
+// 정하는 턴이라 그 단계의 처분 계약을 함께 싣는다.
+export function buildDispositionConfirmationPrompt(question: string, kind: AgentResult["kind"], planSHA256?: string | null): string {
+  return `서버가 방금 응답을 받아들이기 전에 처분 하나를 확인합니다(계약 위반은 아닙니다).
+
+확인할 것: ${question}
+
+작업을 다시 하지 마세요. 파일도 수정하지 마세요. 직전 턴의 실제 판단 그대로, 위 쟁점들의 처분만 다시 정해 전체 결과 JSON을 다시 반환하세요.
+반영·수정을 확인한 것이었다면 합의 유지 규칙에 맞는 처분으로 바꾸세요. 합의를 정말 철회하는 것이면 같은 처분과 그 근거를 그대로 다시 제출하세요 — 서버가 받아들여 사용자 판단을 기다립니다.
+kind는 직전 응답과 동일하게 유지하세요(${kind}).${planSHA256 ? `\n${resultPlanIdentity(planSHA256)}` : ""}
+
+${dispositionContract(kind)}`;
 }
 
 // 허용 오차 위반 교정 — 같은 세션에 위반 목록을 돌려보내 되돌리거나 원장을 채우게 한다(한 번만; 두 번째 위반은 사용자 결정).
@@ -1089,9 +1184,9 @@ ${dispositionContract(kind)}`;
 }
 
 export function buildReviewAnswerConfirmationPrompt(input: {
-  requests: readonly { id: string; sequence: number; question: string; answerDecisionSequence?: number; checkedThrough?: number }[];
+  requests: readonly { id: string; sequence: number; question: string; kind?: "mediator-work"; answerDecisionSequence?: number; checkedThrough?: number }[];
   decisions: readonly { sequence: number; body: string }[];
-  answerEvidence: readonly { sequence: number; body: string }[];
+  answerEvidence: readonly { sequence: number; body: string; kind?: string }[];
 }): string {
   return `리뷰 질문 답변 확인 전용입니다. 코드·파일·계획은 조사하거나 수정하지 마세요. 기존 코드 리뷰 판정도 바꾸지 마세요.
 반환 kind는 REVIEW, status는 completed, findings는 빈 배열입니다.

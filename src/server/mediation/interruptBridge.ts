@@ -4,9 +4,10 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import { pathToFileURL } from "node:url";
 import { z } from "zod";
 import type { MediatorInterrupt, MediatorSession } from "../../shared/mediatorInterrupts.js";
-import { interruptMessage, probeCodexSession, sendCodexInterrupt } from "./codexInterrupt.js";
+import { interruptMessage, resolveCodexTransport, sendCodexInterrupt, type CodexTransport } from "./codexInterrupt.js";
 
 type Delivery = { interrupt: MediatorInterrupt; claim: string };
+type Route = { kind: "channel"; server: Server } | CodexTransport;
 export function claudeChannelNotification(item: MediatorInterrupt) {
   return { method: "notifications/claude/channel" as const, params: { content: interruptMessage(item),
     meta: { interrupt_id: item.id, topic_id: item.topicId, source_role: item.sourceRole } } };
@@ -34,7 +35,7 @@ export async function runInterruptBridge(): Promise<void> {
     }
     return await response.json() as T;
   };
-  let subscriptionTopicId = topicId, checkedAt = 0, available = false;
+  let subscriptionTopicId = topicId, checkedAt = 0;
   const requestInterrupt = async <T>(item: MediatorInterrupt, operation: string, body: unknown): Promise<T> => {
     try { return await request<T>(`topics/${item.topicId}/interrupts/${item.id}/${operation}`, body); }
     catch (error) {
@@ -74,6 +75,15 @@ export async function runInterruptBridge(): Promise<void> {
     await mcp.connect(new StdioServerTransport()); await initialized;
   }
   const reportConnection = (error: string | null) => request(`topics/${encodeURIComponent(subscriptionTopicId)}/interrupts/connection`, { ...session, available: error === null, error });
+  // The connection check is the one place that decides how this session is reached; delivery uses only its result.
+  // When nothing reaches the session, each claimed request records the cause as a pre-send failure (no attempt spent).
+  let route: Route | Error = new Error("중재 세션 연결을 아직 확인하지 않았습니다.");
+  const deliver = async (target: Route, delivery: Delivery): Promise<void> => {
+    if (target.kind !== "channel") return sendCodexInterrupt(target, session.sessionId, delivery.interrupt);
+    received.set(delivery.interrupt.id, delivery);
+    try { await target.server.notification(claudeChannelNotification(delivery.interrupt)); }
+    catch { throw Object.assign(new Error("Claude 채널 전송 결과를 확인할 수 없습니다."), { uncertain: true }); }
+  };
   try {
     while (!abort.signal.aborted) {
       try {
@@ -81,12 +91,10 @@ export async function runInterruptBridge(): Promise<void> {
           // The server resolves the assignment's scope; never adopt a different identity/version.
           const connection = await request<{ subscriptionTopicId: string }>(`topics/${encodeURIComponent(subscriptionTopicId)}/interrupts/connection?${new URLSearchParams(session)}`);
           subscriptionTopicId = connection.subscriptionTopicId;
-          let error: string | null = null;
-          try { if (!mcp) await probeCodexSession(session.sessionId, process.env.CONSENSUS_CODEX_SOCKET); }
-          catch (failure) { error = failure instanceof Error ? failure.message : "중재 세션 연결 실패"; }
-          await reportConnection(error); available = error === null; checkedAt = Date.now();
+          route = mcp ? { kind: "channel", server: mcp } : await resolveCodexTransport(session.sessionId, process.env.CONSENSUS_CODEX_SOCKET)
+            .catch((failure: unknown) => failure instanceof Error ? failure : new Error("중재 세션 연결 실패"));
+          await reportConnection(route instanceof Error ? route.message : null); checkedAt = Date.now();
         }
-        if (!available) { await wait(30_000); continue; }
         const query = new URLSearchParams({ ...session, waitMs: "25000", descendants: "true" });
         const { items } = await request<{ items: MediatorInterrupt[] }>(`topics/${encodeURIComponent(subscriptionTopicId)}/interrupts?${query}`);
         for (const item of items) {
@@ -94,23 +102,20 @@ export async function runInterruptBridge(): Promise<void> {
           let delivery: Delivery;
           try { delivery = await requestInterrupt<Delivery>(item, "claim", session); }
           catch (error) { if ((error as { status?: number }).status === 409 && !(error as { fatal?: boolean }).fatal) continue; throw error; }
-          try {
-            if (mcp) {
-              received.set(item.id, delivery);
-              try { await mcp.notification(claudeChannelNotification(delivery.interrupt)); }
-              catch { throw Object.assign(new Error("Claude 채널 전송 결과를 확인할 수 없습니다."), { uncertain: true }); }
-            }
-            else await sendCodexInterrupt(session.sessionId, delivery.interrupt, process.env.CONSENSUS_CODEX_SOCKET);
-          } catch (error) {
-            await receipt(delivery, (error as { uncertain?: boolean }).uncertain ? "unknown" : "failed", error instanceof Error ? error.message : "전송 실패", (error as { transportUnavailable?: boolean }).transportUnavailable === true);
-            if ((error as { transportUnavailable?: boolean }).transportUnavailable) {
-              available = false; checkedAt = 0;
-              await reportConnection(error instanceof Error ? error.message : "중재 세션 연결 실패"); break;
-            }
-            continue;
+          const failure: unknown = route instanceof Error ? Object.assign(new Error(route.message), { transportUnavailable: true })
+            : await deliver(route, delivery).then(() => null, (error: unknown) => error);
+          if (failure === null) {
+            // A lost receipt never causes another send in this process. The server expires it to unknown.
+            await receipt(delivery, "sent"); continue;
           }
-          // A lost receipt never causes another send in this process. The server expires it to unknown.
-          await receipt(delivery, "sent");
+          const { uncertain, transportUnavailable } = failure as { uncertain?: boolean; transportUnavailable?: boolean };
+          const message: string = failure instanceof Error ? failure.message : "전송 실패";
+          await receipt(delivery, uncertain ? "unknown" : "failed", message, transportUnavailable === true);
+          if (transportUnavailable && !(route instanceof Error)) {
+            // The resolved route stopped reaching the session: report it and decide the route again before the next claim.
+            route = new Error(message); checkedAt = 0;
+            await reportConnection(message); break;
+          }
         }
       } catch (error) {
         if (abort.signal.aborted) break;

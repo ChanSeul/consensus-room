@@ -1,8 +1,21 @@
 import type { DatabaseSync } from "node:sqlite";
 import { BUDGET_KEYS, BudgetPolicySchema, hasBudgetLimits, OBSERVE_USAGE, zeroBudget, type BudgetAccount, type BudgetPolicy, type BudgetVector } from "../shared/budgets.js";
 
+// Why a new execution cannot open now. running clears by itself when that execution ends; unsettled needs its usage
+// confirmed (settled or acknowledged); budget needs a budget decision. Callers decide waiting versus stopping by this.
+export type BudgetBlockReason = "running" | "unsettled" | "budget";
+// What a person does before a stopped topic can resume, by reason.
+const RESUME_STEP: Record<BudgetBlockReason, string> = {
+  running: "같은 예산 계정의 다른 실행이 끝난 뒤 재개하세요.",
+  unsettled: "중단된 실행의 집계를 확인한 뒤 재개하세요.",
+  budget: "토큰·시간 예산도 추가한 뒤 재개하세요.",
+};
 export class BudgetBlocked extends Error {
-  constructor(readonly accountId: string, message = "예산을 추가한 뒤 재개해야 합니다.") { super(message); this.name = "BudgetBlocked"; }
+  // executionId names the unfinished execution behind a running or unsettled refusal.
+  constructor(readonly accountId: string, readonly reason: BudgetBlockReason, message = "예산을 추가한 뒤 재개해야 합니다.",
+    readonly executionId?: string) {
+    super(message); this.name = "BudgetBlocked";
+  }
 }
 interface Execution {
   id: string; accounts: string[]; limit: BudgetVector | null; accountLimits: Record<string,BudgetVector | null>; used: BudgetVector;
@@ -11,6 +24,9 @@ interface Execution {
   dispatchStarted?: boolean;
 }
 export class BudgetLedger {
+  // Executions whose BudgetController.run is live in this server process — the only creator of executions. An unfinished
+  // execution outside it ended without final usage or belongs to an earlier server: its usage is unknown until confirmed.
+  private readonly live = new Set<string>();
   constructor(private readonly db: DatabaseSync) {
     db.exec(`CREATE TABLE IF NOT EXISTS budget_accounts(id TEXT PRIMARY KEY, record_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS budget_executions(id TEXT PRIMARY KEY, record_json TEXT NOT NULL);
@@ -32,7 +48,7 @@ export class BudgetLedger {
   private assertNoLostAccount(id: string): void {
     const prior = this.db.prepare("SELECT 1 FROM budget_grants WHERE account_id=? LIMIT 1").get(id) ||
       this.db.prepare("SELECT 1 FROM budget_executions, json_each(budget_executions.record_json, '$.accounts') WHERE json_each.value=? LIMIT 1").get(id);
-    if (prior) throw new BudgetBlocked(id, "사용량 기록에 연결된 계정이 없습니다. 기록을 복구한 뒤 진행하세요.");
+    if (prior) throw new BudgetBlocked(id, "unsettled", "사용량 기록에 연결된 계정이 없습니다. 기록을 복구한 뒤 진행하세요.");
   }
   configure(id: string, policy: BudgetPolicy, source: string, now = Date.now()): BudgetAccount {
     if (this.account(id)) throw new Error("기존 예산은 덮어쓸 수 없습니다. 증액을 사용하세요.");
@@ -47,7 +63,7 @@ export class BudgetLedger {
       const a = this.account(id);
       if (!a) this.assertNoLostAccount(id);
       const policy = a?.policy;
-      if (a && (a.pause || (policy && hasBudgetLimits(policy) && BUDGET_KEYS.some(key => a.used[key] >= policy.total[key])))) throw new BudgetBlocked(id);
+      if (a && (a.pause || (policy && hasBudgetLimits(policy) && BUDGET_KEYS.some(key => a.used[key] >= policy.total[key])))) throw new BudgetBlocked(id, "budget");
     }
   }
 
@@ -55,12 +71,17 @@ export class BudgetLedger {
     const unfinished = this.db.prepare("SELECT record_json FROM budget_executions").all()
       .map(row=>JSON.parse(String(row.record_json)) as Execution)
       .find(execution=>!execution.finished && execution.accounts.some(id=>ids.includes(id)));
-    if(unfinished) throw new BudgetBlocked(unfinished.accounts.find(id=>ids.includes(id))!,"집계가 끝나지 않은 실행이 있습니다. 중단된 실행을 확인하고 재개하세요.");
+    if(unfinished) {
+      const account = unfinished.accounts.find(id=>ids.includes(id))!;
+      throw this.live.has(unfinished.id)
+        ? new BudgetBlocked(account, "running", "같은 예산 계정의 다른 실행이 진행 중입니다. 그 실행이 끝난 뒤 다시 시작하세요.", unfinished.id)
+        : new BudgetBlocked(account, "unsettled", "집계가 끝나지 않은 실행이 있습니다. 중단된 실행을 확인하고 재개하세요.", unfinished.id);
+    }
     for (const id of ids) {
       const a = this.account(id);
       if (!a) this.assertNoLostAccount(id);
       const policy = a?.policy;
-      if (a && (a.pause || (policy && hasBudgetLimits(policy) && BUDGET_KEYS.some(key => a.used[key] >= policy.total[key])))) throw new BudgetBlocked(id);
+      if (a && (a.pause || (policy && hasBudgetLimits(policy) && BUDGET_KEYS.some(key => a.used[key] >= policy.total[key])))) throw new BudgetBlocked(id, "budget");
     }
   }
   start(input: Omit<Execution, "used" | "finished" | "limit" | "accountLimits">, reserve?: () => void): Execution {
@@ -76,6 +97,14 @@ export class BudgetLedger {
       return execution;
     });
   }
+  // null when a new execution can open on these accounts now; otherwise the step that must come first.
+  resumeStep(ids: string[]): string | null {
+    try { this.assertAvailable(ids); return null; }
+    catch (error) { return RESUME_STEP[error instanceof BudgetBlocked ? error.reason : "budget"]; }
+  }
+  // BudgetController.run brackets its live span with these; leave always runs, even when the final observation throws.
+  enter(id: string): void { this.live.add(id); }
+  leave(id: string): void { this.live.delete(id); }
   execution(id: string): Execution {
     const row = this.db.prepare("SELECT record_json FROM budget_executions WHERE id=?").get(id);
     if (!row) throw new Error("예산 실행 기록이 없습니다.");

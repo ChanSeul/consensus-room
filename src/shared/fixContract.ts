@@ -23,6 +23,10 @@ export interface FixContract {
   origin: { stage: FixOriginStage; review: { kind: "codex-review" | "codex-final-review"; revision: number } | null };
   // 동결된 원본 쟁점 — 리뷰의 쟁점, 또는 최종 리뷰 정지에서 판단이 끝나지 않은 쟁점(이 계약이 싣지 않은 진단의 되돌림 판정 포함).
   source: Finding[];
+  // 리뷰 수정에서 러너 의무로 넘기지 않은 리뷰의 증거 요청(EXTERNAL_EVIDENCE·처분 없음 — findingJudgment.reviewEvidenceFindings). 확정 결함과 함께 나온
+  // 완료 리뷰는 수정을 먼저 열고(2026-10-06 사용자 결정), 이 쟁점은 다음 최종 리뷰가 최종 트리에서 다시 판정한다(FinalReviewBase.deferredEvidence).
+  // 러너는 판정하지 않는다 — 보고에 적어도 엔진이 뺀다. 옛 계약 행에는 없다(빈 목록과 같다).
+  deferredEvidence?: Finding[];
   // 실은 중재자 진단 id(적용 순서). 열린 것(applied·delivered)만 이번 턴의 원본에 더해진다.
   diagnosisIds: string[];
   // 계약 시점에 이미 사용자 판정이 끝난 쟁점 id — 되돌림 가드에서 면제된다.

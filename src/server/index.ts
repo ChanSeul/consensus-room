@@ -10,7 +10,6 @@ import { systemProcessControl } from "./processSupervisor.js";
 
 import { NativeAppReader } from "./evidence/nativeReader.js";
 import { NativeEvidenceConnector } from "./evidence/nativeConnector.js";
-import { resolveCodexExecutable } from "./adapters/codex.js";
 
 import { acquireServerOwnership } from "./serverOwnership.js";
 
@@ -34,7 +33,7 @@ async function main(): Promise<void> {
       database,
       runner,
       hostSandbox,
-      nativeEvidenceConnector: new NativeEvidenceConnector(new NativeAppReader(config.dataDirectory, resolveCodexExecutable(), undefined,
+      nativeEvidenceConnector: new NativeEvidenceConnector(new NativeAppReader(config.dataDirectory, undefined,
         (provider, metric, value) => ownedDatabase.evidence.measure(`identity:${provider}`, metric, value)), id => ownedDatabase.evidence.measure(id, "toolCalls", 1)),
       ...createRuntimeAdapters(runner, {
         dataDirectory: config.dataDirectory,

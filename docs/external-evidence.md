@@ -40,7 +40,7 @@ Cloud ID가 있으면 Jira 요청만 `https://api.atlassian.com/ex/jira/{cloudId
 
 기존 15분 주기를 사용한다. Jira는 이슈·댓글·하위 티켓·외부 링크, Slack은 전체 메시지와 스레드,
 Confluence는 본문·하위 페이지·댓글과 답글을 확인한다. Google Sheets는 숨김 탭을 포함한 탭 목록과
-셀 값·수식·메모·링크, 댓글과 답글을 범위별로 읽는다. Figma는 승인된 노드의 메타데이터·디자인·변수·PNG를 읽으며,
+셀 값·수식·메모·링크, 댓글과 답글을 범위별로 읽는다. Figma는 승인된 노드의 메타데이터·디자인·변수·PNG를 읽는다. 데스크톱 앱이 덧붙이는 현재 선택 상태는 노드 원문이 아니므로 저장하지 않으며,
 현재 도구가 제공하지 않는 댓글은 화면에 미수집으로 표시한다. Figma 전체 읽기의 실사용 성공은 승인된 노드별 마지막 수집 결과로 확인한다.
 완전한 변경 조회가 없는 MCP 경로는 기존 범위를 다시 읽어 과거 수정·삭제를 비교한다.
 
@@ -56,7 +56,9 @@ Confluence는 본문·하위 페이지·댓글과 답글을 확인한다. Google
 현재 계획이 있고 실행 가능한 유휴 주제만 기존 계획자 배정으로 읽기 전용 영향 검토를 시작한다.
 계획 검토 한도·예산·유지보수 제약을 그대로 적용하며, 사용자 결정 대기·승인 대기·실패·닫힌 주제는 자동 재개하지 않는다.
 결과는 영향 없음·계획 재검토 필요·판단 필요로 기록한다. 검토 도중 원문이나 계획이 바뀌면 채택하지 않는다.
-어떤 결과도 계획·코드·근거 검수 승인을 바꾸지 않는다. 실패하거나 서버 중단으로 완료를 확인하지 못한 검토는
+어떤 결과도 계획·코드·근거 검수 승인을 바꾸지 않는다. 근거가 바뀌어 멈춘 구현·리뷰·수정 단계를 retry하면, 저장 단계를 열기 전에
+검토 기록 시점의 원문 버전 대비 바뀐 원문만 영향 검토한다. 영향 없음이면 검토를 기록하고 재개하며, 영향이 있으면 결정 대기로 멈춘다.
+원문 내용이 같고 목록 버전만 바뀌었으면 모델 호출 없이 검토를 유지한다. 원문 버전이 없는 이전 검토 기록은 전체 계획을 한 번 검토한다. 실패하거나 서버 중단으로 완료를 확인하지 못한 검토는
 같은 변경으로 자동 재호출하지 않는다. 실패 내용은 근거 화면에 남긴다.
 
 근거 화면은 수집 성공·변경 없음·검토 대기·연결 오류와 도구 호출·변경 없는 수집·모델 호출 횟수를 구분한다.
@@ -103,6 +105,79 @@ Confluence는 본문·하위 페이지·댓글과 답글을 확인한다. Google
 
 로그인된 브라우저나 기존 연결 도구로 읽을 때 새 OAuth 앱을 만들 필요는 없다. 이 읽기 권한은
 별도 REST 서버에 자동 공유되지 않으며, 호스트가 읽은 결과를 다음 경로로 제출한다.
+
+원문 하나는 한 번에 한 수집 경로만 쓴다. 호스트가 만든 단위 구성은 서버 수집기의 구성과 달라서, 두 경로가 번갈아 쓰면
+내용이 같아도 원문 전체가 바뀐 것으로 감지되기 때문이다. 쓰는 쪽은 원문마다 다음처럼 정한다.
+
+- 서버의 앱 연결 수집기가 완전히 읽는 connector 원문(Jira·Confluence·Slack·Sheets)은 서버가 같은 앱 연결로 직접 수집한다.
+  이 원문은 `hostPlan`에 나오지 않고, `host-import`는 409로 거부한다(`collect`를 쓴다).
+- 서버 수집기가 읽지 못하는 원문(일반 문서·API 문서)과 서버 수집기가 없는 구성은 아래 호스트 경로로 수집한다.
+  여러 루트가 같은 원문을 공유하면 한 번의 호스트 캡처를 모든 루트가 재사용한다.
+- 서버 수집기가 일부만 읽는 원문(Figma: 앱 도구가 댓글을 주지 않아 수집 결과에 누락이 남는다)은 완전한 캡처가 없는 동안
+  서버가 디자인을 수집한다. `hostPlan`은 이 원문의 보완을 계속 제안하고, `host-import`는 댓글까지 담은 완전한 캡처를 받는다.
+  완전한 호스트 캡처가 생기면 그 원문은 호스트가 갱신한다. 서버는 그 캡처를 자기의 불완전한 결과로 덮지 않는다.
+  그래서 캡처가 오래되면 호스트 갱신을 기다리고, 그동안 서버는 디자인 변경을 다시 읽지 않는다(일반 문서의 호스트 캡처와 같은 의미다).
+  Figma 를 보완한 중재자는 그 갱신 책임도 함께 진다. 호스트 캡처가 실패해 쓸 수 없게 되면 서버 수집기가 다시 수집한다.
+
+2026-10-07 실측(공식 Atlassian 앱 도구 이름이 `atlassian_rovo.*` 에서 `atlassian.*` 로 바뀐 데 대한 대응). 토큰·계정 ID·제품 본문은 싣지 않았다.
+
+(1) app-server 도구 목록 원 응답 발췌 — 캡처 2026-10-07T09:49:54Z. 실행: 임시 `CODEX_HOME`(auth.json 링크, `[apps._default] enabled=false`,
+Atlassian 앱만 `default_tools_enabled=false` 와 아래 다섯 도구 허용)으로 `codex app-server --strict-config --stdio` 를 띄우고
+`app/installed`(forceRefresh) 와 `mcpServerStatus/list`(serverName `codex_apps`, detail `toolsAndAuthOnly`) 를 호출했다. 모델 턴은 열지 않았다.
+`app/installed` 의 해당 앱 항목과, 도구 항목의 `name`·`annotations` 를 그대로 옮긴다(`_meta` 는 연결 ID 가 있어 뺐다).
+
+```json
+[{"id": "asdk_app_6a83901dde988191b3f3cefdcc19acfa", "enabled": true, "callable": true}]
+{"name": "atlassian.getJiraIssue", "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}}
+{"name": "atlassian.searchJiraIssuesUsingJql", "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}}
+{"name": "atlassian.getConfluenceContent", "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}}
+{"name": "atlassian.executeRead", "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}}
+{"name": "atlassian.atlassianUserInfo", "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}}
+{"atlassian_rovo_names": []}
+```
+
+한계: 프로브 시점의 앱 목록이다. 같은 날 허용 목록 없이 네 앱을 연 목록에서도 Slack·Sheets·Figma 수집 도구 이름은 그대로였고 readOnlyHint=true 였다.
+
+공개 문서의 계정 주소·이슈 키·원문 및 토픽 식별자는 예시 값으로 치환했다. 수집 상태·호출 수·시각은 관측 기록을 유지한다.
+
+(2) 실제 경로 스모크 원 출력 — 캡처 2026-10-07T09:50:04Z, 작업 트리 HEAD 547fef2. 실행: `CR_SRC=<작업 트리> tsx smoke.mts`.
+이 스크립트는 작업 트리의 `NativeAppReader`(실제 계정, 운영 데이터 디렉터리의 evidence-apps.json)로 계정을 확인한다.
+그 뒤 `NativeEvidenceConnector.discover` 를 Jira PROJECT-124 와 Confluence 1234567890 에 대해 cursor 가 null 이 될 때까지 부른다.
+쪽마다 단위·링크 수와 다음 단계를, 끝에 도구별 호출 수를 찍는다(계정 값은 형식과 존재만 찍는다).
+
+```text
+identity OK string true
+jira page 1 phase body units 1 links 3 next comments
+jira page 2 phase comments units 0 links 0 next children
+jira page 3 phase children units 0 links 5 next remote
+jira page 4 phase remote units 1 links 10 next null
+jira DONE cursor=null pages 4
+confluence page 1 phase body units 1 links 9 next comments
+confluence page 2 phase comments units 4 links 2 next children
+confluence page 3 phase children units 0 links 1 next null
+confluence DONE cursor=null pages 3
+tool calls {"atlassian.getJiraIssue":2,"atlassian.executeRead(listJiraIssueComments)":1,"atlassian.searchJiraIssuesUsingJql":1,"atlassian.executeRead(listJiraIssueRemoteIssueLinks)":1,"atlassian.getConfluenceContent":1,"atlassian.executeRead(listConfluenceComments)":1,"atlassian.executeRead(getConfluenceContentDescendants)":1}
+```
+
+한계: 도구 호출 수의 키 순서는 처음 호출된 순서이고, 같은 도구의 반복 호출은 합쳐진다(`getJiraIssue` 는 본문과 끝 확인). 계정 확인 호출(`atlassian.atlassianUserInfo`)은
+`NativeAppReader.identity` 안에서 일어나 이 계수에 들어가지 않고, 첫 줄로 확인한다. 이름 변경 전 코드(main a729639)는 같은 스모크에서 첫 줄이
+`identity FAIL Error: 공식 앱이 연결되지 않았습니다. 앱에서 연결을 확인하세요.` 였다(같은 날 캡처).
+
+(3) 운영 수집 상태 관찰 — 서버가 저장한 수집 결과이고, connector 도구의 원 응답은 아니다. 이것만으로 서버가 어떤 도구 이름으로 호출했는지는 증명하지 않는다.
+- 운영 DB 읽기 전용 질의(2026-10-07T07:47:35Z 직전, 반영 재시작 07:40:51Z 뒤). 열은 원문 ID 앞 12자리|resource|collection.status|checkedAt(UTC)이다.
+  connectionKey 는 저장된 이전 키와 같았다(값은 싣지 않는다). 재시작 뒤 1시간 동안 새 Atlassian 수집 오류는 없었다.
+
+```text
+source-example-1|example.atlassian.net/PROJECT-125|collected|2026-10-07 07:47:29
+source-example-2|example.atlassian.net/PROJECT-124|collected|2026-10-07 07:47:09
+```
+
+- 공식 API 관찰(Codex, 2026-10-07T09:48:39Z, `GET /api/topics/TOPIC_ID/evidence/catalog`, HTTP 200). 토큰·connectionKey 는 없는 응답이다.
+
+```json
+{"url": "https://example.atlassian.net/browse/PROJECT-124", "checkedAt": 1791363379327, "error": null, "collectionStatus": "unchanged"}
+{"url": "https://example.atlassian.net/browse/PROJECT-125", "checkedAt": 1791359249180, "error": null, "collectionStatus": "collected"}
+```
 
 루트 자료는 `evidence-bridge.py catalog --id TOPIC_ID`에서 현재 목록을 읽고,
 `evidence-bridge.py host-import --id TOPIC_ID --input capture.json`으로 제출한다.

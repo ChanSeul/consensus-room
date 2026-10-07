@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { maxCharacters } from "./textLimits.js";
 
 export const PlanningMigrationSchema = z.object({
   sessionId: z.uuid(), scopeGeneration: z.number().int().positive(), planEpoch: z.number().int().nonnegative(),
@@ -32,9 +33,10 @@ export function planningUsageBlocked(record: PlanningCheckpoint): boolean {
 // 한 호출 패킷 한도(계획 64KiB·검토 96KiB)는 자료 분할 기준이다. 같은 세션의 누적 호스트 입력·응답은 측정값으로만 남기고 다음 호출을 막는 기준으로 쓰지
 // 않는다(plan §3.6, E3-3a — 예전 검토 누적 한도 감사 256KiB·종결 384KiB 는 제거했다). 조사 회차도 측정값이다 — 회차 수만으로 최종 정리를 강제하지 않고
 // (예전 고정 회차 8 + 정리 1 은 제거, E3-4a), 진척 없는 반복(stalledRounds)·예산 soft limit·취소·권한·공급자 오류가 끊는다.
+// 읽기는 쪽(fragmentBytes) 단위로 자르고, 한 회차에 싣는 양은 별도 묶음 한도 없이 실측한 패킷 남은 공간이 정한다(guardedPlanning 의 읽기 패커).
 export const PLANNING_LIMITS = {
   promptBytes: 64 * 1024, reviewPromptBytes: 96 * 1024,
-  fragmentBytes: 8 * 1024, batchBytes: 24 * 1024,
+  fragmentBytes: 8 * 1024,
   checkpointBytes: 12 * 1024, requests: 4, stalledRounds: 2,
 } as const;
 
@@ -43,15 +45,29 @@ export function planningPacketLimit(stage: string): number {
     ? PLANNING_LIMITS.reviewPromptBytes : PLANNING_LIMITS.promptBytes;
 }
 
-const RereadReasonSchema = z.string().trim().min(1).max(500);
+// 공백만 있는 사유는 trim 뒤 비어 거부된다 — 같은 판정을 정규식으로도 두어 생성 스키마(z.toJSONSchema)가 pattern 으로 싣게 한다(R4 리뷰 F002).
+const RereadReasonSchema = maxCharacters(z.string().trim().min(1).regex(/\S/), 500);
+// 범위 읽기의 끝 — 배타적 UTF-8 바이트 위치. offset 의 쪽은 항상 싣고, 이어지는 쪽은 그 쪽의 시작이 end 보다 앞일 때까지 싣는다(쪽을 자르지 않는다 —
+// 쪽 신원 kind·selector·hash·offset 이 그대로다). null 은 문서 끝까지다(사용자 결정 2026-10-06). 모델 출력 스키마는 이 필드를 반드시 쓰게 하고,
+// 필드가 없는 값은 배포 전에 저장된 요청·이연 읽기뿐이라 그때의 계약대로 한 쪽으로 읽는다(readRangeEnd).
+const ReadEndSchema = z.number().int().positive();
 export const PlanningReadSchema = z.object({
   kind: z.enum(["file", "search", "evidence", "memory", "context", "artifact", "image"]),
-  selector: z.string().min(1).max(1024),
-  question: z.string().min(1).max(500),
+  selector: maxCharacters(z.string().min(1), 1024),
+  question: maxCharacters(z.string().min(1), 500),
   offset: z.number().int().nonnegative(),
+  end: ReadEndSchema.nullish(),
   rereadReason: RereadReasonSchema.nullish(),
 }).strict();
 export type PlanningRead = z.infer<typeof PlanningReadSchema>;
+// 저장 형식의 범위 끝 — 필드 없음(옛 요청)은 offset 의 한 쪽만이다. 대기 읽기(QueuedRead)는 이 값으로 정규화해 저장하므로 offset 이 전진해도 범위가 늘지 않는다.
+export function readRangeEnd(read: { offset: number; end?: number | null }): number | null {
+  return read.end === undefined ? read.offset + 1 : read.end;
+}
+// 범위 읽기가 nextOffset 의 쪽까지 이어지는가(정규화한 end 기준).
+export function readContinues(read: { end: number | null }, nextOffset: number | null): nextOffset is number {
+  return nextOffset !== null && (read.end === null || nextOffset < read.end);
+}
 export const PlanningStepSchema = z.object({
   draft: z.string(),
   facts: z.array(z.object({ statement: z.string(), refs: z.array(z.string()).min(1) }).strict()),
@@ -61,10 +77,14 @@ export const PlanningStepSchema = z.object({
   complete: z.boolean(),
 }).strict();
 export type PlanningStep = z.infer<typeof PlanningStepSchema>;
-export const PlanningStepJsonSchema = z.toJSONSchema(PlanningStepSchema);
+// 모델 출력은 범위 끝을 반드시 밝힌다(null = 문서 끝) — 필드가 빠진 값을 옛 한 쪽 계약과 구분할 수 없게 두지 않는다.
+export const PlanningStepJsonSchema = z.toJSONSchema(PlanningStepSchema.safeExtend({
+  requests: z.array(PlanningReadSchema.safeExtend({ end: ReadEndSchema.nullable() })).max(PLANNING_LIMITS.requests),
+}));
 // Codex structured outputs require every object property. Null means the optional reread reason is absent.
 export const CodexPlanningStepJsonSchema = z.toJSONSchema(PlanningStepSchema.safeExtend({
-  requests: z.array(PlanningReadSchema.safeExtend({ rereadReason: RereadReasonSchema.nullable() })).max(PLANNING_LIMITS.requests),
+  requests: z.array(PlanningReadSchema.safeExtend({ end: ReadEndSchema.nullable(), rereadReason: RereadReasonSchema.nullable() }))
+    .max(PLANNING_LIMITS.requests),
 }));
 
 export interface PlanningFragment {
@@ -79,7 +99,10 @@ export interface PlanningFragment {
 // 사용자 결정 요청 뒤로 미룬 읽기(E3-4a Q-C) — 요청 당시 고정 스냅숏의 원문 버전(전체 원문 해시, 읽을 수 없었으면 null)을 함께 둔다. 결정 뒤 시도가 지금 고정
 // 스냅숏에서 selector·버전을 다시 대조해 제공한다(바뀌었으면 첫 구간부터, 없어졌으면 제공하지 않음). 재읽기 사유(rereadReason)도 요청 그대로 보존한다 —
 // 버리면 같은 세션이 이미 받은 조각이라 생략돼, 압축으로 잃은 문맥의 명시적 복구가 실행되지 않는다(host-review 39d21df9 F006).
-export interface DeferredRead { kind: PlanningRead["kind"]; selector: string; offset: number; question: string; hash: string | null; rereadReason?: string }
+export interface DeferredRead { kind: PlanningRead["kind"]; selector: string; offset: number; end?: number | null; question: string; hash: string | null; rereadReason?: string }
+// 대기 읽기(호스트 소유) — 모델이 청했지만 아직 이 세션에 다 싣지 못한 범위. offset 은 아직 채택되지 않은 첫 쪽이고 end 는 정규화한 범위 끝이다.
+// 읽기 패커가 회차마다 남은 패킷 공간에 이어 싣고, 단계 채택(acceptStep)이 실린 쪽만큼 전진시킨다 — 다음 응답이 다시 청하지 않아도 버리지 않는다.
+export interface QueuedRead { kind: PlanningRead["kind"]; selector: string; question: string; offset: number; end: number | null; rereadReason?: string }
 export interface PlanningUsage {
   inputTokens: number; cachedInputTokens: number; outputTokens: number; durationMs: number;
 }
@@ -95,6 +118,8 @@ export interface PlanningCheckpoint {
   planSHA256: string | null;
   admissionId: string; round: number; stalled: number; sessionId: string | null;
   step: PlanningStep; fragments: PlanningFragment[]; delivered: string[];
+  // 대기 읽기 — 없으면 배포 전 체크포인트다(재개 블록이 그때의 대기 요청에서 한 번 채운다).
+  readQueue?: QueuedRead[];
   // Request feedback, never evidence. Persist until the next response is adopted, including interrupted calls.
   readErrors?: Array<{ request: PlanningRead; message: string }>;
   usage: PlanningUsage; updatedAt: string; stopped: string | null;
@@ -144,6 +169,9 @@ export interface PlanningCheckpoint {
   // 결정을 청하며 읽기(필수 타임라인 미완독·이연 읽기)를 남겨 열어 둔 체크포인트(host-review 39d21df9 F001, E3-2-2a F003). 새 사용자 입력이나 원문
   // 변경 전까지는 같은 시도를 다시 불러도 저장된 질문(lastResponse)을 그대로 돌려준다 — 읽기는 결정 뒤다. 원문 변경 초기화와 다음 채택이 지운다.
   awaitingDecision?: boolean;
+  // 처분 확인 회차(core.reopenPlanningCheckpoint, 합동 리뷰 a4628d1d F007) — 이 회차는 모델 호출 한 번이다. 값은 그 호출이 최종 결과를 내지 못해 멈출 때
+  // 다음 retry 에 남길 질문이다. 루프(guardedPlanning settleConfirmation)가 채택·정지 때 지운다.
+  confirmationRound?: string;
   // 예산이 강제한 정리(soft limit)가 완료 결과 없이 결정만 청해 열어 둔 체크포인트(E5 파일럿 51b22146). 정리 모드는 조사를 막아 모델이 필요한 읽기를
   // requests 가 아니라 결정 문장·questions 로만 남긴다 — 이연 읽기처럼 결정 뒤 같은 시도가 이어야 할 조사 의무다. awaitingDecision 과 함께만 뜻이 있고
   // 재개 판정(openReadObligation)이 읽기 의무와 같이 본다. 다음 채택과 원문 변경 초기화가 다시 정한다.
@@ -154,6 +182,10 @@ export interface PlanningCheckpoint {
   // 상속 조각 재검증이 전달로 되살릴 때 적는다. 색인 문서 자체는 적지 않는다(무관한 위키 편집이 시도를 초기화하지 않게). 실행 시작 때 지금 버전과
   // 다르면 원문 변경(sourceChanged)으로 다루고, 실행 중 현재성 검사는 멈춘다. 원문 변경 초기화가 사실·조각·전달과 함께 지운다.
   memoryReads?: Record<string, string>;
+  // 상시 참조 문서(설정 standingReferencePath)를 실은 버전 — selector(절대 경로) → 가린 본문 해시(= 그 문서 조각의 hash). memoryReads 와 같은 규칙이다:
+  // 이 문서는 sourceHash 밖이라, 조각을 실을 때와 상속 조각 재검증이 전달로 되살릴 때만 적는다. 실행 시작 때 지금 버전과 다르면 원문 변경(sourceChanged)으로
+  // 다루고, 실행 중 현재성 검사는 멈춘다. 원문 변경 초기화가 함께 지운다.
+  standingReads?: Record<string, string>;
   // Only external fragments and their source dependencies; availability never resets local research.
   evidenceFragments?: Record<string, string[]>;
   deferredEvidenceSources?: string[];

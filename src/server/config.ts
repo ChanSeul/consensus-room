@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, join, resolve } from "node:path";
+import { delimiter, isAbsolute, join, resolve } from "node:path";
 import {
   AgentSettingsSchema,
   DEFAULT_AGENT_SETTINGS,
@@ -31,6 +31,8 @@ export interface ServerConfig {
   webDirectory: string;
   repositoryPath: string;
   memoryDirectory: string;
+  // 계획 제어 턴이 요청할 때 싣는 상시 참조 문서 하나 — 사용자 지시문이 먼저 읽으라고 가리키는 절대 경로다. 공유 기본값은 없다(비공개 기동 스크립트가 넘긴다).
+  standingReferencePath?: string | null;
   claudeSkillDirectories: string[];
   codexSkillDirectories: string[];
   defaultAgentSettings: AgentSettings;
@@ -63,6 +65,12 @@ export function loadConfig(overrides: Partial<ServerConfig> = {}): ServerConfig 
     );
   }
   const repositoryPath = resolve(overrides.repositoryPath ?? process.env.CONSENSUS_ROOM_REPOSITORY ?? process.cwd());
+  const standingReferencePath = overrides.standingReferencePath !== undefined ? overrides.standingReferencePath
+    : process.env.CONSENSUS_ROOM_STANDING_REFERENCE?.trim() || null;
+  // selector 가 지시문의 링크 문자열과 같아야 모델이 그 경로로 청한 문서가 실린다. 상대 경로를 resolve 로 바꾸면 문자열이 달라지므로 정규화된 절대 경로만 받는다.
+  if (standingReferencePath && (!isAbsolute(standingReferencePath) || resolve(standingReferencePath) !== standingReferencePath)) {
+    throw new Error(`CONSENSUS_ROOM_STANDING_REFERENCE 는 정규화된 절대 경로여야 합니다: ${standingReferencePath}`);
+  }
   const defaultAgentSettings = AgentSettingsSchema.parse(overrides.defaultAgentSettings ?? {
     claude: {
       ...DEFAULT_AGENT_SETTINGS.claude,
@@ -100,6 +108,7 @@ export function loadConfig(overrides: Partial<ServerConfig> = {}): ServerConfig 
     webDirectory: resolve(overrides.webDirectory ?? process.env.CONSENSUS_ROOM_WEB_DIR ?? join(process.cwd(), "dist")),
     repositoryPath,
     memoryDirectory: resolve(overrides.memoryDirectory ?? process.env.CONSENSUS_ROOM_MEMORY_DIR ?? join(repositoryPath, ".consensus-room", "memory")),
+    standingReferencePath,
     claudeSkillDirectories: (overrides.claudeSkillDirectories ?? skillDirectories(process.env.CONSENSUS_ROOM_CLAUDE_SKILL_DIRS, [join(homedir(), ".claude", "skills")])).map((path) => resolve(path)),
     codexSkillDirectories: (overrides.codexSkillDirectories ?? skillDirectories(process.env.CONSENSUS_ROOM_CODEX_SKILL_DIRS, [join(homedir(), ".codex", "skills"), join(homedir(), ".codex", "skills", ".system")])).map((path) => resolve(path)),
     defaultAgentSettings,

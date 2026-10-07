@@ -4,6 +4,7 @@ import { sourceStringEnd, type SourceStringCache } from "./sourceStrings";
 import type { AgentResult, Finding, Participant, PlanEdit, WorkflowState } from "./contracts";
 import { FIX_AWARE_KINDS, FindingSchema, RESPONSE_RESOLVED_IDS_LIMIT, validatePlanHeadings } from "./contracts";
 import { parseTolerancePolicy } from "./tolerance";
+import { parsePlanChecks } from "./planChecks";
 
 export const DELIVERY_RESUME_STATES = ["IMPLEMENTING", "CODEX_REVIEW", "CLAUDE_FIX", "CODEX_FINAL_REVIEW"] as const;
 export type DeliveryResumeState = typeof DELIVERY_RESUME_STATES[number];
@@ -140,6 +141,8 @@ export function assertPlanContract(markdown: string): void {
   if (parseTolerancePolicy(markdown) === null) {
     throw new Error('계획의 `## 허용 오차` 절에 ```tolerance JSON 블록이 없습니다 — 규칙이 없으면 {"scopePaths":[…],"rules":[]} 로 명시하세요.');
   }
+  // 필수 검사 블록(```checks)은 선택이다 — 있으면 형식·등록 프로필을 여기서 거른다(수락 경계에서 처음 파싱해 실패하면 구현 턴 하나를 잃는다).
+  parsePlanChecks(markdown);
 }
 
 export function bothAgentsAcknowledged(
@@ -177,7 +180,7 @@ export function classifyCloseout(result: AgentResult):
   | { state: "CONSENSUS_ACK"; findings: Finding[] }
   | { state: "BLOCKED_ON_EVIDENCE"; findings: Finding[] }
   | { state: "USER_DECISION_REQUIRED"; findings: Finding[] } {
-  const unresolvedDecision = result.requestedUserDecision || result.findings.some((finding) => finding.requiresUserDecision);
+  const unresolvedDecision = result.requestedUserDecision || result.requestedMediatorAction || result.findings.some((finding) => finding.requiresUserDecision);
   if (unresolvedDecision) {
     return { state: "USER_DECISION_REQUIRED", findings: result.findings };
   }
@@ -304,6 +307,7 @@ export function mergeCorrectionResult(original: AgentResult, corrected: AgentRes
   const resolvedIds = resolutionIds({
     resolvedRequestIds: [...(resolved ? resolutionIds(corrected) : []), ...(originalResolved ? resolutionIds(original) : [])],
   });
+  const mediatorAction = corrected.requestedMediatorAction?.trim() || original.requestedMediatorAction?.trim();
   const decision = corrected.requestedUserDecision?.trim() ? corrected.requestedUserDecision : (resolved ? undefined : originalDecision);
   if (!corrected.requestedUserDecision?.trim() && originalDecision && !resolved) preserved.push("요청 결정");
   const originalSummary = original.summary.trim();
@@ -317,6 +321,7 @@ export function mergeCorrectionResult(original: AgentResult, corrected: AgentRes
   const result: AgentResult = {
     ...rest, summary, findings: [...corrected.findings, ...keptFindings], evidenceRefs: [...evidence, ...keptEvidence],
     ...(decision !== undefined ? { requestedUserDecision: decision } : {}),
+    ...(mediatorAction ? { requestedMediatorAction: mediatorAction } : {}),
     // 해소 표식은 최종 병합·소비까지 유지한다 — 실패 원본 복구와 교정 병합이 겹치면 바깥 병합이 원래 질문을 되살렸다(F08).
     ...(resolutionFlag ? { resolvesRequestedDecision: true } : {}),
     ...(resolvedIds.length ? { resolvedRequestIds: resolvedIds } : {}),
@@ -351,6 +356,7 @@ export function salvageResultFields(raw: unknown, kind: AgentResult["kind"]): Ag
   const evidenceRefs = Array.isArray(record.evidenceRefs) ? record.evidenceRefs.filter((ref): ref is string => typeof ref === "string") : [];
   const summary = typeof record.summary === "string" && record.summary.trim() ? record.summary : "";
   const decision = typeof record.requestedUserDecision === "string" && record.requestedUserDecision.trim() ? record.requestedUserDecision : undefined;
+  const mediatorAction = typeof record.requestedMediatorAction === "string" && record.requestedMediatorAction.trim() ? record.requestedMediatorAction : undefined;
   const status = record.status === "completed" || record.status === "in_progress" || record.status === "blocked" ? record.status : undefined;
   const remainingSteps = Array.isArray(record.remainingSteps)
     ? record.remainingSteps.filter((step): step is string => typeof step === "string").slice(0, 50) : undefined;
@@ -361,6 +367,7 @@ export function salvageResultFields(raw: unknown, kind: AgentResult["kind"]): Ag
     : undefined;
   return {
     kind, summary: summary || "(교정 전 원본에 유효한 요약이 없음)", findings, evidenceRefs,
+    ...(mediatorAction ? { requestedMediatorAction: mediatorAction } : {}),
     ...(decision ? { requestedUserDecision: decision } : {}), ...(status ? { status } : {}),
     ...(remainingSteps && remainingSteps.length ? { remainingSteps } : {}),
     ...(resolves ? { resolvesRequestedDecision: true } : {}),
@@ -434,7 +441,7 @@ export function newFindingIDs(
 }
 
 // 앞 단계가 고치기로 합의한 심각도. 수정 단계 판정과 처분 강등 감시가 같은 집합을 봐야 한다.
-// 가드가 적용되는 단계의 프롬프트(prompts.ts agreedActionRule)도 이 두 상수로 규칙을 안내한다.
+// 가드가 적용되는 단계의 프롬프트(prompts.ts agreementRule)도 이 두 상수로 규칙을 안내한다.
 export const ACTIONABLE_SEVERITIES: readonly string[] = ["BLOCKER", "HIGH", "MEDIUM", "LOW"];
 export const DOWNGRADED_DISPOSITIONS: readonly string[] = ["AGREED_NO_ACTION", "REFUTED", "DEFERRED_OUT_OF_SCOPE"];
 

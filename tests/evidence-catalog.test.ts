@@ -3,7 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { ConsensusDatabase } from "../src/server/database";
-import { EvidenceService } from "../src/server/evidence/service";
+import { EvidenceService, PARTIAL_NATIVE_PROVIDERS } from "../src/server/evidence/service";
+import { NativeEvidenceConnector } from "../src/server/evidence/nativeConnector";
+import type { AppReader } from "../src/server/evidence/nativeReader";
 import { collectPage, publicAddress, discoverLinks } from "../src/server/evidence/discovery";
 import { EvidenceFetchError } from "../src/server/evidence/connectors";
 import type { EvidenceRootInput, EvidenceSource } from "../src/shared/externalEvidence";
@@ -333,6 +335,107 @@ it("changes the host list version when an import discovers an approved child bef
     expect(service.hostPlan("a").requests.map(request=>request.sourceId)).not.toContain(child.id);
     expect(service.hostPlan("a").version).toBe(restarted.version);
   } finally {await service.stop();}
+});
+it("a source the server's app reader collects has one writer: the host list skips it and a host import is refused", async () => {
+  // A host capture stores the host's own unit layout. Alternating it with the app reader made each switch a whole-source change.
+  // The document source has no app reader and keeps the host path. No live app connection is used.
+  const {db}=fixture(),c=db.evidence.catalog;
+  const jira=c.add("a",{...input("https://team.atlassian.net/browse/APP-1"),mode:"connector"},true);
+  const page=c.add("a",{...input("https://docs.example.com/policy"),mode:"connector"},true);
+  const native={configured:(source:EvidenceSource)=>source.provider!=="document",fetch:async()=>{throw Error("unused");}};
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("Host only");}},undefined,undefined,native);
+  try {
+    expect(service.hostPlan("a").requests.map(read=>read.sourceId)).toEqual([page.sourceId]);
+    const version=c.version("a"),before=db.evidence.get(jira.sourceId),members=c.members(jira.id);
+    let refused: unknown;
+    try {
+      service.importHost("a",{version,rootId:jira.id,sourceId:jira.sourceId,previousHash:null,previousCheckedAt:null,
+        observedAt:Date.now(),revision:"host",units:[{id:"issue:APP-1",kind:"issue",content:"Host layout"}],missing:[]});
+    } catch (error) { refused=error; }
+    expect(refused).toMatchObject({statusCode:409});
+    expect(db.evidence.get(jira.sourceId)).toEqual(before);
+    expect(c.members(jira.id)).toEqual(members);
+    expect(c.version("a")).toBe(version);
+    const imported=service.importHost("a",{version,rootId:page.id,sourceId:page.sourceId,previousHash:null,previousCheckedAt:null,
+      observedAt:Date.now(),revision:"host",units:[{id:"body",kind:"document",content:"Policy page"}],missing:[]});
+    expect(imported.contentHash).not.toBeNull();
+    expect(service.hostPlan("a").requests).toEqual([]);
+  } finally {await service.stop();}
+});
+it("a shared document the app reader cannot read keeps its host capture for every root that selects it", async () => {
+  // Two roots select the same document and one host import serves both. With an app reader installed, the other root's collection
+  // used to skip the capture because a reader existed at all, then failed on the document and marked the shared source an error.
+  const {db}=fixture(),c=db.evidence.catalog;
+  const url="https://docs.example.com/shared-policy";
+  const first=c.add("a",{...input(url,"topic"),mode:"connector"},true);
+  const second=c.add("b",{...input(url,"topic"),mode:"connector"},true);
+  expect(second.sourceId).toBe(first.sourceId);
+  const discover=vi.fn(async()=>{throw Error("The app reader cannot read documents");});
+  const native={configured:(source:EvidenceSource)=>source.provider!=="document",fetch:async()=>{throw Error("unused");},discover};
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("Host only");}},undefined,undefined,native);
+  try {
+    const imported=service.importHost("a",{version:c.version("a"),rootId:first.id,sourceId:first.sourceId,previousHash:null,previousCheckedAt:null,
+      observedAt:Date.now(),revision:"host",units:[{id:"body",kind:"document",content:"Shared policy"}],missing:[]});
+    await service.collect(second.id);
+    const shared=db.evidence.get(first.sourceId);
+    expect(shared).toMatchObject({contentHash:imported.contentHash,checkedAt:imported.checkedAt});
+    expect(shared.error ?? null).toBeNull();
+    expect(shared.collection?.status).not.toBe("error");
+    expect(discover).not.toHaveBeenCalled();
+    expect(db.evidence.usableSources(db.getTopic("b")).map(source=>source.id)).toEqual([first.sourceId]);
+  } finally {await service.stop();}
+});
+it("a Figma source the app reader reads only partly keeps the host supplement, which the reader does not overwrite", async () => {
+  // The app reader's Figma pages always report comments missing, so only a complete host capture makes the source usable.
+  // Until one exists the reader collects the design; afterwards the host owns the source. Jira stays the reader's alone.
+  const {db}=fixture(),c=db.evidence.catalog;
+  const design=c.add("a",{...input("https://www.figma.com/design/form?node-id=1-2"),mode:"connector"},true);
+  c.add("a",{...input("https://team.atlassian.net/browse/APP-1"),mode:"connector"},true);
+  const discover=vi.fn(async()=>({units:[{id:"get_metadata:0",kind:"design" as const,content:"Reader design"}],links:[],cursor:null,
+    revision:"reader",missing:["The app reader returns no Figma comments."]}));
+  const native={configured:(source:EvidenceSource)=>source.provider!=="document",fetch:async()=>{throw Error("unused");},discover};
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("Host only");}},undefined,undefined,native);
+  try {
+    expect(service.hostPlan("a").requests.map(read=>read.sourceId)).toEqual([design.sourceId]);
+    await service.collect(design.id);
+    expect(discover).toHaveBeenCalledTimes(1);
+    const read=db.evidence.get(design.sourceId);
+    expect(db.evidence.usable(read)).toBe(false);
+    // The reader's collection finished with comments missing; the supplement stays offered while no complete capture exists.
+    expect(service.hostPlan("a").requests.map(request=>request.sourceId)).toEqual([design.sourceId]);
+    const imported=service.importHost("a",{version:c.version("a"),rootId:design.id,sourceId:design.sourceId,previousHash:read.contentHash,
+      previousCheckedAt:read.checkedAt,observedAt:Date.now(),revision:"host",missing:[],
+      units:[{id:"design",kind:"design",content:"Host design"},{id:"comment:1",kind:"comment",content:"Owner comment"}]});
+    expect(db.evidence.usable(imported)).toBe(true);
+    expect(service.hostPlan("a").requests).toEqual([]);
+    await service.collect(design.id,true);
+    expect(discover).toHaveBeenCalledTimes(1);
+    expect(db.evidence.get(design.sourceId)).toMatchObject({contentHash:imported.contentHash,checkedAt:imported.checkedAt});
+  } finally {await service.stop();}
+});
+it("the partly-read provider list matches the providers whose app-reader pages report missing content", async () => {
+  // PARTIAL_NATIVE_PROVIDERS repeats one fact of NativeEvidenceConnector. Each provider's first page is read through a stub app.
+  const {db}=fixture();
+  const responses: Record<string, unknown> = {
+    "atlassian.atlassianUserInfo": {accountId:"owner"}, "slack.slack_read_user_profile": {result:"User ID: U1\n"},
+    "figma.whoami": {whoami:{email:"designer@example.test"}},
+    "atlassian.getJiraIssue": {key:"APP-1",fields:{updated:"2026-10-07T00:00:00.000+0900",summary:"Policy"}},
+    "atlassian.getConfluenceContent": {body:"<p>Policy</p>"},
+    "slack.slack_read_channel": {messages:[{ts:"1.2",user:"U1",text:"Policy"}]},
+    "google_drive.get_spreadsheet_metadata": {sheets:[{properties:{sheetId:1,title:"Policy",gridProperties:{rowCount:1,columnCount:1}}}]},
+    "figma.get_metadata": {content:[{type:"text",text:"<frame id=\"1:2\"/>"}]},
+  };
+  const reader: AppReader = {config:async()=>({googleDriveLinkId:"link_policy"}),close:async()=>{},call:async(_provider,name)=>{
+    if (!(name in responses)) throw Error(`Unexpected app tool ${name}`);
+    return responses[name];
+  }};
+  const connector=new NativeEvidenceConnector(reader), partial=new Set<string>();
+  for (const url of ["https://team.atlassian.net/browse/APP-1","https://team.atlassian.net/wiki/spaces/A/pages/123/Policy",
+    "https://team.slack.com/archives/C123","https://docs.google.com/spreadsheets/d/policy/edit","https://www.figma.com/design/form?node-id=1-2"]) {
+    const source=db.evidence.ensureSource({url,label:url,mode:"connector",intervalSeconds:900},true);
+    if ((await connector.discover(source,null,AbortSignal.timeout(5000))).missing?.length) partial.add(source.provider);
+  }
+  expect([...partial].sort()).toEqual([...PARTIAL_NATIVE_PROVIDERS].sort());
 });
 it("app read plans contain only approved metadata and imports remain incomplete when comments are missing", async () => {
   const {db} = fixture(), c = db.evidence.catalog;

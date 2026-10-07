@@ -18,7 +18,7 @@ import type { ToleranceLedgerEntry } from "../../shared/tolerance.js";
 import { mergeCorrectionResult } from "../../shared/workflow.js";
 import { ArtifactIntegrityError } from "../artifacts.js";
 import { redactAgentResult, redactUnverifiedResult } from "../security.js";
-import { decisionRequestTexts, renderOpenRequests, type OpenRequest } from "./completion.js";
+import { decisionRequestTexts, MEDIATOR_REQUEST_PREFIX, renderOpenRequests, type OpenRequest } from "./completion.js";
 import type { EngineCore } from "./core.js";
 
 export const WORK_CHECKPOINT_KIND = "work-checkpoint";
@@ -184,8 +184,14 @@ export function accumulate(
       unmatchedResolution = describeUnmatchedResolution(unmatched, openRequests, resolvedRequests);
     }
   }
-  const { requestedUserDecision: _decision, resolvesRequestedDecision: _flag, resolvedRequestId: _rid, resolvedRequestIds: _rids, ...rest } = merged.result;
-  const result: AgentResult = openRequests.length > 0 ? { ...rest, requestedUserDecision: renderOpenRequests(openRequests) } : rest;
+  const { requestedMediatorAction: _mediatorAction, requestedUserDecision: _decision, resolvesRequestedDecision: _flag, resolvedRequestId: _rid, resolvedRequestIds: _rids, ...rest } = merged.result;
+  // Only an ID-bound resolution closes the handoff. Omission or a different resolved request cannot clear it.
+  const pendingMediatorAction = openRequests.find(request => request.text.startsWith(MEDIATOR_REQUEST_PREFIX))
+    ?.text.slice(MEDIATOR_REQUEST_PREFIX.length).trim();
+  const result: AgentResult = { ...rest,
+    ...(openRequests.length ? { requestedUserDecision: renderOpenRequests(openRequests) } : {}),
+    ...(pendingMediatorAction ? { requestedMediatorAction: pendingMediatorAction } : {}),
+  };
   return { result, openRequests, preserved: merged.preserved, resolvedRequests, unmatchedResolution, unmatchedIds };
 }
 

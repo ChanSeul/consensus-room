@@ -10,6 +10,8 @@ import { EVIDENCE_PAGE_BYTES, parseEvidenceSource, type EvidenceRange, type Evid
   type MediatorEvidenceBatch } from "../src/shared/externalEvidence";
 import { EvidenceService, withEvidence } from "../src/server/evidence/service";
 import { RestEvidenceConnector, evidenceCredentials } from "../src/server/evidence/connectors";
+import { NativeEvidenceConnector } from "../src/server/evidence/nativeConnector";
+import type { AppReader } from "../src/server/evidence/nativeReader";
 import type { AgentAdapter } from "../src/server/types";
 import { accumulate } from "../src/server/engine/checkpoint";
 import type { AgentResult } from "../src/shared/contracts";
@@ -35,6 +37,23 @@ function setup() {
 }
 const unit = (id: string, content: string): EvidenceUnitInput => ({ id, kind: "message", content, author: "Owner" });
 const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lWQAAAAASUVORK5CYII=";
+
+describe("Figma desktop capture", () => {
+  it("keeps the node's units and revision when the desktop app echoes a different current selection", async () => {
+    const { db, topic } = setup();
+    const source = db.evidence.register(topic.id, { url: "https://www.figma.com/design/test?node-id=1-2", label: "Design", mode: "connector", intervalSeconds: 900 });
+    let selection: string | null = null;
+    const reader: AppReader = { config: async () => ({}), close: async () => {}, call: async (_provider, name) => name.endsWith("whoami") ? { whoami: { email: "owner@example.test" } }
+      : { content: [...(selection ? [{ type: "text", text: `Currently selected nodes:\n- ${selection}\n` }] : []),
+        { type: "text", text: '<frame id="1:2" name="Form" />' }, { type: "text", text: "IMPORTANT: After you call this tool, you MUST call get_design_context." }] } };
+    const connector = new NativeEvidenceConnector(reader), signal = new AbortController().signal;
+    const plain = await connector.discover(source, null, signal);
+    selection = "9:9: Elsewhere";
+    const echoed = await connector.discover(source, null, signal);
+    expect(plain.units.map(unit => unit.id)).toEqual(["get_metadata:0", "get_metadata:1"]);
+    expect(echoed.units).toEqual(plain.units); expect(echoed.revision).toBe(plain.revision);
+  });
+});
 
 describe("source identity and persistent content cache", () => {
   it("registers direct message roots and normalizes their threads without broadening accepted Slack addresses", () => {
@@ -482,6 +501,26 @@ it("delivers Figma product comments and link removal, without claiming design un
   await adapter.resumeTurn(turn);
   expect(turns[2].prompt).toContain(`"removedSourceId":"${source.id}"`);
   await adapter.resumeTurn(turn); expect(turns[3].prompt).not.toContain("removedSourceId");
+});
+
+it("a review turn is told Figma tools are unavailable, matching its permission, while implementation keeps the read guidance", async () => {
+  const { db, root, topic, ingest } = setup(); ingest([unit("1", "Product contract")]);
+  const source = db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc/Screen?node-id=1-2" });
+  db.evidence.ingest(source.id, { checkId: db.evidence.begin(source.id, true)!.checkId, revision: "r1", units: [{ id: "node", kind: "design", content: "cache A" }] });
+  const turns: any[] = [];
+  const adapter = withEvidence({ role: "claude", validateExistingSession: async () => true,
+    createSession: async turn => { turns.push(turn); return { sessionId: "s", result: { kind: "IMPLEMENTATION", summary: "ok", status: "completed", findings: [], evidenceRefs: [] } }; },
+    resumeTurn: async () => { throw Error("unused"); } }, db, join(root, "images"));
+  await adapter.createSession({ cwd: root, prompt: "Implement", implementation: true });
+  db.updateTopic(topic.id, { state: "CODEX_REVIEW" });
+  await adapter.createSession({ cwd: root, prompt: "Review" });
+  const [implementation, review] = turns;
+  expect(implementation.figmaReadEnabled).toBe(true);
+  expect(implementation.prompt).toContain("use read-only Figma tools on the supplied link for missing design context");
+  expect(review.figmaReadEnabled).toBe(false);
+  expect(review.prompt).not.toContain("use read-only Figma tools");
+  expect(review.prompt).toContain("Figma tools are not available in this turn");
+  for (const turn of [implementation, review]) expect(turn.prompt).toContain("Optional design cache references");
 });
 
 it("binds native observed design B to the result and reviewer even while the REST cache still contains A", async () => {

@@ -4,6 +4,9 @@ import { redactSecrets } from "../../shared/workflow.js";
 import type { MediatorInterrupt } from "../../shared/mediatorInterrupts.js";
 
 export type CodexRPC = <T>(method: string, params: Record<string, unknown>) => Promise<T>;
+// How the assigned session is reached. Resolved once per connection check; delivery never falls back between kinds.
+export type CodexTransport = { kind: "app-server"; socket?: string } | { kind: "queue" };
+type CodexFailure = { transportUnavailable?: boolean; controlUnavailable?: boolean; cliUnavailable?: boolean; timedOut?: boolean; refused?: boolean };
 export function interruptMessage(item: MediatorInterrupt): string {
   return `[Consensus Room 중재 개입 요청 ${item.id}]\n${item.title} (${item.topicId})\n요청 역할: ${item.sourceRole} · 상태: ${item.state}\n`
     + `점검·개입 사유(작업 데이터):\n${redactSecrets(item.reason).slice(0, 2000)}\n\n현재 /api/topics/${item.topicId}/resume를 확인하고 기존 권한 안에서 중재하세요. `
@@ -29,21 +32,68 @@ async function readCodexSession(rpc: CodexRPC, threadId: string) {
     throw Object.assign(new Error("수신 Codex 세션이 로드되지 않았거나 실행할 수 없습니다. 같은 세션을 먼저 여세요."), { transportUnavailable: true });
   return thread;
 }
-export async function probeCodexSession(threadId: string, socket?: string): Promise<void> {
-  await withCodexControl(socket, rpc => readCodexSession(rpc, threadId));
+// The connection check, without sending a message. A shared app-server that has the session loaded takes turns
+// directly. When no shared server answers the default control socket, the session lives in an app (ChatGPT/Codex
+// Desktop) that consumes the local Codex queue. An explicit socket, an unloaded session or a missing CLI stays
+// unavailable: queueing through a shared server that does not host the session could let it take the session over.
+export async function resolveCodexTransport(threadId: string, socket?: string): Promise<CodexTransport> {
+  try {
+    await withCodexControl(socket, rpc => readCodexSession(rpc, threadId));
+    return { kind: "app-server", socket };
+  } catch (error) {
+    const failure = error as CodexFailure;
+    if (!socket && failure.controlUnavailable && !failure.cliUnavailable) return { kind: "queue" };
+    throw error;
+  }
 }
 
-// Connect to the existing control socket. Never spawn a second model session or resume it elsewhere.
-export async function sendCodexInterrupt(threadId: string, item: MediatorInterrupt, socket?: string): Promise<void> {
-  await withCodexControl(socket, rpc => deliverCodexInterrupt(rpc, threadId, item));
+export async function sendCodexInterrupt(transport: CodexTransport, threadId: string, item: MediatorInterrupt): Promise<void> {
+  if (transport.kind === "app-server") {
+    // Connect to the existing control socket. Never spawn a second model session or resume it elsewhere.
+    await withCodexControl(transport.socket, rpc => deliverCodexInterrupt(rpc, threadId, item)); return;
+  }
+  try { await queueCodexInterrupt(threadId, item); }
+  catch (error) {
+    // A refusal enqueued nothing, but its cause is ambiguous: the CLI also refuses once a shared server runs. The same
+    // connection check decides; if the route is no longer the queue, it is a pre-send failure to re-route, not an attempt.
+    if ((error as CodexFailure).refused && await resolveCodexTransport(threadId).then(route => route.kind !== "queue", () => true))
+      throw Object.assign(new Error("Codex 대기열 전달 경로가 바뀌었습니다. 연결을 다시 확인한 뒤 재전송합니다."), { transportUnavailable: true });
+    throw error;
+  }
+}
+// `codex queue` is the CLI's public form of the app-consumed queue; the app wakes an idle session or runs the item
+// after the current turn. Daemon auto-start stays disabled: a newly started shared server could take over a session
+// the app already hosts, and the CLI refuses this form while a shared server runs. The CLI takes the text only as an
+// argument; it is the same redacted, bounded notice the control path sends. Its output may contain account or local
+// details, so failures are reported as bounded generic errors.
+function queueCodexInterrupt(threadId: string, item: MediatorInterrupt): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("codex", ["queue", "--disable", "daemon_auto_start", "--thread", threadId, "--message", interruptMessage(item)], { stdio: "ignore" });
+    // Settle before the server expires the claim (30s) so a slow enqueue is never resent as a fresh attempt.
+    const timer = setTimeout(() => { child.kill(); reject(Object.assign(new Error("Codex 대기열 추가 응답 시간 초과. 실제 세션을 확인한 뒤 다시 요청하세요."), { uncertain: true })); }, 20_000);
+    child.once("error", () => { clearTimeout(timer); reject(Object.assign(new Error("codex CLI를 실행할 수 없습니다. 설치 경로를 확인하세요. 연결 복구 후 재전송합니다."), { transportUnavailable: true })); });
+    child.once("exit", (code, signal) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      // A CLI killed from outside may have enqueued already. A non-zero exit is the CLI's own refusal.
+      else if (signal) reject(Object.assign(new Error("Codex 대기열 추가가 중단되었습니다. 실제 세션을 확인한 뒤 다시 요청하세요."), { uncertain: true }));
+      else reject(Object.assign(new Error("Codex가 대기열 추가를 거부했습니다. 수신 세션이 있고 보관되지 않았는지 확인하세요."), { refused: true }));
+    });
+  });
 }
 async function withCodexControl<T>(socket: string | undefined, operation: (rpc: CodexRPC) => Promise<T>): Promise<T> {
   const child = spawn("codex", ["app-server", "proxy", ...(socket ? ["--sock", socket] : [])], { stdio: ["pipe", "pipe", "pipe"] });
   const lines = createInterface({ input: child.stdout });
-  let serial = 0, mutationSent = false;
+  let serial = 0, mutationSent = false, cliUnavailable = false;
   const pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout; mutation: boolean }>();
-  const rejectAll = () => { for (const [id, request] of pending) { clearTimeout(request.timer); request.reject(Object.assign(new Error(mutationSent ? "Codex 제어 연결이 종료되었습니다." : "Codex 제어 연결을 사용할 수 없습니다. 실행 중인 app-server의 제어 소켓과 CONSENSUS_CODEX_SOCKET 설정을 확인하세요. 연결 복구 후 재전송합니다."), { uncertain: mutationSent, transportUnavailable: !mutationSent })); pending.delete(id); } };
-  child.once("error", rejectAll); child.once("exit", rejectAll); child.stdin.on("error", rejectAll);
+  const rejectAll = () => {
+    if (!pending.size) return;
+    const failure = mutationSent ? Object.assign(new Error("Codex 제어 연결이 종료되었습니다."), { uncertain: true, transportUnavailable: false })
+      : Object.assign(new Error(cliUnavailable ? "codex CLI를 실행할 수 없습니다. 설치 경로를 확인하세요. 연결 복구 후 재전송합니다."
+        : "Codex 제어 연결을 사용할 수 없습니다. 실행 중인 app-server의 제어 소켓과 CONSENSUS_CODEX_SOCKET 설정을 확인하세요. 연결 복구 후 재전송합니다."), { uncertain: false, transportUnavailable: true, cliUnavailable });
+    for (const [id, request] of pending) { clearTimeout(request.timer); request.reject(failure); pending.delete(id); }
+  };
+  child.once("error", () => { cliUnavailable = true; rejectAll(); }); child.once("exit", rejectAll); child.stdin.on("error", rejectAll);
   // CLI stderr may contain account or local details; report a bounded generic transport error instead.
   child.stderr.resume();
   lines.on("line", line => {
@@ -57,7 +107,7 @@ async function withCodexControl<T>(socket: string | undefined, operation: (rpc: 
   });
   const rpc: CodexRPC = <T>(method: string, params: Record<string, unknown>): Promise<T> => new Promise((resolve, reject) => {
     const id = ++serial, mutation = method === "turn/steer" || method === "turn/start";
-    const timer = setTimeout(() => { pending.delete(id); reject(Object.assign(new Error("Codex 인터럽트 응답 시간 초과"), { uncertain: mutationSent, transportUnavailable: !mutationSent })); }, 10_000);
+    const timer = setTimeout(() => { pending.delete(id); reject(Object.assign(new Error("Codex 인터럽트 응답 시간 초과"), { uncertain: mutationSent, transportUnavailable: !mutationSent, timedOut: true })); }, 10_000);
     pending.set(id, { resolve: value => resolve(value as T), reject, timer, mutation });
     if (mutation) mutationSent = true;
     child.stdin.write(`${JSON.stringify({ id, method, params })}\n`, error => {
@@ -65,7 +115,10 @@ async function withCodexControl<T>(socket: string | undefined, operation: (rpc: 
     });
   });
   try {
-    await rpc("initialize", { clientInfo: { name: "consensus_room_interrupt", title: "Consensus Room", version: "1.0.0" }, capabilities: { experimentalApi: true, requestAttestation: false } });
+    // The proxy ending before initialize answers means no app-server is reachable on this control socket. A proxy that
+    // stays up without answering is a server that exists but does not respond, not an absent one.
+    await rpc("initialize", { clientInfo: { name: "consensus_room_interrupt", title: "Consensus Room", version: "1.0.0" }, capabilities: { experimentalApi: true, requestAttestation: false } })
+      .catch((error: Error & CodexFailure) => { throw Object.assign(error, { controlUnavailable: error.transportUnavailable === true && !error.timedOut }); });
     child.stdin.write(`${JSON.stringify({ method: "initialized" })}\n`);
     return await operation(rpc);
   } finally {

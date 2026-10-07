@@ -98,6 +98,29 @@ it("records mediator engine defect To-dos without a delegation file while retain
   await app.close();
 });
 
+it("closes an engine defect only for the user: a mediator is refused and nothing changes", async () => {
+  const { app, database } = await makeApp();
+  draftTopic(database, "engine-report");
+  const representative = database.engineDefects.enqueue("engine-report", { key: "first", title: "Engine error", evidence: "Observed", workaround: "" });
+  const target = database.engineDefects.enqueue("engine-report", { key: "again", title: "Engine error again", evidence: "Observed again", workaround: "" });
+  const url = `/api/engine-defects/${target.id}/close`;
+  const payload = { reason: "duplicate", representativeId: representative.id };
+  const token = { "x-consensus-token": "launch-token-for-test" };
+  expect((await app.inject({ method: "POST", url, payload })).statusCode).toBe(401);
+  // The mediator reports defects; closing one takes it out of the queue for good, so only the user may.
+  const mediator = await app.inject({ method: "POST", url, payload, headers: { ...token, "x-consensus-actor": "mediator" } });
+  expect(mediator.statusCode).toBe(403);
+  // A body whose fields do not match its reason is refused.
+  expect((await app.inject({ method: "POST", url, payload: { ...payload, commit: "abc1234" }, headers: token })).statusCode).toBe(400);
+  expect(database.engineDefects.get(target.id)).toEqual(target);
+  expect(database.getTimeline("engine-report").filter(event => event.body.startsWith("엔진 결함 종결"))).toHaveLength(0);
+  const user = await app.inject({ method: "POST", url, payload, headers: token });
+  expect(user.statusCode).toBe(200);
+  expect(user.json()).toMatchObject({ status: "closed", closure: { reason: "duplicate", representativeId: representative.id, actor: "user" } });
+  expect(database.getTimeline("engine-report").filter(event => event.body.startsWith("엔진 결함 종결"))).toHaveLength(1);
+  await app.close();
+});
+
 it("requires authentication and an idempotency key to opt an idle topic into controlled planning", async () => {
   const { app, database } = await makeApp();
   draftTopic(database, "planning-topic");
@@ -875,7 +898,7 @@ it.each(["held","closed","stale"])("budget resume checks the existing %s review 
    planEpoch:topic.planEpoch,planSHA256:topic.planSHA256,reviewedTree:"tree",reportRevision:1});
   for(const id of ["old-1","old-2",ledger.id])database.reviews.admit(topic.id,id,"implementation");
   database.planning.markReviewLedgerSpawned(ledger.id);
-  if(kind==="closed")database.planning.judgeReviewLedger(ledger.id);
+  if(kind==="closed")database.planning.completeReviewLedger(ledger.id);
   if(kind==="stale")database.updateTopic(topic.id,{planEpoch:topic.planEpoch+1});
   database.budgets.configure(topic.id,policy,"test");
   database.budgets.start({id:"reserved-stop",accounts:[topic.id],stage:"CODEX_REVIEW",role:"codex",model:"test",effort:"test",startedAt:0});

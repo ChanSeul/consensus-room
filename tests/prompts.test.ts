@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 
 import type { AgentResult, Finding, TimelineEvent } from "../src/shared/contracts";
 import { buildClaudePlanPrompt, buildCodexAuditPrompt, buildCodexCloseoutPrompt, buildClaudeFixPrompt, buildCodexReviewPrompt, buildImplementationPrompt,
+  buildContinuationPrompt, buildContractCorrectionPrompt, buildDispositionConfirmationPrompt, completionStatusContract, dispositionConfirmationQuestion,
+  resultPlanIdentity, buildDiagnosisPlanRevisionPrompt, planTimelineDelivery,
   DEFERRED_FINDINGS_INLINE_BYTES } from "../src/shared/prompts";
 import type { DeferredFinding } from "../src/shared/contracts";
+import type { DiagnosisPrompt } from "../src/shared/diagnoses";
 
 const implementation: AgentResult = { kind: "IMPLEMENTATION", summary: "구현을 마쳤습니다.", findings: [], evidenceRefs: [] };
 const finding: Finding = {
@@ -300,5 +303,119 @@ describe("이연 쟁점 목록 — 절단 없는 인라인 예산과 원문 산�
     const prompt = planWith(findings);
     for (const finding of findings) expect(prompt).toContain(`${finding.rationale}`);
     expect(prompt).not.toContain("kind=artifact");
+  });
+});
+
+// 2026-10-06 리뷰 단계 불필요 정지 — 실행 검사는 엔진이 수락 경계에서 하고 리뷰는 영수증만 소비한다(리뷰어 좌석은 읽기 전용). 합의 유지 규칙은 한 문단을
+// 감사·종결·수정·최종 리뷰가 공유한다.
+describe("리뷰 실행 검사 계약과 합의 유지 규칙", () => {
+  it.each([false, true])("리뷰 프롬프트는 영수증을 싣고, 직접 실행 금지·checks 없으면 실행 증거 요구 금지·remainingSteps 외부 요청 금지를 말한다(최종: %s)", (finalPass) => {
+    const prompt = buildCodexReviewPrompt({ planMarkdown, planSHA256, implementation, finalPass, timeline: [],
+      verificationReceipts: "호스트 실행 검사 영수증(RECEIPT-MARKER)" });
+    expect(prompt).toContain("호스트 실행 검사 영수증(RECEIPT-MARKER)");
+    expect(prompt).toContain("이 리뷰 좌석은 읽기 전용입니다. 컴파일러·빌드·테스트·스크립트 같은 실행 검사를 직접 돌리지 마세요");
+    expect(prompt).toContain("계획에 ```checks 블록이 없으면 필수 실행 검사가 없는 계획입니다");
+    expect(prompt).toContain("remainingSteps 에 외부 실행·증거 요청을 적지 마세요");
+  });
+
+  it("계획·감사 프롬프트는 checks 선언 안내를 싣고, 감사는 리뷰어 좌석이 못 돌리는 검사를 리뷰 의무로 적었는지 본다", () => {
+    const plan = buildClaudePlanPrompt({ title: "계획", worktreePath: "/w", sourceRepositoryPath: "/r", baseRef: "HEAD", scopeGeneration: 1, timeline: [] });
+    const audit = buildCodexAuditPrompt({ title: "계획", planMarkdown, planSHA256, scopeGeneration: 1, timeline: [] });
+    expect(plan).toContain("필수 검사 선언(선택)");
+    expect(audit).toContain("필수 검사 선언(```checks)도 검토하세요");
+    expect(audit).toContain("필수 검사 선언(선택)");
+  });
+
+  it("합의 유지 규칙은 감사·종결·수정·최종 리뷰가 같은 문단을 쓰고, 단계별 이행 문장만 다르다", () => {
+    const audit = buildCodexAuditPrompt({ title: "계획", planMarkdown, planSHA256, scopeGeneration: 1, timeline: [] });
+    const closeout = buildCodexCloseoutPrompt({ revisedPlan: planMarkdown, revisedPlanSHA256: planSHA256,
+      claudeRevision: { ...implementation, kind: "REVISION" }, timeline: [] });
+    const fix = buildClaudeFixPrompt({ planMarkdown, reviewFindings: [finding], timeline: [] });
+    const final = buildCodexReviewPrompt({ planMarkdown, planSHA256, implementation, finalPass: true, timeline: [] });
+    for (const prompt of [audit, closeout, fix, final]) expect(prompt).toContain("합의 유지 규칙(앞 단계가 AGREED_ACTION 으로 합의한 쟁점):");
+    expect(audit).toContain("planImpact=implementation");
+    expect(closeout).toContain("같은 세션에 한 번 되묻고, 그래도 같은 처분이면 합의 종결 없이");
+    expect(fix).toContain("같은 세션에 한 번 되묻고, 그래도 같은 처분이면 최종 리뷰로 넘기지 않고");
+    // 감사의 planImpact 문단이 두 벌로 남지 않는다.
+    expect(audit.split("planImpact=implementation").length - 1).toBe(1);
+  });
+
+  it("확인형 교정 질문·턴은 하향 쟁점과 단계 규칙·처분 계약을 싣는다", () => {
+    const question = dispositionConfirmationQuestion("FIX", ["F-1", "F-2"]);
+    expect(question).toContain("F-1, F-2");
+    expect(question).toContain("RESOLVED_BY_FIX");
+    const prompt = buildDispositionConfirmationPrompt(question, "FIX");
+    expect(prompt).toContain("계약 위반은 아닙니다");
+    expect(prompt).toContain("같은 처분과 그 근거를 그대로 다시 제출하세요");
+    expect(prompt).toContain("처분(disposition)은 다음 값만 씁니다");
+  });
+
+  it("종결 확인과 그 후속 턴(계약 교정·처분 확인)은 같은 문장으로 확인할 계획 SHA 를 본문에 싣는다", () => {
+    const sha = "b".repeat(64);
+    const identity = resultPlanIdentity(sha);
+    expect(identity).toContain(`SHA-256(${sha})`);
+    const closeout = buildCodexCloseoutPrompt({ revisedPlan: planMarkdown, revisedPlanSHA256: sha,
+      claudeRevision: { ...implementation, kind: "REVISION" }, timeline: [] });
+    expect(closeout).toContain(identity);
+    expect(buildContractCorrectionPrompt("위반", ["CLOSEOUT"], sha)).toContain(identity);
+    expect(buildDispositionConfirmationPrompt("질문", "CLOSEOUT", sha)).toContain(identity);
+    // 계획 SHA 를 적지 않는 결과(수정 등)의 후속 턴에는 싣지 않는다.
+    expect(buildContractCorrectionPrompt("위반", ["FIX"])).not.toContain("planSHA256에 넣어");
+    expect(buildDispositionConfirmationPrompt("질문", "FIX")).not.toContain("planSHA256에 넣어");
+  });
+
+  it("계획 필수 검사 실패의 계속 진행 턴은 실패 내용을 싣고 직접 실행·중재자 요청이 필요 없다고 말한다", () => {
+    const prompt = buildContinuationPrompt([], 1, "FIX", [], undefined, [{ id: "C-1", detail: "C-1(swift-parse) 실패: A.swift:1:1: error" }]);
+    expect(prompt).toContain("필수 검사 1회차");
+    expect(prompt).toContain("실패한 필수 검사(서버 실행 결과):\n- C-1(swift-parse) 실패: A.swift:1:1: error");
+    expect(prompt).not.toContain("남은 단계(직전 제출)");
+    expect(completionStatusContract()).toContain("그 검사의 실행을 requestedMediatorAction 으로 요청하거나");
+  });
+});
+
+// 2026-10-07 입력 효율화 ① — 진단 계획 개정 과제가 같은 직전 보고를 상태 절(요약)과 타임라인 절(agent_output 원문)에 두 번 실었다(DG-4 실측 3,547B).
+describe("진단 계획 개정 — 직전 보고는 타임라인에 원문이 실리면 상태 절에 다시 싣지 않는다", () => {
+  const report = "REPORT-MARKER 신규 진입 흐름을 대조했습니다.";
+  const output = (sequence: number, body: string): TimelineEvent => ({
+    id: sequence, topicId: "topic-1", sequence, scopeGeneration: 1, actor: "claude", kind: "agent_output", state: "IMPLEMENTING",
+    body, payload: {}, createdAt: "2026-10-07T00:00:00.000Z",
+  });
+  const diagnosis: DiagnosisPrompt = {
+    id: "DG-4", title: "진입 경로 연결", severity: "HIGH", observedFailure: "관찰", cause: "원인", uncertainty: "", instructions: "지시",
+    verificationCriteria: ["기준"], evidenceRefs: [], relatedRequestIds: [], supersedes: null, planChange: { required: true, reason: "계획 변경" }, path: null,
+  };
+  const build = (timeline: TimelineEvent[], delivery?: ReturnType<typeof planTimelineDelivery>) => buildDiagnosisPlanRevisionPrompt({
+    planMarkdown, scopeGeneration: 1, worktreePath: "/w", branchName: "b", diagnoses: [diagnosis],
+    carry: { remainingSteps: [], openRequests: [], changedPaths: [], lastSummary: report, verifiedLedgerRows: 0 },
+    timeline, ...(delivery ? { timelineDelivery: delivery } : {}),
+  });
+  const occurrences = (prompt: string) => prompt.split("REPORT-MARKER").length - 1;
+
+  it.each([["기존 렌더", false], ["참조 모드 인라인", true]] as const)("%s: 보고 원문을 타임라인에만 싣고 상태 절은 그 이벤트를 가리킨다", (_, referenced) => {
+    const events = [output(7, report)];
+    const prompt = build(events, referenced ? planTimelineDelivery(events) : undefined);
+    expect(occurrences(prompt)).toBe(1);
+    expect(prompt).toContain("- 직전 보고 요약: 아래 '방에 추가된 결정과 증거'의 [7] 원문과 같습니다");
+  });
+
+  it("그 요약을 인용한 다른 보고는 같은 원문으로 가리키지 않는다", () => {
+    const quoted = output(11, `Claude 보고 '${report}'는 사실과 다릅니다 — 실패 2건이 남았습니다.`);
+    for (const events of [[output(10, report), quoted], [quoted]]) {
+      const prompt = build(events);
+      expect(prompt).not.toContain("[11] 원문과 같습니다");
+      if (events.length === 2) expect(prompt).toContain("- 직전 보고 요약: 아래 '방에 추가된 결정과 증거'의 [10] 원문과 같습니다");
+      else expect(prompt).toContain(`- 직전 보고 요약: ${report}`);
+    }
+  });
+
+  it("보고가 참조로만 실리거나, 타임라인에 없거나, 다른 보고뿐이면 지금처럼 요약을 싣는다", () => {
+    const events = [output(7, report)];
+    const referenced = build(events, planTimelineDelivery(events, { inlineBytes: 10, referenceBytes: 6 * 1024 }));
+    expect(referenced).toContain(`- 직전 보고 요약: ${report}`);
+    expect(referenced).toContain("selector=timeline:7@");
+    expect(build([])).toContain(`- 직전 보고 요약: ${report}`);
+    const other = build([output(8, "다른 턴의 보고")]);
+    expect(other).toContain(`- 직전 보고 요약: ${report}`);
+    expect(other).not.toContain("원문과 같습니다");
   });
 });
