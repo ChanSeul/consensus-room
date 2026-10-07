@@ -234,6 +234,8 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [actionNotice,setActionNotice]=useState<string|null>(null);
   const [dialog, setDialog] = useState<Dialog>(null);
+  const [topicsVisible, setTopicsVisible] = useState(true);
+  const [inspectorVisible, setInspectorVisible] = useState(true);
   const [mobilePanel, setMobilePanel] = useState<"topics" | "chat" | "plan">("chat");
   const [activity, setActivity] = useState<TopicActivity | null>(null);
   const [stageDelivery, setStageDelivery] = useState<({ topicId: string } & StageDeliveryView) | null>(null);
@@ -448,6 +450,14 @@ export function App() {
             <span>계획은 함께 합의하고, 구현은 승인 뒤에 시작합니다.</span>
           </div>
         </div>
+        <div className="panel-toggles" aria-label="패널 표시">
+          <button className="icon-button" aria-label={topicsVisible ? "주제 패널 숨기기" : "주제 패널 보이기"} aria-pressed={topicsVisible} aria-controls="topics-pane" onClick={() => setTopicsVisible(value => !value)} title="주제 패널 표시 전환">
+            <svg viewBox="0 0 24 20" width="24" height="20" aria-hidden="true"><rect x="1" y="1" width="22" height="18" rx="3" fill="none" stroke="currentColor"/><path d="M8 1v18" stroke="currentColor"/><rect x="3" y="3" width="3" height="14" fill="currentColor" opacity={topicsVisible ? 1 : 0.2}/></svg>
+          </button>
+          <button className="icon-button" aria-label={inspectorVisible ? "오른쪽 패널 숨기기" : "오른쪽 패널 보이기"} aria-pressed={inspectorVisible} aria-controls="inspector-pane" onClick={() => setInspectorVisible(value => !value)} title="오른쪽 패널 표시 전환">
+            <svg viewBox="0 0 24 20" width="24" height="20" aria-hidden="true"><rect x="1" y="1" width="22" height="18" rx="3" fill="none" stroke="currentColor"/><path d="M16 1v18" stroke="currentColor"/><rect x="18" y="3" width="3" height="14" fill="currentColor" opacity={inspectorVisible ? 1 : 0.2}/></svg>
+          </button>
+        </div>
         {selected && (
           <div className="topbar-state">
             <StatusBadge state={selected.state} />
@@ -476,14 +486,13 @@ export function App() {
         </div>
       )}
 
-      <main className="workspace">
-        <aside className={`topics-pane mobile-${mobilePanel}`}>
+      <main className={`workspace ${topicsVisible ? "" : "topics-hidden"} ${inspectorVisible ? "" : "inspector-hidden"}`}>
+        <aside id="topics-pane" className={`topics-pane mobile-${mobilePanel}`}>
           <div className="pane-heading">
             <div>
               <p className="eyebrow">TOPICS</p>
               <h1>주제</h1>
             </div>
-            <button className="icon-button" onClick={() => setDialog("create")} aria-label="작업 시작 방식 안내">+</button>
           </div>
           <div className="topic-list">
             {loading ? (
@@ -535,7 +544,7 @@ export function App() {
           )}
         </section>
 
-        <aside className={`inspector-pane mobile-${mobilePanel}`}>
+        <aside id="inspector-pane" className={`inspector-pane mobile-${mobilePanel}`}>
           {selected && detail ? (
             <Inspector
               detail={detail}

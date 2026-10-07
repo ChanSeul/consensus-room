@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { Topic } from "../shared/contracts";
 import { ENTRY_COPY, isTopicGroup, topicAncestors, topicForest, workEntry, type TopicNode } from "../shared/topicStructure";
 
@@ -15,9 +15,12 @@ export function EntryGuide() {
 export function TopicTree({ topics, selectedId, onSelect, status }: { topics: Topic[]; selectedId: string | null; onSelect: (id: string) => void; status?: (topic: Topic) => ReactNode }) {
   const forest = useMemo(() => topicForest(topics), [topics]);
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set(topics.filter(isTopicGroup).map(topic => topic.id)));
+  const revealedSelection = useRef<string | null | undefined>(undefined);
   useEffect(() => {
+    if (revealedSelection.current === selectedId) return;
     const selected = topics.find(topic => topic.id === selectedId);
     if (!selected) return;
+    revealedSelection.current = selectedId;
     const parents = topicAncestors(selected, topics);
     setCollapsed(previous => {
       if (!parents.some(parent => previous.has(parent.id))) return previous;
@@ -27,6 +30,14 @@ export function TopicTree({ topics, selectedId, onSelect, status }: { topics: To
   const toggle = (id: string) => setCollapsed(previous => { const next = new Set(previous); if (next.has(id)) next.delete(id); else next.add(id); return next; });
   const render = (nodes: TopicNode[], depth: number) => <ul className="topic-tree-level">{nodes.map(node => {
     const { topic, children, leaves, closed } = node;
+    const hiddenLeaves = (nodes: TopicNode[]): Topic[] => nodes.flatMap(child => isTopicGroup(child.topic) ? hiddenLeaves(child.children) : [child.topic]);
+    const descendants = collapsed.has(topic.id) ? hiddenLeaves(children) : [];
+    const outstanding = descendants.filter(leaf => leaf.state !== "CLOSED");
+    const summary = new Map<string, { topic: Topic; count: number }>();
+    for (const leaf of outstanding.length ? outstanding : descendants) {
+      const entry = summary.get(leaf.state);
+      if (entry) entry.count += 1; else summary.set(leaf.state, { topic: leaf, count: 1 });
+    }
     return <li key={topic.id}>
       <div className="topic-tree-row">
         {children.length > 0 ? <button className="tree-toggle" aria-label={`${topic.title} 하위 주제`} aria-expanded={!collapsed.has(topic.id)} onClick={() => toggle(topic.id)}>{collapsed.has(topic.id) ? "▸" : "▾"}</button> : <span className="tree-spacer" />}
@@ -35,6 +46,9 @@ export function TopicTree({ topics, selectedId, onSelect, status }: { topics: To
           <span className="topic-card-title">{topic.title}</span>
           <span className="topic-card-meta">{ENTRY_COPY[workEntry(topic).mode].label}</span>
           {!isTopicGroup(topic) && status?.(topic)}
+          {isTopicGroup(topic) && summary.size > 0 && <span className="topic-status-summary" aria-label="접힌 하위 작업 상태">
+            {[...summary.values()].map(entry => <span key={entry.topic.state}>{status?.(entry.topic)}{entry.count > 1 && <small> ×{entry.count}</small>}</span>)}
+          </span>}
           {isTopicGroup(topic) ? <span className="topic-card-progress">{leaves ? `말단 ${closed}/${leaves} 종료` : "하위 주제 준비 중"}</span>
             : <span className="topic-card-meta">{topic.state === "CLOSED" ? "종료" : `계획 ${topic.planRevision}판 · 범위 ${topic.scopeGeneration}세대`}</span>}
         </button>

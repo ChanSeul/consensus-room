@@ -299,3 +299,15 @@ h3 { font-size: 17px; }
 .room-controls { padding: 16px 0; border-bottom: 1px solid var(--line); }
 .room-controls .room-actions { display: grid; grid-template-columns: minmax(0, 1fr); align-items: stretch; }
 .room-controls .session-chip { text-align: left; overflow-wrap: anywhere; }
+
+.topic-status-summary { display: flex; flex-wrap: wrap; gap: 6px; }
+.topic-status-summary > span { display: inline-flex; align-items: center; }
+.panel-toggles { display: flex; gap: 6px; margin-left: auto; }
+.panel-toggles button[aria-pressed="true"] { color: var(--green); }
+@media (min-width: 821px) {
+  .workspace.topics-hidden { grid-template-columns: minmax(420px, 1.7fr) minmax(330px, 1fr); }
+  .workspace.inspector-hidden { grid-template-columns: minmax(230px, .72fr) minmax(420px, 1.7fr); }
+  .workspace.topics-hidden.inspector-hidden { grid-template-columns: minmax(0, 1fr); }
+  .workspace.topics-hidden .topics-pane, .workspace.inspector-hidden .inspector-pane { display: none; }
+}
+@media (max-width: 820px) { .panel-toggles { display: none; } }
