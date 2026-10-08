@@ -1837,7 +1837,9 @@ describe("E3-4c 코드 리뷰 다중 호출 원장", { timeout: DELIVERY_TEST_TI
         : blocker === "decision" ? { remainingSteps: [], requestedUserDecision: "승인된 범위를 넓힐지 결정해 주세요." }
           : { remainingSteps: [], findings: [{ ...reviewFinding("AGREED_ACTION"), disposition: "EXTERNAL_EVIDENCE" }] }) };
     const passing: AgentResult = { ...result("REVIEW", "남은 검토를 마쳤습니다.", []), status: "completed" };
-    const codex = new LedgerCodex([{ result: first }, { result: corrected }, { result: passing }]);
+    const finalReview: AgentResult = { ...result("FINAL_REVIEW", "수정을 확인했습니다.", [reviewFinding("RESOLVED_BY_FIX")]), status: "completed" };
+    const codex = new LedgerCodex([{ result: first }, { result: corrected }, { result: passing },
+      ...(blocker === "incomplete" ? [{ result: finalReview }] : [])]);
     const engine = room.engine(claude, codex);
     engine.startImplementation(room.topicId);
     await room.idle();
@@ -1852,12 +1854,27 @@ describe("E3-4c 코드 리뷰 다중 호출 원장", { timeout: DELIVERY_TEST_TI
     // 판정 아님(결정·증거 대기)은 멈춰 두고(paused) 같은 ID 로 재개한다. 계약 위반 실패는 원장을 연 채(open) 둔다.
     expect(ledger.status).toBe(blocker === "incomplete" ? "open" : "paused");
     if (blocker === "incomplete") {
-      // 재시도는 같은 원장·같은 예약으로 리뷰를 다시 하고 새 리뷰 1회를 사지 않는다.
+      // 위반한 판은 채택되지 않는다. 교정까지 마친 병합본(원본 지적 F-1 포함)은 교정 대기본으로만 남는다(R3e, 2026-10-07 사용자 결정 "좁힌 안").
+      expect(room.database.latestArtifact(room.topicId, "codex-review")).toBeNull();
+      expect(room.database.getTopic(room.topicId).lastError).toContain("보존 위치: pending-contract-repair#");
+      // 재시도는 리뷰를 처음부터 다시 하지 않고 같은 리뷰 세션·같은 원장·같은 예약으로 교정 호출을 실제로 한다 — 위반한 판이 모델 호출 없이 통과하는 경로는 없다.
       engine.retry(room.topicId);
       await room.idle();
-      expect(codex.calls.at(-1)!.reviewLedger).toBe(ledger.id);
-      expect(reviewUsed(room)).toBe(1);
-      expect(room.database.planning.latestReviewLedger(room.topicId)).toMatchObject({ id: ledger.id, status: "completed" });
+      expect(operationsOf(codex.calls)).toEqual(["create:review", "resume:contract-correction", "resume:contract-correction", "resume:final-review"]);
+      expect(codex.calls[2]).toMatchObject({ reviewLedger: ledger.id, sessionId: codex.calls[1].sessionId });
+      expect(room.database.getTimeline(room.topicId).some(event => event.body === "저장된 응답의 교정을 같은 세션에서 재개합니다.")).toBe(true);
+      // 그 교정 호출이 낸 유효한 결과만 채택된다(원본의 유효 필드 F-1 은 병합으로 남는다).
+      const adopted = JSON.parse((await room.artifacts.readLatest(room.topicId, "codex-review"))!);
+      expect(adopted).toMatchObject({ kind: "REVIEW", status: "completed" });
+      expect(adopted.summary).toContain("남은 검토를 마쳤습니다.");
+      expect(adopted.remainingSteps ?? []).toEqual([]);
+      expect(adopted.findings).toContainEqual(expect.objectContaining({ id: "F-1", disposition: "AGREED_ACTION" }));
+      // 원래 원장은 그 예약 하나로 닫힌다. 리뷰 사용 2회 = 원래 리뷰 1 + 수정 뒤 최종 리뷰 1(새 논리 리뷰·새 원장) — 재시도는 리뷰를 새로 사지 않는다.
+      expect(room.database.planning.reviewLedger(ledger.id)).toMatchObject({ status: "completed" });
+      expect(codex.calls[3].reviewLedger).not.toBe(ledger.id);
+      expect(reviewUsed(room)).toBe(2);
+      expect(claude.calls.map(call => call.operation)).toEqual(["implement", "fix"]);
+      expect(room.database.getTopic(room.topicId).state).toBe("READY_TO_DELIVER");
     }
     room.database.close();
   });

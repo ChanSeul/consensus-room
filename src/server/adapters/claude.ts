@@ -19,7 +19,7 @@ import type { AgentAdapter, CommandRunner, CommandResult, CreatedSession, Sessio
 import { agentEnvironment } from "../security.js";
 import { ProjectMemoryReader, type MemoryReaderOptions } from "../projectMemory.js";
 import { readAppliedInstructions } from "../projectInstructions.js";
-import { agentRunError, parsePlanRepair, parseAgentResult, isZeroTurnResult } from "./resultParser.js";
+import { agentRunError, parsePlanRepair, parseAgentResult, isZeroTurnResult, UnverifiedAgentResult } from "./resultParser.js";
 import { ExecutionMetrics, readClaudeUsageBaseline } from "./executionMetrics.js";
 import { captureFigma } from "./figmaCapture.js";
 import { createToolTimeMeter } from "./toolTime.js";
@@ -389,8 +389,12 @@ export class ClaudeAdapter implements AgentAdapter {
       figmaCapture?.assertCaptured();
       if (designCaptureError) throw designCaptureError;
       if (figmaCapture?.hasPending() || [...designCalls.values()].some(call => !call.received)) {
-        const result = parseAgentResult(output.jsonLines, output.stdout);
-        if (result.status !== "blocked" && result.status !== "in_progress") {
+        // 검증 안 된 응답의 status 는 차단·진행 보고로 인정하지 않는다 — 교정 경로(UnverifiedAgentResult)로 넘기면 Figma 증거 없이 받아들여질 수 있다.
+        const status = (() => {
+          try { return parseAgentResult(output.jsonLines, output.stdout).status; }
+          catch (error) { if (error instanceof UnverifiedAgentResult) return undefined; throw error; }
+        })();
+        if (status !== "blocked" && status !== "in_progress") {
           throw new Error("Figma response was not captured; implementation cannot be accepted without shared design evidence.");
         }
       }

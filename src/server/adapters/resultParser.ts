@@ -34,29 +34,120 @@ function withoutNullOptionals(value: unknown): unknown {
   return record;
 }
 
-// 모델 한 번 응답의 원장 한도 — 누적 저장 계약(무제한)과 분리한다(F10). 서버 승계로 500행을 넘는 것은 저장 쪽 몫이다.
-function parseResult(value: unknown) {
-  const parsed = AgentResultSchema.safeParse(withoutNullOptionals(value));
-  if (parsed.success && (parsed.data.toleranceLedger?.length ?? 0) > RESPONSE_LEDGER_LIMIT) {
-    return { success: false as const, error: new Error(`toleranceLedger 가 한 번 응답 한도 ${RESPONSE_LEDGER_LIMIT}행을 넘습니다(서버가 앞 턴 원장을 승계하므로 이번 턴 변경분만 적으세요)`) };
+// 한 번 응답 한도(zod 밖) 위반 — 표기만 고치면 되는 위반이라 교정은 추론 low 로 간다(core.isFormatOnlyViolation).
+export class ResponseLimitViolation extends Error {}
+
+// 모델 한 번 응답의 검증 전부(zod + 응답 한도). 어댑터 파싱과 enforceResultContract 의 첫 검사가 같은 규칙을 쓴다 — 검증 안 된 결과가 교정 경로로
+// 오면(UnverifiedAgentResult) 응답 한도까지 거기서 다시 걸러야 한다(2026-10-07 R3).
+// 원장 한도는 누적 저장 계약(무제한)과 분리한다(F10). 서버 승계로 500행을 넘는 것은 저장 쪽 몫이다.
+export function validateAgentResult(value: unknown): AgentResult {
+  const parsed = AgentResultSchema.parse(withoutNullOptionals(value));
+  if ((parsed.toleranceLedger?.length ?? 0) > RESPONSE_LEDGER_LIMIT) {
+    throw new ResponseLimitViolation(`toleranceLedger 가 한 번 응답 한도 ${RESPONSE_LEDGER_LIMIT}행을 넘습니다(서버가 앞 턴 원장을 승계하므로 이번 턴 변경분만 적으세요)`);
   }
   // 해소 요청 id 도 같은 분리 — 응답 한도는 여기서, 저장 계약(교정 병합 합집합)은 무제한(host-review R02).
-  if (parsed.success && (parsed.data.resolvedRequestIds?.length ?? 0) > RESPONSE_RESOLVED_IDS_LIMIT) {
-    return { success: false as const, error: new Error(`resolvedRequestIds 가 한 번 응답 한도 ${RESPONSE_RESOLVED_IDS_LIMIT}개를 넘습니다(열린 요청과 일치하는 id 만 적으세요)`) };
+  if ((parsed.resolvedRequestIds?.length ?? 0) > RESPONSE_RESOLVED_IDS_LIMIT) {
+    throw new ResponseLimitViolation(`resolvedRequestIds 가 한 번 응답 한도 ${RESPONSE_RESOLVED_IDS_LIMIT}개를 넘습니다(열린 요청과 일치하는 id 만 적으세요)`);
   }
   return parsed;
 }
 
+function parseResult(value: unknown): { success: true; data: AgentResult } | { success: false; error: unknown } {
+  try {
+    return { success: true, data: validateAgentResult(value) };
+  } catch (error) {
+    return { success: false, error };
+  }
+}
+
+// 최종 구조화 응답은 왔지만 검증(validateAgentResult)에 실패했다. 메시지는 기존 계약 실패 문구 그대로라 지금의 소비처(문구 판정·FAILED 기록)는 같다.
+// raw 는 그 응답 객체다. 실행기(TurnExecutor)만, 결과를 곧바로 enforceResultContract 로 넘기는 요청에서 이것을 결과로 바꿔 같은 세션 교정으로 보낸다
+// (2026-10-07 R3: 505자 단계 하나로 1145초 근거 검토 결과가 통째로 버려졌다). 그 밖의 소비처(엔진 결함 워커·계획 제어 루프 등)는 지금처럼 오류를 받는다.
+const unverifiedResults = new WeakSet<object>();
+export class UnverifiedAgentResult extends Error {
+  constructor(readonly raw: Record<string, unknown>, message: string) {
+    super(message);
+    unverifiedResults.add(raw);
+  }
+}
+
+// 검증 안 된 한 번 응답인가 — enforceResultContract 가 응답 한도까지 다시 검사하고, 실행기·소비처가 검증된 결과로 다루지 않게 가른다.
+// 여러 턴을 합친 결과(재대조의 누적본)는 이 표식이 없어 응답 한도를 받지 않는다(저장 계약은 무제한, R02).
+export function isUnverifiedResult(value: unknown): boolean {
+  return typeof value === "object" && value !== null && unverifiedResults.has(value);
+}
+
+// 저장해 둔 한 번 응답(교정 대기본·근거 검토 영수증의 원본)을 다시 계약 검사에 넘길 때 표식을 붙인다 — 직렬화로 표식이 사라져도 응답 한도를 다시 받게.
+export function unverifiedResponse<T extends object>(value: T): T {
+  unverifiedResults.add(value);
+  return value;
+}
+
 export function parseAgentResult(candidates: unknown[], stdout: string): AgentResult {
+  // 왜 구조가 없는지 남긴다 — CLI 의 result 이벤트(subtype·is_error·num_turns·본문 앞부분)가 진단의 전부인데 버려지고
+  // 있었다(2026-09-13 S10 실측: 수정 턴이 tool_use 직후 result 로 끝났는데 원인을 알 길이 없었다).
+  const message = () => `에이전트가 계약된 구조의 결과를 반환하지 않았습니다.${describeTerminalResult(candidates, stdout)}`;
+  // 모델이 제출한 최종 구조화 응답을 먼저 정한다 — 그 응답이 검증에 실패하면 같은 호출의 앞선 유효 JSON(오래된 판정)으로 물러서지 않고 교정 경로로
+  // 보낸다(R3 리뷰 F001: Codex 의 앞선 agent_message 가 유효한 REVIEW 이면 마지막 응답의 새 지적이 교정 없이 사라졌다).
+  // 응답 본문을 가진 최종 이벤트가 있으면 내용과 관계없이 그것만 본다(R3 재리뷰 F001) — 결과 종류 없는 JSON·일반 문장·오류 본문이어도 앞선 후보로
+  // 물러서지 않는다. 구조화 응답이 아니면 교정할 결과가 없으므로 일반 오류로 멈춘다. 최종 이벤트에 응답 본문이 없으면(사용량만 실린 result 이벤트 등)
+  // 그보다 새 응답이 없다는 뜻이라 지금처럼 앞선 후보를 찾는다.
+  const event = finalEvent(candidates);
+  if (event && hasResponseBody(event)) {
+    const final = finalStructuredResponse(event);
+    if (!final) throw new Error(message());
+    const parsed = parseResult(final);
+    if (parsed.success) return parsed.data;
+    throw new UnverifiedAgentResult(final, message());
+  }
+  // 응답 본문을 가진 최종 이벤트가 없을 때만 지금처럼 후보를 뒤에서부터, 그다음 stdout 을 찾는다.
   for (const candidate of [...candidates].reverse()) {
     const parsed = parseCandidate(candidate);
     if (parsed) return parsed;
   }
   const direct = parseJsonText(stdout);
   if (direct) return direct;
-  // 왜 구조가 없는지 남긴다 — CLI 의 result 이벤트(subtype·is_error·num_turns·본문 앞부분)가 진단의 전부인데 버려지고
-  // 있었다(2026-09-13 S10 실측: 수정 턴이 tool_use 직후 result 로 끝났는데 원인을 알 길이 없었다).
-  throw new Error(`에이전트가 계약된 구조의 결과를 반환하지 않았습니다.${describeTerminalResult(candidates, stdout)}`);
+  const raw = event ? null : structuredRecord(jsonObject(stdout));
+  throw raw ? new UnverifiedAgentResult(raw, message()) : new Error(message());
+}
+
+// 검증에 실패한 최종 구조화 응답 — parseStructuredResult 와 같은 마지막 응답 하나(Claude: result 이벤트의 structured_output, 없으면 result 본문,
+// Codex: 마지막 agent_message)만 본다. 앞 메시지의 JSON 은 모델이 제출한 결과가 아니다. 결과 종류(kind 문자열)가 없는 객체는 구조화 응답으로 보지 않는다.
+// stdout 은 최종 이벤트가 없을 때만 본다(parseAgentResult 의 마지막 단계) — 후보 객체보다 먼저 이기지 않게.
+function finalStructuredResponse(final: Record<string, unknown>): Record<string, unknown> | null {
+  const value = final.type === "result" ? (isRecord(final.structured_output) ? final.structured_output : jsonObject(final.result))
+    : jsonObject(isRecord(final.item) ? final.item.text : undefined);
+  return structuredRecord(value);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function finalEvent(candidates: readonly unknown[]): Record<string, unknown> | undefined {
+  return [...candidates].reverse().filter(isRecord)
+    .find(event => event.type === "result" || (event.type === "item.completed" && isRecord(event.item) && event.item.type === "agent_message"));
+}
+
+// 최종 이벤트가 모델 응답 본문을 실었는가 — Claude result 의 structured_output 또는 result 글, Codex agent_message 의 글.
+function hasResponseBody(final: Record<string, unknown>): boolean {
+  return final.type === "result" ? final.structured_output !== undefined && final.structured_output !== null || typeof final.result === "string"
+    : isRecord(final.item) && typeof final.item.text === "string";
+}
+
+function structuredRecord(value: unknown): Record<string, unknown> | null {
+  const record = withoutNullOptionals(value);
+  return isRecord(record) && typeof record.kind === "string" ? record : null;
+}
+
+function jsonObject(text: unknown): unknown {
+  if (typeof text !== "string") return undefined;
+  const trimmed = text.trim();
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1];
+  for (const attempt of fenced ? [trimmed, fenced.trim()] : [trimmed]) {
+    try { return JSON.parse(attempt); } catch { /* next representation */ }
+  }
+  return undefined;
 }
 
 function parseCandidate(candidate: unknown): AgentResult | null {
@@ -240,6 +331,10 @@ export function parseStructuredResult(candidates: readonly unknown[], stdout: st
   throw new Error(`에이전트의 마지막 응답이 JSON 객체가 아닙니다.${describeTerminalResult(candidates, stdout)}`);
 }
 
+// 부분 계획 교정 응답이 PlanRepair 계약(서버 스키마)을 어겼다 — 전송·실행 실패와 구분되는 교정 응답의 형식 위반이다. core 는 이 오류만 교정 뒤 위반으로
+// 받아 원본을 교정 대기본으로 남긴다(R3 리뷰 F004: CLI 스키마는 edits: [] 를 허용하지만 서버 계약 min(1)에 걸려 일반 오류로 계획 전체를 다시 샀다).
+export class PlanRepairViolation extends Error {}
+
 // Repair responses cannot be interpreted as a full AgentResult (or accidentally reuse one from stdout).
 export function parsePlanRepair(candidates: unknown[], stdout: string): PlanRepair {
   const inspect = (value: unknown, depth = 0): PlanRepair | null => {
@@ -263,5 +358,5 @@ export function parsePlanRepair(candidates: unknown[], stdout: string): PlanRepa
   }
   const direct = inspect(stdout);
   if (direct) return direct;
-  throw new Error("부분 교정 결과가 PlanRepair 계약을 만족하지 않습니다.");
+  throw new PlanRepairViolation("부분 교정 결과가 PlanRepair 계약을 만족하지 않습니다.");
 }

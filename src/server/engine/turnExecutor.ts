@@ -2,7 +2,7 @@ import { EVIDENCE_CONTINUATION_POLICY } from "../../shared/externalEvidence.js";
 import { reviewCriteriaPrompt } from "../sessionSettings.js";
 import { invokeAdapter } from "../runtime/invoke.js";
 import { PlanningPaused, type InvocationUsage, type TimelineDelivery } from "../../shared/planningControl.js";
-import { AgentRunError } from "../adapters/resultParser.js";
+import { AgentRunError, UnverifiedAgentResult, isUnverifiedResult } from "../adapters/resultParser.js";
 // 공통 실행기 — 모델 호출은 전부 여기서만 연다(PLAN §2 "다음 실행 허용"). 파이프라인·코어는 adapter 를 직접 부르지 않는다
 // (tests/turn-executor.test.ts 가 소스를 읽어 구조를 검사한다).
 //
@@ -58,6 +58,9 @@ export interface TurnRequest {
   // 복구 경로를 호출자가 가진다(E3-3b, delivery 의 작업 세션 턴) — 연속성 v2 작성자 좌석의 세션 유실도 PlanningPaused 로 바꾸지 않고 원래 오류를 그대로
   // 던진다. 호출자가 계보·사용량·진척을 보고 복구하거나 같은 정지로 돌린다.
   recoverable?: boolean;
+  // 결과를 곧바로 core.enforceResultContract 로 넘기는 호출자만 준다(2026-10-07 R3) — 검증에 실패한 최종 응답(UnverifiedAgentResult)을 결과로 받아
+  // 같은 세션 교정으로 보낸다. 계획 제어 턴과 세션 id 를 모르는 호출, 이 표식이 없는 호출자는 지금처럼 그 오류를 받는다.
+  acceptUnverified?: boolean;
   // prompt 가 이어 쓰는 세션 기준의 변경분일 때의 전체 문맥 판 — SessionTurn.freshSessionPrompt 로 그대로 넘긴다.
   freshSessionPrompt?: string;
   // 두 판의 타임라인 참조 descriptor — SessionTurn.timelineDelivery 로 그대로 넘긴다(E3-2-2a).
@@ -187,11 +190,30 @@ export class TurnExecutor {
 
   // 모델 호출 — AgentResult 를 돌려주는 턴(계획·리뷰·구현·수정·교정·계속 진행·확인).
   async execute(request: TurnRequest): Promise<TurnOutcome> {
+    const outcome = await this.executeOnce(request);
+    // 검증 안 된 결과는 교정 전이라 쟁점을 다루지 않는다 — 교정 경로가 원본의 유효한 필드만 건지고, 최종 결과에 settleRestored 로 같은 처리를 한다.
+    if (isUnverifiedResult(outcome.result)) return outcome;
+    return this.continueDeferredReviews(request, outcome);
+  }
+
+  // 계약 검사 직전의 최종 결과(정규화·누적까지 마친 값)에 정상 응답과 같은 정착 뒤 처리를 한다 — 등록 출처 근거 공백의 이연 변환과, 그 이연으로
+  // 리뷰의 blocked 가 풀리면 같은 원장으로 리뷰를 이어 가는 호출(R3 리뷰 F003: 교정 병합·구현 checkpoint 누적으로 되살린 원본 지적이 EXTERNAL_EVIDENCE 로
+  // 남아 같은 내용의 정상 응답과 다음 상태가 달랐다). 계속 진행 호출은 교정이 아니다. request 는 원 턴의 경로(리뷰 원장 포함)·기대·허용 그대로다.
+  // continued 면 result 는 계속 진행 응답(정규화 전)이고, 검증에 실패했으면 검증 안 된 결과 그대로다(호출자가 다시 정규화·판정한다).
+  // continueReviews: false 면 이연만 한다(계속 진행 응답을 다시 정규화한 뒤의 두 번째 정착 — 모델 호출 없음).
+  async settleRestored(request: TurnRequest, sessionId: string, result: AgentResult, options: { continueReviews?: boolean } = {}):
+    Promise<{ result: AgentResult; continued: boolean }> {
+    const deferred = await this.deferSourceGaps(request, result);
+    if (options.continueReviews === false) return { result: deferred, continued: false };
+    const outcome = await this.continueDeferredReviews(request, { sessionId, result: deferred, created: false });
+    return { result: outcome.result, continued: outcome.result !== deferred };
+  }
+
+  private async continueDeferredReviews(request: TurnRequest, first: TurnOutcome): Promise<TurnOutcome> {
     const continued = new Set<string>();
     const retained = new Map<string, AgentResult["findings"][number]>();
-    let next = request;
+    let outcome = first;
     while (true) {
-      const outcome = await this.executeOnce(next);
       const gaps = this.deferredReviews.get(outcome.result) ?? [];
       const fresh = gaps.filter(id => !continued.has(id));
       if (!fresh.length) {
@@ -206,8 +228,9 @@ export class TurnExecutor {
       const prompt = `The external-source gaps below were recorded as To-do with their dependent scope excluded. Continue reviewing the supported scope in this same review ledger. Return your actual review result; do not claim unrun mandatory checks passed. Do not repeat an excluded source as a blocker.\n${JSON.stringify([...retained.values()])}`;
       // Keep the ledger, settings, admission and usage accounts. A repeated gap buys no
       // further call; each newly excluded registered source may advance this review once.
-      next = { ...request, session: { mode: "resume", sessionId: outcome.sessionId }, purpose: "계속 진행 턴", prompt,
-        freshSessionPrompt: `${request.freshSessionPrompt ?? request.prompt}\n${prompt}` };
+      outcome = await this.executeOnce({ ...request, session: { mode: "resume", sessionId: outcome.sessionId }, purpose: "계속 진행 턴", prompt,
+        freshSessionPrompt: `${request.freshSessionPrompt ?? request.prompt}\n${prompt}` });
+      if (isUnverifiedResult(outcome.result)) return outcome;
     }
   }
 
@@ -224,9 +247,8 @@ export class TurnExecutor {
     // 세션별 메모리 본문 수신(E3-4c host-review 39d21df9 F004) — 프로토콜 턴이 만든 세션은 생성 턴에 본문을 받지 않았다(어댑터는 protocolOnly 에 본문을 싣지
     // 않고 resume 에는 매니페스트만 싣는다). 그 세션의 첫 일반 resume 턴에만 본문 1회를 청한다. 계획 제어 턴은 메모리를 조각으로 받으므로 청하지도, 수신으로
     // 적지도 않는다(경로 판정·예산 래퍼와 같은 식). 기록 없는 세션은 종전 의미(이미 받음)라 청하지 않는다.
-    const receipt = requested && !flags.protocolOnly
-      && !planningControlApplies(database, request.topic.id, database.getTopic(request.topic.id).state, flags)
-      ? database.planning.sessionReceipt(requested) : null;
+    const planningControlled = planningControlApplies(database, request.topic.id, database.getTopic(request.topic.id).state, flags);
+    const receipt = requested && !flags.protocolOnly && !planningControlled ? database.planning.sessionReceipt(requested) : null;
     const memoryBodies = Boolean(receipt && !receipt.memoryBodies);
     const reviews = request.route.job.role === "reviewer" && (request.route.reviewLedger || ["audit", "closeout", "review", "final-review"].includes(request.route.job.operation));
     // Planning admission and cumulative limits survive participant reassignment within this contract.
@@ -260,10 +282,13 @@ export class TurnExecutor {
     const noteProtocolSession = (id: string) => { if (flags.protocolOnly) database.planning.noteProtocolSession(request.topic.id, id); };
     const receipts = { noteProtocolSession, memoryBodiesFor: memoryBodies ? requested : null };
     const authorContinuity = request.route.seat === "claude" && database.planning.continuityEnabled(request.topic.id);
+    // 이 호출에 답한(답할) 세션 — 새 세션은 어댑터가 알린 id(Claude 는 실행 전 할당, Codex 는 thread.started)다. 검증 안 된 응답을 결과로 바꿀 때 쓴다.
+    let answered = requested;
     try {
       if (request.session.mode === "create") {
         const onCreated = request.session.onSessionCreated;
         const created = await invokeAdapter(adapter, { method: "create", turn: { ...base, onSessionCreated: (id: string) => {
+          answered = id;
           noteProtocolSession(id);
           onCreated?.(id);
         } } });
@@ -281,11 +306,16 @@ export class TurnExecutor {
           throw new PlanningPaused("Claude가 다른 세션 ID를 반환했습니다. 기존 세션을 보존하고 중단합니다.");
         }
         if (id !== session.sessionId) noteProtocolSession(id);
-        sessionId = id; session.onSessionCreated?.(id);
+        sessionId = id; answered = id; session.onSessionCreated?.(id);
       } } });
       const outcome = await this.settle(request, { sessionId, result, created: sessionId !== session.sessionId }, receipts);
       return outcome;
     } catch (error) {
+      // 검증에 실패한 최종 응답(R3) — 결과를 곧바로 계약 검사로 넘기는 호출자에게만, 답한 세션과 함께 결과로 정착시킨다. 계획 제어 턴은 체크포인트 루프가
+      // 응답을 관리하므로 지금처럼 오류로 둔다(그 루프 안 계약 검증은 별도 작업).
+      if (error instanceof UnverifiedAgentResult && request.acceptUnverified && answered && !planningControlled) {
+        return this.settle(request, { sessionId: answered, result: error.raw as unknown as AgentResult, created: answered !== requested }, receipts);
+      }
       if (typeof error === "object" && error !== null && !invocationFailures.has(error)) {
         invocationFailures.set(error, { sessionId: requested, seat: request.route.seat, job: request.route.job,
           usage: !lastUsage ? "unknown" : lastUsage.completeness === "complete" ? "complete" : "partial" });
@@ -331,29 +361,43 @@ export class TurnExecutor {
     request.onResponse?.(outcome);
     await this.accept(request, outcome.result);
     await this.core.recordEvidenceGaps(request.topic, request.signal); // Includes failures first observed during this turn.
+    // 검증 안 된 결과(R3)는 세션 기록·채택 검사까지만 한다. 쟁점 처리(근거 공백의 이연 변환)는 교정을 거친 최종 결과에 settleRestored 가 한다.
+    if (isUnverifiedResult(outcome.result)) return outcome;
+    outcome.result = await this.deferSourceGaps(request, outcome.result);
+    return outcome;
+  }
+
+  // 등록 출처에 근거한 근거 공백(EXTERNAL_EVIDENCE·evidenceGap)을 후속 목록에 기록하고 DEFERRED_OUT_OF_SCOPE 로 바꾼다. 그 이연으로 리뷰의 blocked 가
+  // 풀리면 같은 원장의 계속 진행 대상으로 표시한다(continueDeferredReviews). 기록은 id 로 중복을 거르고 변환은 멱등이다.
+  private async deferSourceGaps(request: TurnRequest, result: AgentResult): Promise<AgentResult> {
     // EXTERNAL_EVIDENCE also represents missing mandatory test logs and confirmed tool defects.
     // Only source-backed gaps may be converted; never downgrade those execution contracts.
     const evidence = this.core.dependencies.database.evidence;
     const sources = [...new Map([...evidence.list(request.topic.id),
       ...evidence.catalog.forTopic(request.topic.id).filter(root => root.status === "approved").map(root => evidence.get(root.sourceId))]
       .map(source => [source.id, source])).values()];
-    const deferred = outcome.result.findings.filter(finding => ["EXTERNAL_EVIDENCE", "DEFERRED_OUT_OF_SCOPE"].includes(finding.disposition ?? "") && finding.evidenceGap && !finding.requiresUserDecision &&
+    const deferred = result.findings.filter(finding => ["EXTERNAL_EVIDENCE", "DEFERRED_OUT_OF_SCOPE"].includes(finding.disposition ?? "") && finding.evidenceGap && !finding.requiresUserDecision &&
       finding.evidenceRefs.length > 0 && finding.evidenceRefs.every(ref => sources.some(source =>
         ref === source.url || ref === source.id || ref.startsWith(source.id + "::"))));
-    if (deferred.length && !outcome.result.requestedUserDecision) {
-      await this.core.recordDeferredFindings(request.topic, deferred.map(finding => ({ ...finding,
-        rationale: `${finding.rationale}\nSources: ${finding.evidenceRefs.join(" · ")}` })), "evidence", request.signal);
-      const findings = outcome.result.findings.map(finding => deferred.includes(finding)
-        ? { ...finding, disposition: "DEFERRED_OUT_OF_SCOPE" as const } : finding);
-      const unblocked = outcome.result.status === "blocked" && findings.every(finding => !finding.requiresUserDecision &&
-        ["DEFERRED_OUT_OF_SCOPE", "RESOLVED_BY_FIX", "AGREED_NO_ACTION", "REFUTED"].includes(finding.disposition ?? ""));
-      outcome.result = { ...outcome.result, findings, ...(unblocked ? { status: "in_progress" as const } : {}) };
-      if (unblocked && request.route.job.role === "reviewer" && ["review", "final-review"].includes(request.route.job.operation)) {
-        this.deferredReviews.set(outcome.result, sources.filter(source => deferred.some(finding => finding.evidenceRefs.some(ref =>
-          ref === source.url || ref === source.id || ref.startsWith(source.id + "::")))).map(source => source.id));
-      }
+    if (!deferred.length || result.requestedUserDecision) return result;
+    await this.core.recordDeferredFindings(request.topic, deferred.map(finding => ({ ...finding,
+      rationale: `${finding.rationale}\nSources: ${finding.evidenceRefs.join(" · ")}` })), "evidence", request.signal);
+    const findings = result.findings.map(finding => deferred.includes(finding)
+      ? { ...finding, disposition: "DEFERRED_OUT_OF_SCOPE" as const } : finding);
+    // blocked 해제는 status 를 읽는 쪽보다 먼저, 그 결과의 계약 지점에서 한다(R3 전체 재리뷰 F001). implementer 결과는 누적(checkpoint accumulate)이
+    // 응답마다 status 로 열린 요청을 만들므로(completion.decisionRequestTexts — blocked 면 막힘 요청이 남는다) 응답 단위로 해제한다. 리뷰 계열 결과
+    // (review·final-review·감사·종결)는 해제와 계속 진행 등록이 한 결정이다 — 원본 위에 병합되는 그 교정 응답(contract-correction)은 이연 변환만 하고
+    // blocked 를 둔다. 병합본의 settleRestored 가 원래 경로로 해제와 등록을 함께 한다(여기서 해제만 하면 병합본이 blocked 가 아니어서 계속 진행이
+    // 열리지 않았다). contract-correction 은 enforceResultContract 의 계약 교정에서만 쓰는 job 이고 그 응답은 늘 병합·정규화·최종 정착을 거친다.
+    const releasedAtFinal = request.route.job.role === "reviewer" && request.route.job.operation === "contract-correction";
+    const unblocked = !releasedAtFinal && result.status === "blocked" && findings.every(finding => !finding.requiresUserDecision &&
+      ["DEFERRED_OUT_OF_SCOPE", "RESOLVED_BY_FIX", "AGREED_NO_ACTION", "REFUTED"].includes(finding.disposition ?? ""));
+    const settled = { ...result, findings, ...(unblocked ? { status: "in_progress" as const } : {}) };
+    if (unblocked && request.route.job.role === "reviewer" && ["review", "final-review"].includes(request.route.job.operation)) {
+      this.deferredReviews.set(settled, sources.filter(source => deferred.some(finding => finding.evidenceRefs.some(ref =>
+        ref === source.url || ref === source.id || ref.startsWith(source.id + "::")))).map(source => source.id));
     }
-    return outcome;
+    return settled;
   }
 
   // 응답을 받아들일 때의 검사(PLAN §2 검증 조건 2) — 호출 도중 새 결정·증거가 오거나 계획이 바뀌었으면 결과를 **보존만** 하고 현재 결과로

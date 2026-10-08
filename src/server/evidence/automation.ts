@@ -8,7 +8,9 @@ export function changesBetween(before: Manifest, target: Manifest): EvidenceAsse
   return [...new Set([...Object.keys(before), ...Object.keys(target)])].filter(id => (before[id] ?? null) !== (target[id] ?? null))
     .map(sourceId => ({ sourceId, before: before[sourceId] ?? null, after: target[sourceId] ?? null }));
 }
-export interface AssessmentReceipt { sessionId: string; routeBinding: string; planRevision: number; inputSequence: number; raw: AgentResult; accepted?: AgentResult; consumedAt?: number; resolutionActionId?: string }
+// rawAccumulated: raw 가 교정 영수증의 병합본(여러 응답을 합친 누적본)이라는 출처 표시 — 재사용 때 한 번 응답 한도를 다시 걸지 않는다(R3 리뷰 F002).
+// 없으면 raw 는 한 번 응답(원본)이다. 옛 기록·옛 코드와 호환(JSON 그대로 읽는다).
+export interface AssessmentReceipt { sessionId: string; routeBinding: string; planRevision: number; inputSequence: number; raw: AgentResult; rawAccumulated?: boolean; accepted?: AgentResult; consumedAt?: number; resolutionActionId?: string }
 const binding = (topic: Topic) => stableJSON([topic.scopeGeneration, topic.planEpoch, topic.planSHA256]);
 const changeJobId = (topic: Topic, before: Manifest, target: Manifest) => evidenceHash(stableJSON([topic.id, binding(topic), topic.planRevision, before, target]));
 export class EvidenceAutomationStore {

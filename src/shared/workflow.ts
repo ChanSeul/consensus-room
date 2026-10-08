@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { sourceStringEnd, type SourceStringCache } from "./sourceStrings";
 
 import type { AgentResult, Finding, Participant, PlanEdit, WorkflowState } from "./contracts";
-import { FIX_AWARE_KINDS, FindingSchema, RESPONSE_RESOLVED_IDS_LIMIT, validatePlanHeadings } from "./contracts";
+import { AgentResultSchema, FIX_AWARE_KINDS, FindingSchema, RESPONSE_RESOLVED_IDS_LIMIT, validatePlanHeadings } from "./contracts";
 import { parseTolerancePolicy } from "./tolerance";
 import { parsePlanChecks } from "./planChecks";
 
@@ -344,7 +344,9 @@ export function implementationInProgress(result: AgentResult): boolean {
 // 검증에 실패한 필드를 무조건 재주입하면 교정이 같은 위반으로 다시 죽는다(2026-09-14 Codex 감사 R01 ②).
 // 해소 표식(게이트·단수·복수 id)도 건진다 — 빠뜨리면 turn-result·before-contract-correction checkpoint 가 요청을 열린 채 기록하고 서버 재시작·
 // 계약 교정 뒤 러너가 같은 해소를 다시 해야 한다(2026-09-21 사전 검증 #1; 단수 시절부터의 구멍이 목록으로 규모가 커졌다).
-export function salvageResultFields(raw: unknown, kind: AgentResult["kind"]): AgentResult {
+const remainingStepSchema = AgentResultSchema.shape.remainingSteps.unwrap().element;
+// limitResolvedIds: 해소 id 를 한 번 응답 한도로 자른다(기본). 여러 응답을 합친 누적본을 건질 때는 false — 저장 계약은 무제한이다(R02, R3 리뷰 F002).
+export function salvageResultFields(raw: unknown, kind: AgentResult["kind"], options: { limitResolvedIds?: boolean } = {}): AgentResult {
   const record = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
   const findings: Finding[] = [];
   if (Array.isArray(record.findings)) {
@@ -358,12 +360,15 @@ export function salvageResultFields(raw: unknown, kind: AgentResult["kind"]): Ag
   const decision = typeof record.requestedUserDecision === "string" && record.requestedUserDecision.trim() ? record.requestedUserDecision : undefined;
   const mediatorAction = typeof record.requestedMediatorAction === "string" && record.requestedMediatorAction.trim() ? record.requestedMediatorAction : undefined;
   const status = record.status === "completed" || record.status === "in_progress" || record.status === "blocked" ? record.status : undefined;
+  // 남은 단계는 항목마다 스키마 원소 규칙(길이 한도)을 통과한 것만 건진다 — 한도를 넘는 단계를 건지면 누적본 checkpoint·교정 병합의 재검사가 같은
+  // 위반으로 죽는다(2026-10-07 R3c: 505자 단계 하나가 구현 턴을 교정 전에 FAILED 로 보냈다). 잘라 넣지 않는다 — 원본은 교정 원본·checkpoint raw 에 남는다.
   const remainingSteps = Array.isArray(record.remainingSteps)
-    ? record.remainingSteps.filter((step): step is string => typeof step === "string").slice(0, 50) : undefined;
+    ? record.remainingSteps.filter((step): step is string => remainingStepSchema.safeParse(step).success).slice(0, 50) : undefined;
   const resolves = record.resolvesRequestedDecision === true;
   const resolvedId = typeof record.resolvedRequestId === "string" && record.resolvedRequestId.trim() ? record.resolvedRequestId.trim() : undefined;
   const resolvedIds = Array.isArray(record.resolvedRequestIds)
-    ? record.resolvedRequestIds.filter((id): id is string => typeof id === "string" && id.trim().length > 0).map((id) => id.trim()).slice(0, RESPONSE_RESOLVED_IDS_LIMIT)
+    ? record.resolvedRequestIds.filter((id): id is string => typeof id === "string" && id.trim().length > 0).map((id) => id.trim())
+      .slice(0, options.limitResolvedIds === false ? undefined : RESPONSE_RESOLVED_IDS_LIMIT)
     : undefined;
   return {
     kind, summary: summary || "(교정 전 원본에 유효한 요약이 없음)", findings, evidenceRefs,

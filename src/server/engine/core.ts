@@ -57,9 +57,12 @@ import { buildContractCorrectionPrompt, buildDispositionConfirmationPrompt, resu
 import { redactAgentResult, redactRecord, redactUnverifiedResult } from "../security.js";
 import type { ActionRecord, AgentAdapter, AppliedMemoryChange, ParticipantRole, TurnUsage } from "../types.js";
 import { exceededLimits } from "../adapters/executionMetrics.js";
+import { PlanRepairViolation, ResponseLimitViolation, UnverifiedAgentResult, isUnverifiedResult, unverifiedResponse, validateAgentResult } from "../adapters/resultParser.js";
 import type { WorkflowDependencies } from "../workflow.js";
-import { AdmissionRefused, TurnExecutor, type TurnPurpose, type WriteGuards } from "./turnExecutor.js";
+import { AdmissionRefused, TurnExecutor, type TurnPurpose, type TurnRequest, type WriteGuards } from "./turnExecutor.js";
 import { HostRuntimeUnavailable } from "../hostRuntime.js";
+import { StaleArtifactError } from "../artifacts.js";
+import { parseUsageLimit } from "../../shared/usageLimit.js";
 import { WorkCheckpoints } from "./checkpoint.js";
 import { resultPause, type ResultPause } from "./completion.js";
 import { FixContracts } from "./fixContracts.js";
@@ -84,9 +87,101 @@ export class FormatViolation extends Error {
   }
 }
 
-// 표기만 고치면 되는 위반(추론 low 로 교정): 스키마 오류·응답 종류·허용 오차 블록 형식. 처분 판단이 필요한 위반(쟁점 누락 등)은 제외.
+// 표기만 고치면 되는 위반(추론 low 로 교정): 스키마 오류·응답 한도·응답 종류·허용 오차 블록 형식. 처분 판단이 필요한 위반(쟁점 누락 등)은 제외.
 export function isFormatOnlyViolation(error: unknown): boolean {
-  return error instanceof ZodError || error instanceof FormatViolation || error instanceof ToleranceFormatError;
+  return error instanceof ZodError || error instanceof ResponseLimitViolation || error instanceof FormatViolation || error instanceof ToleranceFormatError;
+}
+
+// 교정 뒤 보존본의 출처 — 병합 교정본(원본의 유효 필드 + 교정 응답), 교정 응답 전체(논의 재제출), 계획 교정을 적용한 결과, 병합 전에 실패한 교정 전 원본,
+// 교정 병합 뒤 같은 원장으로 리뷰를 이어 간 계속 진행 응답(한 번 응답, R3 재리뷰2 884).
+type CorrectionPreservedKind = "merged" | "correction" | "repaired" | "original" | "continuation";
+const CORRECTION_PRESERVED_LABEL: Record<CorrectionPreservedKind, string> = {
+  merged: "병합 교정본", correction: "교정 응답", repaired: "계획 교정 적용본", original: "교정 전 원본", continuation: "계속 진행 응답",
+};
+
+// 이 턴이 보존할 최신 값과 그 출처(누적본인가)·세션(R3 재리뷰2 F002·F005). core.turn 이 소유해 enforceResultContract 에 넘기고, 새 값을 채택하는 모든 자리
+// (계속 진행 응답·계획 교정 적용본·논의 교정·병합본)가 값과 출처·세션을 함께 바꾼다. 보존하는 자리(교정 대기본·교정 뒤 위반)는 이 기록만 읽는다 — 값과 출처를
+// 따로 넘기면(raw 와 고정된 출처 인자, catch 의 진입 값) 새 값을 채택한 뒤의 보존이 옛 출처나 옛 값을 적었다.
+interface LatestResult { value: AgentResult; accumulated: boolean; kind: CorrectionPreservedKind; sessionId: string }
+function adopt(latest: LatestResult, value: AgentResult, accumulated: boolean, kind: CorrectionPreservedKind, sessionId = latest.sessionId): void {
+  latest.value = value; latest.accumulated = accumulated; latest.kind = kind; latest.sessionId = sessionId;
+}
+
+// core.turn 은 자기가 재개를 소유할 때만 교정 대기본을 쓴다(R3 재리뷰3 F006). 다음 두 경우는 소유하지 않는다 — (가) 계획 제어 체크포인트가 그 턴을
+// 소유하는 경우(core.turn 이 진입 때 판정하고 쓰기·읽기를 함께 막는다), (나) 오류 자체가 다른 재개 주인을 밝히는 경우: PlanningPaused 는 계획 제어나
+// 계보 복구(turnExecutor.ts:304-307 신원 불일치·323-326 세션 유실)가, HandledWorkflowInterruption 은 인터럽트 상태가 재개를 맡는다.
+// 턴이 소유할 때 남기는 정지(R3 재리뷰2 F005) — 한도(예산·재작성·리뷰)·실행 허용 거부(사유 무관: 상태를 바꾸는 사유는 pendingRepair 의 계획·근거·새 입력
+// 대조가 버리고, 나머지는 환경 사유라 응답이 유효하다)·사용 한도. 사용 한도는 자동 retry 를 거는 판정(usageLimitRetry.consider)과 같은 함수로 가른다 — 같아야
+// 남긴 대기본을 그 retry 가 잇는다. 분류 없는 일반 실패(전송)는 남기지 않는다 — 계획 단계·논의에는 죽은 세션을 버리는 출구가 없어 retry 가 같은 실패를
+// 되풀이할 수 있다(후속 (아)).
+function preservesLatest(error: unknown): boolean {
+  if (error instanceof PlanningPaused || error instanceof HandledWorkflowInterruption) return false;
+  return error instanceof BudgetBlocked || error instanceof RevisionBlocked || error instanceof ReviewBlocked || error instanceof AdmissionRefused
+    || parseUsageLimit(error instanceof Error ? error.message : String(error)) !== null;
+}
+
+// 같은 세션 교정 1회 뒤에도 남은 기계 계약 위반(R3e, 2026-10-07 사용자 결정 "좁힌 안으로 고침"). 상태 전이는 종전대로 FAILED 다 — 이 오류는 그 문구에
+// 막힌 것·영향·보존 위치·다음 행동을 싣고, 교정까지 마친 결과(preserved)를 호출자에게 넘긴다. core.turn 은 그것을 교정 대기본으로 보존해 retry 가 턴을
+// 다시 사지 않고 같은 세션 교정부터 잇게 한다. 첫 줄은 위반 문구 그대로다. 교정 호출의 전송 실패·실행 허용 거부·정지는 이 오류가 아니다(isFlowControl).
+export class ContractCorrectionFailed extends Error {
+  constructor(
+    readonly violation: string,
+    readonly preserved: AgentResult,
+    readonly preservedKind: CorrectionPreservedKind,
+    readonly stage: WorkflowState,
+    readonly job: TurnJob,
+    readonly kept: readonly string[],
+    cause: unknown,
+    // 보존본의 누적 출처(교정 대기본 accumulated) — 던질 때의 기록(LatestResult)에서 온다(R3 재리뷰 F002·재리뷰2 F002).
+    readonly accumulated = false,
+  ) {
+    super(ContractCorrectionFailed.describe(violation, stage, job, kept.length > 0 ? kept.join(" · ") : "없음",
+      "중재자가 위반 내용을 확인한 뒤 retry 로 이 단계를 다시 엽니다."), { cause });
+    this.name = "ContractCorrectionFailed";
+  }
+
+  // core.turn 이 보존본을 교정 대기본으로 남긴 뒤의 문구 — 보존 위치와 다음 행동이 그 기록을 가리킨다(재개 조건은 pendingRepair 와 같다).
+  withPending(location: string, sessionId: string): string {
+    return ContractCorrectionFailed.describe(this.violation, this.stage, this.job,
+      [`${location}(${CORRECTION_PRESERVED_LABEL[this.preservedKind]}, 세션 ${sessionId})`, ...this.kept].join(" · "),
+      `새 입력 없이 retry 하면 같은 세션 ${sessionId} 에서 보존한 결과의 교정부터 잇습니다(턴 전체를 다시 사지 않습니다). `
+        + "새 결정·증거가 들어오거나 계획·세션이 바뀌면 보존본을 쓰지 않고 턴을 새로 엽니다.");
+  }
+
+  private static describe(violation: string, stage: WorkflowState, job: TurnJob, kept: string, next: string): string {
+    return [
+      violation,
+      `막힌 것: ${stage} 단계 ${job.role}/${job.operation} 결과가 같은 세션 교정 1회 뒤에도 기계 계약을 어겼습니다(첫 줄).`,
+      "영향: 이 결과를 단계에 반영하지 않았습니다. 자동 교정(1회)은 끝났고 이 실행은 실패로 끝납니다.",
+      `보존 위치: ${kept}`,
+      `다음 행동: ${next}`,
+    ].join("\n");
+  }
+}
+
+// 계약 검사가 아닌 흐름 제어 — startAction 이 각자의 정지(새 입력·계획 제어·한도·실행 허용·호스트)로 보낸다. 교정 뒤 위반(FAILED 문구)으로 바꾸지 않는다.
+function isFlowControl(error: unknown): boolean {
+  return error instanceof HandledWorkflowInterruption || error instanceof PlanningPaused || error instanceof BudgetBlocked
+    || error instanceof RevisionBlocked || error instanceof ReviewBlocked || error instanceof AdmissionRefused || error instanceof HostRuntimeUnavailable;
+}
+
+// 교정 응답을 원본의 개별로 유효한 필드 위에 병합한다. 교정 영수증(onCorrectionResponse)과 본 경로가 같은 규칙(호출자의 beforeMerge 포함)을 쓴다 —
+// 둘이 갈라지면 영수증에 교정이 비운 필드가 되살아나 retry 가 이미 고친 위반으로 교정을 한 번 더 열었다(2026-10-07 R3d).
+function mergeCorrection(raw: AgentResult, corrected: AgentResult, normalize: ResultNormalizer | undefined): { result: AgentResult; preserved: string[] } {
+  // 해소 id 는 원본이 검증 안 된 한 번 응답일 때만 응답 한도로 자른다 — 누적본(여러 응답의 합집합, 저장 계약은 무제한 R02)을 다시 병합할 때 잘라 내면 이미
+  // 받아들인 해소 id 를 잃는다(R3 리뷰 F002).
+  const salvaged = salvageResultFields(raw, corrected.kind, { limitResolvedIds: isUnverifiedResult(raw) });
+  return mergeCorrectionResult(normalize?.beforeMerge?.(salvaged, true) ?? salvaged, normalize?.beforeMerge?.(corrected) ?? corrected);
+}
+
+// 원본의 엔진 결함 보고 — 검증 안 된 원본(R3)이면 그 필드가 스키마를 통과할 때만 쓴다. 교정 병합의 재검사에서 원본의 잘못된 필드가 교정 결과를 죽이지 않게.
+function originalEngineDefects(raw: AgentResult): AgentResult["engineDefects"] {
+  return AgentResultSchema.shape.engineDefects.safeParse((raw as { engineDefects?: unknown }).engineDefects).data;
+}
+
+// 검증 안 된 응답이 어긴 계약 문구(응답 한도 포함) — 교정 뒤 위반 문구의 첫 줄로 쓴다.
+function validationMessage(value: unknown): string {
+  try { validateAgentResult(value); return "응답 검증 실패"; } catch (error) { return error instanceof Error ? error.message : String(error); }
 }
 
 // 유지보수 잠금 소유 증명 — 잠금 파일의 pid·at 을 그대로 제시한 호출만 잠금 아래에서 통과한다(R3-06).
@@ -409,22 +504,63 @@ export class EngineCore {
     let executionId: string | undefined;
     const observeUsage = this.usageObserver(topic.id, route, "턴");
     const onUsage = (usage: TurnUsage) => { executionId = usage.executionId; observeUsage(usage); };
-    let result: AgentResult;
-    let sessionId: string;
     const evidenceDigest = this.dependencies.database.evidence.topic(topic).digest;
-    const pending=await this.pendingRepair(topic.id,topic.state);
+    // 재개 소유자(R3 재리뷰3 F006) — enforce 가 PlanningPaused·confirmPlanningResult 를 고르는 판정과 같다. 계획 제어가 적용되면 체크포인트(guardedPlanning
+    // 의 latestAttempt·확인 회차)가 재개를 소유하므로 이 턴은 교정 대기본을 읽지도(pendingRepair 가 null) 쓰지도(stop) 않는다.
+    const flags = turnFlags(route.job);
+    const checkpointOwned = planningControlApplies(this.dependencies.database, topic.id, topic.state, flags);
+    const pending=await this.pendingRepair(topic.id,topic.state,flags);
     // 교정 대기본은 그 응답을 만든 공급자·참여자의 세션으로만 이어 쓴다(E2b — 배정이 바뀌었으면 다시 실행한다).
     const reuse=pending && pending.role===role && sameBinding(pending.binding, route) && pending.contextKey===(options.repairContextKey??null)
       && (!options.session || options.session.id===pending.sessionId);
+    // 이 턴이 보존할 최신 값·출처·세션(R3 재리뷰2) — 응답을 받기 전에는 비어 있고, 비어 있으면 어떤 실패에도 교정 대기본을 쓰지 않는다. 첫 호출 안의 계속
+    // 진행(continueDeferredReviews)이 멈춰도 받은 응답이 남도록 응답마다(onResponse) 채택한다.
+    let latest: LatestResult | null = null;
+    const adoptResponse = (outcome: { sessionId: string; result: AgentResult }) => {
+      if (latest) adopt(latest, outcome.result, false, "original", outcome.sessionId);
+      else latest = { value: outcome.result, accumulated: false, kind: "original", sessionId: outcome.sessionId };
+    };
+    // 교정 대기본 — retry 가 같은 세션 교정부터 잇는다(pendingRepair 가 바인딩·단계·세대·계획·근거·새 입력·세션을 대조한다).
+    // accumulated: 여러 응답을 합친 누적본(교정 병합본)이라는 출처 표시 — 내용만으로는 한도만 어긴 한 번 응답과 정상 병합본이 둘 다 스키마를 통과해
+    // 구분되지 않는다(R3 리뷰 F002). 새 상태가 아니라 기존 기록의 출처 표시이고, 옛 코드는 이 필드를 읽지 않는다(JSON.parse). 값·출처·세션은 기록
+    // (LatestResult) 하나에서 읽는다 — 이 턴이 채택한 최신 값과 그 출처다(R3 재리뷰2 F002·F005).
+    const keepPending=async(record:LatestResult):Promise<string>=>{
+      const revision=this.latestSequence(topic.id)+1;
+      await this.writeArtifact(topic,"pending-contract-repair",revision,JSON.stringify({
+        role,binding:bindingOf(route),stage:topic.state,scopeGeneration:topic.scopeGeneration,planEpoch:topic.planEpoch,planSHA256:topic.planSHA256,
+        participantSessionId:this.participant(this.dependencies.database.getTopic(topic.id),role).sessionId,
+        sessionId:record.sessionId,raw:AgentResultSchema.safeParse(record.value).success?redactAgentResult(record.value):redactUnverifiedResult(record.value),
+        contextKey:options.repairContextKey??null,startedAfter,evidenceDigest,
+        ...(record.accumulated?{accumulated:true}:{}),
+      }),signal);
+      return `pending-contract-repair#${revision}`;
+    };
+    // 정지 처리 — 첫 호출(그 안의 계속 진행 포함)과 계약 검사 어디서 멈춰도 같은 규칙(preservesLatest)으로 기록을 남긴다. 보존 쓰기가 늦은·중단된 실행이라
+    // 거부되면(writeArtifact 의 accept → StaleArtifactError) 그 거부만 삼키고 원래 오류를 올린다(R3 재리뷰2 (b)). 응답 전 실패(기록 없음)는 쓰지 않는다.
+    const stop=async(error:unknown):Promise<never>=>{
+      const preserve=async():Promise<string|null>=>{
+        if(!latest || checkpointOwned)return null;
+        try { return await keepPending(latest); }
+        catch(keepError) { if(keepError instanceof StaleArtifactError)return null; throw keepError; }
+      };
+      // 교정 뒤에도 위반(R3e) — 교정 전 원본이 아니라 교정까지 마친 결과를 남긴다. 상태 전이는 그대로(FAILED), 문구만 이 기록을 가리킨다.
+      if(error instanceof ContractCorrectionFailed) {
+        const location=await preserve();
+        throw location && latest ? new Error(error.withPending(location,latest.sessionId),{cause:error}) : error;
+      }
+      if(preservesLatest(error))await preserve();
+      throw error;
+    };
     if(reuse) {
-      result=pending.raw;sessionId=pending.sessionId;
+      // 누적본(교정 병합본)은 저장 계약만, 한 번 응답(원본)은 응답 한도까지 다시 검사한다 — 표시가 없는 옛 기록은 종전대로 한 번 응답이다(R3 리뷰 F002).
+      latest={value:pending.accumulated===true?pending.raw:unverifiedResponse(pending.raw),accumulated:pending.accumulated===true,kind:"original",sessionId:pending.sessionId};
       this.event(topic.id,"system","system","저장된 응답의 교정을 같은 세션에서 재개합니다.");
     } else if (freshSession || !resumeSessionId || resumeSessionId.startsWith("pending:")) {
       const planningWrite = options.planningWrite ?? planningWriteOf(route.job, topic.state);
       const created = await this.executor.execute({
         evidenceDigest,
         route, topic, signal, purpose: "턴", inputSequence: startedAfter, expected: this.expectationOf(topic),
-        writeGuards: options.writeGuards,
+        writeGuards: options.writeGuards, acceptUnverified: true,
         session: { mode: "create", onSessionCreated: id => {
           this.assertCurrent(topic.id,signal,topic.scopeGeneration,topic.state);
           if (options.session) options.session.persist(id);
@@ -442,6 +578,7 @@ export class EngineCore {
         settings: route.settings, onUsage,
         // 결과 교정·새 입력 처리(채택 검사) 전에 저장해야 재시도가 같은 세션을 이어 쓸 수 있다.
         onResponse: (outcome) => {
+          adoptResponse(outcome);
           if (options.session) options.session.persist(outcome.sessionId);
           else if (!freshSession) {
             if (this.dependencies.database.participantSessionInUse(topic.id, route.provider, outcome.sessionId)) {
@@ -450,15 +587,14 @@ export class EngineCore {
             this.dependencies.database.upsertParticipant(topic.id, { ...participant, sessionId: outcome.sessionId, acknowledgedPlanSHA256: null }, bindingOf(route));
           }
         },
-      });
+      }).catch(stop);
       this.assertCurrent(topic.id, signal, topic.scopeGeneration, topic.state);
-      result = created.result;
-      sessionId = created.sessionId;
+      latest = { value: created.result, accumulated: false, kind: "original", sessionId: created.sessionId };
     } else {
       const resumed = await this.executor.execute({
         evidenceDigest,
         route, topic, signal, purpose: "턴", inputSequence: startedAfter, expected: this.expectationOf(topic),
-        writeGuards: options.writeGuards,
+        writeGuards: options.writeGuards, acceptUnverified: true,
         session: { mode: "resume", sessionId: resumeSessionId, onSessionCreated: id => {
           this.assertCurrent(topic.id, signal, topic.scopeGeneration, topic.state);
           if (options.session) options.session.persist(id);
@@ -469,35 +605,31 @@ export class EngineCore {
         } },
         prompt, freshSessionPrompt: options.freshSessionPrompt, timelineDelivery: options.timelineDelivery, planMode,
         planningWrite: options.planningWrite ?? planningWriteOf(route.job, topic.state),
-        readablePaths: options.readablePaths, settings: route.settings, onUsage,
-      });
-      result = resumed.result;
-      sessionId = resumed.sessionId;
+        readablePaths: options.readablePaths, settings: route.settings, onUsage, onResponse: adoptResponse,
+      }).catch(stop);
+      latest = { value: resumed.result, accumulated: false, kind: "original", sessionId: resumed.sessionId };
     }
+    // 이 턴이 받은 응답(진입 값) — 교정 대기본의 기록은 enforce 가 새 값을 채택할 때마다 바뀌지만, 계획 출력 측정은 진입 값 기준이다.
+    const result = latest.value;
     this.assertCurrent(topic.id, signal, topic.scopeGeneration, topic.state);
     if (await this.interruptPreservingResult(topic, role, result, startedAfter, signal)) throw new HandledWorkflowInterruption();
     let accepted = false;
     try {
-      const checked = await this.enforceResultContract(route, topic, result, sessionId, {
+      const checked = await this.enforceResultContract(route, topic, result, latest.sessionId, {
         evidenceDigest,
         signal, planMode, startedAfter, check, readablePaths: options.readablePaths, normalize: options.normalize, planBase: options.planBase,
-        writeGuards: options.writeGuards, confirm: options.confirm, resultPlanSHA256: options.resultPlanSHA256,
+        writeGuards: options.writeGuards, confirm: options.confirm, resultPlanSHA256: options.resultPlanSHA256, restored: Boolean(reuse), latest,
       });
       accepted = true;
       this.recordResultDefects(topic.id, checked);
       if(pending)await this.writeArtifact(topic,"pending-contract-repair",this.latestSequence(topic.id)+1,"null",signal);
       return checked;
     } catch(error) {
-      if(error instanceof RevisionBlocked || error instanceof ReviewBlocked || error instanceof BudgetBlocked) {
-        await this.writeArtifact(topic,"pending-contract-repair",this.latestSequence(topic.id)+1,JSON.stringify({
-          role,binding:bindingOf(route),stage:topic.state,scopeGeneration:topic.scopeGeneration,planEpoch:topic.planEpoch,planSHA256:topic.planSHA256,
-          participantSessionId:this.participant(this.dependencies.database.getTopic(topic.id),role).sessionId,
-          sessionId,raw:redactAgentResult(result),contextKey:options.repairContextKey??null,startedAfter,evidenceDigest,
-        }),signal);
-      }
-      throw error;
+      return await stop(error);
     } finally {
-      if (result.kind === "PLAN" || result.kind === "REVISION") this.dependencies.database.saveOptimizationMetric(topic.id, topic.scopeGeneration, executionId, {
+      // 스키마를 통과하지 못한 응답(R3: 실행기가 넘긴 검증 안 된 결과·그것을 보관한 교정 대기본)은 계획 출력 형식을 잴 수 없다 — 종전처럼(어댑터가 버려
+      // 여기까지 오지 않았다) 세지 않는다.
+      if ((result.kind === "PLAN" || result.kind === "REVISION") && AgentResultSchema.safeParse(result).success) this.dependencies.database.saveOptimizationMetric(topic.id, topic.scopeGeneration, executionId, {
         kind: "plan-output", success: accepted, format: result.planLineEdits ? "lines" : result.planEdits ? "find-replace" : "full",
         responseBytes: Buffer.byteLength(JSON.stringify(result), "utf8"),
         patchBytes: Buffer.byteLength(JSON.stringify(result.planLineEdits ?? result.planEdits ?? result.planMarkdown ?? ""), "utf8"),
@@ -506,10 +638,15 @@ export class EngineCore {
     }
   }
 
-  async pendingRepair(topicId:string,stage:string):Promise<{
+  // flags: 읽는 턴의 job 유도값(turnFlags). 계획 제어가 적용되는 단계·턴이면 체크포인트가 재개를 소유하므로 대기본이 있어도 돌려주지 않는다 — 버리지 않고
+  // 무시한다(소유자는 읽는 시점의 정책이 정한다: 계획 제어가 꺼지면 같은 기록은 다시 턴 소유의 재개점이고 아래 대조를 그대로 받는다, R3 재리뷰3 F006).
+  // 기본값 {} 는 job 을 모르는 호출처(restartPlanning·코드 리뷰 전달 판정)용이다 — 계획 제어 단계에서 core.turn 을 부르는 job 은 모두 쓰기·프로토콜·근거 검토가
+  // 아닌 계획자·검토자라 단계 판정과 턴 판정이 같고, 어긋나도 재사용을 막는 쪽이다.
+  async pendingRepair(topicId:string,stage:string,flags:Parameters<typeof planningControlApplies>[3]={}):Promise<{
     role:ParticipantRole;binding:SessionBinding;stage:string;scopeGeneration:number;planEpoch:number;planSHA256:string|null;
-    participantSessionId:string|null;sessionId:string;raw:AgentResult;contextKey:string|null;startedAfter:number;evidenceDigest:string;
+    participantSessionId:string|null;sessionId:string;raw:AgentResult;contextKey:string|null;startedAfter:number;evidenceDigest:string;accumulated?:boolean;
   }|null> {
+    if(planningControlApplies(this.dependencies.database,topicId,stage,flags))return null;
     const stored=await this.dependencies.artifacts.readLatest(topicId,"pending-contract-repair");
     if(!stored)return null;
     const pending=JSON.parse(stored);
@@ -529,7 +666,8 @@ export class EngineCore {
 
   // 기계 계약 위반은 작업 실패가 아니라 표기 실패다. 턴을 버리면 그때까지의 작업 비용 전체가 소각되므로
   // (2026-09-01 S1.1: RESOLVED_BY_FIX 금지 하나로 1시간 구현 턴 폐기), 같은 세션에 거부 사유를 돌려주고
-  // 한 번만 재제출받는다. 두 번째 위반은 그대로 던져 FAILED 경로로 보낸다 — 무한 교정은 다른 종류의 소각이다.
+  // 한 번만 재제출받는다. 두 번째 위반은 FAILED 경로로 보낸다 — 무한 교정은 다른 종류의 소각이다. 그 위반은 ContractCorrectionFailed 로 던져 교정까지 마친
+  // 결과와 보존 위치를 싣는다(R3e) — 호출자가 보존하고, 중재자가 연 retry 가 그 결과의 교정부터 잇는다.
   // route: 원 턴의 경로 — 교정 재제출·계획 교정은 원 턴의 세션을 이어 쓰므로 같은 공급자·설정으로 가고, job 만 교정 작업으로 바꾼다(E2b).
   async enforceResultContract(
     route: TurnRoute,
@@ -559,9 +697,21 @@ export class EngineCore {
       // 결과가 확인해 적는 계획 SHA — 후속 턴은 과제 본문을 다시 싣지 않으므로(계획 제어는 "Continue the task already in this session.") 교정·확인
       // 프롬프트와 계획 제어의 교정·확인 질문에 같은 문장(prompts.resultPlanIdentity)으로 싣는다. 세션 기억에 맡기면 압축 뒤 계약 위반으로 멈춘다.
       resultPlanSHA256?: string;
+      // 형식 위반이면 check 가 돌지 못한다 — 호출자가 검증 전 원본으로 판정할 수 있는 조건 위반을 같은 교정 지시에 함께 실어 교정 1회로 고치게 한다(R3).
+      rawCheck?: (raw: unknown) => string | null;
+      // 원본을 호출자가 자기 기록에 이미 보존했다(근거 검토 영수증, R3). 단계의 교정 원본(contract-repair-source)은 그 단계가 소비할 결과의 것이라
+      // (delivery.legacyPendingOriginal·planning.salvagedRevisionAfterApply) 단계 옆에서 도는 턴은 쓰지 않는다.
+      callerKeepsOriginal?: boolean;
+      // 읽는 곳이 없다 — R3i 가 정착 뒤 처리(근거 공백 이연·리뷰 계속 진행)를 정규화 뒤 한 곳으로 모은 뒤 남은 인자다. 제거는 evidenceAssessment.ts 의
+      // 전달과 함께 한다(후속).
+      restored?: boolean;
+      // 보존할 최신 값·출처·세션의 기록(core.turn 소유, R3 재리뷰2) — raw 와 같은 값으로 시작해, 새 값을 채택하는 자리마다 함께 바뀐다. 없으면 이 호출의
+      // 지역 기록을 쓴다(근거 검토·전달 경로: 계속 진행·계획 교정이 없어 raw 가 그대로 보존 대상이다).
+      latest?: LatestResult;
     },
   ): Promise<AgentResult> {
     const role = route.seat;
+    const latest: LatestResult = context.latest ?? { value: raw, accumulated: false, kind: "original", sessionId };
     const evidence = this.dependencies.database.evidence.topic(this.dependencies.database.getTopic(topic.id));
     const evidenceDigest = context.evidenceDigest;
     if (!evidence.ready || evidence.digest !== evidenceDigest) {
@@ -573,8 +723,28 @@ export class EngineCore {
     let confirmation = false;
     let formatOnly = false;
     let repairPlan: string | null = null;
+    // 한 번 응답(검증 안 된 응답·저장해 둔 응답)은 어댑터와 같은 검증(응답 한도 포함)을, 여러 턴을 합친 결과는 저장 계약(스키마)만 받는다.
+    let staged: AgentResult | undefined;
+    let stageError: unknown;
     try {
-      const parsed = normalized(context.normalize, redactAgentResult(AgentResultSchema.parse(raw)));
+      staged = normalized(context.normalize, redactAgentResult(isUnverifiedResult(raw) ? validateAgentResult(raw) : AgentResultSchema.parse(raw)));
+    } catch (error) {
+      stageError = error;
+    }
+    // 정규화(누적)까지 마친 최종 결과에 정상 응답과 같은 정착 뒤 처리를 한다 — 원본이 어디서 복원됐든(저장본 재사용·구현 checkpoint 누적) 한 곳에서
+    // 한다(R3 재리뷰 F003). 계속 진행 호출의 전송 실패는 위반이 아니므로 아래 try 밖에서 부른다. 계속 진행 응답은 받는 즉시 기록에 한 번 응답으로 채택한다 —
+    // 루프의 다음 호출이 멈춰도 받은 응답이 남는다(R3 재리뷰2 F002·F005).
+    const settledFirst = staged ? await this.executor.settleRestored(this.restoredRequest(route, topic, sessionId, context,
+      outcome => adopt(latest, outcome.result, false, "original", outcome.sessionId)), sessionId, staged) : null;
+    try {
+      if (stageError !== undefined) throw stageError;
+      let parsed = settledFirst!.result;
+      if (settledFirst!.continued) {
+        // 계속 진행 응답이 이 세션의 최신 응답이다 — 교정·보존은 이것을 원본으로 삼고(한 번 응답: 누적 출처를 잇지 않는다), 검사 전에 다시 정규화·이연한다.
+        raw = settledFirst!.result;
+        adopt(latest, raw, false, "original");
+        parsed = await this.settleContinuation(route, topic, sessionId, context, raw);
+      }
       assertTurnResult(route.job, parsed);
       context.check?.(parsed);
       const question = context.confirm?.(parsed) ?? null;
@@ -590,6 +760,8 @@ export class EngineCore {
       if (error instanceof HandledWorkflowInterruption) throw error;
       formatOnly = isFormatOnlyViolation(error);
       violation = error instanceof Error ? error.message : String(error);
+      const rawViolation = formatOnly ? context.rawCheck?.(raw) ?? null : null;
+      if (rawViolation) violation = `${violation}\n${rawViolation}`;
       if (error instanceof ToleranceFormatError) repairPlan = repairablePlan(redactAgentResult(raw), context.planBase);
     }
     if (planningControlApplies(this.dependencies.database, topic.id, topic.state, turnFlags(route.job))) {
@@ -614,23 +786,55 @@ export class EngineCore {
       let accepted = false;
       try {
         const sourceRevision = (this.dependencies.database.latestArtifact(topic.id, "plan-repair-source")?.revision ?? 0) + 1;
+        const kept = [`plan-repair-source#${sourceRevision}(${CORRECTION_PRESERVED_LABEL.original})`];
         await this.writeArtifact(topic, "plan-repair-source", sourceRevision, JSON.stringify(redactAgentResult(raw)), context.signal);
         // 실행 허용(새 입력·계획 변경·취소…)은 실행기가 spawn 직전에 본다(R3-03 → PLAN §2 공통 실행기).
-        const patch = await this.executor.executePlanRepair({
-          evidenceDigest,
-          route: repairRoute, topic, signal: context.signal, purpose: "계획 교정", inputSequence: context.startedAfter, expected: this.expectationOf(topic),
-          session: { mode: "resume", sessionId }, prompt: planRepairPrompt(repairPlan, violation),
-          settings: { ...route.settings, effort: "low" },
-          onUsage: (usage) => { executionId = usage.executionId; usageObserver(usage); },
-        });
+        let patch: Awaited<ReturnType<TurnExecutor["executePlanRepair"]>>;
+        try {
+          patch = await this.executor.executePlanRepair({
+            evidenceDigest,
+            route: repairRoute, topic, signal: context.signal, purpose: "계획 교정", inputSequence: context.startedAfter, expected: this.expectationOf(topic),
+            session: { mode: "resume", sessionId }, prompt: planRepairPrompt(repairPlan, violation),
+            settings: { ...route.settings, effort: "low" },
+            onUsage: (usage) => { executionId = usage.executionId; usageObserver(usage); },
+          });
+        } catch (error) {
+          // 교정 응답 자체가 PlanRepair 계약을 어겼다 — 교정 뒤 위반이고, 적용할 교정이 없으므로 원본을 보존본으로 넘긴다. 전송·허용 거부·정지는 그대로 올린다.
+          if (error instanceof PlanRepairViolation) throw this.correctionFailed(route, topic, error, latest, kept);
+          throw error;
+        }
         responseBytes = Buffer.byteLength(JSON.stringify(patch), "utf8");
         this.assertCurrent(topic.id, context.signal, topic.scopeGeneration, topic.state);
         if (this.interruptForNewUserInput(topic, context.startedAfter)) throw new HandledWorkflowInterruption();
         if (this.dependencies.database.getTopic(topic.id).planSHA256 !== topic.planSHA256) throw new Error("교정 중 계획 기준이 바뀌었습니다.");
-        const planMarkdown = applyPlanRepair(repairPlan, patch);
-        const { planEdits: _oldEdits, planLineEdits: _oldLines, ...preserved } = raw;
-        repaired = normalized(context.normalize, redactAgentResult(AgentResultSchema.parse({ ...preserved, planMarkdown })));
-        context.check?.(repaired);
+        let candidate: AgentResult;
+        try {
+          const planMarkdown = applyPlanRepair(repairPlan, patch);
+          const { planEdits: _oldEdits, planLineEdits: _oldLines, ...unchanged } = raw;
+          candidate = AgentResultSchema.parse({ ...unchanged, planMarkdown });
+          // 적용본은 원본의 필드를 그대로 가지므로 원본의 출처를 잇는다.
+          adopt(latest, candidate, latest.accumulated, "repaired");
+        } catch (error) {
+          if (isFlowControl(error)) throw error;
+          throw this.correctionFailed(route, topic, error, latest, kept);
+        }
+        // 적용본은 원본의 필드를 그대로 갖는다 — 정규화 뒤 최종 결과에 정상 응답과 같은 정착 뒤 처리를 하고 검사한다(R3 재리뷰 F003).
+        let normalizedRepair: AgentResult;
+        try {
+          normalizedRepair = normalized(context.normalize, redactAgentResult(candidate));
+        } catch (error) {
+          if (isFlowControl(error)) throw error;
+          throw this.correctionFailed(route, topic, error, latest, kept);
+        }
+        const settledRepair = await this.executor.settleRestored(this.restoredRequest(route, topic, sessionId, context), sessionId, normalizedRepair,
+          { continueReviews: false });
+        try {
+          repaired = settledRepair.result;
+          context.check?.(repaired);
+        } catch (error) {
+          if (isFlowControl(error)) throw error;
+          throw this.correctionFailed(route, topic, error, latest, kept);
+        }
         this.reportCarriedFindings(topic.id, context.normalize, true);
         accepted = true;
         return repaired;
@@ -641,15 +845,21 @@ export class EngineCore {
         });
       }
     }
-    const correctionRevision=(this.dependencies.database.latestArtifact(topic.id,"contract-repair-source")?.revision ?? 0)+1;
-    // 보관은 계약 검증 없이 가린다 — 계약을 어긴 응답을 스키마로 다시 파싱하면 보관에서 죽어 교정에 못 간다(Codex 감사 R08).
-    // 세대·계획 sha·상태에 결속해 보관한다 — 교정이 실패하면 재개(delivery.pendingResultOriginal)가 이 원본을 소비한다(F03).
-    await this.writeArtifact(topic,"contract-repair-source",correctionRevision,JSON.stringify({
-      kind: "contract-repair-source", scopeGeneration: topic.scopeGeneration, planSHA256: topic.planSHA256, state: topic.state,
-      original: redactUnverifiedResult(raw),
-    }),context.signal);
+    // 교정 뒤에도 위반이면 FAILED 문구에 적을 보존 위치(R3e).
+    const kept: string[] = context.callerKeepsOriginal ? [`호출자 기록(${CORRECTION_PRESERVED_LABEL.original})`] : [];
+    if (!context.callerKeepsOriginal) {
+      const correctionRevision=(this.dependencies.database.latestArtifact(topic.id,"contract-repair-source")?.revision ?? 0)+1;
+      kept.push(`contract-repair-source#${correctionRevision}(${CORRECTION_PRESERVED_LABEL.original})`);
+      // 보관은 계약 검증 없이 가린다 — 계약을 어긴 응답을 스키마로 다시 파싱하면 보관에서 죽어 교정에 못 간다(Codex 감사 R08).
+      // 세대·계획 sha·상태에 결속해 보관한다 — 교정이 실패하면 재개(delivery.pendingResultOriginal)가 이 원본을 소비한다(F03).
+      await this.writeArtifact(topic,"contract-repair-source",correctionRevision,JSON.stringify({
+        kind: "contract-repair-source", scopeGeneration: topic.scopeGeneration, planSHA256: topic.planSHA256, state: topic.state,
+        original: redactUnverifiedResult(raw),
+      }),context.signal);
+    }
     // 호출자가 누적본을 보존한다(구현·수정 경로의 checkpoint) — 교정 호출이 죽어도 같은 기록에서 이어간다.
     await context.beforeCorrection?.(raw, violation);
+    if (context.beforeCorrection) kept.push("호출자 checkpoint(교정 전 누적본)");
     this.event(topic.id, "system", "system", confirmation
       ? `합의 철회로 읽히는 처분을 같은 세션에 1회 되묻습니다(계약 위반 아님): ${violation}`
       : `기계 계약 위반을 같은 세션에 돌려보내 1회 교정합니다${formatOnly ? "(표기 교정 — 추론 low)" : ""}: ${violation}`,
@@ -660,46 +870,111 @@ export class EngineCore {
     const correctionRoute: TurnRoute = constrained ? route : { ...route, job: { role: route.job.role, operation: "contract-correction" } };
     const settings = route.settings;
     // 실행 허용(새 입력·계획 변경·취소·유지보수·예산·쓰기 기준)은 실행기가 adapter 호출 전과 spawn 직전에 본다(R3-03 → PLAN §2).
-    const { result: corrected } = await this.executor.execute({
-      evidenceDigest,
-      route: correctionRoute, topic, signal: context.signal, purpose: "계약 교정 재제출", inputSequence: context.startedAfter,
-      expected: { ...this.expectationOf(topic), state: this.dependencies.database.getTopic(topic.id).state },
-      writeGuards: context.writeGuards,
-      session: { mode: "resume", sessionId },
-      prompt: confirmation ? buildDispositionConfirmationPrompt(violation, raw.kind, context.resultPlanSHA256)
-        : buildContractCorrectionPrompt(violation, turnContract(route.job).kinds, context.resultPlanSHA256),
-      onResponse: context.onCorrectionResponse ? response => {
-        const corrected = redactAgentResult(response.result);
-        const retained = mergeCorrectionResult(salvageResultFields(raw, corrected.kind), corrected).result;
-        context.onCorrectionResponse!({ ...retained, engineDefects: corrected.engineDefects ?? raw.engineDefects });
-      } : undefined,
-      planMode: context.planMode, planningWrite: constrained ? undefined : "repair", readablePaths: context.readablePaths,
-      settings: formatOnly ? { ...settings, effort: "low" } : settings,
-    });
+    let corrected: AgentResult;
+    try {
+      ({ result: corrected } = await this.executor.execute({
+        evidenceDigest,
+        route: correctionRoute, topic, signal: context.signal, purpose: "계약 교정 재제출", inputSequence: context.startedAfter,
+        expected: { ...this.expectationOf(topic), state: this.dependencies.database.getTopic(topic.id).state },
+        writeGuards: context.writeGuards,
+        session: { mode: "resume", sessionId },
+        prompt: confirmation ? buildDispositionConfirmationPrompt(violation, raw.kind, context.resultPlanSHA256)
+          : buildContractCorrectionPrompt(violation, turnContract(route.job).kinds, context.resultPlanSHA256),
+        onResponse: context.onCorrectionResponse ? response => {
+          const corrected = redactAgentResult(response.result);
+          const retained = mergeCorrection(raw, corrected, context.normalize).result;
+          context.onCorrectionResponse!({ ...retained, engineDefects: corrected.engineDefects ?? originalEngineDefects(raw) });
+          kept.push("호출자 영수증(교정 응답 병합본)");
+        } : undefined,
+        planMode: context.planMode, planningWrite: constrained ? undefined : "repair", readablePaths: context.readablePaths,
+        settings: formatOnly ? { ...settings, effort: "low" } : settings,
+      }));
+    } catch (error) {
+      // 교정 응답 자체가 형식 검사에 걸렸다 — 이 호출은 검증 안 된 응답을 받지 않으므로(acceptUnverified 없음) 실행기가 그대로 던진다. 교정 뒤 위반이고,
+      // 병합할 검증된 교정이 없으므로 교정 전 원본을 보존본으로 넘긴다. 그 밖의 실패(전송·허용 거부·정지)는 그대로 올린다.
+      if (error instanceof UnverifiedAgentResult) throw this.correctionFailed(route, topic, error, latest, kept);
+      throw error;
+    }
     this.assertCurrent(topic.id, context.signal, topic.scopeGeneration, this.dependencies.database.getTopic(topic.id).state);
     // 교정 응답은 원본에서 개별로 유효했던 필드(요약·쟁점·증거·요청 결정·상태) 위에 병합한다 — 교정이 거부된 필드만 고치고
     // 나머지를 비워 내면 본 턴의 보고와 미해결 결정 요청이 흐름에서 사라진다(Codex 감사 R01 ②).
-    const parsedCorrection = redactAgentResult(AgentResultSchema.parse(corrected));
-    assertTurnResult(route.job, parsedCorrection);
-    if (discussion) {
-      // 논의는 전체 발언을 재제출한다. 계획·감사용 병합으로 금지한 쟁점을 원본에서 되살리지 않는다.
-      context.check?.(parsedCorrection);
-      return parsedCorrection;
+    // 위반 시점까지 만든 가장 진전된 결과를 보존본으로 넘긴다(기록) — 병합 전이면 교정 전 원본이다.
+    let merged: AgentResult;
+    try {
+      const parsedCorrection = redactAgentResult(AgentResultSchema.parse(corrected));
+      assertTurnResult(route.job, parsedCorrection);
+      if (discussion) {
+        // 논의는 전체 발언을 재제출한다. 계획·감사용 병합으로 금지한 쟁점을 원본에서 되살리지 않는다.
+        adopt(latest, parsedCorrection, false, "correction");
+        context.check?.(parsedCorrection);
+        return parsedCorrection;
+      }
+      const combined = mergeCorrection(raw, parsedCorrection, context.normalize);
+      if (combined.preserved.length > 0) {
+        this.event(topic.id, "system", "system", `계약 교정 재제출에 원본의 유효한 필드를 병합했습니다(서버 보존): ${combined.preserved.join(" · ")}`,
+          { correctionPreserved: combined.preserved });
+      }
+      merged = { ...combined.result, engineDefects: parsedCorrection.engineDefects ?? originalEngineDefects(raw) };
+      adopt(latest, merged, true, "merged");
+    } catch (error) {
+      if (isFlowControl(error)) throw error;
+      throw this.correctionFailed(route, topic, error, latest, kept);
     }
-    const salvaged = salvageResultFields(raw, parsedCorrection.kind);
-    const merged = mergeCorrectionResult(
-      context.normalize?.beforeMerge?.(salvaged, true) ?? salvaged,
-      context.normalize?.beforeMerge?.(parsedCorrection) ?? parsedCorrection,
-    );
-    if (merged.preserved.length > 0) {
-      this.event(topic.id, "system", "system", `계약 교정 재제출에 원본의 유효한 필드를 병합했습니다(서버 보존): ${merged.preserved.join(" · ")}`,
-        { correctionPreserved: merged.preserved });
+    let reparsed: AgentResult;
+    try {
+      reparsed = normalized(context.normalize, redactAgentResult(AgentResultSchema.parse(merged)));
+    } catch (error) {
+      if (isFlowControl(error)) throw error;
+      throw this.correctionFailed(route, topic, error, latest, kept);
     }
-    const reparsed = normalized(context.normalize, redactAgentResult(AgentResultSchema.parse({ ...merged.result, engineDefects: parsedCorrection.engineDefects ?? raw.engineDefects })));
-    assertTurnResult(route.job, reparsed);
-    context.check?.(reparsed);
-    this.reportCarriedFindings(topic.id, context.normalize, true);
-    return reparsed;
+    // 병합으로 되살린 원본 필드도 정규화 뒤 최종 결과에서 정상 응답과 같은 정착 뒤 처리를 받는다(R3 리뷰 F003·재리뷰 F003) — 같은 최종 내용이면 같은 다음
+    // 상태다. 계속 진행 응답은 받는 즉시 기록에 채택한다 — 같은 세션의 새 한 번 응답이라 누적 출처를 잇지 않는다(R3 재리뷰2 884). 그 응답이 검증·검사에
+    // 실패하면 교정 1회를 이미 썼으므로 교정 뒤 위반이고, 보존본은 그 응답이다 — 병합본을 남기면 retry 가 정착·계속 진행을 다시 산다(재리뷰2 결정 (a)).
+    const settled = await this.executor.settleRestored(this.restoredRequest(route, topic, sessionId, context,
+      outcome => adopt(latest, outcome.result, false, "continuation", outcome.sessionId)), sessionId, reparsed);
+    if (settled.continued) adopt(latest, settled.result, false, "continuation");
+    if (settled.continued && isUnverifiedResult(settled.result)) {
+      throw this.correctionFailed(route, topic, new Error(`리뷰 계속 진행 응답이 응답 계약을 어겼습니다: ${validationMessage(settled.result)}`), latest, kept);
+    }
+    try {
+      const final = settled.continued ? await this.settleContinuation(route, topic, sessionId, context, settled.result) : settled.result;
+      assertTurnResult(route.job, final);
+      context.check?.(final);
+      this.reportCarriedFindings(topic.id, context.normalize, true);
+      return final;
+    } catch (error) {
+      if (isFlowControl(error)) throw error;
+      throw this.correctionFailed(route, topic, error, latest, kept);
+    }
+  }
+
+  // 계속 진행 응답(정규화 전)을 검사 직전 최종 결과로 만든다 — 다시 정규화(누적)하고 이연만 한다(계속 진행을 더 사지 않는다). 검증 안 된 응답이면
+  // 어댑터와 같은 검증 오류를 던진다(호출자의 위반 처리로 간다).
+  private async settleContinuation(route: TurnRoute, topic: Topic, sessionId: string, context: Parameters<EngineCore["restoredRequest"]>[3] & {
+    normalize?: ResultNormalizer;
+  }, continuation: AgentResult): Promise<AgentResult> {
+    const value = isUnverifiedResult(continuation) ? validateAgentResult(continuation) : AgentResultSchema.parse(continuation);
+    const renormalized = normalized(context.normalize, redactAgentResult(value));
+    return (await this.executor.settleRestored(this.restoredRequest(route, topic, sessionId, context), sessionId, renormalized, { continueReviews: false })).result;
+  }
+
+  // 정착 뒤 처리(settleRestored)의 요청 — 원 턴의 경로(리뷰 원장 포함)·기대·쓰기 기준·읽기 허용 그대로, 같은 세션을 잇는다. 계속 진행 호출만 이것으로 실행된다.
+  // onResponse: 계속 진행 응답을 받는 즉시(루프의 다음 호출 전) 보존 기록에 채택한다(R3 재리뷰2). 세션 저장은 하지 않는다 — 같은 세션을 이어 쓴다.
+  private restoredRequest(route: TurnRoute, topic: Topic, sessionId: string, context: {
+    signal: AbortSignal; planMode: boolean; startedAfter: number; evidenceDigest: string; readablePaths?: readonly string[]; writeGuards?: WriteGuards;
+  }, onResponse?: TurnRequest["onResponse"]): TurnRequest {
+    return {
+      evidenceDigest: context.evidenceDigest, route, topic, signal: context.signal, purpose: "계속 진행 턴", inputSequence: context.startedAfter,
+      expected: { ...this.expectationOf(topic), state: this.dependencies.database.getTopic(topic.id).state }, writeGuards: context.writeGuards,
+      session: { mode: "resume", sessionId }, prompt: "", planMode: context.planMode, readablePaths: context.readablePaths, settings: route.settings,
+      acceptUnverified: true, ...(onResponse ? { onResponse } : {}),
+    };
+  }
+
+  // 교정 뒤 위반 — 보존본·출처·라벨은 던질 때의 기록(LatestResult)에서만 읽는다(R3 재리뷰2: 값과 출처를 따로 넘기면 채택한 새 값에 옛 출처가 붙었다).
+  private correctionFailed(route: TurnRoute, topic: Topic, error: unknown, latest: LatestResult, kept: readonly string[]): ContractCorrectionFailed {
+    return new ContractCorrectionFailed(error instanceof Error ? error.message : String(error), latest.value, latest.kind, topic.state, route.job, kept, error,
+      latest.accumulated);
   }
 
   // 이 턴이 이어 가는 계획 제어 체크포인트 — 같은 단계·공급자·범위 세대·계획 epoch 의 최신 체크포인트. 최종 결과를 무효화하고 질문을 앞에 붙여 같은 시도를
@@ -763,6 +1038,8 @@ export class EngineCore {
         context.resultPlanSHA256 ? ` ${resultPlanIdentity(context.resultPlanSHA256)}` : ""}`);
       throw new PlanningPaused("Disposition confirmation moved to another planning attempt or session; checkpoint and response retained for mediation.");
     }
+    // 확인 응답은 같은 세션의 새 한 번 응답이다 — 같은 기록(context.latest)을 쓰는 다음 검사가 그것을 보존 대상으로 보게 채택한다(R3 재리뷰2).
+    if (context.latest) adopt(context.latest, confirmed.result, false, "original", confirmed.sessionId);
     return this.enforceResultContract(route, topic, confirmed.result, sessionId, { ...context, confirm: undefined });
   }
 

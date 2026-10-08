@@ -6,6 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { ArtifactStore } from "../src/server/artifacts";
+import { BudgetBlocked } from "../src/server/budgetLedger";
 import { ConsensusDatabase } from "../src/server/database";
 import { GitService } from "../src/server/git";
 import { SpawnCommandRunner } from "../src/server/processRunner";
@@ -19,7 +20,7 @@ import { WorkflowEngine } from "../src/server/workflow";
 import { parseTolerancePolicy, ToleranceFormatError } from "../src/shared/tolerance";
 import { REQUIRED_PLAN_HEADINGS, type AgentResult, type Finding } from "../src/shared/contracts";
 import { hashPlan, normalizePlan, redactSecrets } from "../src/shared/workflow";
-import { agentRunError } from "../src/server/adapters/resultParser";
+import { agentRunError, UnverifiedAgentResult } from "../src/server/adapters/resultParser";
 import { PlanningPaused, type PlanningStep } from "../src/shared/planningControl";
 import { guardedPlanning } from "../src/server/guardedPlanning";
 import type { SessionTurn } from "../src/server/types";
@@ -2608,6 +2609,88 @@ describe("기계 계약 위반 자가 교정", () => {
     expect(claude.calls.filter((prompt) => prompt.includes("거부 사유")).length).toBe(1);
     database.close();
   });
+
+  // R3e(2026-10-07 사용자 결정 "좁힌 안으로 고침"): FAILED 전이는 그대로 두고, 교정까지 마친 결과를 교정 대기본으로 남겨 retry 가 턴을 다시 사지 않게 한다.
+  // 문구는 막힌 것·영향·보존 위치·다음 행동을 적는다.
+  it("교정 뒤 위반은 병합 교정본을 교정 대기본으로 남기고, retry 가 턴을 다시 사지 않고 같은 세션 교정부터 잇는다", async () => {
+    const revisedPlan = validPlan("재개 뒤 개정 계획");
+    const revisedSHA = hashPlan(`${revisedPlan.trim()}\n`);
+    const { database, engine, claude, artifacts } = makePlanningEngine({
+      slug: "contract-correction-pending",
+      claudeResults: [
+        { kind: "PLAN", summary: "원본 요약", planMarkdown: "형식이 틀린 계획", findings: [], evidenceRefs: ["원본 증거"] },
+        { kind: "PLAN", summary: "교정 응답 요약", planMarkdown: "여전히 틀린 계획", findings: [], evidenceRefs: [] },
+        { kind: "PLAN", summary: "재개 교정", planMarkdown: validPlan("재개 교정 계획"), findings: [], evidenceRefs: [] },
+        { kind: "REVISION", summary: "개정", planMarkdown: revisedPlan, findings: [], evidenceRefs: [] },
+        { kind: "ACK", summary: "확인", planSHA256: revisedSHA, findings: [], evidenceRefs: [] },
+      ],
+      codexResults: [
+        { kind: "AUDIT", summary: "감사", findings: [], evidenceRefs: [] },
+        { kind: "CLOSEOUT", summary: "종결", planSHA256: revisedSHA, findings: [], evidenceRefs: [] },
+        { kind: "ACK", summary: "확인", planSHA256: revisedSHA, findings: [], evidenceRefs: [] },
+      ],
+    });
+
+    engine.startPlan("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+
+    const failed = database.getTopic("topic-1");
+    expect(failed.state).toBe("FAILED");
+    expect(claude.calls).toHaveLength(2);
+    const lastError = failed.lastError ?? "";
+    expect(lastError).toContain("막힌 것: CLAUDE_PLAN 단계 planner/plan 결과가 같은 세션 교정 1회 뒤에도 기계 계약을 어겼습니다");
+    expect(lastError).toContain("영향: 이 결과를 단계에 반영하지 않았습니다.");
+    expect(lastError).toMatch(/보존 위치: pending-contract-repair#\d+\(병합 교정본, 세션 claude-session\) · contract-repair-source#1\(교정 전 원본\)/);
+    expect(lastError).toContain("다음 행동: 새 입력 없이 retry 하면 같은 세션 claude-session 에서 보존한 결과의 교정부터 잇습니다");
+    const pending = JSON.parse((await artifacts.readLatest("topic-1", "pending-contract-repair"))!);
+    expect(pending).toMatchObject({ role: "claude", stage: "CLAUDE_PLAN", sessionId: "claude-session" });
+    expect(pending.raw.planMarkdown).toBe("여전히 틀린 계획");
+    expect(pending.raw.summary).toContain("교정 응답 요약");
+    expect(pending.raw.summary).toContain("원본 요약");
+    expect(pending.raw.evidenceRefs).toEqual(["원본 증거"]);
+
+    const epoch = failed.planEpoch;
+    engine.retry("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+
+    expect(claude.calls).toHaveLength(5);
+    expect(claude.turns[2]).toMatchObject({ sessionId: "claude-session" });
+    expect(claude.calls[2]).toContain("거부 사유");
+    expect(database.getTimeline("topic-1").some((event) => event.body === "저장된 응답의 교정을 같은 세션에서 재개합니다.")).toBe(true);
+    expect(database.getTopic("topic-1").planEpoch).toBe(epoch);
+    expect(await artifacts.readLatest("topic-1", "claude-plan")).toContain("재개 교정");
+    expect(await artifacts.readLatest("topic-1", "pending-contract-repair")).toBe("null");
+    expect(database.getTopic("topic-1").state).toBe("AWAITING_USER_APPROVAL");
+    database.close();
+  });
+
+  it("교정 응답 자체가 형식 검사에 걸려도 교정 전 원본을 교정 대기본으로 남기고 네 항목을 적어 실패로 보낸다", async () => {
+    const malformed = () => { throw new UnverifiedAgentResult({ kind: "PLAN", summary: 7 }, "에이전트 응답 형식이 올바르지 않습니다: summary"); };
+    const { database, engine, claude, artifacts } = makePlanningEngine({
+      slug: "contract-correction-malformed",
+      claudeResults: [
+        { kind: "AUDIT", summary: "원본 요약", findings: [], evidenceRefs: [] },
+        malformed as unknown as AgentResult,
+      ],
+      codexResults: [],
+    });
+
+    engine.startPlan("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+
+    const failed = database.getTopic("topic-1");
+    expect(failed.state).toBe("FAILED");
+    expect(claude.calls.filter((prompt) => prompt.includes("거부 사유"))).toHaveLength(1);
+    const lastError = failed.lastError ?? "";
+    expect(lastError.split("\n")[0]).toBe("에이전트 응답 형식이 올바르지 않습니다: summary");
+    expect(lastError).toContain("막힌 것: CLAUDE_PLAN 단계 planner/plan");
+    expect(lastError).toContain("영향: ");
+    expect(lastError).toMatch(/보존 위치: pending-contract-repair#\d+\(교정 전 원본, 세션 claude-session\)/);
+    expect(lastError).toContain("다음 행동: 새 입력 없이 retry 하면");
+    const pending = JSON.parse((await artifacts.readLatest("topic-1", "pending-contract-repair"))!);
+    expect(pending.raw).toMatchObject({ kind: "AUDIT", summary: "원본 요약" });
+    database.close();
+  });
 });
 
 // 최종 리뷰 신규 쟁점을 사용자 결정이 소비하면 재리뷰가 같은 쟁점으로 다시 멈추지 않는다.
@@ -4674,6 +4757,33 @@ it("부분 교정 한도 중단도 원본과 같은 세션을 복구해 부분 �
  expect(database.revisions.account("topic-1").used).toBe(4);database.close();
 });
 
+// R3e: 계획 교정(plan-repair)을 적용한 결과가 다시 검사에 걸리면 그 적용본을 교정 대기본으로 남긴다 — 재개는 원본·부분 교정을 다시 사지 않는다.
+it("계획 교정 적용본이 검사에 다시 걸리면 그 적용본을 교정 대기본으로 남기고, 재개는 모델을 다시 부르지 않고 그것부터 잇는다",async()=>{
+ const {database,dependencies}=makeEngine("DRAFT",null);
+ database.updateTopic("topic-1",{state:"CLAUDE_PLAN"});
+ const original=normalizePlan(validPlan("적용본 보존")).replace('"rules":[]','"rules":[],');
+ const repaired=original.replace('"rules":[],','"rules":[]');
+ const calls:string[]=[];
+ dependencies.claude.createSession=async()=>{calls.push("create");return {sessionId:"repair-session",result:{kind:"PLAN",summary:"원본",planMarkdown:original,findings:[],evidenceRefs:[]}};};
+ dependencies.claude.resumePlanRepair=async turn=>{calls.push(`repair:${turn.sessionId}`);return {baseSHA256:hashPlan(original),edits:[{find:'"rules":[],',replace:'"rules":[]'}]};};
+ dependencies.claude.resumeTurn=async()=>{throw new Error("전체 재호출 금지");};
+ // 원본 검사와 교정 적용본 검사는 위반, 재개의 검사는 통과(중재로 위반이 해소된 경우).
+ let checks=0;
+ let checked:AgentResult|undefined;
+ const run=(core:EngineCore)=>core.startAction("topic-1","test",async signal=>{
+  checked=await core.turn(core.route(database.getTopic("topic-1"),{role:"planner",operation:"plan"}),database.getTopic("topic-1"),"처음 계획",signal,{freshSession:true,check:()=>{if(++checks<=2)throw new ToleranceFormatError("적용본도 막는 형식 오류");}});
+ });
+ run(new EngineCore(dependencies));await waitForActionCompletion(database,"topic-1");
+ const failed=database.getTopic("topic-1");
+ expect(failed.state).toBe("FAILED");expect(calls).toEqual(["create","repair:repair-session"]);
+ expect(failed.lastError).toMatch(/보존 위치: pending-contract-repair#\d+\(계획 교정 적용본, 세션 repair-session\) · plan-repair-source#1\(교정 전 원본\)/);
+ expect(JSON.parse((await dependencies.artifacts.readLatest("topic-1","pending-contract-repair"))!).raw.planMarkdown).toBe(repaired);
+ database.updateTopic("topic-1",{state:"CLAUDE_PLAN"});
+ run(new EngineCore(dependencies));await waitForActionCompletion(database,"topic-1");
+ expect(calls).toEqual(["create","repair:repair-session"]);expect(checked?.planMarkdown,database.getTopic("topic-1").lastError??"").toBe(repaired);
+ expect(await dependencies.artifacts.readLatest("topic-1","pending-contract-repair")).toBe("null");database.close();
+});
+
 
 // 2026-09-14 Codex 후속 리뷰 재현(Medium 1·2) — 공개 경계(engine.retry / engine.amendTolerance)에서 고정한다.
 describe("Codex 후속 리뷰 2026-09-14 — 줄 범위 도구 증거·개정 사유 가림", () => {
@@ -5542,4 +5652,118 @@ describe("계획 제어 단계의 종결 합의 하향 확인", () => {
       expect(room.database.planning.latest("topic", "codex")!.confirmationRound).toBeUndefined();
     } finally { await room.engine.shutdown(); room.database.close(); }
   });
+
+  // R3k(R3j 재리뷰 4cabcaf5 F006): 계획 제어 턴은 체크포인트가 재개를 소유한다 — 확인 호출이 사용 한도·예산으로 끊겨도 core.turn 은 교정 대기본을 쓰지
+  // 않고, 이미 쓰인 대기본(옛 판)도 재사용하지 않는다. 입력이 그대로인 retry 는 같은 체크포인트의 확인 회차를 실제로 실행한다. 위 테스트는 확인 호출을
+  // 분류 없는 일반 Error 로 끊어(대기본을 쓰지 않는 오류) 이 경로를 보지 못했다.
+  const pendingOf = (room: ReturnType<typeof guardedRoom>) => room.database.latestArtifact("topic", "pending-contract-repair");
+  const confirmationResumes = async (room: ReturnType<typeof guardedRoom>, attempts: () => number) => {
+    room.engine.retry("topic"); await room.settle();
+    expect(room.database.getTopic("topic")).toMatchObject({ state: "AWAITING_USER_APPROVAL", lastError: null });
+    expect(attempts()).toBe(2);   // 확인 호출을 다시 했다 — 대기본으로 건너뛰지 않았다.
+    expect(room.database.planning.latest("topic", "codex")!.confirmationRound).toBeUndefined();
+  };
+  for (const [label, stop] of [
+    ["사용 한도", () => new Error("Codex 실행 실패(1): You've hit your usage limit (429)")],
+    ["예산", () => new BudgetBlocked("topic", "budget")],
+  ] as const) {
+    it(`R3k: 확인 호출이 응답 없이 ${label}로 끊겨도 교정 대기본을 쓰지 않고, 입력이 그대로인 retry 는 같은 확인 회차를 실행해 합의로 닫는다`, async () => {
+      let attempts = 0;
+      const room = guardedRoom(`guarded-closeout-stop-${attempts}`, (attempt) => { attempts = attempt; if (attempt === 1) throw stop(); return kept(); });
+      try {
+        room.engine.startPlan("topic"); await room.settle();
+        expect(attempts).toBe(1);
+        expect(room.database.planning.latest("topic", "codex")!.confirmationRound).toContain("Answer the disposition confirmation without new reads");
+        expect(pendingOf(room)).toBeNull();
+        await confirmationResumes(room, () => attempts);
+      } finally { await room.engine.shutdown(); room.database.close(); }
+    });
+  }
+
+  it("R3k: 계획 제어 턴은 이미 쓰인 교정 대기본(옛 판)을 재사용하지 않는다 — retry 는 그 대기본을 무시하고 같은 확인 회차를 실행한다", async () => {
+    let attempts = 0;
+    const room = guardedRoom("guarded-closeout-stale-pending", (attempt) => {
+      attempts = attempt;
+      if (attempt === 1) throw new Error("F006_CONFIRMATION_CALL_FAILED");
+      return kept();
+    });
+    try {
+      room.engine.startPlan("topic"); await room.settle();
+      expect(room.database.getTopic("topic").state).toBe("FAILED");
+      // 옛 판(main 74249a3·fd693b6)이 확인 호출의 한도 정지에서 남기던 대기본 — 확인 전 하향 종결이다.
+      const topic = room.database.getTopic("topic");
+      const artifacts = new ArtifactStore(join(room.repo, "..", "artifacts"), room.database);
+      await artifacts.write("topic", "pending-contract-repair", (room.database.getTimeline("topic").at(-1)?.sequence ?? 0) + 1, JSON.stringify({
+        role: "codex", stage: "CODEX_CLOSEOUT", scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch, planSHA256: topic.planSHA256,
+        participantSessionId: topic.participants.find((participant) => participant.role === "codex")!.sessionId,
+        sessionId: (room.codex.calls[1] as SessionTurn).sessionId, contextKey: null,
+        raw: { kind: "CLOSEOUT", summary: "반영 확인", planSHA256: room.revisedSHA, evidenceRefs: [],
+          findings: [finding("F-1", "고치기로 합의한 결함", { severity: "HIGH", disposition: "AGREED_NO_ACTION", rationale: "개정에 반영됐습니다." })] },
+        startedAfter: room.database.getTimeline("topic").at(-1)?.sequence ?? 0, evidenceDigest: room.database.evidence.topic(topic).digest,
+      }));
+      await confirmationResumes(room, () => attempts);
+    } finally { await room.engine.shutdown(); room.database.close(); }
+  });
+
+  it("R3k: 계획 제어가 켜진 단계의 교정 대기본은 pendingRepair 가 돌려주지 않는다 — restartPlanning 이 대기본 때문에 resetToDraft 를 건너뛰지 않는다", async () => {
+    const room = guardedRoom("guarded-plan-stale-pending", () => kept());
+    try {
+      room.database.updateTopic("topic", { state: "CLAUDE_PLAN" });
+      const topic = room.database.getTopic("topic");
+      const artifacts = new ArtifactStore(join(room.repo, "..", "artifacts"), room.database);
+      const core = new EngineCore({ database: room.database, git: new GitService(new SpawnCommandRunner()), artifacts, claude: room.claude.adapter, codex: room.codex.adapter });
+      await artifacts.write("topic", "pending-contract-repair", (room.database.getTimeline("topic").at(-1)?.sequence ?? 0) + 1, JSON.stringify({
+        role: "claude", stage: "CLAUDE_PLAN", scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch, planSHA256: topic.planSHA256,
+        participantSessionId: "claude-existing", sessionId: "claude-existing", contextKey: null,
+        raw: { kind: "PLAN", summary: "계획", planMarkdown: "## stale", findings: [], evidenceRefs: [] },
+        startedAfter: room.database.getTimeline("topic").at(-1)?.sequence ?? 0, evidenceDigest: room.database.evidence.topic(topic).digest,
+      }));
+      expect(await core.pendingRepair("topic", "CLAUDE_PLAN")).toBeNull();
+      // 대조: 계획 제어가 적용되지 않는 턴(쓰기 job)이 읽으면 같은 기록은 턴 소유의 재개점이다 — 기록 자체는 재개 조건을 모두 갖췄다.
+      expect(await core.pendingRepair("topic", "CLAUDE_PLAN", { implementation: true })).toMatchObject({ stage: "CLAUDE_PLAN", sessionId: "claude-existing" });
+    } finally { await room.engine.shutdown(); room.database.close(); }
+  });
+});
+
+// R3h(R3 묶음 리뷰 F004): 부분 계획 교정 응답의 형식 오류(edits: [])도 교정 대기본을 남겨 재개가 계획 턴을 다시 사지 않는다. 전송 실패는 그대로다.
+it("R3h F004: 부분 계획 교정 응답이 계약을 어겨도 원본을 교정 대기본으로 남기고 재개는 같은 세션 교정부터 잇는다",async()=>{
+ const {database,dependencies}=makeEngine("DRAFT",null);
+ database.updateTopic("topic-1",{state:"CLAUDE_PLAN"});
+ const original=normalizePlan(validPlan("부분 교정 형식")).replace('"rules":[]','"rules":[],');
+ const calls:string[]=[];
+ dependencies.claude.createSession=async()=>{calls.push("create");return {sessionId:"repair-session",result:{kind:"PLAN",summary:"원본",planMarkdown:original,findings:[],evidenceRefs:[]}};};
+ const { parsePlanRepair } = await import("../src/server/adapters/resultParser");
+ let empty=true;
+ dependencies.claude.resumePlanRepair=async turn=>{calls.push(`repair:${turn.sessionId}`);
+  const patch=empty?{baseSHA256:hashPlan(original),edits:[]}:{baseSHA256:hashPlan(original),edits:[{find:'"rules":[],',replace:'"rules":[]'}]};
+  return parsePlanRepair([{type:"result",subtype:"success",structured_output:patch,result:JSON.stringify(patch)}],"");};
+ dependencies.claude.resumeTurn=async()=>{throw new Error("전체 재호출 금지");};
+ let checked:AgentResult|undefined;
+ const run=(core:EngineCore)=>core.startAction("topic-1","test",async signal=>{
+  checked=await core.turn(core.route(database.getTopic("topic-1"),{role:"planner",operation:"plan"}),database.getTopic("topic-1"),"처음 계획",signal,{freshSession:true,check:r=>{if(r.planMarkdown?.includes('"rules":[],'))throw new ToleranceFormatError("부분 교정이 필요한 형식 오류");}});
+ });
+ run(new EngineCore(dependencies));await waitForActionCompletion(database,"topic-1");
+ expect(database.getTopic("topic-1").state).toBe("FAILED");expect(calls).toEqual(["create","repair:repair-session"]);
+ expect(await dependencies.artifacts.readLatest("topic-1","pending-contract-repair")).toContain("repair-session");
+ empty=false;database.updateTopic("topic-1",{state:"CLAUDE_PLAN"});
+ run(new EngineCore(dependencies));await waitForActionCompletion(database,"topic-1");
+ expect(calls).toEqual(["create","repair:repair-session","repair:repair-session"]);
+ expect(checked?.planMarkdown,database.getTopic("topic-1").lastError??"").toBe(original.replace('"rules":[],','"rules":[]'));database.close();
+});
+
+it("R3h F004 대조: 부분 계획 교정 호출의 전송 실패는 교정 뒤 위반으로 바꾸지 않고 교정 대기본도 남기지 않는다",async()=>{
+ const {database,dependencies}=makeEngine("DRAFT",null);
+ database.updateTopic("topic-1",{state:"CLAUDE_PLAN"});
+ const original=normalizePlan(validPlan("부분 교정 전송")).replace('"rules":[]','"rules":[],');
+ dependencies.claude.createSession=async()=>({sessionId:"repair-session",result:{kind:"PLAN",summary:"원본",planMarkdown:original,findings:[],evidenceRefs:[]}});
+ dependencies.claude.resumePlanRepair=async()=>{throw new Error("교정 응답 전송 실패");};
+ const core=new EngineCore(dependencies);
+ core.startAction("topic-1","test",async signal=>{
+  await core.turn(core.route(database.getTopic("topic-1"),{role:"planner",operation:"plan"}),database.getTopic("topic-1"),"처음 계획",signal,{freshSession:true,check:r=>{if(r.planMarkdown?.includes('"rules":[],'))throw new ToleranceFormatError("부분 교정이 필요한 형식 오류");}});
+ });
+ await waitForActionCompletion(database,"topic-1");
+ expect(database.getTopic("topic-1").state).toBe("FAILED");
+ expect(database.getTopic("topic-1").lastError).toContain("교정 응답 전송 실패");
+ expect(database.getTopic("topic-1").lastError).not.toContain("막힌 것:");
+ expect(await dependencies.artifacts.readLatest("topic-1","pending-contract-repair")).toBeNull();database.close();
 });

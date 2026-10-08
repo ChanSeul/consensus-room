@@ -782,8 +782,9 @@ export class DeliveryPipeline {
         if (setup.diagnoses?.length) this.core.diagnoses.markDelivered(topicId, setup.diagnoses, { moment, workId: workId(setup.work) });
       };
       const route = this.workRoute(setup);
+      // 결과는 곧바로 absorbTurn(원본은 salvage·checkpoint 로만 다루고 계약 검사로 넘긴다)으로 간다 — 검증 안 된 응답도 같은 세션 교정으로 받는다(R3b).
       const outcome = await this.core.executor.execute({
-        route, topic, signal, purpose: "턴", inputSequence: setup.inputSequence, expected, writeGuards,
+        route, topic, signal, purpose: "턴", inputSequence: setup.inputSequence, expected, writeGuards, acceptUnverified: true,
         session: sessionId ? { mode: "resume", sessionId } : { mode: "create", onSessionCreated: setup.persistSession },
         prompt: sessionId && !freshHandoff ? prompts.resume : prompts.fresh, recoverable: true, readablePaths: withReferences(setup.readablePaths, referencesPath),
         settings: route.settings,
@@ -861,7 +862,7 @@ export class DeliveryPipeline {
       const referencesPath = await this.writeTimelineReferences(topic, [send], signal);
       const continueRoute = this.workRoute(setup, { role: "implementer", operation: "continue" });
       const continued = await this.core.executor.execute({
-        route: continueRoute, topic, signal, purpose: "계속 진행 턴", inputSequence: setup.inputSequence, expected, writeGuards,
+        route: continueRoute, topic, signal, purpose: "계속 진행 턴", inputSequence: setup.inputSequence, expected, writeGuards, acceptUnverified: true,
         session: { mode: "resume", sessionId: workSession }, recoverable: true,
         prompt: buildContinuationPrompt(remainingSteps, round, setup.kind, state.openRequests,
           send.push.required.length ? { ...send.push, referencesPath, recheck } : undefined,
