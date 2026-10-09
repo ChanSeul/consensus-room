@@ -17,11 +17,12 @@ it("filters explicitly marked operator instructions before bounds and preserves 
   writeFileSync(join(dir, "AGENTS.md"), "BASE_RULE");
   writeFileSync(join(dir, "AGENTS.override.md"), "OVERRIDE_RULE\n<!-- interactive-session-only: local workflow -->\nOPERATOR_RULE");
   const result = await readAppliedInstructions({ workspace: dir, fileName: "AGENTS.md", globalPath: global,
-    injectWorkspaceFile: true, strict: true });
+    injectWorkspaceFile: true });
   expect(result.blocks.join("\n")).toContain("REQUIRED_GLOBAL");
   expect(result.blocks.join("\n")).toContain("OVERRIDE_RULE");
   expect(result.blocks.join("\n")).not.toContain("BASE_RULE");
   expect(result.blocks.join("\n")).not.toContain("OPERATOR_RULE");
+  expect(result.blocks.join("\n")).not.toContain("[이하 생략");
   expect(workerInstructionText('Reference `<!-- interactive-session-only: example -->`\nUNMARKED_RULE')).toContain("UNMARKED_RULE");
   expect(workerInstructionText('```html\n<!-- interactive-session-only: example -->\n```\nUNMARKED_RULE')).toContain("UNMARKED_RULE");
 });

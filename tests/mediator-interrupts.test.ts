@@ -28,7 +28,7 @@ async function fixture() {
   const root = mkdtempSync(join(tmpdir(), "room-interrupt-"));
   const path = join(root, "db.sqlite");
   let db = new ConsensusDatabase(path);
-  const topic = db.createTopic({ id: "topic-1", slug: "topic", title: "중재 호출", baseRef: "HEAD", repositoryPath: root, worktreePath: root,
+  const topic = db.createTopic({ workflowMode: "planned", id: "topic-1", slug: "topic", title: "중재 호출", baseRef: "HEAD", repositoryPath: root, worktreePath: root,
     state: "DRAFT", branchName: null, scopeGeneration: 1, planRevision: 0, planSHA256: null, approvedPlanSHA256: null,
     createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), lastError: null });
   db.roles.createProfile({ id: "mediator-profile", provider: "codex", model: "test-model", effort: "medium", options: {} });
@@ -301,13 +301,13 @@ it("checks every five returned review exchanges across retries and restart witho
   expect((await f.post(fifth.id, "receipt", { claim, state: "sent" })).statusCode).toBe(200);
   await f.restart(); model = monitorReviewProgress(raw, f.db);
   expect((await f.get()).json().items).toEqual([]);
-  f.db.updateTopic("topic-1", { state: "CODEX_CLOSEOUT" });
+  // 같은 계획 리뷰 단계(CODEX_AUDIT)에서 계획 리뷰 작업(closeout 도 공개 작업 이름으로 남는다)이 이어진다.
   for (let n = 0; n < 5; n++) await model.resumeTurn({ ...turn, job: { role: "reviewer", operation: "closeout" } });
   const tenth = (await f.get()).json().items[0];
   expect(tenth.reason).toContain("계획 리뷰 왕복 10회");
   expect(tenth.id).not.toBe(fifth.id);
   // A final reply may immediately transition to approval. Preserve its inspection in that alert.
-  f.pause("CODEX_CLOSEOUT", "AWAITING_USER_APPROVAL");
+  f.pause("CODEX_AUDIT", "AWAITING_USER_APPROVAL");
   expect((await f.get()).json().items[0].reason).toContain("계획 리뷰 왕복 10회");
   f.db.updateTopic("topic-1", { state: "CODEX_REVIEW" });
   for (let n = 0; n < 5; n++) await model.resumeTurn({ ...turn, job: { role: "reviewer", operation: "review-read" } });
@@ -402,7 +402,7 @@ it("resolves a closed leaf to its assigned parent and surfaces a narrow subscrip
   expect((await f.app.inject({ url: "/api/topics/integration/resume", headers: f.headers })).json().mediation.connection.state).toBe("connected");
 });
 
-it.each(["IMPLEMENTING", "CONSENSUS_ACK"] as const)("keeps delivery, handling, and %s resumption separate across restart", async state => {
+it.each(["IMPLEMENTING", "CODEX_AUDIT"] as const)("keeps delivery, handling, and %s resumption separate across restart", async state => {
   const f = await fixture(); f.pause();
   const id = (await f.get()).json().items[0].id, claim = (await f.post(id, "claim")).json().claim;
   const activity = async () => (await f.app.inject({ url: "/api/topics/topic-1/activity", headers: f.headers })).json();

@@ -10,13 +10,10 @@ import { SetTopicGoalSchema } from "../shared/topicStructure.js";
 import { parseEvidenceSource } from "../shared/externalEvidence.js";
 import { adoptTopics, assertTopicParent } from "./topicStructure.js";
 import { BrainstormDecisionSchema, BrainstormInputSchema } from "../shared/brainstorm.js";
-import { PlanningMigrationSchema, PlanningUsageRecoverySchema } from "../shared/planningControl.js";
 import {ReviewGrantInputSchema} from "../shared/reviews.js";
-import { DIAGNOSIS_ID_PATTERN, DiagnosisInputSchema } from "../shared/diagnoses.js";
 import {
   ToolTreeRebaselineInputSchema,
-  ResumeImplementationInputSchema, AmendToleranceInputSchema } from "../shared/contracts.js";
-import { RevisionGrantInputSchema } from "../shared/revisions.js";
+  ResumeImplementationInputSchema, ResumeInputSchema, ReturnToPlanningInputSchema } from "../shared/contracts.js";
 import { parseWorkGroupCreateBody, WorkGroupInputSchema, type WorkGroupView } from "../shared/workGroups.js";
 import { WorkGroupService } from "./workGroupService.js";
 import { BudgetPolicySchema, BudgetResumeInputSchema } from "../shared/budgets.js";
@@ -38,6 +35,7 @@ import {
   ReconcileDeliveryInputSchema,
   UpdateAgentSettingsInputSchema,
   UpdateMediationAutonomyInputSchema,
+  WorkflowModeInputSchema,
   type TopicDetail,
 } from "../shared/contracts.js";
 import { ArtifactStore } from "./artifacts.js";
@@ -55,11 +53,11 @@ import { ProcessSupervisor } from "./processSupervisor.js";
 import { ProjectMemoryStore } from "./memoryStore.js";
 import { readMediationAutonomy } from "./mediationAutonomy.js";
 import { assertMediatorAssignment, assertMediatorForAnyTopic, DEFAULT_MEDIATION_POLICY_PATH, readMediationPolicy } from "./mediation.js";
-import { AgentProfileInputSchema, AgentRoleSchema, AssignmentScopeSchema, RoleAssignmentInputSchema, turnFlags, type MediatorIdentity } from "../shared/roles.js";
+import { AgentProfileInputSchema, AgentRoleSchema, AssignmentScopeSchema, RoleAssignmentInputSchema, type MediatorIdentity } from "../shared/roles.js";
 import { scanWorktreeActivity } from "./activity.js";
 import { VerificationService, completeVerificationSchema } from "./verifications.js";
 import { EvidenceService, withEvidence } from "./evidence/service.js";
-import { guardedPlanning, planningControlApplies } from "./guardedPlanning.js";
+import type { WorkerFact } from "../shared/turnContract.js";
 import { profileSuitability, routingView } from "./turnRouting.js";
 import { guardRunnerControl } from "./adapters/turnPolicy.js";
 import { RestEvidenceConnector, evidenceCredentials, type EvidenceConnector } from "./evidence/connectors.js";
@@ -122,21 +120,36 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   const git = new GitService(dependencies.runner);
   // swift-parse 의 검사 대상은 그때그때의 Git 상태다 — 화면용 시간 캐시(readChangedPaths)가 아니라 GitService 를 그대로 준다.
   const verifications = new VerificationService(database, artifacts, config.dataDirectory, undefined, git);
-  const evidence = new EvidenceService(database.evidence, dependencies.evidenceConnector ?? new RestEvidenceConnector(evidenceCredentials()), source => {
-    for (const topic of database.listTopics()) {
-      if (topic.state === "CLOSED" || !database.evidence.list(topic.id).some(item => item.id === source.id)) continue;
-      database.appendEvent({ topicId: topic.id, actor: "system", kind: "system", state: topic.state,
-        body: `외부 원문 변경 감지: ${source.label}. 변경이 요구사항에 미치는 영향은 재확인이 필요합니다.`,
-        payload: { sourceId: source.id, contentHash: source.contentHash } });
-    }
-  }, join(config.dataDirectory, "evidence-images"), dependencies.nativeEvidenceConnector);
-  // 러너 제어 경로 감시(E2c)는 CLI 실행에 가장 가까운 층이다 — 증거·계획 제어 래퍼가 여는 모든 턴(내부 재시도 포함)의 앞뒤를 같은 방식으로 본다.
+  // 원문 사실의 출구(D6, 계약 v3.13 (21)) — 바뀐 원문·조회 오류를 그 원문이 연결된 열린 토픽마다 workerFact system 사건으로 남긴다. 각 역할 세션은
+  // 아직 받지 않은 사실로 다음 턴에 받고(core.pendingFacts), 영향 판단은 작업자·중재자가 한다. 옛 changed 콜백의 "외부 원문 변경 감지" 기록은 이 사실과
+  // 겹치므로 남기지 않는다(changed 인자 삭제는 ⑦).
+  const version = (value: { revision: string | null; contentHash: string | null } | null) =>
+    value ? value.revision ?? value.contentHash?.slice(0, 12) ?? "?" : "없음";
+  // 원문 게시(catalog.publish — 호스트 가져오기·선택 변경) 안에서 난 사실은 게시가 끝난 뒤 남긴다 — 게시 transaction 안에서 사건을 쓰면 중첩 transaction 이다.
+  const recordSourceFact = (fact: WorkerFact) => {
+    if (fact.kind !== "source-change" && fact.kind !== "source-error") return;
+    database.evidence.catalog.afterPublication(() => {
+      for (const topic of database.listTopics()) {
+        if (topic.state === "CLOSED") continue;
+        const source = database.evidence.list(topic.id).find(item => item.id === fact.sourceId);
+        if (!source) continue;
+        database.appendEvent({ topicId: topic.id, actor: "system", kind: "system", state: topic.state,
+          body: fact.kind === "source-change" ? `원문 변경: ${source.label} (${version(fact.before)} → ${version(fact.after)})`
+            : `원문 조회 오류: ${source.label} — ${fact.error}`,
+          payload: { workerFact: fact } });
+      }
+    });
+  };
+  const evidence = new EvidenceService(database.evidence, dependencies.evidenceConnector ?? new RestEvidenceConnector(evidenceCredentials()),
+    join(config.dataDirectory, "evidence-images"), dependencies.nativeEvidenceConnector, recordSourceFact);
+  // 러너 제어 경로 감시(E2c)는 CLI 실행에 가장 가까운 층이다 — 증거 래퍼가 여는 모든 턴(내부 재시도 포함)의 앞뒤를 같은 방식으로 본다. 옛 계획 제어
+  // 래퍼(guardedPlanning)는 결과 봉투 턴을 넘기지 않아 사슬에서 뺐다(계약 v3.11 (20), ⑥).
   const workflow = new WorkflowEngine({
     database,
     artifacts,
     git,
-    claude: guardedPlanning(withEvidence(monitorReviewProgress(guardRunnerControl(dependencies.claude), database), database, join(config.dataDirectory, "evidence-images")), database, git, config.memoryDirectory, join(config.dataDirectory, "evidence-images"), config.standingReferencePath),
-    codex: guardedPlanning(withEvidence(monitorReviewProgress(guardRunnerControl(dependencies.codex), database), database, join(config.dataDirectory, "evidence-images")), database, git, config.memoryDirectory, join(config.dataDirectory, "evidence-images"), config.standingReferencePath),
+    claude: withEvidence(monitorReviewProgress(guardRunnerControl(dependencies.claude), database), database, join(config.dataDirectory, "evidence-images")),
+    codex: withEvidence(monitorReviewProgress(guardRunnerControl(dependencies.codex), database), database, join(config.dataDirectory, "evidence-images")),
     verifications,
     memory: new ProjectMemoryStore(config.memoryDirectory),
     executionLimits: config.executionLimits,
@@ -150,7 +163,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   evidence.canPublish = topicId => workflow.canPublishEvidence(topicId);
   evidence.publishSelection = (guarded, change) => workflow.publishEvidence(guarded, change);
   // 자율중재는 항상 ON이다. 요청 인증·현재 중재자 배정·각 액션의 승인/상태 검사는 별도로 유지한다.
-  const DELEGATED_ACTIONS = new Set(["brainstorm-plan", "brainstorm-close", "approve", "implement", "tool-tree-rebaseline", "commit", "push", "close", "review-resume", "revision-resume", "budget-configure", "budget-resume", "amend-tolerance", "resume-implementation", "reconcile-delivery", "discard-orphan-commit"]);
+  const DELEGATED_ACTIONS = new Set(["brainstorm-plan", "brainstorm-close", "approve", "implement", "tool-tree-rebaseline", "commit", "push", "close", "review-resume", "budget-configure", "budget-resume", "resume-implementation", "resume", "return-to-planning", "reconcile-delivery", "discard-orphan-commit"]);
   const callOrigin = (request: { headers: Record<string, unknown> }): CallOrigin | undefined => {
     if (request.headers["x-consensus-actor"] !== "mediator") return undefined;
     return mediatorOrigin(request, null);
@@ -242,12 +255,11 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   app.put<{ Params: { id: string } }>("/api/topics/:id/iteration-limits", async request => {
     if (request.headers["x-consensus-actor"] === "mediator") throw Object.assign(new Error("횟수 설정은 사용자만 변경할 수 있습니다."), { statusCode: 403 });
     workflow.assertBudgetEditable(request.params.id);
-    const input = z.object({ scope: z.enum(["planning", "implementation", "revision"]), limit: z.number().int().nonnegative().nullable(), version: z.number().int().positive() }).strict().parse(request.body);
-    const result = input.scope === "revision" ? database.revisions.configure(request.params.id, input.limit, input.version)
-      : database.reviews.configure(request.params.id, input.scope, input.limit, input.version);
+    const input = z.object({ scope: z.enum(["planning", "implementation"]), limit: z.number().int().nonnegative().nullable(), version: z.number().int().positive() }).strict().parse(request.body);
+    const result = database.reviews.configure(request.params.id, input.scope, input.limit, input.version);
     const topic = database.getTopic(request.params.id);
     database.appendEvent({ topicId: topic.id, actor: "user", kind: "note", state: topic.state,
-      body: `${input.scope === "revision" ? "계획 재작성" : input.scope === "planning" ? "계획 검토" : "구현 리뷰"} 한도: ${input.limit === null ? "제한 없음" : `${input.limit}회`}. 자동 재개하지 않습니다.`, payload: { iterationLimit: input } });
+      body: `${input.scope === "planning" ? "계획 검토" : "구현 리뷰"} 한도: ${input.limit === null ? "제한 없음" : `${input.limit}회`}. 자동 재개하지 않습니다.`, payload: { iterationLimit: input } });
     return result;
   });
   registerInterruptRoutes(app, database);
@@ -257,7 +269,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     memoryDirectory: config.memoryDirectory,
     defaultAgentSettings: config.defaultAgentSettings,
   }));
-  // 목록 뷰(E4): 단계 상태와 함께 준비·선택 가능 단계, 재계획 대기, 단계별 전달 상태(로컬 커밋과 원격 push 를 나눠)를 붙인다. 묶음 전달 완료는
+  // 목록 뷰(E4): 단계 상태와 함께 준비·선택 가능 단계, 단계별 전달 상태(로컬 커밋과 원격 push 를 나눠)를 붙인다. 묶음 전달 완료는
   // 통합 단계 결과 커밋이 push 된 것이다(push 는 조상 전체를 싣는다) — 기능 검증 완료(통합 단계 CLOSED)와 구분한다. 닫힌 단계도 동결 결과를 push 한다.
   app.get("/api/work-groups",async()=>database.workGroups.list().map((group):WorkGroupView=>{
     const integration=group.stages.at(-1)!,integrationLink=group.links[integration.id],integrationResult=group.results?.[integration.id];
@@ -268,8 +280,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       // 묶음 전달 완료: 통합 결과 커밋이 묶음의 어느 연결 토픽에서든 push 됐다(변경 없는 통합은 다른 단계가 이미 push 한 기준 커밋이 결과일 수 있다 — E4 보완 F003).
       delivered:Boolean(integrationLink&&integrationResult&&Object.values(group.links).some(link=>database.getFlags(link.topicId).pushedOID===integrationResult.commitOID)),
       readyStages:[...new Set([continuation.stageId, ...selectableStages].filter((id): id is string => id !== null))],
-      continuation, selectableStages,
-      replanPending:group.stages.filter(stage=>group.links[stage.id]?.replanPending).map(stage=>stage.id)};
+      continuation, selectableStages};
   }));
   app.post("/api/work-groups",async(request,reply)=>{
     // 생성 전용 입력(기준 커밋·단계 브랜치 접두사·묶음 밖 선행 토픽)은 묶음 입력과 따로 검증한다 — 개정 입력(revise)에는 없다.
@@ -314,44 +325,34 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       return granted;
     });
   });
-  // 개정(E4 D2 — 저장 우선 + 명시적 재계획 대기).
-  //  ① 사전 검사: 실행 중 작업·완료 묶음·준비 중 예약, 개정 규칙(저장소 previewRevision), 문맥이 바뀌는 단계가 지금 범위를 바꿀 수 있는지.
-  //  ② 개정 저장과, 단계 문맥 해시가 바뀐 연결 단계의 재계획 대기 표식을 한 transaction 으로 쓴다(해시가 같은 단계는 승인·세션·세대를 그대로 둔다).
-  //  ③ 대기 단계마다 범위를 바꾸고(handleScopeChange) 대기를 푼다. 실패하면 개정은 저장된 채 대기 표식이 그 단계의 턴·상태 전진·옛 응답 채택을 막는다.
-  // 같은 입력을 새 요청 키로 다시 보내면(지금 버전 또는 직전 버전) 저장하지 않고 ③만 이어 한다 — 범위 세대가 이미 오른 단계는 범위를 다시 바꾸지 않고
-  // 대기만 푼다(version·범위 세대·예산을 중복으로 올리지 않는다). 예산 계정은 어느 경로에서도 다시 설정하지 않는다.
+  // 개정(E4 D2 — 저장과 사실 전달, 계약 v3.18 (33')).
+  //  ① 사전 검사: 완료 묶음·준비 중 예약, 개정 규칙(저장소 previewRevision).
+  //  ② 개정 저장과, 단계 문맥 해시가 바뀐 열린 단계의 재결속·문맥 변경 사실(work-group-revision)을 한 transaction 으로 쓴다. 자동 범위 변경
+  //     (handleScopeChange)은 하지 않는다(D8) — 바뀐 단계 문맥 본문이 그 단계 세션의 다음 턴에 사실로 한 번 실리고, 계획 수정(return-to-planning)·
+  //     범위 변경은 중재자가 정한다. ⑥ 전 개정이 남긴 재계획 대기 표식은 기동 이행(D9, workflowMigration)이 푼다.
+  // 같은 입력을 새 요청 키로 다시 보내면(지금 버전 또는 직전 버전) 저장하지 않는다. 예산 계정은 어느 경로에서도 다시 설정하지 않는다.
   app.post<{Params:{id:string}}>("/api/work-groups/:id/revise",async(request,reply)=>{
     const body=request.body as {input:unknown;version:number;mode?:string};
     const input=WorkGroupInputSchema.parse(body?.input);
     const origin=request.headers["x-consensus-actor"]==="mediator"?"mediator":"user";
     return runIdempotent(request,reply,globalLedger(database,`work-group:revise:${request.params.id}`),200,async()=>{
       const group=database.workGroups.get(request.params.id);
-      // 실행 중인 단계가 있어도 개정할 수 있다 — 문맥이 같은 단계는 건드리지 않고, 문맥이 바뀌는 단계는 범위 변경이 실행을 멈춘다. 멈추기 전에 범위
-      // 변경이 실패해도 대기 표식이 그 실행의 응답 채택을 막는다(core.assertCurrent·writeArtifact accept). E4 전에는 연결 단계 어느 하나라도 실행 중이면
-      // 거부했는데, 개정이 모든 미완료 단계를 초기화하던 때의 보수적 조건이라 막힌 단계 옆 독립 단계가 도는 동안 큰 그림을 고칠 수 없었다.
+      // 실행 중인 단계가 있어도 개정할 수 있다 — 문맥이 같은 단계는 건드리지 않고, 문맥이 바뀌는 단계는 다시 묶은 뒤 다음 턴에 바뀐 문맥을 사실로 받는다.
       if(group.stages.every(stage=>group.links[stage.id] && database.getTopic(group.links[stage.id].topicId).state==="CLOSED"))throw new Error("완료한 작업 묶음은 변경할 수 없습니다.");
       if(Object.keys(group.pending??{}).length)throw new Error("준비 중인 단계를 먼저 연결하세요.");
       const preview=database.workGroups.previewRevision(group.id,input,body.version,topicId=>database.getTopic(topicId).state==="CLOSED");
       // Graph edits change only future execution. Never interrupt or invalidate a linked stage's approval.
       if (body.mode === "pipeline" && preview.affected.length) throw Object.assign(new Error("이미 시작된 단계에 영향을 주는 연결 변경입니다. 편집안을 새로 확인하세요."), {statusCode:409});
-      const generations:Record<string,number>={};
-      for(const stageId of preview.affected) {
-        const link=group.links[stageId],topic=database.getTopic(link.topicId);
-        if(!(link.replanPending && topic.scopeGeneration>link.replanPending.fromGeneration))workflow.assertScopeChangeAllowed(topic.id);
-        generations[stageId]=topic.scopeGeneration;
-      }
-      if(preview.mode==="revise")database.workGroups.applyRevision(group.id,preview,generations,origin);
-      const saved=database.workGroups.get(group.id);
-      for(const stage of saved.stages) {
-        const pending=saved.links[stage.id]?.replanPending;
-        if(!pending)continue;
-        const topicId=saved.links[stage.id].topicId;
-        if(database.getTopic(topicId).scopeGeneration<=pending.fromGeneration) {
-          const cause=(saved.revisions??[]).find(entry=>entry.version===pending.version);
-          await workflow.handleScopeChange(topicId,cause?.contractsChanged?"공통 계약 변경: "+saved.contracts:`작업 묶음 개정 v${pending.version}: ${stage.id} 단계 문맥 변경`);
-        }
-        database.workGroups.completeReplan(saved.id,stage.id,database.getTopic(topicId).scopeGeneration);
-      }
+      database.atomicWithEvents(() => {
+        if (preview.mode === "revise") database.workGroups.applyRevision(group.id, preview, origin);
+        return { saved: database.workGroups.get(group.id), stageIds: preview.mode === "revise" ? preview.affected : [] };
+      }, ({ saved, stageIds }) => stageIds.map(stageId => {
+        const topicId = saved.links[stageId].topicId;
+        return { topicId, actor: "system" as const, kind: "system" as const, state: database.getTopic(topicId).state,
+          body: `작업 묶음 개정 v${saved.version} 으로 이 단계(${stageId}) 문맥이 바뀌었습니다. 바뀐 단계 문맥 전체를 사실로 전합니다 — 계획 수정·범위 변경은 중재자가 정합니다.`,
+          payload: { workerFact: { kind: "work-group-revision", groupId: saved.id, stageId, version: saved.version,
+            context: database.workGroups.renderStageContext(saved, stageId) } } };
+      }));
       return database.workGroups.get(group.id);
     });
   });
@@ -491,9 +492,10 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
           predecessorTopicId: input.predecessorTopicId,
           branchName: null, state: entryInput.mode === "brainstorm" ? "BRAINSTORM_READY" : "DRAFT", scopeGeneration: 1, planRevision: 0,
           planSHA256: null, approvedPlanSHA256: null, createdAt: timestamp, updatedAt: timestamp, lastError: null,
-          agentSettings: config.defaultAgentSettings,
+          agentSettings: config.defaultAgentSettings, workflowMode: input.workflowMode,
         });
-        if (config.guardedPlanning && input.topicKind !== "group") database.planning.enable(created.id);
+        // 계획 연속성 정책은 planned 생성 때만 켠다(Codex Q-e). 생성 입력의 workflowMode 기본값은 ticket 이다(CreateTopicInputSchema).
+        if (created.workflowMode === "planned" && input.topicKind !== "group") database.planning.enable(created.id);
         if (entryInput.mode === "sources") {
           const sourceIds = entryInput.sources.map(source => database.evidence.catalog.add(created.id,
             { ...source, scope: "topic", required: true }, request.headers["x-consensus-actor"] !== "mediator").sourceId);
@@ -563,7 +565,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       orphanCommitOID: database.getFlags(topic.id).orphanCommitOID,
       deliveryRecovery: toDeliveryRecovery(database.unknownDeliveryAction(topic.id)),
       // 역할과 실제 실행 AI(E2c C3) — 엔진 경로 판정과 같은 계획 제어 식으로 계산한다.
-      routing: routingView(database, topic, job => planningControlApplies(database, topic.id, topic.state, turnFlags(job))),
+      routing: routingView(database, topic),
     };
     return detail;
   });
@@ -604,8 +606,6 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       budget: database.budgets.account(topic.id),
       budgetRecoveryRequired: !database.runningAction(topic.id) && database.budgets.hasUnfinishedExecution(topic.id),
       planningProgress: database.planning.progress(topic.id),
-      revisionAllowance: database.revisions.account(topic.id),
-      revisionPaused: workflow.revisionPaused(topic.id),
       reviewAllowances: [database.reviews.account(topic.id,"planning"),database.reviews.account(topic.id,"implementation")],
       reviewPaused: workflow.reviewPaused(topic.id),
       autoRetryAt: workflow.scheduledRetryAt(topic.id),
@@ -619,29 +619,8 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     };
   });
 
-  // ---- 중재자 진단(2026-09-14) — 일반 메시지와 구분되는 기록. 등록·적용은 분리하고, 기존 멱등 요청 처리와 중재자 위임 검사를 그대로 쓴다.
+  // ---- 중재자 진단(2026-09-14) — 지난 기록의 조회만 남는다. 등록·적용 실행 경로는 없다(D8): 중재자는 결정문을 실은 재개(resume)로 작업자에게 전한다.
   app.get<{ Params: { id: string } }>("/api/topics/:id/diagnoses", async (request) => ({ diagnoses: workflow.listDiagnoses(request.params.id) }));
-
-  app.post<{ Params: { id: string } }>("/api/topics/:id/diagnoses", async (request, reply) => {
-    const origin = callOrigin(request);
-    const input = DiagnosisInputSchema.parse(request.body);
-    return runIdempotent(request, reply, actionLedger(database, request.params.id, "diagnosis:register"), 201,
-      (idempotencyKey) => workflow.registerDiagnosis(request.params.id, input, idempotencyKey, origin));
-  });
-
-  app.post<{ Params: { id: string; diagnosisId: string } }>("/api/topics/:id/diagnoses/:diagnosisId/apply", async (request, reply) => {
-    const topicId = request.params.id;
-    const diagnosisId = request.params.diagnosisId;
-    if (!DIAGNOSIS_ID_PATTERN.test(diagnosisId)) throw Object.assign(new Error("진단 id 형식(DG-n)이 아닙니다."), { statusCode: 400 });
-    const origin = callOrigin(request);
-    const action = `diagnosis:apply:${diagnosisId}`;
-    changedPathsCache.delete(topicId);
-    return runIdempotent(request, reply, actionLedger(database, topicId, action), 200, async (idempotencyKey) => {
-      const actionId = requestActionId(topicId, action, idempotencyKey);
-      const started = await workflow.applyDiagnosis(topicId, diagnosisId, { requestKey: idempotencyKey, origin, actionId });
-      return accepted(started, database.getTopic(topicId));
-    });
-  });
 
   app.post<{ Params: { id: string; role: string } }>("/api/topics/:id/participants/:role", async (request, reply) => {
     const role = parseRole(request.params.role);
@@ -671,19 +650,6 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       (idempotencyKey) => workflow.updateAgentSettings(request.params.id, role, input, idempotencyKey));
   });
 
-  app.post<{ Params: { id: string } }>("/api/topics/:id/planning-control/migration", async (request, reply) => {
-    const origin = callOrigin(request);
-    const input = PlanningMigrationSchema.parse(request.body);
-    return runIdempotent(request, reply, actionLedger(database, request.params.id, "planning:migrate"), 200,
-      key => workflow.migrateInterruptedPlanning(request.params.id, input, key, origin));
-  });
-
-  app.post<{ Params: { id: string } }>("/api/topics/:id/planning-control/usage-recovery", async (request, reply) => {
-    const origin = callOrigin(request), input = PlanningUsageRecoverySchema.parse(request.body);
-    return runIdempotent(request, reply, actionLedger(database, request.params.id, "planning:usage-recovery"), 200,
-      key => workflow.authorizeUnknownPlanningUsage(request.params.id, input, key, origin));
-  });
-
   app.post<{ Params: { id: string } }>("/api/topics/:id/planning-control", async (request, reply) => {
     callOrigin(request);
     workflow.assertBudgetEditable(request.params.id);
@@ -707,6 +673,13 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       : workflow.postMessage(request.params.id, input.kind, input.body, idempotencyKey, origin));
   });
 
+  // 작업 방식 전환(D1) — 중재자·사용자 행동. 중재자 요청은 전역 preHandler 가 그 토픽의 배정을 확인한다. 실행은 시작하지 않는다.
+  app.post<{ Params: { id: string } }>("/api/topics/:id/workflow-mode", async (request, reply) => {
+    const origin = callOrigin(request), input = WorkflowModeInputSchema.parse(request.body);
+    return runIdempotent(request, reply, actionLedger(database, request.params.id, "workflow-mode"), 200,
+      key => workflow.setWorkflowMode(request.params.id, input, key, origin));
+  });
+
   app.post<{ Params: { id: string } }>("/api/topics/:id/continuation", async (request, reply) =>
     runIdempotent(request, reply, actionLedger(database, request.params.id, "continuation"), 200,
       () => continuations.arm(request.params.id, request.body, callOrigin(request))));
@@ -724,12 +697,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
           body: `중재자 위임 호출: ${action}(위임 on, set_at ${origin.delegationSetAt ?? "?"})`, payload: { origin, action } });
       }
       let response: unknown;
-      if(action === "review-evidence") {
-        callOrigin(request);
-        workflow.reviewCurrentEvidence(topicId, actionId);
-        response = accepted(actionId, database.getTopic(topicId));
-      }
-      else if(action === "resume-implementation") {
+      if(action === "resume-implementation") {
         const input = ResumeImplementationInputSchema.parse(request.body);
         response = accepted(randomUUID(), workflow.resumeImplementation(topicId, input, origin));
       }
@@ -745,19 +713,6 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
         const blocked=budgetResumeStep(database,topicId);
         response=blocked?{...accepted(actionId,database.getTopic(topicId)),resumeBlocked:`리뷰 1회를 추가했습니다. ${blocked}`}
           :accepted(workflow.retry(topicId,actionId),database.getTopic(topicId));
-      }
-      else if(action === "amend-tolerance") {
-        const input=AmendToleranceInputSchema.parse(request.body);
-        response=accepted(actionId, await workflow.amendTolerance(topicId,input,idempotencyKey));
-      }
-      else if(action === "revision-resume") {
-        workflow.assertBudgetEditable(topicId);
-        const input=RevisionGrantInputSchema.parse(request.body);
-        if(!workflow.revisionPaused(topicId))throw new Error("추가 승인이 필요한 계획 재작성 중단 상태가 아닙니다.");
-        database.revisions.grant(topicId,idempotencyKey,input.version);
-        const blocked=budgetResumeStep(database,topicId);
-        if(blocked)response={...accepted(actionId,database.getTopic(topicId)),resumeBlocked:`재작성 1회를 추가했습니다. ${blocked}`};
-        else response=accepted(database.getTopic(topicId).state==="DRAFT"?workflow.startPlan(topicId,actionId):workflow.retry(topicId,actionId),database.getTopic(topicId));
       }
       else if (action === "budget-configure" || action === "budget-resume") {
         workflow.assertBudgetEditable(topicId);
@@ -783,7 +738,10 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       else if (action === "stop") {
         workflow.stop(topicId);
         response = accepted(randomUUID(), database.getTopic(topicId));
-      } else if (action === "retry") response = accepted(workflow.retry(topicId, actionId), database.getTopic(topicId));
+      } else if (action === "resume") response = accepted(workflow.resume(topicId, ResumeInputSchema.parse(request.body ?? {}), actionId, origin),
+        database.getTopic(topicId));
+      else if (action === "return-to-planning") response = accepted(workflow.returnToPlanning(topicId,
+        ReturnToPlanningInputSchema.parse(request.body ?? {}), actionId, origin), database.getTopic(topicId));
       else if (action === "approve") {
         const input = ApprovalInputSchema.parse(request.body);
         response = accepted(randomUUID(), workflow.approve(topicId, input.planSHA256));
@@ -857,8 +815,12 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     if (phase !== "created") throw new Error("서버를 초기화할 수 없는 상태입니다.");
     phase = "recovering";
     try {
-      await verifications.recoverExpired();
       await new ProcessSupervisor(undefined, undefined, join(config.dataDirectory, "review-tools", "host-review")).recover(database.runningActions());
+      // 기존 토픽 이행(D9) — 옛 저장 형식(지운 상태)은 이 이행만 원시 행으로 읽는다(F6). 그래서 토픽을 현재 상태로 parse 하는 뒤 단계보다 먼저 돈다:
+      // 만료 검사 회수(recoverExpired)는 listTopics 로 모든 토픽을 parse 하고(프로세스와 무관), 기동 복구(recoverInterruptedActions)의 재개 지점
+      // 판정은 현재 단계만 안다. 자동 재개 장치가 옛 단계를 보기 전에 끝난다. 실행은 시작하지 않는다.
+      await workflow.migrateLegacyTopics();
+      await verifications.recoverExpired();
       database.recoverInterruptedActions();
       database.recoverInterruptedNonDeliveryRequests();
       database.recoverInterruptedDeliveryRequests();

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ProjectMemoryReader } from "../src/server/projectMemory";
-import { buildClaudePlanPrompt, buildCodexAuditPrompt } from "../src/shared/prompts";
+import { buildFirstTurnPrompt } from "../src/shared/prompts";
 
 const roots: string[] = [];
 function fixture() {
@@ -77,10 +77,11 @@ describe("memory retrieval: 24 independently labelled questions", () => {
     }
   });
 
-  it("generated plan/audit boilerplate does not turn a feature question into a Consensus Room query", async () => {
+  it("generated planner/plan-reviewer first-turn boilerplate does not turn a feature question into a Consensus Room query", async () => {
     const reader = new ProjectMemoryReader(fixture());
-    const plan = buildClaudePlanPrompt({ title: "매물 등록 폼 검증", worktreePath: "/tmp/example", sourceRepositoryPath: "/tmp/source", baseRef: "main", scopeGeneration: 1, timeline: [] });
-    const audit = buildCodexAuditPrompt({ title: "숏 폼 카드 재생", planMarkdown: "# 숏폼 카드 재생", planSHA256: "a".repeat(64), scopeGeneration: 1, timeline: [] });
+    const plan = buildFirstTurnPrompt({ role: "planner", title: "매물 등록 폼 검증", worktreePath: "/tmp/example", baseRef: "main", planDirectory: "/tmp/example-plan" });
+    const audit = buildFirstTurnPrompt({ role: "plan-reviewer", title: "숏 폼 카드 재생", worktreePath: "/tmp/example", baseRef: "main",
+      plan: { status: "current", version: "a".repeat(64), snapshotPath: "/tmp/example-plan/plan.md", diffPath: null } });
     for (const [prompt, expected] of [[plan, "houseregist-form.md"], [audit, "shortform-media.md"]]) {
       const docs = await reader.select(prompt, "codex");
       expect(docs.map(d => d.path)).toContain(expected);
@@ -90,8 +91,8 @@ describe("memory retrieval: 24 independently labelled questions", () => {
 
   it("a generic generated title retains the user's multi-paragraph request", async () => {
     const reader = new ProjectMemoryReader(fixture());
-    const prompt = buildClaudePlanPrompt({ title: "결함 수정", worktreePath: "/tmp/example", sourceRepositoryPath: "/tmp/source", baseRef: "main", scopeGeneration: 1,
-      timeline: [{ id: 1, topicId: "topic", sequence: 1, scopeGeneration: 1, actor: "user", kind: "note", state: "DRAFT", body: "화면을 확인했어.\n\n숏폼 카드 재생을 고쳐줘.", payload: {}, createdAt: "2026-09-22T00:00:00Z" }] });
+    const prompt = buildFirstTurnPrompt({ role: "planner", title: "결함 수정", worktreePath: "/tmp/example", baseRef: "main", planDirectory: "/tmp/example-plan",
+      discussion: [{ sequence: 1, actor: "user", kind: "note", body: "화면을 확인했어.\n\n숏폼 카드 재생을 고쳐줘." }] });
     const paths = (await reader.select(prompt, "codex")).map(d => d.path);
     expect(paths).toContain("shortform-media.md");
     expect(paths).not.toContain("consensus-room-review.md");

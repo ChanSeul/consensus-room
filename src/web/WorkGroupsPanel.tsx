@@ -78,11 +78,9 @@ const stageStatus = (state: string | null | undefined) =>
     ? "완료"
     : state === "USER_DECISION_REQUIRED"
       ? "결정 대기"
-      : state === "BLOCKED_ON_EVIDENCE"
-        ? "외부 근거 대기"
-        : state
-          ? "진행 중"
-          : "대기";
+      : state
+        ? "진행 중"
+        : "대기";
 
 export function WorkGroupsPanel({
   onTopic,
@@ -158,27 +156,6 @@ export function WorkGroupsPanel({
                   : ""}
             </summary>
             <p>{group.goal}</p>
-            {group.replanPending.length > 0 && (
-              <p role="status">
-                재계획 대기: {group.replanPending.map(title).join(", ")} — 개정은
-                저장됐지만 이 단계들의 재계획 전환이 끝나지 않아 진행을
-                막았습니다.{" "}
-                <button
-                  disabled={busy}
-                  onClick={() =>
-                    void perform(() =>
-                      api.reviseWorkGroup(
-                        group.id,
-                        inputOf(group),
-                        group.version,
-                      ),
-                    )
-                  }
-                >
-                  개정 다시 적용
-                </button>
-              </p>
-            )}
             <form
               onSubmit={(event) => {
                 event.preventDefault();
@@ -200,7 +177,8 @@ export function WorkGroupsPanel({
                   defaultValue={group.contracts}
                 />
               </label>
-              <button disabled={busy}>계약 변경 · 미완료 단계 재계획</button>
+              {/* 개정은 재계획하지 않는다 — 영향 단계마다 개정 시점의 단계 문맥이 사실로 그 단계 세션의 다음 턴에 전달된다(계약 v3.18 (33')). */}
+              <button disabled={busy}>계약 변경 · 영향 단계에 사실로 전달</button>
             </form>
             {questions.length > 0 && (
               <>
@@ -228,9 +206,6 @@ export function WorkGroupsPanel({
                       ? " · 대략 단계(완료 조건 미정)"
                       : ""}
                     {group.readyStages.includes(stage.id) ? " · 준비됨" : ""}
-                    {group.replanPending.includes(stage.id)
-                      ? " · 재계획 대기"
-                      : ""}
                     {delivery &&
                       ` · 커밋 ${short(delivery.committedOID) ?? "없음"} · 푸시 ${short(delivery.pushedOID) ?? "전"}`}{" "}
                     {link && (

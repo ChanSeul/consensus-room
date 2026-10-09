@@ -11,7 +11,7 @@ import type { ExternalPredecessor, PreparedMerge, StageLink, StageResult, WorkGr
 import type { AgentSettings, DeferredFinding } from "../shared/contracts.js";
 
 export interface WorkGroupServiceOptions {
-  // 열린 단계가 외부 결정(사용자 결정·외부 근거)에 막혔는가 — 엔진의 정지 분류(workflow.stageBlockedExternally)를 그대로 쓴다.
+  // 열린 단계가 외부 결정(사용자 결정)에 막혔는가 — 엔진의 정지 분류(workflow.stageBlockedExternally)를 그대로 쓴다.
   // 없으면 어떤 단계도 막힘으로 보지 않는다(선택 착수는 열린 단계가 없을 때만 된다).
   blockedExternally?: (topicId: string) => boolean;
   // 공용 위키(메모리) 루트 — 통합 단계를 열 때 단계 결과가 기록한 위키 문서의 지금 버전을 잰다.
@@ -24,7 +24,7 @@ export interface WorkGroupServiceOptions {
 export interface StageProof {
   stageId: string;
   commit: string;
-  planSHA: string;
+  planSHA: string | null;
   verification: string;
 }
 
@@ -236,8 +236,8 @@ export class WorkGroupService {
           repositoryPath: group.repositoryPath,
           worktreePath,
           baseRef: baseOID,
-          // 묶음 생성 전용 입력(없으면 기존 값). 묶음 밖 선행 작업은 토픽 참조로 잇지 않는다 — 묶음이 생성 때 동결한 원장을 모든 단계가
-          // 이어받는다(inheritedDeferredFindings → deferredFindingsFor).
+          // 묶음 생성 전용 입력(없으면 기존 값). 묶음 밖 선행 작업은 토픽 참조로 잇지 않는다 — 생성 때 묶음 레코드에 동결한 원장은 묶음
+          // 조회(GET /api/work-groups)로 본다.
           branchPrefix: group.branchPrefix ?? "consensus",
           requestedBranchName: stage.branchName ?? null,
           predecessorTopicId: null,
@@ -251,6 +251,8 @@ export class WorkGroupService {
           updatedAt: timestamp,
           lastError: null,
           agentSettings: this.settings,
+          // 단계는 ticket 으로 연다 — 단계·묶음 입력에 계획 선택이 없다(Codex 273). 계획이 필요하면 공개 방식 전환(workflow-mode)으로 planned 를 고른다.
+          workflowMode: "ticket",
         });
       if (!this.database.budgets.account(topicId))
         this.database.budgets.configure(
@@ -258,10 +260,6 @@ export class WorkGroupService {
           budget,
           "explicit-stage-budget",
         );
-      // 새 단계 토픽은 계획 제어 v2 로 시작한다(E4 2차 보완 F012) — 승계 결정·보류 지적 원문이 참조로 실려 끝까지 읽혀야 하고, 참조 전달은 계획 제어가
-      // 적용되는 턴에만 켜진다. 이력 없는 DRAFT 라 enable 이 v2 를 고르고, 이미 정책이 있으면(예약 재사용·기존 토픽) 바꾸지 않는다. 토픽 생성·링크와
-      // 같은 transaction 이라 링크가 실패하면 정책도 남지 않는다. 일반 토픽의 기본값(config.guardedPlanning)과는 무관하다.
-      this.database.planning.enable(topicId);
       // 착수 규칙은 이 서비스가 판정했다(기본 착수도 대략 단계를 건너뛰어 첫 미연결 단계가 아닐 수 있다) — 저장소의 "앞 단계부터" 규칙 대신
       // 선택 연결로 부른다. 착수 방식(기본·선택)은 생성 이벤트 payload 의 selected 로 남긴다.
       this.database.workGroups.link(id, stage.id, topicId, baseOID, {
@@ -528,13 +526,13 @@ function stageClosed(database: ConsensusDatabase, group: WorkGroup, stageId: str
   return Boolean(link) && database.getTopic(link.topicId).state === "CLOSED";
 }
 
-// 결과를 새로 동결하면 문맥(해시)이 바뀌는 열린 단계 — 단계 id → 그 결과를 문맥에 싣는 열린 단계들. 연결·재계획 때 기록한 해시로 결속된 열린 단계의
-// 문맥에는 의존 폐포(통합이면 다른 모든 단계)의 동결 결과가 든다. 재계획 대기 단계는 대기를 풀 때 해시를 다시 기록하므로 제외한다.
+// 결과를 새로 동결하면 문맥(해시)이 바뀌는 열린 단계 — 단계 id → 그 결과를 문맥에 싣는 열린 단계들. 연결·재결속 때 기록한 해시로 결속된 열린 단계의
+// 문맥에는 의존 폐포(통합이면 다른 모든 단계)의 동결 결과가 든다.
 function boundContexts(database: ConsensusDatabase, group: WorkGroup): Map<string, string[]> {
   const bound = new Map<string, string[]>();
   for (const stage of group.stages) {
     const link = group.links[stage.id];
-    if (!link?.contextDigest || link.replanPending || stageClosed(database, group, stage.id)) continue;
+    if (!link?.contextDigest || stageClosed(database, group, stage.id)) continue;
     for (const stageId of inheritedStages(group, stage)) bound.set(stageId, [...(bound.get(stageId) ?? []), stage.id]);
   }
   return bound;

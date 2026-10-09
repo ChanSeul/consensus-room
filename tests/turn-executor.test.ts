@@ -15,20 +15,22 @@ import { GitService } from "../src/server/git";
 import { EngineCore } from "../src/server/engine/core";
 import { resolveRoute } from "../src/server/turnRouting";
 import type { WorkflowState } from "../src/shared/contracts";
+import { PlanningPaused } from "../src/shared/planningControl";
 
 // PLAN §2 "다음 실행 허용" — 모델 호출은 공통 실행기(turnExecutor.ts)에서만 열리고, 허용 검사는 spawn 직전(비동기 준비 뒤·동기 마지막 검사)에 돈다.
 const temporaryDirectories: string[] = [];
 afterEach(() => { for (const directory of temporaryDirectories.splice(0)) rmSync(directory, { recursive: true, force: true }); });
 
 describe("구조 — adapter 는 공통 실행기만 부른다", () => {
-  it("engine/*.ts·workflow.ts·planning 에는 turnExecutor.ts 밖의 createSession/resumeTurn/resumePlanRepair 호출이 없다", () => {
+  // 결과 봉투 메서드도 같은 경계를 지난다(계약 v3.7 (13)) — 엔진은 core.turn 봉투 오버로드로만 부르고 어댑터를 직접 부르지 않는다.
+  it("engine/*.ts·workflow.ts·planning 에는 turnExecutor.ts 밖의 createSession/resumeTurn/resumePlanRepair·봉투 메서드 호출이 없다", () => {
     const engineDirectory = join(process.cwd(), "src", "server", "engine");
     const files = [...readdirSync(engineDirectory).map((name) => join(engineDirectory, name)), join(process.cwd(), "src", "server", "workflow.ts")];
     const offenders: string[] = [];
     for (const file of files) {
       if (file.endsWith("turnExecutor.ts")) continue;
       const source = readFileSync(file, "utf8");
-      for (const pattern of [/\.createSession\(/g, /\.resumeTurn\(/g, /\.resumePlanRepair\b/g]) {
+      for (const pattern of [/\.createSession\(/g, /\.resumeTurn\(/g, /\.resumePlanRepair\b/g, /\.createEnvelopeSession\b/g, /\.resumeEnvelopeTurn\b/g]) {
         if (pattern.test(source)) offenders.push(`${file.replace(process.cwd(), "")}: ${pattern.source}`);
       }
     }
@@ -117,24 +119,12 @@ describe("예약 해제 — spawn 직전 거부로 실제 호출이 없었던 �
     const root = mkdtempSync(join(tmpdir(), "consensus-room-ledger-")); temporaryDirectories.push(root);
     const database = new ConsensusDatabase(join(root, "room.sqlite"));
     database.createTopic({
+      workflowMode: "planned",
       id: "t", slug: "t", title: "t", repositoryPath: root, baseRef: "develop", worktreePath: root, branchName: null, state: "DRAFT",
       scopeGeneration: 1, planRevision: 0, planSHA256: null, approvedPlanSHA256: null, createdAt: "2026-09-14T00:00:00.000Z", updatedAt: "2026-09-14T00:00:00.000Z", lastError: null,
     });
     return database;
   }
-  it("RevisionLedger.release 는 카운트된 시도만 되돌리고 없는 실행은 false", () => {
-    const database = databaseWithTopic();
-    const ledger = database.revisions;
-    ledger.admit("t", "exec-1", "revision");
-    expect(ledger.account("t").used).toBe(1);
-    expect(ledger.release("t", "exec-1")).toBe(true);
-    expect(ledger.account("t").used).toBe(0);
-    expect(ledger.release("t", "exec-1")).toBe(false);
-    ledger.admit("t", "exec-2", "revision");
-    expect(ledger.release("other", "exec-2")).toBe(false);   // 다른 토픽의 실행은 건드리지 않는다
-    expect(ledger.account("t").used).toBe(1);
-    database.close();
-  });
   it("ReviewLedger.release", () => {
     const database = databaseWithTopic();
     const ledger = database.reviews;
@@ -152,7 +142,7 @@ describe("실행 허용 거부의 재개와 예약 복원", () => {
     const root = mkdtempSync(join(tmpdir(), "consensus-room-maint-")); temporaryDirectories.push(root);
     const database = new ConsensusDatabase(join(root, "room.sqlite"));
     const at = new Date().toISOString();
-    database.createTopic({ id: "t", slug: "t", title: "t", repositoryPath: root, baseRef: "develop", worktreePath: root, branchName: null, state: "DRAFT", scopeGeneration: 1, planRevision: 0, planSHA256: null, approvedPlanSHA256: null, createdAt: at, updatedAt: at, lastError: null });
+    database.createTopic({ workflowMode: "planned", id: "t", slug: "t", title: "t", repositoryPath: root, baseRef: "develop", worktreePath: root, branchName: null, state: "DRAFT", scopeGeneration: 1, planRevision: 0, planSHA256: null, approvedPlanSHA256: null, createdAt: at, updatedAt: at, lastError: null });
     for (const role of ["claude", "codex"] as const) database.upsertParticipant("t", { role, sessionId: `${role}-session`, mode: "attached", acknowledgedPlanSHA256: null });
     database.budgets.configure("t", { execution: { inputTokens: 1000, outputTokens: 1000, durationMs: 60000 }, total: { inputTokens: 100000, outputTokens: 100000, durationMs: 600000 } }, "probe");
     const lock = join(root, "maintenance.json");
@@ -160,9 +150,15 @@ describe("실행 허용 거부의 재개와 예약 복원", () => {
     const plan = REQUIRED_PLAN_HEADINGS.map((h) => `## ${h}\n\n${h}${h === "허용 오차" ? '\n\n```tolerance\n{"scopePaths":["owned.txt"],"rules":[]}\n```' : ""}`).join("\n\n");
     let claudeCalls = 0, codexCalls = 0;
     const runClaude = async (turn: { beforeSpawn?: () => void | Promise<void>; admitSync?: () => void }) => { await turn.beforeSpawn?.(); turn.admitSync?.(); claudeCalls++; return { kind: "PLAN" as const, summary: "plan", planMarkdown: plan, findings: [], evidenceRefs: [] }; };
-    const claude = { role: "claude" as const, validateExistingSession: async () => true, resumeTurn: runClaude, createSession: async (turn: Parameters<typeof runClaude>[0]) => ({ sessionId: "c", result: await runClaude(turn) }) };
+    // 계획 턴은 결과 봉투 턴이다(⑥) — 플래너 대역은 같은 spawn 전 경계를 지난 뒤 계획 폴더에 plan.md 를 쓴다.
+    const planTurn = async (turn: Parameters<typeof runClaude>[0] & { planDirectory?: string }) => {
+      await runClaude(turn); writeFileSync(join(turn.planDirectory!, "plan.md"), plan); return { message: "plan", outcome: "ready" as const };
+    };
+    const claude = { role: "claude" as const, validateExistingSession: async () => true, resumeTurn: runClaude, createSession: async (turn: Parameters<typeof runClaude>[0]) => ({ sessionId: "c", result: await runClaude(turn) }),
+      createEnvelopeSession: async (turn: Parameters<typeof planTurn>[0]) => ({ sessionId: "c", envelope: await planTurn(turn) }), resumeEnvelopeTurn: planTurn };
     const runCodex = async (turn: { beforeSpawn?: () => void | Promise<void>; admitSync?: () => void }) => { codexCalls++; writeFileSync(lock, JSON.stringify({ at: new Date().toISOString(), reason: "probe" })); await turn.beforeSpawn?.(); turn.admitSync?.(); throw new Error("unexpected spawn"); };
-    const codex = { role: "codex" as const, validateExistingSession: async () => true, resumeTurn: runCodex, createSession: async (turn: Parameters<typeof runCodex>[0]) => ({ sessionId: "x", result: await runCodex(turn) }) };
+    const codex = { role: "codex" as const, validateExistingSession: async () => true, resumeTurn: runCodex, createSession: async (turn: Parameters<typeof runCodex>[0]) => ({ sessionId: "x", result: await runCodex(turn) }),
+      createEnvelopeSession: async (turn: Parameters<typeof runCodex>[0]) => ({ sessionId: "x", envelope: await runCodex(turn) }), resumeEnvelopeTurn: runCodex };
     const { WorkflowEngine } = await import("../src/server/workflow");
     const { ArtifactStore } = await import("../src/server/artifacts");
     const engine = new WorkflowEngine({ database, artifacts: new ArtifactStore(join(root, "topics"), database),
@@ -181,25 +177,11 @@ describe("실행 허용 거부의 재개와 예약 복원", () => {
     expect(database.getFlags("t").resumeState).toBe("CODEX_AUDIT");
     database.close();
   });
-  it("CF-08: 무료 최초 계획 예약을 해제하면 자격도 돌아와 첫 실제 계획이 재작성 회차를 차감하지 않는다", () => {
-    const root = mkdtempSync(join(tmpdir(), "consensus-room-first-plan-")); temporaryDirectories.push(root);
-    const database = new ConsensusDatabase(join(root, "room.sqlite"));
-    const at = new Date().toISOString();
-    database.createTopic({ id: "u", slug: "u", title: "u", repositoryPath: root, baseRef: "develop", worktreePath: root, branchName: null, state: "DRAFT", scopeGeneration: 1, planRevision: 0, planSHA256: null, approvedPlanSHA256: null, createdAt: at, updatedAt: at, lastError: null });
-    const ledger = database.revisions;
-    ledger.admit("u", "unspawned", "plan"); ledger.release("u", "unspawned");
-    expect(ledger.account("u")).toMatchObject({ used: 0, firstPlanUsed: false });
-    ledger.admit("u", "actual", "plan");
-    expect(ledger.account("u")).toMatchObject({ used: 0, firstPlanUsed: true });
-    ledger.admit("u", "second", "plan"); ledger.release("u", "second");   // 실제 계획이 이미 돈 뒤의 해제는 자격을 되살리지 않는다
-    expect(ledger.account("u")).toMatchObject({ used: 0, firstPlanUsed: true });
-    database.close();
-  });
   it("HS-01: 서버가 샌드박스 안이면 spawn 없이 host-sandbox 로 멈추고, 샌드박스 밖에서 다시 띄운 엔진의 retry 는 같은 단계를 잇는다", async () => {
     const root = mkdtempSync(join(tmpdir(), "consensus-room-host-sandbox-")); temporaryDirectories.push(root);
     const database = new ConsensusDatabase(join(root, "room.sqlite"));
     const at = new Date().toISOString();
-    database.createTopic({ id: "t", slug: "t", title: "t", repositoryPath: root, baseRef: "develop", worktreePath: root, branchName: null, state: "DRAFT", scopeGeneration: 1, planRevision: 0, planSHA256: null, approvedPlanSHA256: null, createdAt: at, updatedAt: at, lastError: null });
+    database.createTopic({ workflowMode: "planned", id: "t", slug: "t", title: "t", repositoryPath: root, baseRef: "develop", worktreePath: root, branchName: null, state: "DRAFT", scopeGeneration: 1, planRevision: 0, planSHA256: null, approvedPlanSHA256: null, createdAt: at, updatedAt: at, lastError: null });
     for (const role of ["claude", "codex"] as const) database.upsertParticipant("t", { role, sessionId: `${role}-session`, mode: "attached", acknowledgedPlanSHA256: null });
     database.budgets.configure("t", { execution: { inputTokens: 1000, outputTokens: 1000, durationMs: 60000 }, total: { inputTokens: 100000, outputTokens: 100000, durationMs: 600000 } }, "probe");
     const lock = join(root, "maintenance.json");
@@ -207,10 +189,16 @@ describe("실행 허용 거부의 재개와 예약 복원", () => {
     const plan = REQUIRED_PLAN_HEADINGS.map((h) => `## ${h}\n\n${h}${h === "허용 오차" ? '\n\n```tolerance\n{"scopePaths":["owned.txt"],"rules":[]}\n```' : ""}`).join("\n\n");
     let claudeCalls = 0, codexCalls = 0;
     const runClaude = async (turn: { beforeSpawn?: () => void | Promise<void>; admitSync?: () => void }) => { await turn.beforeSpawn?.(); turn.admitSync?.(); claudeCalls++; return { kind: "PLAN" as const, summary: "plan", planMarkdown: plan, findings: [], evidenceRefs: [] }; };
-    const claude = { role: "claude" as const, validateExistingSession: async () => true, resumeTurn: runClaude, createSession: async (turn: Parameters<typeof runClaude>[0]) => ({ sessionId: "c", result: await runClaude(turn) }) };
+    // 계획 턴은 결과 봉투 턴이다(⑥) — 플래너 대역은 같은 spawn 전 경계를 지난 뒤 계획 폴더에 plan.md 를 쓴다.
+    const planTurn = async (turn: Parameters<typeof runClaude>[0] & { planDirectory?: string }) => {
+      await runClaude(turn); writeFileSync(join(turn.planDirectory!, "plan.md"), plan); return { message: "plan", outcome: "ready" as const };
+    };
+    const claude = { role: "claude" as const, validateExistingSession: async () => true, resumeTurn: runClaude, createSession: async (turn: Parameters<typeof runClaude>[0]) => ({ sessionId: "c", result: await runClaude(turn) }),
+      createEnvelopeSession: async (turn: Parameters<typeof planTurn>[0]) => ({ sessionId: "c", envelope: await planTurn(turn) }), resumeEnvelopeTurn: planTurn };
     // 두 번째 엔진의 감사는 CF-07 과 같은 유지보수 잠금으로 spawn 직전에 멈춰, 샌드박스 거부가 풀린 뒤 흐름이 감사까지 이어졌음을 끝에서 확인한다.
     const runCodex = async (turn: { beforeSpawn?: () => void | Promise<void>; admitSync?: () => void }) => { codexCalls++; writeFileSync(lock, JSON.stringify({ at: new Date().toISOString(), reason: "probe" })); await turn.beforeSpawn?.(); turn.admitSync?.(); throw new Error("unexpected spawn"); };
-    const codex = { role: "codex" as const, validateExistingSession: async () => true, resumeTurn: runCodex, createSession: async (turn: Parameters<typeof runCodex>[0]) => ({ sessionId: "x", result: await runCodex(turn) }) };
+    const codex = { role: "codex" as const, validateExistingSession: async () => true, resumeTurn: runCodex, createSession: async (turn: Parameters<typeof runCodex>[0]) => ({ sessionId: "x", result: await runCodex(turn) }),
+      createEnvelopeSession: async (turn: Parameters<typeof runCodex>[0]) => ({ sessionId: "x", envelope: await runCodex(turn) }), resumeEnvelopeTurn: runCodex };
     const { WorkflowEngine } = await import("../src/server/workflow");
     const settled = async () => { while (database.runningAction("t")) await new Promise((resolve) => setTimeout(resolve, 10)); };
     const detail = "/usr/bin/sandbox-exec rc 71: sandbox-exec: sandbox_apply: Operation not permitted";
@@ -222,7 +210,6 @@ describe("실행 허용 거부의 재개와 예약 복원", () => {
     const refusal = database.getTimeline("t").find((event) => event.payload?.admissionRefused === "host-sandbox");
     expect(refusal?.body).toContain(detail);
     expect(claudeCalls + codexCalls).toBe(0);                                          // 어떤 공급자도 부르지 않았다
-    expect(database.revisions.account("t")).toMatchObject({ used: 0, firstPlanUsed: false });   // 무료 최초 계획 예약도 돌아왔다
     const resumeState = database.getFlags("t").resumeState;
     const restarted = new WorkflowEngine({ database, artifacts: new ArtifactStore(join(root, "topics"), database), git, claude, codex, enforceBudgets: true, maintenanceLockPath: lock,
       hostSandbox: { kind: "available" } });
@@ -241,7 +228,7 @@ describe("실행 허용 거부의 재개와 예약 복원", () => {
     writeFileSync(join(bin, "node"), "#!/bin/sh\necho 'dyld[1]: Library not loaded: /opt/homebrew/opt/simdjson/lib/libsimdjson.33.dylib' >&2\nkill -ABRT $$\n", { mode: 0o755 });
     const database = new ConsensusDatabase(join(root, "room.sqlite"));
     const at = new Date().toISOString();
-    database.createTopic({ id: "t", slug: "t", title: "t", repositoryPath: root, baseRef: "develop", worktreePath: root, branchName: null, state: "DRAFT", scopeGeneration: 1, planRevision: 0, planSHA256: null, approvedPlanSHA256: null, createdAt: at, updatedAt: at, lastError: null });
+    database.createTopic({ workflowMode: "planned", id: "t", slug: "t", title: "t", repositoryPath: root, baseRef: "develop", worktreePath: root, branchName: null, state: "DRAFT", scopeGeneration: 1, planRevision: 0, planSHA256: null, approvedPlanSHA256: null, createdAt: at, updatedAt: at, lastError: null });
     for (const role of ["claude", "codex"] as const) database.upsertParticipant("t", { role, sessionId: `${role}-session`, mode: "attached", acknowledgedPlanSHA256: null });
     database.budgets.configure("t", { execution: { inputTokens: 1000, outputTokens: 1000, durationMs: 60000 }, total: { inputTokens: 100000, outputTokens: 100000, durationMs: 600000 } }, "probe");
     const lock = join(root, "maintenance.json");
@@ -263,10 +250,16 @@ describe("실행 허용 거부의 재개와 예약 복원", () => {
       await turn.beforeSpawn?.(); turn.admitSync?.(); claudeCalls++;
       return { kind: "PLAN" as const, summary: "plan", planMarkdown: plan, findings: [], evidenceRefs: [] };
     };
-    const claude = { role: "claude" as const, validateExistingSession: async () => true, resumeTurn: runClaude, createSession: async (turn: Parameters<typeof runClaude>[0]) => ({ sessionId: "c", result: await runClaude(turn) }) };
+    // 계획 턴은 결과 봉투 턴이다(⑥) — 플래너 대역은 같은 spawn 전 경계를 지난 뒤 계획 폴더에 plan.md 를 쓴다.
+    const planTurn = async (turn: Parameters<typeof runClaude>[0] & { planDirectory?: string }) => {
+      await runClaude(turn); writeFileSync(join(turn.planDirectory!, "plan.md"), plan); return { message: "plan", outcome: "ready" as const };
+    };
+    const claude = { role: "claude" as const, validateExistingSession: async () => true, resumeTurn: runClaude, createSession: async (turn: Parameters<typeof runClaude>[0]) => ({ sessionId: "c", result: await runClaude(turn) }),
+      createEnvelopeSession: async (turn: Parameters<typeof planTurn>[0]) => ({ sessionId: "c", envelope: await planTurn(turn) }), resumeEnvelopeTurn: planTurn };
     // HS-01 과 같다 — 감사는 유지보수 잠금으로 spawn 직전에 멈춰, retry 뒤 흐름이 감사까지 이어졌음을 끝에서 확인한다.
     const runCodex = async (turn: { beforeSpawn?: () => void | Promise<void>; admitSync?: () => void }) => { codexCalls++; writeFileSync(lock, JSON.stringify({ at: new Date().toISOString(), reason: "probe" })); await turn.beforeSpawn?.(); turn.admitSync?.(); throw new Error("unexpected spawn"); };
-    const codex = { role: "codex" as const, validateExistingSession: async () => true, resumeTurn: runCodex, createSession: async (turn: Parameters<typeof runCodex>[0]) => ({ sessionId: "x", result: await runCodex(turn) }) };
+    const codex = { role: "codex" as const, validateExistingSession: async () => true, resumeTurn: runCodex, createSession: async (turn: Parameters<typeof runCodex>[0]) => ({ sessionId: "x", result: await runCodex(turn) }),
+      createEnvelopeSession: async (turn: Parameters<typeof runCodex>[0]) => ({ sessionId: "x", envelope: await runCodex(turn) }), resumeEnvelopeTurn: runCodex };
     const { WorkflowEngine } = await import("../src/server/workflow");
     const settled = async () => { while (database.runningAction("t")) await new Promise((resolve) => setTimeout(resolve, 10)); };
     const engine = new WorkflowEngine({ database, artifacts: new ArtifactStore(join(root, "topics"), database),
@@ -277,7 +270,6 @@ describe("실행 허용 거부의 재개와 예약 복원", () => {
     expect(stop?.body).toContain("libsimdjson.33.dylib");
     expect(stop?.body).not.toContain("User file access blocked");
     expect(claudeCalls + codexCalls).toBe(0);
-    expect(database.revisions.account("t")).toMatchObject({ used: 0, firstPlanUsed: false });   // spawn 전 실패라 무료 최초 계획 예약이 돌아왔다
     broken = false;   // brew 업그레이드가 끝났다 — 서버 재시작 없이 retry 한다
     engine.retry("t"); await settled();
     expect(claudeCalls).toBe(1);
@@ -313,6 +305,7 @@ describe("E3-4c 코드 리뷰 원장 — 예산 래퍼의 예약·되돌림과 �
     const path = join(root, "room.sqlite");
     let database = new ConsensusDatabase(path);
     database.createTopic({
+      workflowMode: "planned",
       id: "t", slug: "t", title: "t", repositoryPath: root, baseRef: "develop", worktreePath: root, branchName: null, state: "CODEX_REVIEW",
       scopeGeneration: 1, planRevision: 0, planSHA256: null, approvedPlanSHA256: null, createdAt: "2026-09-26T00:00:00.000Z", updatedAt: "2026-09-26T00:00:00.000Z", lastError: null,
     });
@@ -331,7 +324,7 @@ describe("E3-4c 코드 리뷰 원장 — 예산 래퍼의 예약·되돌림과 �
     const fake: AgentAdapter = { role: "codex", validateExistingSession: async () => true,
       createSession: async (turn) => ({ sessionId: "s", result: run(turn) }), resumeTurn: async (turn) => run(turn) };
     return new BudgetController(database.budgets, () => ({ topicId: "t", accounts: ["t"], stage: "CODEX_REVIEW" }), async () => {},
-      database.revisions, budgetsEnabled, database.reviews, database).wrap(fake);
+      budgetsEnabled, database.reviews, database).wrap(fake);
   }
   const job = (operation: string) => ({ role: "reviewer", operation }) as TurnJob;
   const turn = (root: string, operation: string, prompt: string, reviewLedger?: string): SessionTurn =>
@@ -456,6 +449,7 @@ describe("E3-4c host-review 39d21df9 F004 — 프로토콜 턴이 만든 세션�
     writeFileSync(join(memory, "context-router.md"), `# Context Router\n\n${BODY}\n`);
     const database = new ConsensusDatabase(join(root, "room.sqlite"));
     database.createTopic({
+      workflowMode: "planned",
       id: "t", slug: "t", title: "t", repositoryPath: worktree, baseRef: "develop", worktreePath: worktree, branchName: null, state: "IMPLEMENTING",
       scopeGeneration: 1, planRevision: 1, planSHA256: "a".repeat(64), approvedPlanSHA256: "a".repeat(64),
       createdAt: "2026-09-26T00:00:00.000Z", updatedAt: "2026-09-26T00:00:00.000Z", lastError: null,
@@ -538,25 +532,6 @@ describe("E3-4c host-review 39d21df9 F004 — 프로토콜 턴이 만든 세션�
     database.close();
   });
 
-  it.each(["claude", "codex"] as const)("%s: 계획 제어 턴은 본문 수신 표시 없이 종전대로(조각으로 받는다) 가고, 그 뒤 첫 일반 턴이 본문을 한 번 받는다", async (provider) => {
-    const { database, runner, inAction } = executorRoom(provider);
-    const jobs = JOBS[provider];
-    writeFileSync(join(database.getTopic("t").worktreePath, provider === "claude" ? "CLAUDE.md" : "AGENTS.md"), "지시문\n");
-    database.planning.enable("t");
-    expect(database.planning.enabled("t")).toBe(true);
-    await inAction(async (turn) => {
-      const created = await turn(jobs.protocol, jobs.planningStage, null);
-      await turn(jobs.planning, jobs.planningStage, created);
-      expect(database.planning.sessionReceipt(created)).toMatchObject({ protocolCreated: true, memoryBodies: false });
-      await turn(jobs.work, "IMPLEMENTING", created);
-      expect(database.planning.sessionReceipt(created)).toMatchObject({ memoryBodies: true });
-    });
-    expect(hasBody(stdin(runner, 1))).toBe(false);
-    expect(stdin(runner, 1)).not.toContain("메모리 스냅샷 갱신");
-    expect(hasBody(stdin(runner, 2))).toBe(true);
-    database.close();
-  });
-
   it("응답을 받지 못한 호출은 수신으로 적지 않는다 — 다음 일반 턴이 본문을 다시 싣는다", async () => {
     const { database, runner, inAction } = executorRoom("codex");
     let failNext = false;
@@ -601,4 +576,64 @@ it.each(["claude", "codex"] as const)("%s CLI output schema and parser carry nul
   const parsed = await adapter.createSession({ cwd: root, prompt: "Review" });
   expect(observed).toBe(true);
   expect(parsed.result.findings.map(finding => finding.evidenceGap)).toEqual(["unavailable", "insufficient", undefined]);
+});
+
+// 재개 신원(G) — 옛 자동 복구 계보의 짝 기록은 다른 세션을 채택할 근거가 아니다. 새 세션은 중재자의 명시적 resume {replaceSession} 으로만 연다.
+describe("재개 신원 — 옛 자동 복구 계보의 짝 기록이 있어도 다른 세션 id 를 채택하지 않는다", () => {
+  it("작성자 좌석 계보에 짝 복구 기록이 있어도 다른 id 로 답한 resume 은 PlanningPaused 로 멈추고 불일치를 계보에 남긴다", async () => {
+    const root = mkdtempSync(join(tmpdir(), "consensus-room-identity-")); temporaryDirectories.push(root);
+    const worktree = join(root, "worktree");
+    mkdirSync(worktree, { recursive: true });
+    const database = new ConsensusDatabase(join(root, "room.sqlite"));
+    try {
+      database.createTopic({
+        workflowMode: "planned",
+        id: "t", slug: "t", title: "t", repositoryPath: worktree, baseRef: "develop", worktreePath: worktree, branchName: null, state: "DRAFT",
+        scopeGeneration: 1, planRevision: 0, planSHA256: null, approvedPlanSHA256: null,
+        createdAt: "2026-10-09T00:00:00.000Z", updatedAt: "2026-10-09T00:00:00.000Z", lastError: null,
+      });
+      // 연속성 정책 v2 — 작성자 좌석의 신원 변경을 계보에 남기는 대상이다(시작 전 계획 토픽에만 켜진다).
+      database.planning.enable("t");
+      expect(database.planning.continuityEnabled("t")).toBe(true);
+      // 옛 자동 복구가 남긴 짝 기록(claude-1 → claude-2). 지금은 이 기록을 만드는 경로가 없다.
+      database.planning.saveRecoveryLineage("t", "planner", { anchor: null, sessions: ["claude-1", "claude-2"], blocked: null, recoveries: [{
+        at: "2026-10-08T00:00:00.000Z", reason: "session-missing", fromSession: "claude-1", toSession: "claude-2", compaction: "automatic-only",
+        contract: { stage: "CLAUDE_PLAN", scopeGeneration: 1, planEpoch: 0, planSHA256: null, binding: null }, baseline: {},
+        error: { provider: "claude", code: "session-missing", message: "옛 자동 복구" },
+      }] });
+      const resumed: string[] = [];
+      const claude: AgentAdapter = { role: "claude", validateExistingSession: async () => true,
+        createSession: async () => { throw new Error("이 검사는 resume 만 연다"); },
+        resumeTurn: async (turn) => {
+          resumed.push(turn.sessionId);
+          turn.onSessionCreated?.("claude-2");
+          return { kind: "PLAN", summary: "짝 기록의 세션이 답했습니다.", findings: [], evidenceRefs: [] };
+        } };
+      const idle: AgentAdapter = { role: "codex", validateExistingSession: async () => true,
+        createSession: async () => { throw new Error("쓰지 않는 좌석"); }, resumeTurn: async () => { throw new Error("쓰지 않는 좌석"); } };
+      const core = new EngineCore({ database, artifacts: new ArtifactStore(join(root, "topics"), database), git: new GitService(new SpawnCommandRunner()),
+        claude, codex: idle });
+      let failure: unknown = null;
+      core.startAction("t", "identity", async (signal) => {
+        database.updateTopic("t", { state: "CLAUDE_PLAN" });
+        const topic = database.getTopic("t");
+        const route = resolveRoute(database, topic, { role: "planner", operation: "plan" });
+        try {
+          await core.executor.execute({ route, topic, signal, purpose: "턴", inputSequence: database.timelineCount("t"),
+            expected: core.expectationOf(topic), session: { mode: "resume", sessionId: "claude-1" }, prompt: "계획 턴입니다.", settings: route.settings });
+        } catch (error) { failure = error; }
+      });
+      const deadline = Date.now() + 10_000;
+      while (database.runningAction("t")) {
+        if (Date.now() > deadline) throw new Error("action 이 끝나지 않았습니다.");
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(resumed).toEqual(["claude-1"]);
+      expect(failure).toBeInstanceOf(PlanningPaused);
+      expect((failure as Error).message).toContain("다른 세션 ID");
+      const lineage = database.planning.currentRecoveryLineage("t", "planner");
+      expect(lineage.blocked).toMatchObject({ reason: "identity-mismatch", sessions: { requested: "claude-1", returned: "claude-2" } });
+      expect(lineage.recoveries.map((recovery) => [recovery.fromSession, recovery.toSession])).toEqual([["claude-1", "claude-2"]]);
+    } finally { database.close(); }
+  });
 });

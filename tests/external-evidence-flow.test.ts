@@ -1,6 +1,3 @@
-import { DiagnosisService } from "../src/server/engine/diagnoses";
-import { DiagnosisInputSchema } from "../src/shared/diagnoses";
-import { EvidenceAssessmentPipeline } from "../src/server/engine/evidenceAssessment";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { execFile } from "node:child_process";
@@ -20,6 +17,7 @@ import { buildApp, listenReady } from "../src/server/app";
 import { loadConfig } from "../src/server/config";
 import { ProjectMemoryReader } from "../src/server/projectMemory";
 import type { AgentAdapter, CommandRunner } from "../src/server/types";
+import { relayFactsFrom } from "../src/shared/prompts";
 
 // Public workflow and HTTP entry points. Assertions target spawned calls, retained result and final topic state.
 const roots: string[] = []; const dbs: ConsensusDatabase[] = [];
@@ -71,7 +69,8 @@ it("registering an unrelated group root preserves a running scoped stage and its
     expect(clear).not.toHaveBeenCalled();
   } finally {f.database.finishAction("busy","succeeded");await app.close();dbs.splice(dbs.indexOf(f.database),1);}
 });
-it("승인을 전파하는 새 루트는 실행 중 선택 단계를 보호하고 유휴 때 승인을 무효화한다", async () => {
+// 근거 범위 변경은 토픽을 초기화하지 않는다(CR 흐름 단순화 D6). 실행 중인 소비 토픽의 입력은 계속 보호한다.
+it("승인을 전파하는 새 루트는 실행 중 선택 단계를 보호하고 유휴 때 전파하되 계획 승인은 보존한다", async () => {
   const f=fixture(),c=f.database.evidence.catalog;
   const selected=c.add("t",{url:"https://www.figma.com/design/form?node-id=1-2",label:"Selected",scope:"topic",required:true,mode:"connector",intervalSeconds:900},true);
   const groupId="11111111-1111-4111-8111-111111111111";
@@ -102,107 +101,62 @@ it("승인을 전파하는 새 루트는 실행 중 선택 단계를 보호하�
     expect(clear).not.toHaveBeenCalled();
     f.database.finishAction("busy","succeeded");
     expect((await app.inject(request)).statusCode).toBe(200);
-    expect(clear).toHaveBeenCalledWith("t");
-    expect(f.database.getTopic("t").approvedPlanSHA256).toBeNull();
+    expect(c.state("t").entries.find(e=>e.source.url===url)?.state).toBe("approved");
+    expect(f.database.getTopic("t")).toMatchObject({ state:"AWAITING_USER_APPROVAL", planSHA256:"f".repeat(64), approvedPlanSHA256:"f".repeat(64) });
   } finally {f.database.finishAction("busy","succeeded");await app.close();dbs.splice(dbs.indexOf(f.database),1);}
+});
+// 79fc4fc5 F011: 근거 선택 변경은 실제 변경 사실만 system 사실(evidence-selection)로 남긴다 — 사용자 발언으로 꾸미거나 재계획·세션 초기화를 지시하지
+// 않는다. 작업 그룹 근거 연결도 같은 사실(그룹 id)로 남는다.
+it("evidence selection changes are recorded as system facts without replanning or session-reset instructions", async () => {
+  const f=fixture(),c=f.database.evidence.catalog;
+  f.database.updateTopic("t",{state:"DRAFT"});
+  const groupId="11111111-1111-4111-8111-111111111111";
+  f.database.workGroups.create(groupId,{title:"Form",goal:"Form",contracts:"Scope",stages:[
+    {id:"ui",kind:"work",title:"UI",goal:"Layout",acceptance:"Verified",dependsOn:[]},
+    {id:"all",kind:"integration",title:"All",goal:"All",acceptance:"Verified",dependsOn:["ui"]},
+  ]},f.root,"a".repeat(40));
+  const config=loadConfig({repositoryPath:f.root,dataDirectory:f.root,webDirectory:join(f.root,"no-web"),launchToken:"test-token",enforceBudgets:false});
+  const app=await buildApp({config,database:f.database,runner:f.runner,claude:f.adapter,codex:{...f.adapter,role:"codex"}});
+  const headers={"x-consensus-token":"test-token"};
+  try {
+    expect((await app.inject({method:"POST",url:"/api/topics/t/evidence/roots",headers,payload:{
+      url:"https://docs.google.com/spreadsheets/d/policy/edit",label:"Policy",scope:"topic",required:true,mode:"connector",intervalSeconds:900}})).statusCode).toBe(200);
+    const afterRoot=c.version("t");
+    expect((await app.inject({method:"POST",url:"/api/topics/t/evidence/group",headers,payload:{groupId,version:afterRoot}})).statusCode).toBe(200);
+    const timeline=f.database.getTimeline("t");
+    const facts=timeline.filter(event=>(event.payload.workerFact as {kind?:unknown}|undefined)?.kind==="evidence-selection");
+    expect(facts.map(event=>[event.actor,event.kind])).toEqual([["system","system"],["system","system"]]);
+    expect(facts.map(event=>event.payload.workerFact)).toEqual([
+      {kind:"evidence-selection",catalogVersion:afterRoot},{kind:"evidence-selection",catalogVersion:c.version("t"),groupId}]);
+    expect(timeline.filter(event=>event.actor==="user"&&event.kind==="note")).toEqual([]);
+    const relayed=relayFactsFrom(timeline).messages!;
+    expect(relayed.filter(message=>message.kind==="evidence-selection")).toHaveLength(2);
+    for (const body of [...timeline.map(event=>event.body),...relayed.map(message=>message.body)])
+      for (const phrase of ["다시 계획","세션도 새로 시작"]) expect(body).not.toContain(phrase);
+  } finally {await app.close();dbs.splice(dbs.indexOf(f.database),1);}
 });
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "evidence-flow-")); roots.push(root);
   const database = new ConsensusDatabase(join(root, "room.sqlite")); dbs.push(database);
   const topic = database.createTopic({ id: "t", slug: "t", title: "Feature", repositoryPath: root, worktreePath: root, baseRef: "main", branchName: "work",
     state: "IMPLEMENTING", scopeGeneration: 1, planRevision: 1, planSHA256: "a".repeat(64), approvedPlanSHA256: "a".repeat(64),
-    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), lastError: null });
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), lastError: null, workflowMode: "planned" });
   const source = database.evidence.register(topic.id, sourceInput);
   const ingest = (content: string) => {
     const check = database.evidence.begin(source.id, true)!;
     return database.evidence.ingest(source.id, { checkId: check.checkId, revision: content, units: [{ id: "issue", kind: "issue", content }] });
   };
-  ingest("initial"); database.evidence.review(topic, database.evidence.topic(topic).digest, "Compared with plan", topic);
+  ingest("initial");
   const runner: CommandRunner = { run: vi.fn(async () => ({ exitCode: 0, stdout: "", stderr: "", jsonLines: [] })) };
   const adapter: AgentAdapter = { role: "claude", validateExistingSession: async () => true,
     createSession: vi.fn(async turn => { await turn.beforeSpawn?.(); turn.admitSync?.(); return { sessionId: "s", result: { kind: "IMPLEMENTATION", summary: "result", findings: [] } as any }; }),
-    resumeTurn: vi.fn(async () => { throw new Error("unused"); }) };
+    resumeTurn: vi.fn(async () => { throw new Error("unused"); }),
+    // 운영 계획·구현은 결과 봉투 왕복(relay)으로 이 메서드들을 부른다. 기본값은 실패해, 도달한 테스트가 스스로 응답을 정하게 한다.
+    createEnvelopeSession: vi.fn(async () => { throw new Error("unused envelope"); }),
+    resumeEnvelopeTurn: vi.fn(async () => { throw new Error("unused envelope"); }) };
   const dependencies = { database, artifacts: new ArtifactStore(join(root, "topics"), database), git: new GitService(runner), claude: adapter, codex: { ...adapter, role: "codex" as const }, enforceBudgets: false };
   return { root, database, topic, source, ingest, runner, adapter, dependencies };
 }
-it.each([
-  { status: "completed" as const, requestedMediatorAction: "Run the authorized comparison" },
-  { status: "blocked" as const }, { status: "in_progress" as const }, { status: "completed" as const, remainingSteps: ["Read current design"] },
-])("incomplete evidence result cannot satisfy the approval prerequisite: %j", async incomplete => {
-  const f = fixture();
-  const plan = await f.dependencies.artifacts.write("t", "plan", 1, "Current plan");
-  f.database.updateTopic("t", { state: "AWAITING_USER_APPROVAL", planSHA256: plan.sha256, approvedPlanSHA256: null });
-  f.adapter.createSession = async turn => {
-    await turn.beforeSpawn?.(); turn.admitSync?.();
-    return { sessionId: "review", result: { kind: "EVIDENCE_NO_IMPACT", summary: "Not finished", findings: [], evidenceRefs: [], ...incomplete } };
-  };
-  f.adapter.resumeTurn = async () => ({ kind: "EVIDENCE_NO_IMPACT", summary: "Not finished", findings: [], evidenceRefs: [], ...incomplete });
-  const core = new EngineCore(f.dependencies);
-  new EvidenceAssessmentPipeline(core).reviewCurrent("t", "review");
-  await core.active.get("t")!.completion;
-  expect(f.database.evidence.automation.jobs("t")[0]).toMatchObject({ status: "failed", summary: expect.stringContaining("미완료") });
-  expect(f.database.evidence.topic(f.database.getTopic("t")).reviewed).toBe(false);
-  expect(f.database.getTopic("t").approvedPlanSHA256).toBeNull();
-});
-
-it("five thousand design renders reach evidence review with bounded CLI permissions", { timeout: 30_000 }, async () => {
-  const f = fixture();
-  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lWQAAAAASUVORK5CYII=", "base64");
-  const check = f.database.evidence.begin(f.source.id, true)!;
-  f.database.evidence.ingest(f.source.id, { checkId: check.checkId, revision: "large-design", units: Array.from({ length: 5000 }, (_, i) => {
-    const data = Buffer.from(`frame\0${i}`), chunk = Buffer.concat([Buffer.from("tEXt"), data]);
-    const length = Buffer.alloc(4), checksum = Buffer.alloc(4);
-    length.writeUInt32BE(data.length); checksum.writeUInt32BE(crc32(chunk));
-    const image = Buffer.concat([png.subarray(0, -12), length, chunk, checksum, png.subarray(-12)]);
-    return { id: String(i), kind: "render" as const, content: `Frame ${i}`, imageBase64: image.toString("base64") };
-  }) });
-  const plan = await f.dependencies.artifacts.write("t", "plan", 1, "Inspect relevant design frames");
-  f.database.updateTopic("t", { state: "AWAITING_USER_APPROVAL", planSHA256: plan.sha256, approvedPlanSHA256: null });
-  let checked = false;
-  const directories: string[] = [];
-  const imageReads = vi.spyOn(f.database.evidence, "image");
-  f.adapter.createSession = async turn => {
-    await turn.beforeSpawn?.(); turn.admitSync?.();
-    // The review of the revised plan also reads the previous accepted review's input and the previous plan; the count stays fixed.
-    expect(turn.readablePaths).toHaveLength(directories.length ? 7 : 5);
-    expect(Buffer.byteLength(turn.prompt)).toBeLessThan(10_000);
-    const settings = buildIsolationSettings(f.root, join(f.root, "action"), false, { readablePaths: turn.readablePaths }) as any;
-    expect(Buffer.byteLength(JSON.stringify(settings))).toBeLessThan(20_000);
-    const directory = turn.readablePaths!.at(-1)!;
-    directories.push(directory);
-    expect(settings.permissions.allow).toContain(`Read(/${directory}/**)`);
-    const snapshot = f.database.evidence.sourceSnapshot(f.database.evidence.get(f.source.id))!;
-    const image = snapshot.units.at(-1)!;
-    expect(readFileSync(join(directory, `${image.imageHash}.png`)).subarray(0, 8)).toEqual(png.subarray(0, 8));
-    checked = true;
-    return { sessionId: "review", result: { kind: "EVIDENCE_NO_IMPACT", summary: "Checked referenced frame", status: "completed", findings: [], evidenceRefs: [] } };
-  };
-  const core = new EngineCore(f.dependencies);
-  new EvidenceAssessmentPipeline(core).reviewCurrent("t", "review");
-  await core.active.get("t")!.completion;
-  expect(checked).toBe(true);
-  expect(f.database.evidence.topic(f.database.getTopic("t")).reviewed).toBe(true);
-  expect(imageReads).toHaveBeenCalledTimes(5000);
-  const next = await f.dependencies.artifacts.write("t", "plan", 2, "Revise text with the same design images");
-  f.database.updateTopic("t", { planSHA256: next.sha256 });
-  new EvidenceAssessmentPipeline(core).reviewCurrent("t", "review-again");
-  await core.active.get("t")!.completion;
-  expect(f.database.evidence.topic(f.database.getTopic("t")).reviewed).toBe(true);
-  expect(imageReads).toHaveBeenCalledTimes(5000);
-  expect(directories[1]).not.toBe(directories[0]);
-  const hash = f.database.evidence.sourceSnapshot(f.database.evidence.get(f.source.id))!.units.at(-1)!.imageHash!;
-  const first = join(directories[0], `${hash}.png`), second = join(directories[1], `${hash}.png`);
-  expect(statSync(second).ino).toBe(statSync(first).ino);
-  // A modified shared inode invalidates the cached verification before another model call.
-  writeFileSync(first, "tampered");
-  const third = await f.dependencies.artifacts.write("t", "plan", 3, "Third plan");
-  f.database.updateTopic("t", { planSHA256: third.sha256 });
-  new EvidenceAssessmentPipeline(core).reviewCurrent("t", "review-tampered");
-  await core.active.get("t")!.completion;
-  expect(directories).toHaveLength(2);
-  expect(f.database.evidence.topic(f.database.getTopic("t")).reviewed).toBe(false);
-  expect(f.database.evidence.automation.jobs("t")[0]).toMatchObject({ status: "failed", summary: expect.stringContaining("캐시가 변경") });
-});
 it("marks unchanged wiki files for rechecking when their actual source hash changes", async () => {
   const f = fixture();
   const dependency = { sourceId: f.source.id, contentHash: f.database.evidence.get(f.source.id).contentHash! };
@@ -217,58 +171,18 @@ it("marks unchanged wiki files for rechecking when their actual source hash chan
   f.database.evidence.failed(f.source.id, check.checkId, "Access denied");
   expect(await reader.buildPrompt("Reference", "claude")).toContain("외부 근거: unavailable");
 });
-it("blocks the actual spawn if a source changes during adapter preparation", async () => {
-  const f = fixture(); let spawned = false;
-  f.adapter.createSession = async turn => {
-    f.ingest("new"); await turn.beforeSpawn?.(); turn.admitSync?.(); spawned = true;
-    return { sessionId: "s", result: {} as any };
-  };
-  const core = new EngineCore(f.dependencies);
-  core.startAction(f.topic.id, "evidence-test", async signal => {
-    await core.executor.execute({ route: core.route(f.topic, { role: "implementer", operation: "implement" }), topic: f.topic, signal, purpose: "턴", inputSequence: 0, expected: core.expectationOf(f.topic),
-      session: { mode: "create" }, prompt: "Implement", settings: { model: "opus", effort: "high" } });
-  });
-  await core.active.get(f.topic.id)!.completion;
-  expect(spawned).toBe(false); expect(f.database.getTopic(f.topic.id).state).toBe("BLOCKED_ON_EVIDENCE");
-});
-it("preserves an in-flight result without accepting it when source content changes", async () => {
-  const f = fixture(); let accepted = false;
-  f.adapter.createSession = async () => { f.ingest("new"); return { sessionId: "s", result: { kind: "IMPLEMENTATION", summary: "old evidence result", findings: [], evidenceRefs: [], status: "completed" } as any }; };
-  const core = new EngineCore(f.dependencies);
-  core.startAction(f.topic.id, "evidence-test", async signal => {
-    await core.executor.execute({ route: core.route(f.topic, { role: "implementer", operation: "implement" }), topic: f.topic, signal, purpose: "턴", inputSequence: 0, expected: core.expectationOf(f.topic),
-      session: { mode: "create" }, prompt: "Implement", settings: { model: "opus", effort: "high" } });
-    accepted = true;
-  });
-  await core.active.get(f.topic.id)!.completion;
-  expect(accepted).toBe(false); expect(f.database.getTopic(f.topic.id).state).toBe("BLOCKED_ON_EVIDENCE");
-  expect(await f.dependencies.artifacts.readLatest(f.topic.id, "claude-interrupted")).toContain("old evidence result");
-});
-it("guards unreviewed content changes but allows unavailable evidence to be deferred", async () => {
+// 원문 내용 변경은 커밋·push 를 막지 않는다(D6 — 원문 영향 검토 표시는 게이트가 아니다). 인도 자체의 검사와 미수집 원문의 이연은 그대로다.
+it("does not gate delivery on unreviewed content changes or on evidence that needs rechecking", async () => {
   const f = fixture(); f.database.updateTopic(f.topic.id, { state: "READY_TO_DELIVER" });
   const workflow = new WorkflowEngine(f.dependencies); f.ingest("new");
-  expect(() => workflow.commit(f.topic.id, "commit", ["x"])).toThrow("검토");
-  expect(() => workflow.push(f.topic.id)).toThrow("검토");
+  await expect(workflow.commit(f.topic.id, "commit", ["x"])).rejects.toThrow("최종 리뷰가 확인한 변경 스냅샷이 없습니다");
   expect(f.runner.run).not.toHaveBeenCalled();
   let now = Date.now(); vi.spyOn(Date, "now").mockImplementation(() => now);
-  f.database.evidence.review(f.database.getTopic(f.topic.id), f.database.evidence.topic(f.topic).digest, "Checked change", f.database.getTopic(f.topic.id));
   now += 601_000;
+  expect(f.database.evidence.fresh(f.database.evidence.get(f.source.id))).toBe(false);
   await expect(workflow.push(f.topic.id)).rejects.toThrow("확정한 커밋");
 });
-it("rejects a plan repair response when its source changed during the call", async () => {
-  const f = fixture(); let accepted = false;
-  f.adapter.resumePlanRepair = async () => { f.ingest("New planning decision"); return {} as any; };
-  const core = new EngineCore(f.dependencies);
-  core.startAction(f.topic.id, "evidence-repair-test", async signal => {
-    await core.executor.executePlanRepair({ route: core.route(f.topic, { role: "planner", operation: "plan-repair" }), topic: f.topic, signal, purpose: "계획 교정", inputSequence: 0,
-      expected: core.expectationOf(f.topic), session: { mode: "resume", sessionId: "s" }, prompt: "Repair format",
-      settings: { model: "opus", effort: "high" } });
-    accepted = true;
-  });
-  await core.active.get(f.topic.id)!.completion;
-  expect(accepted).toBe(false); expect(f.database.getTopic(f.topic.id).state).toBe("BLOCKED_ON_EVIDENCE");
-});
-it("serves authenticated bridge APIs, rejects stale completions and enforces mediator review authority", async () => {
+it("serves authenticated bridge APIs and rejects stale completions", async () => {
   const f = fixture();
   const config = loadConfig({ repositoryPath: f.root, dataDirectory: f.root, databasePath: join(f.root, "room.sqlite"), topicsDirectory: join(f.root, "topics"),
     worktreesDirectory: join(f.root, "worktrees"), webDirectory: join(f.root, "no-web"), launchToken: "test-token", enforceBudgets: false });
@@ -283,11 +197,7 @@ it("serves authenticated bridge APIs, rejects stale completions and enforces med
   const repeated = await app.inject({ method: "POST", url: `/api/evidence/${f.source.id}/snapshot`, headers,
     payload: { checkId: check.checkId, revision: "v1", units: [] } });
   expect(repeated.statusCode).toBe(409);
-  const state = (await app.inject({ method: "GET", url: "/api/topics/t/evidence", headers })).json();
-  expect(state.reviewed).toBe(false);
-  const denied = await app.inject({ method: "POST", url: "/api/topics/t/evidence/review", headers: { "x-consensus-actor": "mediator" }, payload: { digest: state.digest, plan: state.plan, reason: "Reviewed" } });
-  expect(denied.statusCode).toBe(401);
-  expect((await app.inject({ method: "POST", url: "/api/topics/t/evidence/review", headers: { ...headers, "x-consensus-actor": "mediator" }, payload: { digest: state.digest, plan: state.plan, reason: "Reviewed source and plan" } })).statusCode).toBe(200);
+  expect((await app.inject({ method: "GET", url: "/api/topics/t/evidence", headers })).statusCode).toBe(200);
   expect((await app.inject({ method: "POST", url: "/api/evidence/status", headers, payload: { dependencies: [{ sourceId: f.source.id, contentHash: update.json().contentHash }] } })).json()).toEqual({ status: "current" });
   const address = await listenReady(app, { host: "127.0.0.1", port: 0 });
   const launchFile = join(f.root, "launch.url");
@@ -299,27 +209,6 @@ it("serves authenticated bridge APIs, rejects stale completions and enforces med
   await expect(promisify(execFile)("python3", ["scripts/evidence-bridge.py", "--launch-file", launchFile, "due"]))
     .rejects.toMatchObject({ code: 1, stderr: "Expected the existing local Consensus Room launch URL\n" });
   await app.close(); dbs.splice(dbs.indexOf(f.database), 1);
-});
-
-it.each([
-  { planSHA256: "b".repeat(64) }, { planEpoch: 2 }, { scopeGeneration: 2 },
-])("rejects review submitted for a previous plan binding: %j", async change => {
-  const f = fixture();
-  const config = loadConfig({ repositoryPath: f.root, dataDirectory: f.root, webDirectory: join(f.root, "no-web"), launchToken: "test-token", enforceBudgets: false });
-  const app = await buildApp({ config, database: f.database, runner: f.runner, claude: f.adapter, codex: { ...f.adapter, role: "codex" } });
-  const headers = { "x-consensus-token": "test-token" };
-  try {
-    const previous = (await app.inject({ method: "GET", url: "/api/topics/t/evidence", headers })).json();
-    f.database.updateTopic(f.topic.id, change);
-    const review = await app.inject({ method: "POST", url: "/api/topics/t/evidence/review", headers,
-      payload: { digest: previous.digest, plan: previous.plan, reason: "Compared the previous plan" } });
-    expect(review.statusCode).toBe(409);
-    expect(f.database.evidence.topic(f.database.getTopic(f.topic.id)).reviewed).toBe(false);
-    const current = (await app.inject({ method: "GET", url: "/api/topics/t/evidence", headers })).json();
-    expect((await app.inject({ method: "POST", url: "/api/topics/t/evidence/review", headers,
-      payload: { digest: current.digest, plan: current.plan, reason: "Compared the updated plan" } })).statusCode).toBe(200);
-    expect(f.database.evidence.topic(f.database.getTopic(f.topic.id)).reviewed).toBe(true);
-  } finally { await app.close(); }
 });
 
 it("uses mediator HTTP and CLI batches without model calls or implicit acknowledgement", async () => {
@@ -381,7 +270,6 @@ it.each(["missing", "expired", "failed"])("admits planning and implementation wi
   const core = new EngineCore(f.dependencies);
   for (const implementation of [false, true]) {
     const topic = f.database.updateTopic(f.topic.id, { state: implementation ? "IMPLEMENTING" : "CLAUDE_PLAN" });
-    f.database.evidence.review(topic, f.database.evidence.topic(topic).digest, "Product behavior checked; visual details deferred", topic);
     let accepted = false;
     core.startAction(topic.id, "design-test", async signal => {
       await core.executor.execute({ route: core.route(topic, implementation ? { role: "implementer", operation: "implement" } : { role: "planner", operation: "plan" }),
@@ -402,7 +290,7 @@ it("bridge 가 작은 쪽 크기로 큰 단위를 구간으로 끝까지 받고,
   const database = new ConsensusDatabase(join(root, "room.sqlite")); dbs.push(database);
   const topic = database.createTopic({ id: "t", slug: "t", title: "Pages", repositoryPath: root, worktreePath: root, baseRef: "main", branchName: "work",
     state: "AWAITING_USER_APPROVAL", scopeGeneration: 1, planRevision: 1, planSHA256: "a".repeat(64), approvedPlanSHA256: "a".repeat(64),
-    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), lastError: null });
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), lastError: null, workflowMode: "planned" });
   const source = database.evidence.register(topic.id, { url: "https://team.atlassian.net/browse/APP-2", label: "Big", mode: "rest", intervalSeconds: 300 });
   // 한국어·이모지(서로게이트 쌍)·JSON escape(따옴표·역슬래시·개행·제어 문자)가 섞인 최대 길이(160,000 UTF-16 코드 단위) 본문.
   const alphabet = ["가", "😀", '"', "\\", "\n", "\u0001", "a", "é"];
@@ -495,7 +383,8 @@ it("bridge 가 작은 쪽 크기로 큰 단위를 구간으로 끝까지 받고,
 it("마지막 응답과 원문 없는 주제의 batchId:null 응답도 요청한 쪽 크기 안에서만 돌려주고, 넘치면 최소 바이트와 함께 409 다", async () => {
   const root = mkdtempSync(join(tmpdir(), "evidence-final-page-")); roots.push(root);
   const database = new ConsensusDatabase(join(root, "room.sqlite")); dbs.push(database);
-  const base = { repositoryPath: root, worktreePath: root, baseRef: "main", branchName: "work", state: "AWAITING_USER_APPROVAL" as const, scopeGeneration: 1,
+  const base = { repositoryPath: root, worktreePath: root, baseRef: "main", branchName: "work", state: "AWAITING_USER_APPROVAL" as const,
+    workflowMode: "planned" as const, scopeGeneration: 1,
     planRevision: 1, planSHA256: "a".repeat(64), approvedPlanSHA256: "a".repeat(64), createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), lastError: null };
   const topic = database.createTopic({ ...base, id: "t", slug: "t", title: "Final page" });
   database.createTopic({ ...base, id: "empty", slug: "empty", title: "No evidence", worktreePath: join(root, "empty") });
@@ -596,7 +485,7 @@ it("connects a standalone topic to its registered group evidence through the idl
     expect((await select(groupId,before.version)).statusCode).toBe(200);
     const connected=(await app.inject({method:"GET",url:route,headers})).json();
     expect(connected.sources.map((s:any)=>s.url).sort()).toEqual([sourceInput.url,...urls].sort());
-    expect(f.database.getTopic("t").planSHA256).toBeNull();
+    expect(f.database.getTopic("t").planSHA256).toBe("a".repeat(64));
     expect(f.database.getTopic("completed")).toEqual(completed);
     expect(f.database.workGroups.get(groupId)).toEqual(group);
     expect((await select(null,before.version)).statusCode).toBe(409);
@@ -628,14 +517,13 @@ it("frozen HTTP and mediator readers return the committed body after shared upda
   } finally {await app.close();dbs.splice(dbs.indexOf(f.database),1);}
 });
 
-it.each([false,true])("legacy committed evidence migrates without permanently freezing expiration or re-review: %s",(changed)=>{
+it.each([false,true])("legacy committed evidence migrates without permanently freezing expiration: %s",(changed)=>{
   const f=fixture();if(changed)f.ingest("changed before migration");const now=Date.now();vi.spyOn(Date,"now").mockReturnValue(now+3_600_000);
   const raw=new DatabaseSync(join(f.root,"room.sqlite"));
   try {raw.prepare("UPDATE topics SET committed_oid=?,state='READY_TO_DELIVER' WHERE id='t'").run("b".repeat(40));} finally {raw.close();}
   f.database.evidence.freezeFinalized();
   const topic=f.database.getTopic("t"),state=f.database.evidence.topic(topic);
-  expect(state).toMatchObject({ready:true,reviewed:!changed});
-  if(changed)f.database.evidence.review(topic,state.digest,"Explicitly rechecked migrated body",topic);
+  expect(state).toMatchObject({ready:true});
   expect(()=>f.database.evidence.assertReady(topic)).not.toThrow();
 });
 
@@ -643,7 +531,6 @@ it.each([false,true])("frozen corpus uses committed hashes with an existing inde
   const f=fixture();f.database.evidence.catalog.add("t",{...sourceInput,scope:"topic",required:false},true);
   f.database.updateTopic("t",{planSHA256:"a".repeat(64),state:"READY_TO_DELIVER"});
   const topic=f.database.getTopic("t"),before=f.database.evidence.topic(topic);
-  f.database.evidence.review(topic,before.digest,"Original body checked",topic);
   f.database.updateTopic("t",{committedOID:"b".repeat(40)});
   const adapter=withEvidence(f.adapter,f.database,join(f.root,"images"));
   if(existingIndex)await adapter.createSession({cwd:f.root,prompt:"Review"});
@@ -654,71 +541,79 @@ it.each([false,true])("frozen corpus uses committed hashes with an existing inde
   expect(entries).toHaveLength(1);expect(JSON.parse(readFileSync(entries[0].path,"utf8")).content).toBe("initial");
 });
 
-it("the user and delegated mediator can explicitly re-review migrated closed committed evidence through HTTP",async()=>{
-  const f=fixture();f.ingest("changed after historical approval");
+// 공식 commit 뒤 재진입(F009 resume reentry)은 확정 커밋의 근거 동결을 다시 연다(cd2876b7 F017). 다시 연 작업은 같은 승인 원문의 현재 버전을 읽고,
+// 다음 commit 은 그 근거를 동결한다. 첫 커밋의 동결 기록은 그대로 남고, 재진입 중 재시작(freezeFinalized)은 현재 입력을 다시 얼리지 않는다.
+const commitEvidence=(f:ReturnType<typeof fixture>,oid:string)=>{
+  const topic=f.database.getTopic("t");f.database.evidence.bindCommitInput(topic,f.database.evidence.captureForCommit(topic),oid);
+  f.database.updateTopic("t",{committedOID:oid});
+};
+const frozenRecords=(f:ReturnType<typeof fixture>)=>{
   const raw=new DatabaseSync(join(f.root,"room.sqlite"));
-  try {raw.prepare("UPDATE topics SET state='CLOSED',committed_oid=? WHERE id='t'").run("b".repeat(40));} finally {raw.close();}
-  f.database.evidence.freezeFinalized();const before=f.database.evidence.topic(f.database.getTopic("t"));
-  expect(before.reviewed).toBe(false);
+  try {return raw.prepare("SELECT binding,record FROM evidence_frozen_topics").all().map(row=>({key:JSON.parse(String(row.binding)) as unknown[],
+    digest:String(JSON.parse(String(row.record)).digest)}));} finally {raw.close();}
+};
+it("공식 commit 뒤 재진입은 같은 승인 원문의 새 버전을 읽고 다음 commit 이 그 근거를 동결하며, 첫 커밋 기록은 그대로다", async () => {
+  const f=fixture(),db=f.database;db.evidence.catalog.add("t",{...sourceInput,scope:"topic",required:false},true);
+  db.updateTopic("t",{state:"READY_TO_DELIVER"});
+  commitEvidence(f,"b".repeat(40));
+  const v1=db.evidence.topic(db.getTopic("t")).digest;
+  f.ingest("second version");
+  expect(db.evidence.topic(db.getTopic("t")).digest).toBe(v1);
+  db.applyTopicTransition({topicId:"t",changes:{state:"CLAUDE_FIX"},reopenEvidence:true,events:[]});
+  const v2=db.evidence.topic(db.getTopic("t")).digest;
+  expect(v2).not.toBe(v1);expect(db.evidence.isFrozen(db.getTopic("t"))).toBe(false);
   const config=loadConfig({repositoryPath:f.root,dataDirectory:f.root,webDirectory:join(f.root,"no-web"),launchToken:"test-token",enforceBudgets:false});
-  const app=await buildApp({config,database:f.database,runner:f.runner,claude:f.adapter,codex:{...f.adapter,role:"codex"}});
-  const headers={"x-consensus-token":"test-token"},payload={digest:before.digest,plan:before.plan,reason:"Explicitly reviewed retained body"};
+  const app=await buildApp({config,database:db,runner:f.runner,claude:f.adapter,codex:{...f.adapter,role:"codex"},
+    evidenceConnector:{configured:()=>false,fetch:async()=>{throw Error("Reopened evidence reads the collected body");}}});
+  const headers={"x-consensus-token":"test-token"};
   try {
-    const url="/api/topics/t/evidence/review";
-    expect((await app.inject({method:"POST",url,headers:{...headers,"x-consensus-actor":"mediator"},payload})).statusCode).toBe(200);
-    expect((await app.inject({method:"POST",url,headers,payload})).statusCode).toBe(200);
-    expect(f.database.getTopic("t").state).toBe("CLOSED");
-    expect(f.database.evidence.topic(f.database.getTopic("t"))).toMatchObject({digest:before.digest,reviewed:true,ready:true});
-  } finally {await app.close();dbs.splice(dbs.indexOf(f.database),1);}
+    const search=await app.inject({method:"POST",url:"/api/topics/t/evidence/search",headers,payload:{query:"second"}});
+    expect(search.json().total).toBe(1);const hit=search.json().hits[0];
+    const read=await app.inject({method:"POST",url:"/api/topics/t/evidence/read",headers,payload:{sourceId:hit.sourceId,unitId:hit.unitId,hash:hit.hash}});
+    expect(read.json().content).toBe("second version");
+    await withEvidence(f.adapter,db,join(f.root,"images")).createSession({cwd:f.root,prompt:"Fix"});
+    const entries=readFileSync(join(f.root,"images","corpus","t",v2,"index.jsonl"),"utf8").split("\n").map(line=>JSON.parse(line));
+    expect(entries.map(entry=>JSON.parse(readFileSync(entry.path,"utf8")).content)).toEqual(["second version"]);
+    // 재진입 중 재시작 — 기동의 freezeFinalized 는 다시 연 현재 입력을 얼리지 않는다.
+    db.evidence.freezeFinalized();
+    expect(db.evidence.isFrozen(db.getTopic("t"))).toBe(false);expect(db.evidence.topic(db.getTopic("t")).digest).toBe(v2);
+    // 재리뷰 뒤 두 번째 commit 은 지금 근거(v2)를 동결한다 — 그 뒤 수집한 판은 이 커밋의 근거가 아니다.
+    db.updateTopic("t",{state:"READY_TO_DELIVER"});
+    commitEvidence(f,"c".repeat(40));
+    f.ingest("third version");
+    expect(db.evidence.isFrozen(db.getTopic("t"))).toBe(true);expect(db.evidence.topic(db.getTopic("t")).digest).toBe(v2);
+    db.evidence.freezeFinalized();
+    expect(db.evidence.topic(db.getTopic("t")).digest).toBe(v2);
+    // 첫 커밋의 동결 기록(키 [topic, binding])은 v1 그대로이고, 두 번째 commit 은 다시 연 커밋 OID 를 덧붙인 키로 따로 남는다.
+    expect(frozenRecords(f).map(record=>[record.key.length,record.digest])).toEqual(expect.arrayContaining([[2,v1],[3,v2]]));
+    expect(frozenRecords(f)).toHaveLength(2);
+    // 두 번째 확정 커밋을 다시 열고 commit 이 실패해(근거 체크포인트만 새로 잡힘) 새 commit 없이 닫혀도, 전달 커밋(두 번째)의 근거 v2 를 보존한다.
+    db.applyTopicTransition({topicId:"t",changes:{state:"CLAUDE_FIX"},reopenEvidence:true,events:[]});
+    expect(db.evidence.topic(db.getTopic("t")).digest).not.toBe(v2);
+    db.updateTopic("t",{state:"READY_TO_DELIVER"});db.evidence.captureForCommit(db.getTopic("t"));
+    db.updateTopic("t",{state:"CLOSED"});
+    expect(db.evidence.topic(db.getTopic("t")).digest).toBe(v2);
+  } finally {await app.close();dbs.splice(dbs.indexOf(db),1);}
 });
 
-
-it("queues changes during work, reviews once when idle, and never approves or resumes stopped topics", async()=>{
-  const f=fixture();
-  const plan=await f.dependencies.artifacts.write("t","plan",1,"Current approved plan");
-  f.database.updateTopic("t",{planSHA256:plan.sha256,approvedPlanSHA256:plan.sha256});
-  const core=new EngineCore(f.dependencies), pipeline=new EvidenceAssessmentPipeline(core);
-  f.adapter.createSession=vi.fn(async turn=>{
-    await turn.beforeSpawn?.(); turn.admitSync?.();
-    return {sessionId:"impact",result:{kind:"EVIDENCE_NO_IMPACT" as const,summary:"No change to the current plan",planEdits:[],findings:[],evidenceRefs:[]}};
-  });
-  // EngineCore has wrapped the supplied adapter already; use the existing mutable adapter entry.
-  pipeline.poll(); expect(core.active.size).toBe(0);
-  let release!:()=>void; const pending=new Promise<void>(resolve=>{release=resolve;});
-  core.startAction("t","existing",async()=>pending);
-  f.ingest("Changed policy"); pipeline.poll();
-  expect(f.database.evidence.automation.jobs("t")[0].status).toBe("pending");
-  expect(f.adapter.createSession).not.toHaveBeenCalled();
-  release(); await core.active.get("t")!.completion;
-  pipeline.poll(); const running=core.active.get("t"); expect(running).toBeDefined(); await running!.completion;
-  expect(f.database.evidence.automation.jobs("t")[0]).toMatchObject({status:"complete",outcome:"no-impact"});
-  expect(f.database.evidence.topic(f.database.getTopic("t")).reviewed).toBe(false);
-  pipeline.poll(); expect(f.adapter.createSession).toHaveBeenCalledTimes(1);
-  f.database.updateTopic("t",{state:"USER_DECISION_REQUIRED"}); f.ingest("Another change"); pipeline.poll();
-  expect(f.database.evidence.automation.jobs("t")[0].status).toBe("pending");
-  expect(f.adapter.createSession).toHaveBeenCalledTimes(1); expect(f.database.getTopic("t").state).toBe("USER_DECISION_REQUIRED");
+// 재진입 뒤 새 commit 없이 닫으면 다시 동결한다 — 전달되는 커밋은 다시 연 확정 커밋이라 그 커밋의 근거를 보존한다(master 결정 07:19). commit 입력 없이
+// 동결된 옛 토픽(:502·:520-524 모양)은 다시 열 때 현재였던 동결 기록으로 보존한다(Codex 306 반례).
+it("commit 입력 없이 동결된 커밋을 재진입하고 새 commit 없이 닫으면 원래 동결 기록의 근거로 다시 동결한다", () => {
+  const f=fixture(),db=f.database;db.evidence.catalog.add("t",{...sourceInput,scope:"topic",required:false},true);
+  db.updateTopic("t",{state:"READY_TO_DELIVER",committedOID:"b".repeat(40)});db.evidence.freezeFinalized();
+  const v1=db.evidence.topic(db.getTopic("t")).digest;
+  f.ingest("second version");
+  db.applyTopicTransition({topicId:"t",changes:{state:"CLAUDE_FIX"},reopenEvidence:true,events:[]});
+  expect(db.evidence.isFrozen(db.getTopic("t"))).toBe(false);
+  db.updateTopic("t",{state:"READY_TO_DELIVER"});
+  db.updateTopic("t",{state:"CLOSED"});
+  expect(db.evidence.isFrozen(db.getTopic("t"))).toBe(true);expect(db.evidence.topic(db.getTopic("t")).digest).toBe(v1);
+  db.evidence.freezeFinalized();
+  expect(db.evidence.topic(db.getTopic("t")).digest).toBe(v1);
+  expect(frozenRecords(f).map(record=>[record.key.length,record.digest])).toEqual(expect.arrayContaining([[2,v1],[3,v1]]));
 });
 
-it.each([true,false])("keeps child baselines while a collection slice temporarily hides its links (required=%s)",async(required)=>{
-  const f=fixture();
-  const root=f.database.evidence.catalog.add("t",{...sourceInput,scope:"topic",required},true);
-  f.database.updateTopic("t",{state:"USER_DECISION_REQUIRED",planSHA256:"a".repeat(64)});
-  let sliced=false,child="Original child";
-  const service=new EvidenceService(f.database.evidence,{fetch:async()=>{throw Error("unused");}},()=>{},undefined,{configured:()=>true,fetch:async()=>{throw Error("unused");},discover:async(source,cursor)=>{
-    if(source.id!==root.sourceId)return {units:[{id:"body",kind:"issue",content:child}],links:[],cursor:null,revision:"child",connectionKey:"account"};
-    const n=Number(cursor??0),end=!sliced||n===20;
-    return {units:n===0?[{id:"body",kind:"issue",content:"Parent"}]:[],links:end?[{url:"https://team.atlassian.net/browse/APP-2",label:"Child",unitId:"body",relation:"child"}]:[],cursor:end?null:String(n+1),revision:"parent",connectionKey:"account"};
-  }});
-  const pipeline=new EvidenceAssessmentPipeline(new EngineCore(f.dependencies));
-  try{
-    await service.collect(root.id);expect(f.database.evidence.topic(f.database.getTopic("t")).ready).toBe(true);pipeline.poll();expect(f.database.evidence.automation.jobs("t")).toHaveLength(0);
-    sliced=true;child="Changed child";await service.collect(root.id,true);expect(f.database.evidence.topic(f.database.getTopic("t")).ready).toBe(true);pipeline.poll();expect(f.database.evidence.automation.jobs("t")).toHaveLength(0);
-    await service.collect(root.id);expect(f.database.evidence.topic(f.database.getTopic("t")).ready).toBe(true);pipeline.poll();
-    expect(f.database.evidence.automation.jobs("t")[0]).toMatchObject({status:"pending",changes:[{sourceId:f.database.evidence.list("t").find(s=>s.resource.endsWith("APP-2"))!.id}]});
-  }finally{await service.stop();}
-});
-
-it.each(["host", "native", "cached"] as const)("%s 수집 승인 전파는 optional 루트의 실행과 현재 별칭을 보호한다", async mode => {
+it.each(["host", "native", "cached"] as const)("%s 수집 승인 전파는 optional 루트의 실행과 현재 별칭을 보호하고 유휴 때 전파해도 계획 승인은 보존한다", async mode => {
   const f=fixture(), db=f.database, c=db.evidence.catalog;
   db.evidence.detach("t",f.source.id);
   db.updateTopic("t",{state:"DRAFT"});
@@ -747,7 +642,6 @@ it.each(["host", "native", "cached"] as const)("%s 수집 승인 전파는 optio
   db.updateTopic("t",{state:"AWAITING_USER_APPROVAL",planSHA256:"f".repeat(64),approvedPlanSHA256:"f".repeat(64)});
   db.startAction({id:"busy-discovery",topicId:"t",kind:"test",status:"running",createdAt:new Date().toISOString(),finishedAt:null,error:null,pid:null,pgid:null,processExecutable:null,processCommand:null,processStartedAt:null});
   const clear=vi.spyOn(ArtifactStore.prototype,"clearCurrentAliases");
-  const stale=vi.spyOn(DiagnosisService.prototype,"staleOnReplan");
   await new ArtifactStore(join(f.root,"topics"),db).write("t","plan",1,"approved plan alias");
   const request=async(overrides:Record<string,unknown>={})=>{
     const source=db.evidence.get(collecting.sourceId);
@@ -772,51 +666,15 @@ it.each(["host", "native", "cached"] as const)("%s 수집 승인 전파는 optio
       {units:[{id:"dup",kind:"issue",content:url},{id:"dup",kind:"issue",content:url}]}]) {
       expect((await request(invalid)).statusCode).toBeGreaterThanOrEqual(400);
       expect(clear).not.toHaveBeenCalledWith("t");
-      expect(stale).not.toHaveBeenCalled();
       expect(readFileSync(join(f.root,"topics/t/plan.md"),"utf8")).toBe("approved plan alias");
       expect(c.state("t").entries.find(e=>e.source.url===url)?.state).toBe("candidate");
     }
     if (mode!=="native") c.requestRefresh(collecting.id);
     const result=await request(); expect(result.statusCode,result.body).toBe(200);
     expect(c.state("t").entries.find(e=>e.source.url===url)?.state).toBe("approved");
-    expect(db.getTopic("t").approvedPlanSHA256).toBeNull();
-    expect(clear).toHaveBeenCalledWith("t");
+    expect(db.getTopic("t")).toMatchObject({ state:"AWAITING_USER_APPROVAL", approvedPlanSHA256:"f".repeat(64) });
   } finally {db.finishAction("busy-discovery","succeeded");await app.close();dbs.splice(dbs.indexOf(db),1);}
 });
-
-it("승인 별칭 정리 대기 중 새 소비자가 생기면 최종 변경을 거부한다", async () => {
-  const f=fixture(),db=f.database,c=db.evidence.catalog;
-  db.updateTopic("t",{state:"DRAFT"});
-  db.createTopic({...f.topic,id:"u",slug:"u",state:"DRAFT"});
-  const selected=c.add("u",{url:"https://www.figma.com/design/race?node-id=1-2",label:"Selected",scope:"topic",required:false,mode:"connector",intervalSeconds:900},true);
-  const groupId="11111111-1111-4111-8111-111111111113";
-  db.workGroups.create(groupId,{title:"Scoped",goal:"Scoped",contracts:"Scope",stages:[
-    {id:"ui",kind:"work",title:"UI",goal:"Layout",acceptance:"Verified",dependsOn:[],evidenceRootIds:[selected.id]},
-    {id:"all",kind:"integration",title:"All",goal:"All",acceptance:"Verified",dependsOn:["ui"]},
-  ]},f.root,"a".repeat(40));
-  db.workGroups.link(groupId,"ui","u","a".repeat(40));
-  const url="https://docs.google.com/spreadsheets/d/race-policy/edit";
-  const config=loadConfig({repositoryPath:f.root,dataDirectory:f.root,webDirectory:join(f.root,"no-web"),launchToken:"test-token",enforceBudgets:false});
-  const app=await buildApp({config,database:db,runner:f.runner,claude:f.adapter,codex:{...f.adapter,role:"codex"}});
-  const original=ArtifactStore.prototype.clearCurrentAliases;
-  let injected=false;
-  vi.spyOn(ArtifactStore.prototype,"clearCurrentAliases").mockImplementation(async function(this: ArtifactStore, id){
-    await original.call(this,id);
-    if (!injected) {
-      injected=true;
-      c.acceptPage(selected,db.evidence.get(selected.sourceId),null,{revision:"new",cursor:null,units:[],links:[{url,label:"policy",unitId:"body",relation:"link"}]});
-      db.updateTopic("u",{state:"AWAITING_USER_APPROVAL",planSHA256:"f".repeat(64),approvedPlanSHA256:"f".repeat(64)});
-    }
-  });
-  try {
-    const response=await app.inject({method:"POST",url:"/api/topics/t/evidence/roots",headers:{"x-consensus-token":"test-token"},payload:{url,label:"Policy",scope:"workspace",required:true,mode:"connector",intervalSeconds:900}});
-    expect(response.statusCode).toBe(409);
-    expect(c.roots().some(r=>r.scope==="workspace")).toBe(false);
-    expect(c.state("u").entries.find(e=>e.source.url===url)?.state).toBe("candidate");
-    expect(db.getTopic("u").approvedPlanSHA256).toBe("f".repeat(64));
-  } finally {await app.close();dbs.splice(dbs.indexOf(db),1);}
-});
-
 
 it("같은 루트의 candidate를 child로 재발견해도 실제 승인 변경이 없으면 현재 계획을 보존한다", async () => {
   const f=fixture(),db=f.database,c=db.evidence.catalog;
@@ -830,16 +688,14 @@ it("같은 루트의 candidate를 child로 재발견해도 실제 승인 변경�
   await f.dependencies.artifacts.write("t","plan",1,"unchanged plan");
   const engine=new WorkflowEngine(f.dependencies);
   const connector={configured:()=>true,fetch:async()=>{throw Error("unused");},discover:async()=>({revision:"r2",cursor:null,units:[],links:[{...link,relation:"child" as const}]})};
-  const service=new EvidenceService(db.evidence,connector,undefined,undefined,connector);
+  const service=new EvidenceService(db.evidence,connector,undefined,connector);
   service.canPublish=id=>engine.canPublishEvidence(id);
   service.publishSelection=(guarded,publish)=>engine.publishEvidence(guarded,publish);
-  const stale=vi.spyOn(DiagnosisService.prototype,"staleOnReplan");
   try {
     await service.collect(root.id);
     expect(c.state("t").entries.find(e=>e.source.url===url)?.state).toBe("candidate");
     expect(db.getTopic("t").approvedPlanSHA256).toBe("f".repeat(64));
     expect(readFileSync(join(f.root,"topics/t/plan.md"),"utf8")).toBe("unchanged plan");
-    expect(stale).not.toHaveBeenCalled();
   } finally {await service.stop();}
 });
 
@@ -879,7 +735,6 @@ it.each(["refreshed-graph", "invalid-last-page"] as const)("%s 수집은 변경�
   const config=loadConfig({repositoryPath:f.root,dataDirectory:f.root,webDirectory:join(f.root,"no-web"),launchToken:"test-token",enforceBudgets:false});
   const connector={configured:()=>true,fetch:async()=>{throw Error("unused");},discover:async(source:any)=>({revision:"new",cursor:null,units:[{id:"body",kind:"issue" as const,content:"different last page"}],links:source.id===collecting.sourceId ? [link] : []})};
   const app=await buildApp({config,database:db,runner:f.runner,claude:f.adapter,codex:{...f.adapter,role:"codex"},nativeEvidenceConnector:connector});
-  const stale=vi.spyOn(DiagnosisService.prototype,"staleOnReplan");
   const originalHash=db.evidence.get(collecting.sourceId).contentHash;
   try {
     const response=await app.inject({method:"POST",url:"/api/topics/u/evidence/collect",headers:{"x-consensus-token":"test-token","x-consensus-actor":"mediator"},payload:{}});
@@ -887,7 +742,6 @@ it.each(["refreshed-graph", "invalid-last-page"] as const)("%s 수집은 변경�
     expect(c.state("t").entries.find(e=>e.source.url===url)?.state).toBe("candidate");
     expect(db.getTopic("t").approvedPlanSHA256).toBe("f".repeat(64));
     expect(readFileSync(join(f.root,"topics/t/plan.md"),"utf8")).toBe("preserved plan");
-    expect(stale).not.toHaveBeenCalled();
     if (mode==="invalid-last-page") {
       expect(db.evidence.get(collecting.sourceId).collection?.status).toBe("error");
       expect(db.evidence.get(collecting.sourceId).contentHash).toBe(originalHash);
@@ -949,14 +803,13 @@ async function waitingPlan() {
   for (const role of ["claude", "codex"] as const) f.database.upsertParticipant("t", {
     role, sessionId: `pending:${role}`, mode: "created", acknowledgedPlanSHA256: null,
   });
-  f.database.revisions.configure("t", 3, f.database.revisions.account("t").version);
   f.database.reviews.configure("t", "planning", 3, f.database.reviews.account("t", "planning").version);
   const catalog = f.database.evidence.catalog;
   const root = catalog.add("t", { ...sourceInput, scope: "topic", required: true }, false);
   const engine = new WorkflowEngine(f.dependencies);
   const action = engine.startPlan("t");
   await vi.waitFor(() => expect(f.database.getAction(action)?.status).toBe("succeeded"));
-  expect(f.adapter.createSession).not.toHaveBeenCalled();
+  expect(f.adapter.createEnvelopeSession).not.toHaveBeenCalled();
   const complete = () => {
     if (catalog.roots().find(item => item.id === root.id)?.status !== "approved")
       catalog.select("t", { version: catalog.version("t"), rootId: root.id, action: "approve" });
@@ -967,13 +820,13 @@ async function waitingPlan() {
       revision: "complete", missing: [], units: [{ id: "body", kind: "issue", content: "Confirmed contract" }],
     });
   };
-  vi.mocked(f.adapter.createSession).mockImplementation(async () => { throw Error("Reached planning adapter"); });
+  vi.mocked(f.adapter.createEnvelopeSession!).mockImplementation(async () => { throw Error("Reached planning adapter"); });
   return { ...f, engine, evidenceRoot: root, complete };
 }
 
-it("resumes a requested plan once after evidence invalidation and a server restart", async () => {
+it("resumes a requested plan once after root approval and a server restart", async () => {
   const f = await waitingPlan();
-  // Re-approval uses the same invalidation path as discovered-source selection.
+  // Root approval goes through the same selection path as a discovered source.
   const catalog = f.database.evidence.catalog;
   await f.engine.changeEvidenceSelection(["t"], () => catalog.select("t", {
     version: catalog.version("t"), rootId: f.evidenceRoot.id, action: "approve",
@@ -985,11 +838,11 @@ it("resumes a requested plan once after evidence invalidation and a server resta
   resumed.pollEvidenceAssessments();
   resumed.pollEvidenceAssessments();
   await vi.waitFor(() => expect(database.runningAction("t")).toBeNull());
-  expect(f.adapter.createSession).toHaveBeenCalledTimes(1);
+  expect(f.adapter.createEnvelopeSession).toHaveBeenCalledTimes(1);
   expect(database.getTopic("t").lastError).toContain("Reached planning adapter");
   expect(database.getTopic("t").approvedPlanSHA256).toBeNull();
   resumed.pollEvidenceAssessments();
-  expect(f.adapter.createSession).toHaveBeenCalledTimes(1);
+  expect(f.adapter.createEnvelopeSession).toHaveBeenCalledTimes(1);
 });
 
 it.each(["stop", "scope", "assignment"])("cancels evidence resume after %s, including after restart", async change => {
@@ -1002,115 +855,7 @@ it.each(["stop", "scope", "assignment"])("cancels evidence resume after %s, incl
   const restarted = new WorkflowEngine(f.dependencies);
   restarted.pollEvidenceAssessments();
   expect(f.database.runningAction("t")).toBeNull();
-  expect(f.adapter.createSession).not.toHaveBeenCalled();
-});
-
-it("keeps implementation waiting for evidence review and drops its intent when selection invalidates approval", async () => {
-  const f = await waitingPlan();
-  f.database.updateTopic("t", { state: "BLOCKED_ON_EVIDENCE", resumeState: "IMPLEMENTING", planSHA256: "b".repeat(64), approvedPlanSHA256: "b".repeat(64) });
-  const action = f.engine.retry("t");
-  await vi.waitFor(() => expect(f.database.getAction(action)?.status).toBe("succeeded"));
-  f.complete();
-  f.engine.pollEvidenceAssessments();
-  expect(f.database.runningAction("t")).toBeNull();
-  expect(f.adapter.createSession).not.toHaveBeenCalled();
-  const catalog = f.database.evidence.catalog;
-  await f.engine.changeEvidenceSelection(["t"], () => catalog.select("t", {
-    version: catalog.version("t"), rootId: f.evidenceRoot.id, action: "approve",
-  }));
-  f.complete();
-  f.engine.pollEvidenceAssessments();
-  expect(f.database.getTopic("t").approvedPlanSHA256).toBeNull();
-  expect(f.database.runningAction("t")).toBeNull();
-  expect(f.adapter.createSession).not.toHaveBeenCalled();
-});
-
-// Delivery stopped on changed evidence: the stored review's source versions are the base of what one retry reviews.
-async function changedEvidenceStop(after: Array<{ id: string; content: string }>) {
-  const f = fixture();
-  const ingest = (revision: string, units: typeof after) => {
-    const check = f.database.evidence.begin(f.source.id, true)!;
-    f.database.evidence.ingest(f.source.id, { checkId: check.checkId, revision, units: units.map(unit => ({ ...unit, kind: "issue" as const })) });
-  };
-  ingest("before", [{ id: "get_metadata:0", content: "Currently selected nodes:\n- 9:9: Elsewhere\n" }, { id: "get_metadata:1", content: "<frame id=\"1:2\"/>" }]);
-  const plan = await f.dependencies.artifacts.write("t", "plan", 1, "Current approved plan");
-  f.database.updateTopic("t", { planSHA256: plan.sha256, approvedPlanSHA256: plan.sha256 });
-  const topic = f.database.getTopic("t");
-  f.database.evidence.review(topic, f.database.evidence.topic(topic).digest, "Checked against the plan", topic);
-  ingest("after", after);
-  f.database.updateTopic("t", { state: "BLOCKED_ON_EVIDENCE", resumeState: "IMPLEMENTING" });
-  const engine = new WorkflowEngine(f.dependencies);
-  const resumed = vi.spyOn((engine as any).delivery, "resumeDelivery").mockResolvedValue(undefined);
-  const prompts: string[] = [], packets: unknown[] = [];
-  const answer = (kind: string) => vi.mocked(f.adapter.createSession).mockImplementation(async turn => {
-    await turn.beforeSpawn?.(); turn.admitSync?.(); prompts.push(turn.prompt);
-    const packet = /변경 전후 자료 (\S+)/.exec(turn.prompt)?.[1];
-    if (packet) packets.push(JSON.parse(readFileSync(packet, "utf8")));
-    return { sessionId: "review", result: { kind, summary: `Assessed: ${kind}`, planEdits: [], findings: [], evidenceRefs: [] } as any };
-  });
-  const retry = async () => { engine.retry("t"); await vi.waitFor(() => expect(f.database.runningAction("t")).toBeNull()); };
-  return { ...f, engine, resumed, prompts, packets, answer, retry };
-}
-
-it("one retry reviews the changes since the recorded review, records it, then resumes the stored stage", async () => {
-  // The selection echo disappeared, so the remaining part moved to index 0. Unit ids are compared as recorded.
-  const f = await changedEvidenceStop([{ id: "get_metadata:0", content: "<frame id=\"1:2\"/>" }]);
-  f.answer("EVIDENCE_NO_IMPACT");
-  await f.retry();
-  expect(f.packets).toEqual([[expect.objectContaining({ sourceId: f.source.id, units: [
-    { id: "get_metadata:0", before: expect.objectContaining({ content: expect.stringContaining("Currently selected nodes") }), after: expect.objectContaining({ content: "<frame id=\"1:2\"/>" }) },
-    { id: "get_metadata:1", before: expect.objectContaining({ content: "<frame id=\"1:2\"/>" }), after: null },
-  ] })]]);
-  const topic = f.database.getTopic("t"), evidence = f.database.evidence.topic(topic);
-  expect(evidence.reviewed).toBe(true);
-  expect(f.database.evidence.reviewedManifest(topic)).toEqual({ [f.source.id]: evidence.sources[0].contentHash });
-  expect(f.resumed).toHaveBeenCalledTimes(1);
-  expect(topic.state).toBe("IMPLEMENTING");
-});
-
-it("a changed value stays in the review packet when the same values exist in other units", async () => {
-  const f = await changedEvidenceStop([{ id: "get_metadata:0", content: "Currently selected nodes:\n- 9:9: Elsewhere\n" }, { id: "get_metadata:1", content: "Currently selected nodes:\n- 9:9: Elsewhere\n" }]);
-  f.answer("EVIDENCE_NO_IMPACT");
-  await f.retry();
-  // get_metadata:1 changed to a value another unit already had; the old value also survives elsewhere.
-  expect(f.packets).toEqual([[expect.objectContaining({ units: [
-    { id: "get_metadata:1", before: expect.objectContaining({ content: "<frame id=\"1:2\"/>" }), after: expect.objectContaining({ content: expect.stringContaining("Currently selected nodes") }) },
-  ] })]]);
-});
-
-it("an impacting change stops the resumed stage for a decision before any delivery work", async () => {
-  const f = await changedEvidenceStop([{ id: "get_metadata:0", content: "<frame id=\"1:2\" removed=\"section\"/>" }]);
-  f.answer("EVIDENCE_REPLAN");
-  await f.retry();
-  const topic = f.database.getTopic("t");
-  expect(topic.state).toBe("USER_DECISION_REQUIRED");
-  expect(f.database.getFlags("t").resumeState).toBe("CLAUDE_REVISION");
-  expect(f.database.getTimeline("t").at(-1)?.payload).toMatchObject({ evidenceAssessmentDecision: true });
-  expect(f.database.evidence.topic(topic).reviewed).toBe(false);
-  expect(f.resumed).not.toHaveBeenCalled();
-});
-
-it("a retry keeps the review without a model call when only the evidence listing changed", async () => {
-  const f = await changedEvidenceStop([{ id: "get_metadata:0", content: "Currently selected nodes:\n- 9:9: Elsewhere\n" }, { id: "get_metadata:1", content: "<frame id=\"1:2\"/>" }]);
-  // A review recorded under an older catalog listing: same source versions, different digest.
-  const raw = new DatabaseSync(join(f.root, "room.sqlite"));
-  raw.prepare("UPDATE evidence_reviews SET digest=? WHERE topic_id='t'").run("0".repeat(64)); raw.close();
-  expect(f.database.evidence.topic(f.database.getTopic("t")).reviewed).toBe(false);
-  await f.retry();
-  expect(f.adapter.createSession).not.toHaveBeenCalled();
-  expect(f.database.evidence.topic(f.database.getTopic("t")).reviewed).toBe(true);
-  expect(f.resumed).toHaveBeenCalledTimes(1);
-});
-
-it("a review recorded without source versions makes the retry check the whole plan once", async () => {
-  const f = await changedEvidenceStop([{ id: "get_metadata:0", content: "<frame id=\"1:2\"/>" }]);
-  const raw = new DatabaseSync(join(f.root, "room.sqlite"));
-  raw.prepare("UPDATE evidence_reviews SET manifest=NULL WHERE topic_id='t'").run(); raw.close();
-  f.answer("EVIDENCE_NO_IMPACT");
-  await f.retry();
-  expect(f.prompts).toHaveLength(1); expect(f.prompts[0]).toContain("최초 검토도 포함");
-  expect(f.database.evidence.topic(f.database.getTopic("t")).reviewed).toBe(true);
-  expect(f.resumed).toHaveBeenCalledTimes(1);
+  expect(f.adapter.createEnvelopeSession).not.toHaveBeenCalled();
 });
 
 it("does not retry a budget refusal on every collection poll", async () => {
@@ -1119,7 +864,7 @@ it("does not retry a budget refusal on every collection poll", async () => {
   f.database.budgets.start({ id: "unfinished", accounts: ["t"], startedAt: Date.now(), stage: "CLAUDE_PLAN", role: "claude", model: "test", effort: "low" });
   const gated = new WorkflowEngine({ ...f.dependencies, enforceBudgets: true });
   gated.pollEvidenceAssessments(); gated.pollEvidenceAssessments();
-  expect(f.adapter.createSession).not.toHaveBeenCalled();
+  expect(f.adapter.createEnvelopeSession).not.toHaveBeenCalled();
   expect(f.database.runningAction("t")).toBeNull();
   expect(f.database.getTimeline("t").filter(event => (event.payload?.evidenceResume as any)?.blocked)).toHaveLength(1);
 });
@@ -1132,7 +877,7 @@ it("resumes ready evidence while an unrelated topic is running", async () => {
   f.complete();
   f.engine.pollEvidenceAssessments();
   await vi.waitFor(() => expect(f.database.runningAction("t")).toBeNull());
-  expect(f.adapter.createSession).toHaveBeenCalledTimes(1);
+  expect(f.adapter.createEnvelopeSession).toHaveBeenCalledTimes(1);
   expect(f.database.runningAction("other")?.id).toBe("other-action");
   f.database.finishAction("other-action", "succeeded");
 });
@@ -1164,37 +909,29 @@ it("exposes a pending evidence resume and cancellation through the web activity 
     expect((await app.inject({ method: "GET", url: "/api/topics/t/activity", headers })).json().evidenceResumePending).toBe(false);
     f.complete();
     f.engine.pollEvidenceAssessments();
-    expect(f.adapter.createSession).not.toHaveBeenCalled();
+    expect(f.adapter.createEnvelopeSession).not.toHaveBeenCalled();
   } finally { await app.close(); dbs.splice(dbs.indexOf(f.database), 1); }
 });
 
-// Engine policy: failed source collection is recorded as To-do, while real source-version changes
-// and explicit approvals remain covered by the admission tests above.
-it("starts an approved plan with failed evidence, records its To-do once, and excludes its cache", async () => {
+// 원문 수집 실패는 계획 시작을 막지 않고, 실패한 원문의 옛 캐시는 근거 묶음에서 빠진다. 실패 사실은 source-error 로 전달된다(external-evidence 검사).
+it("starts a requested plan with failed evidence and excludes the failed source's cache", async () => {
   const f = fixture();
   f.database.updateTopic("t", { state: "DRAFT", planSHA256: null, approvedPlanSHA256: null });
   for (const role of ["claude", "codex"] as const) f.database.upsertParticipant("t", {
     role, sessionId: `pending:${role}`, mode: "created", acknowledgedPlanSHA256: null,
   });
-  f.database.revisions.configure("t", 3, f.database.revisions.account("t").version);
   f.database.reviews.configure("t", "planning", 3, f.database.reviews.account("t", "planning").version);
   f.database.evidence.catalog.add("t", { ...sourceInput, scope: "topic", required: true }, true);
   const check = f.database.evidence.begin(f.source.id, true)!;
   f.database.evidence.failed(f.source.id, check.checkId, "HTTP 404", 300);
-  vi.mocked(f.adapter.createSession).mockImplementation(async turn => {
-    expect(turn.prompt).toContain("To-do");
-    throw Error("Planning actually started");
-  });
+  vi.mocked(f.adapter.createEnvelopeSession!).mockImplementation(async () => { throw Error("Planning actually started"); });
   const engine = new WorkflowEngine(f.dependencies);
   const action = engine.startPlan("t");
   await vi.waitFor(() => expect(f.database.getAction(action)?.status).toBe("failed"));
-  expect(f.adapter.createSession).toHaveBeenCalledTimes(1);
+  expect(f.adapter.createEnvelopeSession).toHaveBeenCalledTimes(1);
   expect(f.database.getTopic("t").lastError).toContain("Planning actually started");
   expect(f.database.evidence.resumes.get("t")).toBeNull();
   expect(f.database.evidence.catalog.state("t").coverage.ready).toBe(false);
-  const todos = JSON.parse((await f.dependencies.artifacts.readLatest("t", "deferred-findings"))!);
-  expect(todos.findings).toHaveLength(1);
-  expect(todos.findings[0]).toMatchObject({ source: "evidence", rationale: expect.stringContaining("HTTP 404") });
   expect(f.database.evidence.usableSources(f.database.getTopic("t"))).toEqual([]);
   expect(f.database.evidence.packet(f.database.getTopic("t"), "claude").text).not.toContain('"content":"initial"');
 });
@@ -1204,48 +941,13 @@ it("defers unavailable source content without treating collection failure as a c
   const check = f.database.evidence.begin(f.source.id, true)!;
   f.database.evidence.failed(f.source.id, check.checkId, "Connection unavailable", 300);
   const state = f.database.evidence.topic(f.topic);
-  expect(state).toMatchObject({ ready: true, reviewed: true, digest: before.digest,
+  expect(state).toMatchObject({ ready: true, digest: before.digest,
     deferred: [expect.objectContaining({ sourceId: f.source.id, reason: "Connection unavailable" })] });
   expect(() => f.database.evidence.assertReady(f.topic)).not.toThrow();
   const later = Date.now() + 301_000; vi.spyOn(Date, "now").mockReturnValue(later);
   f.database.evidence.releaseCheck(f.source.id, check.checkId);
   f.ingest("changed contract");
-  expect(f.database.evidence.topic(f.topic).reviewed).toBe(false);
-});
-
-it.each([
-  { requiresUserDecision: false, evidenceRef: sourceInput.url, evidenceGap: "insufficient" as const, shouldDefer: true },
-  { requiresUserDecision: false, evidenceRef: sourceInput.url, evidenceGap: undefined, shouldDefer: false },
-  { requiresUserDecision: true, evidenceRef: sourceInput.url, evidenceGap: "insufficient" as const, shouldDefer: false },
-  { requiresUserDecision: false, evidenceRef: "https://ci.example.com/required-test-log", shouldDefer: false },
-])("records source gaps as To-do and preserves decisions and mandatory validation ($evidenceRef, decision=$requiresUserDecision)", async ({ requiresUserDecision, evidenceRef, evidenceGap, shouldDefer }) => {
-  const f = fixture();
-  f.adapter.createSession = async () => ({ sessionId: "s", result: { kind: "IMPLEMENTATION", summary: "Supported work retained",
-    findings: [{ id: "E1", title: "Unavailable contract", severity: "HIGH", disposition: "EXTERNAL_EVIDENCE",
-      rationale: "Only this dependent change needs the missing source", evidenceRefs: [evidenceRef], requiresUserDecision, evidenceGap },
-      { id: "done", title: "Already resolved", severity: "INFO", disposition: "AGREED_NO_ACTION",
-        rationale: "No blocking work remains", evidenceRefs: [], requiresUserDecision: false }],
-    evidenceRefs: [], status: "blocked" } });
-  const core = new EngineCore(f.dependencies); let paused: boolean | undefined;
-  core.startAction("t", "evidence-test", async signal => {
-    const { result } = await core.executor.execute({ route: core.route(f.topic, { role: "implementer", operation: "implement" }),
-      topic: f.topic, signal, purpose: "턴", inputSequence: 0, expected: core.expectationOf(f.topic),
-      session: { mode: "create" }, prompt: "Continue the supported scope", settings: { model: "opus", effort: "high" } });
-    paused = core.pauseForResult("t", result, "IMPLEMENTING", "Pause");
-    if (shouldDefer) {
-      expect(result.status).toBe("in_progress");
-      expect(result.findings[0].disposition).toBe("DEFERRED_OUT_OF_SCOPE");
-    }
-  });
-  await core.active.get("t")!.completion;
-  expect(paused).toBe(!shouldDefer);
-  const saved = await f.dependencies.artifacts.readLatest("t", "deferred-findings");
-  if (requiresUserDecision) expect(f.database.getTopic("t").state).toBe("USER_DECISION_REQUIRED");
-  else if (shouldDefer) expect(JSON.parse(saved!).findings).toEqual([expect.objectContaining({ id: "E1", source: "evidence" })]);
-  else {
-    expect(f.database.getTopic("t").state).toBe("USER_DECISION_REQUIRED");
-    expect(saved).toBeNull();
-  }
+  expect(f.database.evidence.topic(f.topic).digest).not.toBe(before.digest);
 });
 
 it("continues with an immutable partial corpus after a cached source becomes unavailable", async () => {
@@ -1282,430 +984,4 @@ it("records inaccessible workspace channel roots with metadata-only availability
   expect(f.database.evidence.usableSources(f.database.getTopic("t")).map(source => source.id)).toEqual([f.source.id]);
   expect(snapshot).not.toHaveBeenCalled();
   expect(sourceSnapshot).not.toHaveBeenCalled();
-});
-
-it.each([false, true])("continues a source-only blocked review in the same ledger, bounding repeated gaps (repeat=%s)", async repeat => {
-  const f = fixture();
-  const topic = f.database.updateTopic("t", { state: "CODEX_REVIEW" });
-  const gap = { kind: "REVIEW" as const, summary: "Missing original", status: "blocked" as const,
-    findings: [{ id: "gap", title: "Original inaccessible", severity: "HIGH" as const, disposition: "EXTERNAL_EVIDENCE" as const,
-      evidenceGap: "unavailable" as const, rationale: "Exclude only source-dependent review scope", evidenceRefs: [sourceInput.url], requiresUserDecision: false },
-      { id: "done", title: "Checked", severity: "INFO" as const, disposition: "AGREED_NO_ACTION" as const,
-        rationale: "Already verified", evidenceRefs: [], requiresUserDecision: false }], evidenceRefs: [] };
-  const create = vi.fn(async () => ({ sessionId: "review-session", result: structuredClone(gap) }));
-  const resume = vi.fn(async () => repeat ? structuredClone(gap) : { kind: "REVIEW" as const, summary: "Supported scope reviewed",
-    status: "completed" as const, findings: [], evidenceRefs: [] });
-  f.dependencies.codex = { ...f.dependencies.codex, createSession: create, resumeTurn: resume };
-  const ledger = f.database.planning.openReviewLedger({ topicId: "t", kind: "codex-review", scopeGeneration: 1, planEpoch: topic.planEpoch,
-    planSHA256: topic.planSHA256!, reviewedTree: "b".repeat(40), reportRevision: 1 });
-  const core = new EngineCore(f.dependencies);
-  let result: any;
-  core.startAction("t", "review", async signal => {
-    const route = { ...core.route(topic, { role: "reviewer", operation: "review" }), reviewLedger: ledger.id };
-    result = (await core.executor.execute({ route, topic, signal, purpose: "턴", inputSequence: 0, expected: core.expectationOf(topic),
-      session: { mode: "create" }, prompt: "Review", settings: { model: "codex", effort: "high" } })).result;
-  });
-  await core.active.get("t")!.completion;
-  expect(create).toHaveBeenCalledTimes(1);
-  expect(resume).toHaveBeenCalledTimes(1);
-  expect(resume).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "review-session", reviewLedger: ledger.id }));
-  expect(f.database.planning.reviewLedger(ledger.id)?.status).toBe("open");
-  expect(result.status).toBe(repeat ? "in_progress" : "completed");
-  expect(result.findings).toContainEqual(expect.objectContaining({ id: "gap", disposition: "DEFERRED_OUT_OF_SCOPE" }));
-  expect(f.database.getTopic("t").state).toBe("CODEX_REVIEW");
-});
-
-it("merges repeated To-do IDs while continuing reviews across two newly excluded sources", async () => {
-  const f = fixture();
-  const second = f.database.evidence.register("t", { ...sourceInput, url: "https://team.atlassian.net/browse/APP-2" });
-  const topic = f.database.updateTopic("t", { state: "CODEX_REVIEW" });
-  const finding = (id: string, url: string) => ({ id, title: id, severity: "INFO" as const, disposition: "EXTERNAL_EVIDENCE" as const,
-    evidenceGap: "unavailable" as const, rationale: "Exclude dependent scope", evidenceRefs: [url], requiresUserDecision: false });
-  const a = finding("A", sourceInput.url), b = finding("B", second.url);
-  let resumes = 0;
-  f.dependencies.codex = { ...f.dependencies.codex,
-    createSession: async () => ({ sessionId: "s", result: { kind: "REVIEW", summary: "A", status: "blocked", findings: [a], evidenceRefs: [] } }),
-    resumeTurn: async () => ++resumes === 1 ? { kind: "REVIEW", summary: "A and B", status: "blocked", findings: [a, b], evidenceRefs: [] }
-      : { kind: "REVIEW", summary: "Supported review completed", status: "completed", findings: [], evidenceRefs: [] } };
-  const core = new EngineCore(f.dependencies);
-  let result: any;
-  core.startAction("t", "review", async signal => {
-    result = (await core.executor.execute({ route: core.route(topic, { role: "reviewer", operation: "review" }), topic,
-      signal, purpose: "턴", inputSequence: 0, expected: core.expectationOf(topic), session: { mode: "create" }, prompt: "Review",
-      settings: { model: "codex", effort: "high" } })).result;
-  });
-  await core.active.get("t")!.completion;
-  expect(resumes).toBe(2);
-  expect(result.status).toBe("completed");
-  expect(result.findings.map((finding: any) => finding.id)).toEqual(["A", "B"]);
-});
-
-it("persists source gaps first observed inside the last model turn", async () => {
-  const f = fixture();
-  f.adapter.createSession = async () => {
-    const check = f.database.evidence.begin(f.source.id, true)!;
-    f.database.evidence.failed(f.source.id, check.checkId, "Failed during final turn");
-    return { sessionId: "s", result: { kind: "IMPLEMENTATION", summary: "Supported work only", status: "completed", findings: [], evidenceRefs: [] } };
-  };
-  const core = new EngineCore(f.dependencies);
-  core.startAction("t", "implementation", async signal => {
-    await core.executor.execute({ route: core.route(f.topic, { role: "implementer", operation: "implement" }), topic: f.topic,
-      signal, purpose: "턴", inputSequence: 0, expected: core.expectationOf(f.topic), session: { mode: "create" }, prompt: "Continue supported work",
-      settings: { model: "opus", effort: "high" } });
-  });
-  await core.active.get("t")!.completion;
-  const saved = JSON.parse((await f.dependencies.artifacts.readLatest("t", "deferred-findings"))!);
-  expect(saved.findings).toContainEqual(expect.objectContaining({ source: "evidence", rationale: expect.stringContaining("Failed during final turn") }));
-});
-
-it("background change observation preserves a queued first-plan review", async () => {
-  const f = fixture();
-  const topic = f.database.updateTopic("t", { state: "AWAITING_USER_APPROVAL" });
-  const state = f.database.evidence.topic(topic);
-  const queued = f.database.evidence.automation.reviewPlan(topic, state.sources, state.digest);
-  const pipeline = new EvidenceAssessmentPipeline(new EngineCore(f.dependencies));
-  pipeline.poll();
-  f.ingest("New approved snapshot");
-  pipeline.poll();
-  expect(f.database.evidence.automation.jobs("t").find(job => job.id === queued.id)?.status).toBe("pending");
-  expect(f.adapter.createSession).not.toHaveBeenCalled();
-});
-
-
-it("retains an evidence response and resumes only its correction after a failed correction", async () => {
-  const f = fixture();
-  const plan = await f.dependencies.artifacts.write("t", "plan", 1, "Current plan");
-  f.database.updateTopic("t", { state: "AWAITING_USER_APPROVAL", planSHA256: plan.sha256, approvedPlanSHA256: null });
-  const raw = { kind: "EVIDENCE_REPLAN" as const, summary: "Current policy tab requires a revision", findings: [], evidenceRefs: ["new-tab"],
-    memoryUpdates: [{ path: "policy.md", expectedSHA256: "a".repeat(64), content: "Retain current tab", reason: "Reusable" }] };
-  let research = 0, corrections = 0;
-  f.adapter.createSession = async turn => {
-    await turn.beforeSpawn?.(); turn.admitSync?.(); research++;
-    return { sessionId: "preserved-assessment", result: raw };
-  };
-  f.adapter.resumeTurn = async turn => {
-    await turn.beforeSpawn?.(); turn.admitSync?.(); corrections++;
-    expect(turn.sessionId).toBe("preserved-assessment");
-    expect(turn.job?.operation).toBe("evidence-assessment");
-    expect(turn.planMode).toBe(false);
-    if (corrections === 1) throw Error("Correction transport failed");
-    return { ...raw, memoryUpdates: [] };
-  };
-  let core = new EngineCore(f.dependencies);
-  new EvidenceAssessmentPipeline(core).reviewCurrent("t", "first-review");
-  await core.active.get("t")!.completion;
-  const job = f.database.evidence.automation.jobs("t")[0];
-  expect(f.database.evidence.automation.receipt(job.id)?.raw.summary).toBe(raw.summary);
-  expect(job.status).toBe("failed");
-  core = new EngineCore(f.dependencies);
-  const revise = vi.fn(async () => undefined);
-  new EvidenceAssessmentPipeline(core, revise).reviewCurrent("t", "retry-review");
-  await core.active.get("t")!.completion;
-  expect(research).toBe(1); expect(corrections).toBe(2);
-  expect(revise).toHaveBeenCalledWith("t", expect.objectContaining({ outcome: "replan" }),
-    expect.objectContaining({ summary: raw.summary, evidenceRefs: ["new-tab"], memoryUpdates: [] }), expect.any(AbortSignal));
-  expect(f.database.getTopic("t").approvedPlanSHA256).toBeNull();
-});
-
-async function plannedObligationFixture(adoptedKind: "claude-plan" | "claude-revision" | "diagnosis" = "claude-revision", staleCloseout = false, synthetic = false) {
-  const f = fixture();
-  const obligation = { id: "INT-1", title: "Runtime verification before delivery", severity: "HIGH" as const,
-    disposition: "AGREED_ACTION" as const, rationale: "Run the approved runtime gates after explicit authorization",
-    evidenceRefs: ["approved-plan:runtime-gates"], requiresUserDecision: false };
-  const plan = await f.dependencies.artifacts.write("t", "plan", 1, "Current plan with runtime gates");
-  f.database.updateTopic("t", { state: "AWAITING_USER_APPROVAL", planSHA256: plan.sha256, approvedPlanSHA256: null });
-  await f.dependencies.artifacts.write("t", adoptedKind === "diagnosis" ? "claude-plan" : adoptedKind, 1, JSON.stringify({ kind: adoptedKind === "claude-revision" ? "REVISION" : "PLAN",
-    summary: "Adopted plan", findings: [], evidenceRefs: [] }));
-  const saveCloseout = async () => {
-    await f.dependencies.artifacts.write("t", "closeout", 2, JSON.stringify({ kind: "CLOSEOUT", planSHA256: plan.sha256,
-      summary: "Plan accepted; runtime work remains", findings: synthetic ? [] : [obligation], evidenceRefs: [] }));
-    f.database.appendEvent({ topicId: "t", actor: "codex", kind: "agent_output", state: "CODEX_CLOSEOUT", body: "Current closeout",
-      payload: { resultKind: "CLOSEOUT", artifactRevision: 2 } });
-  };
-  if (staleCloseout) await saveCloseout();
-  if (adoptedKind === "diagnosis") {
-    const topic = f.database.getTopic("t"), core = new EngineCore(f.dependencies);
-    const record = f.database.registerDiagnosis({ topicId: "t", diagnosis: DiagnosisInputSchema.parse({
-      kind: "fix", title: "Add verification", observedFailure: "Verification procedure missing", cause: "Plan omission",
-      instructions: "Include required verification", verificationCriteria: ["Verification is in the plan"],
-      planChange: { required: true, reason: "Plan needs the procedure" },
-    }), binding: { scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch, planSHA256: topic.planSHA256,
-      approvedPlanSHA256: topic.approvedPlanSHA256, state: topic.state, resumeState: null,
-      failure: { actionId: null, actionKind: null, actionStatus: null }, checkpoint: null,
-      worktree: await f.dependencies.git.snapshot(topic.worktreePath), inputSequence: 0, openRequestIds: [] },
-      origin: null, initialStatus: "registered", event: id => ({ actor: "system", kind: "system", state: topic.state, body: `${id} registered` }) });
-    core.diagnoses.markPlanRevised(topic, record, { planRevision: topic.planRevision + 1, sha256: plan.sha256,
-      previousPlanSHA256: "a".repeat(64), artifactRevision: plan.revision });
-  } else {
-    f.database.appendEvent({ topicId: "t", actor: "claude", kind: "agent_output", state: "CLAUDE_REVISION", body: "Plan adopted",
-      payload: { artifactKind: "plan", revision: 1, sha256: plan.sha256, adoptedResult: { kind: adoptedKind, revision: 1 } } });
-  }
-  if (synthetic) {
-    await f.dependencies.artifacts.write("t", "claude-revision", 3, JSON.stringify({ kind: "REVISION",
-      summary: "Implementation note carried without changing the plan", findings: [obligation], evidenceRefs: [] }));
-    f.database.appendEvent({ topicId: "t", actor: "system", kind: "system", state: "CODEX_AUDIT", body: "Revision skipped",
-      payload: { skippedRevision: true, implementationNoteIDs: [obligation.id], adoptedResult: { kind: "claude-revision", revision: 3 } } });
-  }
-  if (!staleCloseout) await saveCloseout();
-  return { ...f, obligation };
-}
-
-it.each([["claude-plan", false], ["claude-revision", false], ["diagnosis", false], ["diagnosis", true]] as const)("unchanged %s obligations survive evidence correction without requiring implementation completion (synthetic %s)", async (kind, synthetic) => {
-  const f = await plannedObligationFixture(kind, false, synthetic);
-  let corrections = 0;
-  f.adapter.createSession = async () => ({ sessionId: "assessment", result: { kind: "EVIDENCE_NO_IMPACT", summary: "Plan impact checked",
-    findings: [f.obligation], evidenceRefs: [], memoryUpdates: [{ path: "note.md", expectedSHA256: null, content: "Forbidden", reason: "Rejected" }] } });
-  f.adapter.resumeTurn = async () => {
-    corrections++;
-    return { kind: "EVIDENCE_NO_IMPACT", summary: "Removed forbidden write", findings: [], evidenceRefs: [] };
-  };
-  const core = new EngineCore(f.dependencies);
-  new EvidenceAssessmentPipeline(core).reviewCurrent("t", "assessment");
-  await core.active.get("t")!.completion;
-  const job = f.database.evidence.automation.jobs("t")[0];
-  expect(corrections).toBe(1);
-  expect(job).toMatchObject({ status: "complete", outcome: "no-impact" });
-  expect(f.database.evidence.automation.receipt(job.id)?.accepted?.findings).toEqual([f.obligation]);
-  expect(f.database.evidence.topic(f.database.getTopic("t")).reviewed).toBe(true);
-  expect(f.database.getTopic("t")).toMatchObject({ state: "AWAITING_USER_APPROVAL", approvedPlanSHA256: null });
-});
-
-it.each(["new", "changed", "decision", "stale-closeout", "stale-diagnosis-closeout"] as const)("evidence no-impact cannot hide a %s obligation through correction omission", async reason => {
-  const f = await plannedObligationFixture(reason === "stale-diagnosis-closeout" ? "diagnosis" : "claude-revision", reason.startsWith("stale-"));
-  const finding = { ...f.obligation,
-    ...(reason === "new" ? { id: "NEW-1" } : {}),
-    ...(reason === "changed" ? { rationale: "Add a new source-dependent implementation procedure" } : {}),
-    ...(reason === "decision" ? { requiresUserDecision: true } : {}) };
-  f.adapter.createSession = async () => ({ sessionId: "assessment", result: { kind: "EVIDENCE_NO_IMPACT", summary: "Incorrect no-impact",
-    findings: [finding], evidenceRefs: [] } });
-  f.adapter.resumeTurn = async () => ({ kind: "EVIDENCE_NO_IMPACT", summary: "Omitted obligation", findings: [], evidenceRefs: [] });
-  const core = new EngineCore(f.dependencies);
-  new EvidenceAssessmentPipeline(core).reviewCurrent("t", "assessment");
-  await core.active.get("t")!.completion;
-  const job = f.database.evidence.automation.jobs("t")[0];
-  expect(job).toMatchObject({ status: "failed", summary: expect.stringContaining(finding.id) });
-  expect(f.database.evidence.topic(f.database.getTopic("t")).reviewed).toBe(false);
-  expect(f.database.evidence.automation.receipt(job.id)?.raw.findings).toContainEqual(finding);
-});
-
-it("corrects a contradictory evidence outcome without erasing its changed obligation or repeating research", async () => {
-  const f = await plannedObligationFixture();
-  const changed = { ...f.obligation, rationale: "The new primary source changes the approved procedure", evidenceRefs: ["new-source:section-2"] };
-  let research = 0, corrections = 0;
-  f.adapter.createSession = async () => {
-    research++;
-    return { sessionId: "assessment", result: { kind: "EVIDENCE_NO_IMPACT", summary: "Found changed procedure", findings: [changed], evidenceRefs: [] } };
-  };
-  f.adapter.resumeTurn = async turn => {
-    corrections++;
-    expect(turn.prompt).toContain("EVIDENCE_NO_IMPACT, EVIDENCE_REPLAN, EVIDENCE_NEEDS_DECISION");
-    expect(turn.prompt).toContain(changed.id);
-    expect(turn.prompt).not.toContain("kind는 직전 응답과 동일하게 유지");
-    return { kind: "EVIDENCE_REPLAN", summary: "The changed procedure needs revision", findings: [], evidenceRefs: [] };
-  };
-  const core = new EngineCore(f.dependencies), revise = vi.fn(async () => undefined);
-  new EvidenceAssessmentPipeline(core, revise).reviewCurrent("t", "assessment");
-  await core.active.get("t")!.completion;
-  expect(research).toBe(1); expect(corrections).toBe(1);
-  expect(revise).toHaveBeenCalledWith("t", expect.objectContaining({ outcome: "replan" }),
-    expect.objectContaining({ kind: "EVIDENCE_REPLAN", findings: [changed] }), expect.any(AbortSignal));
-  expect(f.database.evidence.topic(f.database.getTopic("t")).reviewed).toBe(false);
-});
-
-it.each(["restart", "failed", "cancelled"] as const)("completed changed-source outcomes survive recreation but do not override failure or manual stop: %s", async previous => {
-  const f = fixture();
-  const plan = await f.dependencies.artifacts.write("t", "plan", 1, "Current plan");
-  const topic = f.database.updateTopic("t", { state: "READY_TO_DELIVER", planSHA256: plan.sha256 });
-  const pipeline = new EvidenceAssessmentPipeline(new EngineCore(f.dependencies));
-  pipeline.poll();
-  f.ingest("Changed policy");
-  const current = f.database.evidence.topic(topic);
-  const job = f.database.evidence.automation.observe(topic, current.sources, current.digest)!;
-  f.database.startAction({ id: "completed-before-crash", topicId: "t", kind: "evidence-assessment", status: "running", createdAt: new Date().toISOString(),
-    finishedAt: null, error: null, pid: null, pgid: null, processExecutable: null, processCommand: null, processStartedAt: null });
-  f.database.evidence.automation.start(job, "completed-before-crash");
-  f.database.evidence.automation.saveReceipt(job.id, { sessionId: "saved", routeBinding: "fixture", planRevision: topic.planRevision, inputSequence: 0,
-    raw: { kind: "EVIDENCE_NEEDS_DECISION", summary: "Choose policy", findings: [], evidenceRefs: [] },
-    accepted: { kind: "EVIDENCE_NEEDS_DECISION", summary: "Choose policy", findings: [], evidenceRefs: [], requestedUserDecision: "Which policy?" } });
-  f.database.evidence.automation.finish(job, topic, current.digest, "decision", "Choose policy");
-  f.database.finishAction("completed-before-crash", previous === "failed" ? "failed" : "cancelled", previous === "restart" ? "서버 재시작" : "Explicit failure or stop");
-  const core = new EngineCore(f.dependencies), restored = new EvidenceAssessmentPipeline(core);
-  restored.poll();
-  if (previous !== "restart") {
-    expect(core.active.size).toBe(0);
-    expect(f.database.getTopic("t").state).toBe("READY_TO_DELIVER");
-    restored.reviewCurrent("t", "explicit-recovery");
-  }
-  await core.active.get("t")!.completion;
-  expect(f.database.getTopic("t")).toMatchObject({ state: "USER_DECISION_REQUIRED", lastError: "Which policy?" });
-  expect(f.adapter.createSession).not.toHaveBeenCalled();
-  expect(f.database.evidence.automation.receipt(job.id)?.consumedAt).toBeTypeOf("number");
-});
-
-
-it("an unavailable unrelated root does not hide a change to a collected source", async () => {
-  const f = fixture(), catalog = f.database.evidence.catalog;
-  const root = catalog.add("t", { ...sourceInput, scope: "topic", required: true }, true);
-  catalog.add("t", { ...sourceInput, url: "https://team.atlassian.net/browse/UNAVAILABLE-1", scope: "topic", required: false }, true);
-  const service = new EvidenceService(f.database.evidence, { fetch: async () => { throw Error("Host only"); } });
-  const ingest = (content: string) => {
-    const source = f.database.evidence.get(root.sourceId);
-    service.importHost("t", { version: catalog.version("t"), rootId: root.id, sourceId: source.id, previousHash: source.contentHash,
-      previousCheckedAt: source.checkedAt, observedAt: Date.now(), revision: content, missing: [], units: [{ id: "issue", kind: "issue", content }] });
-  };
-  try {
-    ingest("Initial source");
-    // A paused topic records observations but never spawns a worker.
-    f.database.updateTopic("t", { state: "USER_DECISION_REQUIRED", planSHA256: "a".repeat(64) });
-    const pipeline = new EvidenceAssessmentPipeline(new EngineCore(f.dependencies));
-    pipeline.poll();
-    ingest("Changed source");
-    pipeline.poll();
-    expect(f.database.evidence.automation.jobs("t")[0]).toMatchObject({ status: "pending", changes: [{ sourceId: root.sourceId }] });
-    expect(f.adapter.createSession).not.toHaveBeenCalled();
-  } finally { await service.stop(); }
-});
-
-// 2026-10-07 evidence-review-input — a plan review is a new session. Without the previous accepted review it re-read every source and
-// decision for a one-line plan change (1fd0cc86 6판: 17분, 도구 48회).
-async function reviewPlanOnce(f: ReturnType<typeof fixture>, actionId: string, summary: string) {
-  const turns: Parameters<AgentAdapter["createSession"]>[0][] = [];
-  f.adapter.createSession = async turn => {
-    await turn.beforeSpawn?.(); turn.admitSync?.(); turns.push(turn);
-    return { sessionId: actionId, result: { kind: "EVIDENCE_NO_IMPACT", summary, status: "completed", findings: [], evidenceRefs: ["issue"] } };
-  };
-  const core = new EngineCore(f.dependencies);
-  new EvidenceAssessmentPipeline(core).reviewCurrent("t", actionId);
-  await core.active.get("t")!.completion;
-  return turns[0];
-}
-
-it("a plan review receives the previous accepted review with the plan, user input and source changes since, and judges the current plan", async () => {
-  const f = fixture();
-  const first = await f.dependencies.artifacts.write("t", "plan", 1, "## A\n- KEEP\n## B\n- OLD\n");
-  f.database.updateTopic("t", { state: "AWAITING_USER_APPROVAL", planRevision: 1, planSHA256: first.sha256, approvedPlanSHA256: null });
-  await reviewPlanOnce(f, "first-review", "First plan checked against the issue");
-  const previous = f.database.evidence.automation.jobs("t")[0];
-  expect(previous).toMatchObject({ purpose: "plan-review", status: "complete", outcome: "no-impact", planRevision: 1 });
-
-  const second = await f.dependencies.artifacts.write("t", "plan", 2, "## A\n- KEEP\n## B\n- NEW\n");
-  f.database.updateTopic("t", { planRevision: 2, planSHA256: second.sha256 });
-  f.ingest("changed");
-  const decision = f.database.appendEvent({ topicId: "t", actor: "user", kind: "decision", state: "AWAITING_USER_APPROVAL", body: "Keep the new entry", payload: {} });
-  const diff = vi.fn(async () => "PLAN-DELTA -U0");
-  f.dependencies.git.diffPlanFiles = diff;
-  const turn = await reviewPlanOnce(f, "second-review", "Second plan checked");
-
-  // Artifact paths are content-addressed: the previous-review input follows the plan, before the previous plan and the image directory.
-  const inputPath = turn.readablePaths![4];
-  const input = JSON.parse(readFileSync(inputPath, "utf8"));
-  expect(input.previousReview).toMatchObject({ assessmentId: previous.id, planRevision: 1, planSHA256: first.sha256, digest: previous.digest,
-    outcome: "no-impact", result: { kind: "EVIDENCE_NO_IMPACT", summary: "First plan checked against the issue", findings: [], evidenceRefs: ["issue"] } });
-  expect(input.current).toMatchObject({ planRevision: 2, planSHA256: second.sha256, planPath: expect.stringContaining(second.sha256) });
-  expect(diff).toHaveBeenCalledWith(f.root, input.previousReview.planPath, input.current.planPath);
-  expect(input.previousReview.planPath).toContain(first.sha256);
-  expect(input.planChanges).toBe("PLAN-DELTA -U0");
-  expect(input.newUserInputs).toEqual([decision.sequence]);
-  expect(input.sourceChanges).toEqual([expect.objectContaining({ sourceId: f.source.id,
-    units: [expect.objectContaining({ id: "issue", before: expect.objectContaining({ content: "initial" }), after: expect.objectContaining({ content: "changed" }) })] })]);
-  expect(turn.readablePaths).toEqual(expect.arrayContaining([expect.stringContaining(first.sha256)]));
-  expect(turn.prompt).toContain(`이전에 받아들인 근거 검토 결과와 그 뒤의 변경분 ${inputPath} 를 먼저 읽으세요(이전 판 1, 계획 SHA ${first.sha256}`);
-  expect(turn.prompt).toContain("현재 계획의 통과가 아닙니다");
-  expect(turn.prompt).toContain("최종 판정은 현재 계획 전체에 대해 내리세요");
-  expect(turn.prompt).not.toContain("최초 검토도 포함합니다");
-  // The verdict is still this review's own: the current plan is reviewed with its own job and receipt.
-  const current = f.database.evidence.automation.jobs("t")[0];
-  expect(current).toMatchObject({ purpose: "plan-review", status: "complete", planRevision: 2 });
-  expect(current.id).not.toBe(previous.id);
-  expect(f.database.evidence.topic(f.database.getTopic("t")).reviewed).toBe(true);
-});
-
-it("an altered previous plan is stated as unavailable and does not stop the current plan's review", async () => {
-  const f = fixture();
-  const first = await f.dependencies.artifacts.write("t", "plan", 1, "## A\n- OLD\n");
-  f.database.updateTopic("t", { state: "AWAITING_USER_APPROVAL", planRevision: 1, planSHA256: first.sha256, approvedPlanSHA256: null });
-  await reviewPlanOnce(f, "first-review", "First plan checked");
-  const second = await f.dependencies.artifacts.write("t", "plan", 2, "## A\n- NEW\n");
-  f.database.updateTopic("t", { planRevision: 2, planSHA256: second.sha256 });
-  writeFileSync(first.path, "altered");
-  const turn = await reviewPlanOnce(f, "second-review", "Second plan checked");
-  expect(turn.readablePaths).toHaveLength(6);
-  expect(JSON.parse(readFileSync(turn.readablePaths![4], "utf8")).planChanges).toBe("이전 계획 산출물을 확인하지 못했습니다. 현재 계획 전체를 대조하세요.");
-  expect(f.database.evidence.automation.jobs("t")[0]).toMatchObject({ status: "complete", planRevision: 2 });
-});
-
-it("a plan review without a previous accepted review states it and runs as a first review", async () => {
-  const f = fixture();
-  const plan = await f.dependencies.artifacts.write("t", "plan", 1, "Current plan");
-  f.database.updateTopic("t", { state: "AWAITING_USER_APPROVAL", planSHA256: plan.sha256, approvedPlanSHA256: null });
-  const turn = await reviewPlanOnce(f, "only-review", "Plan checked");
-  expect(turn.prompt).toContain("이전에 받아들인 근거 검토 결과가 없습니다. 최초 검토도 포함합니다.");
-  expect(turn.readablePaths).toHaveLength(5);
-  expect(turn.prompt).not.toContain("이전에 받아들인 근거 검토 결과와 그 뒤의 변경분");
-});
-
-// Engine review 60917216 F001: the previous review's source changes name the before image too, and the reviewer reads images only
-// from this job's directory.
-async function reviewDesignChange(f: ReturnType<typeof fixture>, options: { failedAttempt?: boolean; tamperBefore?: boolean } = {}) {
-  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lWQAAAAASUVORK5CYII=", "base64");
-  const frame = (label: string) => {
-    const check = f.database.evidence.begin(f.source.id, true)!;
-    f.database.evidence.ingest(f.source.id, { checkId: check.checkId, revision: label,
-      units: [{ id: "frame", kind: "render", content: "Checkout frame", imageBase64: Buffer.concat([png, Buffer.from(label)]).toString("base64") }] });
-    return f.database.evidence.sourceSnapshot(f.database.evidence.get(f.source.id))!.units[0].imageHash!;
-  };
-  const before = frame("before");
-  const first = await f.dependencies.artifacts.write("t", "plan", 1, "Follow the checkout frame");
-  f.database.updateTopic("t", { state: "AWAITING_USER_APPROVAL", planRevision: 1, planSHA256: first.sha256, approvedPlanSHA256: null });
-  const firstTurn = await reviewPlanOnce(f, "first-review", "First plan checked against the frame");
-  const after = frame("after");
-  const second = await f.dependencies.artifacts.write("t", "plan", 2, "Follow the revised checkout frame");
-  f.database.updateTopic("t", { planRevision: 2, planSHA256: second.sha256 });
-  if (options.failedAttempt) {
-    // The first attempt links the images, then its model call fails; the retry runs the same job again.
-    f.adapter.createSession = async () => { throw new Error("transient model failure"); };
-    const core = new EngineCore(f.dependencies);
-    new EvidenceAssessmentPipeline(core).reviewCurrent("t", "failed-attempt");
-    await core.active.get("t")!.completion.catch(() => {});
-  }
-  // The shared cache entry changes in place, so a link an earlier attempt made shares the new bytes.
-  if (options.tamperBefore) writeFileSync(join(firstTurn.readablePaths!.at(-1)!, "..", "evidence-images", `${before}.png`), "tampered");
-  const turn = await reviewPlanOnce(f, "second-review", "Second plan checked against the frame");
-  return { turn, before, after, input: JSON.parse(readFileSync(turn.readablePaths![4], "utf8")) };
-}
-
-it("a plan review links the before and after images of the source changes since the previous review into its own directory", async () => {
-  const f = fixture();
-  const { turn, before, after, input } = await reviewDesignChange(f);
-  expect(input.sourceChanges).toEqual([expect.objectContaining({ sourceId: f.source.id,
-    units: [expect.objectContaining({ id: "frame", before: expect.objectContaining({ imageHash: before }), after: expect.objectContaining({ imageHash: after }) })] })]);
-  expect(input.imagesUnavailable).toBeUndefined();
-  const directory = turn.readablePaths!.at(-1)!;
-  for (const hash of [before, after]) expect(readFileSync(join(directory, `${hash}.png`))).toEqual(f.database.evidence.image(hash));
-  expect(turn.prompt).toContain(`원문 unit의 imageHash에 해당하는 이미지는 ${directory}/<imageHash>.png입니다`);
-  expect(turn.prompt).toContain("변경분 단위의 변경 전·후 이미지도 같은 이미지 디렉터리에 있습니다");
-  // Read access stays this job's directory; the shared cache is never granted.
-  expect(turn.readablePaths!.filter(path => path.includes("evidence-images"))).toEqual([directory]);
-  expect(f.database.evidence.automation.jobs("t")[0]).toMatchObject({ status: "complete", planRevision: 2 });
-});
-
-it("a before image that cannot be linked is stated and does not stop the current plan's review", async () => {
-  const f = fixture();
-  const { turn, before, after, input } = await reviewDesignChange(f, { tamperBefore: true });
-  expect(input.imagesUnavailable).toEqual([{ imageHash: before, reason: expect.stringContaining("디자인 캐시") }]);
-  const directory = turn.readablePaths!.at(-1)!;
-  expect(() => statSync(join(directory, `${before}.png`))).toThrow();
-  expect(readFileSync(join(directory, `${after}.png`))).toEqual(f.database.evidence.image(after));
-  expect(f.database.evidence.automation.jobs("t")[0]).toMatchObject({ status: "complete", planRevision: 2 });
-});
-
-it("a retried plan review removes an earlier attempt's link to a before image that no longer verifies", async () => {
-  const f = fixture();
-  const { turn, before, after, input } = await reviewDesignChange(f, { failedAttempt: true, tamperBefore: true });
-  expect(f.database.evidence.automation.jobs("t")).toHaveLength(2);
-  expect(input.imagesUnavailable).toEqual([{ imageHash: before, reason: expect.stringContaining("디자인 캐시") }]);
-  const directory = turn.readablePaths!.at(-1)!;
-  expect(() => statSync(join(directory, `${before}.png`))).toThrow();
-  expect(readFileSync(join(directory, `${after}.png`))).toEqual(f.database.evidence.image(after));
-  expect(f.database.evidence.automation.jobs("t")[0]).toMatchObject({ status: "complete", planRevision: 2 });
 });

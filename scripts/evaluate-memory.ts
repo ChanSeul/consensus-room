@@ -3,7 +3,7 @@ import { lstat, readdir, readFile } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { ProjectMemoryReader } from "../src/server/projectMemory.js";
-import { buildClaudePlanPrompt, buildCodexAuditPrompt } from "../src/shared/prompts.js";
+import { buildFirstTurnPrompt } from "../src/shared/prompts.js";
 import { z } from "zod";
 
 // Only queries/labels/paths/hashes/counts are emitted. Never emit source contents or diagnostic excerpts.
@@ -44,9 +44,11 @@ const Reader: typeof ProjectMemoryReader = modulePath
 const reader = new Reader(root);
 const results = [];
 for (const item of cases) {
+  // plan·audit 는 실제로 보내는 첫 턴 프롬프트(플래너·계획 리뷰어)로 감싼다 — 어댑터는 프롬프트 전체를 기억 질의로 쓴다.
   let query = item.query;
-  if (item.mode === "plan") query = buildClaudePlanPrompt({ title: query, worktreePath: "/tmp/example", sourceRepositoryPath: "/tmp/source", baseRef: "main", scopeGeneration: 1, timeline: [] });
-  if (item.mode === "audit") query = buildCodexAuditPrompt({ title: query, planMarkdown: `# ${query}`, planSHA256: "a".repeat(64), scopeGeneration: 1, timeline: [] });
+  if (item.mode === "plan") query = buildFirstTurnPrompt({ role: "planner", title: query, worktreePath: "/tmp/example", baseRef: "main", planDirectory: "/tmp/example-plan" });
+  if (item.mode === "audit") query = buildFirstTurnPrompt({ role: "plan-reviewer", title: query, worktreePath: "/tmp/example", baseRef: "main",
+    plan: { status: "current", version: "a".repeat(64), snapshotPath: "/tmp/example-plan/plan.md", diffPath: null } });
   for (const role of ["claude", "codex"] as const) {
     const snapshots = await reader.select(query, role);
     const paths = snapshots.map(s => s.path);

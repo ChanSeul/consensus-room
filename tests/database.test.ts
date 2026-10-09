@@ -28,6 +28,7 @@ function topic(id = "topic-1"): Omit<Topic, "participants" | "planEpoch" | "agen
   const timestamp = new Date("2026-08-23T00:00:00.000Z").toISOString();
   return {
     id,
+    workflowMode: "planned",
     slug: "task-cancellation",
     title: "취소 정책 정리",
     repositoryPath: "/tmp/repository",
@@ -258,7 +259,22 @@ describe("이벤트 원장과 재시작 복구", () => {
     reopened.close();
   });
 
-  it.each(["CLAUDE_REVISION", "CODEX_CLOSEOUT", "CONSENSUS_ACK", "AWAITING_USER_APPROVAL"] as const)(
+  // F4 — 저장된 사건의 state 는 기록 문자열이다. 지운 옛 상태로 남은 과거 사건이 있어도 이력 조회가 실패하지 않고 그 값을 그대로 돌려준다.
+  it("지운 옛 상태로 저장된 과거 사건이 있는 토픽도 이력을 읽는다", () => {
+    const { database, path } = openDatabase();
+    database.createTopic({ ...topic(), state: "CODEX_AUDIT" });
+    database.appendEvent({ topicId: "topic-1", actor: "system", kind: "system", state: "CODEX_AUDIT", body: "현재 사건", payload: {} });
+    const raw = new DatabaseSync(path);
+    raw.prepare(`INSERT INTO timeline_events(topic_id, sequence, scope_generation, actor, kind, state, body, payload_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run("topic-1", database.maxSequence("topic-1") + 1, 1, "system", "system", "CONSENSUS_ACK",
+      "옛 확인 단계 사건", "{}", "2026-10-01T00:00:00.000Z");
+    raw.close();
+    expect(database.getTimeline("topic-1").slice(-2).map(event => [event.state, event.body]))
+      .toEqual([["CODEX_AUDIT", "현재 사건"], ["CONSENSUS_ACK", "옛 확인 단계 사건"]]);
+    database.close();
+  });
+
+  it.each(["CLAUDE_REVISION", "AWAITING_USER_APPROVAL"] as const)(
     "근거 검토가 인계받은 %s 단계는 비정상 종료 뒤에도 정확히 복구한다", state => {
       const { database, path } = openDatabase();
       database.createTopic({ ...topic(), state });
@@ -623,7 +639,7 @@ describe("이벤트 원장과 재시작 복구", () => {
     database.close();
   });
 
-  it.each(["FAILED", "USER_DECISION_REQUIRED", "BLOCKED_ON_EVIDENCE"] as const)("a recovery failure from %s retains the original resumable stage", state => {
+  it.each(["FAILED", "USER_DECISION_REQUIRED"] as const)("a recovery failure from %s retains the original resumable stage", state => {
     const { database } = openDatabase();
     database.createTopic(topic());
     database.updateTopic("topic-1", { state, resumeState: "CLAUDE_PLAN" });
@@ -637,7 +653,7 @@ describe("이벤트 원장과 재시작 복구", () => {
     database.close();
   });
 
-  it.each(["FAILED", "USER_DECISION_REQUIRED", "BLOCKED_ON_EVIDENCE"] as const)("startup recovery from %s retains the original resume stage of an admitted retry", state => {
+  it.each(["FAILED", "USER_DECISION_REQUIRED"] as const)("startup recovery from %s retains the original resume stage of an admitted retry", state => {
     const { database, path } = openDatabase();
     database.createTopic(topic());
     database.updateTopic("topic-1", { state, resumeState: "CODEX_AUDIT" });
@@ -652,7 +668,7 @@ describe("이벤트 원장과 재시작 복구", () => {
     reopened.close();
   });
 
-  it.each(["USER_DECISION_REQUIRED", "BLOCKED_ON_EVIDENCE"] as const)("startup only preserves %s when this action reached the pause", state => {
+  it.each(["USER_DECISION_REQUIRED"] as const)("startup only preserves %s when this action reached the pause", state => {
     const { database, path } = openDatabase();
     database.createTopic(topic());
     database.updateTopic("topic-1", { state, resumeState: "CODEX_AUDIT" });
@@ -932,24 +948,73 @@ describe("코드 리뷰 세션의 저장과 범위 격리", () => {
     reopened.close();
   });
 
-  it.each([
-    { scopeGeneration: 2 }, { planEpoch: 2 },
-    { planSHA256: "b".repeat(64), approvedPlanSHA256: "b".repeat(64) },
-    { approvedPlanSHA256: null },
-  ])("범위·계획 회차·승인 계획이 달라지면 이전 리뷰 세션을 반환하지 않는다: %j", (changes) => {
+  // 리뷰 세션은 같은 토픽·같은 범위 세대 동안 이어 쓴다(계약 v3.15 (24)) — 범위 세대만 세션을 끊고, 계획 회차·계획·승인 변경은 사실로 전달된다(D5).
+  it("범위 세대가 바뀌면 이전 리뷰 세션을 반환하지 않고 새 세션을 저장한다", () => {
     const { database } = openDatabase();
     database.createTopic(approvedTopic());
     database.setCodexReviewSession("topic-1", "review-one");
-    expect(database.getCodexReviewSession("topic-1")).toBe("review-one");
-    database.updateTopic("topic-1", changes);
+    database.updateTopic("topic-1", { scopeGeneration: 2 });
     expect(database.getCodexReviewSession("topic-1")).toBeNull();
-    if (changes.approvedPlanSHA256 === null) {
-      expect(() => database.setCodexReviewSession("topic-1", "review-new")).toThrow("승인된 계획 없이");
-    } else {
-      database.setCodexReviewSession("topic-1", "review-new");
-      expect(database.getCodexReviewSession("topic-1")).toBe("review-new");
-    }
+    expect(database.codexReviewSessionBinding("topic-1")).toBeNull();
+    database.setCodexReviewSession("topic-1", "review-new");
+    expect(database.getCodexReviewSession("topic-1")).toBe("review-new");
     database.close();
+  });
+
+  it.each([
+    { planEpoch: 2 },
+    { planSHA256: "b".repeat(64), approvedPlanSHA256: "b".repeat(64) },
+    { approvedPlanSHA256: null },
+  ])("계획 회차·계획·승인이 바뀌어도 같은 리뷰 세션과 전달 커서를 이어 쓴다: %j", (changes) => {
+    const { database } = openDatabase();
+    database.createTopic(approvedTopic());
+    database.setCodexReviewSession("topic-1", "review-one");
+    database.setCodexReviewPromptSequence("topic-1", 7);
+    database.updateTopic("topic-1", changes);
+    expect(database.getCodexReviewSession("topic-1")).toBe("review-one");
+    expect(database.codexReviewSessionBinding("topic-1")).not.toBeNull();
+    expect(database.getCodexReviewPromptSequence("topic-1")).toBe(7);
+    database.close();
+  });
+
+  it("승인 계획 없는 ticket 도 리뷰 세션을 저장하고, planned ↔ ticket 전환 뒤에도 같은 세션을 이어 쓴다", () => {
+    const { database } = openDatabase();
+    database.createTopic({ ...topic(), workflowMode: "ticket" });
+    database.setCodexReviewSession("topic-1", "review-ticket");
+    expect(database.getCodexReviewSession("topic-1")).toBe("review-ticket");
+    database.updateTopic("topic-1", { workflowMode: "planned", planSHA256: "a".repeat(64), approvedPlanSHA256: "a".repeat(64) });
+    expect(database.getCodexReviewSession("topic-1")).toBe("review-ticket");
+    database.updateTopic("topic-1", { workflowMode: "ticket", planSHA256: null, approvedPlanSHA256: null });
+    expect(database.getCodexReviewSession("topic-1")).toBe("review-ticket");
+    database.close();
+  });
+
+  it("plan_epoch·plan_sha256 이 NOT NULL 인 옛 표는 두 열을 풀며 다시 만들고 행·전달 커서·공급자를 보존한다", () => {
+    const { database, path } = openDatabase();
+    database.createTopic(approvedTopic());
+    database.close();
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`
+      DROP TABLE codex_review_sessions;
+      CREATE TABLE codex_review_sessions (topic_id TEXT PRIMARY KEY REFERENCES topics(id), session_id TEXT NOT NULL UNIQUE,
+        scope_generation INTEGER NOT NULL, plan_epoch INTEGER NOT NULL, plan_sha256 TEXT NOT NULL, prompt_sequence INTEGER, provider TEXT, binding_json TEXT);
+      INSERT INTO codex_review_sessions VALUES ('topic-1', 'review-legacy', 1, 1, '${"a".repeat(64)}', 12, 'codex', NULL);
+    `);
+    legacy.close();
+    const reopened = new ConsensusDatabase(path);
+    expect(reopened.getCodexReviewSession("topic-1")).toBe("review-legacy");
+    expect(reopened.getCodexReviewPromptSequence("topic-1")).toBe(12);
+    expect(reopened.codexReviewSessionBinding("topic-1")?.provider).toBe("codex");
+    // 계획 없는 ticket 의 세션 저장(plan_sha256 NULL)은 다시 만든 표에서만 된다.
+    reopened.updateTopic("topic-1", { workflowMode: "ticket", planSHA256: null, approvedPlanSHA256: null });
+    reopened.setCodexReviewSession("topic-1", "review-ticket");
+    expect(reopened.getCodexReviewSession("topic-1")).toBe("review-ticket");
+    reopened.close();
+    const check = new DatabaseSync(path);
+    const columns = check.prepare("PRAGMA table_info(codex_review_sessions)").all() as Array<{ name: string; notnull: number }>;
+    expect(columns.filter(column => ["plan_epoch", "plan_sha256"].includes(column.name)).map(column => column.notnull)).toEqual([0, 0]);
+    expect(check.prepare("SELECT COUNT(*) AS count FROM codex_review_sessions").get()).toMatchObject({ count: 1 });
+    check.close();
   });
 
   it("빈 ID·계획 세션·다른 주제의 계획 및 리뷰 세션을 섞지 않는다", () => {

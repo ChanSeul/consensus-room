@@ -13,6 +13,7 @@ import type { AgentAdapter, SessionTurn } from "../src/server/types";
 import { WorkflowEngine } from "../src/server/workflow";
 import { parseResetTime, parseUsageLimit } from "../src/shared/usageLimit";
 import { REQUIRED_PLAN_HEADINGS, type AgentResult } from "../src/shared/contracts";
+import type { TurnEnvelope } from "../src/shared/turnContract";
 import { hashPlan } from "../src/shared/workflow";
 
 const temporaryDirectories: string[] = [];
@@ -81,13 +82,16 @@ class FakeClock implements RetryClock {
   }
 }
 
-// 호출 순서대로 정해진 실패를 던지는 계획 어댑터. 성공 응답은 이 테스트에 필요 없다 — 재시도가 '시작됐는지' 만 본다.
+// 호출 순서대로 정해진 실패를 던지는 계획 어댑터. 성공 응답은 이 테스트에 필요 없다 — 재시도가 '시작됐는지' 만 본다. 운영 라우팅은 봉투 턴으로
+// 가므로(⑥) 봉투 메서드도 같은 실패를 던진다.
 class FailingClaude implements AgentAdapter {
   readonly role = "claude" as const;
   calls = 0;
   constructor(private readonly errors: string[]) {}
   async createSession(_turn: Omit<SessionTurn, "sessionId">) { return this.fail(); }
   async resumeTurn(_turn: SessionTurn) { return this.fail(); }
+  async createEnvelopeSession(_turn: Omit<SessionTurn, "sessionId">) { return this.fail(); }
+  async resumeEnvelopeTurn(_turn: SessionTurn) { return this.fail(); }
   async validateExistingSession() { return true; }
   private fail(): never {
     const message = this.errors[Math.min(this.calls, this.errors.length - 1)];
@@ -101,12 +105,12 @@ function makeEngine(errors: string[], clock: FakeClock) {
   temporaryDirectories.push(root);
   const database = new ConsensusDatabase(join(root, "room.sqlite"));
   database.createTopic({
+    workflowMode: "planned",
     id: "topic-1", slug: "usage-limit", title: "사용 한도", repositoryPath: "/tmp/repository", baseRef: "develop",
     worktreePath: "/tmp/worktree", branchName: null, state: "DRAFT", scopeGeneration: 1, planRevision: 0,
     planSHA256: null, approvedPlanSHA256: null, createdAt: "2026-09-07T00:00:00.000Z", updatedAt: "2026-09-07T00:00:00.000Z",
     lastError: null,
   });
-  database.revisions.configure("topic-1", 3, database.revisions.account("topic-1").version);
   for (const scope of ["planning", "implementation"] as const) database.reviews.configure("topic-1", scope, 3, database.reviews.account("topic-1", scope).version);
   for (const role of ["claude", "codex"] as const) {
     database.upsertParticipant("topic-1", { role, sessionId: `${role}-session`, mode: "attached", acknowledgedPlanSHA256: null });
@@ -209,10 +213,10 @@ describe("사용 한도 자동 재시도", () => {
       await settle(database);
     }
     expect(clock.timers).toHaveLength(0);
-    expect(database.revisions.account("topic-1")).toMatchObject({used:3,limit:3});
+    // 재시도 상한은 자동 재시도 횟수(attempts)가 막는다(D8).
     expect(database.getAutoRetry("topic-1")?.attempts).toBe(3);
 
-    // 재시작 시뮬레이션: 상한(3회)에 닿은 상태는 DB 에 남아 재시작해도 다시 예약하지 않는다(Codex 후속 지적 5). 사람이 재작성 1회를 추가 승인해야 연다.
+    // 재시작 시뮬레이션: 상한(3회)에 닿은 상태는 DB 에 남아 재시작해도 다시 예약하지 않는다(Codex 후속 지적 5). 사람이 다시 재개해야 연다.
     const restartClock = new FakeClock("2026-09-20T00:00:00.000Z");
     const restarted = new WorkflowEngine({
       database, artifacts: new ArtifactStore(join(tmpdir(), "unused-topics"), database),
@@ -311,6 +315,8 @@ describe("E3-4c 코드 리뷰 원장과 사용 한도 자동 재시도", () => {
   const validPlan = () => REQUIRED_PLAN_HEADINGS.map((heading) => `## ${heading}\n\n검증할 내용${heading === "허용 오차" ? TOLERANCE_BLOCK : ""}`).join("\n\n");
   const PROCESS = { pid: 123, pgid: 123, executable: "fake", commandLine: "fake", startedAt: "now" };
 
+  // 운영 라우팅은 봉투 턴으로 간다(⑥) — 구현·리뷰 가짜는 봉투 메서드로 같은 동작(파일 쓰기, spawn 뒤 사용 한도 실패)을 한다.
+  const implemented: TurnEnvelope = { message: "구현했습니다.", outcome: "done" };
   class ImplementingClaude implements AgentAdapter {
     readonly role = "claude" as const;
     calls = 0;
@@ -320,6 +326,8 @@ describe("E3-4c 코드 리뷰 원장과 사용 한도 자동 재시도", () => {
       return { sessionId: "claude-impl", result: this.implement() };
     }
     async resumeTurn(_turn: SessionTurn) { return this.implement(); }
+    async createEnvelopeSession(_turn: Omit<SessionTurn, "sessionId">) { this.implement(); return { sessionId: "claude-impl", envelope: implemented }; }
+    async resumeEnvelopeTurn(_turn: SessionTurn) { this.implement(); return implemented; }
     async validateExistingSession() { return true; }
     private implement(): AgentResult {
       this.calls += 1;
@@ -335,6 +343,11 @@ describe("E3-4c 코드 리뷰 원장과 사용 한도 자동 재시도", () => {
       return { sessionId: "codex-review-session", result: this.review(turn) };
     }
     async resumeTurn(turn: SessionTurn) { return this.review(turn); }
+    async createEnvelopeSession(turn: Omit<SessionTurn, "sessionId">) {
+      this.review(turn);
+      return { sessionId: "codex-review-session", envelope: { message: "문제 없습니다.", outcome: "approve" } satisfies TurnEnvelope };
+    }
+    async resumeEnvelopeTurn(turn: SessionTurn): Promise<TurnEnvelope> { this.review(turn); return { message: "문제 없습니다.", outcome: "approve" }; }
     async validateExistingSession() { return true; }
     private review(turn: Omit<SessionTurn, "sessionId">): AgentResult {
       this.calls.push(turn.job?.operation ?? "");
@@ -363,11 +376,11 @@ describe("E3-4c 코드 리뷰 원장과 사용 한도 자동 재시도", () => {
     const planSHA256 = hashPlan(plan);
     const topicId = "topic-1";
     database.createTopic({
+      workflowMode: "planned",
       id: topicId, slug: `usage-review-${label}`, title: "리뷰 한도와 자동 재시도", repositoryPath: repository, baseRef: "develop",
       worktreePath: worktree, branchName: null, state: "AWAITING_USER_APPROVAL", scopeGeneration: 1, planRevision: 2, planSHA256,
       approvedPlanSHA256: planSHA256, createdAt: "2026-09-26T00:00:00.000Z", updatedAt: "2026-09-26T00:00:00.000Z", lastError: null,
     });
-  database.revisions.configure(topicId, 3, database.revisions.account(topicId).version);
   for (const scope of ["planning", "implementation"] as const) database.reviews.configure(topicId, scope, 3, database.reviews.account(topicId, scope).version);
     for (const role of ["claude", "codex"] as const) {
       database.upsertParticipant(topicId, { role, sessionId: `${role}-plan-session`, mode: "attached", acknowledgedPlanSHA256: planSHA256 });

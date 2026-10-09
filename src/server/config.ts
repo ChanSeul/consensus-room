@@ -19,7 +19,6 @@ function skillDirectories(value: string | undefined, defaults: string[]): string
 }
 
 export interface ServerConfig {
-  guardedPlanning?: boolean;
   enforceBudgets?: boolean;
   host: "127.0.0.1";
   port: number;
@@ -83,9 +82,6 @@ export function loadConfig(overrides: Partial<ServerConfig> = {}): ServerConfig 
     },
   });
   return {
-    // 새 일반 토픽의 계획 제어는 기본 켬이다(E5 P0-1) — 명시적 CONSENSUS_ROOM_GUARDED_PLANNING=0 일 때만 끈다(그 밖의 값·미설정은 켬). 생성 때만 정책을
-    // 정하므로 기존 토픽은 자동 이관하지 않는다. 작업 묶음의 새 단계 토픽은 이 값과 무관하게 v2 로 연다(E4 F012, workGroupService.createNext).
-    guardedPlanning: overrides.guardedPlanning ?? process.env.CONSENSUS_ROOM_GUARDED_PLANNING !== "0",
     enforceBudgets: overrides.enforceBudgets ?? true,
     host: "127.0.0.1",
     port: overrides.port ?? Number(process.env.CONSENSUS_ROOM_PORT ?? 4317),

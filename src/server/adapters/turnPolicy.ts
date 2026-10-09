@@ -5,7 +5,7 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { parseProviderOptions, turnAccess, turnFlags, type ProviderOptions, type TurnAccess, type TurnJob } from "../../shared/roles.js";
 import { turnContract } from "../../shared/turnContract.js";
 import { toolTreeDirectories } from "../toolTree.js";
-import type { AgentAdapter, OutputSchema, SessionTurn } from "../types.js";
+import { nextEnvelopeMethod, type AgentAdapter, type OutputSchema, type SessionTurn } from "../types.js";
 
 // 역할 정책(엔진 개편 E2a) — job 과 턴 형태에서 계산한다. 공급자 이름을 입력으로 받지 않는다(plan §2.2·§2.3: 정책은 엔진, 변환은 어댑터).
 // 두 어댑터는 이 값을 자기 CLI 인자·설정으로 변환만 하고, 표현할 수 없는 정책은 조용히 바꾸지 않고 실행 전에 거부한다.
@@ -15,7 +15,6 @@ export interface TurnShape {
   // 프로토콜 확인 턴 — job 이 있으면 job 에서 유도한 값이다(resolveTurn).
   protocolOnly?: boolean;
   evidenceManaged?: boolean;
-  planningControl?: boolean;
   // 호스트가 Figma 읽기를 열고 관측 수신처를 붙였다(증거 관리 래퍼).
   figmaRequested?: boolean;
   // 호스트 격리 입력(엔진 개편 E2e) — 운영 도구가 입력 전체(스냅샷·프롬프트)를 고정한 턴. 정책을 좁히기만 한다(E2e.md 규칙 1).
@@ -27,7 +26,7 @@ export interface TurnShape {
 export interface TurnPolicy {
   // job 의 접근 — 작업 환경(쓰기 sandbox 등)의 기준이다.
   access: TurnAccess;
-  // 이번 턴에 노출하는 도구 — 프로토콜 확인·계획 제어 턴은 도구를 전부 닫는다.
+  // 이번 턴에 노출하는 도구 — 프로토콜 확인 턴은 도구를 전부 닫는다.
   tools: TurnAccess;
   planMode: boolean;
   web: boolean;
@@ -43,7 +42,7 @@ export interface TurnPolicy {
 
 export function turnPolicy(job: TurnJob, shape: TurnShape): TurnPolicy {
   const access = turnAccess(job);
-  const tools: TurnAccess = shape.protocolOnly || shape.planningControl ? "none" : access;
+  const tools: TurnAccess = shape.protocolOnly ? "none" : access;
   const isolated = Boolean(shape.isolated);
   return {
     access,
@@ -213,11 +212,18 @@ export function guardRunnerControl(adapter: AgentAdapter): AgentAdapter {
     throw new Error(`작업 폴더의 러너 제어 경로가 git HEAD 와 다릅니다(${when}: ${deviations.join(", ")}) — 지시문·실행 설정(${RUNNER_CONTROL_ENTRIES.join("·")}, `
       + "대소문자 무관)은 러너가 만들거나 고치지 않는다. 확인 뒤 지우거나 되돌리고 재시도하세요.");
   };
-  async function guarded<T>(turn: Omit<SessionTurn, "sessionId">, run: () => Promise<T>): Promise<T> {
+  // received: 안쪽 결과를 받은 직후, 아래 쓰기 후 검사와 바깥 래퍼의 후처리보다 먼저 부른다(결과 봉투 수신 알림, cd2876b7 F008).
+  async function guarded<T>(turn: Omit<SessionTurn, "sessionId">, run: () => Promise<T>, received?: (result: T) => unknown): Promise<T> {
     check(turn, "턴 시작 전");
-    if (!turnFlags(jobOfTurn(adapter.role, turn)).write) return run();
+    if (!turnFlags(jobOfTurn(adapter.role, turn)).write) {
+      const result = await run();
+      received?.(result);
+      return result;
+    }
     try {
-      return await run();
+      const result = await run();
+      received?.(result);
+      return result;
     } finally {
       // 쓰기 턴은 실패로 끝나도 대조한다 — 심은 뒤 죽은 턴을 재시도가 그대로 이어받지 않게. 위반이 원래 오류보다 앞선다.
       check(turn, "쓰기 턴 뒤");
@@ -231,10 +237,38 @@ export function guardRunnerControl(adapter: AgentAdapter): AgentAdapter {
     ...(adapter.createStructuredSession ? { createStructuredSession: (turn: Omit<SessionTurn, "sessionId">, schema: OutputSchema) =>
       guarded(turn, () => adapter.createStructuredSession!(turn, schema)) } : {}),
     ...(adapter.resumeStructuredTurn ? { resumeStructuredTurn: (turn: SessionTurn, schema: OutputSchema) =>
-      guarded(turn, () => adapter.resumeStructuredTurn!(turn, schema)) } : {}) };
+      guarded(turn, () => adapter.resumeStructuredTurn!(turn, schema)) } : {}),
+    // 결과 봉투 턴도 같은 감시(턴 시작 전·쓰기 턴 뒤)를 거친다. 다음 층에 메서드가 없으면 감시 전에 명시 오류로 멈춘다(nextEnvelopeMethod).
+    // 운영 사슬 셋(엔진·독립 런타임·엔진 결함 처리기)의 가장 안쪽 래퍼라, 받은 봉투를 여기서 알리면 바깥 후처리가 던져도 엔진이 원문을 잡는다.
+    createEnvelopeSession: async turn => {
+      const next = nextEnvelopeMethod(adapter, "createEnvelopeSession");
+      return guarded(turn, () => next(turn), created => turn.onEnvelopeReceived?.({ sessionId: created.sessionId, envelope: created.envelope }));
+    },
+    resumeEnvelopeTurn: async turn => {
+      const next = nextEnvelopeMethod(adapter, "resumeEnvelopeTurn");
+      return guarded(turn, () => next(turn), envelope => turn.onEnvelopeReceived?.({ sessionId: turn.sessionId, envelope }));
+    } };
 }
 
 export interface ResolvedTurn { job: TurnJob; policy: TurnPolicy; protocolOnly: boolean }
+
+// planner 계획 폴더 쓰기(D4) — planner 가 계획 묶음(토픽 산출물 폴더의 plan/)을 자기 도구로 쓰고 고친다. 작업 폴더는 읽기 그대로이고 이 폴더만 쓴다.
+// 작업 폴더 안·쓰기 턴 전용인 승인 경로 쓰기(writablePaths)와 다른 계약이다. 경로는 엔진이 만든 실제 디렉터리여야 하고(공급자 sandbox 는 실제 경로로
+// 대조한다), 작업 폴더와 겹치면 작업 폴더 쓰기가 되므로 거부한다. plan 권한 모드는 파일 쓰기를 모두 거부하므로 함께 쓸 수 없다.
+export function planDirectoryProblem(workspace: string, planDirectory: string | undefined, job: TurnJob, policy: TurnPolicy): string | null {
+  if (planDirectory === undefined) return null;
+  if (job.role !== "planner" || policy.tools !== "read" || policy.isolated) return "계획 폴더 쓰기(planDirectory)는 도구가 열린 planner 턴에만 쓸 수 있습니다.";
+  if (policy.planMode) return "계획 폴더 쓰기(planDirectory)는 plan 권한 모드와 함께 쓸 수 없습니다 — plan 모드는 파일 쓰기를 모두 거부합니다.";
+  if (!isAbsolute(planDirectory) || resolve(planDirectory) !== planDirectory) return `계획 폴더는 정규화된 절대 경로여야 합니다: ${planDirectory}`;
+  let stat;
+  try { stat = lstatSync(planDirectory); } catch { return `계획 폴더가 없습니다: ${planDirectory}`; }
+  if (!stat.isDirectory()) return `계획 폴더는 심볼릭 링크가 아닌 디렉터리여야 합니다: ${planDirectory}`;
+  const real = realpathSync(planDirectory);
+  const root = (() => { try { return realpathSync(workspace); } catch { return resolve(workspace); } })();
+  const inside = (parent: string, child: string) => child === parent || child.startsWith(parent.endsWith(sep) ? parent : `${parent}${sep}`);
+  if (inside(root, real) || inside(real, root)) return `계획 폴더는 작업 폴더와 겹칠 수 없습니다: ${planDirectory}`;
+  return null;
+}
 
 // job 없는 직접 호출의 호환 경계 — 공급자 슬롯과 플래그로 E2b 이전 엔진이 쓰던 job 을 되살린다. Codex 는 implementation 플래그를 읽지 않던
 // 읽기 전용 검토자라 호환 경로에서도 검토자다. 래퍼(budgetController·guardedPlanning)도 job 이 없을 때 같은 규칙을 쓴다.
@@ -268,7 +302,7 @@ export function resolveTurn(provider: "claude" | "codex", turn: Omit<SessionTurn
     job = compatibleJob(provider, turn);
   }
   const policy = turnPolicy(job, {
-    planMode: turn.planMode, protocolOnly, evidenceManaged: turn.evidenceManaged, planningControl: Boolean(turn.planningControl),
+    planMode: turn.planMode, protocolOnly, evidenceManaged: turn.evidenceManaged,
     figmaRequested: Boolean(turn.figmaReadEnabled && turn.onFigmaResult), isolated: turn.isolated,
     scopedWrite: turn.writablePaths !== undefined,
   });
@@ -277,13 +311,15 @@ export function resolveTurn(provider: "claude" | "codex", turn: Omit<SessionTurn
 
 // 어댑터 입구의 판정 — resolveTurn 뒤 공급자 표현 가능 여부와 프로필 옵션을 확인하고, 표현할 수 없으면 실행 전에 거부한다(조용히 낮추거나 바꾸지
 // 않는다). 옵션은 경로 판정(turnRouting.resolveRoute)이 이미 검증했지만 이 공급자의 스펙으로 다시 읽는다 — 다른 공급자 옵션이 넘어오면 여기서 멈춘다.
+// planDirectory 는 검증한 계획 폴더의 실제 경로다(없으면 null) — 두 공급자 sandbox 가 실제 경로로 대조하고 Codex 는 링크가 든 쓰기 루트를 거부한다.
 export function resolveSupportedTurn<P extends "claude" | "codex">(provider: P, turn: Omit<SessionTurn, "sessionId">):
-  ResolvedTurn & { options: ProviderOptions<P> } {
+  ResolvedTurn & { options: ProviderOptions<P>; planDirectory: string | null } {
   const resolved = resolveTurn(provider, turn);
   const options = parseProviderOptions(provider, turn.providerOptions);
   const reason = providerRoleOptionsProblem(provider, resolved.job, options) ?? providerSupport(provider, resolved.policy);
   if (reason) throw new Error(`${reason}(job ${resolved.job.role}/${resolved.job.operation}).`);
-  const scope = writeScopeProblem(turn.cwd, turn.writablePaths, resolved.policy);
+  const scope = writeScopeProblem(turn.cwd, turn.writablePaths, resolved.policy)
+    ?? planDirectoryProblem(turn.cwd, turn.planDirectory, resolved.job, resolved.policy);
   if (scope) throw new Error(scope);
-  return { ...resolved, options };
+  return { ...resolved, options, planDirectory: turn.planDirectory === undefined ? null : realpathSync(turn.planDirectory) };
 }

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import { redactSecrets } from "../shared/workflow.js";
 import type { DeferredFinding } from "../shared/contracts.js";
+import { redactSecrets } from "../shared/workflow.js";
 import {
   WorkGroupInputSchema,
   workQuestionResultText,
@@ -22,17 +22,20 @@ import { BUDGET_KEYS, hasBudgetLimits, OBSERVE_USAGE, type BudgetPolicy } from "
 // 객체에서 만들어, 해시가 구성상 실제로 전달한 내용과 같게 한다. 담는 것: 묶음 목표·공통 계약, 자기 단계 서술(분리 근거·체크리스트 포함), 이
 // 단계와 묶음 전체 질문, 이어받는 단계의 동결 결과(통합 단계는 모든 단계 결과), 합류 대상과 엔진이 준비한 병합, 통합이면 기록 뒤 바뀐 위키 문서.
 // 미래·다른 단계 서술·체크리스트, 순서, 예산은 담지 않는다 — 그런 개정은 이 단계를 다시 계획하게 하지 않는다.
+// 예외는 보류 지적 원문 절이다(79fc4fc5 F012, deferredOriginals) — 머리말은 원문을 문맥 객체 밖(동결 결과·선행 토픽 원장)에서 읽어 해시에 넣지 않는다.
+// 어느 지적인지는 문맥의 ID 목록이 결속하고, 본문은 freezeResult 와 생성 때 동결이 바꾸지 않는다.
 export interface StageContextResult {
   stageId: string;
   commitOID: string;
-  planSHA256: string;
+  planSHA256: string | null;
   reviewedTreeOID: string;
   verifications: Array<{ id: string; status: string }>;
   memoryChanges: Array<{ path: string; sha256: string }>;
   openQuestions: string[];
-  // 머리말은 결과를 요약만 한다(E4 2차 보완 F012) — 결과 줄에 전문을 실으면 결과 수에 비례해 커져 계획 제어 패킷 상한(계획 64KB·감사 96KB)을 넘는다.
-  // 보류 지적은 ID 목록과 개수만 싣고 근거 전문은 그 턴의 이연 쟁점 목록(인라인 예산 또는 원문 산출물 참조)이 싣는다. 넘긴 결정은 개수와 요약 해시
-  // (정렬한 {topicId, sequence, sha256} 목록의 정본 JSON sha256)만 싣고 원문은 받는 토픽 타임라인의 '승계 결정' 이벤트(참조)로 간다. 없으면 필드도 없다.
+  // 결과 줄은 요약만 싣는다(E4 2차 보완 F012). 보류 지적은 ID 목록과 개수만 문맥 객체에 둔다 — 원문은 그 단계의 동결 결과
+  // (results.<stageId>.deferredFindings)에 있고, 머리말이 '선행 단계 보류 지적 원문' 절로 그대로 싣는다(79fc4fc5 F012, deferredOriginals). 넘긴 결정은
+  // 개수와 요약 해시(정렬한 {topicId, sequence, sha256} 목록의 정본 JSON sha256)만 싣고 원문은 받는 토픽 타임라인의 '승계 결정' 이벤트(참조)로 간다.
+  // 없으면 필드도 없다.
   deferredFindings?: { count: number; ids: string[] };
   decisions?: { count: number; digest: string };
   legacy?: boolean;
@@ -51,7 +54,7 @@ export interface StageContext {
 }
 export type StageContextState =
   | { linked: false }
-  | { linked: true; groupId: string; stageId: string; current: boolean; reason?: "replan-pending" | "digest-changed" | "version-changed" };
+  | { linked: true; groupId: string; stageId: string; current: boolean; reason?: "digest-changed" | "version-changed" };
 // 개정 미리 보기(D2). closed 는 미리 보기가 닫혔다고 판정한 연결 단계다 — 적용도 같은 판정으로 그 링크를 바이트 그대로 둔다.
 export interface RevisionPreview {
   mode: "revise" | "reapply";
@@ -68,10 +71,12 @@ export interface LinkOptions {
   preparedMerge?: PreparedMerge;
 }
 // prompt() 호환 — 동결 결과가 없는 E4 전 선행 단계의 검증 증거 한 줄.
-export type PriorLine = { stageId: string; commit: string; planSHA: string; verification: string };
+export type PriorLine = { stageId: string; commit: string; planSHA: string | null; verification: string };
+
+// ⑥ 전 개정이 남긴 재계획 대기 표식이 든 옛 저장 연결 — 지금 형에는 없고, 기동 이행(releaseLegacyReplanMarkers)만 읽는다.
+type LegacyStoredLink = StageLink & { replanPending?: unknown };
 
 const CONTEXT_CHANGED = "공통 계약이 바뀌었습니다. 현재 단계의 계획을 다시 승인해야 합니다.";
-const REPLAN_PENDING = "작업 묶음 개정으로 이 단계의 재계획을 기다립니다. 같은 개정을 다시 적용한 뒤 진행하세요.";
 const GROUP_CHANGED = "작업 묶음이 변경됐습니다.";
 
 export class WorkGroups {
@@ -80,7 +85,7 @@ export class WorkGroups {
       "CREATE TABLE IF NOT EXISTS work_groups(id TEXT PRIMARY KEY,record_json TEXT NOT NULL)",
     );
   }
-  // 이미 열린 transaction 안(호출자가 atomic 이나 DB transaction 으로 묶은 경우)이면 그 transaction 에 합류한다 — 개정 적용·재계획 해제·
+  // 이미 열린 transaction 안(호출자가 atomic 이나 DB transaction 으로 묶은 경우)이면 그 transaction 에 합류한다 — 개정 적용·기동 이행의 표식 해제·
   // 결과 동결은 스스로 한 transaction 이어야 하지만, 호출자의 더 큰 transaction 안에서 불려도 중첩 BEGIN 으로 실패하면 안 된다.
   atomic<T>(work: () => T): T {
     if (this.db.isTransaction) return work();
@@ -209,7 +214,8 @@ export class WorkGroups {
     return buildStageContext(group, stageId);
   }
   renderStageContext(group: WorkGroup, stageId: string): string {
-    return renderContext(buildStageContext(group, stageId));
+    const context = buildStageContext(group, stageId);
+    return renderContext(context, deferredOriginals(group, context));
   }
   stageContextDigest(group: WorkGroup, stageId: string): string {
     return digestContext(buildStageContext(group, stageId));
@@ -218,20 +224,15 @@ export class WorkGroups {
   inheritedDecisions(group: WorkGroup, stageId: string): Array<{ stageId: string; decision: StageDecision }> {
     return inheritedDecisions(group, stageId);
   }
-  inheritedDeferredFindings(group: WorkGroup, stageId: string): DeferredFinding[] {
-    return inheritedDeferredFindings(group, stageId);
-  }
   inheritedDecisionEvent(groupId: string, entry: { stageId: string; decision: StageDecision }): ReturnType<typeof inheritedDecisionEvent> {
     return inheritedDecisionEvent(groupId, entry);
   }
-  // 연결 단계의 문맥 결속. 재계획 대기면 현재가 아니다. 연결·재계획 완료 때 기록한 해시가 있으면 지금 해시와 대조하고, 없으면(E4 전 연결)
-  // 묶음 버전으로만 대조한다.
+  // 연결 단계의 문맥 결속. 연결·재결속 때 기록한 해시가 있으면 지금 해시와 대조하고, 없으면(E4 전 연결) 묶음 버전으로만 대조한다.
   stageContextState(topicId: string): StageContextState {
     const g = this.forTopic(topicId);
     if (!g) return { linked: false };
     const [stageId, link] = Object.entries(g.links).find(([, l]) => l.topicId === topicId)!;
     const base = { linked: true as const, groupId: g.id, stageId };
-    if (link.replanPending) return { ...base, current: false, reason: "replan-pending" };
     if (link.contextDigest !== undefined)
       return digestContext(buildStageContext(g, stageId)) === link.contextDigest
         ? { ...base, current: true } : { ...base, current: false, reason: "digest-changed" };
@@ -240,9 +241,8 @@ export class WorkGroups {
   assertStageContextCurrent(topicId: string): void {
     const state = this.stageContextState(topicId);
     if (!state.linked || state.current) return;
-    if (state.reason === "replan-pending") throw new Error(REPLAN_PENDING);
     throw new Error(`${CONTEXT_CHANGED} ${state.reason === "digest-changed"
-      ? "(단계 문맥이 연결·재계획 때와 다릅니다.)" : "(작업 묶음 버전이 연결 때와 다릅니다.)"}`);
+      ? "(단계 문맥이 연결·재결속 때와 다릅니다.)" : "(작업 묶음 버전이 연결 때와 다릅니다.)"}`);
   }
   // 코어 응답 채택 경계용 — 동기, DB 만 본다.
   isStageContextCurrent(topicId: string): boolean {
@@ -263,15 +263,11 @@ export class WorkGroups {
   }
   // 개정 적용(한 transaction). 미리 보기 결과를 믿지 않고 같은 입력·같은 닫힌 단계 판정으로 지금 레코드에서 다시 계산한다 — 미리 보기 뒤
   // 연결이 바뀌어 영향 단계가 달라졌으면 거부한다. 같은 개정이 이미 저장됐으면(재적용) 레코드를 바꾸지 않는다.
-  //  - 닫힌 단계: 링크를 바이트 그대로 둔다(버전·해시·대기 모두 없음).
-  //  - 영향 단계: 재계획 대기 {version, fromGeneration}. 이미 대기면 처음 대기를 유지한다(그 세대가 오른 뒤에만 풀린다).
+  //  - 닫힌 단계: 링크를 바이트 그대로 둔다(버전·해시를 바꾸지 않는다).
+  //  - 영향 단계: 새 버전·새 문맥 해시로 다시 묶는다. 바뀐 문맥은 호출자가 그 단계 토픽의 사실
+  //    (work-group-revision)로 같은 transaction 에 남긴다 — 범위 변경·계획 수정은 중재자가 정한다(D8, 계약 v3.18 (33')).
   //  - 영향 없는 열린 단계: groupVersion 을 새 버전으로, 해시는 다시 계산한다(정의상 같은 값). E4 전 연결은 해시를 새로 붙이지 않는다.
-  applyRevision(
-    id: string,
-    preview: RevisionPreview,
-    generations: Record<string, number>,
-    origin?: string | null,
-  ): WorkGroup {
+  applyRevision(id: string, preview: RevisionPreview, origin?: string | null): WorkGroup {
     return this.atomic(() => {
       const current = this.get(id);
       if (preview.mode === "reapply") return current;
@@ -283,12 +279,9 @@ export class WorkGroups {
       const links: Record<string, StageLink> = {};
       for (const [stageId, link] of Object.entries(current.links)) {
         if (closedIds.has(stageId)) links[stageId] = link;
-        else if (again.affected.includes(stageId)) {
-          if (link.replanPending) { links[stageId] = link; continue; }
-          const generation = generations[stageId];
-          if (!Number.isInteger(generation)) throw new Error(`재계획을 기다릴 단계의 범위 세대가 필요합니다: ${stageId}`);
-          links[stageId] = { ...link, replanPending: { version: next.version, fromGeneration: generation } };
-        } else
+        else if (again.affected.includes(stageId))
+          links[stageId] = { ...link, groupVersion: next.version, contextDigest: digestContext(buildStageContext(next, stageId)) };
+        else
           links[stageId] = { ...link, groupVersion: next.version,
             ...(link.contextDigest !== undefined ? { contextDigest: digestContext(buildStageContext(next, stageId)) } : {}) };
       }
@@ -298,7 +291,7 @@ export class WorkGroups {
       return next;
     });
   }
-  // 기존 호출 호환: 미리 보기 + 적용. 범위 세대를 모르므로 재계획 대기를 만들 수 없다 — 영향 단계가 있으면 공개 API(app)로 하게 한다.
+  // 기존 호출 호환: 미리 보기 + 적용. 영향 단계의 문맥 변경 사실은 타임라인에 남겨야 하므로 영향 단계가 있으면 공개 API(app)로 하게 한다.
   revise(
     id: string,
     input: WorkGroupInput,
@@ -307,23 +300,31 @@ export class WorkGroups {
     const preview = this.previewRevision(id, input, expectedVersion);
     if (preview.mode === "reapply") return preview.group;
     if (preview.affected.length) throw new Error("연결 단계가 있는 개정은 API 로 하세요");
-    return this.applyRevision(id, preview, {});
+    return this.applyRevision(id, preview);
   }
-  // 재계획 완료: 대기 중이고 그 단계 토픽의 범위 세대가 대기를 켤 때보다 올랐으면 대기를 풀고 지금 문맥으로 다시 결속한다. 조건이 안 맞으면
-  // 던지지 않고 false — 재적용이 여러 번 불려도 해제는 한 번뿐이다.
-  completeReplan(id: string, stageId: string, currentGeneration: number): boolean {
+  // 기동 이행(D9) 전용 — ⑥ 전 개정이 남긴 재계획 대기 표식을 푼다. 표식은 지금 형에 없는 옛 저장 형식이라 원시 레코드의 키로만 본다. 표식이
+  // 있던 연결을 지금 버전·문맥 해시로 다시 묶고, 저장한 묶음과 푼 단계 id 를 돌려준다. 호출자가 그 단계들의 문맥 사실을 같은 transaction 에
+  // 남긴다(계약 v3.18 (33')). 표식이 없으면 아무것도 바꾸지 않는다.
+  releaseLegacyReplanMarkers(): Array<{ group: WorkGroup; stageIds: string[] }> {
     return this.atomic(() => {
-      const g = this.get(id);
-      const link = g.links[stageId];
-      if (!link?.replanPending || !(currentGeneration > link.replanPending.fromGeneration)) return false;
-      delete link.replanPending;
-      link.groupVersion = g.version;
-      link.contextDigest = digestContext(buildStageContext(g, stageId));
-      this.save(g);
-      return true;
+      const released: Array<{ group: WorkGroup; stageIds: string[] }> = [];
+      for (const row of this.db.prepare("SELECT record_json FROM work_groups ORDER BY rowid").all()) {
+        const g: WorkGroup & { links: Record<string, LegacyStoredLink> } = JSON.parse(String(row.record_json));
+        const stageIds = Object.entries(g.links).filter(([, link]) => link.replanPending !== undefined).map(([stageId]) => stageId);
+        if (!stageIds.length) continue;
+        for (const stageId of stageIds) {
+          const link = g.links[stageId];
+          delete link.replanPending;
+          link.groupVersion = g.version;
+          link.contextDigest = digestContext(buildStageContext(g, stageId));
+        }
+        this.save(g);
+        released.push({ group: g, stageIds });
+      }
+      return released;
     });
   }
-  // 기존 호출 호환: 대기와 무관하게 지금 버전·문맥으로 다시 결속한다. 재계획 대기는 풀지 않는다(해제는 completeReplan 의 세대 비교뿐).
+  // 기존 호출 호환: 지금 버전·문맥으로 다시 결속한다.
   acknowledgeRevision(id: string, stageId: string): void {
     const g = this.get(id);
     g.links[stageId].groupVersion = g.version;
@@ -360,7 +361,7 @@ export class WorkGroups {
     const context = buildStageContext(g, stageId);
     const covered = new Set([...context.priorResults.map((r) => r.stageId),
       ...context.mergeTargets.filter((m) => m.result).map((m) => m.stageId)]);
-    return renderContext(context, prior.filter((p) => !covered.has(p.stageId)));
+    return renderContext(context, deferredOriginals(g, context), prior.filter((p) => !covered.has(p.stageId)));
   }
   // 계층 연결은 단계 계약을 개정하거나 동결 결과를 무효화하지 않는다.
   attachParent(id: string, parentTopicId: string): void {
@@ -399,22 +400,6 @@ export function inheritedDecisions(group: WorkGroup, stageId: string): Array<{ s
       seen.add(key);
       out.push({ stageId: id, decision: { ...decision } });
     }
-  return out;
-}
-// 보류 지적 원장 — 계획·감사 프롬프트의 기존 이연 목록 경로(core.deferredFindingsFor)가 싣는다. 중복 키는 토픽+지적 ID 다.
-export function inheritedDeferredFindings(group: WorkGroup, stageId: string): DeferredFinding[] {
-  const seen = new Set<string>();
-  const out: DeferredFinding[] = [];
-  const add = (finding: DeferredFinding) => {
-    const key = `${finding.topicId}\u0000${finding.id}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    out.push({ ...finding });
-  };
-  // 묶음 밖 선행 작업의 보류 원장(생성 때 동결) — 모든 단계가 그 결과를 담은 묶음 기준 위에서 시작하므로 모든 단계가 이어받는다.
-  for (const finding of group.predecessor?.deferredFindings ?? []) add(finding);
-  for (const id of inheritedStages(group, stageId))
-    for (const finding of group.results?.[id]?.deferredFindings ?? []) add(finding);
   return out;
 }
 // 승계 결정을 받는 토픽 타임라인에 넣을 이벤트 입력 — 생성(서비스)과 범위 변경(workflow)이 같은 함수를 써서 같은 본문·표식을 만든다.
@@ -489,17 +474,30 @@ const BASIS_LABEL: Record<StageSeparation["basis"], string> = {
   rollback: "이 단계만 되돌려 위험을 줄임",
 };
 const resultLines = (r: StageContextResult): string[] => [
-  `${r.stageId}: commit ${r.commitOID}, plan SHA ${r.planSHA256}, 리뷰 트리 ${r.reviewedTreeOID}, 검증 ${r.verifications.length
+  `${r.stageId}: commit ${r.commitOID}, plan SHA ${r.planSHA256 ?? "없음(ticket)"}, 리뷰 트리 ${r.reviewedTreeOID}, 검증 ${r.verifications.length
     ? r.verifications.map((v) => `${v.id}=${v.status}`).join(", ") : "기록 없음"}${r.legacy ? " (E4 전 결과 — 이전 계약 증거로 동결)" : ""}`,
   ...(r.memoryChanges.length ? [`  위키 변경: ${r.memoryChanges.map((m) => `${m.path}@${m.sha256}`).join(", ")}`] : []),
   ...(r.openQuestions.length ? [`  미해결 사항: ${r.openQuestions.join(" / ")}`] : []),
-  ...(r.deferredFindings ? [`  보류 지적 ${r.deferredFindings.count}건: ${r.deferredFindings.ids.join(", ")} — 근거 전문은 이 턴의 이연 쟁점 목록(인라인 또는 원문 산출물 참조)에 있습니다.`] : []),
+  ...(r.deferredFindings ? [`  보류 지적 ${r.deferredFindings.count}건: ${r.deferredFindings.ids.join(", ")} — 원문은 아래 '선행 단계 보류 지적 원문'에 있습니다.`] : []),
   ...(r.decisions ? [`  넘긴 결정 ${r.decisions.count}건(요약 sha256 ${r.decisions.digest}) — 원문은 이 토픽 타임라인의 '승계 결정' 이벤트로 읽으세요.`] : []),
 ];
 
+// 머리말에 싣는 보류 지적 원문(79fc4fc5 F012) — 묶음에 동결한 선행 토픽 원장, 그다음 이어받는 단계 결과의 원장(문맥의 결과 순서)이다. 둘 다 문맥 객체
+// 밖이라 해시에 들지 않는다. 단계 결과 원문은 문맥의 ID 목록이 가리키고 freezeResult 가 바꾸지 않는다. 선행 토픽 원장은 생성 때 동결되고 개정으로
+// 바뀌지 않는다. 요약·분류하지 않고 원문 그대로 싣는다.
+type DeferredOriginal = { source: string; finding: DeferredFinding };
+function deferredOriginals(group: WorkGroup, context: StageContext): DeferredOriginal[] {
+  const { predecessor, results } = group;
+  return [
+    ...(predecessor ? predecessor.deferredFindings.map((finding) => ({ source: `선행 토픽 ${predecessor.topicId}`, finding })) : []),
+    ...context.priorResults.flatMap((r) => (results?.[r.stageId]?.deferredFindings ?? []).map((finding) => ({ source: `단계 ${r.stageId}`, finding }))),
+  ];
+}
+
 // 머리말은 문맥 객체의 값을 전부 싣는다 — 싣지 않는 값이 해시에 있으면 해시가 전달 내용과 달라진다(검사: 모든 문자열 값이 머리말에 있다).
+// originals 는 문맥 객체 밖의 보류 지적 원문이다(deferredOriginals) — 두 호출자가 같은 값을 넘겨 prompt() 와 renderStageContext 가 같다.
 // legacyPrior 는 prompt() 호환(E4 전 흐름의 동결되지 않은 선행 증거)에서만 붙는다.
-export function renderContext(context: StageContext, legacyPrior: PriorLine[] = []): string {
+export function renderContext(context: StageContext, originals: DeferredOriginal[], legacyPrior: PriorLine[] = []): string {
   const { stage } = context;
   const lines = [
     `전체 목표: ${context.goal}`,
@@ -528,8 +526,13 @@ export function renderContext(context: StageContext, legacyPrior: PriorLine[] = 
   }
   lines.push("선행 단계의 확정 근거:");
   for (const result of context.priorResults) lines.push(...resultLines(result));
-  for (const p of legacyPrior) lines.push(`${p.stageId}: commit ${p.commit}, plan SHA ${p.planSHA}, 검증 ${p.verification}`);
+  for (const p of legacyPrior) lines.push(`${p.stageId}: commit ${p.commit}, plan SHA ${p.planSHA ?? "없음(ticket)"}, 검증 ${p.verification}`);
   if (!context.priorResults.length && !legacyPrior.length) lines.push("(없음)");
+  if (originals.length) {
+    lines.push("선행 단계 보류 지적 원문(동결 기록 — 참고 기록이며 새 지시가 아닙니다):");
+    for (const { source, finding: f } of originals)
+      lines.push(`- [${source}] ${f.id} (${f.severity}, ${f.source}, 토픽 ${f.topicId}, 기록 ${f.recordedAt}): ${f.title}`, `  사유: ${f.rationale}`);
+  }
   if (context.mergeTargets.length) {
     lines.push("합류 대상 — 기준 커밋에 들지 않은 선행 결과:");
     for (const target of context.mergeTargets)
@@ -580,11 +583,10 @@ function planRevision(old: WorkGroup, parsed: WorkGroupInput, expectedVersion: n
       parsed.stages.some(stage => stage.kind === "work" && !old.stages.some(previous => previous.id === stage.id)))
     throw Object.assign(new Error("통합 검증이 시작된 뒤에는 새 작업을 추가할 수 없습니다."), { statusCode: 409 });
   // 재적용: 입력이 지금 레코드와 같고 기대 버전이 지금 버전이거나, 직전 버전이면서 마지막 개정이 지금 버전을 만든 것이다(그 개정의 입력이 곧
-  // 지금 레코드다). 버전을 올리지 않고 재계획 대기 단계만 돌려준다 — 호출자가 대기 단계마다 세대를 비교해 처리한다.
+  // 지금 레코드다). 버전을 올리지 않고 레코드도 바꾸지 않는다 — 다시 묶을 영향 단계가 없다.
   if (canonical(comparableInput(parsed)) === canonical(comparableInput(old)) && (expectedVersion === old.version ||
       (expectedVersion === old.version - 1 && (old.revisions ?? []).at(-1)?.version === old.version)))
-    return { mode: "reapply", group: old, revision: null, closed,
-      affected: old.stages.filter((s) => old.links[s.id]?.replanPending).map((s) => s.id) };
+    return { mode: "reapply", group: old, revision: null, closed, affected: [] };
   if (expectedVersion !== old.version) throw new Error(GROUP_CHANGED);
   if (canonical(old.budgetPolicy ?? null) !== canonical(parsed.budgetPolicy ?? null))
     throw new Error("묶음 예산은 개정으로 바꿀 수 없습니다. 증액은 예산 승인으로 하세요.");
@@ -642,12 +644,10 @@ function planRevision(old: WorkGroup, parsed: WorkGroupInput, expectedVersion: n
   if (parsed.budgetPolicy === undefined) delete group.budgetPolicy;
   if (parsed.questions === undefined) delete group.questions;
   // 영향 단계: 닫히지 않은 연결 단계 가운데 새 레코드의 단계 문맥 해시가 기록 해시와 다른 것. E4 전 연결(해시 없음)은 개정 전후 단계 문맥의
-  // 해시를 비교한다(F006) — 목표·계약·자기 서술·체크리스트·현재 질문(추가·해소)·선행 결과·합류처럼 실제 전달 문맥이 바뀐 것이다. 이미 재계획
-  // 대기인 단계는 그대로 대기에 둔다 — 되돌리는 개정이어도 세대 비교 없이는 풀지 않는다.
+  // 해시를 비교한다(F006) — 목표·계약·자기 서술·체크리스트·현재 질문(추가·해소)·선행 결과·합류처럼 실제 전달 문맥이 바뀐 것이다.
   const affected = parsed.stages.filter((stage) => {
     const link = old.links[stage.id];
     if (!link || closedIds.has(stage.id)) return false;
-    if (link.replanPending) return true;
     if (link.contextDigest !== undefined) return digestContext(buildStageContext(group, stage.id)) !== link.contextDigest;
     return digestContext(buildStageContext(old, stage.id)) !== digestContext(buildStageContext(group, stage.id));
   }).map((stage) => stage.id);

@@ -2,10 +2,11 @@
 //
 // diagnoses      진단 본문과 서버 결속(등록 시점의 세대·계획·실패·체크포인트·작업 트리). **UPDATE 하지 않는다** — 정정은 새 행이다.
 // diagnosis_log  상태 이력(추가 전용). 현재 상태 = 마지막 행. 적용 경로·전달·처분·해결·대체가 모두 여기에 쌓인다.
+// 쓰기 경로는 없다(등록·적용은 1898d91·be40f25 에서 지웠다) — 저장된 이력만 읽는다.
 import type { DatabaseSync } from "node:sqlite";
 
 import {
-  DIAGNOSIS_STATUSES, type DiagnosisBinding, type DiagnosisHistoryEntry, type DiagnosisInput, type DiagnosisOrigin,
+  type DiagnosisBinding, type DiagnosisHistoryEntry, type DiagnosisInput, type DiagnosisOrigin,
   type DiagnosisRecord, type DiagnosisStatus,
 } from "../shared/diagnoses.js";
 
@@ -34,31 +35,6 @@ export class DiagnosisStore {
       );
       CREATE INDEX IF NOT EXISTS diagnosis_log_topic ON diagnosis_log(topic_id, diagnosis_id, seq);
     `);
-  }
-
-  nextNumber(topicId: string): number {
-    const row = this.db.prepare("SELECT COALESCE(MAX(number), 0) + 1 AS next FROM diagnoses WHERE topic_id = ?").get(topicId) as { next: number };
-    return Number(row.next);
-  }
-
-  insert(row: {
-    topicId: string; id: string; number: number; input: DiagnosisInput; binding: DiagnosisBinding; origin: DiagnosisOrigin | null; createdAt: string;
-  }): void {
-    this.db.prepare(`
-      INSERT INTO diagnoses(topic_id, id, number, kind, input_json, binding_json, origin_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(row.topicId, row.id, row.number, row.input.kind, JSON.stringify(row.input), JSON.stringify(row.binding),
-      row.origin ? JSON.stringify(row.origin) : null, row.createdAt);
-  }
-
-  log(topicId: string, diagnosisId: string, status: DiagnosisStatus, detail: Record<string, unknown>, at: string): void {
-    if (!DIAGNOSIS_STATUSES.includes(status)) throw new Error(`알 수 없는 진단 상태입니다: ${status}`);
-    this.db.prepare("INSERT INTO diagnosis_log(topic_id, diagnosis_id, status, detail_json, at) VALUES (?, ?, ?, ?, ?)")
-      .run(topicId, diagnosisId, status, JSON.stringify(detail), at);
-  }
-
-  get(topicId: string, id: string): DiagnosisRecord | null {
-    const row = this.db.prepare("SELECT * FROM diagnoses WHERE topic_id = ? AND id = ?").get(topicId, id) as Record<string, unknown> | undefined;
-    return row ? this.map(row) : null;
   }
 
   list(topicId: string): DiagnosisRecord[] {

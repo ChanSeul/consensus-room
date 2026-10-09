@@ -19,10 +19,10 @@ afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await c
 
 async function room() {
   const root = mkdtempSync(join(tmpdir(), "session-settings-")), database = new ConsensusDatabase(join(root, "db.sqlite"));
-  database.createTopic({ id: "t", slug: "t", title: "t", repositoryPath: root, worktreePath: root, baseRef: "HEAD", branchName: null,
+  database.createTopic({ workflowMode: "planned", id: "t", slug: "t", title: "t", repositoryPath: root, worktreePath: root, baseRef: "HEAD", branchName: null,
     state: "CODEX_AUDIT", scopeGeneration: 1, planRevision: 1, planSHA256: "a".repeat(64), approvedPlanSHA256: null,
     createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), lastError: null });
-  const calls: Array<Omit<SessionTurn, "sessionId">> = [];
+  const calls: Array<Omit<SessionTurn, "sessionId">> = [], participants: string[] = [];
   let fail = false;
   const result = { kind: "AUDIT" as const, summary: "review", findings: [], evidenceRefs: [] };
   const adapter: AgentAdapter = { role: "codex", validateExistingSession: async () => true,
@@ -45,6 +45,7 @@ async function room() {
       core.startAction("t", "settings-test", async signal => {
         try {
           const topic = database.getTopic("t"), route = resolveRoute(database, topic, { role: "reviewer", operation: ledger ? "review" : "audit" });
+          participants.push(route.participant);
           if (ledger) route.reviewLedger = ledger;
           if (rejectContract) await core.turn(route, topic, "계획 검토", signal, {
             session: { id: null, persist: () => undefined }, check: () => { throw new Error("post-response contract failure"); },
@@ -58,7 +59,7 @@ async function room() {
     // Observe action completion, not a guessed delay.
     while (database.runningAction("t")) await new Promise(resolve => setImmediate(resolve));
   };
-  return { database, calls, get, post, turn, setFail: (value: boolean) => { fail = value; } };
+  return { database, calls, participants, get, post, turn, setFail: (value: boolean) => { fail = value; } };
 }
 
 it("user POST reaches the next reviewer request and freezes criteria across interrupted resume", async () => {
@@ -83,7 +84,7 @@ it("user POST reaches the next reviewer request and freezes criteria across inte
   f.database.roles.assign({ ...assignment, participant: "replacement-reviewer", expectedVersion: assignment.version });
   f.setFail(false);
   await f.turn();
-  expect(f.calls[1].binding?.participant).toBe("replacement-reviewer");
+  expect(f.participants[1]).toBe("replacement-reviewer");
   expect(f.calls[1].prompt).toContain("첫 기준");
   expect(f.calls[1].prompt).not.toContain("새 기준");
   // Only a new plan contract starts a new logical audit, not an adapter response.

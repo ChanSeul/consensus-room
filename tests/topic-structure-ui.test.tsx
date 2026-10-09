@@ -45,7 +45,7 @@ it("keeps source and brainstorm entry modes visible after moving into implementa
 it("moves running and blocked badges to the nearest visible row and preserves collapse on refresh", () => {
   const root = topic("r", "Root", null, true), sub = topic("s", "Sub", "r", true);
   const running = { ...topic("a", "실행 작업", "s"), state: "IMPLEMENTING" as const };
-  const blocked = { ...topic("b", "정지 작업", "s"), state: "BLOCKED_ON_EVIDENCE" as const };
+  const blocked = { ...topic("b", "정지 작업", "s"), state: "USER_DECISION_REQUIRED" as const };
   const topics = [root, sub, running, blocked];
   const props = { selectedId: running.id, onSelect: vi.fn(), status: (item: typeof root) => <span>{item.state}</span> };
   const view = render(<TopicTree {...props} topics={topics} />);
@@ -53,12 +53,12 @@ it("moves running and blocked badges to the nearest visible row and preserves co
   expect(screen.getByText("IMPLEMENTING").closest("button")).toHaveTextContent("실행 작업");
   fireEvent.click(screen.getByRole("button", { name: "Sub 하위 주제" }));
   expect(screen.getByText("IMPLEMENTING").closest("button")).toHaveTextContent("Sub");
-  expect(screen.getByText("BLOCKED_ON_EVIDENCE").closest("button")).toHaveTextContent("Sub");
+  expect(screen.getByText("USER_DECISION_REQUIRED").closest("button")).toHaveTextContent("Sub");
   view.rerender(<TopicTree {...props} topics={topics.map(item => ({ ...item }))} />);
   expect(screen.queryByText("실행 작업")).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Root 하위 주제" }));
   expect(screen.getByText("IMPLEMENTING").closest("button")).toHaveTextContent("Root");
-  expect(screen.getAllByText("BLOCKED_ON_EVIDENCE")).toHaveLength(1);
+  expect(screen.getAllByText("USER_DECISION_REQUIRED")).toHaveLength(1);
   fireEvent.click(screen.getByRole("button", { name: "Root 하위 주제" }));
   fireEvent.click(screen.getByRole("button", { name: "Sub 하위 주제" }));
   expect(screen.getByText("IMPLEMENTING").closest("button")).toHaveTextContent("실행 작업");

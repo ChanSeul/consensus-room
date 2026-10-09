@@ -22,7 +22,7 @@ const pythonRuntime = JSON.parse(execFileSync("python3", ["-I", "-S", "-B", "-c"
 const python = pythonRuntime.executable;
 const success: VerificationCompletion = { status: "succeeded", exitCode: 0, durationMs: 1, stdout: "", stderr: "" };
 
-async function fixture() {
+async function fixture(mode: "planned" | "ticket" = "planned") {
   const root = await mkdtemp(join(tmpdir(), "consensus-verification-"));
   cleanup.push(() => rm(root, { recursive: true, force: true }));
   const worktree = join(root, "worktree");
@@ -43,8 +43,9 @@ async function fixture() {
   let dbClosed = false;
   cleanup.push(async () => { if (!dbClosed) database.close(); });
   database.createTopic({ id: "topic-1", slug: "static", title: "정적 검사", repositoryPath: worktree,
-    worktreePath: worktree, baseRef: "HEAD", branchName: null, state: "IMPLEMENTING", scopeGeneration: 1,
-    planRevision: 1, planSHA256: "a".repeat(64), approvedPlanSHA256: "a".repeat(64),
+    worktreePath: worktree, baseRef: "HEAD", branchName: null, state: "IMPLEMENTING", scopeGeneration: 1, workflowMode: mode,
+    ...(mode === "planned" ? { planRevision: 1, planSHA256: "a".repeat(64), approvedPlanSHA256: "a".repeat(64) }
+      : { planRevision: 0, planSHA256: null, approvedPlanSHA256: null }),
     createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), lastError: null });
   const artifacts = new ArtifactStore(join(data, "topics"), database);
   let clock = Date.now();
@@ -86,6 +87,23 @@ describe("정적 검사 실행 기록", () => {
     expect(output.stderr).toContain("Bad.swift:1");
     await f.service.complete("topic-1", first.run.id, output);
     expect((await f.service.prepare("topic-1")).disposition).toBe("run");
+  });
+
+  // ticket 은 계획·승인 없이 시작한다 — 검사는 작업 트리 입력의 사실이라 승인 계획을 실행 조건으로 두지 않는다(v3.10 (19')). 기록의 planSHA256 은 null 이다.
+  it("ticket 토픽은 승인 계획 없이 검사를 실행해 성공을 등록하고, 같은 입력에서 재사용하며, 범위가 바뀌면 재사용하지 않는다", async () => {
+    const f = await fixture("ticket");
+    const prepared = await f.service.prepare("topic-1");
+    expect(prepared.disposition).toBe("run");
+    expect(prepared.run.planSHA256).toBeNull();
+    const completed = await f.service.complete("topic-1", prepared.run.id, success);
+    expect(completed.status).toBe("succeeded");
+    expect((await f.service.prepare("topic-1")).disposition).toBe("reused");
+    expect((await f.service.receipts("topic-1")).text).toContain(completed.id);
+    f.database.updateTopic("topic-1", { scopeGeneration: 2 });
+    const next = await f.service.prepare("topic-1");
+    expect(next.disposition).toBe("run");
+    f.database.updateTopic("topic-1", { scopeGeneration: 3 });
+    expect((await f.service.complete("topic-1", next.run.id, success)).status).toBe("stale");
   });
 
   it.each(["source", "snapshot", "tool", "scope", "approval"])("실행 중 %s 변경은 성공 등록을 재사용하지 못하게 한다", async (change) => {

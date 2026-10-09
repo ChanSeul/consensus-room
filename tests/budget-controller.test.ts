@@ -80,6 +80,36 @@ it("관측 저장이 실패해도 토큰을 복구하고 다음 호출을 막는
  await expect(wrapped.resumeTurn({cwd:"/tmp",prompt:"test",sessionId:"s"})).rejects.toThrow();db.close();
 });
 
+// 79fc4fc5 F008 — 호출은 성공했는데 뒤 처리(관측 저장)가 실패하면, 원래 오류는 그대로 던지되 돌려받은 결과와 입력 커서를 checkpoint 에 남긴다.
+it("성공한 호출의 결과는 뒤 처리 실패로 잃지 않고 checkpoint 에 입력 커서와 함께 보존한다",async()=>{
+ const db=new DatabaseSync(":memory:"),ledger=new BudgetLedger(db);ledger.configure("t",policy,"test");
+ const original=ledger.observe.bind(ledger);let failed=false;
+ vi.spyOn(ledger,"observe").mockImplementation((...args)=>{if(!failed&&args[1].inputTokens){failed=true;throw new Error("storage failure");}return original(...args);});
+ const result={kind:"ACK" as const,summary:"완료",findings:[],evidenceRefs:[]};
+ const adapter:AgentAdapter={role:"claude",validateExistingSession:async()=>true,createSession:async()=>({sessionId:"s",result}),resumeTurn:async t=>{t.onUsage?.({inputTokens:20});return result;}};
+ const saved:unknown[]=[];
+ const wrapped=new BudgetController(ledger,()=>({topicId:"t",accounts:["t"],stage:"ACK"}),async(_id,output)=>{saved.push(output);}).wrap(adapter);
+ await expect(wrapped.resumeTurn({cwd:"/tmp",prompt:"test",sessionId:"s",inputSequence:7})).rejects.toThrow("storage failure");
+ expect(saved).toEqual([expect.objectContaining({sessionId:"s",result,inputSequence:7})]);db.close();
+});
+
+// cd2876b7 F008 — 봉투 결과를 엔진이 수신 슬롯에 잡았으면(captured) 슬롯이 보존하므로 checkpoint 에 결과를 다시 남기지 않는다. 잡지 못했으면 지금처럼 남긴다.
+it("봉투 결과는 엔진이 잡았을 때만 checkpoint 에서 빼고, 잡지 못했으면 결과와 입력 커서를 남긴다",async()=>{
+ for(const captured of [true,false]) {
+  const db=new DatabaseSync(":memory:"),ledger=new BudgetLedger(db);ledger.configure("t",policy,"test");
+  const original=ledger.observe.bind(ledger);let failed=false;
+  vi.spyOn(ledger,"observe").mockImplementation((...args)=>{if(!failed&&args[1].inputTokens){failed=true;throw new Error("storage failure");}return original(...args);});
+  const envelope={message:"완료",outcome:"done" as const};
+  const adapter:AgentAdapter={role:"claude",validateExistingSession:async()=>true,createSession:async()=>{throw new Error("unused");},resumeTurn:async()=>{throw new Error("unused");},
+   resumeEnvelopeTurn:async t=>{t.onEnvelopeReceived?.({sessionId:t.sessionId,envelope});t.onUsage?.({inputTokens:20});return envelope;}};
+  const saved:unknown[]=[];
+  const wrapped=new BudgetController(ledger,()=>({topicId:"t",accounts:["t"],stage:"ACK"}),async(_id,output)=>{saved.push(output);}).wrap(adapter);
+  await expect(wrapped.resumeEnvelopeTurn!({cwd:"/tmp",prompt:"test",sessionId:"s",inputSequence:7,onEnvelopeReceived:()=>captured})).rejects.toThrow("storage failure");
+  expect(saved,String(captured)).toEqual([captured?{sessionId:"s",output:undefined,incomplete:true}:expect.objectContaining({sessionId:"s",result:envelope,inputSequence:7})]);
+  db.close();
+ }
+});
+
 it("refuses a same-account start as running only while a run is live; a run that ends without final usage leaves it unsettled",async()=>{
  const db=new DatabaseSync(":memory:"),ledger=new BudgetLedger(db);ledger.configure("t",policy,"test");
  const reason=()=>{try{ledger.assertAvailable(["t"]);return null;}catch(error){return (error as BudgetBlocked).reason;}};

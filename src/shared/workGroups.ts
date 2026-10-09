@@ -128,8 +128,8 @@ export type WorkGroupInput = z.infer<typeof WorkGroupInputSchema>;
 //  - baseRef: 묶음 기준 커밋. 없으면 저장소 HEAD(기존 동작). 서비스가 커밋 OID 로 해석해 baseOID 로 저장한다.
 //  - branchPrefix: 단계 토픽의 브랜치 접두사. 없으면 "consensus"(기존 동작).
 //  - predecessorTopicId: 묶음 밖 선행 토픽. 같은 저장소이고 전달 커밋이 묶음 기준에 포함돼야 한다(서비스가 검증). 생성 때 그 토픽의
-//    범위 세대·전달 커밋·보류 원장을 묶음 레코드(predecessor)에 동결한다 — 뒤에 선행 토픽이 바뀌어도 승계 근거가 바뀌지 않고, 모든 단계가
-//    같은 기준 위에서 시작하므로 모든 단계가 그 원장을 이어받는다(inheritedDeferredFindings → deferredFindingsFor).
+//    범위 세대·전달 커밋·보류 원장을 묶음 레코드(predecessor)에 동결한다 — 뒤에 선행 토픽이 바뀌어도 승계 근거가 바뀌지 않는다. 엔진은 그
+//    원장을 모든 단계 머리말의 '선행 단계 보류 지적 원문' 절에 원문 그대로 싣는다(문맥 해시 밖).
 export const WorkGroupCreateOptionsSchema = z
   .object({
     parentTopicId: z.string().uuid().optional(),
@@ -148,11 +148,6 @@ export function parseWorkGroupCreateBody(body: unknown): { input: WorkGroupInput
   return { input: WorkGroupInputSchema.parse(body === record ? input : body), options: WorkGroupCreateOptionsSchema.parse(options) };
 }
 
-// 재계획 대기(D2) — 개정 저장과 같은 transaction 에서 켜지고, 그 단계 토픽의 범위 세대가 fromGeneration 보다 오른 뒤에만 꺼진다.
-export interface ReplanPending {
-  version: number;
-  fromGeneration: number;
-}
 export interface StageLink {
   topicId: string;
   baseOID: string;
@@ -160,7 +155,6 @@ export interface StageLink {
   groupVersion: number;
   // 연결·재계획 완료 때 기록한 단계 문맥 해시(stageContext 의 digest). 없으면 E4 전 연결 — groupVersion 으로만 결속한다.
   contextDigest?: string;
-  replanPending?: ReplanPending;
   // 기준 커밋에 모이지 않은 선행 결과(합류 대상) — 이 단계 결과 커밋이 모두 조상으로 가져야 닫을 수 있다.
   mergeTargets?: string[];
   // 통합 단계: 연결 때 잰, 단계 결과가 기록한 위키 문서의 기록 버전과 그때 버전.
@@ -190,7 +184,8 @@ export interface StageResult {
   baseOID: string;
   commitOID: string;
   reviewedTreeOID: string;
-  planSHA256: string;
+  // 결과를 만든 승인 계획 판 — ticket 단계는 계획 없이 리뷰한 커밋·트리로 결속하므로 null 이다(D1).
+  planSHA256: string | null;
   evidenceDigest: string | null;
   verifications: Array<{ id: string; status: string }>;
   memoryChanges: Array<{ path: string; sha256: string }>;
@@ -252,7 +247,6 @@ export interface WorkGroupView extends WorkGroup {
   continuation?: { groupId: string; stageId: string | null; reason: string | null };
   readyStages: string[];
   selectableStages: string[];
-  replanPending: string[];
 }
 
 // 준비된 단계: 완료 조건이 있고, 그 단계(또는 묶음 전체)에 걸린 미해소 차단 질문이 없다. 비용 상한은 선택 사항이다.

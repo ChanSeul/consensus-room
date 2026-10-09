@@ -18,6 +18,11 @@ export class ArtifactStore {
     private readonly database: ConsensusDatabase,
   ) {}
 
+  // 토픽 범위 세대의 산출물 폴더(계약 v3 (4)) — 공개 사본과 계획 묶음(planBundle 의 plan/)이 같은 배치를 쓴다.
+  generationDirectory(topicId: string, scopeGeneration: number): string {
+    return join(this.topicsDirectory, topicId, `generation-${scopeGeneration}`);
+  }
+
   async write(
     topicId: string,
     kind: string,
@@ -30,7 +35,7 @@ export class ArtifactStore {
     const storedRevision = Math.max(revision, previousRevision + 1);
     const sha256 = createHash("sha256").update(content, "utf8").digest("hex");
     const topicDirectory = join(this.topicsDirectory, topicId);
-    const generationDirectory = join(topicDirectory, `generation-${scopeGeneration}`);
+    const generationDirectory = this.generationDirectory(topicId, scopeGeneration);
     const blobsDirectory = join(topicDirectory, "artifacts");
     await mkdir(blobsDirectory, { recursive: true });
     const blobPath = join(blobsDirectory, sha256);
@@ -97,8 +102,9 @@ export class ArtifactStore {
     return artifact ? { path: artifact.path, content: await readVerified(artifact) } : null;
   }
 
-  async verifiedRevision(topicId: string, kind: string, sha256: string): Promise<{ path: string; content: string } | null> {
-    const artifact = this.database.artifactsForScope(topicId, kind).find((entry) => entry.sha256 === sha256);
+  // scopeGeneration: 기동 이행(D9)처럼 토픽 행을 parse 하지 않아야 하는 호출자가 범위 세대를 직접 넘긴다. 없으면 지금 토픽의 세대다.
+  async verifiedRevision(topicId: string, kind: string, sha256: string, scopeGeneration?: number): Promise<{ path: string; content: string } | null> {
+    const artifact = this.database.artifactsForScope(topicId, kind, scopeGeneration).find((entry) => entry.sha256 === sha256);
     return artifact ? { path: artifact.path, content: await readVerified(artifact) } : null;
   }
 

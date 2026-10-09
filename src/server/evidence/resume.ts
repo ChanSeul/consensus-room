@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { Topic, WorkflowState } from "../../shared/contracts.js";
 
-export const EVIDENCE_PLANNING_STATES = new Set<WorkflowState>(["CLAUDE_PLAN", "CODEX_AUDIT", "CLAUDE_REVISION", "CODEX_CLOSEOUT", "CONSENSUS_ACK"]);
 export interface EvidenceResumeIntent {
   topicId: string;
   scopeGeneration: number;
@@ -13,7 +12,7 @@ export interface EvidenceResumeIntent {
   actionId: string;
 }
 
-// Execution intent is separate from plan approval and survives only evidence-driven invalidation.
+// Execution intent is separate from plan approval; a changed scope, plan or mediator binding cancels it (workflow.pollEvidenceAssessments).
 export class EvidenceResumeStore {
   constructor(private readonly db: DatabaseSync) {
     db.exec("CREATE TABLE IF NOT EXISTS evidence_resume_intents(topic_id TEXT PRIMARY KEY REFERENCES topics(id) ON DELETE CASCADE,record TEXT NOT NULL)");
@@ -35,16 +34,5 @@ export class EvidenceResumeStore {
   }
   cancel(topicId: string): boolean {
     return this.db.prepare("DELETE FROM evidence_resume_intents WHERE topic_id=?").run(topicId).changes > 0;
-  }
-  invalidate(topicId: string): void {
-    const intent = this.get(topicId);
-    if (!intent) return;
-    const topic = this.db.prepare("SELECT scope_generation,plan_epoch,plan_sha256,state FROM topics WHERE id=?").get(topicId);
-    if (!topic || topic.scope_generation !== intent.scopeGeneration || topic.plan_epoch !== intent.planEpoch ||
-        topic.plan_sha256 !== intent.planSHA256 || !["DRAFT", "BLOCKED_ON_EVIDENCE"].includes(String(topic.state)) ||
-        !(intent.resumeState === "DRAFT" || EVIDENCE_PLANNING_STATES.has(intent.resumeState))) {
-      this.cancel(topicId); return;
-    }
-    this.save({ ...intent, planEpoch: intent.planEpoch + 1, planSHA256: null, resumeState: "DRAFT" });
   }
 }

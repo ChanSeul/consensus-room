@@ -16,7 +16,6 @@ interface Member {
 export class EvidenceCatalogStore {
   private publicationChanges?: Set<string>;
   private publicationEffects?: Array<() => void>;
-  private beforePublicationInvalidation?: (id: string) => void;
   constructor(private readonly db: DatabaseSync, private readonly store: EvidenceStore, private readonly clock: () => number) {
     db.exec(`
       CREATE TABLE IF NOT EXISTS evidence_roots(id TEXT PRIMARY KEY, record TEXT NOT NULL);
@@ -71,25 +70,13 @@ export class EvidenceCatalogStore {
     this.db.prepare("INSERT INTO evidence_catalog_history(scope,owner,at,action,url) VALUES (?,?,?,?,?)")
       .run(root.scope, root.owner, this.clock(), action, this.store.get(sourceId).url);
   }
-  private invalidate(root: EvidenceRoot): void {
-    this.invalidateTopics(this.affected(root));
-  }
-  private invalidateTopics(ids: string[]): void {
+  // 근거 범위가 바뀐 토픽을 알린다. 토픽은 초기화하지 않는다(D6 — 계획·승인·세션·산출물을 그대로 두고, 빠진 원문은 다음 턴 근거 쪽이 알린다).
+  // 이 목록은 publish 의 승인(admit)이 실행 중인 소비 토픽의 입력이 턴 도중 바뀌지 않게 막는 데 쓴다(입력 무결성). 완료·커밋된 토픽은 근거가 얼려져 대상이 아니다.
+  private scopeChanged(root: EvidenceRoot): void { this.scopeChangedTopics(this.affected(root)); }
+  private scopeChangedTopics(ids: string[]): void {
     for (const id of ids) {
       if (this.db.prepare("SELECT 1 FROM topics WHERE id=? AND (state='CLOSED' OR committed_oid IS NOT NULL)").get(id)) continue;
-      if (!this.publicationChanges?.has(id)) this.beforePublicationInvalidation?.(id);
       this.publicationChanges?.add(id);
-      this.db.prepare(`INSERT INTO evidence_artifact_boundaries
-        SELECT id,scope_generation,COALESCE((SELECT MAX(a.id) FROM artifacts a WHERE a.topic_id=topics.id),0) FROM topics WHERE id=?
-        ON CONFLICT(topic_id,scope_generation) DO UPDATE SET artifact_id=excluded.artifact_id`).run(id);
-      this.store.resumes.invalidate(id);
-      this.db.prepare(`UPDATE topics SET state=CASE WHEN state='BRAINSTORM_READY' THEN state ELSE 'DRAFT' END,plan_epoch=plan_epoch+1,plan_revision=0,plan_sha256=NULL,
-        approved_plan_sha256=NULL,fix_pass_used=0,second_fix_pass_used=0,closeout_revision_used=0,implementation_session_id=NULL,implementation_session_binding_json=NULL,
-        implementation_session_provider=NULL,implementation_prompt_sequence=NULL,resume_state=NULL,last_error=NULL,reviewed_head=NULL,reviewed_diff_sha256=NULL,reviewed_tree_oid=NULL WHERE id=?`).run(id);
-      for (const row of this.db.prepare("SELECT role FROM participants WHERE topic_id=?").all(id))
-        this.db.prepare("UPDATE participants SET session_id=?,mode='created',acknowledged_plan_sha256=NULL,provider=NULL,binding_json=NULL WHERE topic_id=? AND role=?")
-          .run(`pending:${randomUUID()}`, id, String(row.role));
-      this.db.prepare("DELETE FROM evidence_reviews WHERE topic_id=?").run(id);
     }
   }
   add(topicId: string, raw: EvidenceRootInput, approved = false): EvidenceRoot {
@@ -110,7 +97,7 @@ export class EvidenceCatalogStore {
       this.save(root);
       this.db.prepare("INSERT INTO evidence_members VALUES (?,?,?,'pending',NULL,NULL)").run(root.id, source.id, "approved");
       this.audit(root, approved ? "사용자가 루트와 범위를 승인함" : "검수할 루트 제안");
-      if (approved) { this.reuseApproval(source.id,root); this.invalidate(root); }
+      if (approved) { this.reuseApproval(source.id,root); this.scopeChanged(root); }
     });
     return root;
   }
@@ -136,7 +123,7 @@ export class EvidenceCatalogStore {
       if (input.groupId === null) this.db.prepare("DELETE FROM evidence_group_topics WHERE topic_id=?").run(topicId);
       else this.db.prepare("INSERT INTO evidence_group_topics VALUES (?,?) ON CONFLICT(topic_id) DO UPDATE SET group_id=excluded.group_id")
         .run(topicId,input.groupId);
-      this.invalidateTopics([topicId]);
+      this.scopeChangedTopics([topicId]);
     });
   }
   assertSelection(topicId: string, input: { version: string; rootId: string; action: string; sourceId?: string }): EvidenceRoot {
@@ -160,7 +147,7 @@ export class EvidenceCatalogStore {
         this.audit(root,input.action === "accept" ? "연결 자료 묶음 승인" : "연결 자료 묶음 제외",sourceId);
         if (input.action === "accept") this.reuseApproval(sourceId,root);
       }
-      root.version++; this.resetCycle(root); this.invalidate(root);
+      root.version++; this.resetCycle(root); this.scopeChanged(root);
     });
   }
   select(topicId: string, input: { version: string; rootId: string; action: "approve" | "remove" | "accept" | "reject" | "dismiss"; sourceId?: string }): void {
@@ -184,7 +171,7 @@ export class EvidenceCatalogStore {
       root.version++; this.resetCycle(root);
       if (input.action !== "dismiss") this.audit(root, ({ approve: "루트와 범위 승인", remove: "앞으로 사용할 근거에서 해제", accept: "연결 자료 승인", reject: "연결 자료 제외" })[input.action], input.sourceId);
       if (input.action === "approve" || input.action === "accept") this.reuseApproval(input.action === "approve" ? root.sourceId : input.sourceId!,root);
-      this.invalidate(root);
+      this.scopeChanged(root);
     });
   }
   members(rootId: string): Member[] {
@@ -227,12 +214,11 @@ export class EvidenceCatalogStore {
     if (this.publicationEffects) this.publicationEffects.push(effect);
     else effect();
   }
-  publish<T>(change: () => T, admit: (changed: string[]) => void, beforeInvalidate?: (id: string) => void): { result: T; changed: string[]; effects: Array<() => void> } {
+  // changed 는 근거 범위가 바뀐 토픽이다(scopeChanged) — admit 이 실행 중인 소비 토픽을 거부한다. 토픽은 초기화하지 않는다(D6).
+  publish<T>(change: () => T, admit: (changed: string[]) => void): { result: T; changed: string[]; effects: Array<() => void> } {
     const previous = this.publicationChanges, previousEffects = this.publicationEffects, changed = new Set<string>(), effects: Array<() => void> = [];
-    const previousBefore = this.beforePublicationInvalidation;
     this.publicationChanges = changed;
     this.publicationEffects = effects;
-    this.beforePublicationInvalidation = beforeInvalidate;
     try {
       return this.atomic(() => {
         const result = change();
@@ -244,13 +230,13 @@ export class EvidenceCatalogStore {
         if (previousEffects) previousEffects.push(...effects);
         return {result,changed:ids,effects:previousEffects ? [] : effects};
       });
-    } finally { this.publicationChanges = previous; this.publicationEffects = previousEffects; this.beforePublicationInvalidation = previousBefore; }
+    } finally { this.publicationChanges = previous; this.publicationEffects = previousEffects; }
   }
   private reuseApproval(sourceId: string, from: EvidenceRoot): void {
     for (const other of this.roots()) {
       if (other.id === from.id || other.status !== "approved" || !this.sharesApproval(from,other)) continue;
       const changed = this.db.prepare("UPDATE evidence_members SET state='approved' WHERE root_id=? AND source_id=? AND state='candidate'").run(other.id,sourceId);
-      if (changed.changes) { other.version++; this.resetCycle(other); this.audit(other,"같은 작업 범위에서 승인한 자료 재사용",sourceId); this.invalidate(other); }
+      if (changed.changes) { other.version++; this.resetCycle(other); this.audit(other,"같은 작업 범위에서 승인한 자료 재사용",sourceId); this.scopeChanged(other); }
     }
   }
   sourceIds(topicId: string): string[] {

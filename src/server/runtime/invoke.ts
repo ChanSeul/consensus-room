@@ -1,5 +1,6 @@
 import type { AgentResult, PlanRepair } from "../../shared/contracts.js";
-import type { AgentAdapter, CreatedSession, OutputSchema, SessionTurn } from "../types.js";
+import type { TurnEnvelope } from "../../shared/turnContract.js";
+import { nextEnvelopeMethod, type AgentAdapter, type CreatedEnvelopeSession, type CreatedSession, type OutputSchema, type SessionTurn } from "../types.js";
 
 type CreateCall = { method: "create"; turn: Omit<SessionTurn, "sessionId"> };
 type ResumeCall = { method: "resume"; turn: SessionTurn };
@@ -8,6 +9,9 @@ type RepairCall = { method: "plan-repair"; turn: SessionTurn };
 type CreateStructuredCall = { method: "create-structured"; turn: Omit<SessionTurn, "sessionId">; schema: OutputSchema };
 type ResumeStructuredCall = { method: "resume-structured"; turn: SessionTurn; schema: OutputSchema };
 type StructuredCreated = { sessionId: string; value: Record<string, unknown> };
+// 결과 봉투 턴(계약 v3.7 (13)) — 어댑터 사슬에 봉투 메서드가 없으면 기존 메서드로 돌아가지 않고 실행 전에 거부한다.
+type CreateEnvelopeCall = { method: "create-envelope"; turn: Omit<SessionTurn, "sessionId"> };
+type ResumeEnvelopeCall = { method: "resume-envelope"; turn: SessionTurn };
 
 // 엔진과 서버 없는 CLI의 공통 호출 경계. 정책·예산·세션 교체·결과 채택은 호출자 책임이다.
 // 콜백과 signal을 그대로 넘겨 어댑터 준비/재시도 뒤의 spawn 직전 검사도 유지한다.
@@ -16,8 +20,11 @@ export function invokeAdapter(adapter: AgentAdapter, call: ResumeCall): Promise<
 export function invokeAdapter(adapter: AgentAdapter, call: RepairCall): Promise<PlanRepair>;
 export function invokeAdapter(adapter: AgentAdapter, call: CreateStructuredCall): Promise<StructuredCreated>;
 export function invokeAdapter(adapter: AgentAdapter, call: ResumeStructuredCall): Promise<Record<string, unknown>>;
-export function invokeAdapter(adapter: AgentAdapter, call: CreateCall | ResumeCall | RepairCall | CreateStructuredCall | ResumeStructuredCall):
-  Promise<CreatedSession | AgentResult | PlanRepair | StructuredCreated | Record<string, unknown>> {
+export function invokeAdapter(adapter: AgentAdapter, call: CreateEnvelopeCall): Promise<CreatedEnvelopeSession>;
+export function invokeAdapter(adapter: AgentAdapter, call: ResumeEnvelopeCall): Promise<TurnEnvelope>;
+export function invokeAdapter(adapter: AgentAdapter,
+  call: CreateCall | ResumeCall | RepairCall | CreateStructuredCall | ResumeStructuredCall | CreateEnvelopeCall | ResumeEnvelopeCall):
+  Promise<CreatedSession | AgentResult | PlanRepair | StructuredCreated | Record<string, unknown> | CreatedEnvelopeSession | TurnEnvelope> {
   call.turn.signal?.throwIfAborted();
   const original = call.turn;
   let sessionId = "sessionId" in original ? original.sessionId : null;
@@ -53,5 +60,7 @@ export function invokeAdapter(adapter: AgentAdapter, call: CreateCall | ResumeCa
       if (!adapter.resumeStructuredTurn) throw new Error("이 어댑터는 소비처 schema 결과를 지원하지 않습니다.");
       return adapter.resumeStructuredTurn(call.turn, call.schema);
     }
+    case "create-envelope": return nextEnvelopeMethod(adapter, "createEnvelopeSession")(call.turn);
+    case "resume-envelope": return nextEnvelopeMethod(adapter, "resumeEnvelopeTurn")(call.turn);
   }
 }

@@ -27,6 +27,7 @@ function makeStore(): { store: ArtifactStore; database: ConsensusDatabase; root:
     worktreePath: "/tmp/worktree",
     branchName: null,
     state: "DRAFT",
+    workflowMode: "planned",
     scopeGeneration: 1,
     planRevision: 0,
     planSHA256: null,

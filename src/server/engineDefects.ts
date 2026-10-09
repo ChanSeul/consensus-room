@@ -317,7 +317,7 @@ export class EngineDefectWorker {
         const budgeted = new BudgetController(this.db.budgets,
           () => ({ topicId: row.topicId, accounts, stage: "ENGINE_DEFECT" }),
           async (_id, output) => { this.db.engineDefects.save({ ...row, error: safeError(output) }); },
-          undefined, true, undefined, this.db).wrap(this.adapter);
+          true, undefined, this.db).wrap(this.adapter);
         const session = await budgeted.createSession({ cwd: row.worktree, implementation: true, engineDefectFix: true,
           job: { role: "implementer", operation: "fix" }, settings: codexSettings, signal, admitSync: admitted,
           onProcessSpawn: process => this.db.recordActionProcess(row.actionId!, process),
@@ -381,7 +381,7 @@ export class EngineDefectWorker {
       };
       await new BudgetController(this.db.budgets,
         () => ({ topicId: row.topicId, accounts, stage: "ENGINE_DEFECT_REVIEW" }),
-        async () => {}, undefined, true, undefined, this.db).wrap(reviewAdapter).createSession({
+        async () => {}, true, undefined, this.db).wrap(reviewAdapter).createSession({
           cwd: this.repository, prompt: "Registered engine defect host review", settings: AgentExecutionSettingsSchema.parse(defaults.hostReviewer),
           job: { role: "reviewer", operation: "review" }, signal, requiresFinalUsage: true,
           // Persisted before host-review spawns: the worker poll settles this execution if the review is stopped.

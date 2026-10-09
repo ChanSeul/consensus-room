@@ -6,8 +6,9 @@ import { ConsensusDatabase } from "../src/server/database";
 import { NativeEvidenceConnector } from "../src/server/evidence/nativeConnector";
 import { EvidenceService } from "../src/server/evidence/service";
 import type { AppReader } from "../src/server/evidence/nativeReader";
+import type { WorkerFact } from "../src/shared/turnContract";
 
-// discover/collect -> persisted snapshot -> automatic queue is the public contract.
+// discover/collect -> persisted snapshot -> source facts is the public contract.
 // Fixtures model provider pagination, account switching, edits/deletions, and failure.
 // New collection contracts and review regressions are covered here; live auth and rendered UI need separate checks.
 const clean: Array<() => void> = [];
@@ -16,14 +17,14 @@ function fixture() {
   const dir = mkdtempSync(join(tmpdir(), "native-evidence-"));
   const db = new ConsensusDatabase(join(dir, "room.sqlite"));
   clean.push(() => { db.close(); rmSync(dir, {recursive:true,force:true}); });
-  const topic = db.createTopic({ id:"t",slug:"t",title:"Test",repositoryPath:dir,worktreePath:dir,baseRef:"main",branchName:null,
+  const topic = db.createTopic({ workflowMode: "planned", id:"t",slug:"t",title:"Test",repositoryPath:dir,worktreePath:dir,baseRef:"main",branchName:null,
     state:"CODEX_AUDIT",scopeGeneration:1,planRevision:1,planSHA256:"a".repeat(64),approvedPlanSHA256:null,
     createdAt:new Date().toISOString(),updatedAt:new Date().toISOString(),lastError:null });
   const root = db.evidence.catalog.add(topic.id,{url:"https://docs.google.com/spreadsheets/d/test/edit",label:"Policy",mode:"connector",scope:"topic",required:true,intervalSeconds:900},true);
   return {db,topic,root};
 }
 it("commits complete hidden-tab/formula/comment reads, skips duplicate notifications, and preserves cache on failure", async () => {
-  const {db,topic,root}=fixture(); let formula="=1+1", hidden=true, comments:any[]=[{id:"c",content:"Before",replies:[{id:"r",content:"Reply"}]}], fail=false;
+  const {db,root}=fixture(); let formula="=1+1", hidden=true, comments:any[]=[{id:"c",content:"Before",replies:[{id:"r",content:"Reply"}]}], fail=false;
   const call=vi.fn(async (_provider,name) => {
     if(name.endsWith("metadata")) return {sheets:[{properties:{sheetId:1,title:"Hidden",hidden,gridProperties:{rowCount:1,columnCount:1}}}]};
     if(name.endsWith("cells")) return {sheets:[{properties:{sheetId:1},data:[{rowData:[{values:[{userEnteredValue:{formulaValue:formula},note:"Owner note"}]}]}]}]};
@@ -31,25 +32,20 @@ it("commits complete hidden-tab/formula/comment reads, skips duplicate notificat
     return {comments,nextPageToken:null};
   });
   const reader:AppReader={call,config:async()=>({googleDriveLinkId:"link_work"}),close:async()=>{}};
-  const changed=vi.fn();
-  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("No REST");}},changed,undefined,new NativeEvidenceConnector(reader));
-  const observe=()=>db.evidence.automation.observe(topic,db.evidence.list(topic.id),db.evidence.topic(topic).digest);
+  const facts:WorkerFact[]=[];
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("No REST");}},undefined,new NativeEvidenceConnector(reader),fact=>facts.push(fact));
   try {
-    await service.collect(root.id); expect(observe()).toBeNull();
+    await service.collect(root.id);
     const first=db.evidence.get(root.sourceId).contentHash;
     expect(db.evidence.snapshot(root.sourceId)?.units.map(u=>u.id)).toEqual(["1:0:0","comment:c","workbook"]);
-    await service.collect(root.id,true); expect(observe()).toBeNull(); expect(changed).toHaveBeenCalledTimes(1);
+    await service.collect(root.id,true); expect(facts.filter(fact=>fact.kind==="source-change")).toHaveLength(1);
     expect(db.evidence.get(root.sourceId).collection?.status).toBe("unchanged");
     formula="=2+2"; hidden=false; comments=[]; fail=true;
-    await service.collect(root.id,true); expect(db.evidence.get(root.sourceId).contentHash).toBe(first); expect(observe()).toBeNull();
+    await service.collect(root.id,true); expect(db.evidence.get(root.sourceId).contentHash).toBe(first);
     expect(db.evidence.get(root.sourceId).collection?.status).toBe("error");
     fail=false; await service.collect(root.id,true);
-    const job=observe()!; expect(job.changes).toHaveLength(1); expect(observe()?.id).toBe(job.id);
     expect(db.evidence.snapshot(root.sourceId)?.units.map(u=>u.id)).not.toContain("comment:c");
     expect(db.evidence.snapshot(root.sourceId)?.units.find(u=>u.id==="workbook")?.content).toContain('"hidden":false');
-    expect(db.evidence.automation.start(job,"action")).toBe(true); expect(db.evidence.automation.start(job,"other")).toBe(false);
-    expect(db.evidence.automation.finish(job,{...topic,planEpoch:topic.planEpoch+1},job.digest,"no-impact","stale")).toBe(false);
-    expect(db.evidence.automation.jobs(topic.id)[0].status).toBe("superseded");
   } finally {await service.stop();}
 });
 it("refuses mixed accounts across sheet pages and records no completed snapshot", async()=>{
@@ -70,15 +66,6 @@ it("reads Slack formatted messages and refuses an incomplete pagination response
   pagination_info="There are no more messages.";
   const page=await connector.discover(source,null,signal); expect(page.units[0].id).toBe("123.456"); expect(page.links[0].relation).toBe("child");
 });
-it("persists pending changes across store recovery and does not replay an unconfirmed model run",()=>{
-  const {db,topic,root}=fixture();
-  const ingest=(text:string)=>{const check=db.evidence.begin(root.sourceId,true)!;db.evidence.ingest(root.sourceId,{checkId:check.checkId,revision:text,units:[{id:"policy",kind:"cells",content:text}]});};
-  const observe=()=>db.evidence.automation.observe(topic,db.evidence.list(topic.id),db.evidence.topic(topic).digest);
-  ingest("before");expect(observe()).toBeNull();ingest("after");const job=observe()!;
-  db.evidence.automation.recover(topic.id);expect(observe()?.id).toBe(job.id);
-  db.evidence.automation.start(job,"lost-action");db.evidence.automation.recover(topic.id);
-  expect(db.evidence.automation.jobs(topic.id)[0].status).toBe("failed");expect(observe()).toBeNull();
-});
 it("captures Figma design edits and explicitly reports unavailable comments",async()=>{
   const {db,topic}=fixture();const source=db.evidence.register(topic.id,{url:"https://www.figma.com/design/test?node-id=1-2",label:"Approved",mode:"connector",intervalSeconds:900});
   let text="Original design";
@@ -93,7 +80,7 @@ it("resumes a forced multi-slice refresh instead of declaring its previous fresh
   const reader:AppReader={config:async()=>({googleDriveLinkId:"link_work"}),close:async()=>{},call:async(_p,name)=>name.endsWith("metadata")
     ?{sheets:[{properties:{sheetId:1,title:"Tab",gridProperties:{rowCount:rows,columnCount:100}}}]}
     :name.endsWith("cells")?{sheets:[{properties:{sheetId:1},data:[]}]}:{comments:[]}};
-  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("unused");}},()=>{},undefined,new NativeEvidenceConnector(reader));
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("unused");}},undefined,new NativeEvidenceConnector(reader));
   try {
     await service.collect(root.id);const before=db.evidence.get(root.sourceId).contentHash;
     rows=2100;await service.collect(root.id,true);
@@ -118,19 +105,11 @@ it("reuses explicit child discovery when another approved root shares a collecte
   const child="https://team.atlassian.net/wiki/spaces/TEAM/pages/456";
   const discover=vi.fn(async(source:any)=>({revision:"r1",cursor:null,connectionKey:"same-account",accountConfirmed:true,
     units:[{id:"body",kind:"document" as const,content:source.resource}],links:source.id===first.sourceId?[{url:child,label:"Child",unitId:"body",relation:"child" as const}]:[]}));
-  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("unused");}},()=>{},undefined,{configured:()=>true,fetch:async()=>{throw Error("unused");},discover});
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("unused");}},undefined,{configured:()=>true,fetch:async()=>{throw Error("unused");},discover});
   try{await service.poll();expect(discover.mock.calls.filter(([source])=>source.id===first.sourceId)).toHaveLength(1);
     expect(db.evidence.catalog.state("other").entries.filter(e=>e.rootId===second.id).map(e=>e.source.url)).toContain(child);
     expect(db.evidence.catalog.state("other").coverage.ready).toBe(true);
   }finally{await service.stop();}
-});
-it("restores an unstarted superseded change and records removed sources as changes",()=>{
-  const {db,topic,root}=fixture();
-  const ingest=(text:string)=>{const check=db.evidence.begin(root.sourceId,true)!;db.evidence.ingest(root.sourceId,{checkId:check.checkId,revision:text,units:[{id:"policy",kind:"cells",content:text}]});};
-  const observe=()=>db.evidence.automation.observe(topic,db.evidence.list(topic.id),db.evidence.topic(topic).digest);
-  ingest("A");observe();ingest("B");const b=observe()!;ingest("C");observe();ingest("B");
-  expect(observe()).toMatchObject({id:b.id,status:"pending"});
-  const removed=db.evidence.automation.observe(topic,[],"d".repeat(64));expect(removed?.changes).toEqual([{sourceId:root.sourceId,before:b.changes[0].before,after:null}]);
 });
 it("does not fail the main workflow when an automatic review is interrupted by restart",()=>{
   const {db,topic}=fixture();db.updateTopic(topic.id,{state:"CODEX_AUDIT"});db.startAction({id:"auto",topicId:topic.id,kind:"evidence-assessment",status:"running",createdAt:new Date().toISOString(),finishedAt:null,error:null,pid:null,pgid:null,processExecutable:null,processCommand:null,processStartedAt:null});
@@ -184,7 +163,7 @@ it("manual and background reads overlap unrelated providers while source request
     else slackStarted.resolve();
     return {units:[{id:"body",kind:"document" as const,content:"policy"}],links:[],cursor:null,revision:"v1"};
   });
-  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("unused");}},()=>{},undefined,{fetch:async()=>{throw Error("unused");},discover:calls});
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("unused");}},undefined,{fetch:async()=>{throw Error("unused");},discover:calls});
   const manual=service.collect(root.id), duplicate=service.collect(root.id);
   try {
     expect(duplicate).toBe(manual); await sheetStarted.promise;
@@ -198,14 +177,14 @@ it("a cancelled late page preserves the previous snapshot and never notifies mod
   const {db,root}=fixture(), started=collectionLatch<void>(), held=collectionLatch<void>();
   const check=db.evidence.begin(root.sourceId,true)!;
   db.evidence.ingest(root.sourceId,{checkId:check.checkId,revision:"old",units:[{id:"body",kind:"document",content:"old"}]});
-  const hash=db.evidence.get(root.sourceId).contentHash, changed=vi.fn();
-  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("unused");}},changed,undefined,{fetch:async()=>{throw Error("unused");},discover:async()=>{
+  const hash=db.evidence.get(root.sourceId).contentHash, facts:WorkerFact[]=[];
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("unused");}},undefined,{fetch:async()=>{throw Error("unused");},discover:async()=>{
     started.resolve(); await held.promise;
     return {units:[{id:"body",kind:"document",content:"new"}],links:[],cursor:null,revision:"new"};
-  }});
+  }},fact=>facts.push(fact));
   const collect=service.collect(root.id,true);
   await started.promise; const stopped=service.stop(); held.resolve(); await Promise.all([collect,stopped]);
-  expect(db.evidence.get(root.sourceId).contentHash).toBe(hash); expect(changed).not.toHaveBeenCalled();
+  expect(db.evidence.get(root.sourceId).contentHash).toBe(hash); expect(facts.filter(fact=>fact.kind==="source-change")).toEqual([]);
   expect(db.evidence.catalog.members(root.id)[0].progress).not.toBe("complete");
 });
 it("rejects binding changes during a pending final page and retains the completed old snapshot",async()=>{
@@ -217,11 +196,11 @@ it("rejects binding changes during a pending final page and retains the complete
     if(pending){started.resolve();await held.promise;}
     return {comments:[{id:"c",content:pending?"new":"old"}]};
   }};
-  const changed=vi.fn(), service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("unused");}},changed,undefined,new NativeEvidenceConnector(reader));
+  const facts:WorkerFact[]=[], service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("unused");}},undefined,new NativeEvidenceConnector(reader),fact=>facts.push(fact));
   try {
     await service.collect(root.id); const hash=db.evidence.get(root.sourceId).contentHash;
     pending=true; const collect=service.collect(root.id,true);await started.promise;link="link_other";held.resolve();await collect;
-    expect(db.evidence.get(root.sourceId).contentHash).toBe(hash);expect(changed).toHaveBeenCalledTimes(1);
+    expect(db.evidence.get(root.sourceId).contentHash).toBe(hash);expect(facts.filter(fact=>fact.kind==="source-change")).toHaveLength(1);
     expect(db.evidence.get(root.sourceId).collection?.status).toBe("error");
   }finally{held.resolve();await service.stop();}
 });
@@ -255,7 +234,7 @@ it("automatically restarts only the root whose sheet metadata became obsolete", 
     if(name.endsWith("cells")) return {sheets:[{properties:{sheetId:2},data:[{rowData:[{values:[{formattedValue:"replacement tab"}]}]}]}]};
     return {comments:[],nextPageToken:null};
   }};
-  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("No REST");}},()=>{},undefined,new NativeEvidenceConnector(reader));
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("No REST");}},undefined,new NativeEvidenceConnector(reader));
   try {
     await service.collect(root.id);
     expect(db.evidence.get(root.sourceId).collection?.status).toBe("error");

@@ -52,7 +52,7 @@ it("a failed refresh removes stale running indicators, and late replies cannot r
 });
 function pipeline():WorkGroupView{return {id:"g",parentTopicId:"r",title:"파이프라인",goal:"목표",contracts:"보존 계약",repositoryPath:"/repo",baseOID:"base",version:4,createdAt:"now",links:{a:{topicId:"t",baseOID:"base",groupVersion:4}},
   stages:[{id:"a",title:"A 작업",goal:"A 목표",kind:"work",dependsOn:[]},{id:"b",title:"B 작업",goal:"B 목표",kind:"work",dependsOn:[]},{id:"z",title:"통합",goal:"통합 목표",kind:"integration",dependsOn:["a","b"]}],
-  questions:[{id:"q",stageId:null,text:"확인된 계약",blocksStart:false,resolution:"유지"}],budgetPolicy:{mode:"observe"},budget:null,stageStates:{a:"USER_DECISION_REQUIRED"},delivery:{},delivered:false,readyStages:[],selectableStages:[],replanPending:[]};}
+  questions:[{id:"q",stageId:null,text:"확인된 계약",blocksStart:false,resolution:"유지"}],budgetPolicy:{mode:"observe"},budget:null,stageStates:{a:"USER_DECISION_REQUIRED"},delivery:{},delivered:false,readyStages:[],selectableStages:[]};}
 it("edits real dependencies through ports, saves a recoverable draft, and applies versioned input without losing contracts",async()=>{
   const original=pipeline(),onDone=vi.fn();vi.spyOn(api,"listWorkGroups").mockResolvedValue([original]);const apply=vi.spyOn(api,"applyPipeline").mockResolvedValue(original);
   const renderEditor=()=>render(<PipelineEditor topicId="r" topicIds={["r","t"]} canCreate title="Root" goal="Goal" onDone={onDone}/>);

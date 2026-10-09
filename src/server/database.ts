@@ -10,19 +10,15 @@ import { ReviewLedger } from "./reviewLedger.js";
 import { RoleRegistry } from "./roleAssignments.js";
 import { EngineDefectStore } from "./engineDefects.js";
 import { PlanningStore } from "./planningStore.js";
-import { RevisionLedger } from "./revisionLedger.js";
 import { WorkGroups } from "./workGroups.js";
 import { BudgetLedger } from "./budgetLedger.js";
 import { DiagnosisStore } from "./diagnosisStore.js";
-import { FixContractStore } from "./fixContractStore.js";
 import { EvidenceStore } from "./evidence/store.js";
-import type { FixContract } from "../shared/fixContract.js";
-import { CLOSED_DIAGNOSIS_STATUSES, type DiagnosisBinding, type DiagnosisInput, type DiagnosisOrigin, type DiagnosisRecord, type DiagnosisStatus } from "../shared/diagnoses.js";
 import { EventEmitter } from "node:events";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { redactSecrets } from "../shared/workflow.js";
+import { recordedWorkflowMode, redactSecrets } from "../shared/workflow.js";
 import { failureResumePoint, isStopped, stopRecord } from "../shared/workflowLifecycle.js";
 import { redactRecord } from "./security.js";
 import {
@@ -37,11 +33,11 @@ import {
   type Participant,
   type TimelineEvent,
   type Topic,
+  type WorkflowMode,
   type WorkflowState,
 } from "../shared/contracts.js";
 import type { ActionRecord, TurnUsage, AutoRetryState, InternalTopicFlags, ParticipantRole, StoredArtifact } from "./types.js";
-import { legacyBinding, parseBinding, sameBinding, type SessionBinding } from "./turnRouting.js";
-import type { PlanningCheckpoint } from "../shared/planningControl.js";
+import { legacyBinding, parseBinding, type SessionBinding } from "./turnRouting.js";
 
 type SqlValue = string | number | bigint | null | Uint8Array;
 
@@ -54,6 +50,20 @@ interface TimelineEventInput {
   payload?: Record<string, unknown>;
 }
 
+// 기동 이행(D9)이 읽는 토픽 원시 행 — 상태·재개 지점은 지운 옛 값일 수 있는 기록 문자열이다.
+export interface LegacyTopicRow {
+  id: string;
+  state: string;
+  resumeState: string | null;
+  planSHA256: string | null;
+  planEpoch: number;
+  scopeGeneration: number;
+  workflowMode: string;
+  topicKind: string;
+  lastError: string | null;
+  participants: Array<{ role: string; acknowledgedPlanSHA256: string | null }>;
+}
+
 function now(): string {
   return new Date().toISOString();
 }
@@ -61,18 +71,19 @@ function now(): string {
 // 실행이 끝났거나 사용자 판단을 기다리는 상태 — 실패 원장 처리가 이 상태를 FAILED로 덮으면 복구 경로가 사라진다.
 export const COMPLETED_TOPIC_STATES: ReadonlySet<WorkflowState> = new Set([
   "BRAINSTORM_READY",
-  "AWAITING_USER_APPROVAL", "READY_TO_DELIVER", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED", "CLOSED",
+  "AWAITING_USER_APPROVAL", "READY_TO_DELIVER", "USER_DECISION_REQUIRED", "CLOSED",
 ]);
+
+// 현재 코드 리뷰 세션의 조건(계약 v3.15 (24)) — 같은 토픽·같은 범위 세대. 세 조회(세션·바인딩·전달 커서)가 같은 조건을 쓴다.
+const CURRENT_REVIEW_SESSION = "r.topic_id = ? AND r.scope_generation = t.scope_generation";
 
 export class ConsensusDatabase {
   readonly events = new EventEmitter();
   private readonly db: DatabaseSync;
-  readonly revisions: RevisionLedger;
   readonly reviews: ReviewLedger;
   readonly budgets: BudgetLedger;
   readonly workGroups: WorkGroups;
   readonly diagnoses: DiagnosisStore;
-  readonly fixContracts: FixContractStore;
   readonly evidence: EvidenceStore;
   readonly planning: PlanningStore;
   readonly roles: RoleRegistry;
@@ -89,12 +100,10 @@ export class ConsensusDatabase {
     this.continuations = new ContinuationStore(this.db);
     this.db.exec("CREATE TABLE IF NOT EXISTS review_exchanges(topic_id TEXT NOT NULL REFERENCES topics(id), scope TEXT NOT NULL, count INTEGER NOT NULL, PRIMARY KEY(topic_id,scope));");
     this.diagnoses = new DiagnosisStore(this.db);
-    this.fixContracts = new FixContractStore(this.db);
     this.evidence = new EvidenceStore(this.db);
     this.planning = new PlanningStore(this.db);
     this.budgets = new BudgetLedger(this.db);
     this.workGroups = new WorkGroups(this.db);
-    this.revisions = new RevisionLedger(this.db);
     this.reviews = new ReviewLedger(this.db);
     this.roles = new RoleRegistry(this.db);
     this.sessions = new SessionRecords(this.db);
@@ -160,25 +169,8 @@ export class ConsensusDatabase {
       phase: String(row.phase), observedAt: String(row.observed_at), usage: JSON.parse(String(row.usage_json)) as TurnUsage }));
   }
 
-  saveOptimizationMetric(topicId: string, generation: number, executionId: string | undefined, metrics: Record<string, unknown>): void {
-    try {
-      this.db.prepare("INSERT INTO optimization_metrics(topic_id, scope_generation, execution_id, record_json, created_at) VALUES (?, ?, ?, ?, ?)")
-        .run(topicId, generation, executionId ?? null, JSON.stringify(metrics), now());
-    } catch { /* Optional measurements must not change the execution outcome. */ }
-  }
-
-  optimizationMetrics(topicId: string): Array<{ executionId: string | null; metrics: Record<string, unknown> }> {
-    return this.db.prepare("SELECT execution_id, record_json FROM optimization_metrics WHERE topic_id = ? ORDER BY id").all(topicId)
-      .map((row) => ({ executionId: row.execution_id as string | null, metrics: JSON.parse(String(row.record_json)) }));
-  }
-
   private migrate(): void {
     this.db.exec(`
-      CREATE TABLE IF NOT EXISTS optimization_metrics (
-        id INTEGER PRIMARY KEY, topic_id TEXT NOT NULL REFERENCES topics(id), scope_generation INTEGER NOT NULL,
-        execution_id TEXT, record_json TEXT NOT NULL, created_at TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS optimization_metrics_topic ON optimization_metrics(topic_id);
       CREATE TABLE IF NOT EXISTS execution_usage (
         execution_id TEXT PRIMARY KEY,
         topic_id TEXT NOT NULL REFERENCES topics(id),
@@ -228,6 +220,7 @@ export class ConsensusDatabase {
         ,committed_oid TEXT
         ,pushed_oid TEXT
         ,orphan_commit_oid TEXT
+        ,workflow_mode TEXT NOT NULL DEFAULT 'ticket'
       );
       CREATE TABLE IF NOT EXISTS participants (
         topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
@@ -241,8 +234,8 @@ export class ConsensusDatabase {
         topic_id TEXT PRIMARY KEY REFERENCES topics(id),
         session_id TEXT NOT NULL UNIQUE,
         scope_generation INTEGER NOT NULL,
-        plan_epoch INTEGER NOT NULL,
-        plan_sha256 TEXT NOT NULL
+        plan_epoch INTEGER,
+        plan_sha256 TEXT
       );
       CREATE TABLE IF NOT EXISTS timeline_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -358,6 +351,8 @@ export class ConsensusDatabase {
     // 본문 대조(멱등 키 오용 검출)가 자기 주석과 비교하게 되어 정상 재생까지 409가 된다.
     this.ensureColumn("global_requests", "planned_json", "TEXT");
     this.migrateAgentSettings();
+    this.migrateWorkflowMode();
+    this.migrateReviewSessionBinding();
     this.db.exec("CREATE INDEX IF NOT EXISTS artifact_topic_scope_kind ON artifacts(topic_id, scope_generation, kind, revision DESC)");
     this.db.exec("CREATE INDEX IF NOT EXISTS timeline_topic_scope_sequence ON timeline_events(topic_id, scope_generation, sequence)");
   }
@@ -394,6 +389,58 @@ export class ConsensusDatabase {
       for (const [column, definition] of missing) {
         this.db.exec(`ALTER TABLE topics ADD COLUMN ${column} ${definition}`);
       }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  // 작업 방식 컬럼(CR 흐름 단순화 D1·D9). 추가와 기존 행 백필은 한 transaction 이다 — 컬럼만 생긴 채 죽으면 다음 실행이 백필을 건너뛰어
+  // 계획을 가진 토픽이 ticket 으로 남는다. 판정은 recordedWorkflowMode 하나다.
+  private migrateWorkflowMode(): void {
+    const columns = this.db.prepare("PRAGMA table_info(topics)").all() as Array<Record<string, unknown>>;
+    if (columns.some((item) => item.name === "workflow_mode")) return;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec("ALTER TABLE topics ADD COLUMN workflow_mode TEXT NOT NULL DEFAULT 'ticket'");
+      const rows = this.db.prepare("SELECT id, plan_sha256, state, resume_state FROM topics").all() as Array<Record<string, unknown>>;
+      const update = this.db.prepare("UPDATE topics SET workflow_mode = ? WHERE id = ?");
+      for (const row of rows) {
+        update.run(recordedWorkflowMode({ planSHA256: (row.plan_sha256 as string | null) ?? null, state: String(row.state),
+          resumeState: row.resume_state == null ? null : String(row.resume_state) }), String(row.id));
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  // 코드 리뷰 세션 결속(계약 v3.15 (24)) — plan_epoch·plan_sha256 을 결속 열에서 기록 열(nullable)로 바꾼다. SQLite 는 NOT NULL 을 풀 수 없어 표를 다시
+  // 만든다. 새 표 생성·행 복사·옛 표 삭제·이름 변경이 한 transaction 이다 — 중간에 죽으면 옛 표 그대로 다음 실행이 다시 한다. 행과 열(prompt_sequence·
+  // provider·binding_json)·session_id UNIQUE·topics FK 를 그대로 옮긴다.
+  private migrateReviewSessionBinding(): void {
+    const columns = this.db.prepare("PRAGMA table_info(codex_review_sessions)").all() as Array<Record<string, unknown>>;
+    if (!columns.some((column) => ["plan_epoch", "plan_sha256"].includes(String(column.name)) && Number(column.notnull) === 1)) return;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE codex_review_sessions_next (
+          topic_id TEXT PRIMARY KEY REFERENCES topics(id),
+          session_id TEXT NOT NULL UNIQUE,
+          scope_generation INTEGER NOT NULL,
+          plan_epoch INTEGER,
+          plan_sha256 TEXT,
+          prompt_sequence INTEGER,
+          provider TEXT,
+          binding_json TEXT
+        );
+        INSERT INTO codex_review_sessions_next(topic_id, session_id, scope_generation, plan_epoch, plan_sha256, prompt_sequence, provider, binding_json)
+          SELECT topic_id, session_id, scope_generation, plan_epoch, plan_sha256, prompt_sequence, provider, binding_json FROM codex_review_sessions;
+        DROP TABLE codex_review_sessions;
+        ALTER TABLE codex_review_sessions_next RENAME TO codex_review_sessions;
+      `);
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -460,7 +507,7 @@ export class ConsensusDatabase {
       SELECT 1 FROM timeline_events WHERE topic_id=? AND actor='system' AND state='BRAINSTORM_READY'
         AND json_extract(payload_json, '$.brainstormCompletedActionId')=? LIMIT 1
     `).get(topicId, actionId));
-    if (state === "USER_DECISION_REQUIRED" || state === "BLOCKED_ON_EVIDENCE") return Boolean(this.db.prepare(`
+    if (state === "USER_DECISION_REQUIRED") return Boolean(this.db.prepare(`
       SELECT 1 FROM timeline_events e JOIN topics t ON t.id=e.topic_id
       WHERE e.topic_id=? AND e.scope_generation=t.scope_generation AND e.actor='system' AND e.state=?
         AND json_extract(e.payload_json, '$.waitingCompletedActionId')=? LIMIT 1
@@ -524,7 +571,8 @@ export class ConsensusDatabase {
   }
 
   // planEpoch는 항상 1로 시작하고(컬럼 기본값) 이후 무효화·범위 변경만 올린다. 생성 입력에서 받지 않는다.
-  // branchPrefix도 컬럼 기본값(consensus)이 있어 생략할 수 있다.
+  // branchPrefix도 컬럼 기본값(consensus)이 있어 생략할 수 있다. 작업 방식은 호출자가 명시한다(생성 API 는 입력 기본값 ticket, 작업 묶음 단계는
+  // ticket).
   createTopic(input: Omit<Topic,
     "participants" | "planEpoch" | "agentSettings" | "branchPrefix" | "requestedBranchName" | "predecessorTopicId"
   > & {
@@ -537,17 +585,19 @@ export class ConsensusDatabase {
     this.db.prepare(`
       INSERT INTO topics (
         id, slug, title, repository_path, base_ref, worktree_path, branch_prefix, requested_branch_name, predecessor_topic_id, branch_name, state,
-        scope_generation, plan_revision, plan_sha256, approved_plan_sha256,
+        workflow_mode, scope_generation, plan_revision, plan_sha256, approved_plan_sha256,
         claude_model, claude_effort, codex_model, codex_effort,
         claude_impl_model, claude_impl_effort, codex_impl_model, codex_impl_effort,
         created_at, updated_at, last_error, topic_kind, parent_topic_id, work_entry_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       input.id, input.slug, input.title, input.repositoryPath, input.baseRef, input.worktreePath,
       input.branchPrefix ?? "consensus",
       input.requestedBranchName ?? null,
       input.predecessorTopicId ?? null,
-      input.branchName, input.state, input.scopeGeneration, input.planRevision, input.planSHA256,
+      input.branchName, input.state,
+      input.workflowMode,
+      input.scopeGeneration, input.planRevision, input.planSHA256,
       input.approvedPlanSHA256,
       settings.claude.model, settings.claude.effort, settings.codex.model, settings.codex.effort,
       settings.claude.implementation?.model ?? null, settings.claude.implementation?.effort ?? null,
@@ -555,7 +605,6 @@ export class ConsensusDatabase {
       input.createdAt, input.updatedAt, input.lastError,
       input.topicKind ?? "task", input.parentTopicId ?? null, input.workEntry ? JSON.stringify(input.workEntry) : null,
     );
-    this.revisions.initialize(input.id);
     this.reviews.initialize(input.id);
     return this.getTopic(input.id);
   }
@@ -563,6 +612,22 @@ export class ConsensusDatabase {
   listTopics(): Topic[] {
     const rows = this.db.prepare("SELECT * FROM topics ORDER BY updated_at DESC").all();
     return rows.map((row) => this.mapTopic(row));
+  }
+
+  // 기동 이행(D9) 전용 원시 행 — 지운 상태로 저장된 행도 parse 없이 읽는다(옛 저장 형식은 이행 경계에서만 다룬다, F6). 상태·재개 지점은 기록
+  // 문자열이다. 순서는 listTopics 와 같다.
+  legacyMigrationRows(): LegacyTopicRow[] {
+    const participants = this.db.prepare("SELECT role, acknowledged_plan_sha256 FROM participants WHERE topic_id = ? ORDER BY role");
+    const rows = this.db.prepare(`SELECT id, state, resume_state, plan_sha256, plan_epoch, scope_generation, workflow_mode, topic_kind, last_error
+      FROM topics ORDER BY updated_at DESC`).all() as Array<Record<string, unknown>>;
+    const text = (value: unknown): string | null => value == null ? null : String(value);
+    return rows.map((row) => ({
+      id: String(row.id), state: String(row.state), resumeState: text(row.resume_state), planSHA256: text(row.plan_sha256),
+      planEpoch: Number(row.plan_epoch ?? 1), scopeGeneration: Number(row.scope_generation), workflowMode: String(row.workflow_mode),
+      topicKind: String(row.topic_kind ?? "task"), lastError: text(row.last_error),
+      participants: (participants.all(String(row.id)) as Array<Record<string, unknown>>)
+        .map((item) => ({ role: String(item.role), acknowledgedPlanSHA256: text(item.acknowledged_plan_sha256) })),
+    }));
   }
 
   topicForTurn(turn: { cwd: string; topicId?: string }): Topic | undefined {
@@ -611,6 +676,7 @@ export class ConsensusDatabase {
     parentTopicId: string | null;
     workEntry: Topic["workEntry"];
     state: WorkflowState;
+    workflowMode: WorkflowMode;
     scopeGeneration: number;
     planEpoch: number;
     planRevision: number;
@@ -643,7 +709,7 @@ export class ConsensusDatabase {
     const columns: Record<string, string> = {
       parentTopicId: "parent_topic_id",
       workEntry: "work_entry_json",
-      state: "state", scopeGeneration: "scope_generation", planEpoch: "plan_epoch", planRevision: "plan_revision",
+      state: "state", workflowMode: "workflow_mode", scopeGeneration: "scope_generation", planEpoch: "plan_epoch", planRevision: "plan_revision",
       planSHA256: "plan_sha256", approvedPlanSHA256: "approved_plan_sha256",
       branchName: "branch_name", lastError: "last_error", fixPassUsed: "fix_pass_used", secondFixPassUsed: "second_fix_pass_used",
       closeoutRevisionUsed: "closeout_revision_used",
@@ -742,15 +808,6 @@ export class ConsensusDatabase {
       .run(binding.provider, JSON.stringify(binding), topicId);
   }
 
-  // 한 공급자가 계획자 단계(CLAUDE_PLAN·CLAUDE_REVISION)에서 남긴 최신 계획 제어 체크포인트(E2b). 공급자 키만으로 찾으면(planning.latest) 같은 공급자가
-  // 검토자로도 배정됐을 때 감사·종결 체크포인트를 집는다. 기본 배정에서는 Claude 체크포인트가 계획자 단계에만 있어 planning.latest(topic, 'claude') 와 같다.
-  latestPlannerCheckpoint(topicId: string, provider: SessionBinding["provider"]): PlanningCheckpoint | null {
-    const row = this.db.prepare(`SELECT record_json FROM planning_checkpoints WHERE topic_id = ? AND json_extract(record_json,'$.role') = ?
-      AND json_extract(record_json,'$.stage') IN ('CLAUDE_PLAN','CLAUDE_REVISION')
-      ORDER BY json_extract(record_json,'$.updatedAt') DESC, rowid DESC LIMIT 1`).get(topicId, provider) as { record_json: string } | undefined;
-    return row ? JSON.parse(row.record_json) as PlanningCheckpoint : null;
-  }
-
   // 구현 세션의 바인딩(E2b). 구현 세션이 없으면 null.
   implementationSessionBinding(topicId: string): SessionBinding | null {
     const row = this.db.prepare("SELECT implementation_session_id, implementation_session_provider, implementation_session_binding_json FROM topics WHERE id = ?")
@@ -759,13 +816,12 @@ export class ConsensusDatabase {
     return row.implementation_session_id ? parseBinding(row.implementation_session_binding_json, "claude", row.implementation_session_provider) : null;
   }
 
-  // 계획 세션은 보존한다. 리뷰 세션은 승인된 계획·범위·계획 회차가 같은 동안에만 이어 쓴다.
+  // 계획 세션은 보존한다. 리뷰 세션은 같은 토픽·같은 범위 세대 동안 이어 쓴다(계약 v3.15 (24)) — 계획 개정·planned ↔ ticket 전환은 리뷰 세션을 끊지
+  // 않고, 그 변경은 사실로 전달된다(D5). 저장된 plan_epoch·plan_sha256 은 그 세션을 연 때의 기록이다. 공급자·참여자 결속 대조는 호출자(seatSession)가 한다.
   getCodexReviewSession(topicId: string): string | null {
     const row = this.db.prepare(`
       SELECT r.session_id FROM codex_review_sessions r JOIN topics t ON t.id = r.topic_id
-      WHERE r.topic_id = ? AND r.scope_generation = t.scope_generation
-        AND r.plan_epoch = t.plan_epoch AND r.plan_sha256 = t.plan_sha256
-        AND r.plan_sha256 = t.approved_plan_sha256
+      WHERE ${CURRENT_REVIEW_SESSION}
     `).get(topicId) as { session_id: string } | undefined;
     return row?.session_id ?? null;
   }
@@ -774,18 +830,14 @@ export class ConsensusDatabase {
   codexReviewSessionBinding(topicId: string): SessionBinding | null {
     const row = this.db.prepare(`
       SELECT r.provider, r.binding_json FROM codex_review_sessions r JOIN topics t ON t.id = r.topic_id
-      WHERE r.topic_id = ? AND r.scope_generation = t.scope_generation
-        AND r.plan_epoch = t.plan_epoch AND r.plan_sha256 = t.plan_sha256
-        AND r.plan_sha256 = t.approved_plan_sha256
+      WHERE ${CURRENT_REVIEW_SESSION}
     `).get(topicId) as { provider: string | null; binding_json: string | null } | undefined;
     return row ? parseBinding(row.binding_json, "codex", row.provider) : null;
   }
 
+  // 승인 계획을 요구하지 않는다 — planned 의 승인 게이트는 구현 시작(assertImplementationGate)에 있고, ticket 은 계획 없이 리뷰한다(v3.15 (24)).
   setCodexReviewSession(topicId: string, sessionId: string, binding: SessionBinding = legacyBinding("codex")): void {
     const topic = this.getTopic(topicId);
-    if (!topic.planSHA256 || topic.approvedPlanSHA256 !== topic.planSHA256) {
-      throw new Error("승인된 계획 없이 코드 리뷰 세션을 저장할 수 없습니다.");
-    }
     // 검토자 세션은 같은 공급자의 작성자·계획 검토 세션과 달라야 한다(plan §2.1 — 검토자는 작성자와 별도 세션). 같은 공급자의 같은 주제 세션 전부와 대조한다.
     const sameTopicSession = Boolean(this.db.prepare(`
       SELECT 1 FROM participants WHERE topic_id = ? AND session_id = ? AND COALESCE(provider, role) = ?
@@ -830,9 +882,7 @@ export class ConsensusDatabase {
   getCodexReviewPromptSequence(topicId: string): number | null {
     const row = this.db.prepare(`
       SELECT r.prompt_sequence AS sequence FROM codex_review_sessions r JOIN topics t ON t.id = r.topic_id
-      WHERE r.topic_id = ? AND r.scope_generation = t.scope_generation
-        AND r.plan_epoch = t.plan_epoch AND r.plan_sha256 = t.plan_sha256
-        AND r.plan_sha256 = t.approved_plan_sha256
+      WHERE ${CURRENT_REVIEW_SESSION}
     `).get(topicId) as { sequence: number | null } | undefined;
     return row?.sequence == null ? null : Number(row.sequence);
   }
@@ -846,62 +896,6 @@ export class ConsensusDatabase {
       "UPDATE participants SET acknowledged_plan_sha256 = ? WHERE topic_id = ? AND role = ?",
     ).run(sha256, topicId, role);
     if (Number(result.changes) !== 1) throw new Error(`${role} 세션이 연결되지 않았습니다.`);
-  }
-
-  // 연속성 v2 작성자 좌석의 복구 세션 전환(E3-3b) — 복구 세션 S1 이 읽기 전용 확인 턴으로 승인 계획 sha 를 답한 뒤에만 부른다. 참여자(세션·ACK = S1 이 답한
-  // 값)·구현 세션·승인 바인딩(검증 기록)·복구 계보를 한 transaction 으로 옮긴다 — 일부만 옮겨지면 구현 가드가 짝 없는 세션으로 멈추거나 옛 ACK 가 새 세션에
-  // 붙는다. 사용자 승인(approved_plan_sha256)과 계획자 checkpoint 는 건드리지 않는다. 세션 충돌은 다른 주제의 같은 공급자 세션과 대조해 거부한다.
-  // 계획 제어 좌석의 대기 중 자동 복구를 새 세션에 잇는다(E3-3b host-review 9c4d786 F001·F004) — 계보 기록(toSession·세션 목록)과, 연속성 v2 작성자
-  // 좌석이면 구현 연결을 한 transaction 으로 옮긴다. 구현 세션은 지금 값이 그 복구의 원래 세션(fromSession)이고 저장된 구현 바인딩이 이 좌석 바인딩과 같을
-  // 때만 옮긴다 — 다른 구현 세션·바뀐 바인딩은 덮지 않는다(그때는 기존 runImplementation 가드가 판정한다).
-  linkRecoveredPlanningSession(input: {
-    topicId: string; lineage: { jobRole: string; value: import("../shared/planningControl.js").RecoveryLineage };
-    implementation?: { fromSession: string; toSession: string; binding: SessionBinding };
-    checkpoint?: PlanningCheckpoint;
-  }): void {
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      this.planning.saveRecoveryLineage(input.topicId, input.lineage.jobRole, input.lineage.value);
-      const move = input.implementation;
-      if (move && this.getFlags(input.topicId).implementationSessionId === move.fromSession) {
-        const stored = this.implementationSessionBinding(input.topicId) ?? legacyBinding("claude");
-        if (sameBinding(stored, move.binding)) this.setImplementationSession(input.topicId, move.toSession, move.binding);
-      }
-      // 계획 제어가 새 세션을 받은 checkpoint도 같은 transaction에서 저장한다. 중간 종료 때 세션 없는 checkpoint만 남지 않는다.
-      if (input.checkpoint) this.planning.save(input.checkpoint);
-      this.db.exec("COMMIT");
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
-  }
-
-  switchRecoveredAuthorSession(input: {
-    topicId: string; sessionId: string; planSHA256: string; binding: SessionBinding; inputSequence: number;
-    recovery: { fromSession: string | null; verification: import("../shared/planningControl.js").RecoveryVerification };
-    lineage: { jobRole: string; value: import("../shared/planningControl.js").RecoveryLineage };
-    event: Omit<TimelineEventInput, "topicId">;
-  }): void {
-    let event!: TimelineEvent;
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      const topic = this.getTopic(input.topicId);
-      if (this.participantSessionInUse(input.topicId, input.binding.provider, input.sessionId)) {
-        throw new Error(`복구 세션 ${input.sessionId} 은(는) 다른 주제에서 이미 사용 중입니다.`);
-      }
-      const author = topic.participants.find(participant => participant.role === "claude");
-      this.upsertParticipant(input.topicId, { role: "claude", sessionId: input.sessionId, mode: author?.mode ?? "created",
-        acknowledgedPlanSHA256: input.planSHA256 }, input.binding);
-      this.setImplementationSession(input.topicId, input.sessionId, input.binding);
-      this.planning.bindRecoveredSession(this.getTopic(input.topicId), input.planSHA256, input.sessionId, input.inputSequence, input.recovery);
-      this.planning.saveRecoveryLineage(input.topicId, input.lineage.jobRole, input.lineage.value);
-      event = this.insertEventInTransaction({ ...input.event, topicId: input.topicId });
-      this.db.exec("COMMIT");
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
-    this.emitEvent(event);
   }
 
   clearAcknowledgements(topicId: string): void {
@@ -943,6 +937,24 @@ export class ConsensusDatabase {
     return event;
   }
 
+  // 다른 저장소의 쓰기(work)와 그 결과로 정해지는 타임라인 기록을 한 transaction 으로 묶는다 — 작업 묶음 개정과 영향 단계의 문맥 변경 사실(계약 v3.18
+  // (33'))처럼 둘 사이에 끊기면 개정만 남고 사실이 빠지는 쓰기에 쓴다. work 안의 같은 연결 transaction(workGroups.atomic)은 이 transaction 에 합쳐진다.
+  atomicWithEvents<T>(work: () => T, events: (result: T) => TimelineEventInput[]): T {
+    const recorded: TimelineEvent[] = [];
+    let result: T;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      result = work();
+      for (const event of events(result)) recorded.push(this.insertEventInTransaction(event));
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    for (const event of recorded) this.emitEvent(event);
+    return result;
+  }
+
   // 상태 전이와 그 기록(복구 마커 포함)을 한 transaction으로 묶는다. 둘 사이에 서버가 죽으면
   // 복구가 "마커 없음 = 미실행"으로 오판해 같은 조작을 새 키로 중복 실행하기 때문에,
   // 함께 성공하거나 함께 없던 일이 되어야 한다.
@@ -950,14 +962,8 @@ export class ConsensusDatabase {
     topicId: string;
     changes: Parameters<ConsensusDatabase["updateTopic"]>[1];
     clearAcknowledgements?: boolean;
-    planningMigration?: import("../shared/planningControl.js").PlanningMigration;
-    planningUsageRecovery?: { input: import("../shared/planningControl.js").PlanningUsageRecovery; requestKey: string };
-    planningSessionAmendment?: { previousSHA256: string; nextSHA256: string };
     participants?: Participant[];
     events: Array<Omit<TimelineEventInput, "topicId">>;
-    // 전이와 한 transaction 으로 남길 수정 작업 계약 행과 진단 상태 기록(수락 전이·회차 소비·반영 보고가 갈라지지 않게, 2026-09-15 감사 2차).
-    contracts?: readonly FixContract[];
-    diagnosisEntries?: ReadonlyArray<{ diagnosisId: string; status: DiagnosisStatus; detail?: Record<string, unknown> }>;
     // 결과 불명확 전달 요청의 마감(E4 F016) — 결과 확인이 요청을 닫는 쓰기를 상태 전이·확정 기록·이벤트와 같은 transaction 에 둔다. 따로 쓰면 그 사이에서
     // 멈췄을 때 요청은 닫혔는데 토픽이 복구 대기(USER_DECISION_REQUIRED)에 남아, 기동 복구(running 만 회수)·결과 확인·retry 어느 것으로도 빠져나오지 못했다.
     // 마감할 행이 정확히 한 건이 아니면(이미 닫힘·다른 요청) 전체를 되돌린다.
@@ -965,22 +971,19 @@ export class ConsensusDatabase {
     // Admission must not publish an active state without its recoverable action (or vice versa).
     startAction?: ActionRecord;
     finishAction?: { id: string; status: "succeeded" | "failed" | "cancelled"; error?: string };
+    // 역할 세션 교체(계약 v3.16 (17')) — 재개의 행동 시작과 같은 transaction 에서 현재 범위 세대의 코드 리뷰 세션 행을 지우고(이전 세션은 사건 payload 에
+    // 남긴다), 계획 연속성 정책을 해제한다.
+    releaseCodeReviewSession?: true;
+    releaseContinuity?: true;
+    // planned 로의 방식 전환(Codex Q-e) — 같은 transaction 에서 계획 연속성 정책을 켠다(planning.enable: 정책 행이 있으면 그대로, 시작 전 계획에만 v2).
+    enablePlanning?: true;
+    // 인도 대기 재진입(F009) — 같은 transaction 에서 확정 커밋의 근거 동결을 다시 연다(evidence.reopen, cd2876b7 F017).
+    reopenEvidence?: true;
   }): Topic {
     if (input.startAction && input.startAction.topicId !== input.topicId) throw new Error("Action admission topic mismatch");
     const recorded: TimelineEvent[] = [];
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      if (input.planningSessionAmendment && this.planning.continuityEnabled(input.topicId)) {
-        const previous = this.getTopic(input.topicId);
-        const binding = this.planning.boundSession(previous);
-        if (!binding || previous.planSHA256 !== input.planningSessionAmendment.previousSHA256 || input.changes.planSHA256 !== input.planningSessionAmendment.nextSHA256) {
-          throw new Error("허용 오차 개정의 계획–세션 연결이 바뀌었습니다.");
-        }
-        this.planning.bindSession(previous, input.planningSessionAmendment.nextSHA256, binding.sessionId, binding.inputSequence);
-      }
-      if (input.planningMigration) this.planning.migrateInterrupted(this.getTopic(input.topicId), input.planningMigration);
-      if (input.planningUsageRecovery) this.planning.authorizeUnknownUsage(this.getTopic(input.topicId),
-        input.planningUsageRecovery.input, input.planningUsageRecovery.requestKey);
       if (input.deliveryResolution) {
         const { action, idempotencyKey, outcome } = input.deliveryResolution;
         this.resolveUnknownDeliveryAction(input.topicId, action, idempotencyKey, outcome);
@@ -994,13 +997,17 @@ export class ConsensusDatabase {
       }
       this.updateTopic(input.topicId, input.changes);
       if (input.startAction) this.startAction(input.startAction);
-      const at = now();
-      for (const contract of input.contracts ?? []) this.fixContracts.append(input.topicId, contract, at);
-      for (const entry of input.diagnosisEntries ?? []) this.diagnoses.log(input.topicId, entry.diagnosisId, entry.status, entry.detail ?? {}, at);
       if (input.clearAcknowledgements) this.clearAcknowledgements(input.topicId);
       for (const participant of input.participants ?? []) {
         this.upsertParticipant(input.topicId, participant);
       }
+      if (input.releaseCodeReviewSession) {
+        this.db.prepare("DELETE FROM codex_review_sessions WHERE topic_id = ? AND scope_generation = (SELECT scope_generation FROM topics WHERE id = ?)")
+          .run(input.topicId, input.topicId);
+      }
+      if (input.releaseContinuity) this.planning.releaseContinuity(input.topicId);
+      if (input.enablePlanning) this.planning.enable(input.topicId);
+      if (input.reopenEvidence) this.evidence.reopen(this.getTopic(input.topicId));
       for (const event of input.events) {
         recorded.push(this.insertEventInTransaction({ ...event, topicId: input.topicId }));
       }
@@ -1303,89 +1310,6 @@ export class ConsensusDatabase {
     return row ? this.mapAction(row) : null;
   }
 
-  // 수정 작업 계약 행 하나를 이벤트와 함께 남긴다(옛 토픽 이관 등 전이 없는 기록).
-  recordFixContract(topicId: string, contract: FixContract, event?: Omit<TimelineEventInput, "topicId">): void {
-    let recorded: TimelineEvent | null = null;
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      this.fixContracts.append(topicId, contract, now());
-      if (event) recorded = this.insertEventInTransaction({ ...event, topicId });
-      this.db.exec("COMMIT");
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
-    if (recorded) this.emitEvent(recorded);
-  }
-
-  // ---- 중재자 진단(DiagnosisStore) — 등록·상태 기록은 타임라인 이벤트(재시작 복구용 requestKey 마커 포함)와 **한 트랜잭션**이다.
-  // 번호 할당·정정 대상 검사(닫힌 진단은 정정할 수 없다)도 같은 트랜잭션 안에서 한다.
-  registerDiagnosis(input: {
-    topicId: string; diagnosis: DiagnosisInput; binding: DiagnosisBinding; origin: DiagnosisOrigin | null;
-    initialStatus: "registered" | "closed_no_action";
-    event: (id: string) => Omit<TimelineEventInput, "topicId">;
-    // 등록과 한 transaction 으로 바꿀 주제 필드(예: 저장 전 계획 개정을 정정하면 멈췄던 구현 단계로 재개 단계를 되돌린다).
-    changes?: Parameters<ConsensusDatabase["updateTopic"]>[1];
-    // 등록과 한 transaction 으로 남길 수정 작업 계약 행(진단 전용 수정을 수정 불필요로 닫으면 계약도 closed).
-    contracts?: readonly FixContract[];
-  }): DiagnosisRecord {
-    let recorded: TimelineEvent | null = null;
-    let id = "";
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      const number = this.diagnoses.nextNumber(input.topicId);
-      id = `DG-${number}`;
-      const at = now();
-      const supersedes = input.diagnosis.supersedes;
-      if (supersedes) {
-        const previous = this.diagnoses.get(input.topicId, supersedes);
-        if (!previous) throw Object.assign(new Error(`정정 대상 진단 ${supersedes} 가 이 주제에 없습니다.`), { statusCode: 409 });
-        if (CLOSED_DIAGNOSIS_STATUSES.has(previous.status)) {
-          throw Object.assign(new Error(`정정 대상 진단 ${supersedes} 는 이미 닫혔습니다(${previous.status}).`), { statusCode: 409 });
-        }
-      }
-      this.diagnoses.insert({ topicId: input.topicId, id, number, input: input.diagnosis, binding: input.binding, origin: input.origin, createdAt: at });
-      this.diagnoses.log(input.topicId, id, input.initialStatus, supersedes ? { supersedes } : {}, at);
-      if (supersedes) this.diagnoses.log(input.topicId, supersedes, "superseded", { by: id }, at);
-      if (input.changes && Object.keys(input.changes).length > 0) this.updateTopic(input.topicId, input.changes);
-      for (const contract of input.contracts ?? []) this.fixContracts.append(input.topicId, contract, at);
-      recorded = this.insertEventInTransaction({ ...input.event(id), topicId: input.topicId });
-      this.db.exec("COMMIT");
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
-    if (recorded) this.emitEvent(recorded);
-    return this.diagnoses.get(input.topicId, id)!;
-  }
-
-  recordDiagnosisStatus(input: {
-    topicId: string;
-    entries: ReadonlyArray<{ diagnosisId: string; status: DiagnosisStatus; detail?: Record<string, unknown> }>;
-    changes?: Parameters<ConsensusDatabase["updateTopic"]>[1];
-    // 두 에이전트의 계획 확인(ACK)을 같은 transaction 에서 지운다(개정 계획 저장).
-    clearAcknowledgements?: boolean;
-    event?: Omit<TimelineEventInput, "topicId">;
-    // 진단 적용과 한 transaction 으로 남길 수정 작업 계약 행(새 계약·진단 덧붙임·버려진 계약).
-    contracts?: readonly FixContract[];
-  }): void {
-    let recorded: TimelineEvent | null = null;
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      const at = now();
-      for (const entry of input.entries) this.diagnoses.log(input.topicId, entry.diagnosisId, entry.status, entry.detail ?? {}, at);
-      for (const contract of input.contracts ?? []) this.fixContracts.append(input.topicId, contract, at);
-      if (input.changes && Object.keys(input.changes).length > 0) this.updateTopic(input.topicId, input.changes);
-      if (input.clearAcknowledgements) this.clearAcknowledgements(input.topicId);
-      if (input.event) recorded = this.insertEventInTransaction({ ...input.event, topicId: input.topicId });
-      this.db.exec("COMMIT");
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
-    if (recorded) this.emitEvent(recorded);
-  }
-
   getAction(id: string): ActionRecord | null {
     const row = this.db.prepare("SELECT * FROM actions WHERE id = ?").get(id) as Record<string, unknown> | undefined;
     if (!row) return null;
@@ -1673,7 +1597,7 @@ export class ConsensusDatabase {
       branchPrefix: row.branch_prefix ?? "consensus",
       requestedBranchName: row.requested_branch_name ?? null, predecessorTopicId: (row.predecessor_topic_id as string | null) ?? null,
       branchName: row.branch_name,
-      state: row.state, scopeGeneration: Number(row.scope_generation),
+      state: row.state, workflowMode: row.workflow_mode, scopeGeneration: Number(row.scope_generation),
       planEpoch: Number(row.plan_epoch ?? 1),
       planRevision: Number(row.plan_revision), planSHA256: row.plan_sha256,
       approvedPlanSHA256: row.approved_plan_sha256,

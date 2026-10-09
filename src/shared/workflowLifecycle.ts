@@ -2,13 +2,13 @@ import type { TimelineEvent, Topic, WorkflowState } from "./contracts.js";
 
 // A waiting state describes why work stopped, never where execution resumes.
 export const RETRY_POINTS = ["DRAFT", "BRAINSTORM_READY", "BRAINSTORMING", "CLAUDE_PLAN", "CODEX_AUDIT",
-  "CLAUDE_REVISION", "CODEX_CLOSEOUT", "CONSENSUS_ACK", "IMPLEMENTING", "CODEX_REVIEW", "CLAUDE_FIX", "CODEX_FINAL_REVIEW"] as const;
+  "CLAUDE_REVISION", "IMPLEMENTING", "CODEX_REVIEW", "CLAUDE_FIX"] as const;
 export type RetryPoint = typeof RETRY_POINTS[number];
 export type ResumePoint = RetryPoint | "READY_TO_DELIVER";
 export const isRetryPoint = (value: unknown): value is RetryPoint => RETRY_POINTS.some(point => point === value);
 export const isResumePoint = (value: unknown): value is ResumePoint => isRetryPoint(value) || value === "READY_TO_DELIVER";
 export const isStopped = (state: WorkflowState): boolean =>
-  state === "FAILED" || state === "USER_DECISION_REQUIRED" || state === "BLOCKED_ON_EVIDENCE";
+  state === "FAILED" || state === "USER_DECISION_REQUIRED";
 
 export function failureResumePoint(state: WorkflowState, previous: WorkflowState | null): ResumePoint | null {
   return isResumePoint(state) ? state : isResumePoint(previous) ? previous : null;
@@ -16,7 +16,7 @@ export function failureResumePoint(state: WorkflowState, previous: WorkflowState
 
 export interface StopRecord {
   version: 1;
-  reason: "failure" | "resource" | "evidence" | "decision";
+  reason: "failure" | "resource" | "decision";
   resumeAt: ResumePoint | null;
   scopeGeneration: number;
   planEpoch: number;
@@ -25,7 +25,9 @@ export interface StopRecord {
 }
 export const RESOURCE_PAUSE_KEYS = ["planningPause", "budgetPause", "revisionPause", "reviewPause", "admissionRefused"] as const;
 
-export function currentStopEvent(topic: Topic, resume: WorkflowState | null, timeline: readonly TimelineEvent[]): TimelineEvent | undefined {
+// resume 은 저장된 사건 payload(resumeState·stop.resumeAt)와 비교하는 조회 키다 — 기동 이행(D9)은 지운 옛 재개 지점 문자열로 이전 정지를 찾는다.
+export function currentStopEvent(topic: Pick<Topic, "scopeGeneration" | "planEpoch" | "planSHA256">, resume: string | null,
+  timeline: readonly TimelineEvent[]): TimelineEvent | undefined {
   const events = timeline.filter(event => event.scopeGeneration === topic.scopeGeneration);
   const transition = events.filter(event => event.actor === "system" && event.payload?.to !== undefined).at(-1)?.sequence ?? 0;
   return events.findLast(event => {
@@ -41,8 +43,7 @@ export function currentStopEvent(topic: Topic, resume: WorkflowState | null, tim
 export function stopRecord(topic: Topic, resume: WorkflowState | null, event?: Pick<TimelineEvent, "sequence" | "payload">): StopRecord {
   const payload = event?.payload;
   return { version: 1, reason: topic.state === "FAILED" ? "failure"
-    : RESOURCE_PAUSE_KEYS.some(key => Boolean(payload?.[key])) ? "resource"
-    : topic.state === "BLOCKED_ON_EVIDENCE" ? "evidence" : "decision",
+    : RESOURCE_PAUSE_KEYS.some(key => Boolean(payload?.[key])) ? "resource" : "decision",
     resumeAt: isResumePoint(resume) ? resume : null, scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch,
     planSHA256: topic.planSHA256, sourceSequence: event?.sequence ?? 0 };
 }

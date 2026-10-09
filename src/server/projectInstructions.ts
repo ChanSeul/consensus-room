@@ -25,9 +25,6 @@ export function workerInstructionText(raw: string): string {
 // Ignored project instructions may be absent from a topic worktree. Read the original
 // repository only in that case, then apply the same worker view and task precedence.
 export interface AppliedInstructionInput {
-  strict?: boolean;
-  // Guarded planning delivers the complete text through its required input queue when needed.
-  chunkedDelivery?: boolean;
   signal?: AbortSignal;
   workspace: string;
   fileName: string;
@@ -50,24 +47,21 @@ export async function readAppliedInstructions(input: AppliedInstructionInput): P
     repositoryPath: input.repositoryPath ? join(input.repositoryPath, input.fileName) : undefined,
     globalPath: input.globalPath ?? undefined, injectWorkspaceFile: input.injectWorkspaceFile }, { signal: input.signal });
   const blocks: string[] = [];
-  const globalBlock = instructionBlock(`사용자 전역 ${input.fileName}`, files.global, input.strict, input.chunkedDelivery);
+  const globalBlock = instructionBlock(`사용자 전역 ${input.fileName}`, files.global);
   if (globalBlock) blocks.push(globalBlock);
   const projectSource = files.source;
   const label = projectSource === "repository"
     ? `작업 저장소 ${input.fileName} (원본 저장소 사본 — worktree 에는 gitignored 라 없음)` : `작업 저장소 ${input.fileName}`;
-  const projectBlock = instructionBlock(label, files.project, input.strict, input.chunkedDelivery);
+  const projectBlock = instructionBlock(label, files.project);
   if (projectBlock) blocks.push(projectBlock, PROJECT_INSTRUCTION_PRECEDENCE_NOTE);
   return { blocks, projectSource };
 }
 
-function instructionBlock(label: string, raw: string | null, strict = false, chunked = false): string | null {
+function instructionBlock(label: string, raw: string | null): string | null {
   if (!raw) return null;
   raw = workerInstructionText(raw);
   if (!raw.trim()) return null;
-  if (!chunked && strict && Buffer.byteLength(raw) > INSTRUCTION_FILE_LIMIT_BYTES) {
-    throw new Error("Mandatory instruction file exceeds the planning limit; it must not be silently truncated.");
-  }
-  const bounded = !chunked && Buffer.byteLength(raw, "utf8") > INSTRUCTION_FILE_LIMIT_BYTES
+  const bounded = Buffer.byteLength(raw, "utf8") > INSTRUCTION_FILE_LIMIT_BYTES
     ? `${raw.slice(0, INSTRUCTION_FILE_LIMIT_BYTES)}\n[이하 생략: 지시문이 32KB를 넘었습니다.]`
     : raw;
   return [`적용되는 지시문 시작: ${label}`, redactSecrets(bounded).trim(), `적용되는 지시문 끝: ${label}`].join("\n");

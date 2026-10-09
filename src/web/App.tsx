@@ -4,7 +4,6 @@ import { SessionGraph, GraphInspector } from "./SessionGraph";
 import type { GraphNode } from "../shared/sessionGraph";
 import {ReviewPanel} from "./ReviewPanel";
 import { EvidencePanel } from "./EvidencePanel";
-import { RevisionPanel } from "./RevisionPanel";
 import { WorkGroupsPanel } from "./WorkGroupsPanel";
 import { BudgetPanel } from "./BudgetPanel";
 import { EntryGuide, TopicOverview, TopicTree, WORKING_STATES } from "./TopicStructure";
@@ -14,7 +13,6 @@ import {
   ReactNode,
   useCallback,
   useEffect,
-  useMemo,
   useRef,
   useState,
 } from "react";
@@ -34,7 +32,6 @@ import type {
   WorkflowState,
 } from "../shared/contracts";
 import { ApiError, api, topicEventsUrl } from "./api";
-import type { WorkGroupView } from "../shared/workGroups";
 
 const STATE_COPY: Record<WorkflowState, { label: string; tone: StatusTone; hint: string }> = {
   BRAINSTORM_READY: { label: "논의 대기", tone: "attention", hint: "AI가 한 번씩 의견을 낸 뒤 멈춥니다. 다음 행동은 사용자가 선택합니다." },
@@ -44,16 +41,12 @@ const STATE_COPY: Record<WorkflowState, { label: string; tone: StatusTone; hint:
   CLAUDE_PLAN: { label: "계획 작성", tone: "working", hint: "설계자가 첫 계획을 작성하고 있습니다." },
   CODEX_AUDIT: { label: "계획 검토", tone: "working", hint: "검토자가 계획의 빈틈과 근거를 확인하고 있습니다." },
   CLAUDE_REVISION: { label: "계획 수정", tone: "working", hint: "검토 결과를 반영해 계획을 고치고 있습니다." },
-  CODEX_CLOSEOUT: { label: "계획 최종 확인", tone: "working", hint: "합의할 수 있는 계획인지 마지막으로 확인합니다." },
-  CONSENSUS_ACK: { label: "계획 해시 확인", tone: "working", hint: "두 좌석이 같은 계획을 읽었는지 확인합니다." },
   AWAITING_USER_APPROVAL: { label: "승인 대기", tone: "attention", hint: "계획을 읽고 직접 승인해야 구현을 시작할 수 있습니다." },
   IMPLEMENTING: { label: "구현", tone: "working", hint: "승인된 계획 범위 안에서 구현자가 코드를 고치고 있습니다." },
   CODEX_REVIEW: { label: "코드 검토", tone: "working", hint: "검토자가 변경 내용을 읽기 전용으로 검토하고 있습니다." },
   CLAUDE_FIX: { label: "보완", tone: "working", hint: "구현자가 합의된 범위 안의 확정 문제를 한 번 보완합니다." },
-  CODEX_FINAL_REVIEW: { label: "마무리 검토", tone: "working", hint: "검토자가 보완된 결과를 마지막으로 확인합니다." },
   READY_TO_DELIVER: { label: "전달 준비 완료", tone: "success", hint: "검증 결과를 확인한 뒤 커밋할 수 있습니다." },
   CLOSED: { label: "종료", tone: "success", hint: "이 주제의 작업이 끝났습니다." },
-  BLOCKED_ON_EVIDENCE: { label: "증거 필요", tone: "danger", hint: "결론을 내려면 추가 자료나 실행 결과가 필요합니다." },
   USER_DECISION_REQUIRED: { label: "결정 필요", tone: "danger", hint: "범위나 정책을 사용자가 정해야 계속할 수 있습니다." },
   FAILED: { label: "실행 실패", tone: "danger", hint: "오류 내용을 확인한 뒤 다시 시도해 주세요." },
 };
@@ -110,12 +103,9 @@ const ACTIVE_STATES = new Set<WorkflowState>([
   "CLAUDE_PLAN",
   "CODEX_AUDIT",
   "CLAUDE_REVISION",
-  "CODEX_CLOSEOUT",
-  "CONSENSUS_ACK",
   "IMPLEMENTING",
   "CODEX_REVIEW",
   "CLAUDE_FIX",
-  "CODEX_FINAL_REVIEW",
 ]);
 
 // 러너 생존 표시: 작업 트리에서 마지막으로 바뀐 파일과 그 시각. 10분 넘게 조용하면 주의 색.
@@ -183,31 +173,6 @@ function parseMemoryChanges(value: unknown): Array<{ path: string; sha256: strin
   });
 }
 
-function extractFindings(detail: TopicDetail | null): Finding[] {
-  if (!detail) return [];
-  const byID = new Map<string, Finding>();
-  for (const finding of parseFindings(detail.consensus?.findings)) byID.set(finding.id, finding);
-  for (const event of detail.timeline) {
-    for (const finding of parseFindings(event.payload.findings)) byID.set(finding.id, finding);
-  }
-  return [...byID.values()];
-}
-
-// 닫힌 단계라도 미전달 결과가 남았으면 우측 원문 근거 검수는 계속 제공한다.
-interface StageDeliveryView { closedPush: boolean }
-function stageDeliveryOf(groups: readonly WorkGroupView[], topicId: string): StageDeliveryView {
-  for (const group of groups) {
-    const stageId = Object.keys(group.links).find((id) => group.links[id].topicId === topicId);
-    if (!stageId) continue;
-    const result = group.results?.[stageId];
-    const delivery = group.delivery[stageId];
-    return {
-      closedPush: Boolean(result && result.topicId === topicId && delivery?.committedOID === result.commitOID && delivery.pushedOID !== result.commitOID),
-    };
-  }
-  return { closedPush: false };
-}
-
 function participantFor(topic: Topic, role: "claude" | "codex"): Participant | undefined {
   return topic.participants.find((participant) => participant.role === role);
 }
@@ -232,7 +197,6 @@ export function App() {
   const [inspectorVisible, setInspectorVisible] = useState(true);
   const [mobilePanel, setMobilePanel] = useState<"topics" | "chat" | "plan">("chat");
   const [activity, setActivity] = useState<TopicActivity | null>(null);
-  const [stageDelivery, setStageDelivery] = useState<({ topicId: string } & StageDeliveryView) | null>(null);
   const reconnectRef = useRef(0);
   const selectedTopicRef = useRef<string | null>(null);
   const detailRequestRef = useRef(0);
@@ -309,19 +273,6 @@ export function App() {
     const timer = window.setInterval(() => { void load(); }, 10_000);
     return () => { cancelled = true; window.clearInterval(timer); };
   }, [selectedTopicId, detail?.topic.id, detail?.topic.state]);
-
-  // 묶음 단계의 전달 진입 판정 — 선택한 토픽이 전달 준비(READY_TO_DELIVER)나 CLOSED 가 될 때 한 번, 전달 동작(commit·push·결과 확인) 뒤에 다시 읽는다.
-  // 읽지 못하면 진입을 닫는다(최종 판정은 서버 몫이다).
-  const refreshStageDelivery = useCallback(async (topicId: string) => {
-    let view: StageDeliveryView = { closedPush: false };
-    try { view = stageDeliveryOf(await api.listWorkGroups(), topicId); } catch { /* 진입만 닫는다 */ }
-    if (selectedTopicRef.current === topicId) setStageDelivery({ topicId, ...view });
-  }, []);
-  useEffect(() => {
-    const state = detail?.topic.id === selectedTopicId ? detail.topic.state : null;
-    if (!selectedTopicId || (state !== "CLOSED" && state !== "READY_TO_DELIVER")) { setStageDelivery(null); return; }
-    void refreshStageDelivery(selectedTopicId);
-  }, [selectedTopicId, detail?.topic.id, detail?.topic.state, refreshStageDelivery]);
 
   useEffect(() => {
     let cancelled = false;
@@ -411,12 +362,9 @@ export function App() {
         await refreshTopics();
         if (targetTopicId && selectedTopicRef.current === targetTopicId) {
           await refreshDetail(targetTopicId);
-          if (["plan", "retry", "stop"].includes(name)) {
+          if (["plan", "implement", "resume", "stop"].includes(name)) {
             const next = await api.getActivity(targetTopicId).catch(() => null);
             if (next && selectedTopicRef.current === targetTopicId) setActivity(next);
-          }
-          if ((name === "commit" || name === "push" || name === "reconcile-delivery") && selectedTopicRef.current === targetTopicId) {
-            await refreshStageDelivery(targetTopicId);
           }
           if(selectedTopicRef.current===targetTopicId)setActionNotice(response && typeof response==="object" && "resumeBlocked" in response && typeof response.resumeBlocked==="string"?response.resumeBlocked:null);
         }
@@ -428,11 +376,10 @@ export function App() {
         setBusyAction(null);
       }
     },
-    [refreshDetail, refreshStageDelivery, refreshTopics, selectedTopicId],
+    [refreshDetail, refreshTopics, selectedTopicId],
   );
 
   const selected = detail?.topic.id === selectedTopicId ? detail.topic : null;
-  const findings = useMemo(() => extractFindings(detail), [detail]);
 
   return (
     <div className="app-shell">
@@ -441,7 +388,7 @@ export function App() {
           <div className="brand-mark" aria-hidden="true">CR</div>
           <div>
             <strong>Consensus Room</strong>
-            <span>계획은 함께 합의하고, 구현은 승인 뒤에 시작합니다.</span>
+            <span>티켓은 바로 구현하고, 계획을 고른 작업은 승인한 계획으로 구현합니다.</span>
           </div>
         </div>
         <div className="panel-toggles" aria-label="패널 표시">
@@ -519,7 +466,7 @@ export function App() {
                 <ExecutionControls topic={selected} busyAction={busyAction} autoRetryAt={activity?.autoRetryAt ?? null}
                   evidenceResumePending={activity?.evidenceResumePending ?? false}
                   continuation={activity?.continuation ?? null}
-                  budgetPaused={Boolean(activity?.budget?.pause || activity?.budgetRecoveryRequired || activity?.revisionPaused || activity?.reviewPaused)}
+                  budgetPaused={Boolean(activity?.budget?.pause || activity?.budgetRecoveryRequired || activity?.reviewPaused)}
                   onAction={(action, body) => void run(action, () => api.runAction(selected.id, action, body))} />
               </div>
               {centerTab === "graph" ? <div className="center-content" id="graph-panel" role="tabpanel" aria-labelledby="graph-tab">
@@ -542,7 +489,6 @@ export function App() {
           {selected && detail ? (
             <Inspector
               detail={detail}
-              findings={findings}
               busyAction={busyAction}
               onAction={(action, body) => void run(action, () => api.runAction(selected.id, action, body))}
               overview={<TopicOverview topic={selected} topics={topics} onSelect={setSelectedTopicId} />}
@@ -558,34 +504,21 @@ export function App() {
               {activity && <BudgetPanel account={activity.budget ?? null} busy={Boolean(busyAction) || activity.runningAction}
                 recoveryRequired={activity.budgetRecoveryRequired ?? false}
                 onSubmit={(action,body)=>void run(action,async()=>{ const result=await api.runAction(selected.id,action,body as Record<string,unknown>);const next=await api.getActivity(selected.id);if(selectedTopicRef.current===selected.id)setActivity(next);return result; })}/>}
-              {activity?.revisionAllowance && <RevisionPanel account={activity.revisionAllowance} paused={activity.revisionPaused ?? false}
-                busy={Boolean(busyAction) || activity.runningAction}
-                onConfigure={(limit,version)=>void run("revision-limit",async()=>{await api.configureIterations(selected.id,"revision",limit,version);const next=await api.getActivity(selected.id);if(selectedTopicRef.current===selected.id)setActivity(next);})}
-                onGrant={()=>void run("revision-resume",async()=>{const result=await api.runAction(selected.id,"revision-resume",{version:activity.revisionAllowance!.version});const next=await api.getActivity(selected.id);if(selectedTopicRef.current===selected.id)setActivity(next);return result;})}/>}
               {activity?.reviewAllowances && <ReviewPanel accounts={activity.reviewAllowances} paused={activity.reviewPaused??null}
                 onConfigure={(scope,limit,version)=>void run("review-limit",async()=>{await api.configureIterations(selected.id,scope,limit,version);const next=await api.getActivity(selected.id);if(selectedTopicRef.current===selected.id)setActivity(next);})}
                 busy={Boolean(busyAction) || activity.runningAction} onGrant={(scope,version)=>void run("review-resume",async()=>{const result=await api.runAction(selected.id,"review-resume",{scope,version});const next=await api.getActivity(selected.id);if(selectedTopicRef.current===selected.id)setActivity(next);return result;})}/>}
-              {activity?.planningProgress && <section className="panel" aria-label="계획 조사 진행">
-                <h3>계획 조사 {activity.planningProgress.round}회 · {activity.planningProgress.finalized ? "최종 결과 저장" : "중간 결과 저장"}</h3>
-                <p>누적 입력 {activity.planningProgress.usage.inputTokens.toLocaleString()} 토큰 · 캐시 읽기 {activity.planningProgress.usage.cachedInputTokens.toLocaleString()} 토큰</p>
-                <p>누적 입력은 현재 문맥 크기나 과금액이 아닙니다.</p>
-                <p>관측한 요청별 최대 입력: {activity.planningProgress.peakRequestInputTokens?.toLocaleString() ?? "측정값 없음"} · 전달한 텍스트 {activity.planningProgress.injectedBytes.toLocaleString()}바이트</p>
-                <p>전달한 자료 {activity.planningProgress.deliveredFragments}개 · 남은 질문 {activity.planningProgress.questions.length}개</p>
-                {activity.planningProgress.stopped && <p role="status">{activity.planningProgress.stopped}</p>}
-              </section>}
             </Inspector>
           ) : (
             <EmptyPanel>
               <strong>계획과 근거</strong>
-              <span>주제를 선택하면 합의된 계획, 발견 사항, 세션 정보를 볼 수 있습니다.</span>
+              <span>주제를 선택하면 계획과 세션 정보를 볼 수 있습니다.</span>
             </EmptyPanel>
           )}
         </aside>
       </main>
 
-      {evidenceTopicId && detail?.topic.id === evidenceTopicId && <Modal title="원문 연결·검수 관리" description="그래프에 표시할 원문과 검수 상태를 관리합니다." onClose={() => setEvidenceTopicId(null)}>
-        <EvidencePanel key={evidenceTopicId} topicId={evidenceTopicId} busy={Boolean(busyAction) || Boolean(activity?.runningAction)} archived={detail.topic.state === "CLOSED"}
-          archivedReviewRequired={stageDelivery?.topicId === evidenceTopicId && stageDelivery.closedPush} />
+      {evidenceTopicId && detail?.topic.id === evidenceTopicId && <Modal title="원문 연결 관리" description="그래프에 표시할 원문과 수집 상태를 관리합니다." onClose={() => setEvidenceTopicId(null)}>
+        <EvidencePanel key={evidenceTopicId} topicId={evidenceTopicId} busy={Boolean(busyAction) || Boolean(activity?.runningAction)} archived={detail.topic.state === "CLOSED"} />
       </Modal>}
       {dialog === "create" && (
         <Modal title="중재 세션에서 작업 시작" description="세 가지 방식 중 현재 작업에 맞는 출발점을 중재자에게 전달하세요." onClose={() => setDialog(null)}>
@@ -634,25 +567,28 @@ function ExecutionControls({
 }) {
   const claude = participantFor(topic, "claude");
   const codex = participantFor(topic, "codex");
-  const canStart = !isTopicGroup(topic) && Boolean(workEntry(topic).goal) && topic.state === "DRAFT" && Boolean(claude && codex);
+  // ticket 은 계획 없이 구현으로 시작하고 구현 세션은 좌석 없이도 연다. planned 는 플래너·계획 리뷰어 좌석이 있어야 계획을 시작한다.
+  const ticket = topic.workflowMode === "ticket";
+  const canStart = !isTopicGroup(topic) && Boolean(workEntry(topic).goal) && topic.state === "DRAFT" && (ticket || Boolean(claude && codex));
   const pendingRetry = topic.state === "FAILED" && Boolean(autoRetryAt);
   const canStop = ACTIVE_STATES.has(topic.state) || pendingRetry || evidenceResumePending || continuation?.pending;
   const deliveryRecovery = topic.state === "USER_DECISION_REQUIRED" && topic.lastError?.includes("커밋 또는 push 도중");
-  const canRetry = ["FAILED", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED"].includes(topic.state) && !deliveryRecovery && !budgetPaused;
+  const canResume = ["FAILED", "USER_DECISION_REQUIRED"].includes(topic.state) && !deliveryRecovery && !budgetPaused;
 
   return (
     <section className="execution-controls" aria-label="작업 실행">
       {evidenceResumePending && <p role="status">근거 수집이 끝나면 자동으로 재개합니다.</p>}
-      {continuation && <p role="status">{continuation.error ?? `자동 진행: ${{ evidence: "근거 검토", approve: "계획 승인 확인", implement: "구현과 리뷰", commit: "로컬 커밋", close: "단계 완료 확인", "next-plan": "다음 단계 계획" }[continuation.step] ?? continuation.step}`}</p>}
+      {continuation && <p role="status">{continuation.error ?? `자동 진행: ${{ evidence: "근거 범위 승인 대기", approve: "승인한 계획 반영", implement: "구현과 리뷰", commit: "로컬 커밋", close: "단계 완료 확인", "next-plan": "다음 단계 계획" }[continuation.step] ?? continuation.step}`}</p>}
       <div className="room-actions">
         {topic.state === "BRAINSTORM_READY" ? (
           <BrainstormActions key={topic.id} connected={Boolean(claude && codex)} busy={Boolean(busyAction)} budgetPaused={budgetPaused} onAction={onAction} />
         ) : canStop ? (
           <button className="danger-button" disabled={Boolean(busyAction)} onClick={() => onAction("stop")}>{continuation?.pending ? "자동 진행 중지" : evidenceResumePending ? "자동 재개 취소" : pendingRetry ? "재시도 예약 취소" : "중단"}</button>
-        ) : canRetry ? (
-          <button className="secondary-button" disabled={Boolean(busyAction)} onClick={() => onAction("retry")}>다시 시도</button>
+        ) : canResume ? (
+          // 결정문 없는 재개 — 멈춘 역할 턴을 같은 세션으로 다시 연다. 결정문은 중재 세션이 resume 에 싣는다.
+          <button className="secondary-button" disabled={Boolean(busyAction)} onClick={() => onAction("resume")}>다시 시도</button>
         ) : isTopicGroup(topic) ? <span className="entry-origin">하위 주제의 진행 상황을 관리합니다.</span> : (
-          <button className="primary-button" disabled={!canStart || budgetPaused || Boolean(busyAction)} onClick={() => onAction("plan")}>합의 시작</button>
+          <button className="primary-button" disabled={!canStart || budgetPaused || Boolean(busyAction)} onClick={() => onAction(ticket ? "implement" : "plan")}>{ticket ? "구현 시작" : "계획 시작"}</button>
         )}
       </div>
     </section>
@@ -677,7 +613,7 @@ function Timeline({ events }: { events: TimelineEvent[] }) {
       <div className="timeline timeline-empty">
         <EmptyPanel>
           <strong>아직 대화가 없습니다.</strong>
-          <span>세션을 연결하고 합의를 시작하면 작업 기록이 시간순으로 쌓입니다.</span>
+          <span>작업을 시작하면 작업 기록이 시간순으로 쌓입니다.</span>
         </EmptyPanel>
       </div>
     );
@@ -718,7 +654,6 @@ function Timeline({ events }: { events: TimelineEvent[] }) {
 
 function Inspector({
   detail,
-  findings,
   busyAction,
   onAction,
   overview,
@@ -726,7 +661,6 @@ function Inspector({
   children,
 }: {
   detail: TopicDetail;
-  findings: Finding[];
   busyAction: string | null;
   onAction: (action: string, body?: Record<string, unknown>) => void;
   overview: ReactNode;
@@ -734,14 +668,8 @@ function Inspector({
   children: ReactNode;
 }) {
   const { topic } = detail;
-  const claude = participantFor(topic, "claude");
-  const codex = participantFor(topic, "codex");
-  const bothAck = Boolean(
-    topic.planSHA256 &&
-    claude?.acknowledgedPlanSHA256 === topic.planSHA256 &&
-    codex?.acknowledgedPlanSHA256 === topic.planSHA256,
-  );
-  const canApprove = topic.state === "AWAITING_USER_APPROVAL" && bothAck && Boolean(topic.planSHA256);
+  // 승인은 사용자가 지금 판(planSHA256)에 한다 — 리뷰어 동의(agree)로 승인 대기에 온 판이다. 에이전트 ACK 는 없다.
+  const canApprove = topic.state === "AWAITING_USER_APPROVAL" && Boolean(topic.planSHA256);
   const canImplement = topic.state === "AWAITING_USER_APPROVAL" && topic.approvedPlanSHA256 === topic.planSHA256;
 
   return (
@@ -749,21 +677,17 @@ function Inspector({
       {overview}
       {controls}
       <details className="inspector-section execution-details">
-        <summary>사용량·횟수 설정·계획 조사 기록</summary>
+        <summary>사용량·횟수 설정</summary>
         {children}
       </details>
       <details className="inspector-section plan-section">
         <summary className="section-heading">
-          <span>합의 계획</span>
+          <span>계획</span>
           <span className="revision-pill">{topic.planRevision}판</span>
         </summary>
         <div className="hash-row">
           <span>SHA-256</span>
           <code title={topic.planSHA256 ?? ""}>{shortHash(topic.planSHA256)}</code>
-        </div>
-        <div className="ack-grid">
-          <Ack role={seatSessionLabel(detail.routing, "claude")} participant={claude} planHash={topic.planSHA256} />
-          <Ack role={seatSessionLabel(detail.routing, "codex")} participant={codex} planHash={topic.planSHA256} />
         </div>
         {detail.currentPlan ? <pre className="plan-preview">{detail.currentPlan}</pre> : <p className="muted-copy">아직 작성된 계획이 없습니다.</p>}
         {detail.previousPlan && detail.currentPlan && (
@@ -777,8 +701,8 @@ function Inspector({
         )}
         {topic.state === "AWAITING_USER_APPROVAL" && (
           <div className="approval-card">
-            <strong>{bothAck ? "두 에이전트가 같은 계획을 확인했습니다." : "두 에이전트의 계획 확인이 아직 끝나지 않았습니다."}</strong>
-            <p>계획 해시가 바뀌면 이 승인은 자동으로 무효가 됩니다.</p>
+            <strong>리뷰어가 이 판에 동의했습니다.</strong>
+            <p>계획이 바뀌면 승인은 무효가 됩니다.</p>
             <div className="button-row">
               <button
                 className="primary-button"
@@ -792,48 +716,8 @@ function Inspector({
           </div>
         )}
       </details>
-
-      <details className="inspector-section findings-section">
-        <summary className="section-heading">
-          <span>검토 쟁점</span>
-          <span className="count-pill">{findings.length}</span>
-        </summary>
-        {findings.length === 0 ? <p className="muted-copy">아직 분류된 쟁점이 없습니다.</p> : (
-          <div className="finding-list">
-            {findings.map((finding) => (
-              <article className="finding-card" key={finding.id}>
-                <div className="finding-topline">
-                  <code>{finding.id}</code>
-                  <span className={`severity severity-${finding.severity.toLowerCase()}`}>{finding.severity}</span>
-                </div>
-                <strong>{finding.title}</strong>
-                <p>{finding.rationale}</p>
-                <span className="disposition">{finding.disposition ?? (finding.requiresUserDecision ? "사용자 결정 필요" : "판정 중")}</span>
-              </article>
-            ))}
-          </div>
-        )}
-      </details>
-
     </div>
   );
-}
-
-function Ack({ role, participant, planHash }: { role: string; participant?: Participant; planHash: string | null }) {
-  const acknowledged = Boolean(planHash && participant?.acknowledgedPlanSHA256 === planHash);
-  return (
-    <div className={`ack-item ${acknowledged ? "acknowledged" : ""}`}>
-      <span>{role}</span>
-      <strong>{acknowledged ? "같은 계획 확인" : participant ? "확인 대기" : "세션 없음"}</strong>
-    </div>
-  );
-}
-
-// 계획 확인 표의 좌석 이름 — 좌석 역할과, 그 좌석 세션을 실제로 만든 AI(바인딩)를 함께 쓴다.
-function seatSessionLabel(routing: RoutingView | undefined, seat: Seat): string {
-  const session = routing?.sessions.find((entry) => entry.seat === (seat === "claude" ? "author" : "plan-review"));
-  const provider = routing ? session?.binding?.provider : DEFAULT_SEAT_PROVIDER[seat];
-  return provider ? `${SEAT_COPY[seat]} · ${PROVIDER_COPY[provider]}` : SEAT_COPY[seat];
 }
 
 function Modal({ title, description, onClose, children }: { title: string; description: string; onClose: () => void; children: ReactNode }) {

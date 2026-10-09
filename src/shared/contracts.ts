@@ -3,12 +3,10 @@ import agentDefaults from "./agent-defaults.json";
 import { EngineDefectReportSchema } from "./engineDefects.js";
 import {ReviewAllowanceSchema,ReviewScopeSchema} from "./reviews.js";
 import { type BudgetAccount } from "./budgets.js";
-import { RevisionAllowanceSchema } from "./revisions.js";
 import { z } from "zod";
 import { WorkEntryInputSchema, WorkEntrySchema } from "./topicStructure.js";
-import { PlanningStepSchema, PlanningStepJsonSchema, CodexPlanningStepJsonSchema } from "./planningControl.js";
-import { ToleranceLedgerEntrySchema } from "./tolerance";
 import { characterLimit, maxCharacters } from "./textLimits.js";
+import type { EnvelopeRole } from "./turnContract.js";
 
 // 확인 입력 분할과 응답 스키마가 같은 호출당 상한을 쓴다.
 export const REVIEW_DECISION_BATCH_LIMIT = 200;
@@ -34,22 +32,24 @@ export const WORKFLOW_STATES = [
   "CLAUDE_PLAN",
   "CODEX_AUDIT",
   "CLAUDE_REVISION",
-  "CODEX_CLOSEOUT",
-  "CONSENSUS_ACK",
   "AWAITING_USER_APPROVAL",
   "IMPLEMENTING",
   "CODEX_REVIEW",
   "CLAUDE_FIX",
-  "CODEX_FINAL_REVIEW",
   "READY_TO_DELIVER",
   "CLOSED",
-  "BLOCKED_ON_EVIDENCE",
   "USER_DECISION_REQUIRED",
   "FAILED",
 ] as const;
 
 export const WorkflowStateSchema = z.enum(WORKFLOW_STATES);
 export type WorkflowState = z.infer<typeof WorkflowStateSchema>;
+
+// 작업 방식(CR 흐름 단순화 D1) — ticket 은 계획 없이 구현 → 리뷰 → 수정, planned 는 계획 합의와 사용자 승인 뒤 구현한다. 사용자·중재자가 고르고
+// 엔진은 제목·크기·키워드로 추론하지 않는다. 바꾸는 길은 생성 입력과 공식 전환 API(workflow-mode) 둘뿐이다.
+export const WORKFLOW_MODES = ["ticket", "planned"] as const;
+export const WorkflowModeSchema = z.enum(WORKFLOW_MODES);
+export type WorkflowMode = z.infer<typeof WorkflowModeSchema>;
 
 export const AGENT_ROLES = ["claude", "codex", "system", "user"] as const;
 export const AgentRoleSchema = z.enum(AGENT_ROLES);
@@ -101,11 +101,6 @@ export const DISPOSITIONS = [
 ] as const;
 export const DispositionSchema = z.enum(DISPOSITIONS);
 export type Disposition = z.infer<typeof DispositionSchema>;
-
-// 수정이 실제로 일어나는 단계 — 이 kind에서만 RESOLVED_BY_FIX 처분이 허용된다.
-// 검사기(assertFixDispositionAllowed)와 프롬프트(dispositionContract)가 같은 정본을 읽어
-// 짝 드리프트를 구조적으로 차단한다(2026-09-01 S1.1: 프롬프트 누락으로 정상 구현 턴 거부).
-export const FIX_AWARE_KINDS: ReadonlySet<string> = new Set(["IMPLEMENTATION", "FIX", "FINAL_REVIEW"]);
 
 export const FindingSchema = z.object({
   id: z.string().min(1),
@@ -168,9 +163,7 @@ export const PlanRepairJsonSchema = {
 } as const;
 
 export const AgentResultSchema = z.object({
-  planningStep: PlanningStepSchema.optional(),
   kind: z.enum([
-    "EVIDENCE_NO_IMPACT", "EVIDENCE_REPLAN", "EVIDENCE_NEEDS_DECISION",
     "BRAINSTORM",
     "PLAN",
     "AUDIT",
@@ -214,10 +207,6 @@ export const AgentResultSchema = z.object({
   // 요구하면 true. 결정 하나당 판정 하나 — 서버는 입력 결정을 전부 다루지 않은 확인 결과를 받지 않고, true 인 결정이 있으면 코드 판정을 재사용하지 않는다.
   decisionAssessments: z.array(z.object({ decisionSequence: z.number().int().positive(), changesImplementation: z.boolean() }).strict()).max(REVIEW_DECISION_BATCH_LIMIT).optional(),
   memoryUpdates: z.array(MemoryUpdateSchema).max(10).optional(),
-  // 허용 오차 원장 — 승인 범위 밖 변경마다 {ruleId, file, note}. 서버가 git diff 와 대조한다(shared/tolerance.ts).
-  // 서버 누적 원장(승계 포함)의 저장 계약엔 상한이 없다 — 상한은 정책(규칙 수×파일 수)이 정하고, 모델 한 번 응답의 상한(500행)은
-  // 어댑터 결과 파서가 따로 검사한다(F10: 응답 한도와 누적 저장 계약의 분리).
-  toleranceLedger: z.array(ToleranceLedgerEntrySchema).optional(),
  }).superRefine((result, context) => {
   if (result.planLineEdits && (result.kind !== "REVISION" || result.planEdits !== undefined || result.planMarkdown !== undefined)) {
     context.addIssue({ code: "custom", message: "planLineEdits는 REVISION에서 단독으로 사용해야 합니다." });
@@ -250,6 +239,8 @@ export const TopicSchema = z.object({
   // 선행 토픽 — 그 토픽이 이연한 쟁점(deferred-findings)을 이 토픽의 첫 계획·감사 프롬프트가 자동으로 받는다(2026-09-07).
   branchName: z.string().nullable(),
   state: WorkflowStateSchema,
+  // 과거 응답에는 없을 수 있다 — 저장된 토픽은 항상 값을 갖는다(database.ts workflow_mode).
+  workflowMode: WorkflowModeSchema.default("ticket"),
   scopeGeneration: z.number().int().positive(),
   planEpoch: z.number().int().positive().default(1),
   planRevision: z.number().int().nonnegative(),
@@ -270,7 +261,9 @@ export const TimelineEventSchema = z.object({
   scopeGeneration: z.number().int().positive().default(1),
   actor: AgentRoleSchema,
   kind: MessageKindSchema,
-  state: WorkflowStateSchema,
+  // 저장된 사건의 state 는 기록 문자열이다(F4) — 지운 상태로 남은 과거 사건도 이력으로 읽는다. 새 사건 쓰기는 TimelineEventInput.state
+  // (WorkflowState)가 막는다.
+  state: z.string(),
   body: z.string(),
   payload: z.record(z.string(), z.unknown()).default({}),
   createdAt: z.string().datetime(),
@@ -357,6 +350,7 @@ export const CreateTopicInputSchema = z.object({
   entry: WorkEntryInputSchema.optional(),
   title: z.string().trim().min(2).max(120),
   startMode: z.enum(["plan", "brainstorm"]).default("plan"),
+  workflowMode: WorkflowModeSchema.default("ticket"),
   // '-'로 시작하면 git worktree add에서 옵션으로 해석될 수 있다(감사 부차 지적).
   baseRef: z.string().trim().min(1).refine((value) => !value.startsWith("-"), "기준 리비전은 '-'로 시작할 수 없습니다.").default("HEAD"),
   branchPrefix: BranchPrefixSchema.default("consensus"),
@@ -366,8 +360,8 @@ export const CreateTopicInputSchema = z.object({
 });
 export type CreateTopicInput = z.infer<typeof CreateTopicInputSchema>;
 
-// 이연 쟁점 — 종결 확인·최종 리뷰가 "이번 범위 밖" 으로 처분한 새 쟁점. 산출물 `deferred-findings` 에 누적되고
-// 같은 토픽의 재시작 계획과 후속 토픽(predecessorTopicId)의 첫 계획·감사 프롬프트에 자동으로 실린다.
+// 이연 쟁점 — 종결 확인·최종 리뷰가 "이번 범위 밖" 으로 처분한 새 쟁점. 산출물 `deferred-findings` 에 기록됐다(be40f25 뒤 지금 흐름은 새로 쓰지
+// 않고 읽기만 한다). 작업 묶음은 단계 결과와 묶음 밖 선행 토픽(predecessorTopicId)의 원장을 동결하고, 이어받는 단계 머리말에 원문 그대로 싣는다.
 export const DeferredFindingSchema = z.object({
   id: z.string().min(1),
   title: z.string().min(1),
@@ -393,7 +387,6 @@ export const ImplementationNoteSchema = z.object({
   recordedAt: z.string(),
 });
 export type ImplementationNote = z.infer<typeof ImplementationNoteSchema>;
-export const ImplementationNotesSchema = z.object({ notes: z.array(ImplementationNoteSchema) });
 
 export const UpdateAgentSettingsInputSchema = AgentExecutionSettingsSchema;
 export type UpdateAgentSettingsInput = z.infer<typeof UpdateAgentSettingsInputSchema>;
@@ -411,7 +404,6 @@ export const AttachParticipantInputSchema = z.discriminatedUnion("mode", [
 ]);
 export type AttachParticipantInput = z.infer<typeof AttachParticipantInputSchema>;
 
-// 구현 도중 허용 오차 개정(넓히기만): tolerance = 새 블록 JSON 객체 전체, reason = 결정 근거(타임라인 decision 본문).
 // 구현 계속 재개(공식 복구 API, Codex 감사 D01): 러너가 완료 형식으로 리뷰에 들어가 멈췄거나 실패한 토픽을 같은 세션·같은 계획으로
 // IMPLEMENTING 재개 상태로 되돌린다. 기대 상태·세대를 결속해 낡은 요청이 다른 상황에 적용되지 않게 한다(sqlite 직접 수정 대체).
 export const ResumeImplementationInputSchema = z.object({
@@ -423,21 +415,35 @@ export type ResumeImplementationInput = z.infer<typeof ResumeImplementationInput
 
 // 도구 트리 기준 재설정(중재자, 재동기화 뒤) — 감지된 변경을 "복구했다" 고 선언하는 유일한 경로(F04).
 export const ReasonInputSchema = z.object({ reason: z.string().trim().min(1).max(4000) });
+// 작업 방식 전환(D1) — 사유는 timeline 에 남는다. 전환은 초기화가 아니고 실행을 시작하지 않는다(server/workflow.ts setWorkflowMode).
+export const WorkflowModeInputSchema = ReasonInputSchema.extend({ mode: WorkflowModeSchema });
+export type WorkflowModeInput = z.infer<typeof WorkflowModeInputSchema>;
+// 역할 세션 교체(D5, 계약 v3.16 (17')) — 새 세션은 중재자의 이 명시 동작(사유 기록)으로만 연다. 한 호출에 한 역할이다.
+const SESSION_ROLES = ["planner", "plan-reviewer", "implementer", "code-reviewer"] as const satisfies readonly EnvelopeRole[];
+export const SessionReplacementSchema = z.object({ role: z.enum(SESSION_ROLES), reason: z.string().trim().min(1).max(2_000) }).strict();
+export type SessionReplacement = z.infer<typeof SessionReplacementSchema>;
+// 정지 지점 재개(D7) — 결정문은 선택이다. 있으면 재개와 같은 transaction 으로 결정 기록이 되어 대기 역할에 새 사실로 전달되고, 없으면 그 역할은
+// 아직 받지 않은 사실만 받는다. 메시지 길이 한도는 일반 결정(PostMessageInputSchema)과 같다.
+// reentry 는 인도 대기(READY_TO_DELIVER)에서 같은 역할 세션의 수정·재리뷰로 다시 들어가는 중재자 지정이다(F009) — 수정은 결정문이 필수다.
+export const REENTRY_POINTS = ["CLAUDE_FIX", "CODEX_REVIEW"] as const;
+export type ReentryPoint = typeof REENTRY_POINTS[number];
+export const ResumeInputSchema = z.object({
+  decision: z.string().trim().min(1).max(50_000).optional(),
+  replaceSession: SessionReplacementSchema.optional(),
+  reentry: z.enum(REENTRY_POINTS).optional(),
+}).strict();
+export type ResumeInput = z.infer<typeof ResumeInputSchema>;
+// 계획으로 돌아가기(planned 전용, 계약 v3.17 (28)) — 무엇을 고칠지 적은 결정문이 같은 플래너 세션에 사실로 전달된다.
+export const ReturnToPlanningInputSchema = z.object({ decision: z.string().trim().min(1).max(50_000) }).strict();
+export type ReturnToPlanningInput = z.infer<typeof ReturnToPlanningInputSchema>;
 // 도구 트리 기준 갱신 — 유지보수 잠금을 쥔 스크립트가 종료 절차로 부를 때 잠금 파일의 pid·at 을 그대로 제시한다(소유 증명, R3-06).
 export const ToolTreeRebaselineInputSchema = ReasonInputSchema.extend({
   maintenanceLock: z.object({ pid: z.number().int().positive(), at: z.string().min(1) }).optional(),
 });
 export type ToolTreeRebaselineInput = z.infer<typeof ToolTreeRebaselineInputSchema>;
-export const RESPONSE_LEDGER_LIMIT = 500;
 // 한 번 응답이 나열할 수 있는 해소 요청 id 상한(JSON 스키마 maxItems·파서 검사). 저장 계약(AgentResultSchema)에는 상한이 없다 — 교정 병합이
 // 원본과 교정의 id 를 합치면 응답 한도를 넘을 수 있고, 그 병합본을 다시 파싱하는 core 가 거부하면 교정 전체가 죽는다(host-review R02; F10 과 같은 분리).
 export const RESPONSE_RESOLVED_IDS_LIMIT = 100;
-
-export const AmendToleranceInputSchema = z.object({
-  tolerance: z.unknown(),
-  reason: z.string().trim().min(1).max(20_000),
-});
-export type AmendToleranceInput = z.infer<typeof AmendToleranceInputSchema>;
 
 export const PostMessageInputSchema = z.object({
   kind: z.enum(["note", "scope_change", "evidence", "decision"]),
@@ -486,14 +492,13 @@ export type ActionResponse = z.infer<typeof ActionResponseSchema>;
 // 선택성은 null 허용으로 표현한다. Claude(--json-schema)는 이 규칙을 강제하지 않아 이전까지 통과했다.
 // 한도는 서버 계약과 같은 값을 싣는다(R4 — 파일 머리의 한도 주석).
 const defect = EngineDefectReportSchema.shape;
-const ledger = ToleranceLedgerEntrySchema.shape;
 const memory = MemoryUpdateSchema.shape;
 export const AgentResultJsonSchema = {
   type: "object",
   additionalProperties: false,
   required: [
     "kind", "summary", "planMarkdown", "planEdits", "planLineEdits", "planSHA256",
-    "findings", "engineDefects", "evidenceRefs", "requestedUserDecision", "requestedMediatorAction", "memoryUpdates", "toleranceLedger",
+    "findings", "engineDefects", "evidenceRefs", "requestedUserDecision", "requestedMediatorAction", "memoryUpdates",
     "status", "remainingSteps", "resolvesRequestedDecision", "resolvedRequestId", "resolvedRequestIds", "reviewDecisionAnswers", "decisionAssessments",
   ],
   properties: {
@@ -575,26 +580,6 @@ export const AgentResultJsonSchema = {
       type: "object", additionalProperties: false, required: ["decisionSequence", "changesImplementation"],
       properties: { decisionSequence: { type: "integer", minimum: 1 }, changesImplementation: { type: "boolean" } },
     } }, { type: "null" }] },
-    toleranceLedger: {
-      anyOf: [
-        {
-          type: "array",
-          // 한 번 응답의 원장 상한(파서 RESPONSE_LEDGER_LIMIT 과 같은 값) — 앞 턴에서 받아들인 행은 서버가 승계하므로 이번 턴 변경분만 적는다(R3-11).
-          maxItems: RESPONSE_LEDGER_LIMIT,
-          items: {
-            type: "object",
-            additionalProperties: false,
-            required: ["ruleId", "file", "note"],
-            properties: {
-              ruleId: { type: "string", minLength: 1, maxLength: characterLimit(ledger.ruleId), pattern: NON_BLANK },
-              file: { type: "string", minLength: 1, maxLength: characterLimit(ledger.file), pattern: NON_BLANK },
-              note: { type: "string" },
-            },
-          },
-        },
-        { type: "null" },
-      ],
-    },
     memoryUpdates: {
       anyOf: [
         {
@@ -615,17 +600,6 @@ export const AgentResultJsonSchema = {
       ],
     },
   },
-} as const;
-
-export const PlanningAgentResultJsonSchema = {
-  ...AgentResultJsonSchema,
-  required: [...AgentResultJsonSchema.required, "planningStep"],
-  properties: { ...AgentResultJsonSchema.properties, planningStep: PlanningStepJsonSchema },
-} as const;
-
-export const CodexPlanningAgentResultJsonSchema = {
-  ...PlanningAgentResultJsonSchema,
-  properties: { ...PlanningAgentResultJsonSchema.properties, planningStep: CodexPlanningStepJsonSchema },
 } as const;
 
 export const REQUIRED_PLAN_HEADINGS = [
@@ -696,8 +670,6 @@ export const TopicActivitySchema = z.object({
   runningAction: z.boolean(),
   budget: z.custom<BudgetAccount>().nullable().optional(),
   budgetRecoveryRequired: z.boolean().optional(),
-  revisionAllowance: RevisionAllowanceSchema.optional(),
-  revisionPaused: z.boolean().optional(),
   reviewAllowances: z.array(ReviewAllowanceSchema).optional(),
   reviewPaused: ReviewScopeSchema.nullable().optional(),
   executionUsage: z.array(z.object({

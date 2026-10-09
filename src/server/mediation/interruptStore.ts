@@ -81,7 +81,7 @@ export class MediatorInterruptStore {
       const binding = JSON.parse(record.binding);
       if (topic && record.startedActionId && !record.reviewProgress && !record.continuationKey
         && binding[0] === Number(topic.scope_generation) && binding[1] === Number(topic.plan_epoch)
-        && (ACTIVE_WORKFLOW_STATES.has(topic.state as Topic["state"]) || topic.state === "CONSENSUS_ACK")
+        && ACTIVE_WORKFLOW_STATES.has(topic.state as Topic["state"])
         && this.db.prepare("SELECT 1 FROM actions WHERE id=? AND topic_id=? AND status='running'").get(record.startedActionId, topicId)) {
         record.resumed = { at: new Date(this.clock()).toISOString(), actionId: record.startedActionId };
       }

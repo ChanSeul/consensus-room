@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { MediatorEvidenceBatchInputSchema, MediatorEvidenceAckSchema, EvidenceDependencySchema, EvidenceReviewInputSchema, EvidenceSnapshotInputSchema, EvidenceSourceInputSchema,
+import { MediatorEvidenceBatchInputSchema, MediatorEvidenceAckSchema, EvidenceDependencySchema, EvidenceSnapshotInputSchema, EvidenceSourceInputSchema,
   parseEvidenceSource, EvidenceRootInputSchema, EvidenceSelectionInputSchema, EvidenceSearchInputSchema, EvidenceHostImportSchema } from "../../shared/externalEvidence.js";
 import type { ConsensusDatabase } from "../database.js";
 import type { WorkflowEngine } from "../workflow.js";
@@ -16,12 +16,15 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
     if (headers["x-consensus-actor"] === "mediator") throw Object.assign(new Error("근거 선택 승인은 사용자만 할 수 있습니다."), { statusCode: 403 });
   };
   const idle = (ids: string[]) => { for (const id of ids) workflow.assertBudgetEditable(id); };
-  const notifySelection = (ids: string[]) => {
+  // 근거 선택 변경 사실(79fc4fc5 F011) — 바뀐 근거 목록 버전(작업 그룹 근거 연결이면 그 그룹 id)만 system 사실(workerFact)로 남긴다. 사용자 발언으로
+  // 꾸미거나 재계획·세션 초기화를 지시하지 않는다. 닫혔거나 확정 커밋이 있는 토픽은 건너뛰고, 그룹 연결은 요청한 토픽에 늘 남긴다(따로 쓰던 그룹 기록과 같은 범위).
+  const notifySelection = (ids: string[], group?: { groupId: string | null }) => {
     for (const id of new Set(ids)) {
-      const topic = db.getTopic(id); if (topic.state === "CLOSED" || db.getFlags(id).committedOID) continue;
-      db.appendEvent({topicId:id,actor:"user",kind:"note",state:topic.state,
-        body:"앞으로 사용할 근거 목록이 바뀌었습니다. 이전 계획과 인용은 과거 기록이며, 현재 승인된 근거로 다시 계획하고 확인하세요. 에이전트 세션도 새로 시작합니다.",
-        payload:{evidenceCatalogVersion:db.evidence.catalog.version(id),planEpoch:topic.planEpoch}});
+      const topic = db.getTopic(id); if (!group && (topic.state === "CLOSED" || db.getFlags(id).committedOID)) continue;
+      db.appendEvent({topicId:id,actor:"system",kind:"system",state:topic.state,
+        body:group ? (group.groupId ? `작업 그룹 ${group.groupId} 의 근거를 이 주제에 연결했습니다.` : "이 주제의 작업 그룹 근거 연결을 해제했습니다.")
+          : "근거 목록이 바뀌었습니다.",
+        payload:{workerFact:{kind:"evidence-selection",catalogVersion:db.evidence.catalog.version(id),...(group ? {groupId:group.groupId} : {})}}});
     }
   };
   app.get<{ Params: { id: string } }>("/api/topics/:id/evidence/catalog", async request => db.evidence.catalog.state(request.params.id));
@@ -31,9 +34,7 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
     db.evidence.catalog.assertGroup(request.params.id,input);
     if (db.evidence.catalog.context(request.params.id).group === input.groupId) return db.evidence.catalog.state(request.params.id);
     await workflow.changeEvidenceSelection([request.params.id],()=>db.evidence.catalog.selectGroup(request.params.id,input));
-    notifySelection([request.params.id]);
-    db.appendEvent({topicId:request.params.id,actor:"user",kind:"note",state:db.getTopic(request.params.id).state,
-      body:input.groupId ? "등록된 작업 그룹의 근거를 이 주제에 연결했습니다." : "이 주제의 근거 묶음 연결을 해제했습니다.",payload:{evidenceGroupId:input.groupId}});
+    notifySelection([request.params.id],{groupId:input.groupId});
     return db.evidence.catalog.state(request.params.id);
   });
   app.get<{ Params: { id: string } }>("/api/topics/:id/evidence/host-plan", async request => {
@@ -156,9 +157,9 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
   });
   app.get<{ Params: { id: string } }>("/api/topics/:id/evidence", async request => {
     const state = db.evidence.topic(db.getTopic(request.params.id));
-    const collectionMetrics = { ...db.evidence.metrics(`assessment:${request.params.id}`) };
+    const collectionMetrics: Record<string, number> = {};
     for (const source of state.sources) for (const [name, value] of Object.entries(db.evidence.metrics(source.id))) collectionMetrics[name] = (collectionMetrics[name] ?? 0) + value;
-    return { ...state, assessments: db.evidence.automation.jobs(request.params.id).filter(job => job.status !== "superseded" && job.binding === JSON.stringify([state.plan.scopeGeneration, state.plan.planEpoch, state.plan.planSHA256])).slice(0, 20), collectionMetrics, connections: state.sources.map(source => ({ sourceId: source.id, configured: service.connection(source).configured,
+    return { ...state, collectionMetrics, connections: state.sources.map(source => ({ sourceId: source.id, configured: service.connection(source).configured,
       sharedTopics: db.evidence.linkedTopics(source.id).length })) };
   });
   app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/sources", async request => {
@@ -169,17 +170,6 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
     if (request.headers["x-consensus-actor"] !== "mediator") return db.evidence.register(topic.id, input);
     const root = db.evidence.catalog.add(topic.id, { ...input, scope: "topic", required: true }, false);
     return db.evidence.get(root.sourceId);
-  });
-  app.post<{ Params: { id: string } }>("/api/topics/:id/evidence/review", async request => {
-    authorizeReview(request.headers); workflow.assertBudgetEditable(request.params.id);
-    const input = EvidenceReviewInputSchema.parse(request.body);
-    const topic = db.getTopic(request.params.id);
-    if (topic.state === "CLOSED" && !(db.getFlags(topic.id).committedOID && db.evidence.isFrozen(topic)))
-      throw new Error("확정 커밋이 있는 닫힌 단계의 보존된 근거만 재검토할 수 있습니다.");
-    db.evidence.review(topic, input.digest, input.reason, input.plan);
-    db.appendEvent({ topicId: topic.id, actor: "user", kind: "note", state: topic.state,
-      body: `외부 원문 변경 영향 확인: ${input.reason}`, payload: { evidenceDigest: input.digest, planSHA256: topic.planSHA256 } });
-    return db.evidence.topic(topic);
   });
   app.delete<{ Params: { id: string; sourceId: string } }>("/api/topics/:id/evidence/sources/:sourceId", async request => {
     user(request.headers); workflow.assertBudgetEditable(request.params.id);
@@ -209,7 +199,7 @@ export function registerEvidenceRoutes(app: FastifyInstance, db: ConsensusDataba
   });
   app.post<{ Params: { id: string } }>("/api/evidence/:id/failure", async request => {
     const input = z.object({ checkId: z.string().uuid(), error: z.string().max(500), retryAfterSeconds: z.number().int().min(300).max(86400).default(300) }).strict().parse(request.body);
-    db.evidence.failed(request.params.id, input.checkId, input.error, input.retryAfterSeconds); return { ok: true };
+    service.failed(request.params.id, input.checkId, input.error, input.retryAfterSeconds); return { ok: true };
   });
   app.get<{ Params: { id: string }; Querystring: { hash?: string } }>("/api/evidence/:id/snapshot", async request => {
     const query = z.object({ hash: z.string().regex(/^[a-f0-9]{64}$/).optional() }).parse(request.query);

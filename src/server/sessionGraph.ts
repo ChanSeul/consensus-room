@@ -2,8 +2,6 @@ import type { SessionSettingsTarget } from "../shared/sessionSettings.js";
 import { createHash } from "node:crypto";
 import type { ConsensusDatabase } from "./database.js";
 import { routingView } from "./turnRouting.js";
-import { planningControlApplies } from "./guardedPlanning.js";
-import { turnFlags } from "../shared/roles.js";
 import type { GraphNode, GraphRole, SessionGraph, GraphStatus } from "../shared/sessionGraph.js";
 import { GRAPH_ROLES } from "../shared/sessionGraph.js";
 import { readHostReviewGraph } from "./hostReviewGraph.js";
@@ -29,11 +27,11 @@ export function buildSessionGraph(db: ConsensusDatabase, topicId: string, host: 
     const id = `${from}:${to}:${kind}`; if (from !== to && !graph.edges.some(item => item.id === id)) graph.edges.push({ id, from, to, kind, label });
   };
   for (const topic of topics.filter(topic => ids.has(topic.id)).sort((a,b) => { const depth = (id: string) => { let n = 0, item = topics.find(t => t.id === id); const seen = new Set<string>(); while (item?.parentTopicId && ids.has(item.parentTopicId) && !seen.has(item.id)) { seen.add(item.id); n++; item = topics.find(t => t.id === item!.parentTopicId); } return n; }; return depth(a.id)-depth(b.id); })) {
-    const lane = topic.id, routing = routingView(db, topic, job => planningControlApplies(db, topic.id, topic.state, turnFlags(job)));
+    const lane = topic.id, routing = routingView(db, topic);
     graph.lanes.push({ id: lane, title: topic.title });
     const topicNode = `topic:${lane}`, running = Boolean(db.runningAction(lane));
     add({ id: topicNode, kind: "topic", topicId: lane, lane, label: topic.title, subtitle: topic.topicKind === "group" ? "큰 그림 · 하위 주제 관리" : topic.state,
-      status: running ? "running" : topic.state === "CLOSED" ? "complete" : ["FAILED", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED"].includes(topic.state) ? "blocked" : "idle", historical: false,
+      status: running ? "running" : topic.state === "CLOSED" ? "complete" : ["FAILED", "USER_DECISION_REQUIRED"].includes(topic.state) ? "blocked" : "idle", historical: false,
       details: [{ label: "Goal", value: topic.workEntry?.goal ?? topic.title }, { label: "상태", value: topic.state }] });
     if (topic.parentTopicId && ids.has(topic.parentTopicId)) edge(`topic:${topic.parentTopicId}`, topicNode, "hierarchy", "하위 주제");
     const environments = db.sessions.forTopic(topic.id);
@@ -186,7 +184,7 @@ export function buildSessionGraph(db: ConsensusDatabase, topicId: string, host: 
       }
     }
     for (const node of graph.nodes.filter(n => n.lane === lane && n.kind === "session" && n.sessionId && n.status !== "running")) {
-      node.status = node.historical ? "unknown" : topic.state === "CLOSED" ? "complete" : ["FAILED", "BLOCKED_ON_EVIDENCE", "USER_DECISION_REQUIRED"].includes(topic.state) ? "blocked" : "idle";
+      node.status = node.historical ? "unknown" : topic.state === "CLOSED" ? "complete" : ["FAILED", "USER_DECISION_REQUIRED"].includes(topic.state) ? "blocked" : "idle";
     }
   }
   for (const group of db.workGroups.list()) {

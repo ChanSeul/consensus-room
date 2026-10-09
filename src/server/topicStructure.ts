@@ -11,7 +11,7 @@ export function assertEntryReady(db: ConsensusDatabase, topic: Topic): void {
   const entry = workEntry(topic);
   if (!entry.goal) conflict("중재 세션에서 Goal을 확정한 뒤 계획을 시작하세요.");
   if (entry.mode === "sources") {
-    db.evidence.assertReady(topic, false);
+    db.evidence.assertReady(topic);
     const evidence = db.evidence.topic(topic);
     if (!entry.sourceIds.length || entry.sourceIds.some(id => !evidence.sources.some(source => source.id === id)))
       conflict("시작 Source가 현재 근거에서 빠졌습니다. 원문 연결을 확인하세요.");

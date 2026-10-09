@@ -24,12 +24,16 @@ async function fixture() {
   execFileSync("git", ["-C", root, "commit", "-qm", "fixture"]);
   const config = loadConfig({ dataDirectory: root, repositoryPath: root, memoryDirectory: join(root, "memory"),
     databasePath: join(root, "room.sqlite"), worktreesDirectory: join(root, "trees"), topicsDirectory: join(root, "topics"),
-    webDirectory: join(root, "no-web"), launchToken: "test", enforceBudgets: false, guardedPlanning: false });
+    webDirectory: join(root, "no-web"), launchToken: "test", enforceBudgets: false });
   let db = new ConsensusDatabase(config.databasePath);
   const calls: Array<Omit<SessionTurn, "sessionId">> = [];
+  // 계획 턴은 결과 봉투 턴이다(⑥) — 플래너 첫 턴이 입력을 확인하고 중재자 결정을 요청한다. 논의(brainstorm) 턴은 결과 메서드 그대로다.
   const adapter = (role: "claude" | "codex"): AgentAdapter => ({ role, validateExistingSession: async () => true,
     createSession: async turn => { calls.push(turn); return { sessionId: `${role}-${calls.length}`, result: { kind: "PLAN", summary: "계획 입력 확인", findings: [], evidenceRefs: [], requestedUserDecision: "범위를 확인하세요." } }; },
     resumeTurn: async () => { throw new Error("Unexpected resumed turn"); },
+    createEnvelopeSession: async turn => { calls.push(turn); return { sessionId: `${role}-${calls.length}`,
+      envelope: { message: "계획 입력 확인", outcome: "needs-mediator", mediatorRequest: "범위를 확인하세요." } }; },
+    resumeEnvelopeTurn: async () => { throw new Error("Unexpected resumed turn"); },
   });
   const build = () => buildApp({ config, database: db, runner: new SpawnCommandRunner(), claude: adapter("claude"), codex: adapter("codex") });
   let app = await build(), serial = 0;
@@ -48,7 +52,7 @@ it("persists Root → Sub → Sub → leaf, blocks manager execution, and gives 
   const root = await f.create({ title: "제품 큰 그림", topicKind: "group", entry: { mode: "goal", goal: "어떤 언어의 프로젝트에서도 협업한다." } });
   const sub = await f.create({ title: "시작 방식", topicKind: "group", parentTopicId: root.id, entry: { mode: "goal", goal: "사용자의 출발점을 세 경로로 받는다." } });
   const middle = await f.create({ title: "자료 해석", topicKind: "group", parentTopicId: sub.id, entry: { mode: "goal", goal: "링크와 확인된 요구사항을 구분한다." } });
-  const leaf = await f.create({ title: "자료 읽기", parentTopicId: middle.id, entry: { mode: "goal", goal: "원문 읽기 실패를 명확하게 표시한다." } });
+  const leaf = await f.create({ title: "자료 읽기", parentTopicId: middle.id, workflowMode: "planned", entry: { mode: "goal", goal: "원문 읽기 실패를 명확하게 표시한다." } });
   expect(root.worktreePath).toBe(f.root);
   expect(leaf.worktreePath).not.toBe(f.root);
   for (const id of [root.id, sub.id, middle.id]) {
@@ -71,7 +75,7 @@ it("persists Root → Sub → Sub → leaf, blocks manager execution, and gives 
 
 it("sources can establish a partial Goal with deferred originals; changed sources still invalidate that Goal", async () => {
   const f = await fixture();
-  const topic = await f.create({ title: "원문 기반 구현", entry: { mode: "sources", sources: [{ url: "https://example.com/spec", label: "제품 요구사항" }] } });
+  const topic = await f.create({ title: "원문 기반 구현", workflowMode: "planned", entry: { mode: "sources", sources: [{ url: "https://example.com/spec", label: "제품 요구사항" }] } });
   await f.attach(topic.id);
   expect((await f.post(`topics/${topic.id}/actions/plan`, {})).statusCode).toBe(409);
   expect((await f.post(`topics/${topic.id}/goal`, { goal: "원문 미수집 범위를 제외한 읽기 상태 표시", evidenceDigest: f.db.evidence.topic(topic).digest })).statusCode).toBe(200);
@@ -115,7 +119,7 @@ it("mediator source intake preserves source approval and authentication boundari
 
 it("brainstorm establishes a separate Goal and starts planning; a manager only establishes its Goal", async () => {
   const f = await fixture();
-  const leaf = await f.create({ title: "토론 출발", entry: { mode: "brainstorm" } });
+  const leaf = await f.create({ title: "토론 출발", workflowMode: "planned", entry: { mode: "brainstorm" } });
   expect(leaf.state).toBe("BRAINSTORM_READY");
   expect((await f.post(`topics/${leaf.id}/goal`, { goal: "논의 전환을 우회" })).statusCode).toBeGreaterThanOrEqual(400);
   await f.attach(leaf.id);
@@ -192,7 +196,7 @@ it("adopts legacy work groups together and keeps subsequent stage creation under
   expect((await f.post(`topics/${parent.id}/adopt`, { workGroupIds: [groupId] })).statusCode).toBe(200);
   expect(f.db.getTopic(firstId).parentTopicId).toBe(parent.id);
   expect(f.db.workGroups.get(groupId)).toEqual({ ...before, parentTopicId: parent.id });
-  f.db.updateTopic(firstId, { state: "BLOCKED_ON_EVIDENCE", resumeState: "CLAUDE_PLAN" });
+  f.db.updateTopic(firstId, { state: "USER_DECISION_REQUIRED", resumeState: "CLAUDE_PLAN" });
   const next = await f.post(`work-groups/${groupId}/next`, { stageId: "b" }); expect(next.statusCode, next.body).toBe(201);
   expect(next.json().parentTopicId).toBe(parent.id);
   expect((await f.post("role-assignments", { scope: "global", role: "mediator", participant: "global-owner", expectedVersion: 0 })).statusCode).toBe(200);

@@ -7,7 +7,6 @@ import { ConsensusDatabase } from "../src/server/database";
 import { codexUsageEvidence } from "../src/server/adapters/codexUsageEvidence";
 import { reconcileCodexPlanningUsage } from "../src/server/codexUsageReconciliation";
 import { ExecutionMetrics } from "../src/server/adapters/executionMetrics";
-import type { PlanningCheckpoint } from "../src/shared/planningControl";
 
 const dirs: string[] = [];
 afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
@@ -30,6 +29,12 @@ function transcript() {
   ];
 }
 const encode = (events: unknown[]) => events.map(e => JSON.stringify(e)).join("\n");
+function saveCheckpoint<T extends { key: string; topicId: string }>(databasePath: string, record: T) {
+  const raw = new DatabaseSync(databasePath);
+  raw.prepare("INSERT INTO planning_checkpoints VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET record_json=excluded.record_json")
+    .run(record.key, record.topicId, JSON.stringify(record));
+  raw.close();
+}
 function fixture(mixed = false) {
   const root = mkdtempSync(join(tmpdir(), "codex-usage-reconcile-")); dirs.push(root);
   const databasePath = join(root, "room.sqlite"), codexHome = join(root, "home"), transcriptPath = join(codexHome, "sessions/thread-test.jsonl");
@@ -42,7 +47,7 @@ function fixture(mixed = false) {
         usage: turn.usage, reported: turn.reported, lastThread: turn.reported, turnCount: 1, requestIds: turn.requestIds,
       } } } }));
   const database = new ConsensusDatabase(databasePath);
-  database.createTopic({ id: "topic", slug: "usage", title: "Usage", repositoryPath: root, baseRef: "main", worktreePath: root,
+  database.createTopic({ workflowMode: "planned", id: "topic", slug: "usage", title: "Usage", repositoryPath: root, baseRef: "main", worktreePath: root,
     branchPrefix: "test", requestedBranchName: null, predecessorTopicId: null, branchName: null, state: "USER_DECISION_REQUIRED",
     scopeGeneration: 1, planRevision: 0, planSHA256: null, approvedPlanSHA256: null, createdAt: new Date(0).toISOString(),
     updatedAt: new Date(0).toISOString(), lastError: null });
@@ -55,11 +60,11 @@ function fixture(mixed = false) {
   database.saveExecutionUsage("topic", 1, "codex", "turn", { executionId: "execution", ...wrong,
     durationMs: 2000, internalRequests: mixed ? 3 : 2, recordKind: "final", completeness: "complete",
     ...(mixed ? { sourceUsage: { status: "mismatch" as const, turns } } : {}) });
-  database.planning.save({ key: "checkpoint", id: "checkpoint-id", topicId: "topic", sessionId: "thread-test", role: "codex", stage: "CODEX_AUDIT",
+  database.close();
+  saveCheckpoint(databasePath, { key: "checkpoint", id: "checkpoint-id", topicId: "topic", sessionId: "thread-test", role: "codex", stage: "CODEX_AUDIT",
     scopeGeneration: 1, planEpoch: 1, planSHA256: null, stopped: "Planning checkpoint saved; insufficient remaining budget for synthesis.",
     usage: { ...wrong, durationMs: 2100 }, peakStep: { inputTokens: 130, cachedInputTokens: 65, outputTokens: 15, durationMs: 600 },
-    metrics: { internalRequests: mixed ? 3 : 2 }, updatedAt: new Date(3000).toISOString(), admissionId: "same-admission", round: mixed ? 3 : 2, delivered: ["keep-receipt"] } as unknown as PlanningCheckpoint);
-  database.close();
+    metrics: { internalRequests: mixed ? 3 : 2 }, updatedAt: new Date(3000).toISOString(), admissionId: "same-admission", round: mixed ? 3 : 2, delivered: ["keep-receipt"] });
   return { databasePath, codexHome, transcriptPath, executionId: "execution", policy };
 }
 
@@ -86,7 +91,7 @@ it("reconciles only proved overcount, preserves policy/duration/receipts, and at
 it("rejects changed previews without partial writes", () => {
   const f = fixture(), preview = reconcileCodexPlanningUsage(f);
   const db = new ConsensusDatabase(f.databasePath);
-  const cp = db.planning.latest("topic")!; cp.updatedAt = new Date(4000).toISOString(); db.planning.save(cp); db.close();
+  const cp = db.planning.latest("topic")!; cp.updatedAt = new Date(4000).toISOString(); db.close(); saveCheckpoint(f.databasePath, cp);
   expect(() => reconcileCodexPlanningUsage({ ...f, expectedHash: preview.hash })).toThrow("preview changed");
   const raw = new DatabaseSync(f.databasePath);
   expect(JSON.parse(String(raw.prepare("SELECT record_json FROM budget_accounts").get()!.record_json)).used.inputTokens).toBe(240);

@@ -1,18 +1,18 @@
 import {
-  PlanRepairSchema, type PlanRepair, AgentResultSchema, RESPONSE_LEDGER_LIMIT, RESPONSE_RESOLVED_IDS_LIMIT, type AgentResult,
+  PlanRepairSchema, type PlanRepair, AgentResultSchema, RESPONSE_RESOLVED_IDS_LIMIT, type AgentResult,
 } from "../../shared/contracts.js";
 import { redactSecrets } from "../../shared/workflow.js";
 import type { AgentRunErrorCode } from "../../shared/planningControl.js";
+import { envelopeIssues, turnEnvelopeSchema, type EnvelopeRole, type TurnEnvelope } from "../../shared/turnContract.js";
 
 // AgentResultJsonSchema는 선택 필드를 "required + null 허용"으로 표현한다 — OpenAI 구조화 출력이
 // required에 properties의 전 키를 요구하기 때문이다(그 주석 참조). 모델은 값이 없으면 null을 보내는데
 // zod에서 그 필드들은 optional이라 null을 받지 못한다. 그래서 파싱 전에 값이 null인 키만 지운다.
 // memoryUpdates[].expectedSHA256처럼 null 자체가 유효한 값인 필드는 건드리지 않으므로 재귀로 훑지 않는다.
 const OPTIONAL_KEYS = [
-  "planningStep",
   "engineDefects",
   "planMarkdown", "planEdits", "planLineEdits", "planSHA256", "requestedUserDecision", "requestedMediatorAction", "memoryUpdates", "findings", "evidenceRefs",
-  "toleranceLedger", "status", "remainingSteps", "resolvesRequestedDecision", "resolvedRequestId", "resolvedRequestIds", "reviewDecisionAnswers", "decisionAssessments",
+  "status", "remainingSteps", "resolvesRequestedDecision", "resolvedRequestId", "resolvedRequestIds", "reviewDecisionAnswers", "decisionAssessments",
 ] as const;
 
 function withoutNullOptionals(value: unknown): unknown {
@@ -42,9 +42,6 @@ export class ResponseLimitViolation extends Error {}
 // 원장 한도는 누적 저장 계약(무제한)과 분리한다(F10). 서버 승계로 500행을 넘는 것은 저장 쪽 몫이다.
 export function validateAgentResult(value: unknown): AgentResult {
   const parsed = AgentResultSchema.parse(withoutNullOptionals(value));
-  if ((parsed.toleranceLedger?.length ?? 0) > RESPONSE_LEDGER_LIMIT) {
-    throw new ResponseLimitViolation(`toleranceLedger 가 한 번 응답 한도 ${RESPONSE_LEDGER_LIMIT}행을 넘습니다(서버가 앞 턴 원장을 승계하므로 이번 턴 변경분만 적으세요)`);
-  }
   // 해소 요청 id 도 같은 분리 — 응답 한도는 여기서, 저장 계약(교정 병합 합집합)은 무제한(host-review R02).
   if ((parsed.resolvedRequestIds?.length ?? 0) > RESPONSE_RESOLVED_IDS_LIMIT) {
     throw new ResponseLimitViolation(`resolvedRequestIds 가 한 번 응답 한도 ${RESPONSE_RESOLVED_IDS_LIMIT}개를 넘습니다(열린 요청과 일치하는 id 만 적으세요)`);
@@ -62,7 +59,7 @@ function parseResult(value: unknown): { success: true; data: AgentResult } | { s
 
 // 최종 구조화 응답은 왔지만 검증(validateAgentResult)에 실패했다. 메시지는 기존 계약 실패 문구 그대로라 지금의 소비처(문구 판정·FAILED 기록)는 같다.
 // raw 는 그 응답 객체다. 실행기(TurnExecutor)만, 결과를 곧바로 enforceResultContract 로 넘기는 요청에서 이것을 결과로 바꿔 같은 세션 교정으로 보낸다
-// (2026-10-07 R3: 505자 단계 하나로 1145초 근거 검토 결과가 통째로 버려졌다). 그 밖의 소비처(엔진 결함 워커·계획 제어 루프 등)는 지금처럼 오류를 받는다.
+// (2026-10-07 R3: 505자 단계 하나로 1145초 근거 검토 결과가 통째로 버려졌다). 그 밖의 소비처(엔진 결함 워커 등)는 지금처럼 오류를 받는다.
 const unverifiedResults = new WeakSet<object>();
 export class UnverifiedAgentResult extends Error {
   constructor(readonly raw: Record<string, unknown>, message: string) {
@@ -115,9 +112,13 @@ export function parseAgentResult(candidates: unknown[], stdout: string): AgentRe
 // Codex: 마지막 agent_message)만 본다. 앞 메시지의 JSON 은 모델이 제출한 결과가 아니다. 결과 종류(kind 문자열)가 없는 객체는 구조화 응답으로 보지 않는다.
 // stdout 은 최종 이벤트가 없을 때만 본다(parseAgentResult 의 마지막 단계) — 후보 객체보다 먼저 이기지 않게.
 function finalStructuredResponse(final: Record<string, unknown>): Record<string, unknown> | null {
-  const value = final.type === "result" ? (isRecord(final.structured_output) ? final.structured_output : jsonObject(final.result))
+  return structuredRecord(finalResponseValue(final));
+}
+
+// 최종 이벤트가 실은 응답 값 — Claude result 의 structured_output(없으면 result 본문의 JSON), Codex agent_message 본문의 JSON.
+function finalResponseValue(final: Record<string, unknown>): unknown {
+  return final.type === "result" ? (isRecord(final.structured_output) ? final.structured_output : jsonObject(final.result))
     : jsonObject(isRecord(final.item) ? final.item.text : undefined);
-  return structuredRecord(value);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -165,6 +166,23 @@ function parseCandidate(candidate: unknown): AgentResult | null {
   const item = value.item as Record<string, unknown> | undefined;
   if (item?.type === "agent_message" && typeof item.text === "string") return parseJsonText(item.text);
   return null;
+}
+
+// 결과 봉투(D3) — 모델이 제출한 마지막 최종 응답 하나만 읽는다(앞 메시지의 JSON 은 제출한 결과가 아니다). 응답이 JSON 객체가 아니면 교정할 결과가 없으므로
+// 일반 오류다. 객체인데 이 역할의 봉투 계약을 어기면 그 응답을 UnverifiedAgentResult 로 넘긴다 — 같은 세션 교정은 실행기가 정한다.
+// 값이 null 인 선택 키(CLI 스키마의 "required + null")는 지운 뒤 검사한다.
+const ENVELOPE_OPTIONAL_KEYS = ["mediatorRequest", "memoryUpdates", "engineDefects"] as const;
+
+export function parseTurnEnvelope(role: EnvelopeRole, candidates: readonly unknown[], stdout: string): TurnEnvelope {
+  const message = () => `에이전트가 결과 봉투를 반환하지 않았습니다.${describeTerminalResult(candidates, stdout)}`;
+  const event = finalEvent(candidates);
+  const value = event && hasResponseBody(event) ? finalResponseValue(event) : undefined;
+  if (!isRecord(value)) throw new Error(message());
+  const response = { ...value };
+  for (const key of ENVELOPE_OPTIONAL_KEYS) if (response[key] === null) delete response[key];
+  const issues = envelopeIssues(role, response);
+  if (issues.length === 0) return turnEnvelopeSchema(role).parse(response);
+  throw new UnverifiedAgentResult(response, `${message()} 계약 위반: ${issues.join("; ")}`);
 }
 
 // 두 CLI 모두 실패 사유를 stderr가 아니라 stdout에 쓴다 — codex는 스키마 400을, claude는 사용량·API

@@ -7,8 +7,7 @@ import type {
   WorkflowState,
 } from "../shared/contracts.js";
 import type { TurnJob } from "../shared/roles.js";
-import type { TimelineDelivery } from "../shared/planningControl.js";
-import type { SessionBinding } from "./turnRouting.js";
+import type { TurnEnvelope } from "../shared/turnContract.js";
 
 export type ParticipantRole = Extract<AgentRole, "claude" | "codex">;
 
@@ -78,17 +77,11 @@ export interface SessionTurn {
   // 엔진이 이 턴에 명시한 역할·작업(엔진 개편 E2a). 어댑터는 job 과 턴 형태로 역할 정책(adapters/turnPolicy.ts)을 계산해 자기 CLI 인자로 변환한다.
   // implementation·protocolOnly 는 job 에서 유도한 값이 함께 실린다(래퍼가 읽는다). job 이 없으면 어댑터가 공급자·플래그로 유도한다(호환 경계).
   job?: TurnJob;
-  // 이 턴의 경로 바인딩(엔진 개편 E2b) — 세션을 소유하는 공급자·참여자와 선택 근거. 계획 제어 래퍼가 체크포인트의 세션·응답이 이 바인딩의 것인지
-  // 대조한다(다른 참여자의 대화를 이어 쓰지 않게). 어댑터는 읽지 않는다.
-  binding?: SessionBinding;
-  // Bounded planning is tool-free but still receives mandatory project instructions.
-  planningControl?: { admissionId: string; maxPromptBytes: number; image?: { path: string; bytes: number };
-    instructionsInSession?: boolean; instructionsProvided?: boolean };
   // 코드 리뷰 원장 ID(E3-4c) — 실행기가 경로(TurnRoute.reviewLedger)에서 옮겨 싣는다. 예산 래퍼(BudgetController)가 리뷰 좌석의 읽기·최종 판정 호출을
   // 호출마다 새 ID 대신 이 ID 로 예약하고, 원장의 첫 spawn 뒤에는 spawn 전 실패에도 예약을 되돌리지 않는다. 어댑터는 읽지 않는다.
   reviewLedger?: string;
   // 메모리 본문 1회 주입(E3-4c host-review 39d21df9 F004) — 실행기가 "프로토콜 턴이 만들어 메모리 본문을 아직 받지 않은 세션"의 일반 resume 턴에만 싣는다.
-  // 어댑터는 이 resume 에 새 세션처럼 본문을 싣고(매니페스트는 중복하지 않는다) 프로토콜·계획 제어 턴이면 무시한다. 없으면 종전(생성 턴에만 본문, resume 은
+  // 어댑터는 이 resume 에 새 세션처럼 본문을 싣고(매니페스트는 중복하지 않는다) 프로토콜 턴이면 무시한다. 없으면 종전(생성 턴에만 본문, resume 은
   // 매니페스트) — 모든 resume 재주입은 하지 않는다(2026-08-30 턴당 ~20K자 중복 과금 실측).
   memoryBodies?: boolean;
   // Host-managed product evidence disables direct web reads; Figma implementation access is a separate opt-in.
@@ -107,11 +100,6 @@ export interface SessionTurn {
   // prompt 가 sessionId 세션이 이미 받은 내용 위의 변경분일 때만 둔다 — 과제를 다른 세션(교체·새 세션)에 전달하는 쪽은 prompt 대신 이
   // 전체 문맥 판을 쓴다. 변경분은 계산한 세션에서만 유효하다(host-review a7a9ce86 F-001).
   freshSessionPrompt?: string;
-  // Host-owned shared contracts, read once per content version and session by guarded planning.
-  planningDocuments?: readonly { selector: string; content: string }[];
-  // 타임라인 참조 descriptor(E3-2-2a) — prompt·freshSessionPrompt 두 판이 실은 버전 고정 참조의 정본. 엔진이 계획 제어·세션 유지 턴에만 넘기고,
-  // 계획 제어 래퍼는 이것으로만 읽을 문서를 싣는다(프롬프트 문자열을 해석하지 않는다). 과제 문자열을 바꾸는 쪽은 짝을 맞춰 바꿔야 한다.
-  timelineDelivery?: TimelineDelivery;
   cwd: string;
   signal?: AbortSignal;
   // spawn 직전 실행 허용 검사(CommandSpec.beforeSpawn/admitSync 로 그대로 전달). 어댑터의 내부 재시도·슬롯 대기·세션 폴백도 매번 부른다.
@@ -120,12 +108,9 @@ export interface SessionTurn {
   implementation?: boolean;
   // Host-only authority for a registered, completed-topic engine follow-up.
   engineDefectFix?: boolean;
-  // 서버가 지정하는 계획 작성 호출의 종류. 재작성 횟수 집계에 사용한다.
-  planningWrite?: import("../shared/revisions.js").RewriteKind;
   // 프로토콜 확인 전용 턴. 저장소를 읽거나 명령을 실행할 필요가 없는데 도구를 열어 두면 에이전트가
   // 스스로 파일 해시를 계산하는 등 탐색을 시작해 출력 토큰만 쓴다(2026-08-29 ACK 턴 실측: output 19,975).
   protocolOnly?: boolean;
-  evidenceAssessment?: boolean;
   // plan 권한 모드로 돌릴지. 쓰기 차단은 이미 두 층이 독립으로 담당한다 — --tools에서 Edit/Write를 빼고,
   // sandbox가 계획 턴에 denyWrite:[workspace]로 Edit·Write·Bash 세 경로를 모두 막는다. 그래서 plan 모드는
   // 세 번째 중복 방벽이고, 얹히는 "탐색 후 승인 요청" 지침은 비대화형(-p) 개정 턴의 계약과 어긋난다.
@@ -154,6 +139,9 @@ export interface SessionTurn {
   // 세션 id 가 만들어진 즉시(프로세스 실행 전) 알린다 — 턴이 429·stop 으로 끊겨도 resume 할 수 있게 저장하기 위함(2026-09-03 실측).
   // allocated is a new ID reserved before spawn; confirmed identifies the current spawned execution.
   onSessionCreated?: (sessionId: string, phase?: "allocated" | "confirmed") => void;
+  // 결과 봉투 수신(cd2876b7 F008) — 운영 사슬 가장 안쪽 래퍼(guardRunnerControl)가 안쪽 봉투를 받은 직후, 자기 검사·바깥 후처리보다 먼저 한 번 알린다.
+  // 돌려주는 값은 엔진이 수신 슬롯에 실제로 잡았는가(captured)다. 던지지 않는다 — 알림이 정상 봉투를 실패로 바꾸지 않는다.
+  onEnvelopeReceived?: (received: { sessionId: string; envelope: TurnEnvelope }) => boolean;
   // 공급자가 보고한 원시 사용량 객체(E2e-2, Codex turn.completed.usage) — 기록 전용, 합산·보정하지 않는다.
   onProviderUsage?: (usage: Record<string, unknown>) => void;
   // 이 턴에서 추가로 읽기를 허용할 경로(예: 주제 디렉터리의 plan.md). 이어지는 턴이 계획 본문을 다시 받지 않는 대신
@@ -167,6 +155,8 @@ export interface SessionTurn {
   sessionHome?: string;
   // 승인 경로만 쓰기(엔진 개편 E2e-3, turnPolicy.ts writeScopeProblem) — 쓰기 턴의 쓰기 범위를 작업 폴더 안의 이 절대 경로들로 좁힌다. 엔진은 쓰지 않는다.
   writablePaths?: readonly string[];
+  // 계획 작성 턴의 계획 묶음 폴더(D4) — planner 는 이 폴더 안만 쓸 수 있다. 경로 검증과 공급자별 쓰기 권한 변환은 어댑터(turnPolicy)가 한다.
+  planDirectory?: string;
 }
 
 // 소비처가 정한 결과 JSON Schema(엔진 개편 E2e) — 공급자 CLI 의 구조화 출력 제약으로 넘긴다. 의미 검증은 소비처가 한다.
@@ -231,6 +221,12 @@ export interface CreatedSession {
   result: AgentResult;
 }
 
+// 결과 봉투 턴의 새 세션(CR 흐름 단순화 D3, 계약 v3.7 (12)).
+export interface CreatedEnvelopeSession {
+  sessionId: string;
+  envelope: TurnEnvelope;
+}
+
 export interface AgentAdapter {
   readonly role: ParticipantRole;
   createSession(turn: Omit<SessionTurn, "sessionId">): Promise<CreatedSession>;
@@ -239,12 +235,25 @@ export interface AgentAdapter {
   // 소비처 schema 의 결과(엔진 개편 E2e) — 마지막 구조화 응답을 JSON 객체로 돌려준다. 지원하지 않는 어댑터는 두지 않는다(호출 전 거부).
   createStructuredSession?(turn: Omit<SessionTurn, "sessionId">, schema: OutputSchema): Promise<{ sessionId: string; value: Record<string, unknown> }>;
   resumeStructuredTurn?(turn: SessionTurn, schema: OutputSchema): Promise<Record<string, unknown>>;
+  // 결과 봉투 턴(계약 v3.7 (12)) — 봉투 여부는 부른 메서드가 정하고 역할은 envelopeRole(turn.job) 이 정한다. 기존 createSession·resumeTurn 은 그대로다.
+  // 운영 사슬의 래퍼는 이 두 메서드를 늘 정의하고 다음 층의 같은 메서드로 넘긴다(nextEnvelopeMethod).
+  createEnvelopeSession?(turn: Omit<SessionTurn, "sessionId">): Promise<CreatedEnvelopeSession>;
+  resumeEnvelopeTurn?(turn: SessionTurn): Promise<TurnEnvelope>;
   // 호스트 소유 세션 홈의 native 세션 기록 확인(E2e-2) — 읽기만 한다. 공급자 프로세스를 띄우지 않고 홈에 쓰지 않는다.
   inspectSession?(sessionHome: string, cwd: string, sessionId: string): Promise<{ exists: boolean; reason: string }>;
   // 자동 복구용 부재 확인: 전 범위를 확인해 없을 때만 true, 존재하면 false. 조회 실패·불완전 탐색은 throw한다.
   // 지원하지 않는 제공자는 생략한다. 연결 검증(validateExistingSession)의 false로 대체하면 안 된다.
   isSessionMissing?(sessionId: string): Promise<boolean>;
   validateExistingSession(sessionId: string): Promise<boolean>;
+}
+
+type EnvelopeMethod = "createEnvelopeSession" | "resumeEnvelopeTurn";
+// 래퍼가 봉투 턴을 넘길 다음 층의 메서드 — 없으면 명시 오류로 멈춘다. createSession·resumeTurn 으로 돌아가거나 층을 건너뛰지 않는다(계약 v3.7 (12)).
+// 래퍼는 예산 예약·입력 변환 같은 자기 동작 전에 이 함수로 다음 층을 확인한다.
+export function nextEnvelopeMethod<M extends EnvelopeMethod>(adapter: AgentAdapter, method: M): NonNullable<AgentAdapter[M]> {
+  const next = adapter[method];
+  if (!next) throw new Error(`${adapter.role} 어댑터 사슬의 다음 층에 ${method} 가 없어 결과 봉투 턴을 열지 않습니다.`);
+  return next.bind(adapter) as NonNullable<AgentAdapter[M]>;
 }
 
 export interface StoredArtifact {

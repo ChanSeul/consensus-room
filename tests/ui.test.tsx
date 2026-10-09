@@ -60,7 +60,9 @@ describe("방 화면의 비동기 결과", () => {
     const controls = screen.getByRole("region", { name: "작업 실행" });
     expect(overview.closest(".inspector-scroll")?.firstElementChild).toBe(overview);
     expect(controls.closest(".chat-pane")).not.toBeNull();
-    expect(screen.getByText("검토 쟁점").closest("details")?.nextElementSibling).toBeNull();
+    // 계획 섹션이 마지막이다 — 옛 결과의 쟁점 판정 패널(검토 쟁점)은 없다.
+    expect(document.querySelector(".plan-section")?.nextElementSibling).toBeNull();
+    expect(screen.queryByText("검토 쟁점")).not.toBeInTheDocument();
     for (const label of ["범위 지정 커밋", "푸시 승인", "주제 닫기", "빌드 트리 정리"])
       expect(screen.queryByRole("button", { name: label })).not.toBeInTheDocument();
   });
@@ -82,7 +84,7 @@ describe("방 화면의 비동기 결과", () => {
     fireEvent.click(await screen.findByRole("tab", { name: "대화창" }));
     await screen.findByText("첫 기록");
     await waitFor(() => expect(eventSources).toHaveLength(1));
-    fireEvent.click(screen.getByRole("button", { name: "합의 시작" }));
+    fireEvent.click(screen.getByRole("button", { name: "계획 시작" }));
     await waitFor(() => expect(api.getTopic).toHaveBeenCalledTimes(2));
 
     eventSources[0].emit(second);
@@ -90,6 +92,54 @@ describe("방 화면의 비동기 결과", () => {
     staleRefresh.resolve(makeDetail(topic, [first]));
 
     await waitFor(() => expect(screen.getByText("SSE로 먼저 도착한 기록")).toBeInTheDocument());
+  });
+});
+
+// CR 흐름 단순화 — 화면이 새 흐름을 막지 않는다. ticket 은 계획 없이 구현으로 시작하고, planned 승인은 에이전트 ACK 없이 사용자가 지금 판에 한다.
+describe("작업 방식별 시작·승인·재개", () => {
+  it("ticket 토픽은 좌석 없이 구현 시작을 보내고, planned 토픽은 좌석이 없으면 계획 시작을 막는다", async () => {
+    const ticket: Topic = { ...makeTopic(), workflowMode: "ticket" };
+    vi.spyOn(api, "listTopics").mockResolvedValue([ticket]);
+    vi.spyOn(api, "getTopic").mockResolvedValue(makeDetail(ticket));
+    const run = vi.spyOn(api, "runAction").mockResolvedValue({ accepted: true, actionId: "implement", topic: ticket });
+    const view = render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "구현 시작" }));
+    await waitFor(() => expect(run).toHaveBeenCalledWith(ticket.id, "implement", undefined));
+    expect(screen.queryByRole("button", { name: "계획 시작" })).not.toBeInTheDocument();
+    view.unmount();
+
+    const planned = makeTopic();
+    vi.mocked(api.listTopics).mockResolvedValue([planned]);
+    vi.mocked(api.getTopic).mockResolvedValue(makeDetail(planned));
+    render(<App />);
+    expect(await screen.findByRole("button", { name: "계획 시작" })).toBeDisabled();
+  });
+
+  it("승인 대기의 지금 판은 에이전트 ACK 없이 승인할 수 있다", async () => {
+    const plan = "d".repeat(64);
+    const topic: Topic = { ...makeTopic(), state: "AWAITING_USER_APPROVAL", planRevision: 2, planSHA256: plan,
+      participants: (["claude", "codex"] as const).map(role => ({ role, sessionId: `${role}-session`, mode: "attached" as const, acknowledgedPlanSHA256: null })) };
+    vi.spyOn(api, "listTopics").mockResolvedValue([topic]);
+    vi.spyOn(api, "getTopic").mockResolvedValue({ ...makeDetail(topic), currentPlan: "# 계획\n" });
+    const run = vi.spyOn(api, "runAction").mockResolvedValue({ accepted: true, actionId: "approve", topic });
+    render(<App />);
+    expect(await screen.findByText("리뷰어가 이 판에 동의했습니다.")).toBeInTheDocument();
+    expect(screen.queryByText("같은 계획 확인")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "이 계획 승인", hidden: true }));
+    await waitFor(() => expect(run).toHaveBeenCalledWith(topic.id, "approve", { planSHA256: plan }));
+  });
+
+  it("멈춘 토픽의 다시 시도는 결정문 없는 resume 을 보낸다", async () => {
+    const topic: Topic = { ...makeTopic(), state: "FAILED" };
+    vi.spyOn(api, "listTopics").mockResolvedValue([topic]);
+    vi.spyOn(api, "getTopic").mockResolvedValue(makeDetail(topic));
+    vi.mocked(api.getActivity).mockResolvedValue({ state: "FAILED", runningAction: false, lastChangeAt: null, lastChangedPath: null,
+      scanned: 0, truncated: false, autoRetryAt: null, checkedAt: "now" });
+    const run = vi.spyOn(api, "runAction").mockResolvedValue({ accepted: true, actionId: "resume", topic });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "다시 시도" }));
+    await waitFor(() => expect(run).toHaveBeenCalledWith(topic.id, "resume", undefined));
+    expect(run).not.toHaveBeenCalledWith(topic.id, "retry", expect.anything());
   });
 });
 
@@ -399,6 +449,7 @@ function makeTopic(): Topic {
     predecessorTopicId: null,
     branchName: null,
     state: "DRAFT",
+    workflowMode: "planned",
     scopeGeneration: 1,
     planEpoch: 1,
     planRevision: 0,
@@ -483,9 +534,9 @@ it("예산 증액의 늦은 응답은 다른 토픽의 예산을 덮지 않는�
 it("추가 승인 뒤 예산이 부족하면 안내를 표시하고 토픽 전환 시 지운다",async()=>{
  const a={...makeTopic(),state:"USER_DECISION_REQUIRED" as const},b={...makeTopic(),id:"notice-b",title:"다른 승인 토픽",state:"USER_DECISION_REQUIRED" as const};
  vi.spyOn(api,"listTopics").mockResolvedValue([a,b]);vi.spyOn(api,"getTopic").mockImplementation(async id=>makeDetail(id===a.id?a:b));
- vi.mocked(api.getActivity).mockResolvedValue({state:"USER_DECISION_REQUIRED",runningAction:false,lastChangeAt:null,lastChangedPath:null,scanned:0,truncated:false,autoRetryAt:null,checkedAt:"now",revisionPaused:true,revisionAllowance:{topicId:a.id,used:3,limit:3,version:1,firstPlanUsed:true,historyIncomplete:false,startedAt:"now"}});
+ vi.mocked(api.getActivity).mockResolvedValue({state:"USER_DECISION_REQUIRED",runningAction:false,lastChangeAt:null,lastChangedPath:null,scanned:0,truncated:false,autoRetryAt:null,checkedAt:"now",reviewPaused:"planning",reviewAllowances:[{topicId:a.id,scope:"planning",used:3,limit:3,version:1,historyIncomplete:false}]});
  vi.spyOn(api,"runAction").mockResolvedValue({accepted:true,actionId:"grant",topic:a,resumeBlocked:"승인은 저장했습니다. 재개하려면 예산을 추가하세요."} as any);
- render(<App/>);fireEvent.click(await screen.findByRole("button",{name:"재작성 1회 추가 승인 후 재개"}));
+ render(<App/>);fireEvent.click(await screen.findByRole("button",{name:"계획 검토 1회 추가 승인 후 재개"}));
  expect(await screen.findByText("승인은 저장했습니다. 재개하려면 예산을 추가하세요.")).toBeInTheDocument();
  fireEvent.click(screen.getByRole("button",{name:/다른 승인 토픽/}));
  await waitFor(()=>expect(screen.queryByText("승인은 저장했습니다. 재개하려면 예산을 추가하세요.")).not.toBeInTheDocument());
@@ -515,7 +566,7 @@ it("discovers mediator-created roots and child progress while the selected root 
   } finally {view.unmount();vi.useRealTimers();}
 });
 
-it.each(["DRAFT", "BLOCKED_ON_EVIDENCE"] as const)("shows and cancels evidence resume in %s", async state => {
+it.each(["DRAFT"] as const)("shows and cancels evidence resume in %s", async state => {
   const topic = { ...makeTopic(), state };
   vi.spyOn(api, "listTopics").mockResolvedValue([topic]);
   vi.spyOn(api, "getTopic").mockResolvedValue(makeDetail(topic));
@@ -544,7 +595,7 @@ it("shows a queued continuation and permits stopping it before a model runs", as
     return { accepted: true, actionId: "stop", topic };
   });
   render(<App />);
-  expect(await screen.findByText("자동 진행: 근거 검토")).toBeInTheDocument();
+  expect(await screen.findByText("자동 진행: 근거 범위 승인 대기")).toBeInTheDocument();
   fireEvent.click(await screen.findByRole("button", { name: "자동 진행 중지" }));
   await waitFor(() => expect(stop).toHaveBeenCalledWith(topic.id, "stop", undefined));
   await waitFor(() => expect(screen.queryByRole("button", { name: "자동 진행 중지" })).not.toBeInTheDocument());

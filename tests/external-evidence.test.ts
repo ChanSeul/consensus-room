@@ -3,18 +3,18 @@ import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { assertFindingCoverage } from "../src/shared/workflow";
 import { evidenceHash, stableJSON } from "../src/server/evidence/store";
 import { ConsensusDatabase } from "../src/server/database";
 import { EVIDENCE_PAGE_BYTES, parseEvidenceSource, type EvidenceRange, type EvidenceSourceInput, type EvidenceUnitInput,
   type MediatorEvidenceBatch } from "../src/shared/externalEvidence";
+import Fastify from "fastify";
 import { EvidenceService, withEvidence } from "../src/server/evidence/service";
-import { RestEvidenceConnector, evidenceCredentials } from "../src/server/evidence/connectors";
+import { registerEvidenceRoutes } from "../src/server/evidence/routes";
+import { EvidenceFetchError, RestEvidenceConnector, evidenceCredentials } from "../src/server/evidence/connectors";
 import { NativeEvidenceConnector } from "../src/server/evidence/nativeConnector";
 import type { AppReader } from "../src/server/evidence/nativeReader";
 import type { AgentAdapter } from "../src/server/types";
-import { accumulate } from "../src/server/engine/checkpoint";
-import type { AgentResult } from "../src/shared/contracts";
+import type { TurnEnvelope, WorkerFact } from "../src/shared/turnContract";
 
 // Public contracts: source ingestion -> topic freshness/gates, packet -> actual adapter prompt,
 // and provider HTTP -> complete snapshots. Fake boundaries model pagination, edits, failure and late replies.
@@ -25,7 +25,7 @@ const sourceInput: EvidenceSourceInput = { url: "https://team.slack.com/archives
 function setup() {
   const root = mkdtempSync(join(tmpdir(), "evidence-")); roots.push(root);
   const db = new ConsensusDatabase(join(root, "room.sqlite")); databases.push(db);
-  const topic = db.createTopic({ id: "topic", slug: "topic", title: "Evidence", repositoryPath: root, worktreePath: root, baseRef: "main", branchName: null,
+  const topic = db.createTopic({ workflowMode: "planned", id: "topic", slug: "topic", title: "Evidence", repositoryPath: root, worktreePath: root, baseRef: "main", branchName: null,
     state: "AWAITING_USER_APPROVAL", scopeGeneration: 1, planRevision: 1, planSHA256: "a".repeat(64), approvedPlanSHA256: "a".repeat(64),
     createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), lastError: null });
   const source = db.evidence.register(topic.id, sourceInput);
@@ -108,18 +108,17 @@ describe("source identity and persistent content cache", () => {
     expect(db.evidence.get(source.id).error).toBe("Access denied");
     expect(db.evidence.begin(source.id, true)).toBeNull();
   });
-  it("binds review to current content AND plan/scope, failures never mark old content fresh", () => {
+  // ready·assertReady 는 root 원문 승인만 본다(CR 흐름 단순화 D6) — 내용 변경·계획 변경도 막지 않는다.
+  it("assertReady needs only root approval — content changes and plan changes do not gate; failures never mark old content fresh", () => {
     const { db, topic, source, ingest } = setup(); const first = ingest([unit("1", "A")]);
     const deps = [{ sourceId: source.id, contentHash: first.contentHash! }];
     expect(db.evidence.status(deps)).toBe("current");
-    expect(() => db.evidence.assertReady(topic)).toThrow("검토");
-    db.evidence.review(topic, db.evidence.topic(topic).digest, "확정 내용과 계획 대조", topic); db.evidence.assertReady(topic);
-    expect(() => db.evidence.assertReady({ ...topic, planEpoch: topic.planEpoch + 1 })).toThrow("검토");
+    expect(() => db.evidence.assertReady(topic)).not.toThrow();
+    expect(() => db.evidence.assertReady({ ...topic, planEpoch: topic.planEpoch + 1 })).not.toThrow();
     ingest([unit("1", "B")]); expect(db.evidence.status(deps)).toBe("changed");
-    expect(() => db.evidence.assertReady(topic)).toThrow("검토");
+    expect(() => db.evidence.assertReady(topic)).not.toThrow();
     const check = db.evidence.begin(source.id, true)!; db.evidence.failed(source.id, check.checkId, "429");
     expect(db.evidence.status(deps)).toBe("unavailable");
-    db.evidence.review(topic, db.evidence.topic(topic).digest, "접근 불가 원문과 의존 작업은 To-do로 제외", topic);
     expect(db.evidence.topic(topic).deferred).toEqual([expect.objectContaining({ sourceId: source.id })]);
     expect(db.evidence.usableSources(topic)).toEqual([]);
     expect(db.evidence.status(deps)).toBe("unavailable");
@@ -161,6 +160,27 @@ describe("delivery to real adapter boundary", () => {
     ingest([unit("1", "B")]); await adapter.resumeTurn(turn);
     expect(prompts[3]).toContain('"content":"B"'); expect(prompts[3]).toContain("removedUnitId");
     expect(db.evidence.packet(topic, "claude", "new-session").text).toContain('"content":"B"');
+  });
+  // 결과 봉투 턴도 같은 근거 입력·영수증을 받는다. message 는 원문 그대로 돌아오고(관측 참조를 덧붙이지 않는다), 다음 층에 메서드가 없으면 근거를 싣기 전에 명시 오류다.
+  it("passes envelope turns through the same evidence delivery and returns the envelope unchanged", async () => {
+    const { db, root, topic, ingest } = setup(); ingest([unit("1", "A")]);
+    const prompts: string[] = []; let fail = true;
+    const envelope: TurnEnvelope = { message: "## 리뷰\n\n고칠 점 없음\n", outcome: "approve" };
+    const raw: AgentAdapter = { role: "codex", validateExistingSession: async () => true,
+      createSession: async () => { throw new Error("createSession 으로 돌아가면 안 된다"); }, resumeTurn: async () => { throw new Error("resumeTurn 으로 돌아가면 안 된다"); },
+      createEnvelopeSession: async turn => { prompts.push(turn.prompt); expect(turn.evidenceManaged).toBe(true); return { sessionId: "review", envelope }; },
+      resumeEnvelopeTurn: async turn => { prompts.push(turn.prompt); if (fail) throw new Error("failure"); return envelope; } };
+    const adapter = withEvidence(raw, db, join(root, "images"));
+    const job = { role: "reviewer", operation: "review" } as const;
+    await expect(adapter.resumeEnvelopeTurn!({ sessionId: "review", cwd: root, prompt: "Review", job })).rejects.toThrow("failure"); fail = false;
+    expect(await adapter.resumeEnvelopeTurn!({ sessionId: "review", cwd: root, prompt: "Review", job })).toEqual(envelope);
+    expect(await adapter.resumeEnvelopeTurn!({ sessionId: "review", cwd: root, prompt: "Review", job })).toEqual(envelope);
+    expect(prompts[0]).toContain('"content":"A"'); expect(prompts[1]).toContain('"content":"A"'); expect(prompts[2]).not.toContain('"content":"A"');
+    expect(await adapter.createEnvelopeSession!({ cwd: root, prompt: "Review", job })).toEqual({ sessionId: "review", envelope });
+    expect(db.evidence.packet(topic, "codex", "review").text).not.toContain('"content":"A"');
+    const bare = withEvidence({ ...raw, createEnvelopeSession: undefined, resumeEnvelopeTurn: undefined }, db, join(root, "images"));
+    await expect(bare.createEnvelopeSession!({ cwd: root, prompt: "Review", job })).rejects.toThrow("다음 층에 createEnvelopeSession 가 없어");
+    await expect(bare.resumeEnvelopeTurn!({ sessionId: "s", cwd: root, prompt: "Review", job })).rejects.toThrow("다음 층에 resumeEnvelopeTurn 가 없어");
   });
   it("does not acknowledge a cancelled late model response", async () => {
     const { db, root, topic, ingest } = setup(); ingest([unit("1", "A")]);
@@ -236,6 +256,76 @@ describe("read-only provider collection", () => {
     const connector = new RestEvidenceConnector({ figmaToken: "secret" }, request as typeof fetch);
     const result = await connector.fetch({ ...source, revision: "v1" }, { sourceId: source.id, contentHash: "h", units: [{ id: "node:1:2", kind: "design", content: "old node", contentHash: "h" }] }, new AbortController().signal);
     expect(urls).toHaveLength(2); expect(result.units?.some(u => u.content.includes("New policy"))).toBe(true);
+  });
+  // 원문 사실 출구(계약 v3.13 (21)) — 내용 변경은 source-change, 조회 오류는 새로 생기거나 바뀔 때만 source-error.
+  it("facts carries source changes and new or changed lookup errors once each", async () => {
+    const { db, topic } = setup(); const source = db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc/Name?node-id=1-2", mode: "rest" });
+    let next: () => Promise<{ revision: string; units: EvidenceUnitInput[] }> = async () => ({ revision: "v1", units: [unit("1", "A")] });
+    const facts: WorkerFact[] = [];
+    const service = new EvidenceService(db.evidence, { fetch: () => next() }, undefined, undefined, fact => facts.push(fact));
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const later = async () => { vi.setSystemTime(Date.now() + 3_600_000); await service.refresh(source.id, true); };
+    try {
+      await service.refresh(source.id, true);
+      const first = db.evidence.get(source.id).contentHash;
+      next = async () => { throw new EvidenceFetchError("403 denied"); };
+      await later(); await later();
+      next = async () => { throw new EvidenceFetchError("429 limited"); };
+      await later();
+      next = async () => ({ revision: "v2", units: [unit("1", "B")] });
+      await later();
+      expect(facts).toEqual([
+        { kind: "source-change", sourceId: source.id, before: null, after: { revision: "v1", contentHash: first } },
+        { kind: "source-error", sourceId: source.id, error: "403 denied" },
+        { kind: "source-error", sourceId: source.id, error: "429 limited" },
+        { kind: "source-change", sourceId: source.id, before: { revision: "v1", contentHash: first }, after: { revision: "v2", contentHash: db.evidence.get(source.id).contentHash } },
+      ]);
+    } finally { vi.useRealTimers(); await service.stop(); }
+  });
+  // 커넥터가 보고한 조회 실패(/api/evidence/:id/failure → service.failed)도 같은 출구로 나간다. 사실에는 저장소가 정제·절단해 기록한 오류를 싣고,
+  // 기록(오류·다음 확인 시각)은 저장소의 failed 를 직접 부를 때와 같다.
+  it("a connector-reported lookup failure carries the recorded error once, again only when it changes, and records like the store", async () => {
+    const { db, topic, source } = setup();
+    const other = db.evidence.register(topic.id, { ...sourceInput, url: "https://team.slack.com/archives/C999/p1789709010013729" });
+    const facts: WorkerFact[] = [];
+    const service = new EvidenceService(db.evidence, { fetch: async () => { throw new Error("must not fetch"); } }, undefined, undefined, fact => facts.push(fact));
+    const check = (id: string) => db.evidence.begin(id, true)!.checkId;
+    // 오류가 남은 원문은 강제 확인도 다음 확인 시각 전에는 열리지 않는다 — 다음 보고는 그 시각 뒤에 한다.
+    const later = (id: string) => { vi.setSystemTime(Date.now() + 3_600_000); return check(id); };
+    const error = `401 Bearer abcdefghijklmnop ${"not found. ".repeat(60)}`;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const first = check(source.id), second = check(other.id);
+      service.failed(source.id, first, error, 900);
+      db.evidence.failed(other.id, second, error, 900);
+      const recorded = db.evidence.get(source.id);
+      expect(recorded.error).not.toContain("abcdefghijklmnop");
+      expect(recorded.error!.length).toBeLessThanOrEqual(500);
+      expect({ error: recorded.error, nextCheckAt: recorded.nextCheckAt }).toEqual({ error: db.evidence.get(other.id).error, nextCheckAt: db.evidence.get(other.id).nextCheckAt });
+      service.failed(source.id, later(source.id), error);
+      service.failed(source.id, later(source.id), "403 denied");
+      expect(facts).toEqual([
+        { kind: "source-error", sourceId: source.id, error: recorded.error },
+        { kind: "source-error", sourceId: source.id, error: "403 denied" },
+      ]);
+    } finally { vi.useRealTimers(); await service.stop(); }
+  });
+  // 커넥터 bridge 의 공식 경로(check → failure)가 서비스 출구를 지난다 — 라우트가 저장소를 직접 부르면 사실이 빠진다.
+  it("the connector bridge routes check then failure through the service, so the failure becomes a source-error fact", async () => {
+    const { db, source } = setup();
+    const facts: WorkerFact[] = [];
+    const service = new EvidenceService(db.evidence, { fetch: async () => { throw new Error("must not fetch"); } }, undefined, undefined, fact => facts.push(fact));
+    const app = Fastify();
+    registerEvidenceRoutes(app, db, {} as never, service, () => {});
+    try {
+      const check = await app.inject({ method: "POST", url: `/api/evidence/${source.id}/check`, payload: {} });
+      expect(check.statusCode).toBe(200);
+      const checkId = check.json().checkId as string;
+      const failure = await app.inject({ method: "POST", url: `/api/evidence/${source.id}/failure`, payload: { checkId, error: "bridge lookup failed" } });
+      expect(failure.json()).toEqual({ ok: true });
+      expect(db.evidence.get(source.id).error).toBe("bridge lookup failed");
+      expect(facts).toEqual([{ kind: "source-error", sourceId: source.id, error: "bridge lookup failed" }]);
+    } finally { await app.close(); await service.stop(); }
   });
   it("single-flights polling", async () => {
     const { db, topic } = setup(); const source = db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc/Name?node-id=1-2", mode: "rest" });
@@ -326,14 +416,16 @@ it("preserves cache on REST conversion, rejects a live collection lease, and req
   expect(() => db.evidence.useRest(source.id)).toThrow("수집 중");
   db.evidence.unchanged(source.id, lease.checkId, hash!, "r1");
   expect(db.evidence.useRest(source.id)).toMatchObject({ mode: "rest", contentHash: hash, checkedAt: null, nextCheckAt: 0 });
-  expect(() => db.evidence.mediatorBatch(topic, "s")).toThrow("원문 확인");
+  // 재확인이 필요한 원문이 있어도 중재자 근거 읽기를 막지 않는다 — 원문 버전·확인 시각을 실어 중재자가 판단한다(D6).
+  expect(db.evidence.topic(topic).deferred).toEqual([expect.objectContaining({ sourceId: source.id })]);
+  expect(db.evidence.mediatorBatch(topic, "s").sources).toEqual([expect.objectContaining({ id: source.id, contentHash: hash, checkedAt: null })]);
 });
 
 it("waits for a shared pending REST fetch, returns only changed PNG paths, and never calls a model", async () => {
   const { db, root, topic, source } = setup(); db.evidence.useRest(source.id);
   let finish!: (value: any) => void;
   const fetch = vi.fn(() => new Promise<any>(resolve => { finish = resolve; }));
-  const service = new EvidenceService(db.evidence, { fetch }, undefined, join(root, "images"));
+  const service = new EvidenceService(db.evidence, { fetch }, join(root, "images"));
   const first = service.prepareMediator(db, topic.id, "s");
   const second = service.prepareMediator(db, topic.id, "s");
   expect(fetch).toHaveBeenCalledTimes(1);
@@ -404,7 +496,7 @@ it("rebuilds connector Figma trees on REST conversion without dropping child com
     if (value.includes("/images/")) return Response.json({ images: { "1:2": "https://assets.figma.com/design.png" } });
     return new Response(Buffer.from(png, "base64"));
   });
-  const service = new EvidenceService(db.evidence, new RestEvidenceConnector({ figmaToken: "secret" }, request as typeof fetch), undefined, join(root, "images"));
+  const service = new EvidenceService(db.evidence, new RestEvidenceConnector({ figmaToken: "secret" }, request as typeof fetch), join(root, "images"));
   db.evidence.useRest(source.id);
   const next = await service.prepareMediator(db, topic.id, "s");
   expect(next.changes.map(unit => unit.id)).toContain("comment:new");
@@ -642,11 +734,11 @@ it("ignores late design callbacks after cancellation and retains unknown reads f
   expect(resumedPrompt).not.toContain("late success");
 });
 
-it("keeps design debt outside accumulated summaries while supplying current referenced gaps", async () => {
+it("keeps supplying current referenced design gaps across resumed turns", async () => {
   const { db, root, topic, ingest } = setup(); ingest([unit("1", "Behavior")]);
   db.evidence.register(topic.id, { ...sourceInput, url: "https://www.figma.com/design/abc?node-id=1-2" });
   for (let i = 0; i < 36; i++) db.evidence.designRequest(topic, { tool: "mcp__figma-desktop__get_metadata", input: { nodeId: `1:${i + 2}` } });
-  let attempt = 0, accumulated: AgentResult | null = null;
+  let attempt = 0;
   const adapter = withEvidence({ role: "claude", validateExistingSession: async () => true, createSession: async () => { throw Error("unused"); },
     resumeTurn: async turn => {
       expect(turn.prompt).toContain("unreceived");
@@ -656,9 +748,7 @@ it("keeps design debt outside accumulated summaries while supplying current refe
   for (let i = 0; i < 10; i++) {
     const next = await adapter.resumeTurn({ cwd: root, sessionId: "s", prompt: "Continue", implementation: true });
     expect(next.summary).toBe(`Progress ${i + 1}`);
-    accumulated = accumulate(accumulated, next, [], i).result;
   }
-  expect(accumulated!.summary).not.toContain("get_metadata");
   expect(db.evidence.designReadGaps(topic)).toHaveLength(36);
 });
 
@@ -727,7 +817,6 @@ it("retains explicit design failures as unverified To-do without forcing another
   }, reopened, join(root, "images"));
   const missing = await omitted.resumeTurn({ cwd: root, sessionId: "review", prompt: "Review", implementation: true });
   expect(missing.findings).toEqual([]);
-  expect(() => assertFindingCoverage([judgment], missing.findings, "review")).toThrow();
   expect(delivered.prompt).toContain("Do not automatically repeat failed reads");
   expect(delivered.prompt).not.toContain("Repeat these reads before completing");
   const failure = JSON.parse(readFileSync(delivered.readablePaths.find((path: string) => path.endsWith(".json")), "utf8"));
@@ -1019,7 +1108,7 @@ describe("E3-1 근거 쪽·구간 전달", () => {
     const { db, root, topic, source } = setup(); db.evidence.useRest(source.id);
     const first = [unit("a-big", korean), { id: "b-render", kind: "render" as const, content: "design", imageBase64: png }];
     const fetch = vi.fn(async () => ({ revision: "r1", units: first }));
-    const service = new EvidenceService(db.evidence, { fetch }, undefined, join(root, "images"));
+    const service = new EvidenceService(db.evidence, { fetch }, join(root, "images"));
     const responses = [];
     for (let round = 0; round < 60; round++) {
       const response = await service.prepareMediator(db, topic.id, "s", 30_000);
@@ -1133,7 +1222,7 @@ describe("E3-1 근거 쪽·구간 전달", () => {
   it.each(["hi", "한글", "😀😃", '"\n'])("짧은 첫 단위 %j 전체의 응답 크기를 최소 크기 안내에서 빠뜨리지 않는다", async content => {
     const { db, root, topic, source } = setup(); db.evidence.useRest(source.id);
     const fetch = vi.fn(async () => ({ revision: "r1", units: [unit("first", content), unit("second", "z".repeat(10_000))] }));
-    const service = new EvidenceService(db.evidence, { fetch }, undefined, join(root, "images"));
+    const service = new EvidenceService(db.evidence, { fetch }, join(root, "images"));
     try {
       const probe = await service.prepareMediator(db, topic.id, "probe", 2_000);
       expect(probe.changes.map(change => [change.id, change.content, change.range])).toEqual([["first", content, undefined]]);
@@ -1155,11 +1244,11 @@ describe("E3-1 근거 쪽·구간 전달", () => {
   it("재시작 뒤 이미지 경로가 길어져 대기 쪽이 요청 크기를 넘으면 그대로 돌려주지 않고 요청 크기 안의 새 쪽으로 바꾼다", async () => {
     const { db, root, topic, source } = setup(); db.evidence.useRest(source.id);
     const fetch = vi.fn(async () => ({ revision: "r1", units: [{ id: "render", kind: "render" as const, content: "design", imageBase64: png }, unit("z", "zeta")] }));
-    const before = new EvidenceService(db.evidence, { fetch }, undefined, join(root, "i"));
+    const before = new EvidenceService(db.evidence, { fetch }, join(root, "i"));
     const first = await before.prepareMediator(db, topic.id, "s");
     const size = Buffer.byteLength(JSON.stringify(first));
     await before.stop();
-    const after = new EvidenceService(db.evidence, { fetch }, undefined, join(root, "moved-data-directory-with-a-much-longer-name", "images"));
+    const after = new EvidenceService(db.evidence, { fetch }, join(root, "moved-data-directory-with-a-much-longer-name", "images"));
     const replayed = await after.prepareMediator(db, topic.id, "s", size);
     expect(Buffer.byteLength(JSON.stringify(replayed))).toBeLessThanOrEqual(size);
     expect(replayed.batchId).not.toBe(first.batchId);

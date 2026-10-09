@@ -483,7 +483,7 @@ describe("E4 전에 닫힌 단계와 결속된 열린 단계", () => {
       reviewedTreeOID: run(a.worktreePath, "rev-parse", "HEAD^{tree}") });
     // a 는 E4 전에 닫혀 결과가 동결되지 않았고, b 는 그 뒤 해시로 결속됐다(재계획 완료로 해시를 얻은 E4 전 연결과 같은 상태).
     const created = "2026-09-27T00:00:00.000Z";
-    fx.database.createTopic({ id: "topic-b", slug: "stage-b", title: "b", repositoryPath: fx.repository, baseRef: commit,
+    fx.database.createTopic({ workflowMode: "planned", id: "topic-b", slug: "stage-b", title: "b", repositoryPath: fx.repository, baseRef: commit,
       worktreePath: join(fx.root, "stage-b"), branchName: null, state: "USER_DECISION_REQUIRED", scopeGeneration: 1, planRevision: 0,
       planSHA256: null, approvedPlanSHA256: null, createdAt: created, updatedAt: created, lastError: null });
     fx.database.workGroups.link(group.id, "b", "topic-b", commit, { selected: true });
@@ -548,7 +548,7 @@ describe("선행 결과 해석(resolvePriorResults)", () => {
     const { fx, group, commit, tree } = await legacyClosed(true);
     const created = "2026-09-27T00:00:00.000Z";
     for (const [stageId, topicId] of [["b", "topic-b"], ["z", "topic-z"]] as const) {
-      fx.database.createTopic({ id: topicId, slug: `stage-${stageId}`, title: stageId, repositoryPath: fx.repository, baseRef: commit,
+      fx.database.createTopic({ workflowMode: "planned", id: topicId, slug: `stage-${stageId}`, title: stageId, repositoryPath: fx.repository, baseRef: commit,
         worktreePath: join(fx.root, `stage-${stageId}`), branchName: null, state: stageId === "b" ? "CLOSED" : "DRAFT", scopeGeneration: 1,
         planRevision: 0, planSHA256: null, approvedPlanSHA256: null, createdAt: created, updatedAt: created, lastError: null });
     }
@@ -608,8 +608,14 @@ describe("어댑터 게이트", () => {
       resumeTurn: async (turn) => { seen.push(turn); return { kind: "AUDIT", summary: "", findings: [], evidenceRefs: [] }; },
     };
     const revise = () => groups.applyRevision("g",
-      groups.previewRevision("g", { ...input, contracts: "바뀐 공통 계약" }, groups.get("g").version, (topicId) => topicId === "ta"), { b: 1 });
-    return { db, groups, hooks, seen, revise, wrapped: wrapWorkGroupAdapter(inner, database, git) };
+      groups.previewRevision("g", { ...input, contracts: "바뀐 공통 계약" }, groups.get("g").version, (topicId) => topicId === "ta"));
+    // 단계 문맥 결속을 깨는 기록 — 연결·재결속 때 기록한 해시가 지금 문맥과 다르다.
+    const breakBinding = () => {
+      const record = groups.get("g");
+      record.links.b.contextDigest = "stale";
+      db.prepare("UPDATE work_groups SET record_json=? WHERE id=?").run(JSON.stringify(record), "g");
+    };
+    return { db, groups, hooks, seen, revise, breakBinding, wrapped: wrapWorkGroupAdapter(inner, database, git) };
   }
 
   it("선행 결과를 확인한 뒤 저장소 단계 문맥을 두 판(이어 쓰는 판·새 세션 판)에 똑같이 붙이고, 새 세션 판이 없으면 만들지 않는다", async () => {
@@ -697,13 +703,13 @@ describe("어댑터 게이트", () => {
     db.close();
   });
 
-  it("재계획 대기 단계는 턴을 시작하지 않는다", async () => {
-    const { db, hooks, seen, revise, wrapped } = gate();
+  // 개정은 영향 단계를 새 문맥으로 다시 묶는다 — 다음 턴을 막지 않고 머리말이 개정된 문맥이다(바뀐 문맥은 app 이 사실로도 남긴다, 계약 v3.18 (33')).
+  it("개정된 단계는 새 문맥 머리말로 턴을 시작한다", async () => {
+    const { db, seen, revise, wrapped } = gate();
     revise();
-    await expect(wrapped.resumeTurn({ sessionId: "s1", cwd: "/wb", prompt: "과제" }))
-      .rejects.toThrow("작업 묶음 개정으로 이 단계의 재계획을 기다립니다.");
-    expect(hooks.heads).toBe(0);
-    expect(seen).toEqual([]);
+    await wrapped.createSession({ cwd: "/wb", prompt: "과제" });
+    expect(seen).toHaveLength(1);
+    expect(seen[0].prompt).toContain("바뀐 공통 계약");
     db.close();
   });
 
@@ -716,40 +722,40 @@ describe("어댑터 게이트", () => {
     db.close();
   });
 
-  it("선행 결과 확인(git) 중에 개정이 저장되면 경계 뒤 재판정으로 턴을 시작하지 않는다", async () => {
-    const { db, hooks, seen, revise, wrapped } = gate();
-    hooks.onHead = revise;
+  it("선행 결과 확인(git) 중에 단계 문맥 결속이 깨지면 경계 뒤 재판정으로 턴을 시작하지 않는다", async () => {
+    const { db, hooks, seen, breakBinding, wrapped } = gate();
+    hooks.onHead = breakBinding;
     await expect(wrapped.resumeTurn({ sessionId: "s1", cwd: "/wb", prompt: "과제", freshSessionPrompt: "전체" }))
-      .rejects.toThrow("작업 묶음 개정으로 이 단계의 재계획을 기다립니다.");
+      .rejects.toThrow("공통 계약이 바뀌었습니다. 현재 단계의 계획을 다시 승인해야 합니다.");
     expect(hooks.heads).toBe(1);
     expect(seen).toEqual([]);
     db.close();
   });
 });
 
-// ---- E4 2차 보완 F012: 새 단계 토픽은 계획 제어 v2 로 시작한다 ----
-// 승계 결정·보류 지적 원문이 계획·감사 입력에 참조로 실려 끝까지 읽히려면 계획 제어가 적용돼야 한다(참조 전달은 계획 제어 턴에만 켜진다). 서비스가 단계
-// 토픽을 만드는 transaction 안에서 정책을 켠다 — 설정(config.guardedPlanning)·수동 planning-control 호출과 무관하다. 기존 토픽의 정책은 바꾸지 않는다.
-describe("새 단계 토픽의 계획 제어 v2(E4 2차 보완 F012)", () => {
-  it("next 가 여는 새 단계 토픽은 계획 제어 v2 로 시작하고, 이미 연결된 다른 단계 토픽의 정책은 바꾸지 않는다", async () => {
+// ---- 새 단계 토픽은 ticket 이고 계획 연속성 정책을 켜지 않는다(Codex 273, Q-e) ----
+// 단계·묶음 입력에 계획 선택이 없다. 계획이 필요하면 공개 방식 전환으로 planned 를 고르고, 그 전환이 정책을 켠다. 기존 토픽의 정책은 바꾸지 않는다.
+describe("새 단계 토픽의 방식과 계획 연속성 정책", () => {
+  it("next 가 여는 새 단계 토픽은 ticket 이고 정책을 켜지 않으며, 이미 연결된 다른 단계 토픽의 정책은 바꾸지 않는다", async () => {
     const fx = fixture();
     const service = fx.service();
     const group = await service.create(groupInput([work("a"), work("b"), integration("z", ["a", "b"])]));
     // E4 전처럼 계획 제어 없이 연결된 열린 단계 a(정책 0) — 외부 결정으로 막혀 b 를 선택 착수한다.
     const timestamp = new Date().toISOString();
-    const legacy = fx.database.createTopic({ id: "legacy-a", slug: "legacy-a", title: "legacy a", repositoryPath: fx.repository,
+    const legacy = fx.database.createTopic({ workflowMode: "planned", id: "legacy-a", slug: "legacy-a", title: "legacy a", repositoryPath: fx.repository,
       worktreePath: join(fx.root, "legacy-a"), baseRef: fx.base, branchName: null, state: "DRAFT", scopeGeneration: 1, planRevision: 0,
       planSHA256: null, approvedPlanSHA256: null, createdAt: timestamp, updatedAt: timestamp, lastError: null });
     fx.database.workGroups.link(group.id, "a", legacy.id, fx.base);
     expect(fx.database.planning.policyVersion(legacy.id)).toBe(0);
     fx.blocked.add(legacy.id);
     const b = await service.next(group.id, undefined, "b");
-    expect(fx.database.planning.policyVersion(b.id)).toBe(2);
-    expect(fx.database.planning.continuityEnabled(b.id)).toBe(true);
+    expect(b.workflowMode).toBe("ticket");
+    expect(fx.database.planning.policyVersion(b.id)).toBe(0);
+    expect(fx.database.planning.continuityEnabled(b.id)).toBe(false);
     expect(fx.database.planning.policyVersion(legacy.id)).toBe(0);
   });
 
-  it("정책은 토픽 생성·링크와 같은 transaction 이다 — 링크가 실패하면 토픽도 정책도 남지 않고, 예약을 이어 열 때 v2 로 만든다", async () => {
+  it("링크가 실패하면 토픽도 정책도 남지 않고, 예약을 이어 열면 ticket 이고 정책을 켜지 않는다", async () => {
     const fx = fixture();
     const service = fx.service();
     const group = await service.create(groupInput([work("a"), integration("z", ["a"])]));
@@ -762,7 +768,8 @@ describe("새 단계 토픽의 계획 제어 v2(E4 2차 보완 F012)", () => {
     link.mockRestore();
     const a = await service.next(group.id);
     expect(a.id).toBe(reserved);
-    expect(fx.database.planning.policyVersion(a.id)).toBe(2);
+    expect(a.workflowMode).toBe("ticket");
+    expect(fx.database.planning.policyVersion(a.id)).toBe(0);
   });
 
   it("예약을 이어 열 때 토픽이 이미 있고 정책이 있으면 그 정책을 바꾸지 않는다", async () => {
@@ -779,7 +786,7 @@ describe("새 단계 토픽의 계획 제어 v2(E4 2차 보완 F012)", () => {
     const reservation = fx.database.workGroups.get(group.id).pending!.a;
     // 예약된 토픽이 이미 있고, 실행 이력이 있어 정책이 v1 로 정해진 경우(이미 있는 정책) — 이어 여는 착수가 정책을 다시 고르지 않는다.
     const timestamp = new Date().toISOString();
-    fx.database.createTopic({ id: reservation.topicId, slug: "stage-a", title: "묶음 · a 제목", repositoryPath: fx.repository,
+    fx.database.createTopic({ workflowMode: "planned", id: reservation.topicId, slug: "stage-a", title: "묶음 · a 제목", repositoryPath: fx.repository,
       worktreePath: reservation.worktreePath, baseRef: reservation.baseOID, branchName: null, state: "DRAFT", scopeGeneration: 1, planRevision: 0,
       planSHA256: null, approvedPlanSHA256: null, createdAt: timestamp, updatedAt: timestamp, lastError: null });
     fx.database.startAction({ id: "earlier-run", topicId: reservation.topicId, kind: "plan", status: "running", createdAt: timestamp, finishedAt: null,
@@ -796,7 +803,7 @@ describe("새 단계 토픽의 계획 제어 v2(E4 2차 보완 F012)", () => {
 // 묶음 밖 선행 토픽 — 전달 커밋(committedOID)을 가진 일반 토픽. patch 로 저장소·전달 커밋을 바꾼다(null 이면 전달 커밋 없음).
 function predecessor(fx: Fixture, patch: { repositoryPath?: string; committedOID?: string | null } = {}) {
   const id = randomUUID(), timestamp = new Date().toISOString();
-  fx.database.createTopic({ id, slug: `pred-${id.slice(0, 8)}`, title: "선행", repositoryPath: patch.repositoryPath ?? fx.repository,
+  fx.database.createTopic({ workflowMode: "planned", id, slug: `pred-${id.slice(0, 8)}`, title: "선행", repositoryPath: patch.repositoryPath ?? fx.repository,
     worktreePath: join(fx.root, `pred-${id.slice(0, 8)}`), baseRef: fx.base, branchName: null, state: "READY_TO_DELIVER", scopeGeneration: 1,
     planRevision: 0, planSHA256: null, approvedPlanSHA256: null, createdAt: timestamp, updatedAt: timestamp, lastError: null });
   if (patch.committedOID !== null) fx.database.updateTopic(id, { committedOID: patch.committedOID ?? fx.base });
@@ -844,7 +851,7 @@ describe("생성 전용 입력 — 명시 기준 커밋·단계 브랜치·묶�
       .rejects.toThrow("단계 브랜치 이름이 겹칩니다: a(feature/same) ↔ z(feature/same)");
   });
 
-  it("묶음 밖 선행 토픽은 생성 때 세대·전달 커밋·보류 원장을 동결해 모든 단계가 이어받고, 뒤에 선행 토픽이 바뀌어도 승계 근거는 그대로다", async () => {
+  it("묶음 밖 선행 토픽은 생성 때 세대·전달 커밋·보류 원장을 묶음 레코드에 동결하고, 뒤에 선행 토픽이 바뀌어도 동결 기록은 그대로다", async () => {
     const fx = fixture();
     const service = fx.service();
     const predecessorId = predecessor(fx);
@@ -855,20 +862,17 @@ describe("생성 전용 입력 — 명시 기준 커밋·단계 브랜치·묶�
       undefined, { predecessorTopicId: predecessorId });
     expect(group.predecessor).toEqual({ topicId: predecessorId, scopeGeneration: 1, committedOID: fx.base, deferredFindings: [carried],
       frozenAt: expect.any(String) });
-    // 단계 토픽은 선행 토픽을 참조하지 않는다 — 기존 deferredFindingsFor 가 읽는 묶음 승계(inheritedDeferredFindings)로 모든 단계가 받는다.
+    // 단계 토픽은 선행 토픽을 참조하지 않는다 — 선행 토픽의 근거는 묶음 레코드(predecessor)에 동결된다.
     const a = await service.next(group.id);
     expect(fx.database.getTopic(a.id).predecessorTopicId).toBeNull();
-    const inherited = (stageId: string) => fx.database.workGroups.inheritedDeferredFindings(fx.database.workGroups.get(group.id), stageId)
-      .map((finding) => `${finding.topicId}/${finding.id}`);
-    expect(inherited("a")).toEqual([`${predecessorId}/P-1`]);
     // 생성 뒤 선행 토픽이 바뀌어도(원장 교체·전달 커밋 해제 — 범위 변경이 남기는 모양) 동결한 근거는 그대로다.
     fx.ledgers.set(predecessorId, []);
     fx.database.updateTopic(predecessorId, { committedOID: null });
     closeStage(fx, group.id, "a", "2026-09-28T01:00:00.000Z");
     const b = await service.next(group.id);
     expect(fx.database.getTopic(b.id).predecessorTopicId).toBeNull();
-    expect(inherited("b")).toEqual([`${predecessorId}/P-1`]);
-    expect(inherited("z")).toEqual([`${predecessorId}/P-1`]);
+    expect(fx.database.workGroups.get(group.id).predecessor).toEqual(group.predecessor);
+    expect(fx.database.workGroups.get(group.id).predecessor?.deferredFindings).toEqual([carried]);
   });
 
   it("묶음 밖 선행 토픽은 같은 저장소이고 전달 커밋이 기준에 포함돼야 하며, 원장을 읽을 수 없거나 읽는 사이 바뀌면 묶음을 만들지 않는다", async () => {

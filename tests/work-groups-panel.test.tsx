@@ -9,7 +9,7 @@ import { api } from "../src/web/api";
 import type { Topic } from "../src/shared/contracts";
 import type { WorkGroupView } from "../src/shared/workGroups";
 
-// 엔진 개편 E4 — 작업 묶음 패널: 대략 단계·준비/선택 가능 단계·재계획 대기와 재적용·단계별 전달(커밋·푸시 분리)과 묶음 전달·미정 질문·막힌 단계 옆 선택 착수,
+// 엔진 개편 E4 — 작업 묶음 패널: 대략 단계·준비/선택 가능 단계·단계별 전달(커밋·푸시 분리)과 묶음 전달·미정 질문·막힌 단계 옆 선택 착수,
 // 미착수 단계의 완료 조건·예산 준비(host-review F010), 닫힌 단계 push(F002). 목록 뷰의 파생 필드는 서버가 계산한다(여기서는 api 대역으로 준다).
 
 const budget = {
@@ -38,7 +38,6 @@ function view(patch: Partial<WorkGroupView> = {}): WorkGroupView {
     delivered: false,
     readyStages: ["b"],
     selectableStages: ["b"],
-    replanPending: [],
     ...patch,
   };
 }
@@ -90,35 +89,23 @@ describe("작업 묶음 패널", () => {
     expect(next).toHaveBeenCalledWith("g", undefined);
   });
 
-  it("재계획 대기 단계를 보이고 '개정 다시 적용'은 같은 입력(질문·묶음 예산 포함)과 지금 버전으로 개정을 다시 보낸다", async () => {
+  // 개정은 재계획 대기 표식을 만들지 않고 영향 단계에 사실로 전달된다(계약 v3.18 (33')). 패널은 재계획 대기·재적용을 보이지 않는다.
+  it("계약 변경은 같은 입력(질문·묶음 예산 포함)과 지금 버전으로 개정을 보내고, 재계획 대기 표시·재적용 동작은 없다", async () => {
     const policy = { execution: budget.execution, total: { inputTokens: 999, outputTokens: 999, durationMs: 999000 } };
-    const group = view({ replanPending: ["a"], budgetPolicy: policy });
+    const group = view({ budgetPolicy: policy });
     vi.spyOn(api, "listWorkGroups").mockResolvedValue([group]);
     const revise = vi.spyOn(api, "reviseWorkGroup").mockResolvedValue(group);
     const { container } = render(<WorkGroupsPanel onTopic={vi.fn()} />);
     await screen.findByText(/큰 작업/);
-    expect(item(container, "가 단계")).toContain("재계획 대기");
-    expect(screen.getByRole("status", { hidden: true })).toHaveTextContent("재계획 대기: 가 단계");
-    fireEvent.click(screen.getByText("개정 다시 적용"));
-    await waitFor(() => expect(revise).toHaveBeenCalledTimes(1));
-    expect(revise).toHaveBeenCalledWith("g", {
-      title: "큰 작업", goal: "전체 목표", contracts: "공통 계약", stages: group.stages, budgetPolicy: policy, questions: group.questions,
-    }, 3);
+    expect(item(container, "가 단계")).not.toContain("재계획 대기");
+    expect(container.textContent).not.toContain("개정 다시 적용");
     // 계약 변경도 질문·묶음 예산을 빠뜨리지 않는다(기존 질문 삭제로 거부되지 않게).
     fireEvent.change(container.querySelector("textarea[name=contracts]")!, { target: { value: "새 계약" } });
-    fireEvent.submit(screen.getByText("계약 변경 · 미완료 단계 재계획").closest("form")!);
-    await waitFor(() => expect(revise).toHaveBeenCalledTimes(2));
+    fireEvent.submit(screen.getByText("계약 변경 · 영향 단계에 사실로 전달").closest("form")!);
+    await waitFor(() => expect(revise).toHaveBeenCalledTimes(1));
     expect(revise).toHaveBeenLastCalledWith("g", {
       title: "큰 작업", goal: "전체 목표", contracts: "새 계약", stages: group.stages, budgetPolicy: policy, questions: group.questions,
     }, 3);
-  });
-
-  it("재계획 대기가 없으면 재적용 동작을 보이지 않는다", async () => {
-    vi.spyOn(api, "listWorkGroups").mockResolvedValue([view()]);
-    const { container } = render(<WorkGroupsPanel onTopic={vi.fn()} />);
-    await screen.findByText(/큰 작업/);
-    expect(container.textContent).not.toContain("개정 다시 적용");
-    expect(item(container, "가 단계")).not.toContain("재계획 대기");
   });
 
   it("단계별 전달은 커밋과 푸시를 나눠 보이고, 통합 검증 완료와 묶음 전달 완료를 구분한다", async () => {

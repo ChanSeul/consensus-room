@@ -18,7 +18,7 @@ const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "session-graph-")), path = join(root, "db.sqlite"), db = new ConsensusDatabase(path);
-  const topic = (id: string, parentTopicId: string | null = null, group = false) => db.createTopic({ id, slug:id, title:id, parentTopicId, topicKind:group ? "group" : "task",
+  const topic = (id: string, parentTopicId: string | null = null, group = false) => db.createTopic({ workflowMode: "planned", id, slug:id, title:id, parentTopicId, topicKind:group ? "group" : "task",
     workEntry:{mode:"goal",goal:`Goal ${id}`,sourceIds:[],evidenceDigest:null}, baseRef:"HEAD",repositoryPath:root,worktreePath:root,state:"DRAFT",branchName:null,
     scopeGeneration:1,planRevision:0,planSHA256:null,approvedPlanSHA256:null,createdAt:new Date().toISOString(),updatedAt:new Date().toISOString(),lastError:null });
   cleanups.push(() => { db.close(); rmSync(root,{recursive:true,force:true}); });
@@ -239,8 +239,10 @@ it("keeps shared conversation IDs in independent role nodes with role-correct se
   const sql = new DatabaseSync(f.path);
   sql.prepare("INSERT INTO evidence_link_receipts VALUES(?,?)").run(JSON.stringify(["shared", 1, "codex", sid]), source.id); sql.close();
   f.db.planning.noteProtocolSession("shared", sid);
-  f.db.planning.recordDelivery(sid, [{ id: "shared-fragment", kind: "file", selector: "docs/requirements.md",
-    hash: sha, offset: 0, nextOffset: null, content: "Shared requirements" }]);
+  const fragments = new DatabaseSync(f.path);
+  fragments.prepare("INSERT INTO planning_session_fragments VALUES (?,?,?)").run(sid, "shared-fragment", JSON.stringify({ id: "shared-fragment",
+    kind: "file", selector: "docs/requirements.md", hash: sha, offset: 0, nextOffset: null, content: "Shared requirements" }));
+  fragments.close();
   f.db.sessions.observe("shared", { executionId: "shared-observation", sessionId: sid, provider: "codex", consumer: "consensus-engine",
     spawnedAt: new Date().toISOString(), cwd: f.root, hostname: "test-host", hostOS: { platform: "darwin", release: "test", arch: "arm64" },
     isolated: false, workspace: "git", access: "write", sandbox: "recorded", model: "gpt-6-astra", effort: "medium" });
@@ -267,13 +269,13 @@ it("keeps shared conversation IDs in independent role nodes with role-correct se
   ]);
   expect(f.db.getTopic("shared").participants.map(participant => participant.sessionId)).toEqual([sid, sid]);
   // Core retains the parent stage while it submits either kind of review correction.
-  for (const state of ["CODEX_AUDIT", "CODEX_CLOSEOUT", "CODEX_REVIEW", "CODEX_FINAL_REVIEW"] as const) {
+  for (const state of ["CODEX_AUDIT", "CODEX_REVIEW"] as const) {
     f.db.updateTopic("shared", { state });
     for (const operation of ["contract-correction", "plan-repair"] as const) {
       f.db.saveExecutionUsage("shared", 1, "codex", "correction", { executionId: `${state}-${operation}`, recordKind: "progress",
         route: { ...binding, job: { role: "reviewer", operation } } });
       const active = f.graph("shared").nodes.filter(node => node.status === "running" && node.kind === "session");
-      expect(active.map(node => node.role)).toEqual([state === "CODEX_AUDIT" || state === "CODEX_CLOSEOUT" ? "plan-reviewer" : "reviewer"]);
+      expect(active.map(node => node.role)).toEqual([state === "CODEX_AUDIT" ? "plan-reviewer" : "reviewer"]);
     }
   }
 });

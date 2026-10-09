@@ -11,7 +11,6 @@ import { CodexAdapter } from "../src/server/adapters/codex";
 import type { CommandResult, CommandRunner, CommandSpec, TurnUsage } from "../src/server/types";
 import { agentEnvironment } from "../src/server/security";
 import { DEFAULT_AGENT_SETTINGS } from "../src/shared/contracts";
-import { PlanningStepSchema } from "../src/shared/planningControl";
 import { DatabaseSync } from "node:sqlite";
 import { BudgetLedger } from "../src/server/budgetLedger";
 import { BudgetController } from "../src/server/budgetController";
@@ -89,10 +88,8 @@ describe("project worker context", () => {
     const plugin = mkdtempSync(join(tmpdir(), "worker-instruction-plugin-"));
     temporaryDirectories.push(plugin);
     const adapter = provider === "claude" ? new ClaudeAdapter(runner, undefined, { managedPluginDirectory: plugin }) : codexAdapter(runner).adapter;
-    // A controlled planner first starts the session without native instruction flags.
-    const planned = await adapter.createSession({ cwd, prompt: "HOST_REQUIRED_INSTRUCTIONS", planningControl: {
-      admissionId: "plan", maxPromptBytes: 65536, instructionsProvided: true,
-    } });
+    // A protocol-only turn first starts the session without native instruction flags or a delivery receipt.
+    const planned = await adapter.createSession({ cwd, prompt: "HOST_REQUIRED_INSTRUCTIONS", protocolOnly: true });
     await adapter.resumeTurn({ cwd, prompt: "Implement approved task", sessionId: planned.sessionId, implementation: true });
     writeFileSync(file, `KEEP_UPDATED_PRODUCT_CONTRACT\n${boundary}\nPRIVATE_OPERATOR_DEPLOY\n`);
     const usage: TurnUsage[] = [];
@@ -221,12 +218,11 @@ describe("에이전트별 권한 경계", () => {
     const runner = new RecordingRunner(successfulResult([planResult]));
     const adapter = new ClaudeAdapter(runner);
     const settings = { model: "claude-opus-5-5", effort: "xhigh" } as const;
-    const planned = await adapter.createSession({ cwd: root, prompt: "Plan", settings,
-      planningControl: { admissionId: "plan", maxPromptBytes: 65536 } });
+    const planned = await adapter.createSession({ cwd: root, prompt: "Plan", settings });
     await adapter.resumeTurn({ cwd: root, prompt: "Implement approved plan", sessionId: planned.sessionId,
       implementation: true, settings });
     const [planning, implementation] = runner.calls;
-    expect(planning.args[planning.args.indexOf("--tools") + 1]).toBe("");
+    expect(planning.args[planning.args.indexOf("--tools") + 1]).not.toMatch(/Edit|Write/);
     expect(implementation.args[implementation.args.indexOf("--resume") + 1]).toBe(planned.sessionId);
     expect(implementation.args).not.toContain("--session-id");
     expect(implementation.args[implementation.args.indexOf("--model") + 1]).toBe("claude-opus-5-5");
@@ -235,94 +231,6 @@ describe("에이전트별 권한 경계", () => {
     expect(JSON.parse(implementation.args[implementation.args.indexOf("--settings") + 1]).ultracode).toBe(true);
   });
 
-  it("controlled planning disables direct sources, preserves instructions, and transports one image separately", async () => {
-    const root = mkdtempSync(join(tmpdir(), "controlled-adapter-"));
-    temporaryDirectories.push(root);
-    writeFileSync(join(root, "CLAUDE.md"), "KEEP_CLAUDE_INSTRUCTIONS");
-    writeFileSync(join(root, "AGENTS.md"), "KEEP_CODEX_INSTRUCTIONS");
-    const image = join(root, "design.png");
-    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j9xkAAAAASUVORK5CYII=", "base64");
-    writeFileSync(image, png);
-    const planningControl = { admissionId: "attempt", maxPromptBytes: 64 * 1024, image: { path: image, bytes: png.length } };
-    const claude = new RecordingRunner(successfulResult([planResult]));
-    const claudeAdapter = new ClaudeAdapter(claude);
-    const claudeSession = await claudeAdapter.createSession({ cwd: root, prompt: "Bounded planning", planningControl });
-    const call = claude.calls[0];
-    expect(call.args[call.args.indexOf("--tools") + 1]).toBe("");
-    expect(call.args[call.args.indexOf("--input-format") + 1]).toBe("stream-json");
-    const message = JSON.parse(call.stdin!);
-    expect(message.message.content[0].text).toContain("KEEP_CLAUDE_INSTRUCTIONS");
-    expect(message.message.content[1].source.data).toBe(png.toString("base64"));
-    await claudeAdapter.resumeTurn({ cwd: root, prompt: "Continue plan", sessionId: claudeSession.sessionId,
-      planningControl: { admissionId: "attempt", maxPromptBytes: 64 * 1024, instructionsInSession: true } });
-    expect(claude.calls[1].stdin).not.toContain("KEEP_CLAUDE_INSTRUCTIONS");
-    await claudeAdapter.createSession({ cwd: root, prompt: "Fresh plan", planningControl: {
-      admissionId: "fresh-attempt", maxPromptBytes: 64 * 1024, instructionsInSession: true,
-    } });
-    expect(claude.calls[2].stdin).toContain("KEEP_CLAUDE_INSTRUCTIONS");
-    await claudeAdapter.createSession({ cwd: root, prompt: "HOST_QUEUED_INSTRUCTION_FRAGMENT", planningControl: {
-      admissionId: "queued-instructions", maxPromptBytes: 64 * 1024, instructionsProvided: true,
-    } });
-    expect(claude.calls[3].stdin).toContain("HOST_QUEUED_INSTRUCTION_FRAGMENT");
-    expect(claude.calls[3].stdin).not.toContain("KEEP_CLAUDE_INSTRUCTIONS");
-    expect(claude.calls[3].args[claude.calls[3].args.indexOf("--tools") + 1]).toBe("");
-    const codex = new RecordingRunner(successfulResult([{ type: "thread.started", thread_id: "bounded-thread" }, planResult]));
-    const { adapter } = codexAdapter(codex);
-    await adapter.createSession({ cwd: root, prompt: "Bounded review", planningControl });
-    const config = readFileSync(join(adapter.managedHomeFor(root), "config.toml"), "utf8");
-    for (const name of ["shell_tool", "unified_exec", "view_image", "apps", "browser_use", "computer_use", "multi_agent"]) {
-      expect(config).toContain(`${name} = false`);
-    }
-    expect(codex.calls[0].stdin).toContain("KEEP_CODEX_INSTRUCTIONS");
-    await adapter.resumeTurn({ cwd: root, prompt: "Continue review", sessionId: "bounded-thread",
-      planningControl: { admissionId: "attempt", maxPromptBytes: 64 * 1024, instructionsInSession: true } });
-    expect(codex.calls[1].stdin).not.toContain("KEEP_CODEX_INSTRUCTIONS");
-    await adapter.createSession({ cwd: root, prompt: "Fresh review", planningControl: {
-      admissionId: "fresh-attempt", maxPromptBytes: 64 * 1024, instructionsInSession: true,
-    } });
-    expect(codex.calls[2].stdin).toContain("KEEP_CODEX_INSTRUCTIONS");
-    await adapter.createSession({ cwd: root, prompt: "HOST_QUEUED_INSTRUCTION_FRAGMENT", planningControl: {
-      admissionId: "queued-instructions", maxPromptBytes: 64 * 1024, instructionsProvided: true,
-    } });
-    expect(codex.calls[3].stdin).toContain("HOST_QUEUED_INSTRUCTION_FRAGMENT");
-    expect(codex.calls[3].stdin).not.toContain("KEEP_CODEX_INSTRUCTIONS");
-    expect(codex.calls[0].args).toContain(image);
-    const schemaPath = codex.calls[0].args[codex.calls[0].args.indexOf("--output-schema") + 1];
-    expect(schemaPath).toContain(".planning.json");
-    const schema = JSON.parse(readFileSync(schemaPath, "utf8"));
-    const assertStrictObjects = (value: unknown): void => {
-      if (!value || typeof value !== "object") return;
-      const object = value as Record<string, unknown>;
-      if (object.properties) {
-        expect(object.additionalProperties).toBe(false);
-        expect(new Set(object.required as string[])).toEqual(new Set(Object.keys(object.properties as object)));
-      }
-      for (const child of Object.values(object)) assertStrictObjects(child);
-    };
-    assertStrictObjects(schema);
-    const request = schema.properties.planningStep.properties.requests.items;
-    expect(request.required).toContain("rereadReason");
-    expect(request.properties.rereadReason.anyOf).toContainEqual({ type: "null" });
-    // 범위 끝도 반드시 밝힌다 — null 은 원문 끝까지다(필드가 없는 값은 배포 전 저장 요청의 한 쪽 계약으로만 남는다).
-    expect(request.required).toContain("end");
-    expect(request.properties.end.anyOf).toContainEqual({ type: "null" });
-    expect(PlanningStepSchema.safeParse({ draft: "", facts: [], contradictions: [], questions: [],
-      requests: [{ kind: "file", selector: "form.swift", question: "Check", offset: 0, end: null, rereadReason: null }],
-      complete: false }).success).toBe(true);
-  });
-
-  it("rejects the final composed planning input including instructions before spawning either CLI", async () => {
-    const root = mkdtempSync(join(tmpdir(), "bounded-instructions-"));
-    temporaryDirectories.push(root);
-    writeFileSync(join(root, "CLAUDE.md"), "Mandatory".repeat(100));
-    writeFileSync(join(root, "AGENTS.md"), "Mandatory".repeat(100));
-    const runner = new RecordingRunner(successfulResult([planResult]));
-    for (const adapter of [new ClaudeAdapter(runner), codexAdapter(runner).adapter]) {
-      await expect(adapter.createSession({ cwd: root, prompt: "Short", planningControl: { admissionId: "attempt", maxPromptBytes: 100 } }))
-        .rejects.toThrow("mandatory instructions");
-    }
-    expect(runner.calls).toHaveLength(0);
-  });
   it("Claude와 Codex에는 선별된 메모리 본문만 주고 메모리 폴더 직접 접근 권한은 주지 않는다", async () => {
     const memoryRoot = mkdtempSync(join(tmpdir(), "consensus-room-adapter-memory-"));
     temporaryDirectories.push(memoryRoot);
@@ -1330,30 +1238,6 @@ describe("메모리 주입은 세션 생성 턴에만 한다", () => {
     return root;
   }
 
-  it.each(["claude", "codex"] as const)("%s evidence creation and correction share read-only output and memory contracts", async provider => {
-    const directory = mkdtempSync(join(tmpdir(), "evidence-contract-")); temporaryDirectories.push(directory);
-    const runner = new RecordingRunner(successfulResult([
-      { type: "thread.started", thread_id: "thread-1" },
-      { kind: "EVIDENCE_REPLAN", summary: "Policy changed", findings: [], evidenceRefs: [] },
-    ]));
-    const adapter = provider === "claude" ? new ClaudeAdapter(runner, memoryFixture())
-      : new CodexAdapter(runner, join(directory, "schema.json"), join(directory, "home"), memoryFixture());
-    const job = { role: "planner", operation: "evidence-assessment" } as const;
-    await adapter.createSession({ cwd: directory, prompt: "swift evidence review", job, planMode: true });
-    await adapter.resumeTurn({ cwd: directory, prompt: "swift correction", job, planMode: true,
-      sessionId: provider === "claude" ? "11111111-1111-4111-8111-111111111111" : "thread-1" });
-    for (const call of runner.calls) {
-      expect(call.stdin).toContain("memoryUpdates");
-      expect(call.stdin).not.toContain("반드시 한 번 판단하세요");
-      const schema = provider === "claude" ? JSON.parse(call.args[call.args.indexOf("--json-schema") + 1])
-        : JSON.parse(readFileSync(call.args[call.args.indexOf("--output-schema") + 1], "utf8"));
-      expect(schema.properties.kind.enum).toEqual(["EVIDENCE_NO_IMPACT", "EVIDENCE_REPLAN", "EVIDENCE_NEEDS_DECISION"]);
-      expect(schema.properties.memoryUpdates.anyOf[0].maxItems).toBe(0);
-      expect(schema.properties.planMarkdown).toEqual({ type: "null" });
-      if (provider === "claude") expect(call.args[call.args.indexOf("--permission-mode") + 1]).toBe("dontAsk");
-    }
-  });
-
   it("Claude: createSession에만 붙고 resume·protocolOnly에는 안 붙는다", async () => {
     const runner = new RecordingRunner(successfulResult([planResult]));
     const adapter = new ClaudeAdapter(runner, memoryFixture());
@@ -1449,12 +1333,10 @@ describe("세션별 메모리 본문 수신(memoryBodies) — 본문을 받지 �
     expect(plain).toContain("메모리 스냅샷 갱신");
   });
 
-  it.each(["claude", "codex"] as const)("%s: 프로토콜·계획 제어 턴은 memoryBodies 가 있어도 본문을 싣지 않는다", async (provider) => {
+  it.each(["claude", "codex"] as const)("%s: 프로토콜 턴은 memoryBodies 가 있어도 본문을 싣지 않는다", async (provider) => {
     const runner = new RecordingRunner(successfulResult([{ type: "thread.started", thread_id: "thread-1" }, planResult]));
     const adapter = adapters(runner)[provider];
     await adapter.resumeTurn({ sessionId: sessions[provider], prompt: "확인하세요.", cwd: "/tmp", protocolOnly: true, memoryBodies: true });
-    await adapter.resumeTurn({ sessionId: sessions[provider], prompt: "계획을 조사하세요.", cwd: "/tmp", memoryBodies: true,
-      planningControl: { admissionId: "attempt", maxPromptBytes: 64 * 1024, instructionsInSession: true } });
     for (const call of runner.calls) expect(call.stdin ?? "").not.toContain("MEMORY-BODIES-MARKER");
   });
 });
@@ -1530,8 +1412,157 @@ describe("구현 턴 sandbox 쓰기 경계", () => {
     expect(sandbox.allowWrite).not.toContain(workspace);
     expect(sandbox.denyWrite).toContain(workspace);
   });
+
+  // 역별칭(⑧ S2, Codex 289): 보호 경로는 별칭 철자, 작업 폴더는 실제 경로다. 철자로 비교하면 보호 경로 전체 거부가 작업 폴더를 덮는다.
+  it("보호 경로가 별칭 철자이고 작업 폴더가 실제 경로여도 worktree 로 가는 길만 깎는다", () => {
+    const { dataDirectory, workspace } = room();
+    const realData = realpathSync(dataDirectory);
+    const alias = `${realData}-alias`;
+    symlinkSync(realData, alias);
+    temporaryDirectories.push(alias);
+    const realWorkspace = realpathSync(workspace);
+
+    const settings = buildIsolationSettings(realWorkspace, join(realData, "action-temp"), true, { protectedWritePaths: [alias] }) as {
+      permissions: { deny: string[] };
+      sandbox: { filesystem: { allowWrite: string[]; denyWrite: string[] } };
+    };
+
+    // worktree 를 덮는 상위 경로는 두 철자 어느 쪽으로도 남지 않는다.
+    const ancestors = [alias, join(alias, "worktrees"), realData, join(realData, "worktrees")];
+    expect(settings.permissions.deny.filter(rule => ancestors.some(path => rule.endsWith(`(/${path})`) || rule.endsWith(`(/${path}/**)`)))).toEqual([]);
+    expect(settings.sandbox.filesystem.denyWrite.filter(path => ancestors.includes(path))).toEqual([]);
+    expect(settings.sandbox.filesystem.allowWrite).toContain(realWorkspace);
+    // 형제 worktree·원장·codex-home 은 넘겨받은 철자로, .git 은 작업 폴더 철자로 계속 막힌다.
+    const blocked = [join(alias, "worktrees", "topic-b"), join(alias, "consensus-room.sqlite"), join(alias, "codex-home"), join(realWorkspace, ".git")];
+    expect(settings.sandbox.filesystem.denyWrite).toEqual(expect.arrayContaining(blocked));
+    expect(settings.permissions.deny).toEqual(expect.arrayContaining(blocked.map(path => `Write(/${path}/**)`)));
+  });
 });
 
+
+// CR 흐름 단순화 D4 — planner 는 계획 묶음 폴더(토픽 산출물 폴더의 plan/, 작업 폴더 밖·dataDirectory 안)를 자기 도구로 쓰고 고친다.
+// 조건(master 결정): 작업 폴더 쓰기는 명시 거부, 읽기 범위는 지금과 같게(계획 폴더만 더함), Codex 쓰기 루트는 그 폴더와 기존 턴 임시 폴더뿐.
+describe("planner 계획 폴더 쓰기", () => {
+  type PlannerTurn = Parameters<ClaudeAdapter["createSession"]>[0];
+  type Settings = {
+    permissions: { allow: string[]; deny: string[] };
+    sandbox: { filesystem: { allowWrite: string[]; denyWrite: string[]; allowRead: string[] } };
+  };
+
+  function room() {
+    const dataDirectory = realpathSync(mkdtempSync(join(tmpdir(), "consensus-room-plan-folder-")));
+    temporaryDirectories.push(dataDirectory);
+    const workspace = join(dataDirectory, "worktrees", "topic-a");
+    const planDirectory = join(dataDirectory, "topics", "topic-a", "generation-1", "plan");
+    for (const path of [workspace, planDirectory, join(dataDirectory, "topics", "topic-b"), join(dataDirectory, "codex-home")]) mkdirSync(path, { recursive: true });
+    writeFileSync(join(dataDirectory, "consensus-room.sqlite"), "");
+    return { dataDirectory, workspace, planDirectory };
+  }
+
+  const plannerTurn = (workspace: string, planDirectory?: string, extra: Partial<PlannerTurn> = {}): PlannerTurn =>
+    ({ cwd: workspace, prompt: "계획을 쓰세요.", job: { role: "planner", operation: "plan" }, ...(planDirectory ? { planDirectory } : {}), ...extra });
+
+  const settingsOf = (call: CommandSpec) => JSON.parse(call.args[call.args.indexOf("--settings") + 1]) as Settings;
+  const actionTempOf = (call: CommandSpec) => String(call.environment?.TMPDIR);
+
+  it("Claude: 계획 폴더만 Edit·Write 를 열고 작업 폴더 쓰기는 명시 거부하며, 보호 경로는 그 폴더로 가는 길만 깎는다", async () => {
+    const { dataDirectory, workspace, planDirectory } = room();
+    const runner = new RecordingRunner(successfulResult([planResult]));
+    const adapter = new ClaudeAdapter(runner, undefined, { protectedWritePaths: [dataDirectory] });
+
+    await adapter.createSession(plannerTurn(workspace, planDirectory));
+    await adapter.createSession(plannerTurn(workspace));
+
+    const [planner, baseline] = runner.calls;
+    expect(planner.args[planner.args.indexOf("--permission-mode") + 1]).toBe("dontAsk");
+    const tools = planner.args[planner.args.indexOf("--tools") + 1].split(",");
+    expect(tools).toEqual(expect.arrayContaining(["Edit", "Write", "Read"]));
+    expect(tools).not.toContain("Workflow");
+    const settings = settingsOf(planner);
+    expect(settings.permissions.allow.filter(rule => /^(Edit|Write)\(/.test(rule))).toEqual([`Edit(/${planDirectory}/**)`, `Write(/${planDirectory}/**)`]);
+    expect(settings.permissions.deny).toEqual(expect.arrayContaining([`Edit(/${workspace}/**)`, `Write(/${workspace}/**)`,
+      `Write(/${join(dataDirectory, "topics", "topic-b")}/**)`, `Write(/${join(dataDirectory, "codex-home")}/**)`]));
+    // deny 가 allow 를 이기므로 계획 폴더를 덮는 상위 경로가 남으면 안 된다.
+    expect(settings.permissions.deny.filter(rule => [dataDirectory, join(dataDirectory, "topics"), join(dataDirectory, "topics", "topic-a")]
+      .some(path => rule.endsWith(`(/${path}/**)`)))).toEqual([]);
+    expect(settings.sandbox.filesystem.allowWrite).toEqual([actionTempOf(planner), planDirectory]);
+    expect(settings.sandbox.filesystem.denyWrite).toEqual(expect.arrayContaining([workspace, join(dataDirectory, "codex-home"), join(dataDirectory, "consensus-room.sqlite")]));
+    expect(settings.sandbox.filesystem.denyWrite).not.toContain(dataDirectory);
+    // 읽기 범위는 계획 폴더 없는 같은 턴과 같고 계획 폴더만 더해진다(턴 임시 폴더는 턴마다 다르다).
+    const reads = (call: CommandSpec) => settingsOf(call).sandbox.filesystem.allowRead.filter(path => path !== actionTempOf(call));
+    expect(reads(planner)).toEqual([...reads(baseline), planDirectory]);
+    // 계획 폴더가 없는 planner 턴은 바뀌지 않는다 — 쓰기 도구 없음, 작업 폴더 쓰기 차단.
+    expect(baseline.args[baseline.args.indexOf("--tools") + 1]).not.toContain("Edit");
+    expect(settingsOf(baseline).sandbox.filesystem.allowWrite).toEqual([actionTempOf(baseline)]);
+  });
+
+  // ⑧ S2(Codex 289): 데이터 폴더는 resolve 만 한 별칭 철자로, 계획 폴더는 실제 경로로 들어왔다. 철자로 비교하면 포함 관계를 놓쳐 데이터 폴더 전체
+  // 거부가 계획 폴더를 덮는다. 비교는 실제 경로로 하고, 남는 거부 항목은 넘겨받은 철자다.
+  it("Claude: 보호 경로가 별칭 철자이고 계획 폴더가 실제 경로여도 그 폴더로 가는 길만 깎는다", async () => {
+    const { dataDirectory, planDirectory } = room();
+    mkdirSync(join(dataDirectory, "worktrees", "topic-b"));
+    const alias = `${dataDirectory}-alias`;
+    symlinkSync(dataDirectory, alias);
+    temporaryDirectories.push(alias);
+    const workspace = join(alias, "worktrees", "topic-a");
+    const runner = new RecordingRunner(successfulResult([planResult]));
+    const adapter = new ClaudeAdapter(runner, undefined, { protectedWritePaths: [alias] });
+
+    await adapter.createSession(plannerTurn(workspace, planDirectory));
+
+    const settings = settingsOf(runner.calls[0]);
+    expect(settings.permissions.allow.filter(rule => /^(Edit|Write)\(/.test(rule))).toEqual([`Edit(/${planDirectory}/**)`, `Write(/${planDirectory}/**)`]);
+    // 계획 폴더를 덮는 상위 경로는 두 철자 어느 쪽으로도 남지 않는다.
+    const ancestors = [[], ["topics"], ["topics", "topic-a"], ["topics", "topic-a", "generation-1"]]
+      .flatMap(parts => [join(alias, ...parts), join(dataDirectory, ...parts)]);
+    expect(settings.permissions.deny.filter(rule => ancestors.some(path => rule.endsWith(`(/${path})`) || rule.endsWith(`(/${path}/**)`)))).toEqual([]);
+    expect(settings.sandbox.filesystem.denyWrite.filter(path => ancestors.includes(path))).toEqual([]);
+    expect(settings.sandbox.filesystem.allowWrite).toEqual([actionTempOf(runner.calls[0]), planDirectory]);
+    // 원장·다른 토픽·형제 작업 트리·작업 폴더·Git·codex-home 은 넘겨받은 철자로 계속 막힌다.
+    const blocked = [join(alias, "consensus-room.sqlite"), join(alias, "topics", "topic-b"), join(alias, "worktrees"), workspace,
+      join(workspace, ".git"), join(alias, "codex-home")];
+    expect(settings.permissions.deny).toEqual(expect.arrayContaining(blocked.map(path => `Write(/${path}/**)`)));
+    expect(settings.sandbox.filesystem.denyWrite).toEqual(expect.arrayContaining(blocked));
+    // 남은 거부 항목의 실제 위치가 보호 대상의 실제 경로를 덮는다.
+    expect(settings.sandbox.filesystem.denyWrite.filter(path => existsSync(path)).map(path => realpathSync(path))).toEqual(expect.arrayContaining([
+      join(dataDirectory, "consensus-room.sqlite"), join(dataDirectory, "topics", "topic-b"), join(dataDirectory, "worktrees"), join(dataDirectory, "codex-home")]));
+  });
+
+  it("Codex: 읽기 프로필에서 계획 폴더와 턴 임시 폴더만 write 이고 작업 폴더는 read 다", async () => {
+    const { workspace, planDirectory } = room();
+    const runner = new RecordingRunner(successfulResult([{ type: "thread.started", thread_id: "thread-plan" }, planResult]));
+    const { adapter } = codexAdapter(runner);
+
+    await adapter.createSession(plannerTurn(workspace, planDirectory));
+
+    const config = readFileSync(join(adapter.managedHomeFor(workspace), "config.toml"), "utf8");
+    const writes = config.split("\n").filter(line => line.endsWith('= "write"')).map(line => JSON.parse(line.slice(0, line.lastIndexOf(" = "))) as string);
+    expect(writes).toEqual([planDirectory, actionTempOf(runner.calls[0])]);
+    expect(config).toContain(`${JSON.stringify(workspace)} = "read"`);
+    expect(config).toContain('default_permissions = "consensus-review"');
+    expect(config).toContain('description = "Consensus Room planner (plan folder write)"');
+  });
+
+  it("계획 폴더는 도구가 열린 planner 턴의 작업 폴더 밖 실제 디렉터리만 받고, 어기면 CLI 실행 전에 거부한다", async () => {
+    const { workspace, planDirectory } = room();
+    const linked = join(dirname(planDirectory), "linked-plan");
+    symlinkSync(planDirectory, linked);
+    const runner = new RecordingRunner(successfulResult([planResult]));
+    const adapter = new ClaudeAdapter(runner);
+
+    const cases: [PlannerTurn, string][] = [
+      [plannerTurn(workspace, planDirectory, { job: { role: "reviewer", operation: "audit" } }), "planner 턴에만"],
+      [plannerTurn(workspace, planDirectory, { job: { role: "planner", operation: "ack" } }), "planner 턴에만"],
+      [plannerTurn(workspace, planDirectory, { planMode: true }), "plan 권한 모드"],
+      [plannerTurn(workspace, "topics/plan"), "정규화된 절대 경로"],
+      [plannerTurn(workspace, linked), "심볼릭 링크가 아닌 디렉터리"],
+      [plannerTurn(workspace, join(workspace, "plan")), "계획 폴더가 없습니다"],
+      [plannerTurn(workspace, workspace), "작업 폴더와 겹칠 수 없습니다"],
+    ];
+    for (const [turn, reason] of cases) await expect(adapter.createSession(turn)).rejects.toThrow(reason);
+    expect(runner.calls).toEqual([]);
+  });
+});
 
 // 감사 ①(2026-08)에서는 모든 주제가 하나의 CODEX_HOME/config.toml 을 덮어써 전체 직렬로 막았다. 2026-09-07 부터는
 // worktree 마다 관리형 홈을 두므로 다른 주제는 **동시에** 돌고(상한 maxConcurrentTurns), 같은 주제는 직렬이며,
@@ -2042,9 +2073,9 @@ describe("러너 auto-compact 임계값", () => {
     expect(settings.autoCompactWindow).toBe(expected);
     expect(usage.at(-1)?.autoCompactWindowTokens).toBe(expected);
   });
-  it("keeps tool-free planning outside autonomous context sizing", async () => {
+  it("keeps tool-free turns outside autonomous context sizing", async () => {
     const runner=new RecordingRunner(successfulResult([planResult]));
-    await new ClaudeAdapter(runner).resumeTurn({sessionId:"s",cwd:"/tmp",prompt:"plan",planningControl:{admissionId:"a",maxPromptBytes:1000000},
+    await new ClaudeAdapter(runner).resumeTurn({sessionId:"s",cwd:"/tmp",prompt:"plan",protocolOnly:true,
       executionBudget:{inputTokens:9000000,outputTokens:240000,durationMs:2400000}});
     const args=runner.calls[0].args;
     expect(JSON.parse(args[args.indexOf("--settings")+1]).autoCompactWindow).toBe(800000);
@@ -2165,8 +2196,7 @@ it.each([
   }
 });
 
-it.each([{ implementation: false, figmaReadEnabled: true }, { implementation: true }, { implementation: true, protocolOnly: true, figmaReadEnabled: true },
-  { implementation: true, figmaReadEnabled: true, planningControl: { admissionId: "plan", maxPromptBytes: 65536 } }])(
+it.each([{ implementation: false, figmaReadEnabled: true }, { implementation: true }, { implementation: true, protocolOnly: true, figmaReadEnabled: true }])(
   "does not expose Figma during planning or protocol turns: %j", async mode => {
     const runner = new RecordingRunner(successfulResult([planResult]));
     await new ClaudeAdapter(runner, undefined, { figmaMcpUrl: "http://127.0.0.1:3845/mcp" }).createSession({

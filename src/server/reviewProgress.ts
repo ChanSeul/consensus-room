@@ -1,7 +1,7 @@
 import { reviewScope, type ReviewScope } from "../shared/reviews.js";
 import { jobOfTurn } from "./adapters/turnPolicy.js";
 import type { ConsensusDatabase } from "./database.js";
-import type { AgentAdapter, SessionTurn } from "./types.js";
+import { nextEnvelopeMethod, type AgentAdapter, type SessionTurn } from "./types.js";
 
 export function reviewProgressReason(scope: ReviewScope, count: number): string {
   return `${scope === "planning" ? "계획 리뷰" : "구현 리뷰"} 왕복 ${count}회 점검: ` +
@@ -33,5 +33,14 @@ export function monitorReviewProgress(adapter: AgentAdapter, database: Consensus
     createSession: turn => run(turn, () => adapter.createSession(turn)),
     resumeTurn: turn => run(turn, () => adapter.resumeTurn(turn)),
     ...(adapter.resumePlanRepair ? { resumePlanRepair: (turn: SessionTurn) => run(turn, () => adapter.resumePlanRepair!(turn)) } : {}),
+    // 결과 봉투 턴의 리뷰어 응답도 한 번의 실제 응답이다 — 위 펼침이 아니라 같은 기록(run)을 거쳐 넘긴다.
+    createEnvelopeSession: async turn => {
+      const next = nextEnvelopeMethod(adapter, "createEnvelopeSession");
+      return run(turn, () => next(turn));
+    },
+    resumeEnvelopeTurn: async turn => {
+      const next = nextEnvelopeMethod(adapter, "resumeEnvelopeTurn");
+      return run(turn, () => next(turn));
+    },
   };
 }

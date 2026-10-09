@@ -22,7 +22,8 @@ const runSchema = z.object({
   // 엔진 실행 이전의 기록은 모두 CLI 실행이다.
   executor: z.enum(["engine", "mediator-cli"]).default("mediator-cli"),
   status: z.enum(["running", "succeeded", "failed", "cancelled", "timed_out", "stale"]),
-  scopeGeneration: z.number(), planEpoch: z.number(), planSHA256: z.string(),
+  // planSHA256 은 실행 시점 토픽 계획의 기록이다 — 계획 없이 시작한 ticket 토픽은 null(검사 실행의 조건이 아니다, CR 흐름 단순화 v3.10 (19')).
+  scopeGeneration: z.number(), planEpoch: z.number(), planSHA256: z.string().nullable(),
   inputSHA256: z.string(), toolSHA256: z.string(), startedAt: z.number(),
   finishedAt: z.number().optional(), durationMs: z.number().optional(), logSHA256: z.string().optional(),
   completionSHA256: z.string().optional(),
@@ -189,7 +190,7 @@ export class VerificationService {
         await this.assertContext(topicId, profileId, context.cacheKey);
         const run: VerificationRun = {
           id, topicId, cacheKey: context.cacheKey, profileId, executor, status: "running", scopeGeneration: context.topic.scopeGeneration,
-          planEpoch: context.topic.planEpoch, planSHA256: context.topic.planSHA256!,
+          planEpoch: context.topic.planEpoch, planSHA256: context.topic.planSHA256 ?? null,
           inputSHA256: context.inputSHA256, toolSHA256: context.toolSHA256, startedAt: this.clock(),
         };
         this.database.saveVerification(run);
@@ -259,8 +260,8 @@ export class VerificationService {
       // 산출물을 기록하는 동안 주제 변경이 끼어들면 성공을 재사용하지 않는다.
       if (status === "succeeded") {
         const current = this.database.getTopic(topicId);
-        if (current.scopeGeneration !== run.scopeGeneration || current.planEpoch !== run.planEpoch ||
-            current.approvedPlanSHA256 !== run.planSHA256 || current.planSHA256 !== run.planSHA256) status = "stale";
+        if (current.scopeGeneration !== run.scopeGeneration || current.planEpoch !== run.planEpoch || (current.planSHA256 ?? null) !== run.planSHA256 ||
+            (current.workflowMode === "planned" && current.approvedPlanSHA256 !== run.planSHA256)) status = "stale";
       }
       const finished: VerificationRun = { ...run, status, finishedAt: this.clock(), durationMs: input.durationMs,
         logSHA256: log.sha256, completionSHA256 };
@@ -310,8 +311,9 @@ export class VerificationService {
   }
 
   private async context(topicId: string, profileId: VerificationProfileId) {
+    // planned 는 승인된 현재 계획 아래에서만 검사한다. ticket 은 계획 없이 시작하므로 계획 승인을 실행 조건으로 두지 않는다(CR 흐름 단순화 v3.10 (19')).
     const topic = this.database.getTopic(topicId);
-    if (!topic.planSHA256 || topic.approvedPlanSHA256 !== topic.planSHA256) throw new Error("승인된 현재 계획이 필요합니다.");
+    if (topic.workflowMode === "planned" && (!topic.planSHA256 || topic.approvedPlanSHA256 !== topic.planSHA256)) throw new Error("승인된 현재 계획이 필요합니다.");
     const profileRuntime = runtime(profileId);
     const git = this.git;
     const profileContext: ProfileContext = { worktree: topic.worktreePath, dataDirectory: this.dataDirectory,
@@ -325,7 +327,8 @@ export class VerificationService {
     const toolSHA256 = await profileRuntime.toolSHA(profile, topic.worktreePath);
     const current = this.database.getTopic(topicId);
     if (current.scopeGeneration !== topic.scopeGeneration || current.planEpoch !== topic.planEpoch ||
-        current.planSHA256 !== topic.planSHA256 || current.approvedPlanSHA256 !== topic.planSHA256 ||
+        current.planSHA256 !== topic.planSHA256 || current.workflowMode !== topic.workflowMode ||
+        (topic.workflowMode === "planned" && current.approvedPlanSHA256 !== topic.planSHA256) ||
         current.worktreePath !== topic.worktreePath) throw new Error("검사 준비 중 승인 범위가 바뀌었습니다.");
     // 프로필 객체는 그대로 해시한다 — 단일 프로필 시절 기록의 cacheKey(프로필 id 를 따로 넣지 않음)가 그대로 재사용된다.
     const cacheKey = sha(JSON.stringify({ topicId, scope: topic.scopeGeneration, epoch: topic.planEpoch,

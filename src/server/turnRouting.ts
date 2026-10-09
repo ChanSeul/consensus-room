@@ -1,5 +1,4 @@
 import { AgentExecutionSettingsSchema, type AgentExecutionSettings, type RoutingView, type Topic, type WorkflowState } from "../shared/contracts.js";
-import { isPlanRevision } from "../shared/diagnoses.js";
 import { appliedExecutionSettings } from "../shared/execution.js";
 import { providerOptionsProblem, TURN_OPERATIONS, turnFlags, type AgentProfile, type RoleAssignment, type TurnJob, type TurnRole } from "../shared/roles.js";
 import { providerRoleOptionsProblem, providerSupport, turnPolicy } from "./adapters/turnPolicy.js";
@@ -132,16 +131,16 @@ export function designReadRequested(database: ConsensusDatabase, topicId: string
   return turnFlags(job).implementation && database.evidence.list(topicId).some(source => source.provider === "figma");
 }
 
-// 지원 판정 — 공급자 이름 목록이 아니라 job 의 역할 정책(turnPolicy)과 공급자 표현 가능 여부로 정한다. 도구가 닫히는 턴(프로토콜 확인·계획 제어)은
-// 팬아웃이 없어 검토자 턴도 Claude 로 표현할 수 있다. planningControl 은 호출자가 래퍼와 같은 식(guardedPlanning.planningControlApplies)으로 계산해 넘긴다.
-export function routeSupport(route: TurnRoute, planningControl: boolean, figmaRequested = false): string | null {
+// 지원 판정 — 공급자 이름 목록이 아니라 job 의 역할 정책(turnPolicy)과 공급자 표현 가능 여부로 정한다. 판정 형태는 실제 실행 턴이다 — 운영 경로
+// (EngineCore.route·TurnExecutor·routingView)와 세션 설정 저장(sessionSettings)이 증거 래퍼의 Figma 요구(designReadRequested)를 같은 식으로 넘긴다.
+export function routeSupport(route: TurnRoute, figmaRequested = false): string | null {
   const flags = turnFlags(route.job);
-  return providerRoleOptionsProblem(route.provider, route.job, route.options) ?? providerSupport(route.provider, turnPolicy(route.job, { protocolOnly: flags.protocolOnly, planningControl, figmaRequested }));
+  return providerRoleOptionsProblem(route.provider, route.job, route.options) ?? providerSupport(route.provider, turnPolicy(route.job, { protocolOnly: flags.protocolOnly, figmaRequested }));
 }
 
 // 프로필 역할 적합성(plan §2.5 "프로필 조회·검증", E2c) — 이 프로필을 배정하면 역할·작업마다 실행할 수 있는지와 사유. 경로 판정과 같은 함수(설정 스키마·
-// 옵션 스펙·providerSupport)로 계산한다. 판정 형태는 도구가 열린 기본 턴이다(계획 제어 턴은 도구를 닫아 요구가 줄어든다). 구현 job 은 토픽에 디자인
-// 소스가 있을 때(Figma 관측 요구)의 판정을 따로 준다.
+// 옵션 스펙·providerSupport)로 계산한다. 판정 형태는 도구가 열린 기본 턴이다. 구현 job 은 토픽에 디자인 소스가 있을 때(Figma 관측 요구)의
+// 판정을 따로 준다.
 export interface JobSuitability { job: TurnJob; reason: string | null; withDesignSources: string | null }
 export interface ProfileSuitability { profileId: string; provider: Provider; problem: string | null; jobs: JobSuitability[] }
 
@@ -162,46 +161,40 @@ export function profileSuitability(profile: AgentProfile): ProfileSuitability {
   return { profileId: profile.id, provider: profile.provider, problem, jobs };
 }
 
-// 두 좌석이 단계마다 실행하거나 다음에 여는 작업 — 엔진 호출 지점의 core.route 인자와 같다: 계획(planning.ts) plan·audit·revision·closeout·ack,
-// 구현(delivery.ts) implement·review·fix·final-review. 계속 진행·확인·교정 같은 하위 턴은 여는 작업의 경로를 따르므로(E2b) 여는 작업으로 충분하다.
-// 쉬는 좌석은 그 흐름에서 다음에 열 작업이다. 다음 턴이 없는 전달·종료 상태는 구현 단계의 대표 작업(implement·review)이다.
-const plannerJob = (operation: "brainstorm" | "plan" | "revision" | "diagnosis-revision" | "ack"): TurnJob => ({ role: "planner", operation });
+// 두 좌석이 단계마다 실행하거나 다음에 여는 작업 — 엔진 호출 지점의 core.route 인자와 같다: 계획(planning.ts) plan·audit·revision,
+// 구현(delivery.ts) implement·review·fix. 계속 진행·확인·교정 같은 하위 턴은 여는 작업의 경로를 따르므로(E2b) 여는 작업으로 충분하다.
+// 쉬는 좌석은 그 흐름에서 다음에 열 작업이다(계획 수정 뒤 검토 audit, 수정 뒤 리뷰 review). 다음 턴이 없는 전달·종료 상태는 구현 단계의 대표
+// 작업(implement·review)이다.
+const plannerJob = (operation: "brainstorm" | "plan" | "revision"): TurnJob => ({ role: "planner", operation });
 const implementerJob = (operation: "implement" | "fix"): TurnJob => ({ role: "implementer", operation });
-const reviewerJob = (operation: "brainstorm" | "audit" | "closeout" | "ack" | "review" | "final-review"): TurnJob => ({ role: "reviewer", operation });
+const reviewerJob = (operation: "brainstorm" | "audit" | "review"): TurnJob => ({ role: "reviewer", operation });
 const STAGE_JOBS: Readonly<Partial<Record<WorkflowState, { author: TurnJob; reviewer: TurnJob }>>> = {
   BRAINSTORM_READY: { author: plannerJob("brainstorm"), reviewer: reviewerJob("brainstorm") },
   BRAINSTORMING: { author: plannerJob("brainstorm"), reviewer: reviewerJob("brainstorm") },
   DRAFT: { author: plannerJob("plan"), reviewer: reviewerJob("audit") },
   CLAUDE_PLAN: { author: plannerJob("plan"), reviewer: reviewerJob("audit") },
   CODEX_AUDIT: { author: plannerJob("revision"), reviewer: reviewerJob("audit") },
-  CLAUDE_REVISION: { author: plannerJob("revision"), reviewer: reviewerJob("closeout") },
-  CODEX_CLOSEOUT: { author: plannerJob("ack"), reviewer: reviewerJob("closeout") },
-  CONSENSUS_ACK: { author: plannerJob("ack"), reviewer: reviewerJob("ack") },
+  CLAUDE_REVISION: { author: plannerJob("revision"), reviewer: reviewerJob("audit") },
   AWAITING_USER_APPROVAL: { author: implementerJob("implement"), reviewer: reviewerJob("review") },
   IMPLEMENTING: { author: implementerJob("implement"), reviewer: reviewerJob("review") },
   CODEX_REVIEW: { author: implementerJob("fix"), reviewer: reviewerJob("review") },
-  CLAUDE_FIX: { author: implementerJob("fix"), reviewer: reviewerJob("final-review") },
-  CODEX_FINAL_REVIEW: { author: implementerJob("fix"), reviewer: reviewerJob("final-review") },
+  CLAUDE_FIX: { author: implementerJob("fix"), reviewer: reviewerJob("review") },
   READY_TO_DELIVER: { author: implementerJob("implement"), reviewer: reviewerJob("review") },
   CLOSED: { author: implementerJob("implement"), reviewer: reviewerJob("review") },
 };
 
-// 좌석별 현재 작업 — 멈춘 상태(실패·결정 대기·증거 대기)는 재개 단계로 본다. 적용된 계획 변경 진단이 있으면 재시도는 단계와 무관하게 진단 계획 개정으로
-// 간다(workflow.retry → DiagnosisService.pendingPlanRevision: 현재 범위 세대의 plan-revision 적용 기록 중 상태 applied) — 같은 판정을 여기서도 쓴다.
+// 좌석별 현재 작업 — 멈춘 상태(실패·결정 대기)는 재개 단계로 본다.
 export function currentSeatJobs(database: ConsensusDatabase, topic: Topic): { author: TurnJob; reviewer: TurnJob } {
   const stage = STAGE_JOBS[topic.state] ? topic.state : (database.getFlags(topic.id).resumeState ?? "DRAFT");
-  const jobs = STAGE_JOBS[stage] ?? STAGE_JOBS.DRAFT!;
-  const planRevisionPending = database.diagnoses.list(topic.id)
-    .some(record => record.binding.scopeGeneration === topic.scopeGeneration && isPlanRevision(record) && record.status === "applied");
-  return planRevisionPending ? { ...jobs, author: plannerJob("diagnosis-revision") } : jobs;
+  return STAGE_JOBS[stage] ?? STAGE_JOBS.DRAFT!;
 }
 
 // 부속 턴의 부모 작업(host-review F003) — 엔진은 여는 작업의 배정·세션으로 부속 턴을 실행하고 job 만 바꾼다(부속 작업에 따로 둔 배정은 적용되지 않는다):
 // 구현자의 계속 진행·완료 확인·허용 오차 교정·계약 교정은 지금의 작업(implement·fix — delivery.workRoute), 검토자의 답변 확인·리뷰 읽기(E3-4c)는 지금의
-// 리뷰(review·final-review — delivery.confirmReviewAnswers·runReviewOnce, 모델·추론 설정을 낮추지 않고 그대로 쓴다), 설계자·검토자의 계획 교정·계약 교정은
+// 리뷰(review — delivery.confirmReviewAnswers·runReviewOnce, 모델·추론 설정을 낮추지 않고 그대로 쓴다), 설계자·검토자의 계획 교정·계약 교정은
 // 그 역할이 지금 여는 작업(core 의 plan-repair·contract-correction). 확인(ack)은 엔진이 따로 경로를 정하는 독립 작업이다. 부속 턴이 아니면 null.
 const INHERITING_OPERATIONS: Readonly<Record<TurnRole, readonly string[]>> = {
-  planner: ["evidence-assessment", "plan-repair", "contract-correction"],
+  planner: ["plan-repair", "contract-correction"],
   reviewer: ["answer-confirmation", "review-read", "plan-repair", "contract-correction"],
   implementer: ["continue", "completion-confirmation", "tolerance-correction", "contract-correction"],
 };
@@ -209,18 +202,14 @@ const INHERITING_OPERATIONS: Readonly<Record<TurnRole, readonly string[]>> = {
 function inheritedParent(job: TurnJob, current: { author: TurnJob; reviewer: TurnJob }): TurnJob | null {
   if (!INHERITING_OPERATIONS[job.role].includes(job.operation)) return null;
   if (job.role === "implementer") return current.author.role === "implementer" ? current.author : implementerJob("implement");
-  if (job.operation === "evidence-assessment") return plannerJob("plan");
-  if (job.role === "planner") return current.author.role === "planner" && current.author.operation !== "ack" ? current.author : plannerJob("plan");
-  if (job.operation === "answer-confirmation" || job.operation === "review-read") {
-    return current.reviewer.operation === "final-review" ? reviewerJob("final-review") : reviewerJob("review");
-  }
-  return current.reviewer.operation === "ack" ? reviewerJob("audit") : current.reviewer;
+  if (job.role === "planner") return current.author.role === "planner" ? current.author : plannerJob("plan");
+  if (job.operation === "answer-confirmation" || job.operation === "review-read") return reviewerJob("review");
+  return current.reviewer;
 }
 
 // 역할과 실제 실행 AI 의 표시용 값(E2c C3) — 모든 역할·작업의 실제 경로(또는 실행 전 거부 사유)와 네 좌석 세션의 바인딩. 경로·거부는 엔진 경로 판정
-// (EngineCore.route)과 같은 함수·같은 턴 형태로 계산한다 — 화면이 실제 실행과 다른 AI 를 보여 주지 않게. 계획 제어 여부는 호출자가 넘긴다
-// (guardedPlanning 이 이 모듈을 import 하므로 순환을 피한다).
-export function routingView(database: ConsensusDatabase, topic: Topic, planningControl: (job: TurnJob) => boolean): RoutingView {
+// (EngineCore.route)과 같은 함수·같은 턴 형태로 계산한다 — 화면이 실제 실행과 다른 AI 를 보여 주지 않게.
+export function routingView(database: ConsensusDatabase, topic: Topic): RoutingView {
   const current = currentSeatJobs(database, topic);
   const jobs = (Object.keys(TURN_OPERATIONS) as TurnRole[]).flatMap(role =>
     (TURN_OPERATIONS[role] as readonly string[]).map(operation => {
@@ -230,7 +219,7 @@ export function routingView(database: ConsensusDatabase, topic: Topic, planningC
         // 부속 턴은 부모 작업의 경로에 job 만 바꾼다 — 엔진(delivery.workRoute·confirmReviewAnswers, core 의 plan-repair·contract-correction)과 같다.
         const route = { ...resolveRoute(database, topic, parent ?? job), job };
         return { role, operation, inheritsFrom: parent?.operation ?? null, route: { ...bindingOf(route), settings: route.settings },
-          refusal: routeSupport(route, planningControl(job), designReadRequested(database, topic.id, job)) };
+          refusal: routeSupport(route, designReadRequested(database, topic.id, job)) };
       } catch (error) {
         if (!(error instanceof UnsupportedRoute)) throw error;
         return { role, operation, inheritsFrom: parent?.operation ?? null, route: null, refusal: error.message };

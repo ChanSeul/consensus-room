@@ -160,7 +160,7 @@ it("resuming REST pagination replaces old pages and links with the complete host
 function fixture() {
   const path = mkdtempSync(join(tmpdir(),"catalog-")); const db = new ConsensusDatabase(join(path,"db"));
   cleanup.push(() => { db.close(); rmSync(path,{recursive:true,force:true}); });
-  const topic = (id: string) => db.createTopic({ id, slug:id, title:id, repositoryPath:path, worktreePath:path,
+  const topic = (id: string) => db.createTopic({ workflowMode: "planned", id, slug:id, title:id, repositoryPath:path, worktreePath:path,
     baseRef:"main", branchName:null, state:"DRAFT", scopeGeneration:1, planRevision:0, planSHA256:null,
     approvedPlanSHA256:null, createdAt:new Date().toISOString(), updatedAt:new Date().toISOString(), lastError:null });
   topic("a"); topic("b"); topic("closed");
@@ -343,7 +343,7 @@ it("a source the server's app reader collects has one writer: the host list skip
   const jira=c.add("a",{...input("https://team.atlassian.net/browse/APP-1"),mode:"connector"},true);
   const page=c.add("a",{...input("https://docs.example.com/policy"),mode:"connector"},true);
   const native={configured:(source:EvidenceSource)=>source.provider!=="document",fetch:async()=>{throw Error("unused");}};
-  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("Host only");}},undefined,undefined,native);
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("Host only");}},undefined,native);
   try {
     expect(service.hostPlan("a").requests.map(read=>read.sourceId)).toEqual([page.sourceId]);
     const version=c.version("a"),before=db.evidence.get(jira.sourceId),members=c.members(jira.id);
@@ -372,7 +372,7 @@ it("a shared document the app reader cannot read keeps its host capture for ever
   expect(second.sourceId).toBe(first.sourceId);
   const discover=vi.fn(async()=>{throw Error("The app reader cannot read documents");});
   const native={configured:(source:EvidenceSource)=>source.provider!=="document",fetch:async()=>{throw Error("unused");},discover};
-  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("Host only");}},undefined,undefined,native);
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("Host only");}},undefined,native);
   try {
     const imported=service.importHost("a",{version:c.version("a"),rootId:first.id,sourceId:first.sourceId,previousHash:null,previousCheckedAt:null,
       observedAt:Date.now(),revision:"host",units:[{id:"body",kind:"document",content:"Shared policy"}],missing:[]});
@@ -394,7 +394,7 @@ it("a Figma source the app reader reads only partly keeps the host supplement, w
   const discover=vi.fn(async()=>({units:[{id:"get_metadata:0",kind:"design" as const,content:"Reader design"}],links:[],cursor:null,
     revision:"reader",missing:["The app reader returns no Figma comments."]}));
   const native={configured:(source:EvidenceSource)=>source.provider!=="document",fetch:async()=>{throw Error("unused");},discover};
-  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("Host only");}},undefined,undefined,native);
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("Host only");}},undefined,native);
   try {
     expect(service.hostPlan("a").requests.map(read=>read.sourceId)).toEqual([design.sourceId]);
     await service.collect(design.id);
@@ -480,7 +480,8 @@ it("Jira roots belong to separate groups, inherit into new stages, and only expl
   expect(()=>catalog.add("a",input("https://team.atlassian.net/browse/APP-3","workspace"),true)).toThrow("작업 그룹");
   expect(db.getTopic("closed").state).toBe("CLOSED");
 });
-it("approval is versioned, removal starts fresh sessions and preserves snapshots and closed plans", () => {
+// 근거 범위 변경은 토픽을 초기화하지 않는다(CR 흐름 단순화 D6) — 계획·승인·산출물·세션을 그대로 두고, 사용자 행동은 catalog history 에 남는다.
+it("approval is versioned; removal keeps the topic's plan, approval, artifacts and sessions, preserves snapshots and closed plans, and records the action", () => {
   const {db} = fixture(); const c = db.evidence.catalog;
   const root = c.add("a",input("https://team.atlassian.net/browse/APP-1"));
   expect(db.evidence.list("a")).toHaveLength(0);
@@ -497,15 +498,52 @@ it("approval is versioned, removal starts fresh sessions and preserves snapshots
   c.select("a",{version:c.version("a"),rootId:root.id,action:"remove"});
   expect(db.evidence.list("a")).toHaveLength(0);
   expect(db.evidence.snapshot(root.sourceId,snap.contentHash!)!.units[0].content).toBe("historical");
-  expect(db.getTopic("a").planSHA256).toBeNull();
-  expect(db.latestArtifact("a","plan")).toBeNull();
-  expect(db.artifactsForScope("a","plan")).toEqual([]);
-  expect(db.latestArtifactRevision("a","plan")).toBe(1);
-  db.addArtifact("a",{kind:"plan",revision:2,scopeGeneration:1,sha256:"b".repeat(64),path:"/current-plan",createdAt:new Date().toISOString()});
-  expect(db.latestArtifact("a","plan")?.path).toBe("/current-plan");
-  expect(db.getTopic("a").participants[0].sessionId).toMatch(/^pending:/);
+  expect(db.getTopic("a")).toMatchObject({ state:"AWAITING_USER_APPROVAL", planSHA256:"a".repeat(64), approvedPlanSHA256:"a".repeat(64) });
+  expect(db.latestArtifact("a","plan")?.path).toBe("/historical-plan");
+  expect(db.getTopic("a").participants[0].sessionId).toBe("old-session");
   expect(db.getTopic("closed")).toEqual(closed);
   expect(c.state("a").history[0].action).toBe("앞으로 사용할 근거에서 해제");
+});
+// 승인 루트가 있는 토픽도 근거 범위에서 빠진 원문을 다음 턴 근거 입력에 싣는다(계약 v3.12 (7'')) — 세션 영수증에 있는데 현재 원문 목록에 없는 원문이다.
+it("a session of a topic with approved roots is told which received sources left the scope, again after a failed turn and not after a successful one", () => {
+  const {db}=fixture(),c=db.evidence.catalog;
+  const kept=c.add("a",input("https://team.atlassian.net/browse/APP-1"),true), dropped=c.add("a",input("https://team.atlassian.net/browse/APP-2"),true);
+  for (const root of [kept,dropped]) {
+    const check=db.evidence.begin(root.sourceId,true)!;
+    db.evidence.ingest(root.sourceId,{checkId:check.checkId,revision:"r",units:[{id:"body",kind:"issue",content:root.sourceId}]});
+  }
+  const binding=()=>db.getTopic("a"), notice="근거 범위에서 빠진 원문";
+  const first=db.evidence.packet(binding(),"claude","s1");
+  expect(first.entries).toEqual([]); expect([...first.links].sort()).toEqual([kept.sourceId,dropped.sourceId].sort());
+  db.evidence.receipt(binding(),"claude","s1",first);
+  c.select("a",{version:c.version("a"),rootId:dropped.id,action:"remove"});
+  const removed=db.evidence.packet(binding(),"claude","s1");
+  expect(removed.entries).toEqual([{type:"removedSource",sourceId:dropped.sourceId}]);
+  expect(removed.text).toContain(notice); expect(removed.text).toContain("https://team.atlassian.net/browse/APP-2");
+  expect(db.evidence.packet(binding(),"claude","other-session").entries).toEqual([]);
+  // 실패한 턴은 영수증을 남기지 않으므로 다음 턴에 같은 제거가 다시 실린다.
+  expect(db.evidence.packet(binding(),"claude","s1").entries).toEqual(removed.entries);
+  db.evidence.receipt(binding(),"claude","s1",removed);
+  const after=db.evidence.packet(binding(),"claude","s1");
+  expect(after.entries).toEqual([]); expect(after.text).not.toContain(notice);
+  // 조회 오류로 잠시 못 쓰는 원문은 범위에 남아 있으므로 제거로 알리지 않는다.
+  const check=db.evidence.begin(kept.sourceId,true)!; db.evidence.failed(kept.sourceId,check.checkId,"429");
+  expect(db.evidence.topic(binding()).deferred).toEqual([expect.objectContaining({sourceId:kept.sourceId})]);
+  const deferred=db.evidence.packet(binding(),"claude","s1");
+  expect(deferred.entries).toEqual([]); expect(deferred.text).not.toContain(notice);
+  // 중재자 기록은 기존 catalog history 다.
+  expect(c.state("a").history[0]).toMatchObject({action:"앞으로 사용할 근거에서 해제",url:"https://team.atlassian.net/browse/APP-2"});
+});
+// 79fc4fc5 F013: 승인 루트가 있는 토픽의 근거 packet 은 결과 봉투에 없는 처분(DEFERRED_OUT_OF_SCOPE·evidenceGap) 지침을 싣지 않는다. 엔진이 기록한 근거
+// 공백 수(근거 확보 To-do)는 상태 수치로 남는다.
+it("a root evidence packet carries no retired result-disposition guidance", () => {
+  const {db}=fixture(),c=db.evidence.catalog;
+  const root=c.add("a",input("https://team.atlassian.net/browse/APP-1"),true);
+  const check=db.evidence.begin(root.sourceId,true)!;
+  db.evidence.ingest(root.sourceId,{checkId:check.checkId,revision:"r",units:[{id:"body",kind:"issue",content:"body"}]});
+  const packet=db.evidence.packet(db.getTopic("a"),"claude","s1");
+  expect(packet.text).toContain("근거 확보 To-do: 0개");
+  for (const retired of ["DEFERRED_OUT_OF_SCOPE","evidenceGap"]) expect(packet.text).not.toContain(retired);
 });
 it("a durable frontier collects more than 64 children and requires human approval of newly discovered external documents", async () => {
   const {db} = fixture(); const c = db.evidence.catalog;
@@ -596,15 +634,15 @@ it("committed and closed stages keep their evidence while new stages receive fut
   topic('later');expect(db.evidence.list('later').map(s=>s.url)).toContain('https://example.com/shared');
 });
 
-it("replanning preserves finding ledgers and clears flags from the previous plan cycle", () => {
+it("an evidence scope change keeps the plan, finding ledgers and cycle flags", () => {
   const {db}=fixture(),c=db.evidence.catalog;
   db.updateTopic('a',{fixPassUsed:true,secondFixPassUsed:true,closeoutRevisionUsed:true});
   for (const kind of ['implementation-notes','deferred-findings','plan']) db.addArtifact('a',{kind,revision:1,scopeGeneration:1,sha256:'a'.repeat(64),path:`/${kind}`,createdAt:new Date().toISOString()});
   c.add('a',input('https://example.com/source'),true);
   expect(db.latestArtifact('a','implementation-notes')?.path).toBe('/implementation-notes');
   expect(db.latestArtifact('a','deferred-findings')?.path).toBe('/deferred-findings');
-  expect(db.latestArtifact('a','plan')).toBeNull();
-  expect(db.getFlags('a')).toMatchObject({fixPassUsed:false,secondFixPassUsed:false,closeoutRevisionUsed:false});
+  expect(db.latestArtifact('a','plan')?.path).toBe('/plan');
+  expect(db.getFlags('a')).toMatchObject({fixPassUsed:true,secondFixPassUsed:true,closeoutRevisionUsed:true});
 });
 
 it("transient failures retain the cursor, no-op collection preserves dates, and force starts a new cycle", async () => {
@@ -676,7 +714,7 @@ it("Slack invalid_cursor responses restart while other HTTP 200 API failures pre
   }
 });
 
-it("새 루트의 승인 재사용은 선택된 기존 루트의 계획도 무효화한다", async () => {
+it("새 루트의 승인 재사용은 선택된 기존 루트의 자료를 승인하고 그 토픽의 계획·승인은 보존한다", async () => {
   const {db,topic}=fixture(),c=db.evidence.catalog;
   const selected=c.add("a",input("https://team.atlassian.net/browse/APP-1"),true);
   const group=db.workGroups.get("g-a");
@@ -696,7 +734,6 @@ it("새 루트의 승인 재사용은 선택된 기존 루트의 계획도 무�
     expect(c.approvalAffected(candidate.source.id,"group","g-a")).toContain("ui");
     c.add("a",input(url),true);
     expect(c.state("ui").entries.find(e=>e.source.id===candidate.source.id)?.state).toBe("approved");
-    expect(db.getTopic("ui").approvedPlanSHA256).toBeNull();
-    expect(db.getTopic("ui").planEpoch).toBe(before.planEpoch+1);
+    expect(db.getTopic("ui")).toMatchObject({ approvedPlanSHA256:"f".repeat(64), planEpoch:before.planEpoch, state:"AWAITING_USER_APPROVAL" });
   } finally {await service.stop();}
 });

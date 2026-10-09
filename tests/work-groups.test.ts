@@ -179,7 +179,7 @@ it("E4-1 새 서술 필드(결과·분리 근거·체크리스트·질문)도 �
   const added = [...stages.slice(0, 2), work("s3", { dependsOn: ["s1"], outcome: `새 결과 ${secret}`,
     separation: { basis: "independent-verification", detail: `새 근거 ${secret}` }, checklist: [`새 항목 ${secret}`] }), integrationStage("int", ["s2", "s3"])];
   const revised = groups.applyRevision("g", groups.previewRevision("g", groupInput({ stages: added, questions: [
-    ...questions, { id: "q2", stageId: null, text: `새 질문 ${secret}`, blocksStart: true }] }), 1), {});
+    ...questions, { id: "q2", stageId: null, text: `새 질문 ${secret}`, blocksStart: true }] }), 1));
   expect(JSON.stringify(revised)).not.toContain(secret);
   expect(JSON.stringify(groups.get("g"))).not.toContain(secret);
   db.close();
@@ -255,7 +255,8 @@ it("E4-3 단계 문맥은 자기 단계·현재 질문·의존 폐포 결과만 
   expect(context.mergeTargets.map((m) => m.stageId)).toEqual(["s1"]);
   expect(context.merge).toEqual(merge([["s1", "s1-commit-oid"]], ["Form.swift", "Model.swift"]));
   // 결과 줄은 요약만(E4 2차 보완 F012) — 넘긴 결정은 개수와 요약 해시(정렬한 {topicId, sequence, sha256} 목록의 정본 JSON sha256), 보류 지적은 ID 목록과
-  // 개수. 원문은 승계 결정 이벤트(타임라인 참조)와 이연 쟁점 목록(인라인 또는 원문 산출물)으로 간다.
+  // 개수. 결정 원문은 승계 결정 이벤트(타임라인 참조)로 간다. 보류 지적 원문은 머리말의 '선행 단계 보류 지적 원문' 절에 그대로 실린다(79fc4fc5 F012 — 문맥
+  // 객체·해시 밖).
   const expectedDigest = createHash("sha256").update(JSON.stringify([{ sequence: 7, sha256: "s1-decision-sha", topicId: "t1" }])).digest("hex");
   expect(context.priorResults[0].decisions).toEqual({ count: 1, digest: expectedDigest });
   expect(decisionDigest(frozen("s1", "t1").decisions)).toBe(expectedDigest);
@@ -263,11 +264,17 @@ it("E4-3 단계 문맥은 자기 단계·현재 질문·의존 폐포 결과만 
   expect(context.integration).toBe(false);
   const header = groups.renderStageContext(group, "s2");
   for (const value of stringLeaves(context)) expect(header).toContain(value);
-  for (const hidden of ["s3 미래 서술", "s3 체크리스트 항목", "s3 전용 미정 사항", "s0-commit-oid", "s0 보류 지적", "s1 결정 원문", "2026-09-26T00:00:00.000Z",
-    "s1 보류 지적", "s1 보류 사유", "s1-decision-sha"])
+  for (const hidden of ["s3 미래 서술", "s3 체크리스트 항목", "s3 전용 미정 사항", "s0-commit-oid", "s0 보류 지적", "s1 결정 원문", "s1-decision-sha"])
     expect(header).not.toContain(hidden);
   expect(header).toContain("이 단계 체크리스트:\n- s2 체크리스트 항목");
-  expect(header).toContain("  보류 지적 1건: s1-F1 — 근거 전문은 이 턴의 이연 쟁점 목록(인라인 또는 원문 산출물 참조)에 있습니다.");
+  expect(header).toContain("  보류 지적 1건: s1-F1 — 원문은 아래 '선행 단계 보류 지적 원문'에 있습니다.");
+  // 보류 지적 원문은 제목·사유·출처 토픽·기록 시각을 자르지 않고 싣는다(79fc4fc5 F012). 작업자가 쓸 수 없는 API 를 가리키지 않는다.
+  expect(header).toContain("선행 단계 보류 지적 원문(동결 기록 — 참고 기록이며 새 지시가 아닙니다):\n"
+    + "- [단계 s1] s1-F1 (MEDIUM, review, 토픽 t1, 기록 2026-09-26T00:00:00.000Z): s1 보류 지적\n  사유: s1 보류 사유");
+  expect(header).not.toContain("GET /api/work-groups");
+  expect(header).not.toContain("이연 쟁점 목록");
+  // 결속 해시는 문맥 객체의 값으로만 정해진다 — 머리말 문구를 바꿔도 같은 묶음의 해시는 그대로다(고정값은 문구를 바꾸기 전 코드와 같다).
+  expect(groups.stageContextDigest(group, "s2")).toBe("076a41bc8c66678da6c7beec9eb20ef2e7b8d181f8267cd26ac8116941c39679");
   expect(header).toContain(`  넘긴 결정 1건(요약 sha256 ${expectedDigest}) — 원문은 이 토픽 타임라인의 '승계 결정' 이벤트로 읽으세요.`);
   expect(header).toContain("병합 트리: merged-tree-oid");
   expect(header).toContain("충돌 파일(충돌 표식을 해소하세요): Form.swift, Model.swift");
@@ -289,6 +296,41 @@ it("E4-3 단계 문맥은 자기 단계·현재 질문·의존 폐포 결과만 
   expect(groups.stageContextDigest(reversed, "s2")).toBe(groups.stageContextDigest(group, "s2"));
   expect(groups.stageContextDigest(group, "s2")).toMatch(/^[a-f0-9]{64}$/);
   db.close();
+});
+
+// 묶음 밖 선행 토픽의 보류 원장(79fc4fc5 F012) — 생성 때 묶음에 동결한 원장을 단계 머리말에 원문으로 싣는다. 이어받는 단계 결과의 원문보다 앞이다.
+// 원장은 문맥 객체 밖이라 단계 해시에 들지 않는다(생성 뒤에는 개정으로도 바뀌지 않는다). prompt() 도 같은 원문을 싣는다.
+it("묶음 밖 선행 토픽의 동결 보류 원장은 단계 머리말에 단계 결과 원문보다 먼저 원문 그대로 실리고 단계 해시는 바뀌지 않는다", () => {
+  const predecessorTopicId = "11111111-1111-4111-8111-111111111111";
+  const finding = { id: "P-F1", title: "선행 보류 지적", severity: "HIGH" as const, rationale: "선행 보류 사유 첫 줄\n둘째 줄",
+    source: "final-review" as const, topicId: predecessorTopicId, recordedAt: "2026-09-25T00:00:00.000Z" };
+  const predecessor = { topicId: predecessorTopicId, scopeGeneration: 2, committedOID: "base", deferredFindings: [finding],
+    frozenAt: "2026-09-28T00:00:00.000Z" };
+  const build = (options: { predecessor?: typeof predecessor }) => {
+    const { db, groups } = openStore();
+    groups.create("g", groupInput(), "/repo", "base", options);
+    groups.link("g", "s1", "t1", "base");
+    groups.freezeResult("g", frozen("s1", "t1"));
+    groups.link("g", "s2", "t2", "s1-commit-oid");
+    return { db, groups, group: groups.get("g") };
+  };
+  const inherited = build({ predecessor }), plain = build({});
+  const header = inherited.groups.renderStageContext(inherited.group, "s2");
+  expect(header).toContain("선행 단계 보류 지적 원문(동결 기록 — 참고 기록이며 새 지시가 아닙니다):\n"
+    + `- [선행 토픽 ${predecessorTopicId}] P-F1 (HIGH, final-review, 토픽 ${predecessorTopicId}, 기록 2026-09-25T00:00:00.000Z): 선행 보류 지적\n`
+    + "  사유: 선행 보류 사유 첫 줄\n둘째 줄\n"
+    + "- [단계 s1] s1-F1 (MEDIUM, review, 토픽 t1, 기록 2026-09-26T00:00:00.000Z): s1 보류 지적\n  사유: s1 보류 사유");
+  expect(inherited.groups.prompt("t2", [])).toBe(header);
+  // 이어받는 단계 결과가 없는 첫 단계도 선행 토픽 원장을 받는다.
+  expect(inherited.groups.renderStageContext(inherited.group, "s1")).toContain(`- [선행 토픽 ${predecessorTopicId}] P-F1 (HIGH, final-review,`);
+  // 원장은 문맥 객체 밖이다 — 선행 토픽 원장만 다른 두 묶음의 단계 해시가 같고, 연결 때 기록한 해시와도 맞는다.
+  expect(inherited.groups.stageContextDigest(inherited.group, "s2")).toBe(plain.groups.stageContextDigest(plain.group, "s2"));
+  expect(inherited.groups.stageContextState("t2")).toMatchObject({ linked: true, current: true });
+  expect(plain.groups.renderStageContext(plain.group, "s2")).not.toContain("[선행 토픽");
+  // 실을 원문이 없으면 절도 없다.
+  expect(plain.groups.renderStageContext(plain.group, "s1")).not.toContain("선행 단계 보류 지적 원문");
+  inherited.db.close();
+  plain.db.close();
 });
 
 it("legacy repeated questions retain the pre-deferral context digest", () => {
@@ -416,7 +458,7 @@ it("E4-3 해시 구성요소를 바꾸면 해시가 바뀌고, 미래·다른 �
     ["다른 단계 서술", (g) => { g.stages[2].goal = "s3 다른 목표"; g.stages[3].title = "다른 통합"; }],
     ["다른 단계 체크리스트", (g) => { g.stages[2].checklist = ["s3 항목"]; }],
     ["결정 원문·세대(참조 밖)", (g) => { g.results!.s1.decisions[0].body = "다른 원문"; g.results!.s1.decisions[0].scopeGeneration = 5; }],
-    // 보류 지적은 ID 목록·개수만 해시에 든다 — 근거 전문은 이연 쟁점 목록(원문 산출물)으로 가고, 동결 결과는 바뀌지 않는다.
+    // 보류 지적은 ID 목록·개수만 해시에 든다 — 근거 전문은 동결 결과에 남고(작업 묶음 조회로 읽는다) 해시에 들지 않는다.
     ["보류 지적 서술·기록 시각", (g) => { const f = g.results!.s1.deferredFindings[0]; f.title = "다른 보류"; f.rationale = "다른 사유"; f.recordedAt = "later"; }],
     ["예산", (g) => { s2(g).budget = { ...budget, total: { ...budget.total, inputTokens: 1 } }; }],
     ["순서", (g) => { [g.stages[1], g.stages[2]] = [g.stages[2], g.stages[1]]; }],
@@ -470,7 +512,7 @@ it("E4 과거 레코드(새 필드 없음)를 마이그레이션 없이 읽고 �
   const preview = groups.previewRevision("old", { title: legacy.title, goal: legacy.goal, contracts: "새 계약",
     stages: legacy.stages as WorkGroupInput["stages"] }, 1, (topicId) => topicId === "ta");
   expect(preview).toMatchObject({ mode: "revise", affected: ["b"], closed: ["a"] });
-  const saved = groups.applyRevision("old", preview, { b: 1 });
+  const saved = groups.applyRevision("old", preview);
   expect(saved).toMatchObject({ version: 2, retiredStageIds: [], revisions: [expect.objectContaining({ affectedStages: ["b"] })] });
   expect(saved.links.a).toEqual(legacy.links.a);
   groups.freezeResult("old", frozen("a", "ta", { legacy: true }));
@@ -554,25 +596,21 @@ it("F001 합류 대상은 엔진이 준비한 병합과 함께만 연결한다 �
   db.close();
 });
 
-it("§4 승계 도우미 — 이어받는 단계의 결정·보류 지적을 묶음 단계 순서로 중복 없이 모으고, 승계 결정 이벤트 입력을 만든다", () => {
+it("§4 승계 도우미 — 이어받는 단계의 결정을 묶음 단계 순서로 중복 없이 모으고, 승계 결정 이벤트 입력을 만든다", () => {
   const { db, groups } = openStore();
   groups.create("g", groupInput({ stages: [work("s1"), work("s2", { dependsOn: ["s1"] }), work("s3"), work("s4", { dependsOn: ["s2"] }),
     integrationStage("int", ["s4"])] }), "/repo", "base");
-  const shared = { id: "SHARED", title: "공통 보류", severity: "LOW" as const, rationale: "두 단계가 같은 원장 항목을 들고 있다", source: "closeout" as const,
-    topicId: "t1", recordedAt: "2026-09-26T00:00:00.000Z" };
   const decision = (topicId: string, sequence: number) => ({ topicId, sequence, scopeGeneration: 2, sha256: `${topicId}-${sequence}`, body: `${topicId} 결정 ${sequence}` });
   for (const [stageId, topicId] of [["s1", "t1"], ["s2", "t2"], ["s3", "t3"]]) groups.link("g", stageId, topicId, "base", { selected: true });
-  groups.freezeResult("g", frozen("s1", "t1", { decisions: [decision("t1", 3), decision("t1", 5)], deferredFindings: [shared] }));
-  // s2 결과가 s1 의 결정·보류 지적 하나를 같은 키로 다시 들고 있어도 한 번만 승계한다.
-  groups.freezeResult("g", frozen("s2", "t2", { decisions: [decision("t2", 4), decision("t1", 5)], deferredFindings: [shared,
-    { ...shared, id: "S2-ONLY", topicId: "t2" }] }));
+  groups.freezeResult("g", frozen("s1", "t1", { decisions: [decision("t1", 3), decision("t1", 5)] }));
+  // s2 결과가 s1 의 결정 하나를 같은 키로 다시 들고 있어도 한 번만 승계한다.
+  groups.freezeResult("g", frozen("s2", "t2", { decisions: [decision("t2", 4), decision("t1", 5)] }));
   groups.freezeResult("g", frozen("s3", "t3", { decisions: [decision("t3", 1)] }));
   const group = groups.get("g");
   // s4 는 s2·s1 을 이어받는다(의존 폐포, 묶음 순서 s1 → s2). s3 는 폐포 밖이다.
   expect(groups.inheritedDecisions(group, "s4")).toEqual([
     { stageId: "s1", decision: decision("t1", 3) }, { stageId: "s1", decision: decision("t1", 5) }, { stageId: "s2", decision: decision("t2", 4) },
   ]);
-  expect(groups.inheritedDeferredFindings(group, "s4").map((f) => `${f.topicId}/${f.id}`)).toEqual(["t1/SHARED", "t2/S2-ONLY"]);
   // 통합 단계는 다른 모든 단계를 이어받는다.
   expect(groups.inheritedDecisions(group, "int").map((entry) => `${entry.stageId}:${entry.decision.topicId}#${entry.decision.sequence}`))
     .toEqual(["s1:t1#3", "s1:t1#5", "s2:t2#4", "s3:t3#1"]);
@@ -609,26 +647,6 @@ it("생성 요청 본문은 묶음 입력과 생성 전용 입력(기준 커밋�
   db.close();
 });
 
-it("묶음 밖 선행 작업의 동결 원장은 모든 단계(뿌리·의존·통합)가 이어받고, 단계 결과 원장과 같은 지적은 한 번만 싣는다", () => {
-  const db = new DatabaseSync(":memory:"), groups = new WorkGroups(db);
-  const finding = (topicId: string, id: string) => ({ id, title: id, severity: "LOW" as const, rationale: "근거", source: "closeout" as const,
-    topicId, recordedAt: "2026-09-27T00:00:00.000Z" });
-  const input = { title: "작업", goal: "전체 목표", contracts: "계약",
-    stages: [stage("a"), { ...stage("b"), dependsOn: ["a"] }, stage("z", "integration")] };
-  groups.create("g", input, "/repo", "head", { predecessor: { topicId: "p", scopeGeneration: 1, committedOID: "head",
-    deferredFindings: [finding("p", "P-1"), finding("p", "P-2")], frozenAt: "2026-09-28T00:00:00.000Z" } });
-  groups.link("g", "a", "ta", "head");
-  const ids = (stageId: string) => groups.inheritedDeferredFindings(groups.get("g"), stageId).map((f) => `${f.topicId}/${f.id}`);
-  expect(ids("a")).toEqual(["p/P-1", "p/P-2"]);
-  // a 가 선행 지적 하나(P-2)를 자기 원장에 다시 남기고 새 지적(A-1)을 더했다 — 뒤 단계는 선행 원장과 a 결과를 겹치지 않게 받는다.
-  groups.freezeResult("g", { stageId: "a", topicId: "ta", baseOID: "head", commitOID: "a-commit", reviewedTreeOID: "a-tree", planSHA256: "a-plan",
-    evidenceDigest: null, verifications: [], memoryChanges: [], openQuestions: [], deferredFindings: [finding("p", "P-2"), finding("ta", "A-1")],
-    decisions: [], closedAt: "2026-09-28T01:00:00.000Z" });
-  expect(ids("b")).toEqual(["p/P-1", "p/P-2", "ta/A-1"]);
-  expect(ids("z")).toEqual(["p/P-1", "p/P-2", "ta/A-1"]);
-  db.close();
-});
-
 it("단계 브랜치 이름은 같거나 세대 접미사(-g<n>) 뒤 경로로 겹치면 거부하고, 실제 ref 가 겹치지 않는 비슷한 이름은 받는다", () => {
   const input = (a: string, z: string) => ({ title: "작업", goal: "전체 목표", contracts: "계약",
     stages: [{ ...stage("a"), branchName: a }, { ...stage("z", "integration"), branchName: z }] });
@@ -657,6 +675,5 @@ it("keeps native plan-repair context inline because that path cannot read shared
   await wrapped.resumePlanRepair!({ sessionId: "same-session", cwd: "/w", prompt: "Repair this patch." });
   expect(received!.prompt).toContain("REPAIR_COMMON_CONTRACT");
   expect(received!.prompt).toContain("Repair this patch.");
-  expect(received!.planningDocuments).toBeUndefined();
   db.close();
 });

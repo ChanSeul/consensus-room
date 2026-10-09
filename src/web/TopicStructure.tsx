@@ -4,8 +4,8 @@ import { ENTRY_COPY, isTopicGroup, topicAncestors, topicForest, workEntry, type 
 
 export const WORKING_STATES = new Set<WorkflowState>([
   "BRAINSTORMING",
-  "CLAUDE_PLAN", "CODEX_AUDIT", "CLAUDE_REVISION", "CODEX_CLOSEOUT", "CONSENSUS_ACK",
-  "IMPLEMENTING", "CODEX_REVIEW", "CLAUDE_FIX", "CODEX_FINAL_REVIEW",
+  "CLAUDE_PLAN", "CODEX_AUDIT", "CLAUDE_REVISION",
+  "IMPLEMENTING", "CODEX_REVIEW", "CLAUDE_FIX",
 ]);
 
 export function EntryGuide() {
@@ -79,7 +79,7 @@ export function TopicOverview({ topic, topics, onSelect }: { topic: Topic; topic
   const entry = workEntry(topic), copy = ENTRY_COPY[entry.mode], group = isTopicGroup(topic);
   const ancestors = topicAncestors(topic, topics);
   const steps: readonly string[] = group ? [...copy.steps.slice(0, -2), "하위 주제 관리"] : copy.steps;
-  const implementing = ["IMPLEMENTING", "CODEX_REVIEW", "CLAUDE_FIX", "CODEX_FINAL_REVIEW", "READY_TO_DELIVER", "CLOSED"].includes(topic.state);
+  const implementing = ["IMPLEMENTING", "CODEX_REVIEW", "CLAUDE_FIX", "READY_TO_DELIVER", "CLOSED"].includes(topic.state);
   const index = group ? entry.goal ? steps.length - 1 : 0 : implementing ? steps.length - 1 : entry.goal ? steps.length - 2 : 0;
   return <section className="topic-overview" aria-label="주제 목표와 진행 방식">
     {ancestors.length > 0 && <nav className="topic-breadcrumb" aria-label="상위 주제">{ancestors.map((parent, i) =>

@@ -1,8 +1,9 @@
-// 계획 필수 검사 게이트(2026-10-06 사용자 결정) — 구현·수정 결과를 받아들이기 직전, 완료 판정 루프(delivery.runWorkOnce)의 수락 직전 한 곳에서 계획이 선언한
+// 계획 필수 검사 게이트(2026-10-06 사용자 결정) — 구현·수정 결과를 받아들이기 직전, 구현자 완료 뒤(delivery.relayPlanChecks) 한 곳에서 계획이 선언한
 // 검사(```checks, shared/planChecks)를 판정한다. 결과는 세 갈래다:
 //   satisfied ...... 모두 충족 → 수락으로 넘어간다
 //   unsatisfied .... 러너가 고칠 수 있는 실패(검사가 돌았고 실패) → 같은 작업 세션의 계속 진행 턴으로 실패 내용을 돌려보낸다
 //   unavailable .... 러너가 고칠 수 없는 호스트 문제(도구 미해석·프로필 미등록·Git 미연결·시간 초과·입력 반복 변경) → 결과를 보존한 채 정지
+// 상태 전이는 이 집계로 정하고, 사실(check-result)은 함께 돌려주는 항목별 실제 결과(results, 선언 순서)로 만든다 — 실행 불가가 섞여도 실패한 항목은 실패다.
 // 선언이 없으면(빈 목록) 아무것도 부르지 않는다. kind 를 더하면 판정표(PlanCheckSatisfiers)가 그 항목을 요구한다.
 import type { PlanCheckItem, VerificationProfileId } from "../../shared/planChecks.js";
 import type { VerificationOutcome } from "../verifications.js";
@@ -18,9 +19,9 @@ export type PlanCheckSatisfiers = {
 };
 
 export type PlanCheckGateVerdict =
-  | { kind: "satisfied" }
-  | { kind: "unsatisfied"; failures: PlanCheckFailure[]; inputKey: string }
-  | { kind: "unavailable"; failures: PlanCheckUnavailable[] };
+  | { kind: "satisfied"; results: PlanCheckResult[] }
+  | { kind: "unsatisfied"; failures: PlanCheckFailure[]; inputKey: string; results: PlanCheckResult[] }
+  | { kind: "unavailable"; failures: PlanCheckUnavailable[]; results: PlanCheckResult[] };
 
 export async function planCheckGate(items: readonly PlanCheckItem[], satisfiers: PlanCheckSatisfiers, signal: AbortSignal): Promise<PlanCheckGateVerdict> {
   const results: PlanCheckResult[] = [];
@@ -28,10 +29,10 @@ export async function planCheckGate(items: readonly PlanCheckItem[], satisfiers:
     results.push(await (satisfiers[item.kind] as (item: PlanCheckItem, signal: AbortSignal) => Promise<PlanCheckResult>)(item, signal));
   }
   const unavailable = results.filter((result): result is PlanCheckUnavailable => result.status === "unavailable");
-  if (unavailable.length > 0) return { kind: "unavailable", failures: unavailable };
+  if (unavailable.length > 0) return { kind: "unavailable", failures: unavailable, results };
   const failures = results.filter((result): result is PlanCheckFailure => result.status === "unsatisfied");
-  if (failures.length > 0) return { kind: "unsatisfied", failures, inputKey: JSON.stringify(failures.map((failure) => [failure.item.id, failure.inputKey])) };
-  return { kind: "satisfied" };
+  if (failures.length > 0) return { kind: "unsatisfied", failures, inputKey: JSON.stringify(failures.map((failure) => [failure.item.id, failure.inputKey])), results };
+  return { kind: "satisfied", results };
 }
 
 // 로그는 끝부분만 싣는다 — 구문 오류 진단은 stderr 에 파일:줄:열 로 나온다.

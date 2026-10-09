@@ -1,7 +1,7 @@
 import type { SessionSettingsTarget, SessionSettingsUpdate, SessionSettingsView } from "../shared/sessionSettings";
 import type { SessionGraph } from "../shared/sessionGraph";
 import type { WorkGroup, WorkGroupInput, WorkGroupView } from "../shared/workGroups";
-import type { EvidenceCatalog, EvidenceCollectionResult, EvidenceRootInput, EvidenceSourceInput, EvidenceSource, EvidenceTopicState, EvidenceReviewInput } from "../shared/externalEvidence";
+import type { EvidenceCatalog, EvidenceCollectionResult, EvidenceRootInput, EvidenceSourceInput, EvidenceSource, EvidenceTopicState } from "../shared/externalEvidence";
 import type { BudgetAccount } from "../shared/budgets";
 import type {
   ActionResponse,
@@ -98,7 +98,7 @@ export const api = {
   sessionSettings: (id: string, target: SessionSettingsTarget) => request<SessionSettingsView>(`/topics/${encodeURIComponent(id)}/session-settings?target=${encodeURIComponent(target)}`),
   updateSessionSettings: (id: string, input: SessionSettingsUpdate) => request<SessionSettingsView>(`/topics/${encodeURIComponent(id)}/session-settings`, { method: "POST", body: JSON.stringify(input) }),
   sessionGraph: (id: string) => request<SessionGraph>(`/topics/${encodeURIComponent(id)}/graph`),
-  configureIterations: (id: string, scope: "planning" | "implementation" | "revision", limit: number | null, version: number) => request(`/topics/${id}/iteration-limits`, { method: "PUT", body: JSON.stringify({ scope, limit, version }) }),
+  configureIterations: (id: string, scope: "planning" | "implementation", limit: number | null, version: number) => request(`/topics/${id}/iteration-limits`, { method: "PUT", body: JSON.stringify({ scope, limit, version }) }),
   evidenceCatalog: (id: string) => request<EvidenceCatalog>(`/topics/${id}/evidence/catalog`),
   selectEvidenceGroup: (id: string, version: string, groupId: string | null) => request<EvidenceCatalog>(`/topics/${id}/evidence/group`, {method:"POST",body:JSON.stringify({version,groupId})}),
   addEvidenceRoot: (id: string, input: EvidenceRootInput) => request(`/topics/${id}/evidence/roots`, { method: "POST", body: JSON.stringify(input) }),
@@ -109,7 +109,6 @@ export const api = {
   addEvidence: (id: string, input: EvidenceSourceInput) => request<EvidenceSource>(`/topics/${encodeURIComponent(id)}/evidence/sources`, { method: "POST", body: JSON.stringify(input) }),
   useRestEvidence: (id: string) => request(`/evidence/${encodeURIComponent(id)}/use-rest`, { method: "POST", body: "{}" }),
   checkEvidence: (id: string) => request(`/evidence/${encodeURIComponent(id)}/check`, { method: "POST", body: JSON.stringify({ force: true }) }),
-  reviewEvidence: (id: string, input: EvidenceReviewInput) => request(`/topics/${encodeURIComponent(id)}/evidence/review`, { method: "POST", body: JSON.stringify(input) }),
   listWorkGroups:()=>request<WorkGroupView[]>("/work-groups"),
   createWorkGroup:(input:WorkGroupInput,parentTopicId:string,requestKey?:string)=>request<WorkGroup>("/work-groups",{method:"POST",...(requestKey ? {headers:{"idempotency-key":requestKey}} : {}),body:JSON.stringify({...input,parentTopicId})}),
   applyPipeline:(id:string,input:WorkGroupInput,version:number)=>request<WorkGroup>(`/work-groups/${id}/revise`,{method:"POST",body:JSON.stringify({input,version,mode:"pipeline"})}),

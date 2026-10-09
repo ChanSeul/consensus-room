@@ -3,7 +3,7 @@ import { AGENT_EFFORTS, AgentExecutionSettingsSchema, DEFAULT_AGENT_SETTINGS } f
 import { AgentProfileInputSchema, type TurnJob } from "../shared/roles.js";
 import { REVIEW_CRITERIA, type ReviewCriteria, type SessionSettingsTarget, type SessionSettingsView, type SessionSettingsUpdate } from "../shared/sessionSettings.js";
 import type { ConsensusDatabase } from "./database.js";
-import { resolveRoute, routeSupport } from "./turnRouting.js";
+import { designReadRequested, resolveRoute, routeSupport } from "./turnRouting.js";
 import { redactSecrets } from "../shared/workflow.js";
 
 const emptyCriteria = (): ReviewCriteria => ({ selectedIds: [], additionalText: "" });
@@ -62,7 +62,7 @@ export function updateSessionSettings(db: ConsensusDatabase, topicId: string, in
     const { routes } = describe(db, topicId, input.target);
     for (const route of routes) {
       const candidate = { ...route, settings: { model: input.model, effort: input.effort } };
-      const problem = routeSupport(candidate, true);
+      const problem = routeSupport(candidate, designReadRequested(db, topicId, route.job));
       if (problem) fail(problem);
       const profile = AgentProfileInputSchema.parse({ id: `session-settings:${randomUUID()}`, provider: route.provider,
         model: input.model, effort: input.effort, options: route.options,

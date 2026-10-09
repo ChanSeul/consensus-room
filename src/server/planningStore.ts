@@ -1,32 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import { posix } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import type { TimelineEvent, Topic } from "../shared/contracts.js";
-import { planningUsageGaps, TIMELINE_REFERENCE_UNIT, TIMELINE_REFERENCE_VERSION, type PlanningCheckpoint, type PlanningFragment, type PlanningMigration,
-  type PlanningUsageRecovery,
-  type RecoveryAnchor, type RecoveryBoundaryKind, type RecoveryLineage, type RecoveryProgress, type RecoveryVerification,
-  type TimelineReference } from "../shared/planningControl.js";
+import type { Topic } from "../shared/contracts.js";
+import { planningUsageGaps, type PlanningCheckpoint, type PlanningFragment,
+  type RecoveryAnchor, type RecoveryBoundaryKind, type RecoveryLineage, type RecoveryProgress } from "../shared/planningControl.js";
 
 export const planningHash = (value: string) => createHash("sha256").update(value).digest("hex");
-export function planningKey(topic: Topic, role: string, prompt: string): string {
-  return planningHash(JSON.stringify([topic.id, topic.scopeGeneration, topic.planEpoch, topic.planSHA256, topic.state, role, prompt]));
-}
-
-// 계획자는 단계로 가린다 — CLAUDE_PLAN 단계에서 도는 계획 제어 턴은 계획자 job 뿐이다. 체크포인트 role 은 실제 공급자라(E2b 역할 배정)
-// 공급자 이름으로 가리면 Codex 계획자의 완료된 첫 계획을 복구하지 못하고 재계획했다(host-review 2fa1309 F-003).
-export function recoverableFinalizedFirstPlan(
-  record: PlanningCheckpoint | null, topic: Topic, timeline: readonly TimelineEvent[],
-): boolean {
-  return Boolean(record?.finalized && record.finalResult && record.stage === "CLAUDE_PLAN" &&
-    !topic.planSHA256 && record.scopeGeneration === topic.scopeGeneration && record.planEpoch === topic.planEpoch &&
-    record.planSHA256 === topic.planSHA256 && !timeline.some(event => event.sequence > record.inputSequence &&
-      event.actor === "user" && ["decision", "evidence", "scope_change"].includes(event.kind)));
-}
-
-// 타임라인 참조 문서와 그 색인의 selector(guardedPlanning 이 kind=context 문서로 싣는다) — 계보 진척은 이 원문을 전달 인정 기록으로만 센다.
-const TIMELINE_FRAGMENT_SELECTOR = /^timeline(?::\d+|-index)@[0-9a-f]{64}$/;
-
-// 파일을 읽는 PlanningReader와 같은 경로 신원. 원래 selector·조각 id는 전달 영수증이므로 바꾸지 않는다.
+// 복구 기준선의 원본 신원(파일 경로는 정규화한다). 원래 selector·조각 id는 전달 영수증이므로 바꾸지 않는다.
 function fragmentSourceKey(fragment: Pick<PlanningFragment, "kind" | "selector" | "hash">): string {
   return JSON.stringify([fragment.kind, fragment.kind === "file" ? posix.normalize(fragment.selector) : fragment.selector, fragment.hash]);
 }
@@ -112,42 +92,23 @@ export class PlanningStore {
   constructor(private readonly db: DatabaseSync) {
     db.exec(`CREATE TABLE IF NOT EXISTS planning_policies(topic_id TEXT PRIMARY KEY, version INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS planning_checkpoints(key TEXT PRIMARY KEY, topic_id TEXT NOT NULL, record_json TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS planning_fragments(key TEXT PRIMARY KEY, record_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS planning_session_fragments(session_id TEXT NOT NULL,id TEXT NOT NULL,record_json TEXT NOT NULL,PRIMARY KEY(session_id,id));
       CREATE TABLE IF NOT EXISTS planning_sessions(topic_id TEXT PRIMARY KEY, record_json TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS planning_archives(id INTEGER PRIMARY KEY, topic_id TEXT NOT NULL, record_json TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS planning_reference_reads(session_id TEXT NOT NULL, scope_key TEXT NOT NULL, selector TEXT NOT NULL, offset INTEGER NOT NULL,
-        record_json TEXT NOT NULL, PRIMARY KEY(session_id, scope_key, selector, offset));
-      CREATE TABLE IF NOT EXISTS planning_session_references(session_id TEXT NOT NULL, scope_key TEXT NOT NULL, selector TEXT NOT NULL, record_json TEXT NOT NULL,
-        PRIMARY KEY(session_id, scope_key, selector));
       CREATE TABLE IF NOT EXISTS planning_recovery_lineages(topic_id TEXT NOT NULL, job_role TEXT NOT NULL, record_json TEXT NOT NULL,
         PRIMARY KEY(topic_id, job_role));
-      CREATE TABLE IF NOT EXISTS planning_adopted_fragments(session_id TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY(session_id, id));
       CREATE TABLE IF NOT EXISTS planning_review_ledgers(id TEXT PRIMARY KEY, topic_id TEXT NOT NULL, record_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS planning_session_receipts(session_id TEXT PRIMARY KEY, topic_id TEXT NOT NULL, record_json TEXT NOT NULL);`);
-    // 옛 DB에는 전달과 채택을 구분할 기록이 없다. 그 전달을 채택으로 승격하지 않고, 재읽기로 추가 복구를 얻지 못하도록
-    // 기존 미확인 구간을 한 번만 고정한다. 이후 거절된 호출은 이 목록에 추가하지 않는다(DB 재개도 같음).
-    db.exec("BEGIN IMMEDIATE");
-    try {
-      if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='planning_progress_exclusions'").get()) {
-        db.exec(`CREATE TABLE planning_progress_exclusions(session_id TEXT NOT NULL, id TEXT NOT NULL, record_json TEXT NOT NULL,
-          PRIMARY KEY(session_id, id));
-          INSERT INTO planning_progress_exclusions SELECT delivered.session_id, delivered.id, delivered.record_json
-          FROM planning_session_fragments delivered WHERE NOT EXISTS
-            (SELECT 1 FROM planning_adopted_fragments adopted WHERE adopted.session_id=delivered.session_id AND adopted.id=delivered.id);`);
-      }
-      db.exec("COMMIT");
-    } catch (error) {
-      db.exec("ROLLBACK");
-      throw error;
-    }
   }
   policyVersion(topicId: string): number {
     const row = this.db.prepare("SELECT version FROM planning_policies WHERE topic_id=?").get(topicId);
     return row ? Number(row.version) : 0;
   }
-  enabled(topicId: string): boolean { return this.policyVersion(topicId) > 0; }
   continuityEnabled(topicId: string): boolean { return this.policyVersion(topicId) === 2; }
+  // 계획 연속성 해제(계약 v3.16 (17')) — 중재자가 작성자 좌석을 교체하면 이 토픽의 "계획 → 구현 한 세션" 보장을 끝낸다. 행을 지우지 않고 v1 로 내린다:
+  // 지우면 enable()(ON CONFLICT DO NOTHING — 행이 있을 때만 막는다)이 연속성을 다시 켤 수 있다. 호출자의 transaction 안에서 부른다.
+  releaseContinuity(topicId: string): boolean {
+    return Number(this.db.prepare("UPDATE planning_policies SET version=1 WHERE topic_id=? AND version=2").run(topicId).changes) === 1;
+  }
   enable(topicId: string): void {
     // Existing policies and in-flight/approved work retain their original session contract.
     const topic = this.db.prepare("SELECT state,resume_state,plan_sha256,implementation_session_id FROM topics WHERE id=?").get(topicId);
@@ -160,105 +121,6 @@ export class PlanningStore {
       this.db.prepare("SELECT 1 FROM artifacts WHERE topic_id=? LIMIT 1").get(topicId);
     const version = unstartedPlan && !hasHistory ? 2 : 1;
     this.db.prepare("INSERT INTO planning_policies VALUES (?,?) ON CONFLICT(topic_id) DO NOTHING").run(topicId, version);
-  }
-  assertMigration(topic: Topic, input: PlanningMigration): void {
-    const flags = this.db.prepare("SELECT resume_state,implementation_session_id FROM topics WHERE id=?").get(topic.id);
-    const session = topic.participants.find(p => p.role === "claude");
-    const artifact = this.db.prepare("SELECT sha256 FROM artifacts WHERE topic_id=? AND scope_generation=? AND kind='interrupted-output' ORDER BY revision DESC LIMIT 1")
-      .get(topic.id, topic.scopeGeneration);
-    const completed = this.db.prepare("SELECT 1 FROM artifacts WHERE topic_id=? AND kind!='interrupted-output' LIMIT 1").get(topic.id);
-    if (!["USER_DECISION_REQUIRED", "FAILED"].includes(topic.state) || flags?.resume_state !== "CLAUDE_PLAN" ||
-        flags?.implementation_session_id || topic.planSHA256 || topic.approvedPlanSHA256 || topic.planRevision !== 0 ||
-        topic.scopeGeneration !== input.scopeGeneration || topic.planEpoch !== input.planEpoch ||
-        session?.sessionId !== input.sessionId || session.acknowledgedPlanSHA256 ||
-        artifact?.sha256 !== input.interruptedSHA256 || completed || this.latest(topic.id) || this.continuityEnabled(topic.id)) {
-      throw new Error("Only an interrupted initial plan with the exact session and artifact can migrate.");
-    }
-  }
-  migrateInterrupted(topic: Topic, input: PlanningMigration): void {
-    this.assertMigration(topic, input);
-    this.db.prepare("INSERT INTO planning_policies VALUES (?,2) ON CONFLICT(topic_id) DO UPDATE SET version=2").run(topic.id);
-  }
-  // 타임라인 참조의 전달 인정(E3-2-2a). 호출이 반환하고 반환 뒤 동기 재대조(중단·주제 현재성·좌석)를 통과한 참조 조각만 적는다 — 기존 세션 조각 기록
-  // (recordDelivery)은 현재성 검사 전에 적혀 취소를 무시하고 늦게 끝난 호출의 조각도 남으므로 참조에는 쓰지 않는다. 참조 문서의 재전송 생략과 완독
-  // 판정이 모두 이 기록만 읽는다(두 집합이 갈라지면 다시 보내지 않는 구간이 영원히 미완독으로 남는다). 단위·버전은 PlanningReader 의 UTF-8 바이트 v1 이다.
-  acknowledgeReferenceReads(sessionId: string, topic: Pick<Topic, "id" | "scopeGeneration">,
-    reads: ReadonlyArray<{ selector: string; hash: string; offset: number; nextOffset: number | null; total: number }>): void {
-    const insert = this.db.prepare("INSERT INTO planning_reference_reads VALUES (?,?,?,?,?) ON CONFLICT(session_id,scope_key,selector,offset) DO NOTHING");
-    for (const read of reads) insert.run(sessionId, JSON.stringify([topic.id, topic.scopeGeneration, read.hash]), read.selector, read.offset, JSON.stringify({
-      topicId: topic.id, scopeGeneration: topic.scopeGeneration, unit: TIMELINE_REFERENCE_UNIT, version: TIMELINE_REFERENCE_VERSION,
-      hash: read.hash, offset: read.offset, end: read.nextOffset ?? read.total, total: read.total }));
-  }
-  private referenceReads(sessionId: string, topic: Pick<Topic, "id" | "scopeGeneration">, selector: string, hash: string) {
-    return this.db.prepare("SELECT record_json FROM planning_reference_reads WHERE session_id=? AND selector=?").all(sessionId, selector)
-      .map(row => JSON.parse(String(row.record_json)) as { topicId: string; scopeGeneration: number; unit: string; version: number;
-        hash: string; offset: number; end: number; total: number })
-      .filter(read => read.topicId === topic.id && read.scopeGeneration === topic.scopeGeneration && read.hash === hash &&
-        read.unit === TIMELINE_REFERENCE_UNIT && read.version === TIMELINE_REFERENCE_VERSION);
-  }
-  referenceReadAcknowledged(sessionId: string, topic: Pick<Topic, "id" | "scopeGeneration">, selector: string, hash: string, offset: number): boolean {
-    return this.referenceReads(sessionId, topic, selector, hash).some(read => read.offset === offset);
-  }
-  // 처음부터 빈틈없이 인정된 바이트 수 — 다음에 읽을 위치다. 첫 공백에서 멈춘다(그 뒤에 인정된 구간이 있어도 세지 않는다).
-  // pending: 지금 보내는 패킷의 조각(아직 인정 전) — 읽기 현황 안내가 "이 패킷을 읽은 뒤" 이어 읽을 위치를 알리도록 계산에만 더한다(저장하지 않는다).
-  referenceCovered(sessionId: string, topic: Pick<Topic, "id" | "scopeGeneration">,
-    reference: Pick<TimelineReference, "selector" | "hash" | "bytes" | "unit" | "version">,
-    pending: ReadonlyArray<{ selector: string; hash: string; offset: number; nextOffset: number | null }> = []): number {
-    if (reference.unit !== TIMELINE_REFERENCE_UNIT || reference.version !== TIMELINE_REFERENCE_VERSION) return 0;
-    let covered = 0;
-    const reads = [...this.referenceReads(sessionId, topic, reference.selector, reference.hash), ...pending
-      .filter(read => read.selector === reference.selector && read.hash === reference.hash)
-      .map(read => ({ offset: read.offset, end: read.nextOffset ?? reference.bytes, total: reference.bytes }))];
-    for (const read of reads.sort((left, right) => left.offset - right.offset)) {
-      if (read.total !== reference.bytes || read.offset > covered) break;
-      covered = Math.max(covered, read.end);
-    }
-    return covered;
-  }
-  // 완독: 인정된 구간이 [0, 전체) 를 빈틈없이 덮을 때만. 끝 조각 하나(nextOffset null)·마지막 조각 먼저·중간 공백은 미완독이다.
-  referenceComplete(sessionId: string, topic: Pick<Topic, "id" | "scopeGeneration">,
-    reference: Pick<TimelineReference, "selector" | "hash" | "bytes" | "unit" | "version">): boolean {
-    return reference.unit === TIMELINE_REFERENCE_UNIT && reference.version === TIMELINE_REFERENCE_VERSION &&
-      this.referenceCovered(sessionId, topic, reference) >= reference.bytes;
-  }
-  // 호스트가 과제 프롬프트에 직접 실은 쪽의 전달 인정(E3-2-2b) — 정상 반환한 호출이 실제로 보낸 판의 쪽만 반환된 세션에 적는다. 같은 offset 에 더 긴
-  // 쪽이 인정되면 끝을 늘린다(쪽 크기가 바뀌어도 인정 구간이 줄지 않는다). 2a 모델 요청 경로(acknowledgeReferenceReads)의 기록·판정은 그대로다.
-  acknowledgeReferencePages(sessionId: string, topic: Pick<Topic, "id" | "scopeGeneration">,
-    pages: ReadonlyArray<{ selector: string; hash: string; offset: number; end: number; total: number }>): void {
-    const upsert = this.db.prepare(`INSERT INTO planning_reference_reads VALUES (?,?,?,?,?) ON CONFLICT(session_id,scope_key,selector,offset)
-      DO UPDATE SET record_json=excluded.record_json
-      WHERE json_extract(excluded.record_json,'$.end') > json_extract(planning_reference_reads.record_json,'$.end')`);
-    for (const page of pages) upsert.run(sessionId, JSON.stringify([topic.id, topic.scopeGeneration, page.hash]), page.selector, page.offset, JSON.stringify({
-      topicId: topic.id, scopeGeneration: topic.scopeGeneration, unit: TIMELINE_REFERENCE_UNIT, version: TIMELINE_REFERENCE_VERSION,
-      hash: page.hash, offset: page.offset, end: page.end, total: page.total }));
-  }
-  // 인정 구간 합집합 밖의 바이트 구간(E3-2-2b) — 호스트가 다음 쪽을 고르는 근거다. 완독·첫 공백 판정(referenceCovered)은 앞에서부터 빈틈없는 구간만
-  // 세지만, 여기서는 첫 공백 뒤의 인정 구간도 빼므로 다시 싣는 것은 공백뿐이다. 겹치거나 크기가 다른 구간도 합집합이라 건너뛰거나 두 번 세지 않는다.
-  // 같은 session·topic·scope·hash·unit·version 의 기록만 쓴다(referenceReads). 세션이 없으면(새 세션 판) 전체가 공백이다.
-  referenceGaps(sessionId: string | null, topic: Pick<Topic, "id" | "scopeGeneration">,
-    reference: Pick<TimelineReference, "selector" | "hash" | "bytes" | "unit" | "version">): Array<{ offset: number; end: number }> {
-    const reads = sessionId && reference.unit === TIMELINE_REFERENCE_UNIT && reference.version === TIMELINE_REFERENCE_VERSION
-      ? this.referenceReads(sessionId, topic, reference.selector, reference.hash).filter(read => read.total === reference.bytes) : [];
-    const gaps: Array<{ offset: number; end: number }> = [];
-    let cursor = 0;
-    for (const read of reads.sort((left, right) => left.offset - right.offset)) {
-      if (read.offset > cursor) gaps.push({ offset: cursor, end: Math.min(read.offset, reference.bytes) });
-      cursor = Math.max(cursor, read.end);
-    }
-    if (cursor < reference.bytes) gaps.push({ offset: cursor, end: reference.bytes });
-    return gaps;
-  }
-  // 세션이 받은 참조 목록 — 커서가 전진해 과제에서 빠져도 같은 세션의 다음 계획 제어 턴이 미완독 참조를 이어받는다(새 세션은 상속하지 않는다).
-  rememberSessionReferences(sessionId: string, topic: Pick<Topic, "id" | "scopeGeneration">, references: readonly TimelineReference[]): void {
-    const insert = this.db.prepare("INSERT INTO planning_session_references VALUES (?,?,?,?) ON CONFLICT(session_id,scope_key,selector) DO NOTHING");
-    for (const reference of references) insert.run(sessionId, JSON.stringify([topic.id, topic.scopeGeneration]), reference.selector,
-      JSON.stringify({ topicId: topic.id, scopeGeneration: topic.scopeGeneration, reference }));
-  }
-  unreadSessionReferences(sessionId: string, topic: Pick<Topic, "id" | "scopeGeneration">): TimelineReference[] {
-    return this.db.prepare("SELECT record_json FROM planning_session_references WHERE session_id=?").all(sessionId)
-      .map(row => JSON.parse(String(row.record_json)) as { topicId: string; scopeGeneration: number; reference: TimelineReference })
-      .filter(row => row.topicId === topic.id && row.scopeGeneration === topic.scopeGeneration && !this.referenceComplete(sessionId, topic, row.reference))
-      .map(row => row.reference).sort((left, right) => left.seq - right.seq);
   }
   // ---- 코드 리뷰 원장(E3-4c) — 논리 리뷰 한 번 = 호스트 소유 ID 하나 = 리뷰 1회 예약. 주제마다 가장 최근에 연 원장 한 행만 살아 있다. ----
 
@@ -345,7 +207,6 @@ export class PlanningStore {
     this.db.prepare("UPDATE planning_session_receipts SET record_json=? WHERE session_id=?").run(JSON.stringify(record), sessionId);
   }
   // 리뷰 전문 판을 실은 판정 호출이 응답을 받았다(기록 없는 세션은 이미 받은 것이라 바꾸지 않는다).
-  noteReviewContext(sessionId: string): void { this.noteReceived(sessionId, "reviewContext"); }
   // 메모리 본문을 실은 일반 턴이 응답을 받았다.
   noteMemoryBodies(sessionId: string): void { this.noteReceived(sessionId, "memoryBodies"); }
   // ---- 복구 계보(E3-3a) — 좌석(job 역할)별 한 행. 자동 복구 1회는 계보 단위로 소비된다. ----
@@ -384,150 +245,18 @@ export class PlanningStore {
     return this.recoveryLineage(topicId, seat, "artifacts" in anchors
       ? this.recoveryAnchor(topicId, anchors.artifacts) : this.boundaryAnchor(topicId, anchors.boundaries));
   }
-  // 저장된 좌석 계보를 anchor 대조 없이 읽는다(실행기의 신원 짝 검사·작업 재개의 대기 중 복구 확인용). 없으면 null.
-  storedRecoveryLineage(topicId: string, jobRole: string): RecoveryLineage | null {
-    const row = this.db.prepare("SELECT record_json FROM planning_recovery_lineages WHERE topic_id=? AND job_role=?").get(topicId, jobRole);
-    return row ? JSON.parse(String(row.record_json)) as RecoveryLineage : null;
-  }
   saveRecoveryLineage(topicId: string, jobRole: string, lineage: RecoveryLineage): void {
     this.db.prepare("INSERT INTO planning_recovery_lineages VALUES (?,?,?) ON CONFLICT(topic_id,job_role) DO UPDATE SET record_json=excluded.record_json")
       .run(topicId, jobRole, JSON.stringify(lineage));
-  }
-  // 계보 진척 — 계보의 모든 세션에서 **인정된** 원문 구간의 원본별 합집합(덮은 바이트). 세션별 전달 영수증(재전송 생략·완독)과 분리한 집계다:
-  // 새 세션이 옛 세션에서 이미 인정된 같은 원본·해시·구간을 다시 받아도 늘지 않는다. 범위 세대는 원본 신원에 넣지 않는다(같은 원문·해시·구간은 같은 근거).
-  // 출처는 두 인정 기록뿐이다(plan v3 §3.6).
-  // - 타임라인 참조: 전달 인정(planning_reference_reads — 반환·현재성 재대조 뒤 기록). 계획 제어 읽기(2a)와 호스트 쪽(2b)이 같은 신원으로 적는다.
-  //   같은 원문을 조각(kind=context, selector timeline:…·timeline-index@…)으로도 받지만 그 조각은 세지 않는다 — 두 경로의 같은 원문을 두 번 세면
-  //   옛 세션의 인정 구간을 새 세션이 조각으로 다시 받는 것만으로 진척이 된다(host-review 008064c F002).
-  // - 파일·근거 조각: 채택된 조각(planning_adopted_fragments — 현재성 검사와 단계 채택을 통과한 호출의 조각)만. 반환 직후 적는 전달 기록
-  //   (planning_session_fragments)은 구간 값을 읽는 데만 쓴다 — 현재성·채택이 거절된 조각은 진척이 아니다.
-  lineageProgress(topicId: string, sessions: readonly string[]): RecoveryProgress {
-    const intervals = new Map<string, Array<[number, number]>>();
-    const excluded = new Map<string, Array<[number, number]>>();
-    const add = (key: string, start: number, end: number) => { if (end > start) intervals.set(key, [...(intervals.get(key) ?? []), [start, end]]); };
-    for (const session of new Set(sessions)) {
-      for (const row of this.db.prepare("SELECT record_json FROM planning_progress_exclusions WHERE session_id=?").all(session)) {
-        const fragment = JSON.parse(String(row.record_json)) as PlanningFragment;
-        const key = fragmentSourceKey(fragment);
-        excluded.set(key, [...(excluded.get(key) ?? []), [fragment.offset,
-          fragment.nextOffset ?? fragment.offset + Buffer.byteLength(fragment.content)]]);
-      }
-      for (const row of this.db.prepare("SELECT selector, record_json FROM planning_reference_reads WHERE session_id=?").all(session)) {
-        const read = JSON.parse(String(row.record_json)) as { topicId: string; unit: string; version: number; hash: string; offset: number; end: number };
-        if (read.topicId === topicId) add(JSON.stringify(["timeline", read.hash, read.unit, read.version, String(row.selector)]), read.offset, read.end);
-      }
-      const adopted = new Set(this.db.prepare("SELECT id FROM planning_adopted_fragments WHERE session_id=?").all(session).map(row => String(row.id)));
-      for (const fragment of this.deliveredToSession(session)) {
-        if (!adopted.has(fragment.id) || (fragment.kind === "context" && TIMELINE_FRAGMENT_SELECTOR.test(fragment.selector))) continue;
-        add(fragmentSourceKey(fragment), fragment.offset,
-          fragment.nextOffset ?? fragment.offset + Buffer.byteLength(fragment.content));
-      }
-    }
-    const progress: RecoveryProgress = {};
-    for (const [key, ranges] of intervals) {
-      let covered = 0, cursor = -1;
-      for (const [start, end] of ranges.sort((left, right) => left[0] - right[0])) {
-        let from = Math.max(start, cursor);
-        // 새로 채택한 구간 중 업데이트 전 전달 구간과 겹치지 않는 부분만 진척이다. 쪽 경계가 달라져도 바이트 구간으로 뺀다.
-        for (const [oldStart, oldEnd] of (excluded.get(key) ?? []).sort((left, right) => left[0] - right[0])) {
-          if (oldEnd <= from) continue;
-          if (oldStart >= end) break;
-          if (oldStart > from) covered += oldStart - from;
-          from = Math.max(from, oldEnd);
-        }
-        if (end > from) covered += end - from;
-        cursor = Math.max(cursor, end);
-      }
-      if (covered > 0) progress[key] = covered;
-    }
-    return progress;
-  }
-  deliveredToSession(sessionId: string): PlanningFragment[] {
-    return this.db.prepare("SELECT record_json FROM planning_session_fragments WHERE session_id=?").all(sessionId)
-      .map(row => JSON.parse(String(row.record_json)) as PlanningFragment);
-  }
-  // 단계 채택으로 인정된 조각(E3-3a) — 계보 진척만 읽는다. 전달 기록(recordDelivery)·재전송 생략 판정과는 따로다.
-  recordAdoption(sessionId: string, ids: readonly string[]): void {
-    const insert = this.db.prepare("INSERT INTO planning_adopted_fragments VALUES (?,?) ON CONFLICT(session_id,id) DO NOTHING");
-    for (const id of ids) insert.run(sessionId, id);
-  }
-  recordDelivery(sessionId: string, fragments: readonly PlanningFragment[]): void {
-    const insert = this.db.prepare("INSERT INTO planning_session_fragments VALUES (?,?,?) ON CONFLICT(session_id,id) DO NOTHING");
-    for (const fragment of fragments) insert.run(sessionId, fragment.id, JSON.stringify(fragment));
-  }
-  get(key: string): PlanningCheckpoint | null {
-    const row = this.db.prepare("SELECT record_json FROM planning_checkpoints WHERE key=?").get(key);
-    return row ? JSON.parse(String(row.record_json)) : null;
-  }
-  save(record: PlanningCheckpoint): void {
-    this.db.prepare("INSERT INTO planning_checkpoints VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET record_json=excluded.record_json")
-      .run(record.key, record.topicId, JSON.stringify(record));
-  }
-  authorizeUnknownUsage(topic: Topic, input: PlanningUsageRecovery, requestKey: string): void {
-    const record = this.latest(topic.id);
-    const flags = this.db.prepare("SELECT resume_state FROM topics WHERE id=?").get(topic.id);
-    if (!record || record.id !== input.checkpointId || planningHash(JSON.stringify(record)) !== input.checkpointSHA256 ||
-        record.scopeGeneration !== topic.scopeGeneration || record.planEpoch !== topic.planEpoch || record.planSHA256 !== topic.planSHA256 ||
-        !["FAILED", "USER_DECISION_REQUIRED", "BLOCKED_ON_EVIDENCE"].includes(topic.state) || flags?.resume_state !== record.stage ||
-        this.db.prepare("SELECT 1 FROM actions WHERE topic_id=? AND status='running'").get(topic.id)) {
-      throw new Error("Planning usage recovery requires the current idle, interrupted checkpoint.");
-    }
-    const gaps = planningUsageGaps(record), requested = new Set(input.gapIds);
-    if (requested.size !== input.gapIds.length || input.gapIds.some(id => !gaps.some(gap => gap.id === id && !gap.authorization))) {
-      throw new Error("Select unresolved usage gaps from the current checkpoint.");
-    }
-    const at = new Date().toISOString();
-    record.usageGaps = gaps.map(gap => requested.has(gap.id)
-      ? { ...gap, authorization: { requestKey, reason: input.reason, at } } : gap);
-    record.updatedAt = at;
-    this.save(record);
   }
   latest(topicId: string, role?: "claude" | "codex"): PlanningCheckpoint | null {
     const row = this.db.prepare("SELECT record_json FROM planning_checkpoints WHERE topic_id=? AND (? IS NULL OR json_extract(record_json,'$.role')=?) ORDER BY json_extract(record_json,'$.updatedAt') DESC, rowid DESC LIMIT 1").get(topicId, role ?? null, role ?? null);
     return row ? JSON.parse(String(row.record_json)) : null;
   }
-  archive(record: PlanningCheckpoint): void {
-    this.db.prepare("INSERT INTO planning_archives(topic_id,record_json) VALUES (?,?)").run(record.topicId, JSON.stringify(record));
-  }
-  rekey(previousKey: string, record: PlanningCheckpoint): void {
-    this.db.prepare("UPDATE planning_checkpoints SET key=?,record_json=? WHERE key=?")
-      .run(record.key, JSON.stringify(record), previousKey);
-  }
-  // 재배정·재키로 현재 행이 교체돼도 archive의 측정값은 남는다. 같은 체크포인트의 반복 보관본은 최댓값 한 번,
-  // 서로 다른 체크포인트에서 같은 세션에 보낸 호출은 각각 센다. 복구 전 세션의 sessionMeasurements도 같은 규칙이다.
-  sessionContext(sessionId: string): { known: boolean; bytes: number } {
-    const rows = this.db.prepare(`SELECT record_json FROM
-      (SELECT record_json FROM planning_checkpoints UNION ALL SELECT record_json FROM planning_archives)
-      WHERE json_extract(record_json,'$.sessionId')=?
-      OR EXISTS (SELECT 1 FROM json_each(record_json,'$.sessionMeasurements') WHERE json_extract(value,'$.sessionId')=?)`).all(sessionId, sessionId);
-    const checkpoints = new Map<string, { known: boolean; bytes: number }>();
-    for (const record of rows.map(r => JSON.parse(String(r.record_json)) as PlanningCheckpoint)) {
-      const total = checkpoints.get(record.id) ?? { known: false, bytes: 0 };
-      if (record.sessionId === sessionId) {
-        total.known ||= record.started;
-        total.bytes = Math.max(total.bytes, record.injectedBytes + (record.responseBytes ?? 0));
-      }
-      for (const measured of record.sessionMeasurements ?? []) {
-        if (measured.sessionId !== sessionId) continue;
-        total.known ||= measured.started;
-        total.bytes = Math.max(total.bytes, measured.injectedBytes + measured.responseBytes);
-      }
-      checkpoints.set(record.id, total);
-    }
-    return { known: [...checkpoints.values()].some(value => value.known), bytes: [...checkpoints.values()].reduce((sum, value) => sum + value.bytes, 0) };
-  }
   bindSession(topic: Topic, planSHA256: string, sessionId: string, inputSequence: number): void {
     this.db.prepare("INSERT INTO planning_sessions VALUES (?,?) ON CONFLICT(topic_id) DO UPDATE SET record_json=excluded.record_json")
       .run(topic.id, JSON.stringify({ scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch,
         planSHA256, sessionId, inputSequence }));
-  }
-  // 승인 계획과 복구 세션을 잇는 바인딩(E3-3b, 연속성 v2) — 계획자 checkpoint 를 만든 세션이 아니라 복구 세션 S1 이 승인 계획을 확인했다는 검증 기록을
-  // 함께 둔다. 계획 작성의 finalized checkpoint 는 건드리지 않는다. 참여자·ACK·구현 세션 전환과 한 transaction 으로만 부른다(ConsensusDatabase).
-  bindRecoveredSession(topic: Topic, planSHA256: string, sessionId: string, inputSequence: number,
-    recovery: { fromSession: string | null; verification: RecoveryVerification }): void {
-    this.db.prepare("INSERT INTO planning_sessions VALUES (?,?) ON CONFLICT(topic_id) DO UPDATE SET record_json=excluded.record_json")
-      .run(topic.id, JSON.stringify({ scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch,
-        planSHA256, sessionId, inputSequence, recovery }));
   }
   boundSession(topic: Topic): { sessionId: string; inputSequence: number } | null {
     const row = this.db.prepare("SELECT record_json FROM planning_sessions WHERE topic_id=?").get(topic.id);
@@ -537,29 +266,8 @@ export class PlanningStore {
       binding.planSHA256 === topic.planSHA256 && binding.sessionId === topic.participants.find(p => p.role === "claude")?.sessionId
       ? { sessionId: binding.sessionId, inputSequence: binding.inputSequence } : null;
   }
-  continuesPriorPlan(topic: Topic, previousPlanSHA256: string): boolean {
-    return this.priorPlanCursor(topic, previousPlanSHA256) !== null;
-  }
-  // 유지 계획 세션의 재계획 전달 커서(E3-2-1): 직전 epoch 에 저장 성공으로 묶인 같은 작성자 좌석 세션이 마지막으로 받은 순번이다.
-  // 계획 정책 v2·같은 범위 세대·직전 epoch·직전 계획 SHA·지금 작성자 좌석의 세션이 모두 맞을 때만 있다 — 아니면 null(전체를 보낸다).
-  priorPlanCursor(topic: Topic, previousPlanSHA256: string): number | null {
-    if (!this.continuityEnabled(topic.id)) return null;
-    const row = this.db.prepare("SELECT record_json FROM planning_sessions WHERE topic_id=?").get(topic.id);
-    if (!row) return null;
-    const binding = JSON.parse(String(row.record_json));
-    return binding.scopeGeneration === topic.scopeGeneration && binding.planEpoch === topic.planEpoch - 1 &&
-      binding.planSHA256 === previousPlanSHA256 &&
-      binding.sessionId === topic.participants.find(p => p.role === "claude")?.sessionId ? Number(binding.inputSequence) : null;
-  }
-  fragment(key: string): PlanningFragment | null {
-    const row = this.db.prepare("SELECT record_json FROM planning_fragments WHERE key=?").get(key);
-    return row ? JSON.parse(String(row.record_json)) : null;
-  }
-  saveFragment(key: string, fragment: PlanningFragment): void {
-    this.db.prepare("INSERT INTO planning_fragments VALUES (?,?) ON CONFLICT(key) DO NOTHING").run(key, JSON.stringify(fragment));
-  }
   // 진행 표시는 논리 시도 단위다 — 참여자가 바뀌어 대화가 여럿이면 지금 대화 값에 앞선 대화들의 합(priorAttempt)을 더한다. 같은 표의 usage 가 이미
-  // 시도 합이라 단위를 맞춘다(E2b 사용자 결정 A안). 세션 문맥 판정(sessionContext)은 대화 값만 읽는다.
+  // 시도 합이라 단위를 맞춘다(E2b 사용자 결정 A안).
   progress(topicId: string) {
     const r = this.latest(topicId);
     const prior = r?.priorAttempt;

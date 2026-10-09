@@ -269,7 +269,7 @@ describe("공통 호출과 공급자 생성", () => {
     const adapter = fakeAdapter();
     const turn: SessionTurn = { cwd: "/tmp", sessionId: id, prompt: "p", job: { role: "planner", operation: "plan" },
       beforeSpawn: vi.fn(), admitSync: vi.fn(), onProcessSpawn: vi.fn(), onUsage: vi.fn(), onSessionCreated: vi.fn(),
-      onFigmaResult: vi.fn(), planningControl: { admissionId: "a", maxPromptBytes: 1000 } };
+      onFigmaResult: vi.fn() };
     await invokeAdapter(adapter, { method: "resume", turn });
     expect(vi.mocked(adapter.resumeTurn).mock.calls[0][0]).toBe(turn);
     const blocked = new Error("admission");

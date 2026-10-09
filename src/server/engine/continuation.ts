@@ -12,7 +12,7 @@ class HostStopping extends Error {}
 // The scheduler persists intent and observes outcomes. The workflow port owns all eligibility,
 // recovery dispatch, approval and delivery checks; scheduling cannot inspect its private flags.
 export type ContinuationWorkflow = Pick<WorkflowEngine, "assertContinuationIdle" | "continuationAdmission" | "resumeApprovedDelivery" |
-  "retry" | "reviewCurrentEvidence" | "approve" | "startImplementation" | "pendingCommitPaths" | "resumeInfo" |
+  "retry" | "approve" | "startImplementation" | "pendingCommitPaths" | "resumeInfo" |
   "commit" | "assertReviewedLocalDelivery" | "closeStage" | "startPlan">;
 
 // One durable owner advances an explicitly authorized plan through its prerequisites.
@@ -41,8 +41,6 @@ export class ContinuationCoordinator {
         throw new Error("현재 묶음 버전의 아직 시작하지 않은 다음 단계를 지정하세요.");
       if (this.binding(group.parentTopicId ?? topicId) !== this.binding(topicId)) throw new Error("다음 단계의 중재자 배정이 현재 주제와 다릅니다.");
     }
-    const evidence = this.db.evidence.topic(topic);
-    if (!evidence.reviewed) this.db.evidence.automation.retryPlanReview(topic, evidence.sources, evidence.digest);
     const record = this.db.continuations.save({ ...input, reason: redactSecrets(input.reason), id: randomUUID(), topicId,
       scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch, mediator: this.binding(topicId),
       inputSequence: this.db.getTimeline(topicId).at(-1)?.sequence ?? 0,
@@ -90,15 +88,11 @@ export class ContinuationCoordinator {
   }
 
   private binding(topicId: string): string { return stableJSON(this.db.roles.effective(topicId, "mediator")); }
-  private ownsEvidenceRevision(record: ContinuationRecord): boolean {
-    return record.step === "evidence" && this.db.getTimeline(record.topicId, record.inputSequence).some(event =>
-      event.payload?.continuationId === record.id && event.payload.evidenceRevisionBaseSHA256 === record.planSHA256);
-  }
   private valid(record: ContinuationRecord): void {
     const stored = this.db.continuations.get(record.topicId), topic = this.db.getTopic(record.topicId);
     if (this.stopping) throw new HostStopping("서버 종료 뒤 같은 예약에서 이어갑니다.");
     if (stored?.id !== record.id || !["pending", "running"].includes(stored.status)) throw new Error("자동 진행이 중지되거나 교체됐습니다.");
-    if (topic.scopeGeneration !== record.scopeGeneration || topic.planEpoch !== record.planEpoch || (topic.planSHA256 !== record.planSHA256 && !this.ownsEvidenceRevision(record)) ||
+    if (topic.scopeGeneration !== record.scopeGeneration || topic.planEpoch !== record.planEpoch || topic.planSHA256 !== record.planSHA256 ||
         this.binding(topic.id) !== record.mediator) throw new Error("계획·범위 또는 중재자 배정이 바뀌어 이전 자동 진행 권한을 사용하지 않았습니다.");
     const input = this.db.getTimeline(topic.id, record.inputSequence).find(event => event.actor === "user" &&
       ["decision", "evidence", "scope_change"].includes(event.kind) &&
@@ -138,27 +132,15 @@ export class ContinuationCoordinator {
       // durable intent; budget/decision/provider failures retain their existing recovery gate.
       const hostInterrupted = action.status === "cancelled" && /^서버 (종료|재시작)/.test(action.error ?? "");
       if (!hostInterrupted) throw new Error(action.error || `이전 ${record.step} 실행 결과가 ${action.status}입니다.`);
-      if (record.step === "evidence" && topic.state === "FAILED" && this.ownsEvidenceRevision(record)) {
-        this.launch(record, "evidence", id => this.workflow.retry(topic.id, id)); return;
-      } else if (record.step === "evidence") {
-        const evidence = this.db.evidence.topic(topic);
-        this.db.evidence.automation.retryPlanReview(topic, evidence.sources, evidence.digest);
-      } else if (record.step === "implement" && topic.state === "FAILED") {
+      if (record.step === "implement" && topic.state === "FAILED") {
         this.launch(record, "implement", id => this.workflow.retry(topic.id, id)); return;
-      } else throw new Error(action.error || "중단된 작업을 확인해야 합니다.");
-    }
-    if (topic.planSHA256 !== record.planSHA256) {
-      if (topic.state !== "AWAITING_USER_APPROVAL" || !this.ownsEvidenceRevision(record))
-        throw new Error("개정 계획의 합의가 완료되지 않았습니다. 보존된 개정 단계에서 복구하세요.");
-      this.update(record, { status: "awaiting-approval", error: "근거 검토를 반영한 새 계획의 합의가 끝났습니다. 기존 승인 범위와 대조한 뒤 새 계획 해시로 이어가세요." });
-      return;
+      }
+      // 옛 근거 심사 단계(evidence)의 중단된 행동은 다시 사지 않는다 — 원문 영향 심사는 없다(D6). 아래 상태 판정으로 잇는다.
+      if (record.step !== "evidence") throw new Error(action.error || "중단된 작업을 확인해야 합니다.");
     }
     if (topic.state === "AWAITING_USER_APPROVAL" || topic.state === "READY_TO_DELIVER") {
-      const evidence = this.db.evidence.topic(topic);
-      if (!evidence.ready) { this.update(record, { status: "pending", step: "evidence", error: "필수 근거 범위 승인을 기다립니다." }); return; }
-      if (!evidence.reviewed) {
-        this.launch(record, "evidence", id => this.workflow.reviewCurrentEvidence(topic.id, id)); return;
-      }
+      // root 원문 승인(ready, 사용자 권한)만 기다린다 — 원문 영향 심사(reviewed)는 실행 조건이 아니다(D6).
+      if (!this.db.evidence.topic(topic).ready) { this.update(record, { status: "pending", step: "evidence", error: "필수 근거 범위 승인을 기다립니다." }); return; }
     }
     if (topic.state === "AWAITING_USER_APPROVAL") {
       this.update(record, { step: "approve", error: null });
@@ -214,6 +196,10 @@ export class ContinuationCoordinator {
       if (this.db.workGroups.get(group.id).version !== next.version) throw new Error("다음 단계 생성 중 묶음 버전이 바뀌었습니다. 계획을 시작하지 않았습니다.");
       const nextTopic = this.db.getTopic(nextTopicId);
       if (this.binding(nextTopicId) !== record.mediator) throw new Error("다음 단계의 중재자 배정이 바뀌었습니다.");
+      // ticket 단계는 열기만 한다 — 이 권한은 계획까지이고 구현 시작이 아니다(계약 v3.17 (30)). 구현은 중재자의 implement 가 연다.
+      if (nextTopic.workflowMode !== "planned") {
+        this.update(record, { status: "complete", step: "complete", error: "다음 단계는 ticket 작업이라 열기만 했습니다. 다음 행동: implement" }); return;
+      }
       if (nextTopic.state === "DRAFT" && !this.db.runningAction(nextTopicId)) this.workflow.startPlan(nextTopicId);
       else if (["FAILED", "USER_DECISION_REQUIRED", "CLOSED"].includes(nextTopic.state)) throw new Error("다음 단계가 별도 정지 또는 완료 상태입니다. 계획 시작 결과를 확인해야 합니다.");
       // This permission opens/plans the specified next stage, never approves its unseen plan.

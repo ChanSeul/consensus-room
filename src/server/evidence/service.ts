@@ -6,7 +6,9 @@ import { EvidenceAdmissionExpired, EvidenceScheduler, evidenceGroup } from "./sc
 import { discoverLinks } from "./discovery.js";
 import type { ConsensusDatabase } from "../database.js";
 import type { AgentResult } from "../../shared/contracts.js";
-import type { AgentAdapter, SessionTurn } from "../types.js";
+import { nextEnvelopeMethod, type AgentAdapter, type SessionTurn } from "../types.js";
+import { turnFlags } from "../../shared/roles.js";
+import type { TurnEnvelope, WorkerFact } from "../../shared/turnContract.js";
 import { EvidenceFetchError, type EvidenceConnector } from "./connectors.js";
 import { DESIGN_PLANNING_CONTRACT } from "../../shared/prompts.js";
 import { evidenceHash, type EvidenceStore } from "./store.js";
@@ -39,7 +41,23 @@ export class EvidenceService {
   };
 
   constructor(readonly store: EvidenceStore, private readonly connector: EvidenceConnector,
-    private readonly changed: (source: EvidenceSource) => void = () => undefined, private readonly imageDirectory?: string, private readonly native?: EvidenceConnector) {}
+    private readonly imageDirectory?: string, private readonly native?: EvidenceConnector,
+    // 원문 사실의 출구(D6) — source-change·source-error 를 하나의 출구로 낸다. 타임라인 기록·전달은 연결하는 쪽(app.ts)이 한다.
+    private readonly facts: (fact: WorkerFact) => void = () => undefined) {}
+
+  // 작업자·중재자에게 전할 원문 사실 — 영향 판단은 받는 쪽이 한다. 첫 수집은 before 가 null 이다.
+  private sourceChanged(before: EvidenceSource, after: EvidenceSource): void {
+    if (before.contentHash === after.contentHash) return;
+    const version = (source: EvidenceSource) => source.contentHash ? { revision: source.revision, contentHash: source.contentHash } : null;
+    this.store.catalog.afterPublication(() => {
+      this.facts({ kind: "source-change", sourceId: after.id, before: version(before), after: version(after) });
+    });
+  }
+
+  // 조회 오류는 새로 생기거나 바뀔 때만 사실로 알린다 — 같은 오류의 재시도마다 기록하지 않는다.
+  private sourceFailed(source: EvidenceSource, previous: string | null | undefined, error: string | null | undefined): void {
+    if (error && error !== previous) this.facts({ kind: "source-error", sourceId: source.id, error });
+  }
   start(): void {
     if (this.timer) return;
     const poll = () => { void this.poll().catch(() => console.warn("[evidence] 원문 확인을 마치지 못했습니다. 다음 주기에 다시 확인합니다.")); };
@@ -141,12 +159,14 @@ export class EvidenceService {
             this.store.recordCollection(source.id, { status: before.contentHash === after.contentHash ? "unchanged" : "collected", checkedAt: after.checkedAt!, connectionKey: page.connectionKey, missing: page.missing, error: undefined });
             if (page.connectionKey) this.store.catalog.afterPublication(() => this.collectedThisPoll.set(source.id, { key: `${page.connectionKey}:${after.contentHash}`, links: data.links }));
             this.store.measure(source.id, before.contentHash === after.contentHash ? "unchangedCollections" : "changedCollections", 1);
-            if (before.contentHash !== after.contentHash) this.store.catalog.afterPublication(() => this.changed(after));
+            this.sourceChanged(before, after);
           }
         });
       } catch (error) {
         if (this.abort.signal.aborted || error instanceof EvidenceAdmissionExpired) return;
-        this.store.recordCollection(source.id, { status: "error", error: error instanceof Error ? error.message.slice(0, 500) : "수집 실패" });
+        const message = error instanceof Error ? error.message.slice(0, 500) : "수집 실패";
+        this.store.recordCollection(source.id, { status: "error", error: message });
+        this.sourceFailed(source, source.collection?.error, message);
         this.store.catalog.failed(rootId, source.id, error instanceof EvidenceFetchError ? error.message : "원문 수집이 중단됐습니다. 이전 자료는 보존했습니다.",
           error instanceof EvidenceFetchError ? error.retryAfterSeconds : 300,
           committing || (error instanceof EvidenceFetchError && error.restart));
@@ -232,7 +252,7 @@ export class EvidenceService {
     }
     const catalog = this.store.catalogFor(topic);
     if (catalog.roots.length) {
-      this.store.assertReady(topic, false);
+      this.store.assertReady(topic);
       const digest = this.store.topic(topic).digest;
       const response: MediatorEvidenceResponse = { batchId:null,digest,currentDigest:digest,superseded:false,
         sources:[],changes:[],removedSources:[],removedUnits:[],images:[],remaining:0,nextCursor:null,
@@ -257,7 +277,7 @@ export class EvidenceService {
     }
     const current = database.getTopic(topicId);
     if (current.scopeGeneration !== topic.scopeGeneration || current.state === "CLOSED") throw new Error("자료 준비 중 작업 범위가 바뀌었습니다.");
-    this.store.assertReady(current, false);
+    this.store.assertReady(current);
     const response = respond(packet, this.store.topic(current).digest);
     this.store.measure(`mediator:${topicId}`, "deliveredBytes", Buffer.byteLength(JSON.stringify(response)));
     return response;
@@ -301,21 +321,31 @@ export class EvidenceService {
       // HTTP bodies and credentials must not enter diagnostics. A provider error is already bounded.
       try {
         this.store.failed(id, check.checkId, error instanceof EvidenceFetchError ? error.message : "원문 수집에 실패했습니다. 이전 캐시를 최신으로 처리하지 않습니다.", error instanceof EvidenceFetchError ? error.retryAfterSeconds : 300);
-        this.store.recordCollection(id, { status: "error", error: this.store.get(id).error ?? "수집 실패" });
+        const failed = this.store.get(id);
+        this.store.recordCollection(id, { status: "error", error: failed.error ?? "수집 실패" });
+        this.sourceFailed(failed, source.error, failed.error);
       } catch { /* A newer lease owns this source. */ }
     } finally { this.store.releaseCheck(id, check.checkId); }
   }
   ingest(id: string, input: EvidenceSnapshotInput): EvidenceSource {
     const before = this.store.get(id); const after = this.store.ingest(id, input);
-    if (before.contentHash !== after.contentHash) this.store.catalog.afterPublication(() => this.changed(after));
+    this.sourceChanged(before, after);
     return after;
+  }
+  // 커넥터가 보고한 조회 실패(/api/evidence/:id/failure). 기록은 저장소가 하고, 사실에는 저장소가 기록한(정제·절단한) 오류를 싣는다.
+  failed(id: string, checkId: string, error: string, retryAfterSeconds?: number): void {
+    const before = this.store.get(id);
+    this.store.failed(id, checkId, error, retryAfterSeconds);
+    const after = this.store.get(id);
+    this.sourceFailed(after, before.error, after.error);
   }
   importHost(topicId: string, input: EvidenceHostImport): EvidenceSource {
     const before=this.store.get(input.sourceId);
     if (this.nativeOnly(before))
       throw Object.assign(new Error("이 원문은 서버가 같은 앱 연결로 직접 수집합니다. host-import 대신 collect 를 호출하세요."),{statusCode:409});
     const after=this.store.catalog.importHostSnapshot(topicId,input,discoverLinks(input.units,before.url));
-    if (before.contentHash!==after.contentHash) this.store.catalog.afterPublication(() => this.changed(after));
+    this.sourceChanged(before, after);
+    this.sourceFailed(after, before.error, after.error);
     return after;
   }
 }
@@ -330,12 +360,17 @@ function designAccessGuidance(figmaRead: boolean, cache: readonly unknown[], obs
     : "Figma tools are not available in this turn; do not try other tools or skills to read Figma. Use only the observations and caches below. If a design value needed for a comparison is missing from them, report the node and tool as an evidence gap for the mediator to register in the shared cache, and continue with the rest; never invent design values.";
   return `Inspect only the Figma screen currently being implemented or reviewed. Reuse already inspected data with the same contentHash; read the cache only when needed. The observed-design references are the exact native tool responses seen by implementation, not a claim that the remote file is still current. Use those same observations for review. Older source caches are baseline references only and must not override a newer observed response. ${missing}\nOptional design cache references (not yet read): ${JSON.stringify(cache)}\nObserved design references retained in this scope (including prior plan revisions; verify their relevance to the current plan): ${JSON.stringify(observations)}`;
 }
+// 결과마다 다른 것은 세 가지다: 세션 id, 미완료 여부(Figma 응답 미수집을 허용하는 진행·정지 보고), 관측 참조를 결과에 묶는 방법. 결과 봉투는 message 를 원문 그대로
+// 전달해야 하므로 관측 참조를 묶지 않는다 — 관측은 관측 원장(observeDesign·recordDesignRead)에 남고 다음 턴의 근거 입력이 다시 싣는다.
+interface EvidenceResult<T> { session: (result: T) => string; unfinished: (result: T) => boolean; bindObservations?: (result: T, refs: string[]) => void }
+const legacyUnfinished = (result: AgentResult) => result.status === "blocked" || result.status === "in_progress";
+const envelopeUnfinished = (envelope: TurnEnvelope) => envelope.outcome === "continue" || envelope.outcome === "needs-mediator";
+const bindEvidenceRefs = (result: AgentResult, refs: string[]) => { result.evidenceRefs = [...result.evidenceRefs, ...new Set(refs)]; };
+
 export function withEvidence(adapter: AgentAdapter, database: ConsensusDatabase, imageDirectory: string): AgentAdapter {
-  const run = async <T>(turn: Omit<SessionTurn, "sessionId"> | SessionTurn, invoke: (enriched: typeof turn) => Promise<T>, session: (result: T) => string): Promise<T> => {
+  const run = async <T>(turn: Omit<SessionTurn, "sessionId"> | SessionTurn, invoke: (enriched: typeof turn) => Promise<T>, handling: EvidenceResult<T>): Promise<T> => {
     const topic = database.topicForTurn(turn);
-    if (!topic || turn.protocolOnly || turn.planningControl) return invoke(turn);
-    // Impact review already carries the exact diff and a local cache; do not inject a fresh session full-corpus page.
-    if (turn.evidenceAssessment) return invoke({ ...turn, evidenceManaged: true, figmaReadEnabled: false });
+    if (!topic || turn.protocolOnly) return invoke(turn);
     // 한 턴에 근거 한 쪽을 싣는다(E3-1). 쪽 크기는 바뀐 PNG 경로 줄까지 포함한 근거 블록의 바이트다. 새로 전달할 항목이 없으면 블록은 비어 있지만,
     // 원문이 연결된 주제의 턴은 계속 근거 관리 턴이다(웹 조회 차단·로컬 PNG 읽기·Figma 안내). 원문도 삭제 알림도 없을 때만 그대로 부른다.
     const imagePath = (hash: string) => join(imageDirectory, `${hash}.png`);
@@ -355,9 +390,11 @@ export function withEvidence(adapter: AgentAdapter, database: ConsensusDatabase,
     const designPaths: string[] = [];
     const designCache: Array<{ url: string; nodeId: string; contentHash: string; path: string }> = [];
     const designSources = database.evidence.list(topic.id).filter(source => source.provider === "figma");
-    const designAccess = turn.implementation || ["CODEX_REVIEW", "CODEX_FINAL_REVIEW"].includes(topic.state);
+    // 쓰기 턴(구현자) — job 이 있으면 job 에서 정하고(봉투 턴은 job 만 싣는다), 없는 옛 직접 호출은 지금처럼 implementation 플래그를 쓴다.
+    const writes = turn.job ? turnFlags(turn.job).write : Boolean(turn.implementation);
+    const designAccess = writes || topic.state === "CODEX_REVIEW";
     // Only implementation reads Figma; the guidance below is generated from this same permission.
-    const figmaReadEnabled = Boolean(turn.implementation && designSources.length);
+    const figmaReadEnabled = Boolean(writes && designSources.length);
     if (designAccess && !turn.signal?.aborted) database.evidence.beginDesignTurn(topic);
     const observed = designAccess ? database.evidence.designObservations(topic) : [];
     const observationReferences: Array<{ hash: string; path: string }> = [];
@@ -446,42 +483,50 @@ export function withEvidence(adapter: AgentAdapter, database: ConsensusDatabase,
       else database.evidence.recordDesignRead(topic, { kind: "unavailable", request: { tool: observation.tool, input: observation.input }, failure: observation.content ?? null });
     };
     const result = await invoke({ ...turn,
-      onFigmaRequest: turn.implementation ? request => {
+      onFigmaRequest: writes ? request => {
         if (!turn.signal?.aborted) database.evidence.recordDesignRead(topic, { kind: "requested", request });
       } : undefined,
-      onFigmaResult: turn.implementation ? capture : undefined, evidenceManaged: true, figmaReadEnabled,
+      onFigmaResult: writes ? capture : undefined, evidenceManaged: true, figmaReadEnabled,
       figmaFileKeys: designSources.map(source => source.resource),
       prompt: `${turn.prompt}${evidenceText ? `\n\n${evidenceText}` : ""}${corpusGuidance}` +
         (gaps.length ? `\nDeferred design reads (not verified design): ${JSON.stringify(gaps)}. Unreceived means unknown; unavailable means an explicit failure. Preserve these as To-do and exclude only dependent behavior. Continue the supported implementation or review. Do not automatically repeat failed reads or replay this backlog; retry only a read needed for current supported work after a relevant source/access change or explicit refresh. Completed means supported work is complete with excluded dependencies identified, never that these reads or mandatory checks succeeded.` : ""),
       readablePaths: [...turn.readablePaths ?? [], ...designPaths, ...gaps.map(item => item.path), ...packet.availableImages.map(hash => join(imageDirectory, `${hash}.png`))] });
     const current = database.getTopic(topic.id);
     if (!turn.signal?.aborted && current.scopeGeneration === topic.scopeGeneration && current.planEpoch === topic.planEpoch && current.planSHA256 === topic.planSHA256) {
-      const refs: string[] = [];
-      const outcome = result as AgentResult | { result: AgentResult };
-      const agentResult = "result" in outcome ? outcome.result : outcome;
-      const unfinished = agentResult.status === "blocked" || agentResult.status === "in_progress";
-      if (designAccess && !unfinished && database.evidence.designReadView(topic).pending.length) throw new Error("A design response from this turn was not captured; current-turn capture integrity must be repaired before accepting this result.");
+      if (designAccess && !handling.unfinished(result) && database.evidence.designReadView(topic).pending.length) throw new Error("A design response from this turn was not captured; current-turn capture integrity must be repaired before accepting this result.");
       // Gaps live in the lifecycle/host ledger and the next consumer's referenced input, never
       // in accumulated model summaries: every continuation would duplicate the entire backlog.
       // Rebind retained observations even if this resumed turn needed no new Figma calls.
-      for (const observation of designAccess ? database.evidence.designObservations(topic) : []) {
-        const files = await materializeObservation(imageDirectory, observation.hash, observation.record);
-        refs.push(`figma-observation:${observation.hash} ${files[0]}`);
+      if (handling.bindObservations) {
+        const refs: string[] = [];
+        for (const observation of designAccess ? database.evidence.designObservations(topic) : []) {
+          const files = await materializeObservation(imageDirectory, observation.hash, observation.record);
+          refs.push(`figma-observation:${observation.hash} ${files[0]}`);
+        }
+        // Bind the accepted implementation artifact to the exact observed content, not an older REST snapshot.
+        if (refs.length) handling.bindObservations(result, refs);
       }
-      // Bind the accepted implementation artifact to the exact observed content, not an older REST snapshot.
-      if (refs.length) {
-        agentResult.evidenceRefs = [...agentResult.evidenceRefs, ...new Set(refs)];
-      }
-      database.evidence.receipt(topic, adapter.role, session(result), packet);
+      database.evidence.receipt(topic, adapter.role, handling.session(result), packet);
     }
     return result;
   };
   return {
     role: adapter.role, validateExistingSession: id => adapter.validateExistingSession(id),
     ...(adapter.isSessionMissing ? { isSessionMissing: (id: string) => adapter.isSessionMissing!(id) } : {}),
-    createSession: turn => run(turn, enriched => adapter.createSession(enriched), result => result.sessionId),
-    resumeTurn: turn => run(turn, enriched => adapter.resumeTurn(enriched as SessionTurn), () => turn.sessionId),
+    createSession: turn => run(turn, enriched => adapter.createSession(enriched), { session: created => created.sessionId,
+      unfinished: created => legacyUnfinished(created.result), bindObservations: (created, refs) => bindEvidenceRefs(created.result, refs) }),
+    resumeTurn: turn => run(turn, enriched => adapter.resumeTurn(enriched as SessionTurn), { session: () => turn.sessionId,
+      unfinished: legacyUnfinished, bindObservations: bindEvidenceRefs }),
     ...(adapter.resumePlanRepair ? { resumePlanRepair: (turn: SessionTurn) => adapter.resumePlanRepair!(turn) } : {}),
+    // 결과 봉투 턴도 같은 근거 입력·Figma 읽기 허용·관측 기록을 받는다. 다음 층에 메서드가 없으면 근거를 싣기 전에 명시 오류로 멈춘다.
+    createEnvelopeSession: async turn => {
+      const next = nextEnvelopeMethod(adapter, "createEnvelopeSession");
+      return run(turn, enriched => next(enriched), { session: created => created.sessionId, unfinished: created => envelopeUnfinished(created.envelope) });
+    },
+    resumeEnvelopeTurn: async turn => {
+      const next = nextEnvelopeMethod(adapter, "resumeEnvelopeTurn");
+      return run(turn, enriched => next(enriched as SessionTurn), { session: () => turn.sessionId, unfinished: envelopeUnfinished });
+    },
   };
 }
 

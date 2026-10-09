@@ -21,5 +21,5 @@ export interface MediatorInterrupt {
   sourceRole: "planner" | "runner" | "reviewer" | "system";
 }
 
-const attentionStates = new Set(["USER_DECISION_REQUIRED", "BLOCKED_ON_EVIDENCE", "FAILED", "AWAITING_USER_APPROVAL", "READY_TO_DELIVER", "BRAINSTORM_READY"]);
+const attentionStates = new Set(["USER_DECISION_REQUIRED", "FAILED", "AWAITING_USER_APPROVAL", "READY_TO_DELIVER", "BRAINSTORM_READY"]);
 export function needsMediatorAttention(state: string): boolean { return attentionStates.has(state); }

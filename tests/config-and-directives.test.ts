@@ -4,9 +4,8 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { loadConfig } from "../src/server/config";
-import { isMissingSessionError } from "../src/server/engine/delivery";
-import { agentRunError, parseAgentResult } from "../src/server/adapters/resultParser";
-import { replanDirective } from "../src/shared/workflow";
+import { isMissingSessionError } from "../src/server/engine/turnExecutor";
+import { agentRunError } from "../src/server/adapters/resultParser";
 import { appliedExecutionSettings } from "../src/shared/execution";
 
 const temporaryDirectories: string[] = [];
@@ -81,22 +80,6 @@ describe("상시 참조 문서 설정", () => {
   });
 });
 
-describe("재계획 지시 판정(2026-09-07 'REPLAN 아님' 사고)", () => {
-  it("줄 머리 또는 본문 끝의 REPLAN 만 지시로 본다", () => {
-    expect(replanDirective("REPLAN — 전제가 바뀌었다")).toBe(true);
-    expect(replanDirective("설명 한 줄\nREPLAN\n이유")).toBe(true);
-    expect(replanDirective("핵심 전제가 바뀌었다. REPLAN")).toBe(true);
-    expect(replanDirective("핵심 전제가 바뀌었다. REPLAN   \n")).toBe(true);
-  });
-
-  it("문장 가운데 언급이나 부정('REPLAN 아님')은 지시가 아니다", () => {
-    expect(replanDirective("# [d03] 종결 3회차 — REPLAN 아님, 처분 변경 없음")).toBe(false);
-    expect(replanDirective("이 결정은 REPLAN 을 요구하지 않는다.")).toBe(false);
-    expect(replanDirective("replan 소문자는 무시")).toBe(false);
-    expect(replanDirective("PREPLANNED 도 아니다")).toBe(false);
-  });
-});
-
 describe("구현 세션 유실 판정", () => {
   // E3-3b: 문구가 아니라 어댑터가 관측으로 분류한 코드(session-missing — 모델 턴 없음 관측이 필요조건)로만 본다.
   it("어댑터가 session-missing 으로 분류한 실패만 유실로 본다 — 같은 문구를 담은 일반 Error 는 유실이 아니다", () => {
@@ -108,16 +91,5 @@ describe("구현 세션 유실 판정", () => {
     expect(isMissingSessionError(new Error("Claude 실행 실패(1): No conversation found with session ID: ff30"))).toBe(false);
     expect(isMissingSessionError(new Error("Claude 실행 실패(1): rate limited"))).toBe(false);
     expect(isMissingSessionError("문자열 오류")).toBe(false);
-  });
-});
-
-describe("결과 파서 — 구조화 출력의 null 선택 필드", () => {
-  it("toleranceLedger: null 인 정상 응답을 받아들인다(Codex 지적 1)", () => {
-    const candidate = {
-      kind: "ACK", summary: "확인", planMarkdown: null, planEdits: null, planSHA256: null,
-      findings: [], evidenceRefs: [], requestedUserDecision: null, memoryUpdates: null, toleranceLedger: null,
-    };
-    expect(parseAgentResult([candidate], "").kind).toBe("ACK");
-    expect(parseAgentResult([{ ...candidate, toleranceLedger: [{ ruleId: "T-1", file: "a", note: "" }] }], "").toleranceLedger).toHaveLength(1);
   });
 });

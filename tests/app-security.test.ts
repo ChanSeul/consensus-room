@@ -1,4 +1,3 @@
-import { ArtifactStore } from "../src/server/artifacts";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -125,7 +124,7 @@ it("requires authentication and an idempotency key to opt an idle topic into con
   const { app, database } = await makeApp();
   draftTopic(database, "planning-topic");
   const url = "/api/topics/planning-topic/planning-control";
-  expect(database.planning.enabled("planning-topic")).toBe(false);
+  expect(database.planning.policyVersion("planning-topic")).toBe(0);
   expect((await app.inject({ method: "POST", url })).statusCode).toBe(401);
   const headers = { "x-consensus-token": "launch-token-for-test" };
   expect((await app.inject({ method: "POST", url, headers })).statusCode).toBe(400);
@@ -134,7 +133,7 @@ it("requires authentication and an idempotency key to opt an idle topic into con
   expect(first.statusCode).toBe(200);
   expect(first.json().version).toBe(2);
   expect((await app.inject(request)).json()).toEqual(first.json());
-  expect(database.planning.enabled("planning-topic")).toBe(true);
+  expect(database.planning.policyVersion("planning-topic")).toBeGreaterThan(0);
   await app.close();
 });
 
@@ -147,73 +146,6 @@ it("enabling planning after approval does not impose a new session contract", as
   expect(response.statusCode).toBe(200);
   expect(response.json().version).toBe(1);
   expect(database.planning.continuityEnabled("approved-topic")).toBe(false);
-  await app.close();
-});
-
-// Public API -> persisted policy -> retry routing. No model call is needed to migrate.
-// Fixtures reproduce a hash-verified interrupted CLI output; saved plans and concurrent changes must refuse migration.
-async function migrationFixture(validate: () => Promise<boolean> = async () => true) {
-  const context = await makeApp(undefined, validate);
-  const { database, root } = context;
-  draftTopic(database, "migrate");
-  const sessionId = "11111111-1111-4111-8111-111111111111";
-  database.upsertParticipant("migrate", { role: "claude", sessionId, mode: "created", acknowledgedPlanSHA256: null });
-  database.updateTopic("migrate", { state: "USER_DECISION_REQUIRED", resumeState: "CLAUDE_PLAN" });
-  const store = new ArtifactStore(join(root, "topics"), database);
-  const artifact = await store.write("migrate", "interrupted-output", 1, JSON.stringify({ sessionId,
-    output: { stdout: JSON.stringify({ type: "system", subtype: "init", session_id: sessionId, cwd: "/tmp/worktree" }) } }));
-  const topic = database.getTopic("migrate");
-  const payload = { sessionId, scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch,
-    interruptedSHA256: artifact.sha256, apply: true };
-  const request = { method: "POST" as const, url: "/api/topics/migrate/planning-control/migration",
-    headers: { "x-consensus-token": "launch-token-for-test", "idempotency-key": "migration" }, payload };
-  return { ...context, request, store, artifact };
-}
-
-it("previews and atomically migrates a verified interrupted plan without granting allowances or calling models", async () => {
-  const { app, database, request, adapterCalls } = await migrationFixture();
-  const topic = database.getTopic("migrate");
-  const revisions = database.revisions.account("migrate");
-  const preview = await app.inject({ ...request, headers: { ...request.headers, "idempotency-key": "preview" },
-    payload: { ...request.payload, apply: false } });
-  expect(preview.statusCode).toBe(200);
-  expect(database.planning.policyVersion("migrate")).toBe(0);
-  const first = await app.inject(request);
-  expect(first.statusCode).toBe(200);
-  expect(first.json()).toMatchObject({ version: 2, applied: true });
-  expect((await app.inject(request)).json()).toEqual(first.json());
-  expect(database.getTopic("migrate")).toMatchObject({ scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch,
-    state: topic.state, participants: topic.participants, planSHA256: null });
-  expect(database.revisions.account("migrate")).toEqual(revisions);
-  expect(database.getTimeline("migrate").filter(e => e.payload?.planningMigration)).toHaveLength(1);
-  expect(adapterCalls).toEqual([]);
-  await app.close();
-});
-
-it.each(["missing-session", "saved-plan", "tampered-output", "wrong-session", "wrong-epoch", "stale-mediator", "wrong-worktree", "implementation"])(
-  "refuses migration for %s without changing the policy", async reason => {
-    const { app, database, request, store, artifact } = await migrationFixture(async () => reason !== "missing-session");
-    if (reason === "saved-plan") await store.write("migrate", "claude-plan", 1, "saved response before planSHA assignment");
-    if (reason === "tampered-output") writeFileSync(artifact.path, "tampered");
-    if (reason === "wrong-session") request.payload.sessionId = "22222222-2222-4222-8222-222222222222";
-    if (reason === "wrong-epoch") request.payload.planEpoch++;
-    if (reason === "wrong-worktree") database.updateTopic("migrate", { worktreePath: "/tmp/another-worktree" });
-    if (reason === "implementation") database.updateTopic("migrate", { implementationSessionId: request.payload.sessionId });
-    if (reason === "stale-mediator") database.roles.assign({ scope: "global", role: "mediator", participant: "current-mediator",
-      profileId: null, sessionId: null, note: "", operation: "", expectedVersion: 0 });
-    const response = await app.inject({ ...request, headers: { ...request.headers,
-      ...(reason === "stale-mediator" ? { "x-consensus-actor": "mediator" } : {}) } });
-    expect(response.statusCode).toBeGreaterThanOrEqual(400);
-    expect(database.planning.policyVersion("migrate")).toBe(0);
-    await app.close();
-  });
-
-it("rejects a changed topic after asynchronous session validation", async () => {
-  let mutate = () => {};
-  const { app, database, request } = await migrationFixture(async () => { mutate(); return true; });
-  mutate = () => database.updateTopic("migrate", { planEpoch: request.payload.planEpoch + 1 });
-  expect((await app.inject(request)).statusCode).toBeGreaterThanOrEqual(400);
-  expect(database.planning.policyVersion("migrate")).toBe(0);
   await app.close();
 });
 
@@ -243,10 +175,16 @@ async function makeApp(runner?: CommandRunner, validateSession: () => Promise<bo
   // 가짜는 프로세스를 띄운 뒤 실패한 호출을 흉내 낸다(onProcessSpawn) — 띄우지 않은 호출은 예약이 해제되므로 집계 테스트의 전제가 달라진다(PLAN §2 검증 조건 1).
   const fakeSpawn = (turn: { onProcessSpawn?: (process: { pid: number; pgid: number; executable: string; commandLine: string; startedAt: string }) => void }) =>
     turn.onProcessSpawn?.({ pid: 1, pgid: 1, executable: "fake", commandLine: "fake", startedAt: new Date().toISOString() });
+  // 운영 라우팅은 봉투 턴(createEnvelopeSession·resumeEnvelopeTurn)으로 간다(⑥) — 옛 결과 메서드와 같은 실패 흉내를 봉투 메서드에도 둔다.
+  const failCall = (role: "claude" | "codex", turn: Parameters<typeof fakeSpawn>[0]): never => {
+    adapterCalls.push(role); resolveAdapterCall(role); fakeSpawn(turn); throw new Error("이 테스트에서는 CLI를 실행하지 않습니다.");
+  };
   const adapter = (role: "claude" | "codex"): AgentAdapter => ({
     role,
-    createSession: async (turn) => { adapterCalls.push(role); resolveAdapterCall(role); fakeSpawn(turn); throw new Error("이 테스트에서는 CLI를 실행하지 않습니다."); },
-    resumeTurn: async (turn) => { adapterCalls.push(role); resolveAdapterCall(role); fakeSpawn(turn); throw new Error("이 테스트에서는 CLI를 실행하지 않습니다."); },
+    createSession: async (turn) => failCall(role, turn),
+    resumeTurn: async (turn) => failCall(role, turn),
+    createEnvelopeSession: async (turn) => failCall(role, turn),
+    resumeEnvelopeTurn: async (turn) => failCall(role, turn),
     validateExistingSession: validateSession,
   });
   const database = new ConsensusDatabase(join(root, "room.sqlite"));
@@ -317,6 +255,7 @@ function draftTopic(
   changes: Partial<{ repositoryPath: string; worktreePath: string; branchName: string | null }> = {},
 ) {
   database.createTopic({
+    workflowMode: "planned",
     id,
     slug: "idempotency",
     title: "중복 요청",
@@ -333,7 +272,6 @@ function draftTopic(
     updatedAt: "2026-08-23T00:00:00.000Z",
     lastError: null,
   });
-  database.revisions.configure(id,3,database.revisions.account(id).version);
   for(const scope of ["planning","implementation"] as const) database.reviews.configure(id,scope,3,database.reviews.account(id,scope).version);
 }
 
@@ -440,6 +378,7 @@ describe("HTTP idempotency", () => {
     const { app, database } = await makeApp();
     const planSHA256 = "a".repeat(64);
     database.createTopic({
+      workflowMode: "planned",
       id: "topic-1",
       slug: "idempotency",
       title: "중복 승인",
@@ -724,29 +663,35 @@ it.each(["grant","resume","observe"])("작업 묶음 API는 단계 생성 중복
  try {
   const created=await post("/api/work-groups",input,"create");expect(created.statusCode).toBe(201);const group=created.json();
   const next=await post(`/api/work-groups/${group.id}/next`,{},"next");expect(next.statusCode).toBe(201);const topic=next.json();
-  expect(database.planning.policyVersion(topic.id)).toBe(2);
+  // 새 단계는 ticket 이고 정책을 켜지 않는다. 아래 예산 재개는 계획 단계를 검사하므로 공개 방식 전환으로 planned 를 고른다.
+  expect(database.planning.policyVersion(topic.id)).toBe(0);
+  expect((await post(`/api/topics/${topic.id}/workflow-mode`,{mode:"planned",reason:"계획 단계 예산 재개를 검사한다"},"mode")).statusCode).toBe(200);
   const repeated=await post(`/api/work-groups/${group.id}/next`,{},"next");expect(repeated.json().id).toBe(topic.id);expect(worktreeAdds).toHaveLength(1);
   const blocked=await post(`/api/work-groups/${group.id}/next`,{},"next-new");expect(blocked.statusCode).toBeGreaterThanOrEqual(400);expect(worktreeAdds).toHaveLength(1);
   database.updateTopic(topic.id,{state:"AWAITING_USER_APPROVAL",planSHA256:"a".repeat(64),approvedPlanSHA256:"a".repeat(64)});
   const revised=await post(`/api/work-groups/${group.id}/revise`,{input:{...input,contracts:"새 계약"},version:1},"revise");expect(revised.statusCode).toBe(200);
-  expect(database.getTopic(topic.id)).toMatchObject({state:"DRAFT",planSHA256:null,approvedPlanSHA256:null,planEpoch:2});
+  // 개정은 승인 계획·상태를 초기화하지 않는다 — 바뀐 단계 문맥을 그 단계 토픽의 사실(work-group-revision)로 남기고, 계획 수정·범위 변경은 중재자가 정한다
+  // (D8, 계약 v3.18 (33')).
+  expect(database.getTopic(topic.id)).toMatchObject({state:"AWAITING_USER_APPROVAL",planSHA256:"a".repeat(64),approvedPlanSHA256:"a".repeat(64),planEpoch:1,scopeGeneration:1});
   expect(database.budgets.account(topic.id)?.policy).toEqual(budget);
   expect(database.workGroups.forTopic(topic.id)?.version).toBe(2);
-  // E4 D2(저장 우선 + 명시적 재계획 대기) — 범위 변경이 끊겨도 개정은 저장되고, 대기 표식이 그 단계를 막으며, 같은 입력을 새 키로 다시 보내면 이어 적용한다.
-  // (E4 전 계약은 "실패하면 개정을 저장하지 않는다" 였는데, 영향 단계가 둘이면 일부만 초기화된 채 개정이 사라졌다 — E0 관측.)
+  const revisionFacts=()=>database.getTimeline(topic.id).filter(event=>(event.payload?.workerFact as {kind?:string}|undefined)?.kind==="work-group-revision")
+    .map(event=>(event.payload.workerFact as {version:number}).version);
+  expect(revisionFacts()).toEqual([2]);
+  // 개정은 작업 트리를 만들지 않는다(범위 변경 없음) — worktree 생성이 실패하는 동안에도 저장된다. 같은 입력을 새 키로 다시 보내면 바꿀 것이 없다.
   database.updateTopic(topic.id,{state:"READY_TO_DELIVER",approvedPlanSHA256:"a".repeat(64)});failWorktree=true;
-  const failure=await post(`/api/work-groups/${group.id}/revise`,{input:{...input,contracts:"범위 변경이 끊긴 계약"},version:2},"revision-failure");
-  expect(failure.statusCode).toBeGreaterThanOrEqual(400);
-  expect(database.workGroups.get(group.id)).toMatchObject({version:3,contracts:"범위 변경이 끊긴 계약"});
-  expect(database.workGroups.get(group.id).links.one.replanPending).toEqual({version:3,fromGeneration:2});
-  expect(database.getTopic(topic.id)).toMatchObject({state:"READY_TO_DELIVER",scopeGeneration:2,approvedPlanSHA256:"a".repeat(64)});failWorktree=false;
-  const reapplied=await post(`/api/work-groups/${group.id}/revise`,{input:{...input,contracts:"범위 변경이 끊긴 계약"},version:3},"revision-reapply");
+  const second=await post(`/api/work-groups/${group.id}/revise`,{input:{...input,contracts:"두 번째 계약"},version:2},"revision-second");
+  expect(second.statusCode).toBe(200);
+  expect(database.workGroups.get(group.id)).toMatchObject({version:3,contracts:"두 번째 계약"});
+  expect(database.getTopic(topic.id)).toMatchObject({state:"READY_TO_DELIVER",scopeGeneration:1,approvedPlanSHA256:"a".repeat(64)});failWorktree=false;
+  expect(worktreeAdds).toHaveLength(1);
+  const reapplied=await post(`/api/work-groups/${group.id}/revise`,{input:{...input,contracts:"두 번째 계약"},version:3},"revision-reapply");
   expect(reapplied.statusCode).toBe(200);
-  expect(database.workGroups.get(group.id)).toMatchObject({version:3,contracts:"범위 변경이 끊긴 계약"});
-  expect(database.workGroups.get(group.id).links.one.replanPending).toBeUndefined();
-  expect(database.getTopic(topic.id)).toMatchObject({state:"DRAFT",scopeGeneration:3,approvedPlanSHA256:null});
+  expect(database.workGroups.get(group.id)).toMatchObject({version:3,contracts:"두 번째 계약"});
+  expect(revisionFacts()).toEqual([2,3]);
   expect(database.budgets.account(topic.id)?.policy).toEqual(budget);
-  database.updateTopic(topic.id,{state:"USER_DECISION_REQUIRED",resumeState:"CLAUDE_PLAN"});
+  // 예산으로 멈춘 첫 계획 단계 — 계획 없이 CLAUDE_PLAN 재개 지점으로 둔다(묶음 예산 재개가 실제 계획 턴을 연다).
+  database.updateTopic(topic.id,{state:"USER_DECISION_REQUIRED",resumeState:"CLAUDE_PLAN",planSHA256:null,approvedPlanSHA256:null});
   database.appendEvent({topicId:topic.id,actor:"system",kind:"system",state:"USER_DECISION_REQUIRED",body:"예산 중단",payload:{budgetPause:true,resumeState:"CLAUDE_PLAN"}});
   database.budgets.start({id:"group-cap",accounts:[group.id,topic.id],startedAt:Date.now(),stage:"PLAN",role:"claude",model:"test",effort:"test"});
   database.budgets.observe("group-cap",{inputTokens:100},Date.now(),true);
@@ -763,47 +708,6 @@ it.each(["grant","resume","observe"])("작업 묶음 API는 단계 생성 중복
   if(mode==="resume")expect(database.budgets.account(group.id)?.policy).toEqual(groupPolicy);
   if(mode==="observe")expect(database.budgets.account(group.id)?.policy).toEqual({mode:"observe"});
 
- } finally {await app.close();}
-});
-
-it("재작성 승인은 1회만 늘리고 실제 호출을 재개하며 중복·낡은 승인을 거절한다",async()=>{
- const {app,database,root,adapterCalls}=await makeApp(countingGitRunner().runner);
- const post=(action:string,payload:unknown,key:string)=>app.inject({method:"POST",url:`/api/topics/revisions/actions/${action}`,payload:payload as any,headers:{"x-consensus-token":"launch-token-for-test","idempotency-key":key}});
- try {
-  draftTopic(database,"revisions",{worktreePath:root});
-  for(const role of ["claude","codex"] as const)database.upsertParticipant("revisions",{role,sessionId:`${role}-revision`,mode:"attached",acknowledgedPlanSHA256:null});
-  database.revisions.admit("revisions","initial","plan");
-  for(const id of ["a","b","c"])database.revisions.admit("revisions",id,"revision");
-  const policy={execution:{inputTokens:1000,outputTokens:1000,durationMs:100000},total:{inputTokens:10000,outputTokens:10000,durationMs:1000000}};
-  database.budgets.configure("revisions",policy,"test");
-  const unauthorized=await app.inject({method:"POST",url:"/api/topics/revisions/actions/revision-resume",payload:{version:1}});
-  expect(unauthorized.statusCode).toBe(401);
-  expect((await post("revision-resume",{version:1,limit:100},"invalid")).statusCode).toBeGreaterThanOrEqual(400);
-  const grant=await post("revision-resume",{version:2},"grant");expect(grant.statusCode).toBe(200);
-  await vi.waitFor(()=>expect(database.runningAction("revisions")).toBeNull());
-  expect(adapterCalls,database.getTopic("revisions").lastError ?? JSON.stringify(grant.json())).toEqual(["claude"]);
-  expect(database.revisions.account("revisions")).toMatchObject({used:4,limit:4,version:3});
-  expect((await post("revision-resume",{version:2},"grant")).statusCode).toBe(200);
-  expect((await post("revision-resume",{version:2},"stale")).statusCode).toBeGreaterThanOrEqual(400);
-  expect(adapterCalls).toHaveLength(1);
-  const budgetGrant=await post("budget-resume",{version:1,policy:{...policy,execution:{...policy.execution,inputTokens:2000}}},"budget");
-  expect(budgetGrant.statusCode).toBe(200);expect(budgetGrant.json().resumeBlocked).toContain("재작성");
-  expect(database.revisions.account("revisions").limit).toBe(4);expect(adapterCalls).toHaveLength(1);
- } finally {await app.close();}
-});
-
-it("재작성 승인 후 명시한 토큰 예산이 소진됐으면 승인만 보존하고 호출하지 않는다",async()=>{
- const {app,database,root,adapterCalls}=await makeApp(countingGitRunner().runner);
- try {
-  draftTopic(database,"both",{worktreePath:root});
-  database.budgets.configure("both",{execution:{inputTokens:1,outputTokens:1,durationMs:1000},total:{inputTokens:1,outputTokens:1,durationMs:1000}},"user-explicit");
-  database.budgets.start({id:"both-cap",accounts:["both"],startedAt:0,stage:"PLAN",role:"claude",model:"test",effort:"test"});
-  database.budgets.observe("both-cap",{inputTokens:1},1,true);
-  database.revisions.admit("both","initial","plan");
-  for(const id of ["a","b","c"])database.revisions.admit("both",id,"revision");
-  const grant=await app.inject({method:"POST",url:"/api/topics/both/actions/revision-resume",payload:{version:2},headers:{"x-consensus-token":"launch-token-for-test","idempotency-key":"grant"}});
-  expect(grant.statusCode).toBe(200);expect(grant.json().resumeBlocked).toContain("예산");
-  expect(database.revisions.account("both")).toMatchObject({used:3,limit:4});expect(adapterCalls).toHaveLength(0);
  } finally {await app.close();}
 });
 
@@ -993,14 +897,4 @@ describe("Codex 후속 F07 — 중재자 권한 경계", () => {
       expect(existsSync(join(root, "maintenance.lock"))).toBe(true);   // 잠금은 스크립트가 끝날 때 스스로 지운다 — 서버가 풀지 않는다
     } finally { await app.close(); }
   });
-});
-
-it("migrates when a bounded stdout tail lost init but verified jsonLines retained it", async () => {
-  const { app, request, store } = await migrationFixture();
-  const artifact = await store.write("migrate", "interrupted-output", 2, JSON.stringify({ sessionId: request.payload.sessionId,
-    output: { stdout: '{"type":"progress"}\n', truncated: true,
-      jsonLines: [{ type: "system", subtype: "init", session_id: request.payload.sessionId, cwd: "/tmp/worktree" }] } }));
-  request.payload.interruptedSHA256 = artifact.sha256;
-  expect((await app.inject(request)).statusCode).toBe(200);
-  await app.close();
 });

@@ -12,6 +12,7 @@ import { turnPolicy } from "../src/server/adapters/turnPolicy";
 import { DEFAULT_AGENT_SETTINGS, type AgentResult } from "../src/shared/contracts";
 import { brainstormReplies, latestBrainstormRound } from "../src/shared/brainstorm";
 import type { AgentAdapter, SessionTurn } from "../src/server/types";
+import type { TurnEnvelope } from "../src/shared/turnContract";
 
 // 공개 API → 상태·타임라인·다음 행동을 소비하는 방 화면/중재자 계약.
 // 대역은 pending, 오류, 취소를 무시한 늦은 응답을 재현한다. 대기는 action 완료와 명시적 latch를 쓴다.
@@ -23,7 +24,11 @@ afterEach(async () => { for (const clean of cleanups.splice(0).reverse()) await 
 const reply = (text = "현재 방식과 작은 실험을 비교해 볼 수 있습니다."): AgentResult => ({ kind: "BRAINSTORM", summary: text, findings: [], evidenceRefs: [] });
 function latch<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(done => { resolve = done; }); return { promise, resolve }; }
 
-async function fixture(control?: (turn: Omit<SessionTurn, "sessionId">, index: number) => Promise<AgentResult>, guardedPlanning = false) {
+// planned 토픽의 계획 인계는 같은 행동에서 계획 왕복(봉투 턴)을 연다. planner 대역은 봉투만 돌려준다 — 기본은 중재자 정지(계획 질문)다.
+const askMediator = (): TurnEnvelope => ({ message: "계획에서 확인할 질문", outcome: "needs-mediator", mediatorRequest: "측정 환경을 확인해 주세요." });
+async function fixture(control?: (turn: Omit<SessionTurn, "sessionId">, index: number) => Promise<AgentResult>,
+  options: { workflowMode?: "ticket" | "planned"; envelope?: (turn: Omit<SessionTurn, "sessionId">) => TurnEnvelope } = {}) {
+  const { workflowMode, envelope = askMediator } = options;
   const root = mkdtempSync(join(tmpdir(), "room-brainstorm-"));
   execFileSync("git", ["init", "-q", root]);
   execFileSync("git", ["-C", root, "config", "user.name", "Test"]);
@@ -32,21 +37,27 @@ async function fixture(control?: (turn: Omit<SessionTurn, "sessionId">, index: n
   execFileSync("git", ["-C", root, "add", "README.md"]);
   execFileSync("git", ["-C", root, "commit", "-qm", "baseline"]);
   let database = new ConsensusDatabase(join(root, "room.sqlite"));
-  const calls: Array<{ provider: string; turn: Omit<SessionTurn, "sessionId">; sessionId?: string }> = [];
+  const calls: Array<{ provider: string; turn: Omit<SessionTurn, "sessionId">; sessionId?: string; envelope?: true }> = [];
   const adapter = (provider: "claude" | "codex"): AgentAdapter => {
     const run = async (turn: Omit<SessionTurn, "sessionId">, sessionId?: string) => {
       calls.push({ provider, turn, sessionId });
       return control ? control(turn, calls.length) : reply(`의견 ${calls.length}`);
     };
+    const relay = (turn: Omit<SessionTurn, "sessionId">, sessionId?: string) => {
+      calls.push({ provider, turn, sessionId, envelope: true });
+      return envelope(turn);
+    };
     return { role: provider, validateExistingSession: async () => true,
       createSession: async turn => ({ sessionId: `${provider}-${calls.length}`, result: await run(turn) }),
-      resumeTurn: turn => run(turn, turn.sessionId) };
+      resumeTurn: turn => run(turn, turn.sessionId),
+      createEnvelopeSession: async turn => { const result = relay(turn); return { sessionId: `${provider}-${calls.length}`, envelope: result }; },
+      resumeEnvelopeTurn: async turn => relay(turn, turn.sessionId) };
   };
   const config: ServerConfig = {
     host: "127.0.0.1", port: 0, launchToken: "test-token", dataDirectory: root, topicsDirectory: join(root, "topics"),
     worktreesDirectory: join(root, "trees"), databasePath: join(root, "room.sqlite"), repositoryPath: root,
     webDirectory: join(root, "no-web"), memoryDirectory: join(root, "memory"), claudeSkillDirectories: [], codexSkillDirectories: [],
-    defaultAgentSettings: DEFAULT_AGENT_SETTINGS, figmaMcpUrl: null, codexConcurrency: 2, guardedPlanning, enforceBudgets: false,
+    defaultAgentSettings: DEFAULT_AGENT_SETTINGS, figmaMcpUrl: null, codexConcurrency: 2, enforceBudgets: false,
   };
   const build = () => buildApp({ database, runner: new SpawnCommandRunner(), claude: adapter("claude"), codex: adapter("codex"), config });
   let app = await build();
@@ -54,7 +65,7 @@ async function fixture(control?: (turn: Omit<SessionTurn, "sessionId">, index: n
   let key = 0;
   const post = (url: string, payload: Record<string, unknown> = {}, headers: Record<string, string> = {}) => app.inject({ method: "POST", url, payload,
     headers: { "x-consensus-token": "test-token", "idempotency-key": `request-${++key}`, ...headers } });
-  const created = await post("/api/topics", { title: "긴 계획을 어떻게 전달할지 논의", startMode: "brainstorm" });
+  const created = await post("/api/topics", { title: "긴 계획을 어떻게 전달할지 논의", startMode: "brainstorm", ...(workflowMode ? { workflowMode } : {}) });
   expect(created.statusCode).toBe(201);
   const id = created.json().id as string;
   for (const seat of ["claude", "codex"]) {
@@ -76,7 +87,7 @@ async function fixture(control?: (turn: Omit<SessionTurn, "sessionId">, index: n
 
 it.each([0, 1])("random order %s: each participant speaks once, then only the user chooses another round or closure", async order => {
   vi.mocked(randomInt).mockReturnValue(order as never);
-  const f = await fixture(undefined, true);
+  const f = await fixture(undefined, { workflowMode: "planned" });
   expect(f.database.planning.policyVersion(f.id)).toBe(2);
   expect((await f.action("plan")).statusCode).toBeGreaterThanOrEqual(400);
   expect((await f.action("brainstorm", { message: "작은 실험으로 비교하고 싶습니다" }, { "idempotency-key": "same-round" })).statusCode).toBe(200);
@@ -85,6 +96,8 @@ it.each([0, 1])("random order %s: each participant speaks once, then only the us
   expect(f.calls.map(c => c.turn.job?.role)).toEqual(order === 0 ? ["planner", "reviewer"] : ["reviewer", "planner"]);
   expect(f.calls.every(c => c.turn.job?.operation === "brainstorm")).toBe(true);
   expect(f.calls[1].turn.prompt).toContain("의견 1");
+  // 논의 턴은 지적·처분을 내지 않는다 — 폐기된 결과 처분 지침(DEFERRED_OUT_OF_SCOPE)을 싣지 않는다(79fc4fc5 F013).
+  for (const call of f.calls) expect(call.turn.prompt).not.toContain("DEFERRED_OUT_OF_SCOPE");
   for (const call of f.calls) expect(turnPolicy(call.turn.job!, {})).toMatchObject({ access: "read", fanout: false });
   await f.action("brainstorm", { message: "작은 실험으로 비교하고 싶습니다" }, { "idempotency-key": "same-round" });
   expect(f.calls).toHaveLength(2);
@@ -118,7 +131,7 @@ it("pending duplicate is refused; second-speaker failure resumes only that speak
   expect(brainstormReplies(f.events(), round.sequence)).toHaveLength(1);
   await f.restart();
   vi.mocked(randomInt).mockReturnValue(1 as never);
-  await f.action("retry"); await f.done();
+  await f.action("resume"); await f.done();
   expect(f.calls.map(c => c.turn.job?.role)).toEqual(["planner", "reviewer", "reviewer"]);
   expect(latestBrainstormRound(f.events())).toEqual(round);
   expect(f.calls[2].turn.prompt).toContain("첫 번째 발언");
@@ -134,16 +147,15 @@ it("a decision arriving during a pending turn keeps the late answer out of accep
   release.resolve(reply("OUTDATED ANSWER")); await f.done();
   expect(f.database.getTopic(f.id).state).toBe("USER_DECISION_REQUIRED");
   expect(f.events().filter(e => e.payload.resultKind === "BRAINSTORM")).toHaveLength(0);
-  await f.action("retry"); await f.done();
+  await f.action("resume"); await f.done();
   expect(f.calls[1].turn.prompt).toContain("전송량부터 확인");
   expect(f.calls[1].turn.prompt).not.toContain("OUTDATED ANSWER");
   expect(f.database.getTopic(f.id).state).toBe("BRAINSTORM_READY");
 });
 
+// planned 토픽은 계획 인계와 같은 행동에서 계획 왕복을 연다. 결정은 사용자 사실로, 논의 발언은 첫 턴의 논의 원문으로 플래너에게 간다(결정 A).
 it.each(["reversed", "same-provider"])("uses assigned participants for %s and hands the explicit decision and discussion to planning", async mode => {
-  const f = await fixture(async turn => turn.job?.operation === "plan"
-    ? { kind: "PLAN", summary: "계획에서 확인할 질문", findings: [], evidenceRefs: [], requestedUserDecision: "측정 환경을 확인해 주세요." }
-    : reply("전체 도입보다 비교 실험을 제안합니다."));
+  const f = await fixture(async () => reply("전체 도입보다 비교 실험을 제안합니다."), { workflowMode: "planned" });
   for (const role of ["planner", "reviewer"] as const) {
     const provider = role === "planner" || mode === "same-provider" ? "codex" : "claude";
     expect((await f.post("/api/agent-profiles", { id: `${role}-profile`, provider, model: provider === "codex" ? "gpt-6-astra" : "opus", effort: "high" })).statusCode).toBe(201);
@@ -156,10 +168,15 @@ it.each(["reversed", "same-provider"])("uses assigned participants for %s and ha
   expect((await f.action("brainstorm-plan", { decision: " " })).statusCode).toBe(400);
   expect(f.calls).toHaveLength(2);
   expect((await f.action("brainstorm-plan", { decision: "비교 실험만 계획하고 전체 도입은 제외합니다." }, { "x-consensus-actor": "mediator" })).statusCode).toBe(200); await f.done();
-  expect(f.calls[2].turn.job).toEqual({ role: "planner", operation: "plan" });
+  expect(f.calls).toHaveLength(3);
+  expect(f.calls[2]).toMatchObject({ provider: "codex", envelope: true, turn: { job: { role: "planner", operation: "plan" } } });
+  expect(f.calls[2].turn.prompt).toContain("역할: 플래너.");
   expect(f.calls[2].turn.prompt).toContain("전체 도입은 제외");
+  expect(f.calls[2].turn.prompt).toContain("논의 발언 원문:");
   expect(f.calls[2].turn.prompt).toContain("비교 실험을 제안");
   expect(f.database.getTopic(f.id)).toMatchObject({ state: "USER_DECISION_REQUIRED", approvedPlanSHA256: null });
+  expect(f.events().findLast(event => event.payload.waitingFor !== undefined)?.payload)
+    .toMatchObject({ waitingFor: "mediator", mediatorRequest: "측정 환경을 확인해 주세요." });
 });
 
 it("scope change discards a late discussion answer and starts a fresh discussion without entering planning", async () => {
@@ -185,7 +202,7 @@ it.each(["brainstorm", "brainstorm-plan", "brainstorm-close"])("restart before p
   await f.restart();
   expect(f.database.getTopic(f.id).state).toBe("FAILED");
   expect(f.database.getFlags(f.id).resumeState).toBe("BRAINSTORM_READY");
-  await f.action("retry"); await f.done();
+  await f.action("resume"); await f.done();
   expect(f.calls).toHaveLength(0);
   expect(f.database.getTopic(f.id).state).toBe("BRAINSTORM_READY");
   await f.action("brainstorm"); await f.done();
@@ -196,10 +213,7 @@ it.each(["brainstorm", "brainstorm-plan", "brainstorm-close"])("restart before p
 // 호스트 리뷰 회귀: 공개 action부터 실행해 v2 계획 연결, 근거 대기/재개, 교정의 실제 어댑터 입력과 채택 발언을 확인한다.
 // 아래 세 검사는 수정 전 각각 세션 연결 거부, FAILED 전이, 원본 finding 복원으로 실패한다.
 it("hands an operation-only discussion assignment to the default planner under continuity v2", async () => {
-  const f = await fixture(async turn => turn.job?.operation === "plan" ? {
-    kind: "PLAN", summary: "계획에 필요한 질문", findings: [], evidenceRefs: [], requestedUserDecision: "실험 환경을 알려 주세요.",
-    planningStep: { draft: "비교 실험", facts: [], contradictions: [], questions: ["실험 환경"], requests: [], complete: false },
-  } : reply("작은 비교 실험"), true);
+  const f = await fixture(async () => reply("작은 비교 실험"), { workflowMode: "planned" });
   await f.post("/api/agent-profiles", { id: "discussion", provider: "codex", model: "gpt-6-astra", effort: "high" });
   await f.post("/api/role-assignments", { scope: `topic:${f.id}`, role: "planner", operation: "brainstorm", participant: "discussion-author", profileId: "discussion", expectedVersion: 0 });
   await f.action("brainstorm"); await f.done();
@@ -207,14 +221,16 @@ it("hands an operation-only discussion assignment to the default planner under c
   const previousSession = f.database.getTopic(f.id).participants.find(p => p.role === "claude")!.sessionId;
   await f.action("brainstorm-plan", { decision: "비교 실험만 계획합니다." }); await f.done();
   expect(f.calls).toHaveLength(3);
-  expect(f.calls[2]).toMatchObject({ provider: "claude", sessionId: undefined, turn: { job: { role: "planner", operation: "plan" } } });
+  expect(f.calls[2]).toMatchObject({ provider: "claude", sessionId: undefined, envelope: true, turn: { job: { role: "planner", operation: "plan" } } });
+  expect(f.calls[2].turn.prompt).toContain("논의 발언 원문:");
   expect(f.calls[2].turn.prompt).toContain("작은 비교 실험");
   expect(f.database.getTopic(f.id).state).toBe("USER_DECISION_REQUIRED");
   expect(f.database.getTopic(f.id).participants.find(p => p.role === "claude")!.sessionId).not.toBe(previousSession);
   expect(f.database.planning.policyVersion(f.id)).toBe(2);
 });
 
-it("defers missing evidence but retries an unaccepted speech when actual source content changes", async () => {
+// 원문 변경은 논의를 멈추지 않는다(D6) — 바뀐 원문은 사실로 남고, 이미 낸 발언은 그대로 채택된다. 영향 판단은 참여자·중재자가 한다.
+it("accepts a speech that finished after its source changed instead of blocking the discussion", async () => {
   const entered = latch<void>(); const release = latch<AgentResult>();
   const f = await fixture(async (_turn, index) => { if (index === 1) { entered.resolve(); return release.promise; } return reply("최신 근거의 의견"); });
   cleanups.push(async () => release.resolve(reply()));
@@ -226,11 +242,9 @@ it("defers missing evidence but retries an unaccepted speech when actual source 
   await f.action("brainstorm"); await entered.promise;
   expect(f.calls).toHaveLength(1);
   await publish("v2"); release.resolve(reply("OLD EVIDENCE")); await f.done();
-  expect(f.database.getTopic(f.id).state).toBe("BLOCKED_ON_EVIDENCE");
-  expect(brainstormReplies(f.events(), latestBrainstormRound(f.events())!.sequence)).toHaveLength(0);
-  await f.action("retry"); await f.done();
-  expect(f.calls).toHaveLength(3);
   expect(f.database.getTopic(f.id).state).toBe("BRAINSTORM_READY");
+  expect(brainstormReplies(f.events(), latestBrainstormRound(f.events())!.sequence).map(event => event.body)).toEqual(["OLD EVIDENCE", "최신 근거의 의견"]);
+  expect(f.calls).toHaveLength(2);
 });
 
 it("a discussion correction keeps no-fanout policy and removes prohibited findings before accepting the speech", async () => {
