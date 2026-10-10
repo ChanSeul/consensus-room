@@ -153,7 +153,7 @@ Codex와 Claude를 함께 쓰며 한 세션이 놓친 문제를 다른 세션이
 
 # 화면·엔진·실행 도구의 역할
 
-React·Vite는 상태를 보여 주고, Node.js·TypeScript 서버는 허용된 행동을 실행한다. SQLite는 승인·배정·사건·중단 위치를 보존한다. 엔진이 지적의 의미까지 여러 곳에서 판정하던 구조를 줄이고, 역할별 응답을 다음 세션에 전달하도록 책임을 좁혔다.
+React·Vite는 상태를 보여 주고, Node.js·TypeScript·Fastify 서버는 허용된 행동을 실행한다. SQLite는 승인·배정·사건·중단 위치를 보존한다. 엔진이 지적의 의미까지 여러 곳에서 판정하던 구조를 줄이고, 역할별 응답을 다음 세션에 전달하도록 책임을 좁혔다.
 
 ```diagram
 {
@@ -325,7 +325,7 @@ React·Vite는 상태를 보여 주고, Node.js·TypeScript 서버는 허용된 
 
 ## 역할별 구현 책임
 
-React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 실행 런타임은 Claude·Codex CLI의 옵션과 출력 차이를 어댑터 뒤로 모은다. Git 작업 트리는 코드 변경을 격리하며, 원문과 결과 파일은 내용 해시로 식별한다.
+React·Vite는 화면을, Node.js·TypeScript·Fastify는 서버를 구성한다. 공통 실행 런타임은 Claude·Codex CLI의 옵션과 출력 차이를 어댑터 뒤로 모은다. Git 작업 트리는 코드 변경을 격리하며, 원문과 결과 파일은 내용 해시로 식별한다.
 
 ## 공통 실행과 정책의 경계
 
@@ -1484,51 +1484,51 @@ React·Vite는 화면을, Node.js·TypeScript는 서버를 구성한다. 공통 
 
 관련 자료: docs/memory-retrieval.md · src/server/wikiEvidence.ts
 
-# Slack·Jira·Figma 자료 흐름
+# 외부 자료 수집과 변경 전달
 
-Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격으로 조회 시점을 확인한다. 시작할 때 밀린 조회도 확인한다. 닫힌 작업에서만 사용하는 출처는 정기 조회 대상에서 빠진다. 외부 자료가 없는 작업에는 조회할 대상이 없다.
+Slack·Jira·Figma·Confluence·Google Sheets와 일반 HTTPS 문서를 등록한다. REST 수집기는 기본 15분 간격으로 재확인하고, 시작할 때 밀린 조회도 처리한다. 닫힌 작업에서만 쓰는 출처는 정기 조회에서 제외한다.
 
 ```diagram
 {
   "section": "SOURCES",
   "lead": "자동 수집은 관측 사실을 남기고, 작업 세션이 변경의 영향을 판단한다.",
-  "source": "src/server/evidence/catalog.ts · src/server/evidence/service.ts · src/server/evidence/store.ts",
+  "source": "src/shared/externalEvidence.ts · src/server/evidence/discovery.ts · src/server/evidence/service.ts",
   "height": 263,
   "elements": [],
   "graph": {
     "nodes": [
       {
-        "id": "slack",
+        "id": "communication",
         "x": 0,
         "y": 0,
         "w": 149,
-        "h": 62,
-        "label": "Slack",
-        "body": "등록된 대화",
+        "h": 70,
+        "label": "대화·이슈",
+        "body": "Slack·Jira",
         "color": "coral",
         "icon": "slack"
       },
       {
-        "id": "jira",
+        "id": "design",
         "x": 181,
         "y": 0,
         "w": 149,
-        "h": 62,
-        "label": "Jira",
-        "body": "본문·댓글",
-        "color": "blue",
-        "icon": "jira"
+        "h": 70,
+        "label": "디자인",
+        "body": "Figma 버전·노드",
+        "color": "purple",
+        "icon": "figma"
       },
       {
-        "id": "figma",
+        "id": "documents",
         "x": 362,
         "y": 0,
         "w": 149,
-        "h": 62,
-        "label": "Figma",
-        "body": "버전·노드",
-        "color": "purple",
-        "icon": "figma"
+        "h": 70,
+        "label": "문서·정책서",
+        "body": "Confluence·Sheets\nHTML·OpenAPI",
+        "color": "blue",
+        "icon": "role-file"
       },
       {
         "id": "collect",
@@ -1566,11 +1566,10 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
     ],
     "edges": [
       {
-        "source": "slack",
+        "source": "communication",
         "target": "collect",
         "source_port": "bottom",
         "target_port": "top",
-        "label": "REST / 커넥터",
         "via": [
           [
             75,
@@ -1585,11 +1584,10 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "dashed": false
       },
       {
-        "source": "jira",
+        "source": "design",
         "target": "collect",
         "source_port": "bottom",
         "target_port": "top",
-        "label": "원문 수집",
         "via": [
           [
             255,
@@ -1604,11 +1602,10 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "dashed": false
       },
       {
-        "source": "figma",
+        "source": "documents",
         "target": "collect",
         "source_port": "bottom",
         "target_port": "top",
-        "label": "관련 노드",
         "via": [
           [
             437,
@@ -1668,13 +1665,13 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
 
 ## 수집과 모델 전달의 분리
 
-수집 자체는 모델을 호출하지 않는다. 원문 변경과 선택 변경은 다음 작업 턴의 사실로 전달한다. Figma는 구현자가 필요한 노드와 이미지를 확인한다. 링크나 캐시 이미지가 있다는 이유로 디자인 검증을 완료했다고 판단하지 않는다.
+수집 자체는 모델을 호출하지 않는다. 일반 문서는 HTML 본문과 OpenAPI 명세를 읽으며, 원문·선택 변경은 다음 작업 턴에 전달한다. Figma 노드와 화면의 일치는 구현자가 별도로 확인한다.
 
 ## 재확인 기한과 접근 실패의 구분
 
-운영 중 정상 수집된 원문이 재확인 기한을 넘겼다는 이유로 읽기 대상에서 빠진 적이 있었다. 저장된 내용의 사용 가능 여부와 최신 확인 필요 상태를 구분했다. 실제 접근 오류와 누락은 그대로 기록한다.
+정상 수집한 원문이 재확인 기한을 넘겼다는 이유로 읽기 대상에서 빠진 적이 있었다. 저장된 내용의 사용과 최신 확인 필요 여부를 나눴다. 접근 오류와 누락은 그대로 기록한다.
 
-선택에서 뺀 자료도 조용히 사라지지 않도록 제거 사실을 전달한다. 같은 실패의 반복 알림을 줄이되, 읽기 성공이나 새 내용이 확인되기 전에는 수집 성공으로 바꾸지 않는다. 계획에 미치는 영향은 별도 자동 심사로 판정하지 않는다.
+선택에서 뺀 자료도 제거 사실을 전달한다. 같은 실패의 반복 알림은 줄이되, 실제 읽기에 성공하기 전에는 수집 성공으로 바꾸지 않는다. 변경이 계획에 미치는 영향은 작업 세션이 판단한다.
 
 # 자료 누락과 후속 작업
 
@@ -2627,9 +2624,9 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
 }
 ```
 
-## 논리적 리뷰와 실제 실행 횟수
+## 역할별 원문과 실제 실행 횟수
 
-옛 구조는 재작성과 확인을 별도 원장과 턴으로 관리했다. 그 사슬을 없애면서 남은 재작성 예약과 타입도 삭제했다. 현재 역할 턴의 리뷰 원장과 사용량 원장은 유지한다. 단계 이름만 바꿔 같은 검토를 새로 시작하지 않는다.
+report-usage.py는 운영 DB와 세션 원문을 읽어 역할별 JSON·Markdown 보고서를 만든다. 자동으로 연결할 수 없는 세션은 작업과 역할을 명시하고, 같은 요청의 사용량은 한 번만 합산한다. 역할 턴의 리뷰 횟수와 실제 모델 호출 수는 별도로 남긴다.
 
 ## 누적 사용량과 적용 한도
 
@@ -2639,12 +2636,12 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
 
 # 검사 결과의 재사용 조건
 
-현재 재사용 경로는 Swift 동시성 정책 정적 검사 한 종류를 대상으로 한다. 코드·검사 도구·환경·로그를 대조하고, 계획 작업에서는 승인 계획도 확인한다. 일반 작업이 계획 없는 상태라는 이유만으로 검사 기록을 저장하지 못하는 결속은 제거했다.
+Swift 동시성 정책 정적 검사와 변경된 Swift 파일의 구문 검사, 두 프로필을 지원한다. 코드·도구·환경·로그를 대조하고, 계획 작업에서는 승인 계획도 확인한다. 계획 없는 일반 작업도 검사 결과를 저장하고 재사용한다.
 
 ```diagram
 {
   "section": "VERIFICATION",
-  "lead": "확인된 정적 검사 한 종류의 입력·도구·환경·계획·로그를 함께 대조.",
+  "lead": "두 검사 프로필의 입력·도구·환경·계획·로그가 같을 때 통과 결과를 재사용.",
   "source": "src/server/planCheckGate.ts · src/shared/planChecks.ts · src/server/verifications.ts",
   "height": 223,
   "elements": [],
@@ -2845,7 +2842,7 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
         "w": 128,
         "h": 57,
         "label": "서버 재시작",
-        "body": "DB 60개 테이블 보존",
+        "body": "당시 60개 테이블 보존",
         "color": "gray",
         "icon": "role-refresh"
       },
@@ -2917,9 +2914,9 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
 }
 ```
 
-## 다섯 단계의 실행 결과
+## 개발 네 단계와 최종 통합
 
-두 번째 파일럿은 실제 Claude·Codex CLI로 수행했다. 진행 중 엔진 파일을 바꾸지 않았고, 비교 대상 243개 파일의 해시가 유지됐다. 마지막에는 모든 단계를 닫고 최종 통합 결과를 격리된 bare 원격에 전달했다.
+두 번째 파일럿은 개발 네 단계와 최종 통합을 실제 Claude·Codex CLI로 수행했다. 진행 중 엔진 파일을 바꾸지 않았고, 비교 대상 243개 파일의 해시가 유지됐다. 마지막에는 모든 단계를 닫고 최종 통합 결과를 격리된 bare 원격에 전달했다.
 
 ## 대상 검사와 실패 검출
 
@@ -3002,9 +2999,98 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
 
 ## 최신 엔진 검사와 제품 검수의 구분
 
-10월 흐름 단순화의 최종 엔진 후보는 검사 1,686개와 호스트 리뷰 검사 275개를 통과했다. 조건부 8개는 건너뛰었고 TypeScript·웹 빌드·공식 리뷰를 확인했다. 코드와 검사 입력이 같은 통과 결과는 재사용했다.
+10월 9일 흐름 단순화 후보의 실행 기록에서 엔진 검사 1,686개와 호스트 리뷰 검사 275개 통과를 확인했다. 조건부 8개는 건너뛰었고 TypeScript·웹 빌드·공식 리뷰를 확인했다. 코드와 검사 입력이 같은 통과 결과는 재사용했다.
 
 대상 iOS 앱은 매물 등록 2단계의 화면·입력·로컬 검증·임시저장 복원을 검수했다. 관련 검사 980개와 디자인 시스템 179개가 통과했고, 같은 CR 리뷰어가 추가 지적 없이 승인했다. 다른 단계와 매물 전송 API 성공은 이 승인에 포함하지 않는다.
+
+# 실제 iOS 앱의 Swift 6 전환
+
+운영 중인 iOS 앱을 Swift 6로 전환하면서 Consensus Room을 사용했다. 공통 모듈부터 기능 모듈·앱·테스트까지 의존 순서로 작업을 나누고, 각 단계의 계획·구현·검토 기록을 보존했다.
+
+```diagram
+{
+  "section": "PRODUCT CASE",
+  "lead": "2026.08.30 - 09.23, 약 4주에 걸친 전환. 10월 개편 전 엔진으로 수행한 운영 사례.",
+  "source": "단계별 계획·구현·검토 기록 · iOS 전환 커밋 · Project.swift · ci/check_swift_version_policy.py",
+  "height": 162,
+  "elements": [
+    {
+      "kind": "node",
+      "x": 0,
+      "y": 96,
+      "w": 511,
+      "h": 66,
+      "label": "각 단계에서 계획 합의 → 승인 → 구현 → 교차 검토 → 검증",
+      "body": "범위와 판단은 사람이 정하고, 두 모델의 응답·지적·수정 결과를 같은 작업에 보존",
+      "color": "teal",
+      "size": 11,
+      "body_size": 10
+    }
+  ],
+  "graph": {
+    "nodes": [
+      {
+        "id": "shared",
+        "x": 0,
+        "y": 0,
+        "w": 142,
+        "h": 57,
+        "label": "공통 모듈",
+        "body": "기반 타입·데이터·네트워크",
+        "color": "blue"
+      },
+      {
+        "id": "feature",
+        "x": 185,
+        "y": 0,
+        "w": 142,
+        "h": 57,
+        "label": "기능 모듈",
+        "body": "지도·미디어·매물 기능",
+        "color": "purple"
+      },
+      {
+        "id": "app",
+        "x": 369,
+        "y": 0,
+        "w": 142,
+        "h": 57,
+        "label": "앱·테스트",
+        "body": "언어 모드 기본값 6.0",
+        "color": "coral"
+      }
+    ],
+    "edges": [
+      {
+        "source": "shared",
+        "target": "feature",
+        "source_port": "right",
+        "target_port": "left",
+        "color": "teal"
+      },
+      {
+        "source": "feature",
+        "target": "app",
+        "source_port": "right",
+        "target_port": "left",
+        "color": "teal"
+      }
+    ]
+  }
+}
+```
+
+## 직접 맡은 판단과 모델별 역할
+
+작업 범위와 설계 판단, 계획 승인은 직접 맡았다. Claude의 구현을 Codex가 교차 검토하고, 지적과 수정 내역을 같은 단계에 남겼다. 예외가 필요한 동시성 처리는 적용 범위와 근거를 기록해 다음 단계에서도 확인했다.
+
+## 검토가 실제 수정을 만든 사례
+
+공통 모듈의 전환 전후 비교에서 프로젝트 생성이 실패했는데도 기존 Swift 6 프로젝트로 두 빌드를 수행한 문제가 드러났다. 생성 성공과 실제 컴파일 언어 모드를 먼저 확인하도록 절차를 고치고, Swift 5와 Swift 6의 비교 결과를 다시 수집했다.
+
+## 전환 완료와 재유입 방지
+
+9월 23일 전환 코드를 개발 브랜치에 통합하고, 앱·테스트를 포함한 프로젝트의 Swift 언어 모드 기본값을 6.0으로 올렸다. 전환 후에는 Swift 5 설정이 다시 들어오면 실패하도록 CI 검사를 추가했다. 구현 완료뿐 아니라 후속 변경에서도 전환 결과를 지킬 수 있게 했다.
 
 # 복구 계약의 검증과 남은 과제
 
@@ -3148,7 +3234,9 @@ Slack·Jira·Figma 링크를 등록하면 REST 수집기가 기본 15분 간격�
 
 ## 다음 검증 범위와 설계 기준
 
-운영 반영 뒤 같은 작업 세션에서 iOS 2단계 구현·호스트 검증·공식 리뷰까지 이어 갔다. 사용자가 제외한 뒤 단계와 전송 API는 미검수로 남겼다. 엔진이 실행됐다는 사실과 사용자가 정한 범위를 끝냈다는 사실을 나눠 확인했다.
+매물등록 폼의 단계 구성·서버 기반 검증·안내 문구는 개별 작업으로 완료했다. 통합 검증은 작업 트리의 HEAD가 엔진에 기록된 구현 기준과 달라 중단됐고, 그 실패 기록은 유지했다.
+
+별도로 정한 2단계 화면·입력·임시저장 범위는 검수와 리뷰를 마쳤다. 앞선 통합 검증이나 다른 단계·전송 API까지 성공한 것으로 합치지 않았다.
 
 # 오류 교정과 원문 보존
 
