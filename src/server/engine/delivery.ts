@@ -8,7 +8,10 @@ import { normalizeCommitPaths } from "../git.js";
 import type { EngineCore, EnvelopeEvent, EnvelopeNext } from "./core.js";
 import { AdmissionRefused, type WriteGuards } from "./turnExecutor.js";
 import { parsePlanChecks, type PlanCheckItem } from "../../shared/planChecks.js";
+import { PlanItemReportSchema, type PlanItem } from "../../shared/planItems.js";
 import { planCheckGate, verificationSatisfier, type PlanCheckGateVerdict } from "./planCheckGate.js";
+import { coverageInputKey, coverageReceipt, declaredPlanItems, deliveryCoverageProblem, implementerCoverage, PLAN_ITEMS_CHECK_ID, planItemsFact, planItemsInputKey,
+  reviewerCoverage } from "./planCoverage.js";
 import type { TurnJob } from "../../shared/roles.js";
 import { buildFirstTurnPrompt, buildRelayPrompt, relayFactsFrom, type RelayFacts } from "../../shared/prompts.js";
 import type { EnvelopeRole, TurnEnvelope, WorkerFact } from "../../shared/turnContract.js";
@@ -24,12 +27,14 @@ function isWithinSelectedPaths(path: string, selectedPaths: readonly string[]): 
 const RELAY_IMPLEMENT_JOB: TurnJob = { role: "implementer", operation: "implement" };
 const RELAY_REVIEW_JOB: TurnJob = { role: "reviewer", operation: "review" };
 
-// 구현자·리뷰어에게 주는 계획 — planned 는 승인 계획 정본(필수 검사 선언 포함), ticket 은 남은 계획 묶음의 참고 경로(게이트·검사 근거 아님).
+// 구현자·리뷰어에게 주는 계획 — planned 는 승인 계획 정본(필수 검사 선언·항목 목록 포함), ticket 은 남은 계획 묶음의 참고 경로(게이트·검사·항목 근거 아님).
 interface RelayPlan {
   status: "approved" | "reference";
   version: string;
   snapshotPath: string;
   checks: PlanCheckItem[];
+  // 승인 계획이 선언한 항목(planned 는 비어 있을 수 없다 — relayPlanContext 가 선언 없음·형식 오류를 멈춘다). ticket 은 빈 목록.
+  items: PlanItem[];
 }
 
 // 구현자 턴의 준비(구현·수정 공통).
@@ -161,24 +166,52 @@ export class DeliveryPipeline {
         return;
       }
       if (envelope.outcome !== "done") throw new Error(`구현자 봉투의 outcome 을 처리할 수 없습니다: ${envelope.outcome}`);
+      // 항목별 보고(planned) — 선언 집합과 정확히 같고 전부 implemented 여야 검사·리뷰로 간다. 아니면 교정 사실을 같은 세션에 돌려주고(필수 검사 실패와 같은
+      // 루프), 같은 보고를 되풀이하면 중재자 정지 — 같은 조건의 반복은 진척이 아니다.
+      // 집합이 맞으면 passed 사실을 이 턴의 기록(검사 결과·리뷰 전이)과 함께 남긴다 — 리뷰어에게는 구현자 보고의 영수증이고, 반복 판정(같은 계열의 마지막 사실)에는
+      // 앞선 교정 실패의 연속성이 끝나는 지점이다.
+      const coverageFacts: EnvelopeEvent[] = [];
+      if (setup.plan?.status === "approved") {
+        const coverage = implementerCoverage(setup.plan.items, envelope.planItems);
+        if (coverage.ok) {
+          coverageFacts.push(planItemsFact(`구현자가 선언 항목 ${setup.plan.items.length}개를 전부 implemented 로 보고했습니다 — 항목별 판정은 리뷰어가 합니다.`, "", "passed"));
+        }
+        if (!coverage.ok) {
+          // 반복 키의 실제 검사 입력 — 승인 판·planEpoch·이 턴 뒤 작업 트리 내용(기준 HEAD 대비 diff 해시). 구현 경로는 턴 뒤 내용 스냅샷을 따로 갖지 않아(무결성 검사는
+          // HEAD·도구 트리만 본다) 보고가 어긋났을 때만 한 번 찍는다 — 교정 모델 턴이나 정지보다 훨씬 싼 조회다.
+          const snapshot = await this.core.dependencies.git.snapshot(topic.worktreePath, setup.baselineHead);
+          const inputKey = coverageInputKey("implementer", { planSHA256: setup.plan.version, planEpoch: topic.planEpoch, snapshot }, setup.plan.items, coverage.violations, coverage.unmet);
+          const fact = planItemsFact(coverage.summary, inputKey);
+          if (this.core.repeatedCheckFailure(topic, inputKey, [PLAN_ITEMS_CHECK_ID])) {
+            await this.relayRecord(turn, signal, { ...relayStop(`구현자가 항목별 보고를 같은 내용으로 다시 내 리뷰로 넘기지 않았습니다 — ${coverage.summary} `
+              + "구현자 응답은 결과 기록(agent_output)에, 확인 결과는 check-result 사실로 보존했습니다. 결정(남은 항목의 처리·범위 변경 등)을 남기고 재개하면 같은 구현자 세션이 그 결정을 받습니다.", state),
+              events: [fact] });
+            return;
+          }
+          await this.relayRecord(turn, signal, { events: [fact] });
+          continued = true;
+          continue;
+        }
+      }
       const checks = await this.relayPlanChecks(topic, setup.plan, signal);
       if (checks && checks.verdict.kind === "unavailable") {
         await this.relayRecord(turn, signal, { ...relayStop(`계획 필수 검사를 이 호스트에서 판정하지 못해 구현자의 완료를 리뷰로 넘기지 않았습니다 — ${checks.details}. `
-          + "구현자 응답은 결과 기록(agent_output)에, 검사 결과는 check-result 사실로 보존했습니다. 호스트 도구·검사 프로필을 확인한 뒤 재개하면 같은 구현자 세션이 이어서 받습니다.", state), events: [checks.event] });
+          + "구현자 응답은 결과 기록(agent_output)에, 검사 결과는 check-result 사실로 보존했습니다. 호스트 도구·검사 프로필을 확인한 뒤 재개하면 같은 구현자 세션이 이어서 받습니다.", state), events: [...coverageFacts, checks.event] });
         return;
       }
       if (checks && checks.verdict.kind === "unsatisfied") {
-        if (this.relayRepeatedCheckFailure(topic, checks.verdict.inputKey)) {
+        if (this.core.repeatedCheckFailure(topic, checks.verdict.inputKey, checks.ids)) {
           await this.relayRecord(turn, signal, { ...relayStop(`계획 필수 검사가 직전 실패와 같은 입력(검사 대상이 바뀌지 않음)으로 다시 실패했습니다 — ${checks.details}. `
-            + "구현자 응답은 결과 기록(agent_output)에, 검사 결과는 check-result 사실로 보존했습니다. 결정(고칠 방향·검사 선언 변경 등)을 남기고 재개하면 같은 구현자 세션이 그 결정과 검사 결과를 받습니다.", state), events: [checks.event] });
+            + "구현자 응답은 결과 기록(agent_output)에, 검사 결과는 check-result 사실로 보존했습니다. 결정(고칠 방향·검사 선언 변경 등)을 남기고 재개하면 같은 구현자 세션이 그 결정과 검사 결과를 받습니다.", state), events: [...coverageFacts, checks.event] });
           return;
         }
         // 실패 사실(check-result)은 다음 구현자 턴의 새 사실로 실린다 — 전이 없이 봉투 기록과 사실을 한 transaction 으로 남긴다.
-        await this.relayRecord(turn, signal, { events: [checks.event] });
+        await this.relayRecord(turn, signal, { events: [...coverageFacts, checks.event] });
         continued = true;
         continue;
       }
-      await this.relayRecord(turn, signal, { state: "CODEX_REVIEW", message: "Codex가 구현 결과를 읽기 전용으로 검토합니다.", ...(checks ? { events: [checks.event] } : {}) });
+      const reviewFacts = [...coverageFacts, ...(checks ? [checks.event] : [])];
+      await this.relayRecord(turn, signal, { state: "CODEX_REVIEW", message: "Codex가 구현 결과를 읽기 전용으로 검토합니다.", ...(reviewFacts.length ? { events: reviewFacts } : {}) });
       return this.relayReview(topicId, signal, setup.baselineHead);
     }
   }
@@ -195,14 +228,18 @@ export class DeliveryPipeline {
     return { baselineHead, toolTreesBefore, plan: await this.relayPlanContext(topic) };
   }
 
-  // 계획 문맥 — planned 는 sha 로 검증한 승인 계획 정본과 그 checks 선언, ticket 은 남은 계획 묶음의 현재 판(참고 경로만, 필수 검사 없음).
+  // 계획 문맥 — planned 는 sha 로 검증한 승인 계획 정본과 그 checks·plan-items 선언, ticket 은 남은 계획 묶음의 현재 판(참고 경로만, 필수 검사·항목 없음).
+  // planned 승인 계획이 항목 목록을 선언하지 않았거나 형식이 틀리면 모델 호출 0 으로 중재자 정지(PlanningPaused → 지금 상태가 재개 지점) — 구현 진입·수정 재개·
+  // 리뷰 진입이 모두 이 문맥을 지나므로 legacy 승인 계획의 보완 경로(return-to-planning·workflow-mode ticket)는 한 곳에서 안내된다.
   private async relayPlanContext(topic: Topic): Promise<RelayPlan | null> {
     if (topic.workflowMode === "planned") {
       const { content, path } = await this.core.requireCurrentPlanArtifact(topic.id);
-      return { status: "approved", version: topic.approvedPlanSHA256 ?? topic.planSHA256 ?? "", snapshotPath: path, checks: parsePlanChecks(content) };
+      const declaration = declaredPlanItems(content);
+      if (declaration.kind !== "declared") throw new PlanningPaused(declaration.message);
+      return { status: "approved", version: topic.approvedPlanSHA256 ?? topic.planSHA256 ?? "", snapshotPath: path, checks: parsePlanChecks(content), items: declaration.items };
     }
     const reference = await this.core.planBundle.current(topic);
-    return reference ? { status: "reference", version: reference.version, snapshotPath: reference.snapshotPath, checks: [] } : null;
+    return reference ? { status: "reference", version: reference.version, snapshotPath: reference.snapshotPath, checks: [], items: [] } : null;
   }
 
   // 턴 뒤 작업 트리 무결성 — 러너가 브랜치를 바꿨거나, 커밋을 만들었거나(기준 HEAD 이동), 앱 밖 도구 트리를 바꿨으면 중재자 정지 문구(막힌 것·근거·
@@ -234,7 +271,7 @@ export class DeliveryPipeline {
   // 엔진이 이 작업 트리에서 실제로 실행하고, 결과를 check-result 사실(system 이벤트의 payload.workerFact)로 만든다 — 구현자에게는 실패, 리뷰어에게는
   // 영수증으로 새 사실 커서가 싣는다. 반복 실패 판정용 입력 해시(planCheckInput)는 workerFact 밖에 둔다.
   private async relayPlanChecks(topic: Topic, plan: RelayPlan | null, signal: AbortSignal): Promise<{
-    verdict: PlanCheckGateVerdict; details: string; event: EnvelopeEvent;
+    verdict: PlanCheckGateVerdict; details: string; ids: string[]; event: EnvelopeEvent;
   } | null> {
     if (!plan || plan.status !== "approved" || plan.checks.length === 0) return null;
     const verifications = this.core.dependencies.verifications;
@@ -247,18 +284,11 @@ export class DeliveryPipeline {
     const checks: Extract<WorkerFact, { kind: "check-result" }>["checks"] = verdict.results.map((result) =>
       ({ id: result.item.id, status: status[result.status], summary: result.detail }));
     const details = failures.length ? failures.map((failure) => failure.detail).join(" / ") : "모두 통과";
-    return { verdict, details, event: {
+    return { verdict, details, ids: checks.map((check) => check.id), event: {
       actor: "system", kind: "system",
       body: `계획 필수 검사 결과: ${checks.map((check) => `${check.id} ${check.status}`).join(", ")}`,
       payload: { workerFact: { kind: "check-result", checks }, ...(verdict.kind === "unsatisfied" ? { planCheckInput: verdict.inputKey } : {}) },
     } };
-  }
-
-  // 직전 검사 결과가 같은 입력으로 실패했는가 — 그 사이 통과한 검사 결과가 있으면 반복이 아니다.
-  private relayRepeatedCheckFailure(topic: Topic, inputKey: string): boolean {
-    const previous = this.core.dependencies.database.getScopedTimeline(topic.id, topic.scopeGeneration)
-      .findLast((event) => event.actor === "system" && (event.payload?.workerFact as { kind?: unknown } | undefined)?.kind === "check-result");
-    return previous?.payload?.planCheckInput === inputKey;
   }
 
   // ---- 두 번째 리뷰 진입(재개·재진입, cd2876b7 F015·F016) ----
@@ -276,7 +306,7 @@ export class DeliveryPipeline {
       return;
     }
     if (checks && checks.verdict.kind === "unsatisfied") {
-      if (this.relayRepeatedCheckFailure(topic, checks.verdict.inputKey)) {
+      if (this.core.repeatedCheckFailure(topic, checks.verdict.inputKey, checks.ids)) {
         const message = `계획 필수 검사가 직전 실패와 같은 입력(검사 대상이 바뀌지 않음)으로 다시 실패해 리뷰를 열지 않았습니다 — ${checks.details}. `
           + "검사 결과는 check-result 사실로 보존했습니다. 결정(고칠 방향·검사 선언 변경 등)을 남기고 재개하면 같은 구현자 세션이 그 결정과 검사 결과를 받습니다.";
         this.core.interrupt(topicId, "USER_DECISION_REQUIRED", message, "CLAUDE_FIX", { waitingFor: "mediator", mediatorRequest: message }, undefined, [checks.event]);
@@ -307,12 +337,14 @@ export class DeliveryPipeline {
       throw new Error(`리뷰 기준 HEAD(${reviewed.head.slice(0, 12)})가 검사 전에 확인한 구현 기준(${expectedHead.slice(0, 12)})과 다릅니다. 서버 밖에서 생긴 커밋을 먼저 처분해 주세요.`);
     }
     const reviewedTree = await git.writeWorkingTree(topic.worktreePath, `${topicId.slice(0, 8)}-review`).catch(() => null);
+    // 계획 문맥(승인 계획·항목 선언)은 원장을 열기 전에 — 선언 없음·형식 오류의 정지가 리뷰 예약을 만들지 않게.
+    const plan = await this.relayPlanContext(topic);
     // 코드 리뷰 원장 — 같은 검토 tree·같은 구현 보고에 대한 재시도·재개는 리뷰 1회로 센다(회차 한도는 사용자 설정).
     const ledger = database.planning.openReviewLedger({ topicId, kind: "codex-review", scopeGeneration: topic.scopeGeneration,
       planEpoch: topic.planEpoch, planSHA256: topic.planSHA256, reviewedTree: reviewedTree ?? JSON.stringify(reviewed),
       reportRevision: this.relayLatestEnvelope(topic, "implementer")?.sequence ?? 0 });
     const turn = await this.relayTurn(topic, RELAY_REVIEW_JOB, "code-reviewer", signal, {
-      plan: await this.relayPlanContext(topic), ledger: ledger.id,
+      plan, ledger: ledger.id,
       persist: (sessionId) => database.setCodexReviewSession(topicId, sessionId, bindingOf(reviewRoute)),
     });
     const after = await git.snapshot(topic.worktreePath);
@@ -324,12 +356,45 @@ export class DeliveryPipeline {
     } else if (envelope.outcome === "changes") {
       await this.relayRecord(turn, signal, { state: "CLAUDE_FIX", message: "Claude가 리뷰 응답을 반영합니다.", changes: snapshot });
     } else if (envelope.outcome === "approve") {
-      // 확정 커밋(push)이 지금 HEAD 그대로면 보존한다 — 커밋 뒤 새 결정을 다시 리뷰한 경우 인도 사슬(deliveryBase)이 그 커밋에서 이어진다(host-review
-      // 2026-09-21 R3). HEAD 가 다르면 그 커밋은 더 이상 인도 기준이 아니므로 지운다.
-      const flags = database.getFlags(topicId);
-      await this.relayRecord(turn, signal, { state: "READY_TO_DELIVER", message: "코드 리뷰가 현재 작업 트리를 승인했습니다.", changes: { ...snapshot,
-        committedOID: flags.committedOID && flags.committedOID === reviewed.head ? flags.committedOID : null,
-        pushedOID: flags.pushedOID && flags.pushedOID === reviewed.head ? flags.pushedOID : null } });
+      // 항목별 판정(planned) — 선언 집합과 같지 않으면 코드는 그대로이므로 같은 리뷰 세션·같은 원장(리뷰 1회)으로 판정만 다시 받고, 같은 형식 오류를 되풀이하면
+      // 중재자 정지. 충족되지 않은 항목이 있는 approve 는 모순이라 changes 와 같이 수정 턴으로 보낸다(미충족 항목을 사실로 실어). 전 항목 satisfied 일 때만
+      // 승인이고, 그 판정을 승인 판·검토 트리·리뷰 세션·원장에 결속한 영수증을 READY 전이 사건에 남긴다 — 전달 경계(commit·push·close)가 이것을 대조한다.
+      const approvedPlan = plan?.status === "approved" ? plan : null;
+      const coverage = approvedPlan ? reviewerCoverage(approvedPlan.items, envelope.planItems) : null;
+      if (approvedPlan && coverage?.kind === "format") {
+        // 반복 키의 실제 검사 입력 — 승인 판·planEpoch·리뷰 시작 스냅샷(reviewed, 새 git 조회 없음).
+        const inputKey = coverageInputKey("code-reviewer", { planSHA256: approvedPlan.version, planEpoch: topic.planEpoch, snapshot: reviewed }, approvedPlan.items, coverage.violations);
+        const fact = planItemsFact(coverage.summary, inputKey);
+        if (this.core.repeatedCheckFailure(topic, inputKey, [PLAN_ITEMS_CHECK_ID])) {
+          await this.relayRecord(turn, signal, { ...relayStop(`리뷰어가 항목별 판정을 같은 형식 오류로 다시 내 승인을 채택하지 않았습니다 — ${coverage.summary} `
+            + "리뷰 응답은 결과 기록(agent_output)에, 확인 결과는 check-result 사실로 보존했습니다. 결정을 남기고 재개하면 같은 리뷰 세션이 현재 트리를 다시 판정합니다.", "CODEX_REVIEW"),
+            events: [fact] });
+          database.planning.pauseReviewLedger(ledger.id);
+          return;
+        }
+        await this.relayRecord(turn, signal, { events: [fact] });
+        database.planning.pauseReviewLedger(ledger.id);
+        return this.relayReview(topicId, signal, expectedHead);
+      }
+      if (coverage?.kind === "unmet") {
+        await this.relayRecord(turn, signal, { state: "CLAUDE_FIX", message: "리뷰어 판정에 충족되지 않은 계획 항목이 있어 Claude가 그 항목을 마저 구현합니다.", changes: snapshot,
+          events: [planItemsFact(coverage.summary, planItemsInputKey("unmet", coverage.unmet))] });
+      } else {
+        // 확정 커밋(push)이 지금 HEAD 그대로면 보존한다 — 커밋 뒤 새 결정을 다시 리뷰한 경우 인도 사슬(deliveryBase)이 그 커밋에서 이어진다(host-review
+        // 2026-09-21 R3). HEAD 가 다르면 그 커밋은 더 이상 인도 기준이 아니므로 지운다.
+        const flags = database.getFlags(topicId);
+        const receipt = plan?.status === "approved" && coverage?.kind === "ok" ? coverageReceipt({
+          planSHA256: plan.version, scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch,
+          reviewedHead: reviewed.head, reviewedDiffSHA256: reviewed.diffSHA256, reviewedTreeOID: reviewedTree,
+          reviewSessionId: turn.sessionId, reviewLedgerId: ledger.id, items: coverage.items,
+        }) : null;
+        // 전 항목 satisfied 의 passed 사실도 같은 transaction 으로 — 같은 계열의 반복 판정에서 앞선 형식 교정 실패의 연속성이 여기서 끝난다.
+        await this.relayRecord(turn, signal, { state: "READY_TO_DELIVER", message: "코드 리뷰가 현재 작업 트리를 승인했습니다.", changes: { ...snapshot,
+          committedOID: flags.committedOID && flags.committedOID === reviewed.head ? flags.committedOID : null,
+          pushedOID: flags.pushedOID && flags.pushedOID === reviewed.head ? flags.pushedOID : null },
+          ...(receipt && plan ? { payload: { planCoverage: receipt },
+            events: [planItemsFact(`리뷰어가 선언 항목 ${plan.items.length}개를 전부 satisfied 로 판정했습니다.`, "", "passed")] } : {}) });
+      }
     } else if (envelope.outcome === "needs-mediator") {
       await this.relayRecord(turn, signal, relayStop(envelope.mediatorRequest?.trim() || envelope.message, "CODEX_REVIEW"));
     } else {
@@ -351,13 +416,16 @@ export class DeliveryPipeline {
     const route = input.parent && input.parent !== job ? { ...this.core.route(topic, input.parent), job } : this.core.route(topic, job);
     const sessionId = this.core.seatSession(topic, route);
     const pending = this.core.pendingFacts(topic, role, sessionId);
-    const facts: RelayFacts = { ...relayFactsFrom(pending.facts), counterpart: this.relayCounterpart(topic, role, pending.since) };
-    const plan = input.plan ? { status: input.plan.status, version: input.plan.version, snapshotPath: input.plan.snapshotPath } : null;
+    const pendingFacts = relayFactsFrom(pending.facts);
+    // 승인 계획의 항목 id 는 매 턴 사실로 싣는다 — 기존 세션(첫 턴 지침을 받지 않은)도 항목별 보고 의무와 형식을 안다. 이 단계의 계획 정본은 파이프라인이 정한
+    // 문맥(approved·reference)이다 — 사실 커서에 실린 계획 왕복 때의 판 알림(current)이 그것을 덮지 않는다. 첫 턴 프롬프트와 재개 프롬프트가 같은 facts 를
+    // 쓴다(Root 인수 검토 2, 2026-10-11 — 이전엔 첫 턴에만 넣어 재개 세션이 승인 판·스냅샷·항목 id 의무를 받지 못했다).
+    const plan = input.plan ? { status: input.plan.status, version: input.plan.version, snapshotPath: input.plan.snapshotPath,
+      ...(input.plan.status === "approved" && input.plan.items.length ? { items: input.plan.items.map((item) => item.id) } : {}) } : null;
+    const facts: RelayFacts = { ...pendingFacts, plan: plan ?? pendingFacts.plan, counterpart: this.relayCounterpart(topic, role, pending.since) };
     const first = buildFirstTurnPrompt({
       ...facts, role, title: topic.title, task: hierarchyContext(this.core.dependencies.database, topic), worktreePath: topic.worktreePath, branchName: topic.branchName,
       baseRef: this.core.dependencies.database.getFlags(topic.id).implementationBaseOID,
-      // 이 단계의 계획 정본은 파이프라인이 정한 문맥(approved·reference)이다 — 첫 턴에 실리는 계획 왕복 때의 판 알림(current)이 그것을 덮지 않는다.
-      plan: plan ?? facts.plan,
     });
     const relay = sessionId !== null && this.relayLatestEnvelope(topic, role, sessionId) !== null;
     const turnRoute: TurnRoute = input.ledger ? { ...route, reviewLedger: input.ledger } : route;
@@ -384,11 +452,14 @@ export class DeliveryPipeline {
       && (event.payload?.envelope as { role?: unknown } | undefined)?.role === role && (sessionId === undefined || event.payload?.sessionId === sessionId)) ?? null;
   }
 
-  // 상대 봉투 원문 — 이 역할 세션이 마지막으로 받은 커서(since) 뒤에 기록된 상대 역할의 마지막 봉투 message.
+  // 상대 봉투 원문 — 이 역할 세션이 마지막으로 받은 커서(since) 뒤에 기록된 상대 역할의 마지막 봉투 message 와, 그 봉투의 항목별 보고·판정(planItems, 기록 payload 에
+  // 보존된 원문). 양방향이다 — 리뷰어 changes/approve 의 항목별 근거가 구현자에게, 구현자 done 의 항목별 근거가 리뷰어에게 간다(host-review F001).
   private relayCounterpart(topic: Topic, role: EnvelopeRole, since: number): RelayFacts["counterpart"] {
     const other: EnvelopeRole = role === "implementer" ? "code-reviewer" : "implementer";
     const event = this.relayLatestEnvelope(topic, other);
-    return event && event.sequence > since ? { role: other, message: event.body } : null;
+    if (!event || event.sequence <= since) return null;
+    const planItems = PlanItemReportSchema.safeParse((event.payload?.envelope as { planItems?: unknown } | undefined)?.planItems);
+    return { role: other, message: event.body, planItems: planItems.success ? planItems.data : null };
   }
 
   // 도구 트리 기준 산출물(tool-tree-baseline, 세대별). 없으면 지금 지문을 첫 기준으로 쓴다. 감지된 변경은 중재자가 재동기화 뒤
@@ -429,6 +500,13 @@ export class DeliveryPipeline {
     throw new Error(`도구 트리가 기준과 다릅니다(${phase}) — 러너 권한 밖. 재동기화 + tool-tree-rebaseline 뒤 재시도.`);
   }
 
+  // planned 전달 경계 — 항목 영수증(engine/planCoverage)이 승인 판·범위 세대·planEpoch·검토 트리와 일치해야 commit·push 한다. 영수증이 없는 legacy planned 와
+  // 낡은 영수증은 거부하고 보완 경로를 안내한다. 복구(discardOrphanCommit·reconcileDelivery)와 닫힌 단계 push 는 이 경계를 지나지 않는다.
+  private assertPlanCoverage(topic: Topic, flags: ReturnType<EngineCore["dependencies"]["database"]["getFlags"]>): void {
+    const problem = deliveryCoverageProblem(topic, flags, this.core.dependencies.database.getScopedTimeline(topic.id, topic.scopeGeneration));
+    if (problem) throw new Error(problem);
+  }
+
   // 브랜치 생성 시점에 고정한 기준 HEAD를 돌려준다. 현재 HEAD가 기준과 다르면 서버 밖에서 커밋이
   // 생긴 것이므로 그것을 기준으로 승격하지 않고 멈춘다 — 사용자가 discard-orphan-commit이나 직접
   // 확인으로 처분해야 한다(감사 ⑥). 예외는 공식 commit 으로 확정한 커밋(committedOID)이다 — 엔진이 부모·내용·경로를 확인한 인도 사슬의 끝이므로,
@@ -449,11 +527,22 @@ export class DeliveryPipeline {
     return pinned;
   }
 
+  // 현재 작업 트리가 최종 리뷰 스냅샷과 같은지 — 기준 HEAD 는 마지막 확정 커밋(없으면 리뷰 HEAD), 내용 불변은 리뷰 HEAD 기준 diff 해시다(인도 사슬 규칙, commit 주석).
+  // commit 과 planned 일반 닫기(WorkflowEngine.close)가 같은 대조를 쓴다(2026-10-11 코드 버전 결속). 작업 트리가 깨끗할 것(모두 커밋)은 요구하지 않는다.
+  async assertWorktreeReviewed(topic: Topic, flags: ReturnType<EngineCore["dependencies"]["database"]["getFlags"]>, purpose: string): Promise<void> {
+    if (!flags.reviewedHead || !flags.reviewedDiffSHA256) throw new Error("최종 리뷰가 확인한 변경 스냅샷이 없습니다.");
+    const current = await this.core.dependencies.git.snapshot(topic.worktreePath, flags.reviewedHead);
+    if (current.head !== (flags.committedOID ?? flags.reviewedHead) || current.diffSHA256 !== flags.reviewedDiffSHA256) {
+      throw new Error(`최종 리뷰 뒤 worktree가 바뀌었습니다. 다시 리뷰해야 ${purpose}.`);
+    }
+  }
+
   async commit(topicId: string, message: string, paths: string[], idempotencyKey?: string): Promise<string> {
     return this.withDeliveryLock(topicId, async (topic) => {
       if (!topic.branchName) throw new Error("커밋할 작업 브랜치가 없습니다.");
       const flags = this.core.dependencies.database.getFlags(topicId);
       if (!flags.reviewedHead || !flags.reviewedDiffSHA256) throw new Error("최종 리뷰가 확인한 변경 스냅샷이 없습니다.");
+      this.assertPlanCoverage(topic, flags);
       // 인도 커밋은 사슬을 이룰 수 있다(S11 계획 C1 소스 → C2 flip → C3 문서, [d02] S11-A03; 2026-09-21): 다음 커밋의 기준 HEAD 와 부모는
       // **마지막 확정 커밋**(없으면 리뷰 HEAD)이고, 내용 불변은 **리뷰 HEAD 기준** diff 해시로 본다 — 커밋은 파일을 바꾸지 않으므로 리뷰가 본
       // 변경 집합(작업 트리 vs 리뷰 HEAD)은 사슬 내내 같다. 이전엔 기준이 리뷰 HEAD 로 고정돼 두 번째 커밋부터 "worktree 가 바뀌었다" 로 거부됐다.
@@ -465,10 +554,7 @@ export class DeliveryPipeline {
       if (paths.length === 0) throw new Error("커밋할 경로를 하나 이상 고르세요.");
       // stage와 사후 검증이 같은 정규화 결과를 봐야 한다. 다르면 커밋은 남고 기록은 없는 고아 커밋이 생긴다.
       const selectedPaths = normalizeCommitPaths(topic.worktreePath, paths);
-      const current = await this.core.dependencies.git.snapshot(topic.worktreePath, flags.reviewedHead);
-      if (current.head !== deliveryBase || current.diffSHA256 !== flags.reviewedDiffSHA256) {
-        throw new Error("최종 리뷰 뒤 worktree가 바뀌었습니다. 다시 리뷰해야 커밋할 수 있습니다.");
-      }
+      await this.assertWorktreeReviewed(topic, flags, "커밋할 수 있습니다");   // 기준 HEAD == deliveryBase
       // 요청의 시작 HEAD 를 실행 **전에** 요청 좌표로 남긴다 — 서버가 확정 기록(committedOID)과 요청 완료(ledger.finish) 사이에 죽어도, 복구는
       // "이 요청이 그 HEAD 위에 새 커밋을 만들었는가" 를 좌표로 판정한다(메시지 대조는 git 의 공백 정리와 같은 메시지 재사용에 깨진다 — host-review R1·R2).
       if (idempotencyKey) {
@@ -648,6 +734,7 @@ export class DeliveryPipeline {
       if (!topic.branchName) throw new Error("push할 작업 브랜치가 없습니다.");
       const flags = this.core.dependencies.database.getFlags(topicId);
       if (!flags.committedOID) throw new Error("Consensus Room에서 확정한 커밋이 없습니다.");
+      this.assertPlanCoverage(topic, flags);
       if (await this.core.dependencies.git.head(topic.worktreePath) !== flags.committedOID) {
         throw new Error("확정한 커밋 뒤 HEAD가 바뀌어 push를 중단했습니다.");
       }

@@ -65,6 +65,16 @@ planned 의 계획 왕복은 같은 플래너 세션과 같은 계획 리뷰어 
 
 두 세션은 상대의 응답 원문만 받는다. 엔진은 응답을 요약하거나 판정하지 않는다. 종결·ACK·재계획 턴은 없다. 판이 바뀌면 이전 승인은 무효가 된다.
 
+### 계획 항목 coverage(planned 전용, 2026-10-11)
+
+planned 계획은 구현할 항목 목록을 fenced 블록 ```` ```plan-items ```` 으로 선언한다(`{"version":1,"items":[{"id":"R-1","requirement":"…","done":"…"}]}`, 여러 .md 의 블록을 합치며 id 는 묶음 전체에서 유일하다. 항목 수 상한은 없다). 목록의 버전은 계획 판 sha 그대로다. 엔진은 다음을 기계적으로 확인하고, 항목의 의미·구현의 정확성·근거의 진실성은 리뷰어·중재자·사용자가 판단한다.
+
+1. 플래너가 `ready` 로 답했는데 블록이 없거나 형식이 틀리면 판을 확정하지 않고 같은 플래너 세션에 `check-result`(`plan-items`) 사실로 돌려준다. 같은 내용으로 되풀이하면 중재자 정지다. 승인(`approve`)과 구현 진입·재개·리뷰 진입도 목록 없는 승인 계획을 거부한다 — 보완은 `return-to-planning`(같은 플래너 세션이 목록을 보완한 뒤 리뷰·승인)이나 명시적 `workflow-mode` ticket 전환이다. 자동으로 바꾸지 않는다.
+2. 구현자의 `done` 봉투는 `planItems`(항목마다 `id`·`status` implemented/not-implemented·`evidence`)가 선언 집합과 정확히 같고 전부 implemented 여야 리뷰로 간다. 아니면 교정 사실을 받아 같은 세션에서 이어 가고, 같은 보고를 되풀이하면 중재자 정지다.
+3. 코드 리뷰어의 `approve` 봉투는 `planItems`(항목마다 satisfied/unimplemented/unverified)가 선언 집합과 같아야 한다(아니면 같은 리뷰 세션·같은 리뷰 원장으로 판정만 다시 받는다). 하나라도 satisfied 가 아니면 `changes` 와 같이 수정 턴으로 간다. 전 항목 satisfied 일 때만 READY_TO_DELIVER 이고, 그 판정은 승인 판·범위 세대·planEpoch·검토 트리·리뷰 세션·원장에 결속된 영수증(READY 전이 사건의 `planCoverage`)으로 남는다.
+4. commit·push·close(단계 닫기 포함)는 영수증이 지금 승인 판·검토 트리와 일치할 때만 된다. 영수증이 없는 planned(이 계약 전에 READY 에 이른 토픽 포함)와 낡은 영수증은 거부하고 보완 경로(`resume` reentry CODEX_REVIEW·`return-to-planning`·ticket 전환)를 안내한다. 복구(`discard-orphan-commit`·`reconcile-delivery`)와 닫힌 단계의 push 는 이 검사를 지나지 않는다. 묶음에 없는 planned 의 닫기(`close`, API 의 `closeStage`)는 영수증 대조에 더해 현재 작업 트리가 최종 리뷰 스냅샷과 같은지도 확인한다(commit 과 같은 대조 — 기준 HEAD 는 마지막 확정 커밋 또는 리뷰 HEAD, 내용은 리뷰 HEAD 기준 diff 해시). 영수증은 리뷰 기록에 결속되므로 리뷰 뒤 바뀐 파일은 이 대조로만 드러난다. 커밋·clean 은 요구하지 않으며, 바뀌었으면 다시 리뷰(`resume` reentry CODEX_REVIEW)한 뒤 닫는다. ticket 닫기와 묶음 단계 닫기(결과 커밋 검증)는 이전과 같다.
+5. 매 planned 왕복 턴은 승인 계획 사실에 항목 id 목록을 싣는다 — 기존 세션도 항목별 보고 의무와 형식을 안다. ticket(이전 계획이 남은 ticket 포함)은 이 계약을 지나지 않는다.
+
 방식은 `POST /api/topics/:id/workflow-mode`(`{ mode, reason }`)로 바꾼다. 방식을 바꿔도 실행은 시작하지 않는다. 승인한 계획을 고치려면 `return-to-planning` 을 쓴다. 사용법은 [중재 정책](mediation/policy.md)에 있다.
 
 ## 세션 그래프와 실행 편집

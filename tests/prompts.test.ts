@@ -63,6 +63,25 @@ describe("역할별 원문 왕복 프롬프트", () => {
     expect(() => buildFirstTurnPrompt({ role: "planner", title: "Swift 6 전환", worktreePath: "/w/t" })).toThrow("planDirectory");
   });
 
+  // 계획 항목 coverage(2026-10-11) — 승인 계획 사실은 항목 id 를 매 턴 싣고(기존 세션도 의무를 안다), 역할 지침은 plan-items 선언·항목별 보고·판정을 설명한다.
+  it("승인 계획 사실은 항목 id 를 매 턴 싣고, 역할 지침은 plan-items 선언·항목별 보고·판정을 설명한다", () => {
+    const relay = buildRelayPrompt({ plan: { status: "approved", version: "e".repeat(64), snapshotPath: "/d/plan-v1", items: ["R-1", "R-2"] } });
+    expect(relay).toContain("승인 계획 항목(2개): R-1, R-2");
+    expect(relay).toContain("planItems");
+    expect(buildRelayPrompt({ plan: { status: "approved", version: "e".repeat(64), snapshotPath: "/d/plan-v1" } })).not.toContain("승인 계획 항목");
+    expectNoRetiredObligation(relay);
+    const planner = buildFirstTurnPrompt({ role: "planner", title: "t", worktreePath: "/w", planDirectory: "/d/plan" });
+    expect(planner).toContain("```plan-items");
+    expect(planner).toContain('"requirement"');
+    const reviewer = buildFirstTurnPrompt({ role: "plan-reviewer", title: "t", worktreePath: "/w" });
+    expect(reviewer).toContain("plan-items");
+    const implementer = buildFirstTurnPrompt({ role: "implementer", title: "t", worktreePath: "/w" });
+    expect(implementer).toContain("implemented 또는 not-implemented");
+    const codeReviewer = buildFirstTurnPrompt({ role: "code-reviewer", title: "t", worktreePath: "/w" });
+    expect(codeReviewer).toContain("전 항목 satisfied");
+    for (const prompt of [planner, reviewer, implementer, codeReviewer]) expectNoRetiredObligation(prompt);
+  });
+
   it("논의 발언 원문은 첫 턴에만 그대로 싣고, 없으면 절을 만들지 않는다 — 이어지는 턴의 사실 렌더에는 논의 절이 없다", () => {
     const discussion = [
       { sequence: 4, actor: "planner", kind: "brainstorm", body: "DISCUSSION-A\n- 비교 실험부터" },
@@ -167,5 +186,20 @@ describe("역할별 원문 왕복 프롬프트", () => {
     expect(prompt).toContain("changes · approve · needs-mediator");
     expect(prompt).toContain("작업을 다시 하지 말고");
     expectNoRetiredObligation(prompt);
+  });
+});
+
+// host-review F001 — 상대 봉투의 항목별 보고·판정(planItems)은 원문 경계 줄 뒤에 그대로 목록으로 실린다. 없으면 그 절이 없다.
+describe("상대 봉투의 항목별 보고·판정(planItems) 전달", () => {
+  it("리뷰어의 항목별 판정 원문(id·status·evidence)을 구현자 프롬프트에 그대로 싣고, 없으면 싣지 않는다", () => {
+    const withItems = buildRelayPrompt({ counterpart: { role: "code-reviewer", message: "R-2 를 보완하세요.",
+      planItems: [{ id: "R-1", status: "satisfied", evidence: "feature.txt 확인" }, { id: "R-2", status: "unimplemented", evidence: "REV-EV README 가 없습니다" }] } });
+    expect(withItems).toContain("코드 리뷰어 응답 원문 시작");
+    expect(withItems).toContain("코드 리뷰어의 항목별 보고·판정(planItems):\n- R-1 satisfied — feature.txt 확인\n- R-2 unimplemented — REV-EV README 가 없습니다");
+    for (const planItems of [undefined, null, []]) {
+      expect(buildRelayPrompt({ counterpart: { role: "implementer", message: "구현했습니다.", planItems } })).not.toContain("항목별 보고·판정");
+    }
+    expect(buildRelayPrompt({ counterpart: { role: "implementer", message: "구현했습니다.", planItems: [{ id: "R-1", status: "implemented", evidence: "IMPL-EV 12행" }] } }))
+      .toContain("구현자의 항목별 보고·판정(planItems):\n- R-1 implemented — IMPL-EV 12행");
   });
 });

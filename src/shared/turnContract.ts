@@ -1,5 +1,7 @@
 import { z } from "zod";
 import { AgentResultJsonSchema, AgentResultSchema, type AgentResult } from "./contracts.js";
+import { IMPLEMENTER_ITEM_STATUSES, PLAN_ITEM_STATUSES, planItemReportSchema, planItemsOutputSchema, REVIEWER_ITEM_STATUSES,
+  type PlanItemStatus } from "./planItems.js";
 import type { TurnJob } from "./roles.js";
 
 // One operation contract drives generation, injected instructions and acceptance.
@@ -26,6 +28,13 @@ export type EnvelopeRole = keyof typeof TURN_OUTCOMES;
 export type TurnOutcome = (typeof TURN_OUTCOMES)[EnvelopeRole][number];
 const ALL_TURN_OUTCOMES = ["ready", "changes", "agree", "done", "continue", "approve", "needs-mediator"] as const satisfies readonly TurnOutcome[];
 
+// 항목별 보고·판정(planItems, shared/planItems)을 싣는 역할과 그 역할의 status 값 — planned 승인 계획이 항목을 선언한 토픽에서는 의무이고(수락 경계
+// engine/planCoverage 가 선언 집합과의 일치를 확인한다) 그 밖(선언 없음·ticket)에서는 null 이다. 계획 왕복 역할의 봉투에는 이 필드가 없다.
+export const TURN_ITEM_STATUSES: Readonly<Partial<Record<EnvelopeRole, readonly PlanItemStatus[]>>> = {
+  implementer: IMPLEMENTER_ITEM_STATUSES,
+  "code-reviewer": REVIEWER_ITEM_STATUSES,
+};
+
 // 봉투를 쓰는 작업 — 계획 왕복(작성·같은 계획 수정·검토)과 구현 왕복(구현·리뷰 응답 수정·계속·리뷰). 그 밖의 작업(브레인스토밍, 삭제 예정인
 // 종결·최종 리뷰·ACK·확인·읽기 턴 등)은 봉투가 없다.
 export function envelopeRole(job: TurnJob): EnvelopeRole | null {
@@ -47,7 +56,8 @@ export function requireEnvelopeRole(job: TurnJob): EnvelopeRole {
 }
 
 // memoryUpdates·engineDefects 는 기존 결과 계약의 항목 스키마와 한도를 그대로 쓴다(R4 — CLI 스키마와 서버 한도의 일치는 기존 parity 검사가 지킨다).
-function envelopeSchema<const O extends readonly [TurnOutcome, ...TurnOutcome[]]>(outcomes: O) {
+// itemStatuses 는 이 역할의 봉투가 받는 planItems 의 status 값이다(CLI 스키마는 그 역할에만 필드를 둔다). 저장·전달용 스키마는 모든 값을 받는다.
+function envelopeSchema<const O extends readonly [TurnOutcome, ...TurnOutcome[]]>(outcomes: O, itemStatuses: readonly PlanItemStatus[] = PLAN_ITEM_STATUSES) {
   return z.object({
     message: RawText,
     outcome: z.enum(outcomes),
@@ -55,6 +65,8 @@ function envelopeSchema<const O extends readonly [TurnOutcome, ...TurnOutcome[]]
     mediatorRequest: RawText.optional(),
     memoryUpdates: AgentResultSchema.shape.memoryUpdates,
     engineDefects: AgentResultSchema.shape.engineDefects,
+    // 항목별 보고·판정(planned 승인 계획이 항목을 선언한 토픽에서 의무) — 엔진 수락 경계(engine/planCoverage)가 선언 집합과의 일치를 확인한다.
+    planItems: planItemReportSchema(itemStatuses as readonly [PlanItemStatus, ...PlanItemStatus[]]).optional(),
   }).superRefine((envelope, context) => {
     if (envelope.outcome === "needs-mediator" && !envelope.mediatorRequest) {
       context.addIssue({ code: "custom", path: ["mediatorRequest"], message: "outcome 이 needs-mediator 이면 mediatorRequest 에 중재자에게 물을 내용을 적어야 합니다." });
@@ -62,12 +74,12 @@ function envelopeSchema<const O extends readonly [TurnOutcome, ...TurnOutcome[]]
   });
 }
 
-// 저장·전달용 봉투(모든 역할의 outcome) — 받은 턴의 역할 대조는 turnEnvelopeSchema(role) 가 한다.
-export const TurnEnvelopeSchema = envelopeSchema(ALL_TURN_OUTCOMES);
+// 저장·전달용 봉투(모든 역할의 outcome·모든 항목 status) — 받은 턴의 역할 대조는 turnEnvelopeSchema(role) 가 한다.
+export const TurnEnvelopeSchema = envelopeSchema(ALL_TURN_OUTCOMES, PLAN_ITEM_STATUSES);
 export type TurnEnvelope = z.infer<typeof TurnEnvelopeSchema>;
 
 export function turnEnvelopeSchema(role: EnvelopeRole) {
-  return envelopeSchema(TURN_OUTCOMES[role]);
+  return envelopeSchema(TURN_OUTCOMES[role], TURN_ITEM_STATUSES[role]);
 }
 
 // 이 역할의 봉투 계약 위반 목록(없으면 빈 배열) — 파서와 실행기의 같은 세션 교정이 같은 판정을 쓴다.
@@ -96,17 +108,20 @@ export type WorkerFact = z.infer<typeof WorkerFactSchema>;
 const NON_BLANK = "\\S";
 
 // 봉투의 CLI 출력 스키마. OpenAI 구조화 출력 규칙대로 모든 키를 required 에 두고 선택성은 null 허용으로 표현한다(contracts.ts AgentResultJsonSchema 주석).
+// 항목별 보고(planItems)는 그 필드를 받는 역할에만 있다(TURN_ITEM_STATUSES).
 export function envelopeOutputSchema(role: EnvelopeRole) {
+  const itemStatuses = TURN_ITEM_STATUSES[role];
   return {
     type: "object",
     additionalProperties: false,
-    required: ["message", "outcome", "mediatorRequest", "memoryUpdates", "engineDefects"],
+    required: ["message", "outcome", "mediatorRequest", "memoryUpdates", "engineDefects", ...(itemStatuses ? ["planItems"] : [])],
     properties: {
       message: { type: "string", minLength: 1, pattern: NON_BLANK },
       outcome: { enum: [...TURN_OUTCOMES[role]] },
       mediatorRequest: { anyOf: [{ type: "string", minLength: 1, pattern: NON_BLANK }, { type: "null" }] },
       memoryUpdates: AgentResultJsonSchema.properties.memoryUpdates,
       engineDefects: AgentResultJsonSchema.properties.engineDefects,
+      ...(itemStatuses ? { planItems: planItemsOutputSchema(itemStatuses) } : {}),
     },
   } as const;
 }

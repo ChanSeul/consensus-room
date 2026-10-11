@@ -6,7 +6,9 @@ import { currentStopEvent, isRetryPoint, resetCycle, stopRecord, RESOURCE_PAUSE_
 import { ReviewBlocked } from "./reviewLedger.js";
 import { BudgetBlocked } from "./budgetLedger.js";
 import { createHash, randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { describePrune, pruneBuildTrees } from "./buildTrees.js";
+import { deliveryCoverageProblem, requireDeclaredPlanItems } from "./engine/planCoverage.js";
 import { basename, dirname, join } from "node:path";
 import {
   REENTRY_POINTS,
@@ -767,7 +769,18 @@ export class WorkflowEngine {
     if (topic.state !== "AWAITING_USER_APPROVAL" || !planSHA256 || topic.planSHA256 !== planSHA256) {
       throw new Error("현재 승인을 기다리는 계획 해시와 일치하지 않습니다.");
     }
+    // planned 승인 경계 — 승인할 판이 항목 목록(plan-items)을 선언해야 한다(engine/planCoverage). 목록 없는 판은 승인 뒤 구현 진입이 아니라 여기서 거부한다.
+    requireDeclaredPlanItems(this.readPlanRevision(topicId, planSHA256));
     this.assertStageContextCurrent(topicId);
+  }
+
+  // 현재 범위 세대의 그 sha 계획 산출물 본문 — approve 는 동기 액션이라 artifacts.verifiedRevision(비동기)과 같은 원장 행·같은 바이트 계약(원문 sha256)으로 동기로 읽는다.
+  private readPlanRevision(topicId: string, planSHA256: string): string {
+    const artifact = this.core.dependencies.database.artifactsForScope(topicId, "plan").find((entry) => entry.sha256 === planSHA256);
+    if (!artifact) throw new Error(`승인할 계획 판(${planSHA256.slice(0, 12)}…)의 산출물이 없습니다 — 계획 상태를 먼저 확인하세요.`);
+    const content = readFileSync(artifact.path, "utf8");
+    if (sha256(content) !== planSHA256) throw new Error(`계획 산출물이 기록된 sha 와 다릅니다(변조 또는 손상): ${artifact.path}`);
+    return content;
   }
 
   // 중재자 인계용 재개 정보(엔진 개편 E1, plan §2.5 "재개 정보 조회") — 어느 중재자가 읽어도 같은 사실과 같은 다음 작업을 돌려준다.
@@ -907,14 +920,19 @@ export class WorkflowEngine {
         db.evidence.assertReady(topic);
         if (!topic.branchName) throw new Error("커밋할 작업 브랜치가 없습니다.");
         if (!flags.reviewedHead || !flags.reviewedDiffSHA256) throw new Error("최종 리뷰가 확인한 변경 스냅샷이 없습니다.");
+        // 항목 영수증 대조는 인도 실행(DeliveryPipeline.assertPlanCoverage)과 같은 판정이다 — 중재자가 재개 정보에서 보완 경로를 본다.
+        const coverageProblem = deliveryCoverageProblem(topic, flags, db.getScopedTimeline(topicId, topic.scopeGeneration));
+        if (coverageProblem) throw new Error(coverageProblem);
       });
       const deferredChecks = ["리뷰 질문 답변 확인", "작업 트리가 최종 리뷰 스냅샷과 같은지", "전달 잠금"];
       actions.push({ action: "commit", input: { message: null, paths: null }, blocker: deliverable(), deferredChecks });
       if (flags.committedOID && flags.pushedOID !== flags.committedOID) actions.push({ action: "push", blocker: deliverable(), deferredChecks });
-      // 묶음 단계는 closeStage 의 결과 확인(git)까지 같은 함수로 판정한다.
-      actions.push({ action: "close", blocker: db.workGroups.forTopic(topicId)
+      // 묶음 단계는 closeStage 의 결과 확인(git)까지 같은 함수로 판정한다. 묶음 없는 planned 의 리뷰 스냅샷 대조는 실행 때 한다(commit 과 같은 deferred 검사).
+      const grouped = Boolean(db.workGroups.forTopic(topicId));
+      actions.push({ action: "close", blocker: grouped
         ? await this.asyncBlocker(async () => { this.closePreconditions(topicId); await this.stageCloseResult(topicId, { freeze: false }); })
-        : this.blocker(() => this.closePreconditions(topicId)) });
+        : this.blocker(() => this.closePreconditions(topicId)),
+        ...(!grouped && topic.workflowMode === "planned" ? { deferredChecks: ["작업 트리가 최종 리뷰 스냅샷과 같은지"] } : {}) });
       // 중재자 재진입(F009) — 같은 역할 세션의 수정·재리뷰. 상태 검사는 이 분기가 보장하므로 차단 사유는 재개의 사전 검사와 같다.
       for (const reentry of REENTRY_POINTS) {
         actions.push({ action: "resume", input: { reentry, decision: null },
@@ -940,14 +958,29 @@ export class WorkflowEngine {
     return updated;
   }
 
-  // 작업 묶음에 연결되지 않은 주제의 닫기. 묶음 단계는 결과 커밋 검증(git)과 결과 동결이 필요해 closeStage 로만 닫는다 — 동기 경로로 닫으면
-  // 동결 기록 없이 CLOSED 가 되어 다음 단계가 이 결과를 승계할 수 없다(엔진 개편 E4, plan §3.3).
-  close(topicId: string): Topic {
+  // 작업 묶음에 연결되지 않은 주제의 닫기. 묶음 단계는 결과 커밋 검증(git)과 결과 동결이 필요해 closeStage 로만 닫는다 — 동결 기록 없이 CLOSED 가 되면
+  // 다음 단계가 이 결과를 승계할 수 없다(엔진 개편 E4, plan §3.3).
+  // planned 는 닫기 전에 현재 작업 트리가 최종 리뷰 스냅샷과 같은지 확인한다(commit 과 같은 대조 — delivery.assertWorktreeReviewed; 2026-10-11 코드 버전 결속).
+  // 항목 영수증은 리뷰 기록(flags)에 결속되므로 리뷰 뒤 바뀐 파일은 영수증 대조만으로는 드러나지 않는다. 커밋·clean 은 요구하지 않는다(커밋 없이 닫는 기존
+  // 의미 유지). git 경계 뒤 사전 검사를 다시 한다. ticket 은 이전과 같다.
+  async close(topicId: string): Promise<Topic> {
+    const db = this.core.dependencies.database;
     this.closePreconditions(topicId);
-    if (this.core.dependencies.database.workGroups.forTopic(topicId)) {
+    if (db.workGroups.forTopic(topicId)) {
       throw new Error("작업 묶음 단계는 결과 커밋을 확인하고 결과를 동결해야 닫을 수 있습니다(closeStage).");
     }
-    return this.core.transition(topicId, "CLOSED", "주제를 닫았습니다.");
+    if (this.stageClosing.has(topicId)) throw new Error("이미 주제를 닫고 있습니다.");
+    this.stageClosing.add(topicId);
+    try {
+      const topic = db.getTopic(topicId);
+      if (topic.workflowMode === "planned") {
+        await this.delivery.assertWorktreeReviewed(topic, db.getFlags(topicId), "닫을 수 있습니다");
+        this.closePreconditions(topicId);
+      }
+      return this.core.transition(topicId, "CLOSED", "주제를 닫았습니다.");
+    } finally {
+      this.stageClosing.delete(topicId);
+    }
   }
 
   // 닫기(API 경로) — 묶음 단계면 검증된 로컬 커밋(HEAD==committedOID·clean·커밋 트리==리뷰 트리·기준의 후손)과 합류 대상·통합의 조상 관계를 확인하고
@@ -957,9 +990,10 @@ export class WorkflowEngine {
   // 커밋을 싣는다(F003).
   async closeStage(topicId: string): Promise<Topic> {
     const db = this.core.dependencies.database;
-    this.closePreconditions(topicId);
+    // 묶음에 없는 주제는 일반 닫기(close)와 같은 경로다 — planned 의 리뷰 스냅샷 대조도 거기서 한다.
     const group = db.workGroups.forTopic(topicId);
-    if (!group) return this.core.transition(topicId, "CLOSED", "주제를 닫았습니다.");
+    if (!group) return this.close(topicId);
+    this.closePreconditions(topicId);
     if (this.stageClosing.has(topicId)) throw new Error("이미 단계를 닫고 있습니다.");
     this.stageClosing.add(topicId);
     try {
@@ -1098,6 +1132,10 @@ export class WorkflowEngine {
     }
     const topic = this.core.dependencies.database.getTopic(topicId);
     if (topic.state !== "READY_TO_DELIVER") throw new Error("전달 준비가 끝난 주제만 닫을 수 있습니다.");
+    // planned 는 항목 영수증이 승인 판·검토 트리와 일치해야 닫는다(commit·push 와 같은 대조, engine/planCoverage) — 단계 닫기(closeStage)도 이 검사를 지난다.
+    const coverageProblem = deliveryCoverageProblem(topic, this.core.dependencies.database.getFlags(topicId),
+      this.core.dependencies.database.getScopedTimeline(topicId, topic.scopeGeneration));
+    if (coverageProblem) throw new Error(coverageProblem);
     // 묶음 단계: 문맥 변경 중에는 닫지 않는다(닫기는 결과를 동결해 다음 단계로 승계하는 길이다). 결과 커밋 검증은 closeStage 가 한다.
     this.assertStageContextCurrent(topicId);
   }

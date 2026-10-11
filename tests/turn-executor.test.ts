@@ -147,7 +147,7 @@ describe("실행 허용 거부의 재개와 예약 복원", () => {
     database.budgets.configure("t", { execution: { inputTokens: 1000, outputTokens: 1000, durationMs: 60000 }, total: { inputTokens: 100000, outputTokens: 100000, durationMs: 600000 } }, "probe");
     const lock = join(root, "maintenance.json");
     const { REQUIRED_PLAN_HEADINGS } = await import("../src/shared/contracts");
-    const plan = REQUIRED_PLAN_HEADINGS.map((h) => `## ${h}\n\n${h}${h === "허용 오차" ? '\n\n```tolerance\n{"scopePaths":["owned.txt"],"rules":[]}\n```' : ""}`).join("\n\n");
+    const plan = REQUIRED_PLAN_HEADINGS.map((h) => `## ${h}\n\n${h}${h === "허용 오차" ? '\n\n```tolerance\n{"scopePaths":["owned.txt"],"rules":[]}\n```' : ""}`).join("\n\n") + '\n```plan-items\n{"version":1,"items":[{"id":"R-1","requirement":"owned.txt","done":"확인"}]}\n```\n';
     let claudeCalls = 0, codexCalls = 0;
     const runClaude = async (turn: { beforeSpawn?: () => void | Promise<void>; admitSync?: () => void }) => { await turn.beforeSpawn?.(); turn.admitSync?.(); claudeCalls++; return { kind: "PLAN" as const, summary: "plan", planMarkdown: plan, findings: [], evidenceRefs: [] }; };
     // 계획 턴은 결과 봉투 턴이다(⑥) — 플래너 대역은 같은 spawn 전 경계를 지난 뒤 계획 폴더에 plan.md 를 쓴다.
@@ -186,7 +186,7 @@ describe("실행 허용 거부의 재개와 예약 복원", () => {
     database.budgets.configure("t", { execution: { inputTokens: 1000, outputTokens: 1000, durationMs: 60000 }, total: { inputTokens: 100000, outputTokens: 100000, durationMs: 600000 } }, "probe");
     const lock = join(root, "maintenance.json");
     const { REQUIRED_PLAN_HEADINGS } = await import("../src/shared/contracts");
-    const plan = REQUIRED_PLAN_HEADINGS.map((h) => `## ${h}\n\n${h}${h === "허용 오차" ? '\n\n```tolerance\n{"scopePaths":["owned.txt"],"rules":[]}\n```' : ""}`).join("\n\n");
+    const plan = REQUIRED_PLAN_HEADINGS.map((h) => `## ${h}\n\n${h}${h === "허용 오차" ? '\n\n```tolerance\n{"scopePaths":["owned.txt"],"rules":[]}\n```' : ""}`).join("\n\n") + '\n```plan-items\n{"version":1,"items":[{"id":"R-1","requirement":"owned.txt","done":"확인"}]}\n```\n';
     let claudeCalls = 0, codexCalls = 0;
     const runClaude = async (turn: { beforeSpawn?: () => void | Promise<void>; admitSync?: () => void }) => { await turn.beforeSpawn?.(); turn.admitSync?.(); claudeCalls++; return { kind: "PLAN" as const, summary: "plan", planMarkdown: plan, findings: [], evidenceRefs: [] }; };
     // 계획 턴은 결과 봉투 턴이다(⑥) — 플래너 대역은 같은 spawn 전 경계를 지난 뒤 계획 폴더에 plan.md 를 쓴다.
@@ -234,7 +234,7 @@ describe("실행 허용 거부의 재개와 예약 복원", () => {
     const lock = join(root, "maintenance.json");
     const { REQUIRED_PLAN_HEADINGS } = await import("../src/shared/contracts");
     const { readAppliedInstructions } = await import("../src/server/projectInstructions");
-    const plan = REQUIRED_PLAN_HEADINGS.map((h) => `## ${h}\n\n${h}${h === "허용 오차" ? '\n\n```tolerance\n{"scopePaths":["owned.txt"],"rules":[]}\n```' : ""}`).join("\n\n");
+    const plan = REQUIRED_PLAN_HEADINGS.map((h) => `## ${h}\n\n${h}${h === "허용 오차" ? '\n\n```tolerance\n{"scopePaths":["owned.txt"],"rules":[]}\n```' : ""}`).join("\n\n") + '\n```plan-items\n{"version":1,"items":[{"id":"R-1","requirement":"owned.txt","done":"확인"}]}\n```\n';
     let broken = true, claudeCalls = 0, codexCalls = 0;
     // 어댑터가 공급자를 부르기 전에 지시문을 읽는 경로(claude.ts:268 과 같은 위치)를 실제 리더로 재현한다.
     const readInstructions = async (signal?: AbortSignal) => {

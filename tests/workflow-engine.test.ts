@@ -35,9 +35,9 @@ function envelopeOf(result: AgentResult, turn: { planDirectory?: string }): Turn
       if (result.planMarkdown && turn.planDirectory) writeFileSync(join(turn.planDirectory, "plan.md"), `${result.planMarkdown.trim()}\n`);
       return { message: result.summary, outcome: "ready", ...carried };
     case "AUDIT": return { message: result.summary, outcome: result.findings.length ? "changes" : "agree", ...carried };
-    case "REVIEW": return { message: result.summary, outcome: result.findings.length ? "changes" : "approve", ...carried };
+    case "REVIEW": return { message: result.summary, outcome: result.findings.length ? "changes" : "approve", ...carried, ...(result.findings.length ? {} : { planItems: SATISFIED }) };
     case "IMPLEMENTATION": case "FIX":
-      return { message: result.summary, outcome: result.status === "in_progress" ? "continue" : "done", ...carried };
+      return { message: result.summary, outcome: result.status === "in_progress" ? "continue" : "done", ...carried, ...(result.status === "in_progress" ? {} : { planItems: IMPLEMENTED }) };
     default: throw new Error(`봉투 relay 에 없는 결과 종류입니다: ${result.kind}`);
   }
 }
@@ -110,6 +110,7 @@ function makeEngine(
     const head = "a".repeat(40);
     const diffSHA256 = createHash("sha256").update(`BASE\0${head}\0`, "utf8").digest("hex");
     database.updateTopic("topic-1", { reviewedHead: head, reviewedDiffSHA256: diffSHA256 });
+    if (alreadyApproved) coverageReceiptEvent(database, "topic-1");
   }
   const unavailableAdapter = (role: "claude" | "codex"): AgentAdapter => ({
     role,
@@ -463,9 +464,10 @@ describe("범위 세대", () => {
   });
 
   it("이미 닫은 주제는 범위 변경으로 되살리지 않는다", async () => {
-    const { database, engine } = makeEngine("READY_TO_DELIVER", "e".repeat(64), true);
+    // planned 닫기는 리뷰 스냅샷 대조(git)를 지난다 — 기록 러너는 변경 없는 트리(리뷰 HEAD 그대로)를 답한다.
+    const { database, engine } = makeEngine("READY_TO_DELIVER", "e".repeat(64), true, new RecordingGitRunner());
     database.updateTopic("topic-1", { branchName: null });
-    engine.close("topic-1");
+    await engine.close("topic-1");
 
     await expect(engine.handleScopeChange("topic-1", "닫힌 주제를 다시 열어 주세요."))
       .rejects.toThrow("닫은 주제");
@@ -477,9 +479,12 @@ describe("범위 세대", () => {
 });
 
 describe("사용자 계획 승인", () => {
-  it("사용자가 두 모델이 확인한 현재 해시를 승인하면 그 버전만 기록한다", () => {
-    const sha = "b".repeat(64);
-    const { database, engine } = makeEngine("AWAITING_USER_APPROVAL", sha);
+  it("사용자가 두 모델이 확인한 현재 해시를 승인하면 그 버전만 기록한다", async () => {
+    // 승인 경계는 승인할 판의 산출물을 읽어 plan-items 선언을 확인한다 — 승인 판 바이트의 sha 가 계획 해시다.
+    const plan = `${validPlan("승인").trim()}\n`;
+    const sha = createHash("sha256").update(plan, "utf8").digest("hex");
+    const { database, engine, dependencies } = makeEngine("AWAITING_USER_APPROVAL", sha);
+    await dependencies.artifacts.write("topic-1", "plan", 2, plan);
 
     const approved = engine.approve("topic-1", sha);
 
@@ -843,7 +848,20 @@ const TOLERANCE_BLOCK = '\n\n```tolerance\n{"scopePaths":["**"],"rules":[]}\n```
 function validPlan(label: string): string {
   return REQUIRED_PLAN_HEADINGS
     .map((heading) => `## ${heading}\n\n${label}: ${heading}${heading === "허용 오차" ? TOLERANCE_BLOCK : ""}`)
-    .join("\n\n");
+    .join("\n\n") + ITEMS_BLOCK;
+}
+// planned 계획 항목 선언(plan-items)과 항목별 보고·판정 — 2026-10-11 계약. 선언 집합과 같아야 구현 완료가 리뷰로, 리뷰 승인이 READY 로 간다.
+const ITEMS_BLOCK = '\n```plan-items\n{"version":1,"items":[{"id":"R-1","requirement":"검증할 내용을 구현한다","done":"리뷰어가 코드로 확인"}]}\n```\n';
+const IMPLEMENTED = [{ id: "R-1", status: "implemented" as const, evidence: "구현 위치와 검증 결과" }];
+const SATISFIED = [{ id: "R-1", status: "satisfied" as const, evidence: "코드로 확인" }];
+
+// planned 전달 경계(commit·push·close)가 요구하는 항목 영수증 — 리뷰가 READY 로 옮기며 남기는 전이 사건과 같은 모양을 지금 승인 판·검토 트리에 결속해 둔다.
+function coverageReceiptEvent(database: ConsensusDatabase, topicId: string): void {
+  const topic = database.getTopic(topicId), flags = database.getFlags(topicId);
+  database.appendEvent({ topicId, actor: "system", kind: "system", state: "READY_TO_DELIVER", body: "코드 리뷰가 현재 작업 트리를 승인했습니다.", payload: {
+    from: "CODEX_REVIEW", to: "READY_TO_DELIVER", planCoverage: { planSHA256: topic.approvedPlanSHA256, scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch,
+      reviewedHead: flags.reviewedHead, reviewedDiffSHA256: flags.reviewedDiffSHA256, reviewedTreeOID: flags.reviewedTreeOID ?? null,
+      reviewSessionId: "codex-review", reviewLedgerId: "ledger-fixture", items: SATISFIED, recordedAt: "2026-10-11T00:00:00.000Z" } } });
 }
 
 function makePlanningEngine(input: {
@@ -1664,9 +1682,9 @@ it("묶음의 중간 단계는 검증된 로컬 커밋에서 push 없이 닫고 
  {id:"b",kind:"integration",title:"b",goal:"b",acceptance:"b",dependsOn:["a"],budget}]},"/repo","head");
  database.workGroups.link("group","a","topic-1","head");
  // 동기 close 는 묶음 단계를 닫지 않는다(동결 기록 없이 닫히면 다음 단계가 승계할 수 없다).
- expect(()=>engine.close("topic-1")).toThrow("closeStage");
+ await expect(engine.close("topic-1")).rejects.toThrow("closeStage");
  await expect(engine.closeStage("topic-1")).rejects.toThrow("저장된 plan.md가 없습니다");
- database.updateTopic("topic-1",{committedOID:commit,reviewedTreeOID:tree});
+ database.updateTopic("topic-1",{committedOID:commit,reviewedTreeOID:tree});coverageReceiptEvent(database,"topic-1");
  await expect(engine.closeStage("topic-1")).rejects.toThrow("작업 트리 HEAD");
  head=commit;treeFiles="form.swift\0";
  await expect(engine.closeStage("topic-1")).rejects.toThrow("리뷰한 트리");
@@ -1698,7 +1716,7 @@ it("planned 무변경 단계는 여러 파일 계획 묶음의 바이트 버전�
  expect(hashPlan(serializePlanBundle(files))).not.toBe(version);
  const {database,engine,dependencies}=makeEngine("READY_TO_DELIVER",version,true,runner);
  await dependencies.artifacts.write("topic-1","plan",1,serializePlanBundle(files));
- database.updateTopic("topic-1",{reviewedHead:"head",reviewedTreeOID:tree});
+ database.updateTopic("topic-1",{reviewedHead:"head",reviewedTreeOID:tree});coverageReceiptEvent(database,"topic-1");
  const budget={execution:{inputTokens:10,outputTokens:10,durationMs:100},total:{inputTokens:100,outputTokens:100,durationMs:1000}};
  database.workGroups.create("group",{title:"작업",goal:"목표",contracts:"계약",stages:[
  {id:"a",kind:"work",title:"a",goal:"a",acceptance:"a",dependsOn:[],budget},
@@ -1758,7 +1776,7 @@ function stageCloseFixture(kind:"merge"|"integration"){
  if(kind==="merge")database.workGroups.link("group","z","topic-1","x-commit",{selected:true,mergeTargets:["y"],
   preparedMerge:{tree,conflicts:[],targets:[{stageId:"y",commitOID:"y-commit"}]}});
  else database.workGroups.link("group","int","topic-1","x-commit",{selected:true});
- database.updateTopic("topic-1",{committedOID:commit,reviewedTreeOID:tree});
+ database.updateTopic("topic-1",{committedOID:commit,reviewedTreeOID:tree});coverageReceiptEvent(database,"topic-1");
  return {database,engine,commit,dirtyTree,notAncestors,setHead:(value:string)=>{head=value;},onMergeBase:(hook:()=>void)=>{onMergeBase=hook;}};
 }
 
@@ -1796,12 +1814,13 @@ it("통합 단계는 의존하지 않는 단계를 포함해 다른 모든 단�
  await expect(fx.engine.closeStage("topic-1")).rejects.toThrow("단계 w 의 결과 커밋이 이 단계 결과에 포함되지 않았습니다(통합 대상)");
  fx.notAncestors.clear();
  // 커밋 없이 기준(x-commit)에서 검증만 한 통합(F004) — 리뷰 HEAD 가 기준이 아니면(리뷰 기록 없음) 닫지 않는다.
- fx.database.updateTopic("topic-1",{committedOID:null,reviewedHead:null});fx.setHead("x-commit");
+ // 리뷰 플래그를 바꿀 때마다 영수증을 그 리뷰에 맞춰 다시 둔다 — 영수증 대조(검토 트리)가 아니라 단계 결과 해석이 거부하는지 본다.
+ fx.database.updateTopic("topic-1",{committedOID:null,reviewedHead:null});coverageReceiptEvent(fx.database,"topic-1");fx.setHead("x-commit");
  await expect(fx.engine.closeStage("topic-1")).rejects.toThrow("변경 없는 단계 결과를 리뷰한 기록");
  // 리뷰한 작업 트리에 변경이 있었는데(리뷰 트리 ≠ 기준 트리) 커밋하지 않고 되돌렸으면 리뷰한 결과가 아니다.
- fx.database.updateTopic("topic-1",{reviewedHead:"x-commit",reviewedTreeOID:fx.dirtyTree});
+ fx.database.updateTopic("topic-1",{reviewedHead:"x-commit",reviewedTreeOID:fx.dirtyTree});coverageReceiptEvent(fx.database,"topic-1");
  await expect(fx.engine.closeStage("topic-1")).rejects.toThrow("리뷰한 작업 트리에 변경이 있었습니다");
- fx.database.updateTopic("topic-1",{reviewedTreeOID:"e".repeat(40)});
+ fx.database.updateTopic("topic-1",{reviewedTreeOID:"e".repeat(40)});coverageReceiptEvent(fx.database,"topic-1");
  expect((await fx.engine.closeStage("topic-1")).state).toBe("CLOSED");
  expect(fx.database.workGroups.get("group").results?.int).toMatchObject({commitOID:"x-commit",baseOID:"x-commit"});
  // 리뷰한 기준 커밋을 전달 계약의 확정 커밋으로 기록한다(F003) — 닫힌 단계 push 가 이 커밋을 싣는다.

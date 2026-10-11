@@ -8,7 +8,8 @@ import { brainstormReplies } from "../../shared/brainstorm.js";
 import type { PlanBundleCapture } from "../../shared/planningControl.js";
 import type { EngineCore, EnvelopeNext } from "./core.js";
 import type { EnvelopeRole, WorkerFact } from "../../shared/turnContract.js";
-import { PlanBundleError } from "../planBundle.js";
+import { PlanBundleError, planBundleVersion, serializePlanBundle } from "../planBundle.js";
+import { declaredPlanItems, PLAN_ITEMS_CHECK_ID, planItemsFact, planItemsInputKey, type PlanItemsDeclaration } from "./planCoverage.js";
 
 // 계획 왕복의 역할 턴 단계 — 플래너의 첫 작성·같은 계획 수정, 리뷰어의 검토.
 type RelayStage = "CLAUDE_PLAN" | "CLAUDE_REVISION" | "CODEX_AUDIT";
@@ -109,6 +110,22 @@ export class PlanningPipeline {
       await record(mediatorStop(envelope.mediatorRequest ?? envelope.message, stage));
       return null;
     }
+    // planned 계획은 항목 목록(plan-items)을 선언해야 한다 — 판을 확정(산출물 기록)하기 전에 폴더 본문으로 확인한다. 없거나 틀리면 같은 플래너 세션에 사실로
+    // 돌려주고 같은 단계를 다시 연다(필수 검사 실패와 같은 루프). 같은 폴더 내용으로 되풀이하면 중재자 정지 — 같은 조건의 반복은 진척이 아니다.
+    const declaration = await this.planItemsDeclaration(topic);
+    if (typeof declaration === "string") {
+      await record(await this.bundleStop(topic, stage, "플래너가 ready 로 답했지만 계획 폴더를 읽지 못했습니다.", declaration));
+      return null;
+    }
+    if (declaration && declaration.kind !== "declared") {
+      const inputKey = planItemsInputKey("planner", declaration.version, declaration.message);
+      if (this.core.repeatedCheckFailure(topic, inputKey, [PLAN_ITEMS_CHECK_ID])) {
+        await record(mediatorStop(`플래너가 같은 계획 내용으로 다시 ready 로 답했지만 항목 목록이 그대로 없거나 틀립니다 — ${declaration.message}`, stage));
+        return null;
+      }
+      await record({ events: [planItemsFact(declaration.message, inputKey)] });
+      return stage;
+    }
     const captured = await this.capture(topic, signal);
     if (typeof captured === "string") {
       await record(await this.bundleStop(topic, stage, "플래너가 ready 로 답했지만 계획 폴더를 계획 판으로 확정하지 못했습니다.", captured));
@@ -117,7 +134,11 @@ export class PlanningPipeline {
     // 계획 세션을 구현으로 잇는 토픽(계획 연속성 정책)은 이 판을 쓴 세션과 그 세션이 받은 순번을 묶어 둔다. 결속은 계획 SHA 가 같을 때만 읽히므로
     // 판 확정 앞에 써도 효력이 없고, 확정 뒤 끊겨 결속이 빠지는 일이 없다.
     if (database.planning.continuityEnabled(topic.id)) database.planning.bindSession(topic, captured.version, sessionId, pending.through);
-    await record({ state: "CODEX_AUDIT", message: "리뷰어가 계획을 검토합니다.", ...planVersionAdoption(topic, captured) });
+    // 선언 확인 성공도 채택과 같은 transaction 의 passed 사실로 남긴다 — 같은 계열의 반복 판정에서 앞선 선언 실패의 연속성이 여기서 끝난다(host-review F003:
+    // 잘못된 A → 교정 B 채택 → 수정 중 A 재발이 첫 턴부터 정지되지 않고 교정 사실을 받는다).
+    const adoption = planVersionAdoption(topic, captured);
+    const declared = declaration?.kind === "declared" ? [planItemsFact(`플래너가 항목 ${declaration.items.length}개를 선언했습니다(목록 확인).`, "", "passed")] : [];
+    await record({ state: "CODEX_AUDIT", message: "리뷰어가 계획을 검토합니다.", ...adoption, events: [...(adoption.events ?? []), ...declared] });
     return "CODEX_AUDIT";
   }
 
@@ -150,6 +171,16 @@ export class PlanningPipeline {
         return "CLAUDE_REVISION";
       case "agree": {
         // 합의는 리뷰어가 받은 판이 지금 폴더의 판일 때만이다. 리뷰 사이에 폴더가 바뀌었으면 새 판을 확정해 같은 리뷰어 세션에 다시 보낸다(상태 유지).
+        // 바뀐 폴더가 항목 목록(plan-items)을 잃었거나 틀리면 리뷰어가 고칠 수 없으므로 판을 확정하지 않고 중재자에게 넘긴다(플래너 ready 의 확인과 같은 계약).
+        const declaration = await this.planItemsDeclaration(topic);
+        if (typeof declaration === "string") {
+          await record(await this.bundleStop(topic, "CODEX_AUDIT", "리뷰어가 동의했지만 계획 폴더를 읽지 못했습니다.", declaration));
+          return null;
+        }
+        if (declaration && declaration.kind !== "declared") {
+          await record(await this.bundleStop(topic, "CODEX_AUDIT", "리뷰어가 동의했지만 지금 계획 폴더에 항목 목록(plan-items)이 없거나 틀립니다.", declaration.message));
+          return null;
+        }
         const captured = await this.capture(topic, signal);
         if (typeof captured === "string") {
           await record(await this.bundleStop(topic, "CODEX_AUDIT", "리뷰어가 동의했지만 동의한 판이 지금 계획 폴더와 같은지 확인하지 못했습니다.", captured));
@@ -177,6 +208,18 @@ export class PlanningPipeline {
       `보존: ${role} 응답 원문은 이 기록에, 계획 파일은 ${await this.core.planBundle.directory(topic)} 에 그대로 있습니다. 지금 계획 판은 ${topic.planSHA256 ?? "없음"} 입니다.`,
       `다음 행동: 계획 폴더를 고치거나 진행 방법을 결정으로 남긴 뒤 재개하면, 같은 ${role} 세션이 그 결정을 받아 ${RELAY_LABEL[stage]} 턴을 다시 합니다.`,
     ].join("\n"), stage);
+  }
+
+  // 작업 폴더의 항목 선언(plan-items) — 판을 확정하기 전에 같은 직렬화 본문으로 본다. 폴더가 비어 있으면 null(확정 경로가 그 사유로 멈춘다), 읽을 수 없으면 사유 문자열.
+  private async planItemsDeclaration(topic: Topic): Promise<(PlanItemsDeclaration & { version: string }) | string | null> {
+    try {
+      const files = await this.core.planBundle.read(topic);
+      if (files.length === 0) return null;
+      return { ...declaredPlanItems(serializePlanBundle(files)), version: planBundleVersion(files) };
+    } catch (error) {
+      if (error instanceof PlanBundleError) return error.message;
+      throw error;
+    }
   }
 
   // 작업 폴더를 버전으로 확정한다(실행 중인 턴의 현재성 검사로 저장). 폴더에 계획이 없거나 읽을 수 없으면 그 사유를 돌려준다 — 호출자가 원문을 보존하고

@@ -27,7 +27,12 @@ afterEach(async () => {
 
 const TOKEN = "launch-token-for-diagnosis-test";
 const TOLERANCE_BLOCK = '\n\n```tolerance\n{"scopePaths":["**"],"rules":[]}\n```';
-const plan = () => REQUIRED_PLAN_HEADINGS.map((heading) => `## ${heading}\n\n검증할 내용${heading === "허용 오차" ? TOLERANCE_BLOCK : ""}`).join("\n\n");
+const plan = () => REQUIRED_PLAN_HEADINGS.map((heading) => `## ${heading}\n\n검증할 내용${heading === "허용 오차" ? TOLERANCE_BLOCK : ""}`).join("\n\n") + ITEMS_BLOCK;
+// planned 계획 항목 선언(plan-items)과 항목별 보고·판정 — 2026-10-11 계약. 선언 집합과 같아야 구현 완료가 리뷰로, 리뷰 승인이 READY 로 간다.
+const ITEMS_BLOCK = '\n```plan-items\n{"version":1,"items":[{"id":"R-1","requirement":"검증할 내용을 구현한다","done":"리뷰어가 코드로 확인"}]}\n```\n';
+const IMPLEMENTED = [{ id: "R-1", status: "implemented" as const, evidence: "구현 위치와 검증 결과" }];
+const SATISFIED = [{ id: "R-1", status: "satisfied" as const, evidence: "코드로 확인" }];
+
 const git = (cwd: string, args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 
 // 구현자: 차례대로 정해진 동작을 하고 완료 봉투를 낸다. 리뷰어: 승인 봉투를 낸다.
@@ -51,8 +56,8 @@ class ApprovingCodex implements AgentAdapter {
   async validateExistingSession() { return true; }
   async createSession(): Promise<never> { throw new Error("봉투 턴만 부릅니다."); }
   async resumeTurn(): Promise<never> { throw new Error("봉투 턴만 부릅니다."); }
-  async createEnvelopeSession(_turn: Omit<SessionTurn, "sessionId">) { return { sessionId: "codex-review", envelope: { message: "확인했습니다.", outcome: "approve" } satisfies TurnEnvelope }; }
-  async resumeEnvelopeTurn(_turn: SessionTurn): Promise<TurnEnvelope> { return { message: "확인했습니다.", outcome: "approve" }; }
+  async createEnvelopeSession(_turn: Omit<SessionTurn, "sessionId">) { return { sessionId: "codex-review", envelope: { message: "확인했습니다.", outcome: "approve", planItems: SATISFIED } satisfies TurnEnvelope }; }
+  async resumeEnvelopeTurn(_turn: SessionTurn): Promise<TurnEnvelope> { return { message: "확인했습니다.", outcome: "approve", planItems: SATISFIED }; }
 }
 
 async function waitFor(predicate: () => boolean, label: string, timeout = 15_000): Promise<void> {
@@ -121,7 +126,7 @@ async function room(label: string) {
 describe("R1/R2 delivery admission", () => {
   it("R1 commit 대기 중 결정은 거부하고 실패 후 잠금을 해제한다", async () => {
     const r = await room("r1-delivery-race");
-    r.steps.push(() => { writeFileSync(join(r.worktree, "feature.txt"), "구현\n"); return { message: "완료", outcome: "done" }; });
+    r.steps.push(() => { writeFileSync(join(r.worktree, "feature.txt"), "구현\n"); return { message: "완료", outcome: "done", planItems: IMPLEMENTED }; });
     await r.call("POST", `/api/topics/${r.topicId}/actions/implement`);
     await r.idle("READY_TO_DELIVER");
     const original = GitService.prototype.snapshot;

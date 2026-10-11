@@ -171,7 +171,7 @@ function parseCandidate(candidate: unknown): AgentResult | null {
 // 결과 봉투(D3) — 모델이 제출한 마지막 최종 응답 하나만 읽는다(앞 메시지의 JSON 은 제출한 결과가 아니다). 응답이 JSON 객체가 아니면 교정할 결과가 없으므로
 // 일반 오류다. 객체인데 이 역할의 봉투 계약을 어기면 그 응답을 UnverifiedAgentResult 로 넘긴다 — 같은 세션 교정은 실행기가 정한다.
 // 값이 null 인 선택 키(CLI 스키마의 "required + null")는 지운 뒤 검사한다.
-const ENVELOPE_OPTIONAL_KEYS = ["mediatorRequest", "memoryUpdates", "engineDefects"] as const;
+const ENVELOPE_OPTIONAL_KEYS = ["mediatorRequest", "memoryUpdates", "engineDefects", "planItems"] as const;
 
 export function parseTurnEnvelope(role: EnvelopeRole, candidates: readonly unknown[], stdout: string): TurnEnvelope {
   const message = () => `에이전트가 결과 봉투를 반환하지 않았습니다.${describeTerminalResult(candidates, stdout)}`;

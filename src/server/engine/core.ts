@@ -204,6 +204,8 @@ export interface EnvelopeNext {
   message?: string;
   changes?: TransitionInput["changes"];
   events?: EnvelopeEvent[];
+  // 전이 사건(state 가 있을 때)의 추가 payload — 전이와 같은 사건에 결속해 남길 기록(계획 항목 영수증 planCoverage 등). transitionWith 의 extras.payload 와 같다.
+  payload?: Record<string, unknown>;
 }
 
 // AgentResult 턴의 옵션(core.turn) — 결과 계약 검사·교정 사다리·새 입력 인터럽트를 지나는 옛 경로다.
@@ -942,6 +944,19 @@ export class EngineCore {
     return null;
   }
 
+  // 직전 검사 결과(check-result 사실)가 같은 입력(payload.planCheckInput)으로 실패했는가 — 그 사이 같은 계열의 다른 결과가 있으면 반복이 아니다. 계획 필수 검사(delivery)와
+  // 계획 항목 보고 교정(delivery·planning)이 같은 판정으로 "같은 조건의 반복은 진척이 아니다" 를 적용한다.
+  // 같은 검사 계열(checkIds 가운데 하나라도 담은 사실)의 마지막 check-result 만 본다 — 항목 검사(plan-items)와 정적 검사(C-ID)의 사실이 섞여도 서로의 반복 판정을
+  // 끊거나 이어 주지 않는다. 같은 계열의 성공 사실(passed, planCheckInput 없음)이 뒤에 남으면 그 다음 첫 실패는 반복이 아니다(Root 인수 검토 3, 2026-10-11).
+  repeatedCheckFailure(topic: Topic, inputKey: string, checkIds: readonly string[]): boolean {
+    const ids = new Set(checkIds);
+    const previous = this.dependencies.database.getScopedTimeline(topic.id, topic.scopeGeneration).findLast((event) => {
+      const fact = event.payload?.workerFact as { kind?: unknown; checks?: Array<{ id?: unknown }> } | undefined;
+      return event.actor === "system" && fact?.kind === "check-result" && (fact.checks ?? []).some((check) => typeof check.id === "string" && ids.has(check.id));
+    });
+    return previous?.payload?.planCheckInput === inputKey;
+  }
+
   // 역할 세션이 아직 받지 않은 새 사실(계약 v3 (2)). since 는 같은 범위 세대·역할·세션의 마지막 봉투 기록이 전달한 지점이다. 그 기록이 없으면 옛 커서
   // (구현 세션의 implementationPromptSequence, 코드 리뷰 세션의 prompt_sequence)를 잇고, 그것도 없거나 세션이 없으면(새 세션) 0 이다. facts 는 since 뒤의
   // 사용자 입력과 workerFact 표식이 있는 system 이벤트, through 는 지금 마지막 sequence 다 — 호출자는 이 값을 recordEnvelope 의 deliveredThrough 로 넘긴다.
@@ -986,7 +1001,9 @@ export class EngineCore {
     const next = record.next ?? {};
     const events: TransitionInput["events"] = [{ actor: route.seat, kind: "agent_output", state: topic.state, body: envelope.message, payload: {
       envelope: { role, outcome: envelope.outcome, ...(envelope.mediatorRequest ? { mediatorRequest: envelope.mediatorRequest } : {}),
-        ...(envelope.engineDefects?.length ? { engineDefects: envelope.engineDefects } : {}) },
+        ...(envelope.engineDefects?.length ? { engineDefects: envelope.engineDefects } : {}),
+        // 항목별 보고·판정 원문 — 영수증(planCoverage)의 출처이자 중재자가 대조할 기록이다(스키마에만 있으면 저장되지 않는다).
+        ...(envelope.planItems ? { planItems: envelope.planItems } : {}) },
       sessionId: record.sessionId, deliveredThrough: record.deliveredThrough, route: routeRecord(route), memoryChanges,
     } }];
     let changes: TransitionInput["changes"] = { ...(next.changes ?? {}) };
@@ -999,7 +1016,8 @@ export class EngineCore {
     } else if (next.state) {
       assertTransition(topic.state, next.state);
       changes = { lastError: null, resumeState: null, ...(next.changes ?? {}), state: next.state };
-      events.push({ actor: "system", kind: "system", state: next.state, body: next.message ?? `${topic.state} → ${next.state}`, payload: { from: topic.state, to: next.state } });
+      events.push({ actor: "system", kind: "system", state: next.state, body: next.message ?? `${topic.state} → ${next.state}`,
+        payload: { from: topic.state, to: next.state, ...(next.payload ?? {}) } });
     } else if (next.message) {
       events.push({ actor: "system", kind: "system", state: topic.state, body: next.message, payload: {} });
     }

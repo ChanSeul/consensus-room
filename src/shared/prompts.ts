@@ -1,4 +1,5 @@
 import type { TimelineEvent } from "./contracts";
+import { PLAN_ITEMS_EXAMPLE, type PlanItemReport } from "./planItems";
 import { TURN_OUTCOMES, WorkerFactSchema, type EnvelopeRole, type WorkerFact } from "./turnContract";
 
 // 어댑터가 매 턴 프롬프트 앞에 붙인다. 개방된 도구의 사용 규칙은 프롬프트가 아니라 sandbox가 강제하지만,
@@ -76,14 +77,16 @@ export interface SourceChangeFact {
 export type CheckFact = Extract<WorkerFact, { kind: "check-result" }>["checks"][number];
 
 export interface RelayFacts {
-  // 상대 역할의 응답 원문 — 엔진은 바꾸지 않고 그대로 싣는다.
-  counterpart?: { role: EnvelopeRole; message: string } | null;
+  // 상대 역할의 응답 원문 — 엔진은 바꾸지 않고 그대로 싣는다. planItems 는 그 봉투의 항목별 보고·판정(id·status·evidence)으로, 있으면 원문 뒤에 그대로 목록으로 싣는다
+  // (host-review F001: 봉투 기록에만 남고 다음 역할이 받지 못하던 결함).
+  counterpart?: { role: EnvelopeRole; message: string; planItems?: PlanItemReport | null } | null;
   // 이 세션이 아직 받지 않은 중재자·사용자 메시지(결정·증거·메모).
   messages?: readonly RelayMessage[];
   sourceChanges?: readonly SourceChangeFact[];
   checks?: readonly CheckFact[];
   // current = 검토·수정 중인 현재 판, approved = 사용자가 승인한 판, reference = ticket 으로 전환된 토픽에 남은 이전 계획(따를 의무 없음).
-  plan?: (PlanBundleFact & { status: "current" | "approved" | "reference" }) | null;
+  // items = 승인 판이 선언한 항목 id(approved 에서만, 본문은 스냅샷 경로에) — 기존 세션에도 매 턴 실려 항목별 보고 의무가 빠지지 않는다.
+  plan?: (PlanBundleFact & { status: "current" | "approved" | "reference"; items?: readonly string[] }) | null;
 }
 
 export interface FirstTurnInput extends RelayFacts {
@@ -106,19 +109,24 @@ function relayRoleGuide(role: EnvelopeRole, planDirectory: string | null | undef
     case "planner":
       if (!planDirectory) throw new Error("planner 첫 턴에는 계획 폴더(planDirectory)가 필요합니다.");
       return `역할: 플래너. 계획을 \`${planDirectory}\` 폴더의 Markdown 파일(기본 plan.md, 필요하면 여러 파일)로 직접 쓰고, 리뷰어 응답을 받으면 같은 파일을 고칩니다. 이 폴더 밖의 파일은 수정하지 않습니다.
+계획에는 구현할 항목 목록을 \`\`\`plan-items 블록(id·requirement·done)으로 선언합니다 — 현재 단계의 범위만, 본문의 요구가 목록에서 빠지지 않게. id 는 개정에서도 같은 요구에 같은 값을 씁니다. 예시:
+${PLAN_ITEMS_EXAMPLE}
 message 는 리뷰어에게 그대로 전달됩니다 — 무엇을 쓰거나 바꿨는지, 리뷰어 응답에 대한 답을 적으세요.
 outcome: ready(리뷰어에게 넘길 준비가 됨) · needs-mediator(중재자·사용자 결정이 있어야 계속할 수 있음 — 물을 내용은 mediatorRequest 에)`;
     case "plan-reviewer":
       return `역할: 계획 리뷰어. 플래너의 계획 파일을 읽고 검토합니다. 파일을 수정하지 않습니다.
+계획 본문의 요구가 \`\`\`plan-items 목록(id·requirement·done)에 빠짐없이 들어갔는지, 각 항목의 완료 조건이 확인 가능한지도 봅니다.
 message 는 플래너에게 그대로 전달됩니다 — 고칠 점과 근거, 또는 동의하는 이유를 적으세요.
 outcome: changes(계획을 고쳐야 함) · agree(이 판의 계획에 동의) · needs-mediator(중재자·사용자 결정이 필요함 — 물을 내용은 mediatorRequest 에)`;
     case "implementer":
       return `역할: 구현자. 작업 폴더에서 과제를 구현하고 필요한 검증을 실행합니다. commit·push 는 하지 않습니다.
 message 는 코드 리뷰어에게 그대로 전달됩니다 — 바꾼 것, 실행한 검증과 결과, 남은 문제를 적으세요.
+승인 계획이 항목(plan-items)을 선언했으면 planItems 에 항목마다 id · status(implemented 또는 not-implemented) · evidence(구현 위치와 실행한 검증 결과)를 적습니다 — 선언한 항목 전부, 빠짐도 추가도 없이. 선언이 없거나 ticket 이면 null 입니다.
 outcome: done(리뷰받을 준비가 됨) · continue(남은 일을 이 세션에서 이어서 함) · needs-mediator(중재자·사용자 결정이나 실행이 필요함 — 필요한 것은 mediatorRequest 에)`;
     case "code-reviewer":
       return `역할: 코드 리뷰어. 작업 폴더의 변경을 검토합니다. 파일을 수정하지 않습니다.
 message 는 구현자에게 그대로 전달됩니다 — 고칠 점과 근거, 또는 승인하는 이유를 적으세요.
+승인 계획이 항목(plan-items)을 선언했으면 planItems 에 항목마다 id · status(satisfied · unimplemented · unverified) · evidence(실제로 확인한 코드·근거)를 구현자 보고와 별개로 독립 판정해 적습니다 — 선언한 항목 전부. approve 는 전 항목 satisfied 일 때만이고, 하나라도 아니면 changes 로 돌려보냅니다. 선언이 없거나 ticket 이면 null 입니다.
 outcome: changes(수정이 필요함) · approve(현재 변경을 승인) · needs-mediator(중재자·사용자 결정이 필요함 — 물을 내용은 mediatorRequest 에)`;
   }
 }
@@ -129,7 +137,10 @@ function relayPlanFact(plan: NonNullable<RelayFacts["plan"]>): string {
     case "current":
       return `계획 버전 ${plan.version}: ${location}${plan.diffPath ? ` · 직전 판 대비 변경분: \`${plan.diffPath}\`` : ""}`;
     case "approved":
-      return `사용자가 승인한 계획(버전 ${plan.version}): ${location} — 구현 범위입니다.`;
+      // 항목 id 만 싣는다(본문은 스냅샷 경로) — 기존 세션도 매 턴 이 줄로 항목별 보고 의무와 형식을 안다.
+      return `사용자가 승인한 계획(버전 ${plan.version}): ${location} — 구현 범위입니다.${plan.items?.length
+        ? `\n승인 계획 항목(${plan.items.length}개): ${plan.items.join(", ")} — planItems 에 항목마다 id·status·evidence 를 적습니다(빠짐·추가 없이). 전 항목이 충족돼야 승인됩니다.`
+        : ""}`;
     case "reference":
       return `참고 자료 — 이전 계획 묶음(따를 의무는 없습니다. 필요할 때만 읽으세요): ${location}`;
   }
@@ -152,6 +163,9 @@ function relayFactSections(facts: RelayFacts): string[] {
   if (facts.counterpart) {
     const name = RELAY_ROLE_NAMES[facts.counterpart.role];
     sections.push(`----- ${name} 응답 원문 시작 -----\n${facts.counterpart.message}\n----- ${name} 응답 원문 끝 -----`);
+    if (facts.counterpart.planItems?.length) {
+      sections.push(`${name}의 항목별 보고·판정(planItems):\n${facts.counterpart.planItems.map((entry) => `- ${entry.id} ${entry.status} — ${entry.evidence}`).join("\n")}`);
+    }
   }
   if (facts.plan) sections.push(relayPlanFact(facts.plan));
   if (facts.messages?.length) {

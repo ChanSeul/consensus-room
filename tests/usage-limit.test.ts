@@ -16,6 +16,11 @@ import { REQUIRED_PLAN_HEADINGS, type AgentResult } from "../src/shared/contract
 import type { TurnEnvelope } from "../src/shared/turnContract";
 import { hashPlan } from "../src/shared/workflow";
 
+// planned 계획 항목 선언(plan-items)과 항목별 보고·판정 — 2026-10-11 계약. 선언 집합과 같아야 구현 완료가 리뷰로, 리뷰 승인이 READY 로 간다.
+const ITEMS_BLOCK = '\n```plan-items\n{"version":1,"items":[{"id":"R-1","requirement":"검증할 내용을 구현한다","done":"리뷰어가 코드로 확인"}]}\n```\n';
+const IMPLEMENTED = [{ id: "R-1", status: "implemented" as const, evidence: "구현 위치와 검증 결과" }];
+const SATISFIED = [{ id: "R-1", status: "satisfied" as const, evidence: "코드로 확인" }];
+
 const temporaryDirectories: string[] = [];
 
 afterEach(() => {
@@ -312,11 +317,11 @@ describe("E3-4c 코드 리뷰 원장과 사용 한도 자동 재시도", () => {
     return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
   }
   const TOLERANCE_BLOCK = '\n\n```tolerance\n{"scopePaths":["**"],"rules":[]}\n```';
-  const validPlan = () => REQUIRED_PLAN_HEADINGS.map((heading) => `## ${heading}\n\n검증할 내용${heading === "허용 오차" ? TOLERANCE_BLOCK : ""}`).join("\n\n");
+  const validPlan = () => REQUIRED_PLAN_HEADINGS.map((heading) => `## ${heading}\n\n검증할 내용${heading === "허용 오차" ? TOLERANCE_BLOCK : ""}`).join("\n\n") + ITEMS_BLOCK;
   const PROCESS = { pid: 123, pgid: 123, executable: "fake", commandLine: "fake", startedAt: "now" };
 
   // 운영 라우팅은 봉투 턴으로 간다(⑥) — 구현·리뷰 가짜는 봉투 메서드로 같은 동작(파일 쓰기, spawn 뒤 사용 한도 실패)을 한다.
-  const implemented: TurnEnvelope = { message: "구현했습니다.", outcome: "done" };
+  const implemented: TurnEnvelope = { message: "구현했습니다.", outcome: "done", planItems: IMPLEMENTED };
   class ImplementingClaude implements AgentAdapter {
     readonly role = "claude" as const;
     calls = 0;
@@ -345,9 +350,9 @@ describe("E3-4c 코드 리뷰 원장과 사용 한도 자동 재시도", () => {
     async resumeTurn(turn: SessionTurn) { return this.review(turn); }
     async createEnvelopeSession(turn: Omit<SessionTurn, "sessionId">) {
       this.review(turn);
-      return { sessionId: "codex-review-session", envelope: { message: "문제 없습니다.", outcome: "approve" } satisfies TurnEnvelope };
+      return { sessionId: "codex-review-session", envelope: { message: "문제 없습니다.", outcome: "approve", planItems: SATISFIED } satisfies TurnEnvelope };
     }
-    async resumeEnvelopeTurn(turn: SessionTurn): Promise<TurnEnvelope> { this.review(turn); return { message: "문제 없습니다.", outcome: "approve" }; }
+    async resumeEnvelopeTurn(turn: SessionTurn): Promise<TurnEnvelope> { this.review(turn); return { message: "문제 없습니다.", outcome: "approve", planItems: SATISFIED }; }
     async validateExistingSession() { return true; }
     private review(turn: Omit<SessionTurn, "sessionId">): AgentResult {
       this.calls.push(turn.job?.operation ?? "");

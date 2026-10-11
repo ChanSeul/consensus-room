@@ -8,8 +8,10 @@ import { buildApp, listenReady } from "../src/server/app";
 import { request as httpRequest } from "node:http";
 import { ProcessSupervisor, systemProcessControl } from "../src/server/processSupervisor";
 import { acquireServerOwnership } from "../src/server/serverOwnership";
+import { ArtifactStore } from "../src/server/artifacts";
 import { ConsensusDatabase } from "../src/server/database";
 import { TopicActivitySchema } from "../src/shared/contracts";
+import { hashPlan } from "../src/shared/workflow";
 import { SpawnCommandRunner } from "../src/server/processRunner";
 import type { AgentAdapter, CommandRunner } from "../src/server/types";
 
@@ -375,8 +377,10 @@ describe("HTTP idempotency", () => {
   });
 
   it("같은 성공 요청 키를 다시 보내면 저장한 응답을 돌려주고 결정 이벤트를 한 번만 기록한다", async () => {
-    const { app, database } = await makeApp();
-    const planSHA256 = "a".repeat(64);
+    const { app, database, root } = await makeApp();
+    // planned 승인 경계는 승인할 판이 항목 목록(plan-items)을 선언한 산출물이어야 받는다(2026-10-11 계약) — 승인할 판을 실제 산출물로 둔다.
+    const plan = '# 계획\n\n```plan-items\n{"version":1,"items":[{"id":"R-1","requirement":"중복 승인 검사","done":"요청 두 번"}]}\n```\n';
+    const planSHA256 = hashPlan(plan);
     database.createTopic({
       workflowMode: "planned",
       id: "topic-1",
@@ -403,6 +407,7 @@ describe("HTTP idempotency", () => {
         acknowledgedPlanSHA256: planSHA256,
       });
     }
+    await new ArtifactStore(join(root, "topics"), database).write("topic-1", "plan", 2, plan);
     const request = {
       method: "POST" as const,
       url: "/api/topics/topic-1/actions/approve",

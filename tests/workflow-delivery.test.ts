@@ -32,6 +32,7 @@ describe("인도 커밋 사슬(C1→C2→C3) — 2026-09-21", { timeout: DELIVER
     writeFileSync(join(ready.worktree, "second.txt"), "둘째 파일\n");
     const reviewed = await ready.gitService.snapshot(ready.worktree);   // 리뷰가 두 파일 변경을 본 상태
     ready.database.updateTopic(ready.topicId, { reviewedHead: reviewed.head, reviewedDiffSHA256: reviewed.diffSHA256 });
+    coverageReceiptEvent(ready.database, ready.topicId);   // 그 리뷰가 남긴 항목 영수증도 같은 검토 트리에 결속된다
     return { ...ready, reviewed };
   }
 
@@ -260,12 +261,12 @@ describe("사후 검증이 거부한 커밋 처분", () => {
     await expect(parentMismatchEngine.commit(topicId, "부모 검증이 실패하는 커밋", ["feature.txt"]))
       .rejects.toThrow("부모가 최종 리뷰 기준과 다릅니다");
 
-    expect(() => engine.close(topicId)).toThrow("전달하지 못한 로컬 커밋");
+    await expect(engine.close(topicId)).rejects.toThrow("전달하지 못한 로컬 커밋");
     expect(database.getTopic(topicId).state).toBe("READY_TO_DELIVER");
 
     await parentMismatchEngine.discardOrphanCommit(topicId);
 
-    expect(engine.close(topicId).state).toBe("CLOSED");
+    expect((await engine.close(topicId)).state).toBe("CLOSED");
     database.close();
   });
 
@@ -302,10 +303,61 @@ describe("사후 검증이 거부한 커밋 처분", () => {
   });
 });
 
+// planned 일반 닫기의 코드 버전 결속(2026-10-11, Root 경계): 항목 영수증은 리뷰 기록(flags)에 결속되므로 리뷰 뒤 바뀐 파일은 영수증 대조만으로는 드러나지 않는다.
+// close 와 묶음 없는 closeStage(API 경로)는 commit 과 같은 리뷰 스냅샷 대조를 지난다 — 커밋·clean 은 요구하지 않고, ticket 은 지나지 않는다.
+describe("planned 일반 닫기의 리뷰 스냅샷 대조 — 2026-10-11", { timeout: DELIVERY_TEST_TIMEOUT_MS }, () => {
+  it("리뷰 뒤 바뀐 작업 트리는 close·closeStage 모두 거부하고, 되돌리면 커밋 없이 닫힌다", async () => {
+    const { database, engine, worktree, topicId } = await setupReadyToDeliver("close-binding");
+    expect((await engine.nextActions(topicId)).find((action) => action.action === "close"))
+      .toEqual({ action: "close", blocker: null, deferredChecks: ["작업 트리가 최종 리뷰 스냅샷과 같은지"] });
+    writeFileSync(join(worktree, "feature.txt"), "리뷰 뒤 바뀐 구현\n");
+    await expect(engine.close(topicId)).rejects.toThrow("최종 리뷰 뒤 worktree가 바뀌었습니다. 다시 리뷰해야 닫을 수 있습니다.");
+    await expect(engine.closeStage(topicId)).rejects.toThrow("다시 리뷰해야 닫을 수 있습니다");
+    expect(database.getTopic(topicId).state).toBe("READY_TO_DELIVER");
+    writeFileSync(join(worktree, "feature.txt"), "리뷰를 통과한 구현\n");
+    expect((await engine.closeStage(topicId)).state).toBe("CLOSED");
+    expect(database.getFlags(topicId).committedOID).toBeNull();
+    database.close();
+  });
+
+  it("확정 커밋 뒤에는 그 커밋이 기준이고, 커밋 뒤 바뀐 파일도 닫기를 막는다", async () => {
+    const { database, engine, worktree, topicId } = await setupReadyToDeliver("close-after-commit");
+    const c1 = await engine.commit(topicId, "C1 소스", ["feature.txt"]);
+    writeFileSync(join(worktree, "feature.txt"), "커밋 뒤 바뀐 구현\n");
+    await expect(engine.close(topicId)).rejects.toThrow("다시 리뷰해야 닫을 수 있습니다");
+    writeFileSync(join(worktree, "feature.txt"), "리뷰를 통과한 구현\n");
+    expect((await engine.close(topicId)).state).toBe("CLOSED");
+    expect(database.getFlags(topicId).committedOID).toBe(c1);
+    database.close();
+  });
+
+  it("ticket 은 리뷰 스냅샷 대조 없이 이전과 같이 닫힌다", async () => {
+    const { database, engine, worktree, topicId } = await setupReadyToDeliver("close-ticket", "ticket");
+    expect((await engine.nextActions(topicId)).find((action) => action.action === "close")).toEqual({ action: "close", blocker: null });
+    writeFileSync(join(worktree, "feature.txt"), "리뷰 뒤 바뀐 구현\n");
+    expect((await engine.closeStage(topicId)).state).toBe("CLOSED");
+    database.close();
+  });
+});
 
 function validPlan(): string {
-  return REQUIRED_PLAN_HEADINGS.map((heading) => `## ${heading}\n\n검증할 내용${heading === "허용 오차" ? TOLERANCE_BLOCK : ""}`).join("\n\n");
+  return REQUIRED_PLAN_HEADINGS.map((heading) => `## ${heading}\n\n검증할 내용${heading === "허용 오차" ? TOLERANCE_BLOCK : ""}`).join("\n\n") + ITEMS_BLOCK;
 }
+// planned 계획 항목 선언(plan-items)과 항목별 보고·판정 — 2026-10-11 계약. 선언 집합과 같아야 구현 완료가 리뷰로, 리뷰 승인이 READY 로 간다.
+const ITEMS_BLOCK = '\n```plan-items\n{"version":1,"items":[{"id":"R-1","requirement":"검증할 내용을 구현한다","done":"리뷰어가 코드로 확인"}]}\n```\n';
+const IMPLEMENTED = [{ id: "R-1", status: "implemented" as const, evidence: "구현 위치와 검증 결과" }];
+const SATISFIED = [{ id: "R-1", status: "satisfied" as const, evidence: "코드로 확인" }];
+
+// planned 전달 경계(commit·push·close)가 요구하는 항목 영수증 — 리뷰가 READY 로 옮기며 남기는 전이 사건과 같은 모양을 지금 승인 판·검토 트리에 결속해 둔다.
+// fixture 가 reviewed* 플래그를 직접 바꾸면(리뷰를 흉내) 그 뒤에 다시 불러 영수증을 그 트리에 맞춘다.
+function coverageReceiptEvent(database: ConsensusDatabase, topicId: string): void {
+  const topic = database.getTopic(topicId), flags = database.getFlags(topicId);
+  database.appendEvent({ topicId, actor: "system", kind: "system", state: "READY_TO_DELIVER", body: "코드 리뷰가 현재 작업 트리를 승인했습니다.", payload: {
+    from: "CODEX_REVIEW", to: "READY_TO_DELIVER", planCoverage: { planSHA256: topic.approvedPlanSHA256, scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch,
+      reviewedHead: flags.reviewedHead, reviewedDiffSHA256: flags.reviewedDiffSHA256, reviewedTreeOID: flags.reviewedTreeOID ?? null,
+      reviewSessionId: "codex-review", reviewLedgerId: "ledger-fixture", items: SATISFIED, recordedAt: "2026-10-11T00:00:00.000Z" } } });
+}
+
 
 // 허용 오차 블록은 계획 필수 요소다 — 범위 전체를 승인 경로로 두고 규칙 없음.
 const TOLERANCE_BLOCK = '\n\n```tolerance\n{"scopePaths":["**"],"rules":[]}\n```';
@@ -338,7 +390,7 @@ function idleAdapter(role: "claude" | "codex"): AgentAdapter {
   };
 }
 
-async function setupReadyToDeliver(label: string) {
+async function setupReadyToDeliver(label: string, mode: "planned" | "ticket" = "planned") {
   const root = mkdtempSync(join(tmpdir(), `consensus-room-${label}-`));
   temporaryDirectories.push(root);
   const repository = join(root, "repository");
@@ -376,7 +428,7 @@ async function setupReadyToDeliver(label: string) {
     worktreePath: worktree,
     branchName,
     state: "READY_TO_DELIVER",
-    workflowMode: "planned",
+    workflowMode: mode,
     scopeGeneration: 1,
     planRevision: 2,
     planSHA256,
@@ -390,6 +442,7 @@ async function setupReadyToDeliver(label: string) {
   database.updateTopic(topicId, {
     reviewedHead: reviewed.head, reviewedDiffSHA256: reviewed.diffSHA256,
   });
+  if (mode === "planned") coverageReceiptEvent(database, topicId);
   const dependencies = {
     database, artifacts, claude: idleAdapter("claude"), codex: idleAdapter("codex"),
   };
@@ -456,7 +509,7 @@ it("closing after a failed commit freezes the latest evidence, not the failed at
     const spy=vi.spyOn(gitService,"commit").mockRejectedValue(new Error("Git failed"));
     try {await expect(engine.commit(topicId,"feature",["feature.txt"])).rejects.toThrow("Git failed");} finally {spy.mockRestore();}
     ingest("v2");const latest=database.evidence.topic(topic);
-    engine.close(topicId);
+    await engine.close(topicId);
     expect(database.getTopic(topicId).state).toBe("CLOSED");
     expect(database.getFlags(topicId).committedOID).toBeNull();
     expect(database.evidence.topic(database.getTopic(topicId))).toMatchObject({digest:latest.digest,ready:true});
