@@ -76,7 +76,7 @@ def main():
     c.setTitle('Consensus Room | AI 개발 작업 관리')
     c.setAuthor('조찬슬')
     c.setCreator('Consensus Room vector portfolio renderer')
-    c.setSubject('계획·검토 병목과 시행착오·같은 세션의 원문 왕복·실행과 판단의 분리 | 2026-10-11')
+    c.setSubject('계획 합의 자동화 / 플랜모드와 티켓모드 / Swift 6 적용 사례 | 2026-10-11')
     c.setKeywords('Consensus Room, Claude, Codex, 워크플로, 계층 계약, 복구, 시각화')
     counts = []
 
@@ -227,7 +227,7 @@ def main():
                 y += text(paragraph,MARGIN,y,CW,10.8,max_h=766-y) + 9
             y += 7
         text(spec.get('source',''),MARGIN,776,CW,6.8,ink=MUTED,max_h=22)
-        text('조찬슬  ·  2026.10.11',MARGIN,815,CW-60,7,ink=MUTED,max_h=12)
+        text('조찬슬  /  2026.10.11',MARGIN,815,CW-60,7,ink=MUTED,max_h=12)
         text(f'{index} / {len(specs)}',W-MARGIN-60,815,60,7,ink=MUTED,align=2,max_h=12)
         counts.append(len(spec['elements'])+len(spec.get('graph',{}).get('nodes',[])));c.showPage()
     c.save();temporary.replace(args.output)
