@@ -64,6 +64,10 @@ export function buildSessionGraph(db: ConsensusDatabase, topicId: string, host: 
     for (const seat of routing.sessions) {
       const discussion = topic.state.startsWith("BRAINSTORM");
       const sid = sessionId(seat.sessionId);
+      if (topic.workflowMode === "ticket" && (seat.seat === "author" || seat.seat === "plan-review")) {
+        if (sid) session(sid, seatRole[seat.seat], seat.binding?.provider ?? null, true);
+        continue;
+      }
       if (topic.topicKind === "group" && !discussion && !sid) continue;
       if (topic.topicKind === "group" && discussion && ["implementation", "code-review"].includes(seat.seat) && !sid) continue;
       const role = seatRole[seat.seat], node = session(sid, role, seat.binding?.provider ?? null, topic.topicKind === "group" && !discussion); current[role] = node;

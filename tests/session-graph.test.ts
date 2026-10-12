@@ -25,6 +25,38 @@ function fixture() {
   const graph = (id: string) => buildSessionGraph(db,id,{nodes:[],edges:[],warning:"Host-review 미연결"});
   return {db,topic,graph,root,path};
 }
+it.each(["ticket", "planned"] as const)("shows only applicable current workflow roles in %s mode", mode => {
+  const f = fixture();
+  f.topic("t");
+  f.db.updateTopic("t", { workflowMode: mode, state: "IMPLEMENTING", implementationSessionId: "work" });
+  const graph = f.graph("t");
+  const current = graph.nodes.filter(node => node.kind === "session" && !node.historical && node.lane === "t");
+  const roles = mode === "ticket"
+    ? ["mediator", "runner", "reviewer", "verifier"]
+    : ["mediator", "planner", "plan-reviewer", "runner", "reviewer", "verifier"];
+  expect(current.map(node => node.role).sort()).toEqual([...roles].sort());
+  const flow = graph.edges.filter(edge => edge.kind === "flow");
+  const path = ["topic:t", ...roles.map(role => current.find(node => node.role === role)!.id)];
+  expect(flow.map(edge => [edge.from, edge.to])).toEqual(path.slice(1).map((id, index) => [path[index], id]));
+  expect(current.find(node => node.role === "runner")?.sessionId).toBe("work");
+});
+
+it("keeps previous planning sessions as history outside the ticket flow", () => {
+  const f = fixture();
+  f.topic("t");
+  for (const role of ["claude", "codex"] as const) f.db.upsertParticipant("t", {
+    role, sessionId: `previous-${role}`, mode: "attached", acknowledgedPlanSHA256: null,
+  });
+  f.db.updateTopic("t", { workflowMode: "ticket", state: "IMPLEMENTING" });
+  const graph = f.graph("t");
+  for (const role of ["planner", "plan-reviewer"]) {
+    const node = graph.nodes.find(node => node.role === role)!;
+    expect(node).toMatchObject({ historical: true, sessionId: expect.stringContaining("previous-") });
+    expect(node.settingsTargets).toBeUndefined();
+    expect(graph.edges.some(edge => edge.kind === "flow" && (edge.from === node.id || edge.to === node.id))).toBe(false);
+  }
+});
+
 it("retains sessions from the stored previous recovery lineage without timeline events", () => {
   const f=fixture();f.topic("t");f.topic("outside");
   const old=f.db.planning.recoveryLineage("t","implementer",{kind:"approval",revision:1,sha256:"old"});
