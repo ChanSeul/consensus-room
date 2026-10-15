@@ -10,7 +10,7 @@ import {
   DEFAULT_AGENT_SETTINGS,
   type AgentResult,
 } from "../../shared/contracts.js";
-import { executionPolicyNote } from "../../shared/prompts.js";
+import { EXECUTION_POLICY_NOTE } from "../../shared/prompts.js";
 import { readAppliedInstructions } from "../projectInstructions.js";
 import type { AgentAdapter, CommandRunner, CreatedSession, OutputSchema, SessionTurn } from "../types.js";
 import { defaultDataDirectory } from "../config.js";
@@ -20,6 +20,7 @@ import { agentRunError, parseAgentResult, parseStructuredResult, parseTurnEnvelo
 import { codexHomeUsage, ExecutionMetrics } from "./executionMetrics.js";
 import { createToolTimeMeter } from "./toolTime.js";
 import { resolveSupportedTurn, runnerControlPaths, type TurnPolicy } from "./turnPolicy.js";
+import { TOOL_TREE_RUNNER_NOTE } from "../toolTree.js";
 import { nativeFigma, NATIVE_FIGMA_READS } from "./nativeFigma.js";
 import { resolveHostExecutable } from "../hostRuntime.js";
 import { reportBackgroundFailure } from "../backgroundTask.js";
@@ -364,7 +365,7 @@ export class CodexAdapter implements AgentAdapter {
       // 않았다 — 엔진이 그 세션의 첫 일반 resume 에 memoryBodies 를 실으면 그 resume 에 한 번 싣는다(매니페스트 없이).
       const injectMemory = Boolean(this.memory) && !protocolOnly && (newSession || turn.memoryBodies === true);
       const enriched = injectMemory
-        ? await this.memory!.buildPrompt(turn.prompt, this.role, turn.signal, turnContract(job).memoryUpdates)
+        ? await this.memory!.buildPrompt(turn.prompt, this.role, turn.signal, turnContract(job).memoryUpdates, turn.memorySearch)
         : await this.withMemoryManifest(turn, protocolOnly);
       // 프로토콜 확인 턴은 판단에 필요한 값을 프롬프트가 다 담고 있어 프로젝트 지시문(AGENTS.md)도 싣지 않는다
       // (2026-09-07 Codex 자기 최적화 제안 ②: ACK 턴마다 지시문 블록을 재전송하던 낭비).
@@ -377,11 +378,12 @@ export class CodexAdapter implements AgentAdapter {
           injectWorkspaceFile: true,
         });
       // Config instructions are session context, not another user message on every resume.
-      // Protocol-only turns carry the policy note in their input instead.
-      const systemInstructions = protocolOnly ? "" : [executionPolicyNote(turn.engineDefectFix), ...instructions].join("\n\n");
+      // Protocol-only turns carry the policy note in their input instead. Write turns, whose tool trees are write-denied
+      // (managedConfigBody runnerControlPaths), also carry the protected tool-tree note.
+      const systemInstructions = protocolOnly ? "" : [EXECUTION_POLICY_NOTE, ...(policy.tools === "write" ? [TOOL_TREE_RUNNER_NOTE] : []), ...instructions].join("\n\n");
       if (!protocolOnly) commandArgs = ["-c", `developer_instructions=${tomlString(systemInstructions)}`, ...commandArgs];
       const instructionBytes = Buffer.byteLength(systemInstructions, "utf8");
-      const stdin = protocolOnly ? [executionPolicyNote(turn.engineDefectFix), ...instructions, enriched].join("\n\n") : enriched;
+      const stdin = protocolOnly ? [EXECUTION_POLICY_NOTE, ...instructions, enriched].join("\n\n") : enriched;
       if (!policy.figma) return await this.run(turn, codex, commandArgs, newSession, topicHome, stdin, this.codexHome, turnEnvironment, instructionBytes);
       const figma = await nativeFigma(codex, join(this.codexHome, "auth.json"), turn.cwd, turn);
       try {
@@ -506,7 +508,8 @@ export class CodexAdapter implements AgentAdapter {
     protocolOnly: boolean,
   ): Promise<string> {
     if (!this.memory || protocolOnly) return turn.prompt;
-    const manifest = await this.memory.buildManifest(turn.prompt, this.role, turn.signal, turnContract(resolveSupportedTurn("codex", turn).job).memoryUpdates);
+    const manifest = await this.memory.buildManifest(turn.prompt, this.role, turn.signal,
+      turnContract(resolveSupportedTurn("codex", turn).job).memoryUpdates, turn.memorySearch);
     return manifest ? `${turn.prompt}\n\n${manifest}` : turn.prompt;
   }
 

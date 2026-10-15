@@ -177,6 +177,29 @@ function fixture() {
   return {db,topic};
 }
 const input = (url: string, scope: EvidenceRootInput["scope"] = "group"): EvidenceRootInput => ({url,label:url,scope,required:true,mode:"rest",intervalSeconds:900});
+// 2026-10-15: one poll parsed the whole work_groups table once per topic per root (context() inside affected()), so the
+// server's main thread was intermittently unresponsive. A synchronous read computation now parses it once; separate calls
+// still read the current table.
+it("one due()/affected() computation reads work_groups once, and the next call sees a changed group", () => {
+  const {db,topic}=fixture(),catalog=db.evidence.catalog;
+  const root=catalog.add("a",input("https://team.atlassian.net/browse/APP-1"),true);
+  const sqlite=(catalog as unknown as {db:{prepare:(sql:string)=>{all:(...args:unknown[])=>unknown[]}}}).db;
+  const prepare=sqlite.prepare.bind(sqlite); let reads=0;
+  vi.spyOn(sqlite,"prepare").mockImplementation((sql:string)=>{
+    const statement=prepare(sql);
+    if (!/FROM work_groups/.test(sql)) return statement;
+    const all=statement.all.bind(statement);
+    return Object.assign(statement,{all:(...args:unknown[])=>{reads++;return all(...args);}});
+  });
+  const counted=<T,>(run:()=>T)=>{reads=0;const value=run();return {value,reads};};
+  expect(counted(()=>catalog.due().map(r=>r.id))).toEqual({value:[root.id],reads:1});
+  expect(counted(()=>catalog.affected(root))).toEqual({value:["a","closed"],reads:1});
+  topic("next"); db.workGroups.link("g-a","later","next","a".repeat(40));
+  expect(counted(()=>catalog.affected(root))).toEqual({value:["a","closed","next"],reads:1});
+  expect(counted(()=>catalog.managed(root.sourceId))).toEqual({value:true,reads:1});
+  // Outside a computation every context() reads the table, as before.
+  expect(counted(()=>{catalog.context("a");catalog.context("a");}).reads).toBe(2);
+});
 it("a scoped stage preserves expired selected originals while its mediator still requires freshness", async () => {
   // Group revision/link -> catalog -> actual mediator packet/readiness. Restore the old inheritance to see RED.
   // Live OAuth and Figma pixels are not proved by these captured source fixtures.

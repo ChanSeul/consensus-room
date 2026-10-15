@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { nativeApps } from "../adapters/nativeApps.js";
+import { AppCallTimeout, AppConnectionReset, nativeApps } from "../adapters/nativeApps.js";
 import { resolveHostExecutable } from "../hostRuntime.js";
 import { EvidenceFetchError } from "./connectors.js";
 
@@ -126,12 +126,17 @@ export class NativeAppReader implements AppReader {
     if (flight) this.metric(provider, "identityReuse", 1);
     else {
       flight = (async () => {
-        let account = state.config.googleDriveLinkId;
+        let raw: unknown;
         if (provider !== "sheets") {
           this.metric(provider, "identityCalls", 1); onCall();
-          account = identityAccount(await this.call(provider, identityTool(provider), {}, signal));
+          raw = await this.call(provider, identityTool(provider), {}, signal);
         }
-        const identity = { account: checkAccount(provider, account, state.config), config: state.config, generation };
+        // Only an account that cannot be confirmed or differs from the pinned one invalidates the identity. A failed
+        // identity call already did what call() decides for its connection.
+        let account: string;
+        try { account = checkAccount(provider, provider === "sheets" ? state.config.googleDriveLinkId : identityAccount(raw), state.config); }
+        catch (error) { this.invalidateIdentity(provider); throw error; }
+        const identity = { account, config: state.config, generation };
         await this.validateIdentity(provider, identity, signal);
         // The bridge has no verified account-change notification, so account pins alone cannot enable a cross-page cache.
         if (provider === "sheets") this.cached.set(provider, identity);
@@ -141,8 +146,7 @@ export class NativeAppReader implements AppReader {
       const current = flight;
       void flight.finally(() => { if (this.identities.get(provider) === current) this.identities.delete(provider); }).catch(() => {});
     }
-    try { const result = await flight; await this.validateIdentity(provider, result, signal); return result; }
-    catch (error) { this.invalidateIdentity(provider); throw error; }
+    const result = await flight; await this.validateIdentity(provider, result, signal); return result;
   }
   async validateIdentity(provider: AppProvider, identity: ReaderIdentity, signal: AbortSignal): Promise<void> {
     const state = await this.state(); signal.throwIfAborted();
@@ -161,8 +165,9 @@ export class NativeAppReader implements AppReader {
         .then(codex => nativeApps(codex.realPath, this.authPath, this.directory, { [app.id]: [...app.names] }, this.controller.signal));
       this.clients.set(provider, client);
     }
+    let connection: Awaited<typeof client> | undefined;
     try {
-      const connection = await client;
+      connection = await client;
       signal.throwIfAborted();
       const result = await connection.call(name, args);
       signal.throwIfAborted();
@@ -171,9 +176,25 @@ export class NativeAppReader implements AppReader {
       if (result?.isError) throw new EvidenceFetchError("MCP 원문 조회 실패: " + name + ". 앱 연결과 읽기 권한을 확인하세요.");
       return result;
     } catch (error) {
-      this.invalidateIdentity(provider);
-      if (this.clients.get(provider) === client) this.clients.delete(provider);
-      await client.then(value => value.close(), () => undefined);
+      // Only the call whose connection is still the cached one decides about that connection. A call that ended with a
+      // connection already replaced or reset — its own late failure, or one stopped together with it — changes nothing,
+      // so it can never drop a newer connection or the identity verified through it.
+      if (this.clients.get(provider) === client) {
+        if (!connection || connection.closed) {
+          // Never opened, or ended on its own: replace it, and the identity verified through it goes with it.
+          this.clients.delete(provider);
+          this.invalidateIdentity(provider);
+          await client.then(value => value.close(), () => undefined);
+        } else if (error instanceof AppCallTimeout) {
+          // An unanswered request may mean a stuck app server: the next call opens a new connection. This call is not
+          // retried, and the account is unchanged, so the identity stays (it is checked again on the next page).
+          this.clients.delete(provider);
+          await connection.close(new AppConnectionReset("응답 시간 초과로 연결을 재설정하면서 중단됐습니다."));
+        }
+      }
+      // A tool error, an error reply, a cancellation or a generation change seen by this call fails this read only: the
+      // shared connection and the identity other reads verified through it stay. Invalidating here failed every
+      // concurrent read of the provider as an account change (2026-10-15 diagnosis).
       throw error;
     }
   }

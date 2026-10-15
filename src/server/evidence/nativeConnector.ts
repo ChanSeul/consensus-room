@@ -142,7 +142,10 @@ export class NativeEvidenceConnector implements EvidenceConnector {
           if (typeof updated !== "string") throw new EvidenceFetchError("Jira 이슈 버전을 확인하지 못했습니다.");
           const links = [...(issue.fields?.subtasks ?? issue.subtasks ?? []), ...(issue.fields?.issuelinks ?? issue.links ?? []).flatMap((l: Data) => [l.inwardIssue, l.outwardIssue].filter(Boolean))]
             .filter((item: Data) => /^[A-Z][A-Z0-9_]*-\d+$/.test(item.key)).map((item: Data) => ({ url: `https://${site}/browse/${item.key}`, label: item.key, unitId: key, relation: "child" as const }));
-          return page([unit(key, "issue", normalized(issue))], { phase: "comments", start: 0, updated }, links);
+          // fields.lastViewed is when the reading account last opened the issue, not issue content: viewing alone changed
+          // the hash. Only that field goes; development and other fields stay, and other keys of that name are content.
+          const { lastViewed: _viewed, ...fields } = issue.fields ?? {};
+          return page([unit(key, "issue", normalized(issue.fields ? { ...issue, fields } : issue))], { phase: "comments", start: 0, updated }, links);
         }
         if (cursor.phase === "comments") {
           const data = await read("listJiraIssueComments", { issueIdOrKey: key, startAt: cursor.start, maxResults: 20, orderBy: "created", responseContentFormat: "html" });

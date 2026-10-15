@@ -184,7 +184,7 @@ it("scope change discards a late discussion answer and starts a fresh discussion
   const f = await fixture(async (_turn, index) => { if (index === 1) { entered.resolve(); return release.promise; } return reply("새 범위의 의견"); });
   cleanups.push(async () => release.resolve(reply()));
   await f.action("brainstorm"); await entered.promise;
-  const changing = f.post(`/api/topics/${f.id}/messages`, { kind: "scope_change", body: "텍스트 저장과 검색만 비교합니다." });
+  const changing = f.post(`/api/topics/${f.id}/messages`, { kind: "scope_change", body: "텍스트 저장과 검색만 비교합니다.", confirmScopeGenerationBump: true, expectedScopeGeneration: 1 });
   release.resolve(reply("OLD SCOPE"));
   expect((await changing).statusCode).toBe(200); await f.done();
   expect(f.database.getTopic(f.id)).toMatchObject({ state: "BRAINSTORM_READY", scopeGeneration: 2, planSHA256: null });

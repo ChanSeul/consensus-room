@@ -13,7 +13,7 @@ export const REVIEW_DECISION_BATCH_LIMIT = 200;
 export const REVIEW_ANSWER_BATCH_LIMIT = 100;
 
 // 서버 계약과 CLI 출력 스키마가 같이 읽는 한도(R4) — 서버만 거부하는 한도는 모델이 볼 수 없어 CLI 는 받고 서버 파서만 응답 전체를 버렸다
-// (2026-10-07 1fd0cc86 seq 360: 근거 검토의 remainingSteps 항목 505자). 문자열 길이는 JSON Schema 처럼 코드 포인트로 세는 상한(textLimits.ts maxCharacters)을
+// (2026-10-07 example-topic seq 360: 근거 검토의 remainingSteps 항목 505자). 문자열 길이는 JSON Schema 처럼 코드 포인트로 세는 상한(textLimits.ts maxCharacters)을
 // 두고 CLI 스키마가 characterLimit 로 읽는다.
 // 계획·파일·메모리에 그대로 적용되는 값(planEdits[], planLineEdits, memoryUpdates[], PlanRepair edits)에는 현재 상태와 대조되는 해시 패턴만 싣고,
 // 개수·길이·최솟값 한도는 서버에만 둔다 — Codex 는 구조화 출력 한도를 생성 단계에서 값을 바꿔 맞추므로(잘라 내거나 지어냄), 거부될 응답이
@@ -441,14 +441,36 @@ export const ToolTreeRebaselineInputSchema = ReasonInputSchema.extend({
   maintenanceLock: z.object({ pid: z.number().int().positive(), at: z.string().min(1) }).optional(),
 });
 export type ToolTreeRebaselineInput = z.infer<typeof ToolTreeRebaselineInputSchema>;
+// 구현 기준 채택(중재자, 서버 밖 커밋 확인 뒤) — 재시도는 외부 커밋을 기준으로 승격하지 않는다(감사 ⑥). 중재자가 확인한 커밋(지금 HEAD 의 40자 SHA)을
+// 이 명시 동작으로만 구현 기준으로 삼는다(F04 tool-tree-rebaseline 과 같은 모양, server/workflow.ts rebaselineImplementation).
+export const ImplementationRebaselineInputSchema = ReasonInputSchema.extend({
+  head: z.string().regex(/^[0-9a-f]{40}$/, "head 는 확인한 커밋의 40자 SHA 입니다."),
+});
+export type ImplementationRebaselineInput = z.infer<typeof ImplementationRebaselineInputSchema>;
+// 계획 왕복 1회 보류(자문 17, 사용자 결정 2026-10-15) — 중재자가 미리 거는 명시 제어. 요청은 지금 범위 세대·계획 epoch 에 결속하고(다르면 409), 엔진은
+// 다음 계획 왕복 경계에서 결과를 저장한 뒤 다음 모델 턴 전에 한 번 멈춘다(server/engine/planning.ts requestHold).
+export const PlanningHoldInputSchema = ReasonInputSchema.extend({
+  expectedScopeGeneration: z.number().int().positive(),
+  expectedPlanEpoch: z.number().int().positive(),
+});
+export type PlanningHoldInput = z.infer<typeof PlanningHoldInputSchema>;
 // 한 번 응답이 나열할 수 있는 해소 요청 id 상한(JSON 스키마 maxItems·파서 검사). 저장 계약(AgentResultSchema)에는 상한이 없다 — 교정 병합이
 // 원본과 교정의 id 를 합치면 응답 한도를 넘을 수 있고, 그 병합본을 다시 파싱하는 core 가 거부하면 교정 전체가 죽는다(host-review R02; F10 과 같은 분리).
 export const RESPONSE_RESOLVED_IDS_LIMIT = 100;
 
-export const PostMessageInputSchema = z.object({
-  kind: z.enum(["note", "scope_change", "evidence", "decision"]),
-  body: z.string().trim().min(1).max(50_000),
+// 범위 변경은 계획·승인·브랜치·구현 기준·리뷰 결속·두 세션을 되돌릴 수 없이 초기화한다. kind 하나만 틀려도 그 경로에 닿았으므로(2026-10-13
+// example-topic — 결정을 scope_change 로 보내 READY_TO_DELIVER gen 1 이 DRAFT gen 2 로 초기화됐다) 명시적 초기화 확인과 지금 세대를 함께 요구한다.
+// 서버(handleScopeChange)는 부작용 전에 같은 두 값을 다시 검사한다 — 세대가 다르면 409 SCOPE_GENERATION_MISMATCH.
+const ScopeChangeConfirmationSchema = z.object({
+  confirmScopeGenerationBump: z.literal(true, "scope_change 는 범위 세대 초기화 확인(confirmScopeGenerationBump: true)이 필요합니다."),
+  expectedScopeGeneration: z.number().int().positive(),
 });
+export type ScopeChangeConfirmation = z.infer<typeof ScopeChangeConfirmationSchema>;
+const MessageBodySchema = z.string().trim().min(1).max(50_000);
+export const PostMessageInputSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.enum(["note", "evidence", "decision"]), body: MessageBodySchema }),
+  ScopeChangeConfirmationSchema.extend({ kind: z.literal("scope_change"), body: MessageBodySchema }),
+]);
 export type PostMessageInput = z.infer<typeof PostMessageInputSchema>;
 
 export const ApprovalInputSchema = z.object({

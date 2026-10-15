@@ -79,6 +79,9 @@ export const WorkGroupInputSchema = z
     budgetPolicy: BudgetPolicySchema.optional(),
     // 선택 필드다(과거 레코드·기존 호출의 입력 형식 유지). 없으면 빈 목록으로 읽는다.
     questions: z.array(WorkQuestionSchema).max(100).optional(),
+    // 전달 브랜치(사용자 결정 1a, 2026-10-15) — 묶음 결과를 보낼 브랜치의 표시다. 강제가 아니다: 착수·전이·push 를 막거나 바꾸지 않고, 단계 문맥
+    // (buildStageContext)에도 들지 않는다. 전달 관측 기록(POST /api/work-groups/:id/delivery-observation)이 이 값을 쓴다. 없으면 지금 동작과 같다.
+    deliveryBranch: BranchNameSchema.optional(),
   })
   .strict()
   .superRefine((g, ctx) => {
@@ -199,6 +202,29 @@ export interface StageResult {
   closedAt: string;
   legacy?: boolean;
 }
+// 전달 관측 요청(사용자 결정 1a) — 통합 결과 커밋이 로컬에 있는 원격 추적 ref(refs/remotes/<remote>/<branch>)에 들어 있는지 본다. 엔진은 fetch 하지
+// 않는다 — 원격 최신화는 중재자가 기록 전에 한다. branch 는 묶음의 deliveryBranch 가 없을 때만 받는다(있으면 같은 값만).
+export const DeliveryObservationInputSchema = z
+  .object({
+    remote: BranchNameSchema.max(100).refine(value => !value.includes("/"), "원격 이름에는 슬래시를 쓸 수 없습니다.").optional(),
+    branch: BranchNameSchema.optional(),
+  })
+  .strict();
+export type DeliveryObservationInput = z.infer<typeof DeliveryObservationInputSchema>;
+// 전달 관측 기록 — "로컬 원격 추적 ref 를 관측한 SHA 와 그 시점의 포함 여부"다. 원격의 최신 상태를 증명하지 않는다(관측 전에 fetch 했는지는 엔진이
+// 모른다). 포함·미포함·ref 없음(observedSha null) 모두 남기고, 묶음·단계 상태·묶음 전달 판정(delivered)·인계 인터럽트는 바꾸지 않는다.
+export interface DeliveryObservation {
+  remote: string;
+  branch: string;
+  observedRef: string;
+  observedSha: string | null;
+  // 관측한 통합 단계 결과 커밋(results[통합 단계].commitOID).
+  resultSha: string;
+  contains: boolean;
+  observedAt: string;
+  origin: "user" | "mediator";
+  requestKey: string;
+}
 // 묶음 밖 선행 작업의 동결 기록(생성 때 한 번) — 검증한 범위 세대·전달 커밋과 그때의 보류 원장. 뒤에 선행 토픽이 범위를 바꾸거나 다시 커밋해도
 // 이 기록은 바뀌지 않는다(묶음 기준 커밋이 그대로이므로 승계 근거도 그대로다).
 export interface ExternalPredecessor {
@@ -237,6 +263,8 @@ export interface WorkGroup extends WorkGroupInput {
   revisions?: WorkGroupRevision[];
   retiredStageIds?: string[];
   results?: Record<string, StageResult>;
+  // 전달 관측 기록(덧붙이기만 한다 — 미포함에서 포함으로 바뀐 이력을 남긴다). 개정이 아니라서 version 을 올리지 않는다.
+  deliveryObservations?: DeliveryObservation[];
 }
 // 목록 API 가 붙이는 파생 상태(저장하지 않는다).
 export interface WorkGroupView extends WorkGroup {

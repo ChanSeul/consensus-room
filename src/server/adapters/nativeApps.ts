@@ -7,6 +7,12 @@ import { createTailBuffer } from "../processRunner.js";
 import { redactSecrets } from "../../shared/workflow.js";
 const LIMIT = 32 * 1024 * 1024;
 
+// A request the app server did not answer in time. Only that request is rejected here; the owner of the connection decides
+// whether to replace it (NativeAppReader does, without retrying the request).
+export class AppCallTimeout extends Error {}
+// The reason a connection's owner stops it while other requests are still waiting, so those callers see why they ended.
+export class AppConnectionReset extends Error {}
+
 // Transport only: callers cannot start a model turn or invoke unlisted tools.
 export async function nativeApps(command: string, authPath: string, cwd: string,
   apps: Record<string, readonly string[]>, signal?: AbortSignal) {
@@ -83,16 +89,18 @@ export async function nativeApps(command: string, authPath: string, cwd: string,
     if (ended || failure || signal?.aborted) { reject(failure ?? Error("앱 연결이 종료됐습니다.")); return; }
     if (!child.stdin) { child.once("error", reject); return; }
     const id = ++sequence;
-    const timer = setTimeout(() => { calls.delete(id); reject(Error("앱 연결 응답 시간이 지났습니다.")); }, 120_000);
+    const timer = setTimeout(() => { calls.delete(id); reject(new AppCallTimeout("앱 연결 응답 시간이 지났습니다.")); }, 120_000);
     calls.set(id, { resolve, reject, timer });
     child.stdin!.write(JSON.stringify({ id, method, params }) + "\n", error => {
       if (error) { calls.delete(id); clearTimeout(timer); reject(error); }
     });
   });
   let stopping: Promise<void> | undefined;
-  const stop = () => stopping ??= (async () => {
+  // reason: why the requests still waiting end (default: the connection ended). A stopped connection takes no new request.
+  const stop = (reason?: Error) => stopping ??= (async () => {
+    failure ??= reason ?? Error("앱 연결이 종료됐습니다.");
     signal?.removeEventListener("abort", abort);
-    child.stdout?.removeListener("data", onData); rejectCalls();
+    child.stdout?.removeListener("data", onData); rejectCalls(failure as Error);
     if (child.pid && !ended) {
       await new Promise<void>(resolve => {
         const timer = setTimeout(() => { try { process.kill(-child.pid!, "SIGKILL"); } catch { /* already exited */ } }, 2000);
@@ -119,7 +127,11 @@ export async function nativeApps(command: string, authPath: string, cwd: string,
       const tool = available[name];
       return tool?.annotations?.readOnlyHint === true ? [{ ...tool, name }] : [];
     });
-    return { tools, async call(name: string, args: Record<string, unknown>) {
+    return { tools,
+      // Gone for every caller: the process or its transport ended, or the connection was stopped. A timed-out request or
+      // an error reply rejects only that request and leaves this false.
+      get closed() { return ended || failure !== undefined || stopping !== undefined; },
+      async call(name: string, args: Record<string, unknown>) {
       if (!tools.some(tool => tool.name === name)) throw Error("허용된 읽기 도구가 없습니다: " + name);
       if (failure) throw failure;
       return rpc("mcpServer/tool/call", { threadId: thread.id, server: "codex_apps", tool: name, arguments: args });

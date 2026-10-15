@@ -314,6 +314,17 @@ export class GitService {
     )).stdout.split("\0").filter(Boolean).sort();
   }
 
+  // 로컬 ref 를 커밋 OID 로 읽는다 — 없으면 null(작업 묶음 전달 관측, 사용자 결정 1a). 원격에 묻지 않는다(fetch·ls-remote 없음): 원격 추적 ref 는
+  // 마지막 fetch 때의 값이다. 종료 코드 1 은 "ref 없음", 그 밖의 실패는 판정할 수 없으므로 던진다.
+  async localRefOID(repositoryPath: string, ref: string): Promise<string | null> {
+    const result = await this.execute({
+      command: "git", args: ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], cwd: repositoryPath, maxOutputBytes: 64 * 1024,
+    });
+    if (result.exitCode === 0) return result.stdout.trim();
+    if (result.exitCode === 1) return null;
+    throw new Error(`git rev-parse 실패: ${result.stderr || result.stdout}`);
+  }
+
   async remoteBranchOID(worktreePath: string, branchName: string): Promise<string | null> {
     const result = await this.run(worktreePath, ["ls-remote", "--heads", "origin", `refs/heads/${branchName}`]);
     const oid = result.stdout.trim().split(/\s+/, 1)[0];

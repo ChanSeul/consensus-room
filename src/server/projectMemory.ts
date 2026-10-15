@@ -4,11 +4,13 @@ import { isAbsolute, normalize, relative, resolve, sep } from "node:path";
 
 import { redactSecrets } from "../shared/workflow.js";
 import type { ParticipantRole } from "./types.js";
-import { memoryRelevance } from "./memoryRetrieval.js";
+import { memoryRelevance, memorySearch, type MemorySearchInput } from "./memoryRetrieval.js";
 import { wikiEvidenceNotice, type MemoryReaderOptions } from "./wikiEvidence.js";
 export type { MemoryReaderOptions, MemoryEvidenceDependency, MemoryEvidenceStatus } from "./wikiEvidence.js";
 
 const ROUTER_FILE = "context-router.md";
+// 라우터·MEMORY.md 의 이 절에 링크된 문서가 기능 위키다(자문 7) — 검색 주제가 그 기능이면 일반 문서의 부수적 단어 점수와 경쟁하지 않고 먼저 고른다.
+const FEATURE_WIKI_SECTION = "기능별 위키 안내";
 const MAX_ROUTED_DOCUMENTS = 4;
 const MAX_DOCUMENT_BYTES = 80_000;
 const MAX_CONTEXT_BYTES = 180_000;
@@ -43,8 +45,10 @@ export class ProjectMemoryReader {
   // 본문 없이 현재 SHA-256만 다시 알려 준다. 문서 본문은 세션 생성 턴에 한 번만 싣지만(턴당 ~20K자 중복),
   // 해시는 그 사이 바뀔 수 있어 그대로 두면 에이전트가 낡은 expectedSHA256으로 쓰기를 제안하고 거부당한다.
   // 매니페스트는 수백 바이트라 매 턴 실어도 비용이 없다.
-  async buildManifest(prompt: string, role: ParticipantRole, signal?: AbortSignal, allowUpdates = true): Promise<string> {
-    const snapshots = await this.select(prompt, role, signal);
+  // search 는 문서를 고를 검색 입력이다(엔진 턴은 SessionTurn.memorySearch). 생략하면 프롬프트 전체가 검색어다.
+  async buildManifest(prompt: string, role: ParticipantRole, signal?: AbortSignal, allowUpdates = true,
+    search: string | MemorySearchInput = prompt): Promise<string> {
+    const snapshots = await this.select(search, role, signal);
     if (snapshots.length === 0) return allowUpdates ? "" : "이 턴의 메모리는 읽기 참고용입니다. 이전 세션의 저장 안내와 관계없이 memoryUpdates는 비워 두세요.";
     const rows = (await Promise.all(snapshots.map(async (snapshot) => {
       const notice = await wikiEvidenceNotice(snapshot.content, this.options);
@@ -60,8 +64,9 @@ export class ProjectMemoryReader {
     ].join("\n");
   }
 
-  async buildPrompt(prompt: string, role: ParticipantRole, signal?: AbortSignal, allowUpdates = true): Promise<string> {
-    const snapshots = await this.select(prompt, role, signal);
+  async buildPrompt(prompt: string, role: ParticipantRole, signal?: AbortSignal, allowUpdates = true,
+    search: string | MemorySearchInput = prompt): Promise<string> {
+    const snapshots = await this.select(search, role, signal);
     if (snapshots.length === 0) return `${prompt}\n\n${memoryUsageRules(role, this.memoryDirectory, [], allowUpdates)}`;
     const rendered = (await Promise.all(snapshots.map(async (snapshot) => [
       await wikiEvidenceNotice(snapshot.content, this.options) ?? "",
@@ -73,31 +78,41 @@ export class ProjectMemoryReader {
     return `${prompt}\n\n${memoryUsageRules(role, this.memoryDirectory, snapshots, allowUpdates)}\n\n${rendered}`;
   }
 
-  async select(prompt: string, role: ParticipantRole, signal?: AbortSignal): Promise<MemoryDocumentSnapshot[]> {
-    return (await this.selectWithDiagnostics(prompt, role, signal)).snapshots;
+  async select(input: string | MemorySearchInput, role: ParticipantRole, signal?: AbortSignal): Promise<MemoryDocumentSnapshot[]> {
+    return (await this.selectWithDiagnostics(input, role, signal)).snapshots;
   }
 
-  async selectWithDiagnostics(prompt: string, role: ParticipantRole, signal?: AbortSignal): Promise<MemorySelection> {
+  async selectWithDiagnostics(input: string | MemorySearchInput, role: ParticipantRole, signal?: AbortSignal): Promise<MemorySelection> {
     const empty = (): MemorySelection => ({ snapshots: [], decisions: [], bytes: 0 });
     const targets = await this.linkTargets(role, signal);
     if (!targets) return empty();
-    const { root, router, contexts } = targets;
+    const { root, router, contexts, wikis } = targets;
+    const search = memorySearch(input);
     const decisions: MemorySelection["decisions"] = [];
-    const candidates: Array<{ snapshot: MemoryDocumentSnapshot; score: number; decision: MemorySelection["decisions"][number] }> = [];
+    const candidates: Array<{ snapshot: MemoryDocumentSnapshot; score: number; subjects: string[]; decision: MemorySelection["decisions"][number] }> = [];
     const current = await this.readSnapshots(root, [...contexts.keys()], role, signal);
     for (const [path, labels] of contexts) {
       if (!isReadableMemoryPath(path, role)) continue;
       const snapshot = current.get(path);
       if (!snapshot) { decisions.push({ path, score: 0, reason: "unreadable", selected: false }); continue; }
-      const relevance = memoryRelevance(prompt, path, labels.join("\n"), snapshot.content);
+      const relevance = memoryRelevance(search, path, labels.join("\n"), snapshot.content);
       const decision = { path, score: relevance.score, reason: relevance.reason as string, selected: false };
       decisions.push(decision);
-      if (relevance.score > 0) candidates.push({ snapshot, score: relevance.score, decision });
+      if (relevance.score > 0) candidates.push({ snapshot, score: relevance.score, subjects: relevance.subjects, decision });
     }
     candidates.sort((a, b) => b.score - a.score || a.snapshot.path.localeCompare(b.snapshot.path));
+    // 검색 주제마다 대표 문서 하나를 문서 수 상한 전에 먼저 고른다 — 그 기능의 위키가 있으면 위키, 없으면 정체성이 그 주제인 최고 점수 문서다.
+    // 같은 주제의 일반 문서끼리 점수로 4자리를 다투다 위키가 빠지거나(자문 7 제목 단독 대조), 주제가 둘일 때 한쪽 문서가 자리를 다 차지하지 않게 한다.
+    const representatives = new Set(search.subjects.flatMap(subject => {
+      const owned = candidates.filter(candidate => candidate.subjects.includes(subject));
+      const chosen = owned.find(candidate => wikis.has(candidate.snapshot.path)) ?? owned[0];
+      if (chosen && wikis.has(chosen.snapshot.path)) chosen.decision.reason = "feature-wiki";
+      return chosen ? [chosen] : [];
+    }));
+    const ordered = [...candidates.filter(candidate => representatives.has(candidate)), ...candidates.filter(candidate => !representatives.has(candidate))];
     const snapshots = [router];
     let bytes = Buffer.byteLength(router.content);
-    for (const { snapshot, decision } of candidates) {
+    for (const { snapshot, decision } of ordered) {
       if (snapshots.length >= MAX_ROUTED_DOCUMENTS + 1) { decision.reason = "document-limit"; continue; }
       const size = Buffer.byteLength(snapshot.content);
       if (bytes + size > MAX_CONTEXT_BYTES) { decision.reason = "byte-limit"; continue; }
@@ -126,20 +141,22 @@ export class ProjectMemoryReader {
   }
 
   // 라우터와 MEMORY.md 의 링크 대상과 링크 문맥 — 선택(selectWithDiagnostics)과 허용 색인(index)이 같은 목록을 쓴다. 라우터가 없으면 둘 다 비어 있다.
-  private async linkTargets(role: ParticipantRole, signal?: AbortSignal): Promise<{ root: string; router: MemoryDocumentSnapshot; contexts: Map<string, string[]> } | null> {
+  private async linkTargets(role: ParticipantRole, signal?: AbortSignal): Promise<{ root: string; router: MemoryDocumentSnapshot; contexts: Map<string, string[]>; wikis: Set<string> } | null> {
     const root = await resolveUserPath(this.memoryDirectory, { signal });
     if (!root) return null;
     const router = await this.readSnapshot(root, ROUTER_FILE, role, signal);
     if (!router) return null;
     const index = await this.readSnapshot(root, "MEMORY.md", role, signal);
     const contexts = new Map<string, string[]>();
+    const wikis = new Set<string>();
     for (const source of [router.content, index?.content ?? ""]) {
       for (const candidate of extractMarkdownLinks(source)) {
         if (candidate.path === ROUTER_FILE || candidate.path === "MEMORY.md") continue;
         contexts.set(candidate.path, [...contexts.get(candidate.path) ?? [], candidate.context]);
+        if (candidate.wiki) wikis.add(candidate.path);
       }
     }
-    return { root, router, contexts };
+    return { root, router, contexts, wikis };
   }
 
   private async readSnapshots(root: string, paths: string[], role: ParticipantRole, signal?: AbortSignal): Promise<Map<string, MemoryDocumentSnapshot>> {
@@ -203,15 +220,19 @@ const MARKDOWN_LINK = /\[[^\]]+\]\(([^)]+\.md)(?:#[^)]+)?\)/g;
 // MEMORY.md 가 한 줄에 여러 문서를 묶을 때 쓰는 구분자(`- 주제: [문서](경로) · [문서](경로)`).
 const GROUPED_LINK_SEPARATOR = " · ";
 
-function extractMarkdownLinks(markdown: string): Array<{ path: string; context: string }> {
-  const links = new Map<string, string>();
+// wiki: 한 번이라도 FEATURE_WIKI_SECTION 제목 아래에서 링크됐다.
+function extractMarkdownLinks(markdown: string): Array<{ path: string; context: string; wiki: boolean }> {
+  const links = new Map<string, { context: string; wiki: boolean }>();
+  let section: string | null = null;
   for (const line of markdown.split(/\r?\n/)) {
+    const heading = /^#{1,6}\s+(.*?)\s*$/.exec(line);
+    if (heading) section = heading[1];
     for (const { target, context } of linkContexts(line)) {
       const path = normalize(target).replaceAll("\\", "/");
-      if (!path.startsWith("../") && !path.startsWith("/")) links.set(path, context);
+      if (!path.startsWith("../") && !path.startsWith("/")) links.set(path, { context, wiki: section === FEATURE_WIKI_SECTION || (links.get(path)?.wiki ?? false) });
     }
   }
-  return [...links].map(([path, context]) => ({ path, context }));
+  return [...links].map(([path, link]) => ({ path, ...link }));
 }
 
 // 여러 문서를 ` · `로 묶은 줄에서 줄 전체를 모든 링크의 문맥으로 쓰면 한 문서에 맞은 키워드가 같은 줄의 다른 문서

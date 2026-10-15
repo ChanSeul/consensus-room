@@ -1,8 +1,8 @@
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, expect, it } from "vitest";
-import { nativeApps } from "../src/server/adapters/nativeApps";
+import { afterEach, expect, it, vi } from "vitest";
+import { AppCallTimeout, AppConnectionReset, nativeApps } from "../src/server/adapters/nativeApps";
 import { nativeFigma } from "../src/server/adapters/nativeFigma";
 
 const roots: string[] = [];
@@ -28,6 +28,9 @@ require('node:readline').createInterface({input:process.stdin}).on('line',line=>
   'figma.get_screenshot':{name:'figma.get_screenshot',inputSchema:{type:'object'},annotations:{readOnlyHint:false}},
   'figma.delete_file':{name:'figma.delete_file',inputSchema:{type:'object'},annotations:{readOnlyHint:false}}
  }}]};
+ if(message.method==='mcpServer/tool/call'&&message.params.arguments.nodeId==='exit')process.exit(3);
+ if(message.method==='mcpServer/tool/call'&&message.params.arguments.nodeId==='hang')return;
+ if(message.method==='mcpServer/tool/call'&&message.params.arguments.nodeId==='refused'){console.log(JSON.stringify({id:message.id,error:{code:-32000,message:'refused'}}));return;}
  if(message.method==='mcpServer/tool/call')result={content:[{type:'text',text:${JSON.stringify(text)}}],structuredContent:{version:7}};
  console.log(JSON.stringify({id:message.id,result}));
 });
@@ -97,4 +100,40 @@ it("preserves Unicode line separators inside a model-free MCP response",async()=
     const requests=readFileSync(log,"utf8").trim().split("\n").map(line=>JSON.parse(line));
     expect(requests.some(request=>request.method==="turn/start")).toBe(false);
   }finally{await client.close();}
+});
+
+it("reports a connection closed only when it ended, not when one call was refused", async () => {
+  const { root, command, auth } = fixture();
+  const client = await nativeApps(command, auth, root, { connector_68df038e0ba48191908c8434991bbac2: ["figma.get_metadata"] });
+  try {
+    await expect(client.call("figma.get_metadata", { fileKey: "Approved", nodeId: "refused" })).rejects.toThrow("공식 앱 연결");
+    expect(client.closed).toBe(false);
+    await client.call("figma.get_metadata", { fileKey: "Approved", nodeId: "1:2" });
+    await expect(client.call("figma.get_metadata", { fileKey: "Approved", nodeId: "exit" })).rejects.toThrow("앱 연결이 종료됐습니다");
+    expect(client.closed).toBe(true);
+  } finally { await client.close(); }
+  const stopped = await nativeApps(command, auth, root, { connector_68df038e0ba48191908c8434991bbac2: ["figma.get_metadata"] });
+  await stopped.close();
+  expect(stopped.closed).toBe(true);
+});
+
+it("times out an unanswered request alone, and a reset ends the requests still waiting with its reason", async () => {
+  const { root, command, auth } = fixture();
+  const client = await nativeApps(command, auth, root, { connector_68df038e0ba48191908c8434991bbac2: ["figma.get_metadata"] });
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    const stuck = client.call("figma.get_metadata", { fileKey: "Approved", nodeId: "hang" });
+    stuck.catch(() => {});
+    vi.advanceTimersByTime(60_000);
+    const waiting = client.call("figma.get_metadata", { fileKey: "Approved", nodeId: "hang" });
+    waiting.catch(() => {});
+    vi.advanceTimersByTime(60_000);
+    await expect(stuck).rejects.toBeInstanceOf(AppCallTimeout);
+    expect(client.closed).toBe(false);
+    vi.useRealTimers();
+    await client.close(new AppConnectionReset("응답 시간 초과로 연결을 재설정하면서 중단됐습니다."));
+    await expect(waiting).rejects.toThrow("재설정");
+    expect(client.closed).toBe(true);
+    await expect(client.call("figma.get_metadata", { fileKey: "Approved", nodeId: "1:2" })).rejects.toThrow("재설정");
+  } finally { vi.useRealTimers(); await client.close(); }
 });

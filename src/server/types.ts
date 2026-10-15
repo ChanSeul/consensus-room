@@ -7,6 +7,7 @@ import type {
   WorkflowState,
 } from "../shared/contracts.js";
 import type { TurnJob } from "../shared/roles.js";
+import type { MemorySearchInput } from "./memoryRetrieval.js";
 import type { TurnEnvelope } from "../shared/turnContract.js";
 
 export type ParticipantRole = Extract<AgentRole, "claude" | "codex">;
@@ -84,6 +85,9 @@ export interface SessionTurn {
   // 어댑터는 이 resume 에 새 세션처럼 본문을 싣고(매니페스트는 중복하지 않는다) 프로토콜 턴이면 무시한다. 없으면 종전(생성 턴에만 본문, resume 은
   // 매니페스트) — 모든 resume 재주입은 하지 않는다(2026-08-30 턴당 ~20K자 중복 과금 실측).
   memoryBodies?: boolean;
+  // 메모리 검색 입력(자문 7) — 실행기가 토픽과 상위 토픽의 제목·Goal, 사용자 요청으로 싣는다. 어댑터는 본문 주입과 resume 매니페스트를 모두 이 값으로 고른다
+  // (프롬프트에는 역할 안내·경로·전달 기록이 섞이고 resume 프롬프트에는 제목이 없다). 없으면 프롬프트 전체가 검색어다(엔진 밖 호출자).
+  memorySearch?: MemorySearchInput;
   // Host-managed product evidence disables direct web reads; Figma implementation access is a separate opt-in.
   evidenceManaged?: boolean;
   // Host opt-in only for implementation with registered Figma links; never planning or protocol turns.
@@ -106,8 +110,6 @@ export interface SessionTurn {
   beforeSpawn?: () => void | Promise<void>;
   admitSync?: () => void;
   implementation?: boolean;
-  // Host-only authority for a registered, completed-topic engine follow-up.
-  engineDefectFix?: boolean;
   // 프로토콜 확인 전용 턴. 저장소를 읽거나 명령을 실행할 필요가 없는데 도구를 열어 두면 에이전트가
   // 스스로 파일 해시를 계산하는 등 탐색을 시작해 출력 토큰만 쓴다(2026-08-29 ACK 턴 실측: output 19,975).
   protocolOnly?: boolean;

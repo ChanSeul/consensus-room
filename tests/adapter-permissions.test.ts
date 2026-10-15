@@ -6,7 +6,8 @@ import { dirname, isAbsolute, join } from "node:path";
 import { afterEach } from "vitest";
 import { describe, expect, it, vi } from "vitest";
 
-import { buildIsolationSettings, ClaudeAdapter } from "../src/server/adapters/claude";
+import { actionTempRunnerNote, buildIsolationSettings, ClaudeAdapter, XCODEBUILD_CALL_CONTRACT } from "../src/server/adapters/claude";
+import { TOOL_TREE_RUNNER_NOTE, TOOL_TREE_SUBDIRECTORIES } from "../src/server/toolTree";
 import { CodexAdapter } from "../src/server/adapters/codex";
 import type { CommandResult, CommandRunner, CommandSpec, TurnUsage } from "../src/server/types";
 import { agentEnvironment } from "../src/server/security";
@@ -111,7 +112,9 @@ describe("project worker context", () => {
       // A new adapter/process reuses the host-owned delivery receipt.
       const reopened = new ClaudeAdapter(runner, undefined, { managedPluginDirectory: plugin });
       await reopened.resumeTurn({ cwd, prompt: "Continue unchanged task", sessionId: planned.sessionId, implementation: true });
-      expect(runner.calls[3].stdin).toBe("Continue unchanged task");
+      // 지시문은 다시 싣지 않지만, 쓰기 턴의 xcodebuild 호출 계약·도구 트리 안내와 이 턴의 임시 폴더 안내는 영수증과 무관하게 매 턴 싣는다.
+      const temp = actionTempRunnerNote(String(runner.calls[3].environment?.TMPDIR), "write");
+      expect(runner.calls[3].stdin).toBe(`${XCODEBUILD_CALL_CONTRACT}\n\n${TOOL_TREE_RUNNER_NOTE}\n\n${temp}\n\nContinue unchanged task`);
     } else {
       const config = readFileSync(join((adapter as CodexAdapter).managedHomeFor(cwd), "config.toml"), "utf8");
       expect(config).toContain("project_doc_max_bytes = 0");
@@ -136,7 +139,8 @@ describe("project worker context", () => {
     await adapter.resumeTurn({ cwd, prompt: "Continue", sessionId });
     await adapter.resumeTurn({ cwd, prompt: "Continue unchanged", sessionId });
     expect(calls[1].stdin).toContain("REQUIRED_WORKER_RULE");
-    expect(calls[2].stdin).toBe("Continue unchanged");
+    // 지시문은 다시 싣지 않아도 이 턴의 임시 폴더 안내는 매 도구 턴 싣는다.
+    expect(calls[2].stdin).toBe(`${actionTempRunnerNote(String(calls[2].environment?.TMPDIR), "read")}\n\nContinue unchanged`);
   });
 
   it("Claude forgets a prior receipt when compaction streams before interruption", async () => {
@@ -155,7 +159,7 @@ describe("project worker context", () => {
     const { sessionId } = await adapter.createSession({ cwd, prompt: "Work" });
     await expect(adapter.resumeTurn({ cwd, prompt: "Continue", sessionId })).rejects.toThrow("interrupted");
     await adapter.resumeTurn({ cwd, prompt: "Retry", sessionId });
-    expect(calls[1].stdin).toBe("Continue");
+    expect(calls[1].stdin).toBe(`${actionTempRunnerNote(String(calls[1].environment?.TMPDIR), "read")}\n\nContinue`);
     expect(calls[2].stdin).toContain("REQUIRED_WORKER_RULE");
   });
 });
@@ -824,6 +828,14 @@ describe("에이전트별 권한 경계", () => {
     const planArgs = runner.calls[1].args;
     const plan = JSON.parse(planArgs[planArgs.indexOf("--settings") + 1]) as Settings;
     expect((plan.sandbox as unknown as { excludedCommands: string[] }).excludedCommands).toEqual([]);
+    // 면제가 켜진 구현 턴에만 실측된 호출 방식을 입력에 싣는다.
+    expect(runner.calls[0].stdin).toContain(XCODEBUILD_CALL_CONTRACT);
+    expect(runner.calls[1].stdin).not.toContain(XCODEBUILD_CALL_CONTRACT);
+    // 도구 트리를 쓰기 거부하는 구현 턴에만 보호 목록 안내를 싣는다(엔진 결함 example-tool-tree). 안내는 보호 목록 정본에서 만든다.
+    expect(runner.calls[0].stdin).toContain(TOOL_TREE_RUNNER_NOTE);
+    expect(runner.calls[1].stdin).not.toContain(TOOL_TREE_RUNNER_NOTE);
+    for (const subdirectory of TOOL_TREE_SUBDIRECTORIES) expect(TOOL_TREE_RUNNER_NOTE).toContain(`\`${subdirectory}/\``);
+    expect(TOOL_TREE_RUNNER_NOTE).toContain("DerivedData/<이름>-logs/");
     expect(plan.sandbox.network.allowedDomains).toEqual([]);
     expect(plan.sandbox.network.deniedDomains).toEqual(["*"]);
     expect(plan.sandbox.filesystem.allowWrite.some((path) => path.includes(".local/state"))).toBe(false);
@@ -1333,6 +1345,28 @@ describe("세션별 메모리 본문 수신(memoryBodies) — 본문을 받지 �
     expect(plain).toContain("메모리 스냅샷 갱신");
   });
 
+  // 자문 7 — 프롬프트에는 역할 안내·경로·상대 응답 원문이 섞이고 resume 프롬프트에는 제목이 없다. 본문과 매니페스트는 엔진이 실은 검색 입력으로 고른다.
+  it.each(["claude", "codex"] as const)("%s: memorySearch 가 있으면 프롬프트가 아니라 그 입력으로 본문·매니페스트 문서를 고른다", async (provider) => {
+    const root = mkdtempSync(join(tmpdir(), "consensus-room-memory-search-"));
+    temporaryDirectories.push(root);
+    writeFileSync(join(root, "context-router.md"), "# Router\n- [매물등록 폼](houseregist-form.md)\n- [숏폼 미디어](shortform-media.md)");
+    writeFileSync(join(root, "houseregist-form.md"), "# 매물등록 폼\nHOUSE-FORM-MARKER");
+    writeFileSync(join(root, "shortform-media.md"), "# 숏폼 미디어\nSHORTFORM-MARKER");
+    const directory = mkdtempSync(join(tmpdir(), "consensus-room-memory-search-codex-"));
+    temporaryDirectories.push(directory);
+    const runner = new RecordingRunner(successfulResult([{ type: "thread.started", thread_id: "thread-1" }, planResult]));
+    const adapter = provider === "claude" ? new ClaudeAdapter(runner, root)
+      : new CodexAdapter(runner, join(directory, "schema.json"), join(directory, "codex-home"), root);
+    const memorySearch = { subject: "매물등록 폼 검증" };
+    await adapter.createSession({ prompt: "숏폼 카드 재생 원문이 섞인 과제", cwd: "/tmp", memorySearch });
+    await adapter.resumeTurn({ sessionId: sessions[provider], prompt: "숏폼 미디어 응답 원문", cwd: "/tmp", memorySearch });
+    const [created, resumed] = runner.calls.map((call) => call.stdin ?? "");
+    expect(created).toContain("HOUSE-FORM-MARKER");
+    expect(created).not.toContain("SHORTFORM-MARKER");
+    expect(resumed).toContain("- houseregist-form.md @");
+    expect(resumed).not.toContain("shortform-media.md @");
+  });
+
   it.each(["claude", "codex"] as const)("%s: 프로토콜 턴은 memoryBodies 가 있어도 본문을 싣지 않는다", async (provider) => {
     const runner = new RecordingRunner(successfulResult([{ type: "thread.started", thread_id: "thread-1" }, planResult]));
     const adapter = adapters(runner)[provider];
@@ -1561,6 +1595,82 @@ describe("planner 계획 폴더 쓰기", () => {
     ];
     for (const [turn, reason] of cases) await expect(adapter.createSession(turn)).rejects.toThrow(reason);
     expect(runner.calls).toEqual([]);
+  });
+});
+
+// 엔진 결함 example-temp-access(2026-10-13): 샌드박스 Bash 의 $TMPDIR 은 CLI 가 바꾼 사용자별 공용 폴더라, 러너가 하위 에이전트 결과를 그 폴더에 쓰면 Read 가
+// 거부됐다. 이 턴의 임시 폴더(actionTemp)는 실제 경로 한 철자로 sandbox·도구 규칙·안내·TMPDIR 이 같이 쓰고, 안내는 그 턴에 열린 도구만 말한다.
+describe("이 턴의 임시 폴더 — 도구 규칙·안내·철자", () => {
+  type Settings = { permissions: { allow: string[] }; sandbox: { filesystem: { allowWrite: string[]; allowRead: string[] } } };
+  const settingsOf = (call: CommandSpec) => JSON.parse(call.args[call.args.indexOf("--settings") + 1]) as Settings;
+  const toolsOf = (call: CommandSpec) => call.args[call.args.indexOf("--tools") + 1].split(",").filter(Boolean);
+
+  it.each([false, true])("Claude 임시 폴더 정리가 실패해도 원래 결과·오류를 보존한다 (provider failure: %s)", async fail => {
+    let locked = "";
+    const originalError = new Error("provider crashed");
+    const runner: CommandRunner = { run: async spec => {
+      locked = join(spec.environment!.TMPDIR!, "readonly");
+      mkdirSync(locked); writeFileSync(join(locked, "file"), "x"); chmodSync(locked, 0o555);
+      if (fail) throw originalError;
+      return successfulResult([planResult]);
+    } };
+    try {
+      const result = new ClaudeAdapter(runner).createSession({ prompt: "검토하세요.", cwd: "/tmp" });
+      if (fail) await expect(result).rejects.toBe(originalError);
+      else expect((await result).result).toMatchObject(planResult);
+    } finally {
+      if (locked) { chmodSync(locked, 0o755); rmSync(dirname(locked), { recursive: true, force: true }); }
+    }
+  });
+
+  it("모든 턴이 실제 경로 한 철자를 쓰고, 읽기는 모든 턴·쓰기는 쓰기 턴만 열며, 도구 턴마다 접근 수준에 맞는 안내를 한 번 싣는다", async () => {
+    const dataDirectory = realpathSync(mkdtempSync(join(tmpdir(), "consensus-room-action-temp-")));
+    temporaryDirectories.push(dataDirectory);
+    const workspace = join(dataDirectory, "worktrees", "topic-a");
+    const planDirectory = join(dataDirectory, "topics", "topic-a", "plan");
+    for (const path of [workspace, planDirectory]) mkdirSync(path, { recursive: true });
+    const runner = new RecordingRunner(successfulResult([planResult]));
+    const adapter = new ClaudeAdapter(runner);
+
+    await adapter.createSession({ cwd: workspace, prompt: "구현하세요.", implementation: true });
+    await adapter.createSession({ cwd: workspace, prompt: "검토하세요." });
+    await adapter.createSession({ cwd: workspace, prompt: "계획을 쓰세요.", job: { role: "planner", operation: "plan" }, planDirectory });
+    await adapter.createSession({ cwd: workspace, prompt: "해시를 확인하세요.", protocolOnly: true });
+
+    const [write, read, planner, protocol] = runner.calls;
+    for (const [call, access] of [[write, "write"], [read, "read"], [planner, "read"], [protocol, "none"]] as const) {
+      const temp = String(call.environment?.TMPDIR);
+      // 한 철자: 실제 경로이고, 캐시·sandbox·도구 규칙이 같은 문자열을 쓴다. 턴이 끝나면 지워진다.
+      expect(realpathSync(dirname(temp))).toBe(dirname(temp));
+      expect(call.environment?.XDG_CACHE_HOME).toBe(join(temp, "cache"));
+      expect(existsSync(temp)).toBe(false);
+      const settings = settingsOf(call);
+      expect(settings.sandbox.filesystem.allowRead).toContain(temp);
+      expect(settings.sandbox.filesystem.allowWrite).toContain(temp);
+      const rules = settings.permissions.allow.filter(rule => rule.includes(temp));
+      expect(rules).toEqual(access === "write"
+        ? [`Read(/${temp}/**)`, `Edit(/${temp}/**)`, `Write(/${temp}/**)`]
+        : [`Read(/${temp}/**)`]);
+      // CLI 공용 임시 폴더(/tmp/claude-<uid>)는 열지 않는다 — 그 이름을 담은 규칙은 이 턴의 폴더 규칙뿐이다.
+      expect(settings.permissions.allow.filter(rule => /\/tmp\/claude/.test(rule) && !rule.includes(temp))).toEqual([]);
+      const stdin = call.stdin ?? "";
+      if (access === "none") {
+        expect(stdin).not.toContain("이 턴의 임시 폴더");
+        continue;
+      }
+      const note = actionTempRunnerNote(temp, access);
+      expect(stdin.split(note).length - 1).toBe(1);
+      expect(note).toContain(`\`${temp}\``);
+      expect(note).toContain("하위 에이전트에게 맡길 때는 이 경로를 지시에 적어 넘기세요");
+      if (access === "write") expect(note).toContain("Write");
+      else expect(note).not.toMatch(/Write|Edit/);
+    }
+    // 읽기 턴에는 Edit·Write 도구가 없고, 계획자 턴의 Edit·Write 규칙은 계획 폴더뿐이다(이 턴의 폴더로 넓히지 않는다).
+    expect(toolsOf(read)).not.toContain("Edit");
+    expect(toolsOf(read)).not.toContain("Write");
+    expect(toolsOf(write)).toEqual(expect.arrayContaining(["Edit", "Write"]));
+    expect(settingsOf(planner).permissions.allow.filter(rule => /^(Edit|Write)\(/.test(rule)))
+      .toEqual([`Edit(/${planDirectory}/**)`, `Write(/${planDirectory}/**)`]);
   });
 });
 

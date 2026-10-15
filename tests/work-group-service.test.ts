@@ -86,6 +86,69 @@ function closeStage(fx: Fixture, groupId: string, stageId: string, closedAt: str
 }
 const creationEvent = (fx: Fixture, topicId: string) => fx.database.getTimeline(topicId)[0];
 
+it("records delivery against a captured local remote-tracking SHA without network or workflow changes", async () => {
+  const fx = fixture(), service = fx.service();
+  const group = await service.create(groupInput([work("a"), integration("z", ["a"])]));
+  await expect(service.observeDelivery(group.id, {}, "user", "missing-branch")).rejects.toThrow("deliveryBranch");
+  await expect(service.observeDelivery(group.id, { branch: "ship" }, "user", "no-result")).rejects.toThrow("통합 단계 결과");
+  await service.next(group.id);
+  closeStage(fx, group.id, "a", "2026-10-15T00:00:00Z");
+  await service.next(group.id);
+  const closed = closeStage(fx, group.id, "z", "2026-10-15T00:01:00Z");
+  const original = fx.database.workGroups.get(group.id), flags = fx.database.getFlags(closed.topic.id);
+  const commands: string[][] = [];
+  const runner = new SpawnCommandRunner();
+  const git = new GitService({ run: spec => { commands.push(spec.args); return runner.run(spec); } });
+  const observer = fx.service(git);
+  const ref = "refs/remotes/origin/ship";
+  const missing = await observer.observeDelivery(group.id, { branch: "ship" }, "mediator", "missing");
+  expect(missing).toMatchObject({ observedRef: ref, observedSha: null, resultSha: closed.commit, contains: false });
+  run(fx.repository, "update-ref", ref, fx.base);
+  expect(await observer.observeDelivery(group.id, { branch: "ship" }, "mediator", "not-contained"))
+    .toMatchObject({ observedSha: fx.base, contains: false });
+  const descendant = run(fx.repository, "commit-tree", closed.tree, "-p", closed.commit, "-m", "delivered descendant");
+  run(fx.repository, "update-ref", ref, descendant);
+  const read = git.localRefOID.bind(git);
+  vi.spyOn(git, "localRefOID").mockImplementationOnce(async (...args) => {
+    const captured = await read(...args);
+    run(fx.repository, "update-ref", ref, fx.base);
+    return captured;
+  });
+  const contained = await observer.observeDelivery(group.id, { branch: "ship" }, "mediator", "contained");
+  expect(contained).toMatchObject({ observedSha: descendant, contains: true, resultSha: closed.commit, origin: "mediator" });
+  expect(Number.isNaN(Date.parse(contained.observedAt))).toBe(false);
+  const { deliveryObservations, ...unchanged } = fx.database.workGroups.get(group.id);
+  expect(deliveryObservations).toHaveLength(3);
+  expect(unchanged).toEqual(original);
+  expect(fx.database.getFlags(closed.topic.id)).toEqual(flags);
+  expect(fx.database.getTopic(closed.topic.id).state).toBe("CLOSED");
+  expect(commands.every(args => ["rev-parse", "merge-base"].includes(args[0]))).toBe(true);
+  for (const remote of ["bad..name", "bad.lock", "bad/name"]) {
+    await expect(observer.observeDelivery(group.id, { remote, branch: "ship" }, "user", remote)).rejects.toThrow();
+  }
+  const failure = Object.assign(new Error("git unavailable"), { code: "ENOENT" });
+  vi.spyOn(git, "localRefOID").mockRejectedValueOnce(failure);
+  await expect(observer.observeDelivery(group.id, { branch: "ship" }, "user", "failed")).rejects.toBe(failure);
+  expect(fx.database.workGroups.get(group.id).deliveryObservations).toHaveLength(3);
+});
+
+it("uses the optional deliveryBranch and rejects a changed target before recording", async () => {
+  const fx = fixture(), service = fx.service();
+  const input = { ...groupInput([work("a"), integration("z", ["a"])]), deliveryBranch: "ship" };
+  const group = await service.create(input);
+  await service.next(group.id); closeStage(fx, group.id, "a", "2026-10-15T00:00:00Z");
+  await service.next(group.id); closeStage(fx, group.id, "z", "2026-10-15T00:01:00Z");
+  await expect(service.observeDelivery(group.id, { branch: "other" }, "user", "wrong-target")).rejects.toThrow("다릅니다");
+  expect(await service.observeDelivery(group.id, {}, "user", "default-target")).toMatchObject({ branch: "ship", remote: "origin" });
+  vi.spyOn(fx.git, "localRefOID").mockImplementationOnce(async () => {
+    const preview = fx.database.workGroups.previewRevision(group.id, { ...input, deliveryBranch: "new-ship" }, group.version);
+    fx.database.workGroups.applyRevision(group.id, preview, "user");
+    return null;
+  });
+  await expect(service.observeDelivery(group.id, {}, "user", "moved-target")).rejects.toThrow("관측 중 전달 대상");
+  expect(fx.database.workGroups.get(group.id).deliveryObservations).toHaveLength(1);
+});
+
 it("continuation reports the actual default admission blocker and never readies integration early", async () => {
   const fx = fixture(), service = fx.service();
   const group = await service.create(groupInput([
@@ -403,6 +466,30 @@ describe("승계 검사(동결 결과)", () => {
     expect(group.links.b).toBeUndefined();
     expect(group.pending ?? {}).toEqual({});
   };
+
+  it.each([false, true])("missing prior worktree is diagnosed without repair (legacy=%s)", async (legacy) => {
+    const { fx, service, group } = await opened();
+    const topic = fx.database.getTopic(fx.database.workGroups.get(group.id).links.a.topicId);
+    if (legacy) {
+      fx.database.updateTopic(topic.id, { state: "CLOSED", approvedPlanSHA256: sha256("plan"),
+        committedOID: fx.base, pushedOID: fx.base, reviewedTreeOID: run(topic.worktreePath, "rev-parse", "HEAD^{tree}") });
+    } else closeStage(fx, group.id, "a", "2026-10-15T00:00:00Z");
+    rmSync(topic.worktreePath, { recursive: true });
+    const error = await service.next(group.id).catch(error => error);
+    expect(error.message).toContain(`선행 단계 a 의 작업 폴더가 없습니다: ${topic.worktreePath}`);
+    expect(error.cause).toMatchObject({ code: "ENOENT" });
+    expect(() => readFileSync(topic.worktreePath)).toThrow();
+    unlinked(fx, group.id);
+  });
+
+  it.each(["ENOENT", "EACCES"])("preserves %s from Git when the prior worktree still exists", async (code) => {
+    const { fx, group } = await opened();
+    closeStage(fx, group.id, "a", "2026-10-15T00:00:00Z");
+    const error = Object.assign(new Error("original Git error"), { code });
+    const git = new GitService({ run: async () => { throw error; } });
+    await expect(fx.service(git).next(group.id)).rejects.toBe(error);
+    unlinked(fx, group.id);
+  });
 
   it("① 결과 커밋 트리가 리뷰한 트리와 다르면 다음 단계를 열지 않는다", async () => {
     const { fx, service, group } = await opened();

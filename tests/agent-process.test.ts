@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { describeCommandFailure, parseAgentResult } from "../src/server/adapters/resultParser";
+import { describeCommandFailure, isClaudeFinalResult, isZeroTurnResult, parseAgentResult } from "../src/server/adapters/resultParser";
 import { resolutionIds } from "../src/shared/workflow";
 import { SpawnCommandRunner } from "../src/server/processRunner";
 import { execFile } from "node:child_process";
@@ -560,6 +560,47 @@ describe("최종 결과 뒤 유휴 종료 (2026-09-03 hang 처방)", () => {
 
     expect(command.exitCode).toBe(3);
     expect(command.terminatedAfterResult).toBeUndefined();
+  });
+
+  // 2026-10-14 CP2 실측: resume 직후 합성 0턴 result 가 먼저 나오고 같은 프로세스에서 실제 턴이 이어졌다. 그 줄로 타이머를 켜면
+  // 실제 턴이 정리 시간 뒤 끊긴다. 테스트는 정리 시간을 300ms 로 줄이고 실제 턴을 그보다 길게 돌린다.
+  const synthetic = '{"type":"result","subtype":"success","is_error":false,"num_turns":0,"result":"No response requested."}\n';
+  const realTurn = '{"type":"assistant","message":{"content":[{"type":"text","text":"작업"}]}}\n'
+    + '{"type":"result","subtype":"success","is_error":false,"num_turns":5,"structured_output":{"outcome":"done"}}\n';
+  const lateRealTurn = `process.stdout.write(${JSON.stringify(synthetic)}); setTimeout(() => { process.stdout.write(${JSON.stringify(realTurn)}); process.exit(0); }, 900);`;
+
+  it("합성 0턴 result 는 정리 타이머를 켜지 않아 정리 시간을 넘긴 실제 턴이 실제 result 까지 끝난다", async () => {
+    const command = await new SpawnCommandRunner().run({
+      command: process.execPath, args: ["-e", lateRealTurn], cwd: process.cwd(),
+      finalResultTimeoutMs: 300, isFinalResult: isClaudeFinalResult,
+    });
+    expect(command.terminatedAfterResult).toBeUndefined();
+    expect(command.exitCode).toBe(0);
+    expect(command.jsonLines).toContainEqual(expect.objectContaining({ num_turns: 5, structured_output: { outcome: "done" } }));
+    expect(isZeroTurnResult(command.jsonLines)).toBe(false);
+  });
+
+  it("대조: 모든 result 를 최종으로 보면 같은 실행이 정리 시간에 끊기고 합성 result 만 남는다", async () => {
+    const command = await new SpawnCommandRunner().run({
+      command: process.execPath, args: ["-e", lateRealTurn], cwd: process.cwd(),
+      finalResultTimeoutMs: 300, isFinalResult: (value) => (value as { type?: unknown } | null)?.type === "result",
+    });
+    expect(command.terminatedAfterResult).toBe(true);
+    expect(command.jsonLines).not.toContainEqual(expect.objectContaining({ num_turns: 5 }));
+  });
+
+  it("실제 최종 result 와 0턴 오류 result 뒤 남은 프로세스는 그대로 정리한다", async () => {
+    for (const line of [
+      '{"type":"result","subtype":"success","is_error":false,"num_turns":5,"structured_output":{"outcome":"done"}}\n',
+      '{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0}\n',
+    ]) {
+      const command = await new SpawnCommandRunner().run({
+        command: process.execPath, args: ["-e", `process.stdout.write(${JSON.stringify(line)}); setTimeout(() => {}, 30_000);`], cwd: process.cwd(),
+        finalResultTimeoutMs: 300, isFinalResult: isClaudeFinalResult,
+      });
+      expect(command.terminatedAfterResult).toBe(true);
+      expect(command.exitCode).toBe(0);
+    }
   });
 });
 

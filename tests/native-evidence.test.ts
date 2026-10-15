@@ -145,6 +145,25 @@ it("ignores Confluence view counts while preserving page edits",async()=>{
   body="Changed policy";expect((await connector.discover(source,null,signal)).revision).not.toBe(first.revision);
 });
 
+it("ignores the reading account's Jira lastViewed while preserving development, remote links and other same-named keys",async()=>{
+  const {db,topic}=fixture();const source=db.evidence.register(topic.id,{url:"https://team.atlassian.net/browse/APP-1",label:"Jira",mode:"connector",intervalSeconds:900});
+  let lastViewed:string|undefined="2026-10-15T12:00:00.000+0900",development="{}";
+  const reader:AppReader={config:async()=>({}),close:async()=>{},call:async(_p,name)=>name.endsWith("atlassianUserInfo")?{accountId:"owner"}:
+    {key:"APP-1",fields:{updated:"original",description:"Policy",...(lastViewed===undefined?{}:{lastViewed}),
+      customFields:{"상태 태그":{value:"검증"},development:{id:"customfield_10000",value:development},memo:{lastViewed:"kept as content"}}}}};
+  const connector=new NativeEvidenceConnector(reader),signal=new AbortController().signal;
+  const first=await connector.discover(source,null,signal);
+  lastViewed="2026-10-15T13:00:00.000+0900";expect((await connector.discover(source,null,signal)).units).toEqual(first.units);
+  lastViewed=undefined;expect((await connector.discover(source,null,signal)).revision).toBe(first.revision);
+  const body=JSON.parse(first.units[0].content);
+  expect(body.fields.lastViewed).toBeUndefined();
+  expect(body.fields.customFields.memo.lastViewed).toBe("kept as content");
+  expect(body.fields.customFields.development.value).toBe("{}");
+  // The development panel summary is issue content here, so a change to it is still a change.
+  development="{repository={count=2, dataType=repository}}";
+  expect((await connector.discover(source,null,signal)).revision).not.toBe(first.revision);
+});
+
 it("discovers complete URLs before splitting long MCP text",async()=>{
   const {db,topic}=fixture();const source=db.evidence.register(topic.id,{url:"https://www.figma.com/design/test?node-id=1-2",label:"Design",mode:"connector",intervalSeconds:900});
   const url="https://team.atlassian.net/browse/APP-123";

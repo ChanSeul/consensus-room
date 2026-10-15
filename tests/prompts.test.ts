@@ -49,6 +49,36 @@ describe("역할별 원문 왕복 프롬프트", () => {
     expect(buildRelayPrompt({})).toBe("새 입력이 없습니다. 이어서 진행하세요.");
   });
 
+  // 결정 원문 묶음(2026-10-14 자문 8) — 사용자 결정은 색인으로 본문 공유·파일 위치를 정하고, 색인·경로는 새 입력이 없어도 매 턴 싣는다.
+  it("같은 본문의 결정은 처음 순번을, 긴 고유 본문은 원문 파일 구간을 가리키고 순번·출처는 남긴다 — 짧은 고유 결정은 종전과 같다", () => {
+    const long = `LONG-DESIGN ${"설계 문단. ".repeat(700)}`;
+    const origin = { stageId: "cp0-prep", topicId: "cp0-topic", sequence: 3, scopeGeneration: 1 };
+    const decisionSources = { path: "/d/topics/t/artifacts/abc", version: 2, sha256: "f".repeat(64), entries: [
+      { sequence: 3, origin: null, sha256: "a".repeat(64), chars: long.length, sameAs: null },
+      { sequence: 7, origin: null, sha256: "b".repeat(64), chars: 14, sameAs: null },
+      { sequence: 9, origin, sha256: "a".repeat(64), chars: long.length, sameAs: 3 },
+    ] };
+    const prompt = buildRelayPrompt({ decisionSources, messages: [
+      { sequence: 3, actor: "user", kind: "decision", body: long },
+      { sequence: 7, actor: "user", kind: "decision", body: "SHORT-DECISION" },
+      { sequence: 9, actor: "user", kind: "decision", body: `승계 결정 — 단계 cp0-prep(…):\n\n${long}` },
+      { sequence: 10, actor: "user", kind: "note", body: "NOTE-BODY" },
+    ] });
+
+    expect(prompt).not.toContain("LONG-DESIGN");
+    expect(prompt).toContain(`[#3 user/decision] 이 토픽 · ${long.length}자 · sha256 ${"a".repeat(12)}\n본문이 길어 결정 원문 파일의 \`===== 결정 #3 원문 시작 · sha256 ${"a".repeat(12)} =====\` 구간에 둡니다.`);
+    expect(prompt).toContain(`[#9 user/decision] 승계: 단계 cp0-prep(토픽 cp0-topic #3, 범위 세대 1) · ${long.length}자 · sha256 ${"a".repeat(12)}\n본문은 #3 결정과 같습니다 — 결정 원문 파일의 \`===== 결정 #3 원문 시작 · sha256 ${"a".repeat(12)} =====\` 구간.`);
+    expect(prompt).toContain("[#7 user/decision]\nSHORT-DECISION");
+    expect(prompt).toContain("[#10 user/note]\nNOTE-BODY");
+    expect(prompt).toContain(`결정 원문 파일(읽기 허용 · 판 2 · sha256 ${"f".repeat(12)} · 결정 3건): \`/d/topics/t/artifacts/abc\``);
+    expect(prompt).toContain(`- #9 승계: 단계 cp0-prep(토픽 cp0-topic #3, 범위 세대 1) · ${long.length}자 · 본문은 #3 과 같음`);
+    expectNoRetiredObligation(prompt);
+    // 색인은 새 사실이 아니다 — 새 입력이 없는 계속 턴은 종전 문구 뒤에 색인만 붙는다. 첫 턴도 같은 색인을 싣는다.
+    const idle = buildRelayPrompt({ decisionSources });
+    expect(idle.startsWith("새 입력이 없습니다. 이어서 진행하세요.\n\n결정 원문 파일(읽기 허용")).toBe(true);
+    expect(buildFirstTurnPrompt({ role: "implementer", title: "T", worktreePath: "/w", decisionSources })).toContain("- #3 이 토픽 ·");
+  });
+
   it("계획 리뷰어는 같은 계획의 버전과 직전 판 대비 변경분 경로를 받고, 플래너 첫 턴은 계획 폴더 없이 만들지 않는다", () => {
     const relay = buildRelayPrompt({
       counterpart: { role: "planner", message: "리뷰 지적 1·2 를 반영했습니다." },

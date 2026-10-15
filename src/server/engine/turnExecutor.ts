@@ -11,6 +11,7 @@ import { AgentRunError, UnverifiedAgentResult } from "../adapters/resultParser.j
 // 쓰기 호출의 Git 기준·도구 트리 기준. 거부하면 프로세스는 뜨지 않고, 사유는 구조화된 이벤트로 남으며, 결과·재개 위치는 호출자가
 // checkpoint 로 이미 보존한 상태다(호출자가 execute 전에 record 한다).
 import type { AgentExecutionSettings, AgentResult, Topic, WorkflowState } from "../../shared/contracts.js";
+import { topicMemorySearch } from "../memoryRetrieval.js";
 import type { TurnEnvelope } from "../../shared/turnContract.js";
 import { turnFlags } from "../../shared/roles.js";
 import { bindingOf, designReadRequested, routeSupport, type Provider, type TurnRoute } from "../turnRouting.js";
@@ -158,7 +159,7 @@ export class TurnExecutor {
         this.core.interruptForNewUserInput(topic, request.inputSequence);
         throw new HandledWorkflowInterruption();
       }
-      try { this.core.assertNoMaintenanceLock(); } catch (error) {
+      try { this.core.assertNoMaintenanceLock(undefined, { topicId: topic.id, signal }); } catch (error) {
         this.refuse(request, "maintenance", `${request.purpose} 을 열지 않습니다 — ${error instanceof Error ? error.message : String(error)}`);
       }
       if (this.core.dependencies.enforceBudgets) {
@@ -239,6 +240,8 @@ export class TurnExecutor {
       // 코드 리뷰 원장 ID(E3-4c) — core.turn 을 지나는 최종 판정 호출도 경로로만 실어 오므로 여기서 턴에 옮긴다. 없는 턴에는 키를 두지 않는다.
       ...(request.route.reviewLedger ? { reviewLedger: request.route.reviewLedger } : {}),
       ...(memoryBodies ? { memoryBodies: true } : {}),
+      // 메모리 검색 입력(자문 7) — 토픽에서 고른다. 프롬프트의 역할 안내·작업 경로·전달 기록은 검색어가 아니다. 프로토콜 턴은 메모리를 싣지 않는다(어댑터).
+      ...(flags.protocolOnly ? {} : { memorySearch: topicMemorySearch(database, request.topic) }),
       planMode: request.planMode, protocolOnly: flags.protocolOnly, readablePaths: request.readablePaths,
       consumer: "consensus-engine",
       onExecutionEnvironment: (record: import("../../shared/sessionSettings.js").SessionEnvironment) => database.sessions.observe(request.topic.id, record),

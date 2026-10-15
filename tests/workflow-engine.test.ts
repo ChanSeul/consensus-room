@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -23,6 +23,9 @@ import type { SessionTurn } from "../src/server/types";
 import { envelopeIssues, type TurnEnvelope } from "../src/shared/turnContract";
 
 const temporaryDirectories: string[] = [];
+// 범위 변경 확인(2026-10-13) — 지금 세대를 그대로 확인하는 정상 요청.
+const confirmCurrentScope = (database: ConsensusDatabase, topicId = "topic-1") =>
+  ({ confirmScopeGenerationBump: true as const, expectedScopeGeneration: database.getTopic(topicId).scopeGeneration });
 
 // 운영 라우팅은 결과 봉투 턴이다(⑥) — 옛 결과 모양의 가짜 응답을 그 역할의 봉투로 옮긴다. 플래너 결과의 계획 본문은 계획 폴더의 plan.md 로 쓴다(플래너가
 // 파일로 계획을 쓰는 것과 같다). 봉투 relay 에 없는 턴(종결·ACK·최종 리뷰)의 결과가 오면 던진다.
@@ -297,7 +300,7 @@ describe("범위 세대", () => {
     const sha = "a".repeat(64);
     const { database, engine } = makeEngine("AWAITING_USER_APPROVAL", sha, true);
 
-    const changed = await engine.handleScopeChange("topic-1", "푸시 알림도 이번 범위에 넣어 주세요.");
+    const changed = await engine.handleScopeChange("topic-1", "푸시 알림도 이번 범위에 넣어 주세요.", confirmCurrentScope(database));
 
     expect(changed).toMatchObject({
       state: "DRAFT",
@@ -398,7 +401,7 @@ describe("범위 세대", () => {
     engine.startPlan("topic-1");
     await turnStarted;
     expect(() => engine.startPlan("topic-1")).toThrow("이미 실행 중인 작업");
-    const scopeChange = engine.handleScopeChange("topic-1", "새 범위로 다시 계획합니다.");
+    const scopeChange = engine.handleScopeChange("topic-1", "새 범위로 다시 계획합니다.", confirmCurrentScope(database));
     await abortObserved;
 
     expect(database.runningAction("topic-1")).toMatchObject({ status: "running" });
@@ -447,7 +450,7 @@ describe("범위 세대", () => {
     await waitForActionCompletion(database, "topic-1");
     const firstSHA = database.getTopic("topic-1").planSHA256!;
     engine.approve("topic-1", firstSHA);
-    await engine.handleScopeChange("topic-1", "두 번째 세대 범위로 다시 계획합니다.");
+    await engine.handleScopeChange("topic-1", "두 번째 세대 범위로 다시 계획합니다.", confirmCurrentScope(database));
 
     engine.startPlan("topic-1");
     await waitForActionCompletion(database, "topic-1");
@@ -469,11 +472,43 @@ describe("범위 세대", () => {
     database.updateTopic("topic-1", { branchName: null });
     await engine.close("topic-1");
 
-    await expect(engine.handleScopeChange("topic-1", "닫힌 주제를 다시 열어 주세요."))
+    await expect(engine.handleScopeChange("topic-1", "닫힌 주제를 다시 열어 주세요.", confirmCurrentScope(database)))
       .rejects.toThrow("닫은 주제");
 
     expect(database.getTopic("topic-1")).toMatchObject({ state: "CLOSED", scopeGeneration: 3 });
     expect(database.getTimeline("topic-1").some((event) => event.kind === "scope_change")).toBe(false);
+    database.close();
+  });
+
+  // 2026-10-13 example-topic — 결정을 scope_change 로 보내 인도 대기 토픽이 초기화됐다. 확인 누락·낡은 세대는 재시도 취소·작업 트리 생성·별칭 삭제 전에 거부한다.
+  it("초기화 확인이 없거나 세대가 다르면 아무것도 바꾸지 않고 거부하고, 지금 세대를 확인하면 초기화한다", async () => {
+    const runner = new RecordingGitRunner();
+    const { root, database, engine } = makeEngine("READY_TO_DELIVER", "e".repeat(64), true, runner);
+    const retry = { attempts: 1, lastFiredAt: null, scheduledAt: 1_900_000_000_000, cancelled: false };
+    database.setAutoRetry("topic-1", retry);
+    const alias = join(root, "topics", "topic-1", "plan.md");
+    mkdirSync(dirname(alias), { recursive: true });
+    writeFileSync(alias, "현재 계획");
+    const before = database.getTopic("topic-1");
+
+    const unconfirmed = { confirmScopeGenerationBump: false, expectedScopeGeneration: 3 } as unknown as ReturnType<typeof confirmCurrentScope>;
+    await expect(engine.handleScopeChange("topic-1", "확인 없는 범위 변경", unconfirmed)).rejects.toMatchObject({ statusCode: 400 });
+    await expect(engine.handleScopeChange("topic-1", "낡은 세대의 범위 변경", { confirmScopeGenerationBump: true, expectedScopeGeneration: 2 }))
+      .rejects.toMatchObject({ statusCode: 409, errorCode: "SCOPE_GENERATION_MISMATCH", current: 3 });
+
+    expect(database.getTopic("topic-1")).toEqual(before);
+    expect(runner.args).toEqual([]);
+    expect(database.getAutoRetry("topic-1")).toEqual(retry);
+    expect(readFileSync(alias, "utf8")).toBe("현재 계획");
+    expect(database.getTimeline("topic-1").some((event) => event.kind === "scope_change")).toBe(false);
+
+    // 대조: 지금 세대를 확인하면 같은 검사가 재시도 취소·별칭 삭제를 잡는다. 이 fixture 의 저장소는 실재하지 않으므로 작업 트리를 만들지 않는
+    // 승인 대기 상태로 옮겨 확인한다(확인한 요청의 작업 트리 생성은 app-security 「같은 키의 범위 변경」이 본다).
+    database.updateTopic("topic-1", { state: "AWAITING_USER_APPROVAL", branchName: null });
+    const changed = await engine.handleScopeChange("topic-1", "확인한 범위 변경", { confirmScopeGenerationBump: true, expectedScopeGeneration: 3 });
+    expect(changed).toMatchObject({ state: "DRAFT", scopeGeneration: 4 });
+    expect(database.getAutoRetry("topic-1")).toBeNull();
+    expect(existsSync(alias)).toBe(false);
     database.close();
   });
 });
@@ -535,7 +570,7 @@ describe("사용자 계획 승인", () => {
     database.claimActionRequest("topic-1", "message:scope_change", "scope-key", { body: "범위 변경" });
 
     // 범위 변경은 끝났지만 서버가 원장 finish 전에 죽은 상황 — 마커는 전이와 한 transaction으로 이미 남았다.
-    await engine.handleScopeChange("topic-1", "결제 검증까지 범위에 넣습니다.", "scope-key");
+    await engine.handleScopeChange("topic-1", "결제 검증까지 범위에 넣습니다.", confirmCurrentScope(database), "scope-key");
     database.recoverInterruptedNonDeliveryRequests();
 
     expect(database.getActionRequest("topic-1", "message:scope_change", "scope-key")?.status).toBe("succeeded");
@@ -550,7 +585,7 @@ describe("사용자 계획 승인", () => {
     const sha = "c".repeat(64);
     const { database, engine } = makeEngine("AWAITING_USER_APPROVAL", sha, true);
 
-    const changed = await engine.handleScopeChange("topic-1", "결제 검증까지 범위에 넣습니다.");
+    const changed = await engine.handleScopeChange("topic-1", "결제 검증까지 범위에 넣습니다.", confirmCurrentScope(database));
 
     expect(changed.planEpoch).toBe(2);
     for (const participant of changed.participants) {
@@ -1051,7 +1086,7 @@ describe("미확정 전달과 범위 변경", () => {
     database.recoverInterruptedDeliveryRequests();
     expect(database.unknownDeliveryAction("topic-1")).not.toBeNull();
 
-    await expect(engine.handleScopeChange("topic-1", "새 범위"))
+    await expect(engine.handleScopeChange("topic-1", "새 범위", confirmCurrentScope(database)))
       .rejects.toThrow("결과가 불명확한 commit 또는 push");
     database.close();
   });
@@ -1383,7 +1418,7 @@ describe("2026-09-07 엔진 수정: 회차 소비·종료 정리·메모 비중�
   });
 });
 
-// 2026-09-07 Codex 2차 제안 ④: 닫힌 주제의 빌드 트리 정리 — *-logs 만 남기고 DerivedData 하위를 지운다.
+// 닫힌 주제의 수동 캐시 정리 — 작업·증거 트리와 열린 묶음의 참조를 보호한다.
 describe("닫힌 주제 빌드 트리 정리(archive)", () => {
   function closedTopicWithDerivedData() {
     const root = mkdtempSync(join(tmpdir(), "consensus-room-archive-"));
@@ -1411,7 +1446,7 @@ describe("닫힌 주제 빌드 트리 정리(archive)", () => {
     return { database, engine, worktree };
   }
 
-  it("CLOSED 주제의 DerivedData 에서 *-logs 가 아닌 디렉터리만 지우고 원장에 남긴다", async () => {
+  it("CLOSED 주제의 허용 캐시만 지우고 원장에 남긴다", async () => {
     const { database, engine, worktree } = closedTopicWithDerivedData();
 
     engine.archiveBuildTrees("topic-1");
@@ -1419,19 +1454,95 @@ describe("닫힌 주제 빌드 트리 정리(archive)", () => {
 
     expect(existsSync(join(worktree, "DerivedData", "s7-logs", "artifacts", "file.txt"))).toBe(true);
     expect(existsSync(join(worktree, "DerivedData", "note.txt"))).toBe(true);
-    expect(existsSync(join(worktree, "DerivedData", "gate2-a"))).toBe(false);
-    expect(existsSync(join(worktree, "DerivedData", "s71-post"))).toBe(false);
+    expect(existsSync(join(worktree, "DerivedData", "gate2-a", "Build"))).toBe(false);
+    expect(existsSync(join(worktree, "DerivedData", "s71-post", "Build"))).toBe(false);
     expect(database.getTopic("topic-1").state).toBe("CLOSED");
     const body = database.getTimeline("topic-1").map((event) => event.body).find((text) => text.startsWith("빌드 트리 정리"));
     expect(body).toContain("2개 삭제");
-    expect(body).toContain("gate2-a, s71-post");
-    expect(body).toContain("보존: s7-logs");
+    expect(body).toContain("DerivedData/gate2-a/Build, DerivedData/s71-post/Build");
+    expect(body).toContain("보존: DerivedData/s7-logs");
 
     // 두 번째 실행은 지울 것이 없어도 실패하지 않는다.
     engine.archiveBuildTrees("topic-1");
     await waitForActionCompletion(database, "topic-1");
     expect(database.getTimeline("topic-1").filter((event) => event.body.startsWith("빌드 트리 정리")).length).toBe(2);
     database.close();
+  });
+
+  it("dry-run records the same candidates without deleting", async () => {
+    const { database, engine, worktree } = closedTopicWithDerivedData();
+    engine.archiveBuildTrees("topic-1", undefined, { dryRun: true });
+    await waitForActionCompletion(database, "topic-1");
+    const report = database.getTimeline("topic-1").find(event => event.payload.buildTreePrune)?.payload.buildTreePrune;
+    expect(report).toMatchObject({ dryRun: true, removed: [], candidates: expect.arrayContaining([
+      expect.objectContaining({ path: "DerivedData/gate2-a/Build", bytes: 1024, removed: false }),
+    ]) });
+    expect(existsSync(join(worktree, "DerivedData/gate2-a/Build/file.txt"))).toBe(true);
+    database.close();
+  });
+
+  it.each(["lease", "action", "predecessor", "linked", "reservation-other", "reservation-related"])("preserves a closed tree referenced by %s", async (mode) => {
+    const { database, engine, worktree } = closedTopicWithDerivedData();
+    if (mode === "lease") database.saveVerification({ id: "lease", topicId: "topic-1", cacheKey: "cache", status: "running" });
+    if (mode === "action") {
+      database.createTopic({ ...database.getTopic("topic-1"), id: "other", slug: "other" });
+      database.startAction({ id: "other-action", topicId: "other", kind: "archive", status: "running", createdAt: new Date().toISOString(),
+        finishedAt: null, error: null, pid: null, pgid: null, processExecutable: null, processCommand: null, processStartedAt: null });
+    }
+    if (["predecessor", "linked", "reservation-other", "reservation-related"].includes(mode)) {
+      const budget = { mode: "observe" } as const;
+      database.workGroups.create("open-group", { title: "next", goal: "next", contracts: "contract", stages: [
+        { id: "one", kind: "work", title: "work", goal: "work", acceptance: "done", dependsOn: [], budget },
+        { id: "two", kind: "integration", title: "integration", goal: "integrate", acceptance: "done", dependsOn: ["one"], budget },
+      ] }, "/tmp/repository", "head", mode === "predecessor" ? { predecessor: {
+        topicId: "topic-1", scopeGeneration: 1, committedOID: "head", deferredFindings: [], frozenAt: new Date().toISOString(),
+      } } : {});
+      if (mode === "linked") database.workGroups.link("open-group", "one", "topic-1", "head");
+      if (mode.startsWith("reservation")) database.workGroups.reserve("open-group", "one", {
+        topicId: "not-created", worktreePath: mode === "reservation-related" ? worktree : join(worktree, "..", "future"), baseOID: "head",
+      });
+    }
+    engine.archiveBuildTrees("topic-1");
+    await waitForActionCompletion(database, "topic-1");
+    expect(existsSync(join(worktree, "DerivedData/gate2-a/Build/file.txt"))).toBe(mode !== "reservation-other");
+    const report = database.getTimeline("topic-1").find(event => event.payload.buildTreePrune)?.payload.buildTreePrune;
+    if (mode === "reservation-other") expect(report).toMatchObject({ removed: ["DerivedData/gate2-a/Build", "DerivedData/s71-post/Build"] });
+    else expect(report).toMatchObject({ removed: [], kept: expect.arrayContaining([expect.any(String)]) });
+    database.close();
+  });
+
+  it("uses the existing delivery contract when another stage pushed the identical integration commit", async () => {
+    const { database, engine, worktree } = closedTopicWithDerivedData();
+    database.createTopic({ ...database.getTopic("topic-1"), id: "integration-topic", slug: "integration-topic", worktreePath: join(worktree, "..", "integration") });
+    const budget = { mode: "observe" } as const, commit = "a".repeat(40);
+    database.workGroups.create("delivered", { title: "done", goal: "done", contracts: "contract", stages: [
+      { id: "one", kind: "work", title: "work", goal: "work", acceptance: "done", dependsOn: [], budget },
+      { id: "two", kind: "integration", title: "integration", goal: "integrate", acceptance: "done", dependsOn: ["one"], budget },
+    ] }, "/tmp/repository", commit);
+    database.workGroups.link("delivered", "one", "topic-1", commit);
+    database.workGroups.link("delivered", "two", "integration-topic", commit);
+    database.workGroups.freezeResult("delivered", { stageId: "two", topicId: "integration-topic", baseOID: commit, commitOID: commit,
+      reviewedTreeOID: commit, planSHA256: null, evidenceDigest: null, verifications: [], memoryChanges: [], openQuestions: [], deferredFindings: [], decisions: [], closedAt: new Date().toISOString() });
+    database.updateTopic("topic-1", { pushedOID: commit });
+    expect(database.workGroupDelivered(database.workGroups.get("delivered"))).toBe(true);
+    engine.archiveBuildTrees("topic-1"); await waitForActionCompletion(database, "topic-1");
+    expect(existsSync(join(worktree, "DerivedData/gate2-a/Build"))).toBe(false);
+    database.close();
+  });
+
+  it("records deletion failure separately and fails only archive while keeping CLOSED", async () => {
+    const { database, engine, worktree } = closedTopicWithDerivedData();
+    const blocked = join(worktree, "DerivedData/s71-post/Build");
+    chmodSync(blocked, 0o555);
+    try {
+      const action = engine.archiveBuildTrees("topic-1"); await waitForActionCompletion(database, "topic-1");
+      expect(database.getAction(action)?.status).toBe("failed");
+      expect(database.getTopic("topic-1").state).toBe("CLOSED");
+      expect(existsSync(join(worktree, "DerivedData/gate2-a/Build"))).toBe(false);
+      const report = database.getTimeline("topic-1").find(event => event.payload.buildTreePrune)?.payload.buildTreePrune;
+      expect(report).toMatchObject({ removed: ["DerivedData/gate2-a/Build"], incomplete: [expect.stringContaining("DerivedData/s71-post/Build")],
+        candidates: [expect.objectContaining({ removed: true }), expect.objectContaining({ removed: false, incomplete: true })] });
+    } finally { chmodSync(blocked, 0o755); database.close(); }
   });
 
   it("닫히지 않은 주제는 거부한다", () => {

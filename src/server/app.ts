@@ -12,9 +12,9 @@ import { adoptTopics, assertTopicParent } from "./topicStructure.js";
 import { BrainstormDecisionSchema, BrainstormInputSchema } from "../shared/brainstorm.js";
 import {ReviewGrantInputSchema} from "../shared/reviews.js";
 import {
-  ToolTreeRebaselineInputSchema,
+  ImplementationRebaselineInputSchema, PlanningHoldInputSchema, ToolTreeRebaselineInputSchema,
   ResumeImplementationInputSchema, ResumeInputSchema, ReturnToPlanningInputSchema } from "../shared/contracts.js";
-import { parseWorkGroupCreateBody, WorkGroupInputSchema, type WorkGroupView } from "../shared/workGroups.js";
+import { DeliveryObservationInputSchema, parseWorkGroupCreateBody, WorkGroupInputSchema, type WorkGroupView } from "../shared/workGroups.js";
 import { WorkGroupService } from "./workGroupService.js";
 import { BudgetPolicySchema, BudgetResumeInputSchema } from "../shared/budgets.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -41,7 +41,7 @@ import {
 import { ArtifactStore } from "./artifacts.js";
 import { loadConfig, type ServerConfig } from "./config.js";
 import { ConsensusDatabase } from "./database.js";
-import { EngineDefectInput, EngineDefectWorker } from "./engineDefects.js";
+import { EngineDefectCloser, EngineDefectInput } from "./engineDefects.js";
 import { EngineDefectClosureSchema } from "../shared/engineDefects.js";
 import { GitService } from "./git.js";
 import { redactRecord, safeError } from "./security.js";
@@ -156,14 +156,14 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     enforceBudgets: config.enforceBudgets ?? true,
     maintenanceLockPath: join(config.dataDirectory, "maintenance.lock"),
     hostSandbox: dependencies.hostSandbox,
+    standingReferencePath: config.standingReferencePath,
   });
   evidence.onIdle = () => workflow.pollEvidenceAssessments();
-  const engineDefects = new EngineDefectWorker(database, dependencies.runner, guardRunnerControl(dependencies.codex),
-    config.dataDirectory, resolve(import.meta.dirname, "../.."), dependencies.hostSandbox?.kind !== "unavailable");
+  const engineDefects = new EngineDefectCloser(database, dependencies.runner, resolve(import.meta.dirname, "../.."));
   evidence.canPublish = topicId => workflow.canPublishEvidence(topicId);
   evidence.publishSelection = (guarded, change) => workflow.publishEvidence(guarded, change);
   // 자율중재는 항상 ON이다. 요청 인증·현재 중재자 배정·각 액션의 승인/상태 검사는 별도로 유지한다.
-  const DELEGATED_ACTIONS = new Set(["brainstorm-plan", "brainstorm-close", "approve", "implement", "tool-tree-rebaseline", "commit", "push", "close", "review-resume", "budget-configure", "budget-resume", "resume-implementation", "resume", "return-to-planning", "reconcile-delivery", "discard-orphan-commit"]);
+  const DELEGATED_ACTIONS = new Set(["brainstorm-plan", "brainstorm-close", "approve", "implement", "tool-tree-rebaseline", "implementation-rebaseline", "planning-hold", "commit", "push", "close", "review-resume", "budget-configure", "budget-resume", "resume-implementation", "resume", "return-to-planning", "reconcile-delivery", "discard-orphan-commit"]);
   const callOrigin = (request: { headers: Record<string, unknown> }): CallOrigin | undefined => {
     if (request.headers["x-consensus-actor"] !== "mediator") return undefined;
     return mediatorOrigin(request, null);
@@ -272,13 +272,13 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   // 목록 뷰(E4): 단계 상태와 함께 준비·선택 가능 단계, 단계별 전달 상태(로컬 커밋과 원격 push 를 나눠)를 붙인다. 묶음 전달 완료는
   // 통합 단계 결과 커밋이 push 된 것이다(push 는 조상 전체를 싣는다) — 기능 검증 완료(통합 단계 CLOSED)와 구분한다. 닫힌 단계도 동결 결과를 push 한다.
   app.get("/api/work-groups",async()=>database.workGroups.list().map((group):WorkGroupView=>{
-    const integration=group.stages.at(-1)!,integrationLink=group.links[integration.id],integrationResult=group.results?.[integration.id];
+    const integration=group.stages.at(-1)!,integrationResult=group.results?.[integration.id];
     const continuation = workGroups.continuation(group), selectableStages = workGroups.selectableStages(group);
     return {...group,budget:database.budgets.account(group.id),
       stageStates:Object.fromEntries(group.stages.map(stage=>[stage.id,group.links[stage.id]?database.getTopic(group.links[stage.id].topicId).state:null])),
       delivery:Object.fromEntries(Object.entries(group.links).map(([stageId,link])=>{const flags=database.getFlags(link.topicId);return [stageId,{committedOID:flags.committedOID??null,pushedOID:flags.pushedOID??null}];})),
       // 묶음 전달 완료: 통합 결과 커밋이 묶음의 어느 연결 토픽에서든 push 됐다(변경 없는 통합은 다른 단계가 이미 push 한 기준 커밋이 결과일 수 있다 — E4 보완 F003).
-      delivered:Boolean(integrationLink&&integrationResult&&Object.values(group.links).some(link=>database.getFlags(link.topicId).pushedOID===integrationResult.commitOID)),
+      delivered:Boolean(integrationResult&&database.workGroupDelivered(group)),
       readyStages:[...new Set([continuation.stageId, ...selectableStages].filter((id): id is string => id !== null))],
       continuation, selectableStages};
   }));
@@ -287,6 +287,12 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     const {input,options}=parseWorkGroupCreateBody(request.body);
     if (options.parentTopicId && request.headers["x-consensus-actor"] === "mediator") assertMediatorAssignment(database.roles, request.headers, options.parentTopicId);
     return runIdempotent(request,reply,globalLedger(database,"work-group:create"),201,key=>workGroups.create(input,id=>database.annotateGlobalRequest("work-group:create",key,{plannedGroupId:id}),options));
+  });
+  app.post<{Params:{id:string}}>("/api/work-groups/:id/delivery-observation",async(request,reply)=>{
+    const input=DeliveryObservationInputSchema.parse(request.body ?? {});
+    const origin=request.headers["x-consensus-actor"]==="mediator"?"mediator":"user";
+    return runIdempotent(request,reply,globalLedger(database,`work-group:delivery-observation:${request.params.id}`),200,
+      key=>workGroups.observeDelivery(request.params.id,input,origin,key));
   });
   // 본문 stageId 가 있으면 막힌 단계 옆 독립 준비 단계를 골라 연다(E4-6). 없으면 기본 규칙(한 번에 한 단계, 첫 준비 단계).
   app.post<{Params:{id:string}}>("/api/work-groups/:id/next",async(request,reply)=>{
@@ -391,14 +397,8 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     const topic = database.getTopic(request.params.id);
     const row = database.engineDefects.enqueue(topic.id, EngineDefectInput.parse(redactRecord(EngineDefectInput.parse(request.body))));
     database.appendEvent({ topicId: topic.id, actor: "system", kind: "system", state: topic.state,
-      body: `엔진 결함 To-do 보관: ${row.title}. 토픽 완료 후 처리합니다.`, payload: { engineDefectId: row.id } });
+      body: `엔진 결함 To-do 보관: ${row.title}. 원장에 보관하며 master 가 분류해 수리를 배정합니다.`, payload: { engineDefectId: row.id } });
     return row;
-  });
-  app.post<{ Params: { id: string } }>("/api/engine-defects/:id/retry", async request => {
-    if (request.headers["x-consensus-actor"] === "mediator") {
-      throw Object.assign(new Error("중단된 엔진 결함 재개는 사용자만 요청할 수 있습니다."), { statusCode: 403 });
-    }
-    return engineDefects.retry(request.params.id);
   });
   // Closing takes a defect out of the queue for good. The mediator reports defects, so it must not be able to hide one.
   app.post<{ Params: { id: string } }>("/api/engine-defects/:id/close", async request => {
@@ -668,8 +668,9 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     const origin = input.kind === "note" || input.kind === "evidence"
       ? (mediatorHeader ? mediatorOrigin(request, null) : undefined)
       : callOrigin(request);
+    // 범위 변경의 초기화 확인·기대 세대는 parse 가 원장 기록 전에 요구하고(누락 400), 세대 대조는 handleScopeChange 가 부작용 전에 한다(409).
     return runIdempotent(request, reply, ledger, 200, (idempotencyKey) => input.kind === "scope_change"
-      ? workflow.handleScopeChange(request.params.id, input.body, idempotencyKey, origin)
+      ? workflow.handleScopeChange(request.params.id, input.body, input, idempotencyKey, origin)
       : workflow.postMessage(request.params.id, input.kind, input.body, idempotencyKey, origin));
   });
 
@@ -704,6 +705,16 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       else if(action === "tool-tree-rebaseline") {
         const input = ToolTreeRebaselineInputSchema.parse(request.body);
         response = accepted(randomUUID(), await workflow.rebaselineToolTree(topicId, input.reason, origin, input.maintenanceLock));
+      }
+      else if(action === "implementation-rebaseline") {
+        const input = ImplementationRebaselineInputSchema.parse(request.body);
+        response = accepted(randomUUID(), await workflow.rebaselineImplementation(topicId, input, idempotencyKey, origin));
+      }
+      else if(action === "planning-hold") {
+        // 계획 왕복 1회 보류(자문 17) — 요청 기록만 하고 실행은 시작하지 않는다. 응답의 hold 가 결속값과 실제 적용 경계다.
+        const input = PlanningHoldInputSchema.parse(request.body);
+        const hold = workflow.requestPlanningHold(topicId, input, idempotencyKey, origin);
+        response = { ...accepted(randomUUID(), database.getTopic(topicId)), hold };
       }
       else if(action === "review-resume") {
         workflow.assertBudgetEditable(topicId);
@@ -762,7 +773,10 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       } else if (action === "discard-orphan-commit") {
         response = accepted(randomUUID(), await workflow.discardOrphanCommit(topicId));
       } else if (action === "close") response = accepted(randomUUID(), await workflow.closeStage(topicId));
-      else if (action === "archive") response = accepted(workflow.archiveBuildTrees(topicId, actionId), database.getTopic(topicId));
+      else if (action === "archive") {
+        const input = z.object({ dryRun: z.boolean().optional() }).strict().parse(request.body ?? {});
+        response = accepted(workflow.archiveBuildTrees(topicId, actionId, input), database.getTopic(topicId));
+      }
       else throw Object.assign(new Error(`알 수 없는 action입니다: ${action}`), { statusCode: 404 });
       return response;
     });
@@ -830,7 +844,6 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       const restored = workflow.restoreScheduledRetries();
       continuations.start();
       evidence.start();
-      engineDefects.start();
       phase = "ready";
       if (restored > 0) process.stdout.write(`시작: 사용 한도로 멈춘 주제 ${restored}건의 자동 재시도 예약을 복원했습니다.\n`);
     } catch (error) { if ((phase as string) !== "stopping") phase = "failed"; throw error; }
@@ -845,7 +858,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     await initialization?.catch(() => {});
     // Start all stops before awaiting any: continuations may be waiting for an action
     // whose cancellation belongs to workflow.shutdown(). Keep the DB open until all settle.
-    const outcomes = await Promise.allSettled([continuations.stop(), engineDefects.stop(), evidence.stop(), workflow.shutdown()]);
+    const outcomes = await Promise.allSettled([continuations.stop(), evidence.stop(), workflow.shutdown()]);
     const errors = outcomes.flatMap(result => result.status === "rejected" ? [result.reason] : []);
     if (errors.length) throw new AggregateError(errors, "서버 종료 처리를 마치지 못했습니다.");
   })());

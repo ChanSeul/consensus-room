@@ -57,6 +57,28 @@ it("keeps previous planning sessions as history outside the ticket flow", () => 
   }
 });
 
+it.each([
+  ["BRAINSTORM_READY", null], ["BRAINSTORMING", null], ["FAILED", "BRAINSTORMING"], ["USER_DECISION_REQUIRED", "BRAINSTORM_READY"],
+] as const)("keeps ticket brainstorming seats current in %s (resume %s)", (state, resumeState) => {
+  const f = fixture();
+  f.topic("t");
+  for (const role of ["claude", "codex"] as const) f.db.upsertParticipant("t", {
+    role, sessionId: `${role}-discussion`, mode: "attached", acknowledgedPlanSHA256: null,
+  });
+  f.db.updateTopic("t", { workflowMode: "ticket", state, resumeState });
+  const graph = f.graph("t");
+  const roles = ["mediator", "planner", "plan-reviewer", "runner", "reviewer", "verifier"];
+  const current = graph.nodes.filter(node => node.kind === "session" && !node.historical && node.lane === "t");
+  expect(current.map(node => node.role).sort()).toEqual([...roles].sort());
+  for (const [role, target, sid] of [["planner", "planner", "claude-discussion"], ["plan-reviewer", "plan-review", "codex-discussion"]] as const) {
+    expect(current.find(node => node.role === role)).toMatchObject({ sessionId: sid, settingsTargets: [target] });
+  }
+  expect(graph.nodes.some(node => node.historical && ["planner", "plan-reviewer"].includes(node.role ?? ""))).toBe(false);
+  const flow = graph.edges.filter(edge => edge.kind === "flow");
+  const path = ["topic:t", ...roles.map(role => current.find(node => node.role === role)!.id)];
+  expect(flow.map(edge => [edge.from, edge.to])).toEqual(path.slice(1).map((id, index) => [path[index], id]));
+});
+
 it("retains sessions from the stored previous recovery lineage without timeline events", () => {
   const f=fixture();f.topic("t");f.topic("outside");
   const old=f.db.planning.recoveryLineage("t","implementer",{kind:"approval",revision:1,sha256:"old"});
@@ -181,6 +203,15 @@ it("reads host session settings without trusting corrupt or out-of-root subject 
 it("keeps the two brainstorming sessions visible on a management topic", () => {
   const f=fixture();f.topic("root",null,true);f.db.updateTopic("root",{state:"BRAINSTORM_READY"});
   for (const role of ["claude","codex"] as const) f.db.upsertParticipant("root",{role,sessionId:`${role}-discussion`,mode:"attached",acknowledgedPlanSHA256:null});
+  const graph=f.graph("root");
+  expect(graph.nodes.filter(n=>["planner","plan-reviewer"].includes(n.role??"")).map(n=>[n.sessionId,n.historical])).toEqual([["claude-discussion",false],["codex-discussion",false]]);
+  expect(graph.nodes.some(n=>n.role==="runner")).toBe(false);
+});
+
+it("keeps a stopped management discussion's sessions current until it resumes", () => {
+  const f=fixture();f.topic("root",null,true);
+  for (const role of ["claude","codex"] as const) f.db.upsertParticipant("root",{role,sessionId:`${role}-discussion`,mode:"attached",acknowledgedPlanSHA256:null});
+  f.db.updateTopic("root",{state:"FAILED",resumeState:"BRAINSTORMING"});
   const graph=f.graph("root");
   expect(graph.nodes.filter(n=>["planner","plan-reviewer"].includes(n.role??"")).map(n=>[n.sessionId,n.historical])).toEqual([["claude-discussion",false],["codex-discussion",false]]);
   expect(graph.nodes.some(n=>n.role==="runner")).toBe(false);

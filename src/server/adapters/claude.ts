@@ -17,12 +17,15 @@ import type { AgentAdapter, CommandRunner, CommandResult, CreatedSession, Sessio
 import { agentEnvironment } from "../security.js";
 import { ProjectMemoryReader, type MemoryReaderOptions } from "../projectMemory.js";
 import { readAppliedInstructions } from "../projectInstructions.js";
-import { agentRunError, parsePlanRepair, parseAgentResult, parseTurnEnvelope, isZeroTurnResult, UnverifiedAgentResult } from "./resultParser.js";
+import { agentRunError, parsePlanRepair, parseAgentResult, parseTurnEnvelope, isClaudeFinalResult, isZeroTurnResult, UnverifiedAgentResult } from "./resultParser.js";
 import { ExecutionMetrics, readClaudeUsageBaseline } from "./executionMetrics.js";
 import { captureFigma } from "./figmaCapture.js";
 import { createToolTimeMeter } from "./toolTime.js";
 import { resolveSupportedTurn, runnerControlPaths } from "./turnPolicy.js";
+import { TOOL_TREE_RUNNER_NOTE } from "../toolTree.js";
+import type { TurnAccess } from "../../shared/roles.js";
 import { resolveHostExecutable } from "../hostRuntime.js";
+import { reportBackgroundFailure } from "../backgroundTask.js";
 
 export interface ClaudeAdapterOptions {
   memoryReaderOptions?: MemoryReaderOptions;
@@ -76,6 +79,25 @@ const FIGMA_WRITE_METHODS = ["use_figma", "create_new_file", "generate_diagram"]
 // 중첩 증식(정책 7)을 구조적으로 막을 수 없다. built-in 배제 수단이 생기면 재검토한다.
 
 const FINAL_RESULT_TIMEOUT_MS = 120_000;
+
+// 쓰기(구현) 턴의 xcodebuild 샌드박스 면제(buildIsolationSettings excludedCommands) — 실측으로 면제가 확인된 호출 형태를 지침으로 알린다(아래 면제 주석).
+// 파이프·리디렉션 금지 등은 그 단독 호출 형식을 지키기 위한 운영 지침이다(CLI 판정 규칙 전체를 단정하지 않는다).
+// 지시문 블록은 변경·압축 때만 다시 전달되므로, 면제가 켜지는 턴의 매 턴 입력에 싣는다(2026-10-14 CP4: 첫 프롬프트의 같은 안내가 자동 압축 뒤 지켜지지 않았다).
+export const XCODEBUILD_CALL_CONTRACT = "xcodebuild 호출 방식: 이 턴에서 빌드할 때는 맨 이름 `xcodebuild` 또는 `xcrun xcodebuild`로 시작하는 단독 Bash 호출을 사용하세요. "
+  + "cd·변수 대입·복사 같은 준비 명령은 별도 Bash 호출로 먼저 하고, 빌드 호출에는 접두·`&&`·`;` 연결·파이프·리디렉션을 붙이지 마세요. "
+  + "위치는 cd 대신 `-workspace`·`-project`·`-derivedDataPath` 같은 경로 인자에 리터럴 절대 경로로 주세요.";
+
+// 이 턴의 임시 폴더(actionTemp) 안내 — 샌드박스 Bash 의 $TMPDIR 은 CLI 가 사용자별 공용 폴더(/tmp/claude-<uid>)로 바꾸므로 엔진이 넘긴 TMPDIR 과
+// 다르고, 그 폴더에는 도구 규칙이 없다(엔진 결함 example-temp-access). 접근 수준에 열린 도구만 적는다 — 읽기 턴(계획자 턴 포함) 문구는 Write·Edit 를 말하지 않는다.
+export function actionTempRunnerNote(actionTemp: string, access: TurnAccess): string {
+  const tools = access === "write"
+    ? "Bash 와 Read·Write·Edit 도구가 모두 이 폴더를 쓸 수 있습니다."
+    : "이 폴더에는 Bash 로 파일을 만들고, Read 도구나 Bash 로 읽을 수 있습니다.";
+  const blocked = access === "write" ? "Read·Write 도구로" : "Read 도구로";
+  return `이 턴의 임시 폴더: \`${actionTemp}\`. ${tools} 하위 에이전트 결과나 긴 출력처럼 나중에 Read 로 읽을 파일은 이 폴더에 두고, `
+    + `하위 에이전트에게 맡길 때는 이 경로를 지시에 적어 넘기세요. Bash 의 \`$TMPDIR\` 은 CLI 공용 임시 폴더라 ${blocked} 열리지 않습니다. `
+    + "이 폴더는 턴이 끝나면 지워집니다.";
+}
 
 export class ClaudeAdapter implements AgentAdapter {
   readonly role = "claude" as const;
@@ -156,8 +178,9 @@ export class ClaudeAdapter implements AgentAdapter {
   private async invoke(turn: Omit<SessionTurn, "sessionId"> | SessionTurn, args: string[], fresh: boolean, envelope?: EnvelopeRole): Promise<AgentResult | TurnEnvelope> {
     const schema = envelope ? envelopeOutputSchema(envelope) : undefined;
     let output = await this.invokeOutput(turn, args, fresh, schema, envelope);
-    // 모델 호출 0회로 끝난 합성 턴(resume 직후 큐에 남은 알림이 먼저 소비된 경우)은 비용 0 이므로 같은 호출을 한 번 더 돌린다.
-    // 새 세션(fresh)은 큐가 비어 있어 해당 없고, 두 번째도 0턴이면 그대로 계약 오류로 올린다.
+    // 합성 0턴 result 만 내고 모델·도구 작업 없이 끝난 호출(resume 직후 큐에 남은 알림이 먼저 소비된 경우)은 같은 호출을 한 번 더 돌린다.
+    // 합성 result 뒤 실제 작업이 이어진 호출은 대상이 아니다(isZeroTurnResult). 새 세션(fresh)은 큐가 비어 있어 해당 없고,
+    // 두 번째도 0턴이면 그대로 계약 오류로 올린다.
     if (!fresh && isZeroTurnResult(output.jsonLines)) {
       this.options.onZeroTurnRetry?.();
       output = await this.invokeOutput(turn, args, fresh, schema, envelope);
@@ -214,9 +237,12 @@ export class ClaudeAdapter implements AgentAdapter {
       ? providerOptions.advisorModel === undefined ? "fable" : providerOptions.advisorModel
       : null;
     const workspace = resolve(turn.cwd);
-    const actionTemp = await mkdtemp(join(tmpdir(), "consensus-room-claude-"));
+    const createdTemp = await mkdtemp(join(tmpdir(), "consensus-room-claude-"));
     let figmaCapture: Awaited<ReturnType<typeof captureFigma>> | undefined;
     try {
+      // 실제 경로로 푼다(/var → /private/var) — sandbox·도구 규칙·러너 안내·TMPDIR 이 한 철자를 써서, 도구 규칙 대조가 CLI 의 링크 해석과
+      // 무관하게 맞는다(Codex 와 같은 방식, 엔진 결함 example-temp-access).
+      const actionTemp = await realpath(createdTemp);
       const permissionMode = policy.planMode ? "plan" : "dontAsk";
       const executionSettings = turn.settings ?? DEFAULT_AGENT_SETTINGS.claude;
       const defaultWindow = policy.access === "write" ? RUNNER_AUTO_COMPACT_WINDOW.implementation : RUNNER_AUTO_COMPACT_WINDOW.planning;
@@ -299,7 +325,7 @@ export class ClaudeAdapter implements AgentAdapter {
       // 한 번 싣는다(매니페스트 없이). 그 뒤 resume 은 다시 매니페스트만이다.
       const injectMemory = Boolean(this.memory) && !protocolOnly && (newSession || turn.memoryBodies === true);
       const enriched = injectMemory
-        ? await this.memory!.buildPrompt(turn.prompt, this.role, turn.signal, turnContract(job).memoryUpdates)
+        ? await this.memory!.buildPrompt(turn.prompt, this.role, turn.signal, turnContract(job).memoryUpdates, turn.memorySearch)
         : await this.withMemoryManifest(turn, protocolOnly);
       const instructionText = [EXECUTION_POLICY_NOTE,
         ...(policy.fanout ? ["Workflow 결과는 완료 알림 또는 TaskOutput(task_id, block=true)으로 기다리세요. 로그·시각을 반복 조회하지 말고, 필요한 하위 작업이 끝난 뒤 최종 결과를 제출하세요."] : []),
@@ -310,7 +336,11 @@ export class ClaudeAdapter implements AgentAdapter {
       // Keep Claude's system snapshot unchanged (including preserved thinking). Ordinary turns
       // deliver worker rules once, or after their content changes. Protocol-only turns always carry them and keep no receipt.
       const deliverInstructions = protocolOnly || newSession || !await this.instructionsDelivered(receiptKey, instructionHash);
-      const stdin = deliverInstructions ? [instructionText, enriched].join("\n\n") : enriched;
+      // 빌드 호출 계약과 도구 트리 안내는 지시문 영수증과 무관하게 매 턴 싣는다 — 면제(excludedCommands)와 도구 트리 쓰기 거부가 켜지는 같은 조건(쓰기 턴)에서만.
+      const callContract = policy.access === "write" ? [XCODEBUILD_CALL_CONTRACT, TOOL_TREE_RUNNER_NOTE] : [];
+      // 이 턴의 임시 폴더 안내도 매 턴 싣는다 — 경로가 턴마다 바뀌고, 도구를 쓰는 모든 턴이 하위 에이전트 결과를 파일로 받는다.
+      const actionTempNote = policy.tools === "none" ? [] : [actionTempRunnerNote(actionTemp, policy.access)];
+      const stdin = [...(deliverInstructions ? [instructionText] : []), ...callContract, ...actionTempNote, enriched].join("\n\n");
       const startedAt = Date.now();
       const toolTime = createToolTimeMeter("claude");
       const environment = agentEnvironment({
@@ -378,8 +408,9 @@ export class ClaudeAdapter implements AgentAdapter {
         signal: turn.signal, onSpawn: spawned => { turn.onProcessSpawn?.(spawned); observeEnvironment(turn, "claude", policy, executionSettings, `Claude ${permissionMode}; sandbox enabled`, spawned, newSession ? "create" : "resume"); },
         onJSONLine: (value, at) => { toolTime.observe(value, at); metrics.observe(value); observeDesign(value); observeInstructionContext(value); },
         // stream-json 의 마지막 줄은 {"type":"result"} 다. 그 뒤 2분 안에 프로세스가 안 끝나면 hang 으로 보고 정리한다.
+        // 합성 0턴 성공 result 는 뒤에 실제 턴이 이어질 수 있어 시작점에서 뺀다(isClaudeFinalResult).
         finalResultTimeoutMs: FINAL_RESULT_TIMEOUT_MS,
-        isFinalResult: (value) => typeof value === "object" && value !== null && (value as { type?: unknown }).type === "result",
+        isFinalResult: isClaudeFinalResult,
         environment,
       });
       // 테스트용 runner가 onJSONLine을 생략해도 최종 버퍼를 한 번 관찰한다.
@@ -421,7 +452,7 @@ export class ClaudeAdapter implements AgentAdapter {
       }
     } finally {
       await figmaCapture?.close();
-      await rm(actionTemp, { recursive: true, force: true });
+      await rm(createdTemp, { recursive: true, force: true }).catch(error => reportBackgroundFailure("claude-action-temp-cleanup", error));
     }
   }
 
@@ -432,7 +463,8 @@ export class ClaudeAdapter implements AgentAdapter {
     protocolOnly: boolean,
   ): Promise<string> {
     if (!this.memory || protocolOnly) return turn.prompt;
-    const manifest = await this.memory.buildManifest(turn.prompt, this.role, turn.signal, turnContract(resolveSupportedTurn("claude", turn).job).memoryUpdates);
+    const manifest = await this.memory.buildManifest(turn.prompt, this.role, turn.signal,
+      turnContract(resolveSupportedTurn("claude", turn).job).memoryUpdates, turn.memorySearch);
     return manifest ? `${turn.prompt}\n\n${manifest}` : turn.prompt;
   }
 
@@ -613,6 +645,10 @@ export function buildIsolationSettings(
           `Edit(${permissionPath(workspace)}/**)`,
           `Write(${permissionPath(workspace)}/**)`,
         ]),
+        // 이 턴의 임시 폴더는 sandbox 가 이미 연 접근 수준 그대로 도구 규칙에도 연다 — 읽기는 모든 턴, 쓰기는 쓰기 턴만. 규칙이 없으면 Bash 로
+        // 만든 파일을 Read 가 거부한다(엔진 결함 example-temp-access, 2026-10-13: 하위 에이전트 결과를 Read 로 읽다 막힘). 계획자 턴의 쓰기는 계획 폴더뿐이다.
+        `Read(${permissionPath(actionTemp)}/**)`,
+        ...(implementation ? [`Edit(${permissionPath(actionTemp)}/**)`, `Write(${permissionPath(actionTemp)}/**)`] : []),
         "Glob",
         "Grep",
         "Bash",
@@ -636,9 +672,11 @@ export function buildIsolationSettings(
       // actool에서 사망). XPC는 filesystem·network 설정으로 열 수 없어 이 명령 하나만 sandbox 밖에서
       // 실행한다 — 구현 턴 한정, simctl은 제외(런타임 게이트 강등은 유지).
       // 매칭 의미론(CLI 2.1.251 실물 확인): 와일드카드 없는 항목은 명령 문자열 전체와 exact 비교라
-      // "xcodebuild" 단독은 인자가 붙는 순간 불일치한다. "xcodebuild *"는 ^xcodebuild( .*)?$로 컴파일되고,
-      // 복합 명령은 세그먼트 하나만 맞아도 전체가 면제된다. 래퍼 스크립트 안에 숨은 xcodebuild는
-      // 매칭되지 않는다 — Bash 명령 문자열 최상위에 xcodebuild가 그대로 등장해야 한다.
+      // "xcodebuild" 단독은 인자가 붙는 순간 불일치한다. "xcodebuild *"는 ^xcodebuild( .*)?$로 컴파일된다.
+      // 복합 명령: 2.1.251 당시에는 세그먼트 하나만 맞아도 전체가 면제된다고 읽었으나, 최근 실측(2026-10-14 CP0·CP2·CP4,
+      // CLI 2.1.299)에서는 `cd … && xcodebuild`·`WT=…; xcodebuild`·리디렉션을 붙인 호출이 면제를 잃었고, 첫 토큰이 맨 이름
+      // xcodebuild인 단독 호출은 면제됐다. CLI 내부 판정 규칙은 확정하지 않았다 — 러너에게는 실측된 형태만 알린다
+      // (XCODEBUILD_CALL_CONTRACT). 래퍼 스크립트 안에 숨은 xcodebuild는 매칭되지 않는다.
       excludedCommands: implementation ? ["xcodebuild *", "xcrun xcodebuild *"] : [],
       filesystem: {
         // 구현 턴은 worktree를 고쳐야 하므로 쓰기를 연다. permissions.allow만으로는 부족하다 —

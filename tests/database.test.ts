@@ -216,20 +216,42 @@ describe("이벤트 원장과 재시작 복구", () => {
     reopened.close();
   });
 
-  it("완료 토픽의 중단된 엔진 후속 action은 성공으로 복구하지 않고 원본 완료 상태를 보존한다", () => {
+  it("완료 토픽의 중단된 엔진 후속 action은 성공으로 복구하지 않고 원본 완료 상태와 결함 기록을 보존한다", () => {
     const { database, path } = openDatabase();
     database.createTopic({ ...topic(), state: "CLOSED" });
     const defect = database.engineDefects.enqueue("topic-1", { key: "crash", title: "crash", evidence: "observed crash", workaround: "" });
     database.engineDefects.save({ ...defect, status: "reviewing", actionId: "action-1", head: "fixed-head" });
     database.startAction(runningAction("action-1", "engine-defect"));
     database.recoverInterruptedActions();
-    database.engineDefects.recover();
     const records = new DatabaseSync(path);
     expect(records.prepare("SELECT status FROM actions WHERE id=?").get("action-1")?.status).toBe("cancelled");
     records.close();
     expect(database.getTopic("topic-1").state).toBe("CLOSED");
-    expect(database.engineDefects.get(defect.id)).toMatchObject({ status: "blocked", head: "fixed-head" });
+    // 지운 자동 큐의 행은 기록된 그대로 읽힌다 — 기동 복구가 결함 상태를 바꾸지 않는다.
+    expect(database.engineDefects.get(defect.id)).toMatchObject({ status: "reviewing", actionId: "action-1", head: "fixed-head" });
     database.close();
+  });
+
+  it.each([false, true])("중단된 archive는 CLOSED와 기존 삭제 기록을 보존하고 결과 불명으로 복구한다 (보고서 %s)", withReport => {
+    const { database, path } = openDatabase();
+    database.createTopic({ ...topic(), state: "CLOSED" });
+    database.startAction(runningAction("archive-interrupted", "archive"));
+    if (withReport) database.appendEvent({ topicId: "topic-1", actor: "system", kind: "system", state: "CLOSED",
+      body: "이미 기록한 일부 삭제", payload: { buildTreePrune: { removed: ["DerivedData/Build"], freedBytes: 10 } } });
+    const before = database.getTimeline("topic-1");
+    database.close();
+
+    const reopened = new ConsensusDatabase(path);
+    reopened.recoverInterruptedActions();
+    expect(reopened.getAction("archive-interrupted")).toMatchObject({ status: "cancelled", error: expect.stringContaining("결과를 확정할 수 없습니다") });
+    expect(reopened.getTopic("topic-1").state).toBe("CLOSED");
+    expect(reopened.getFlags("topic-1").resumeState).toBeNull();
+    const timeline = reopened.getTimeline("topic-1");
+    expect(timeline.slice(0, before.length)).toEqual(before);
+    expect(timeline.at(-1)).toMatchObject({ state: "CLOSED", payload: { archiveInterrupted: true, recoveredActionId: "archive-interrupted" } });
+    reopened.recoverInterruptedActions();
+    expect(reopened.getTimeline("topic-1")).toEqual(timeline);
+    reopened.close();
   });
 
   it("중단된 CLI 작업을 재시작 뒤 성공으로 바꾸지 않는다", () => {

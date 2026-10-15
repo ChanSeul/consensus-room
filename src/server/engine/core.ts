@@ -2,8 +2,6 @@ import { assertTurnResult, envelopeIssues, envelopeRole, requireEnvelopeRole, tu
 import { isTopicGroup } from "../../shared/topicStructure.js";
 import {ReviewBlocked} from "../reviewLedger.js";
 import { existsSync, readFileSync } from "node:fs";
-import { dirname } from "node:path";
-import { assertEngineRepositoryAvailable } from "../engineRepositoryLock.js";
 import {reviewScope} from "../../shared/reviews.js";
 import { wrapWorkGroupAdapter } from "../workGroupAdapter.js";
 import { BudgetController } from "../budgetController.js";
@@ -208,6 +206,10 @@ export interface EnvelopeNext {
   payload?: Record<string, unknown>;
 }
 
+// 계획 왕복 경계(자문 17 1회 보류) — 이 봉투 기록 뒤 왕복이 열 다음 모델 턴의 단계(continueTo)와 그 이름. 정지·승인으로 끝나는 경계는 continueTo 가 null 이다.
+// 대기 보류가 있으면 recordEnvelope 가 같은 transaction 에서 다음 단계 전이를 정지로 바꾸거나(continueTo 있음) 이미 멈춘 경계에서 소비한다(null).
+export interface RelayBoundary { continueTo: WorkflowState | null; label: string | null }
+
 // AgentResult 턴의 옵션(core.turn) — 결과 계약 검사·교정 사다리·새 입력 인터럽트를 지나는 옛 경로다.
 export interface ResultTurnOptions {
   freshSession?: boolean;
@@ -361,13 +363,13 @@ export class EngineCore {
     if (initialTransition) {
       assertTransition(topic.state, initialTransition.to);
       topic = this.dependencies.database.applyTopicTransition({ topicId, ...release,
-        changes: { ...releaseChanges, state: initialTransition.to, lastError: null, resumeState: null }, startAction: record,
+        assertAdmission: () => this.assertNoMaintenanceLock(), changes: { ...releaseChanges, state: initialTransition.to, lastError: null, resumeState: null }, startAction: record,
         events: [...admissionEvents, { actor: "system", kind: "system", state: initialTransition.to, body: initialTransition.message,
           payload: { from: topic.state, to: initialTransition.to } }],
       });
     } else if (admissionEvents.length > 0 || admissionRelease) {
-      topic = this.dependencies.database.applyTopicTransition({ topicId, ...release, changes: releaseChanges ?? {}, startAction: record, events: admissionEvents });
-    } else this.dependencies.database.startAction(record);
+      topic = this.dependencies.database.applyTopicTransition({ topicId, ...release, assertAdmission: () => this.assertNoMaintenanceLock(), changes: releaseChanges ?? {}, startAction: record, events: admissionEvents });
+    } else this.dependencies.database.startAction(record, () => this.assertNoMaintenanceLock());
     const inputSequence = this.latestSequence(topicId);
     this.active.set(topicId, { actionId, controller, completion });
     // A resumed action may consume stored results without a model turn. Its input
@@ -420,6 +422,12 @@ export class EngineCore {
         this.dependencies.database.finishAction(actionId, cancelled ? "cancelled" : "failed", message);
         return;
       }
+      // 캐시 정리는 닫힌 제품 결과의 상태를 바꾸지 않는다. 부분 삭제·취소는 action 실패와 원장에만 남긴다.
+      if (kind === "archive") {
+        this.dependencies.database.finishAction(actionId, cancelled ? "cancelled" : "failed", message);
+        this.event(topicId, "system", "system", message, { archiveFailed: true });
+        return;
+      }
       const failure = this.dependencies.database.finishActionAndFailTopic({
         actionId,
         topicId,
@@ -444,19 +452,16 @@ export class EngineCore {
       throw new Error("이 주제에서 이미 실행 중인 작업이 있습니다.");
     }
     this.assertNoMaintenanceLock(options.maintenanceOwner);
-    if (this.dependencies.maintenanceLockPath) {
-      assertEngineRepositoryAvailable(dirname(this.dependencies.maintenanceLockPath), this.dependencies.database.getTopic(topicId).repositoryPath);
-    }
   }
 
   // 중재자가 도구 트리·서버를 교체하는 동안(next-stop.sh) 새 실행을 시작하지 않는다 — 유휴 확인과 교체 사이의 경쟁을 막는 공유 잠금.
   // 60분이 지나고 소유 PID가 실제로 종료된 잠금만 무시한다. 손상된 소유 기록은 시간만으로 해제하지 않는다.
   // 잠금 **소유자**(잠금 파일의 pid·at 을 그대로 제시한 호출)는 통과한다 — 유지보수 스크립트가 잠금을 쥔 채 마지막에 기준 갱신(rebaseline)을
   // 부르는 종료 절차가 자기 잠금에 막히지 않게(R3-06). 잠금을 조기에 풀어 유휴 확인↔교체 경쟁을 되살리지 않는다.
-  assertNoMaintenanceLock(owner?: MaintenanceLockOwner): void {
+  assertNoMaintenanceLock(owner?: MaintenanceLockOwner, admitted?: { topicId: string; signal: AbortSignal }): void {
     const path = this.dependencies.maintenanceLockPath;
     if (!path || !existsSync(path)) return;
-    let info: { at?: string; reason?: string; pid?: number } = {};
+    let info: { at?: string; reason?: string; pid?: number; mode?: string } = {};
     try { info = JSON.parse(readFileSync(path, "utf8")) as { at?: string; reason?: string; pid?: number }; } catch { /* 형식 무관 — 파일 존재가 잠금이다 */ }
     const timestamp = info.at ? Date.parse(info.at) : NaN;
     const age = Date.now() - timestamp;
@@ -467,6 +472,12 @@ export class EngineCore {
     }
     if (deadOwner && age > 60 * 60 * 1000) return;
     if (owner && typeof info.pid === "number" && info.pid === owner.pid && info.at === owner.at) return;
+    if (admitted && info.reason === "restart_room" && info.mode === "idle-restart") {
+      const active = this.active.get(admitted.topicId);
+      const action = active && this.dependencies.database.getAction(active.actionId);
+      if (!admitted.signal.aborted && active?.controller.signal === admitted.signal &&
+        action?.topicId === admitted.topicId && action.status === "running") return;
+    }
     throw new Error(`중재자 유지보수 잠금 중입니다(${info.reason ?? "사유 없음"}, ${info.at ?? "시각 없음"}) — 끝난 뒤 다시 시도하세요.`);
   }
 
@@ -957,6 +968,21 @@ export class EngineCore {
     return previous?.payload?.planCheckInput === inputKey;
   }
 
+  // 계획 왕복의 대기 보류 요청(자문 17) — 이 범위 세대 타임라인을 뒤에서 훑어 가장 최근 보류 기록이 요청이고 지금 계획 epoch 와 같을 때만이다. 소비 표식이
+  // 먼저 나오면 없다. 작업 방식 전환(workflow-mode 사실)은 계획 왕복을 끝내므로 그 앞의 요청은 무효다 — 남은 요청이 나중 왕복을 멈추지 않는다.
+  // 범위 변경은 세대 범위가, 계획 초기화(resetToDraft)는 planEpoch 가 막는다.
+  pendingPlanningHold(topic: Topic): { requestId: string; sequence: number } | null {
+    const timeline = this.dependencies.database.getScopedTimeline(topic.id, topic.scopeGeneration);
+    for (let index = timeline.length - 1; index >= 0; index--) {
+      const event = timeline[index]!;
+      const hold = event.payload?.planningHold as { request?: unknown; consumed?: unknown; planEpoch?: unknown } | undefined;
+      if (hold?.consumed !== undefined) return null;
+      if (event.actor === "system" && (event.payload?.workerFact as { kind?: unknown } | undefined)?.kind === "workflow-mode") return null;
+      if (typeof hold?.request === "string") return hold.planEpoch === topic.planEpoch ? { requestId: hold.request, sequence: event.sequence } : null;
+    }
+    return null;
+  }
+
   // 역할 세션이 아직 받지 않은 새 사실(계약 v3 (2)). since 는 같은 범위 세대·역할·세션의 마지막 봉투 기록이 전달한 지점이다. 그 기록이 없으면 옛 커서
   // (구현 세션의 implementationPromptSequence, 코드 리뷰 세션의 prompt_sequence)를 잇고, 그것도 없거나 세션이 없으면(새 세션) 0 이다. facts 는 since 뒤의
   // 사용자 입력과 workerFact 표식이 있는 system 이벤트, through 는 지금 마지막 sequence 다 — 호출자는 이 값을 recordEnvelope 의 deliveredThrough 로 넘긴다.
@@ -984,7 +1010,7 @@ export class EngineCore {
   // body 에 둔다(엔진은 해석·요약하지 않는다). 메모리 반영은 현재 실행 확인 뒤에만 한다 — 버려질 응답이 메모리만 바꾸지 않게(saveAgentOutput 과 같은 이유).
   // 확인과 transaction 사이에는 await 가 없다.
   async recordEnvelope(topic: Topic, route: TurnRoute, envelope: TurnEnvelope,
-    record: { sessionId: string; deliveredThrough: number; next?: EnvelopeNext }, signal: AbortSignal): Promise<TimelineEvent> {
+    record: { sessionId: string; deliveredThrough: number; next?: EnvelopeNext; relayBoundary?: RelayBoundary }, signal: AbortSignal): Promise<TimelineEvent> {
     const role = envelopeRole(route.job);
     if (!role) throw new Error(`${route.job.role}/${route.job.operation} 작업에는 결과 봉투가 없습니다.`);
     const issues = envelopeIssues(role, envelope);
@@ -998,7 +1024,18 @@ export class EngineCore {
     const memoryChanges = updates.length > 0 ? await this.applyMemoryUpdates(route.provider, updates) : [];
     this.recordResultDefects(topic.id, envelope);
     this.assertCurrent(topic.id, signal, topic.scopeGeneration, topic.state);
-    const next = record.next ?? {};
+    // 계획 왕복 1회 보류(자문 17) — 여기서 transaction 까지 await 가 없으므로, 이 판정보다 먼저 기록된 요청은 이 경계에서 소비되고 뒤에 접수된 요청은
+    // 다음 경계로 간다(접수와 경계 확정의 순서 = DB 기록 순서). 다음 단계로 이어지는 경계는 원래 기록의 changes(계획 판 채택)·events(판 알림 등)를 그대로
+    // 두고 전이만 기존 중재자 정지(USER_DECISION_REQUIRED, resumeState = 다음 단계)로 바꾼다 — 재개는 기존 resume 이 같은 세션으로 다음 단계를 연다.
+    const boundary = record.relayBoundary;
+    const hold = boundary ? this.pendingPlanningHold(topic) : null;
+    const held = hold && boundary?.continueTo ? boundary.continueTo : null;
+    const next: EnvelopeNext = held ? {
+      ...(record.next ?? {}), state: "USER_DECISION_REQUIRED", payload: undefined,
+      message: `중재자 보류 요청(${hold!.requestId}, #${hold!.sequence})에 따라 결과를 저장하고 다음 ${boundary!.label ?? held} 턴을 시작하기 전에 멈췄습니다. `
+        + `결정문을 실어 resume 하면 같은 세션으로 ${boundary!.label ?? held} 턴을 엽니다.`,
+      changes: { ...(record.next?.changes ?? {}), resumeState: held },
+    } : record.next ?? {};
     const events: TransitionInput["events"] = [{ actor: route.seat, kind: "agent_output", state: topic.state, body: envelope.message, payload: {
       envelope: { role, outcome: envelope.outcome, ...(envelope.mediatorRequest ? { mediatorRequest: envelope.mediatorRequest } : {}),
         ...(envelope.engineDefects?.length ? { engineDefects: envelope.engineDefects } : {}),
@@ -1022,6 +1059,12 @@ export class EngineCore {
       events.push({ actor: "system", kind: "system", state: topic.state, body: next.message, payload: {} });
     }
     for (const event of next.events ?? []) events.push({ ...event, state: next.state ?? topic.state });
+    if (hold) {
+      events.push({ actor: "system", kind: "system", state: next.state ?? topic.state, body: held
+        ? `중재자 보류 요청 ${hold.requestId} 를 이 경계에서 적용했습니다.`
+        : `중재자 보류 요청 ${hold.requestId} 는 이 경계가 이미 멈추거나 끝나서 추가 정지 없이 충족됐습니다.`,
+      payload: { planningHold: { consumed: hold.requestId, requestSequence: hold.sequence, applied: Boolean(held), continueTo: boundary!.continueTo } } });
+    }
     const before = this.latestSequence(topic.id);
     this.dependencies.database.applyTopicTransition({ topicId: topic.id, changes, events });
     if (this.receivedEnvelopes.get(topic.id)?.envelope === envelope) this.receivedEnvelopes.delete(topic.id);

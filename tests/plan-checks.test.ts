@@ -13,7 +13,7 @@ const plan = (extra = "") => REQUIRED_PLAN_HEADINGS.map((heading) => heading ===
   : `## ${heading}\n\n내용\n`).join("\n") + extra;
 
 describe("계획 필수 검사 선언(```checks)", () => {
-  it("블록이 없으면 필수 검사가 없다 — 이 계약 전에 승인된 계획(1fd0cc86 등)은 그대로 통과한다", () => {
+  it("블록이 없으면 필수 검사가 없다 — 이 계약 전에 승인된 계획(example-topic 등)은 그대로 통과한다", () => {
     expect(parsePlanChecks(plan())).toEqual([]);
     expect(() => assertPlanContract(plan())).not.toThrow();
   });

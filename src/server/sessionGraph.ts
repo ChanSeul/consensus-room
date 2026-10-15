@@ -61,10 +61,12 @@ export function buildSessionGraph(db: ConsensusDatabase, topicId: string, host: 
         if (old.sessionId) session(old.sessionId, role, old.profileId ? db.roles.profile(old.profileId)?.provider ?? null : null, true);
       }
     }
+    // The discussion phase is the engine's current stage (currentSeatJobs), so a stopped brainstorm still resumes as one.
+    const discussion = routing.current.author.operation === "brainstorm";
     for (const seat of routing.sessions) {
-      const discussion = topic.state.startsWith("BRAINSTORM");
       const sid = sessionId(seat.sessionId);
-      if (topic.workflowMode === "ticket" && (seat.seat === "author" || seat.seat === "plan-review")) {
+      // Ticket work has no planning stage. Its author and plan-review seats are current only while they brainstorm.
+      if (topic.workflowMode === "ticket" && !discussion && (seat.seat === "author" || seat.seat === "plan-review")) {
         if (sid) session(sid, seatRole[seat.seat], seat.binding?.provider ?? null, true);
         continue;
       }

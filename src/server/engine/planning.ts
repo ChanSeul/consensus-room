@@ -1,12 +1,16 @@
 // 계획 왕복(planned 모드): CLAUDE_PLAN → CODEX_AUDIT ⇄ CLAUDE_REVISION → (agree) AWAITING_USER_APPROVAL. 같은 두 세션이 응답 원문과 계획 판을 주고받는다.
 // 진입점은 runPlanningRelay·resumePlanning·returnToPlanning 셋이다. 옛 계획 수렴 경로(감사·개정·종결·ACK·채택 기록)는 없다(CR 흐름 단순화).
-import { realpath } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { lstat, realpath } from "node:fs/promises";
 import { hierarchyContext, assertTask, assertEntryReady } from "../topicStructure.js";
-import { type Topic, type TimelineEvent, type WorkflowState } from "../../shared/contracts.js";
+import { type PlanningHoldInput, type Topic, type TimelineEvent, type WorkflowState } from "../../shared/contracts.js";
+import { isStopped } from "../../shared/workflowLifecycle.js";
+import type { CallOrigin } from "../workflow.js";
 import { buildFirstTurnPrompt, buildRelayPrompt, relayFactsFrom, type RelayFacts, type RelayMessage } from "../../shared/prompts.js";
 import { brainstormReplies } from "../../shared/brainstorm.js";
 import type { PlanBundleCapture } from "../../shared/planningControl.js";
-import type { EngineCore, EnvelopeNext } from "./core.js";
+import { conflict, type EngineCore, type EnvelopeNext, type RelayBoundary } from "./core.js";
+import { prepareDecisionSources } from "./delivery.js";
 import type { EnvelopeRole, WorkerFact } from "../../shared/turnContract.js";
 import { PlanBundleError, planBundleVersion, serializePlanBundle } from "../planBundle.js";
 import { declaredPlanItems, PLAN_ITEMS_CHECK_ID, planItemsFact, planItemsInputKey, type PlanItemsDeclaration } from "./planCoverage.js";
@@ -15,6 +19,11 @@ import { declaredPlanItems, PLAN_ITEMS_CHECK_ID, planItemsFact, planItemsInputKe
 type RelayStage = "CLAUDE_PLAN" | "CLAUDE_REVISION" | "CODEX_AUDIT";
 const RELAY_LABEL: Readonly<Record<RelayStage, string>> = { CLAUDE_PLAN: "계획 작성", CLAUDE_REVISION: "계획 수정", CODEX_AUDIT: "계획 검토" };
 const isRelayStage = (value: unknown): value is RelayStage => typeof value === "string" && value in RELAY_LABEL;
+
+// 봉투 기록 뒤 왕복이 열 다음 역할 턴(없으면 정지·승인 경계) — 중재자 보류(자문 17)를 그 경계에서 적용하거나 소비하려고 모든 기록이 넘긴다.
+function relayBoundary(continueTo: RelayStage | null): RelayBoundary {
+  return { continueTo, label: continueTo ? RELAY_LABEL[continueTo] : null };
+}
 
 // 중재자에게 넘기고 같은 역할 턴을 재개 지점으로 둔다.
 function mediatorStop(request: string, stage: RelayStage): EnvelopeNext {
@@ -38,6 +47,20 @@ function planVersionAdoption(topic: Topic, captured: PlanBundleCapture): Pick<En
 }
 
 const envelopeOf = (event: TimelineEvent) => event.payload?.envelope as { role?: string; outcome?: string } | undefined;
+
+// 계획 왕복 1회 보류 요청의 응답(자문 17) — 결속값과 실제 적용 경계. stage 는 보류가 적용될 경계 앞 턴(실행 중이거나 재개될 턴)이다.
+export interface PlanningHoldReceipt {
+  requestId: string;
+  sequence: number;
+  alreadyPending: boolean;
+  scopeGeneration: number;
+  planEpoch: number;
+  state: WorkflowState;
+  stage: RelayStage;
+  running: boolean;
+  lastResultSequence: number | null;
+  appliesAfter: string;
+}
 
 export class PlanningPipeline {
   constructor(private readonly core: EngineCore) {}
@@ -76,10 +99,56 @@ export class PlanningPipeline {
     await this.relay(topicId, "CLAUDE_REVISION", signal);
   }
 
+  // 계획 왕복 1회 보류(자문 17, 사용자 결정 2026-10-15) — 중재자가 미리 거는 명시 제어다. 요청은 지금 범위 세대·계획 epoch 에 결속한 system 사건 하나로
+  // 남고(멱등 키 복구 마커를 같은 insert 로), 다음 계획 왕복 경계에서 core.recordEnvelope 가 결과를 저장한 뒤 다음 모델 턴 전에 한 번 멈춘다. 실행 중인
+  // 턴은 끊지 않는다. 대기 요청이 있으면 새로 쓰지 않고 그 요청을 돌려준다. 전이 기록이 다음 턴의 시작이므로, 다음 턴이 이미 시작된 뒤 접수된 요청은
+  // 그 턴이 끝난 뒤 경계에 적용된다 — 응답은 지금 상태·실행 중 여부·마지막 결과 기록 순번으로 그 경계를 알린다. 거부(409)는 요청 대조이고 실행 정지가 아니다.
+  requestHold(topicId: string, input: PlanningHoldInput, requestKey?: string, origin?: CallOrigin): PlanningHoldReceipt {
+    const { database } = this.core.dependencies;
+    const topic = database.getTopic(topicId);
+    if (topic.workflowMode !== "planned") throw conflict("계획 보류는 planned 작업의 계획 왕복에서만 걸 수 있습니다.");
+    const resume = database.getFlags(topicId).resumeState;
+    const stage = isRelayStage(topic.state) ? topic.state : isStopped(topic.state) && isRelayStage(resume) ? resume : null;
+    if (!stage) throw conflict(`계획 왕복 중이 아닙니다(상태 ${topic.state}, 재개 지점 ${resume ?? "없음"}).`);
+    if (input.expectedScopeGeneration !== topic.scopeGeneration) {
+      throw conflict(`범위 세대가 다릅니다(요청 ${input.expectedScopeGeneration}, 지금 ${topic.scopeGeneration}). 지금 토픽을 다시 읽고 요청하세요.`);
+    }
+    if (input.expectedPlanEpoch !== topic.planEpoch) {
+      throw conflict(`계획 epoch 가 다릅니다(요청 ${input.expectedPlanEpoch}, 지금 ${topic.planEpoch}). 지금 토픽을 다시 읽고 요청하세요.`);
+    }
+    const running = this.core.active.has(topicId) || Boolean(database.runningAction(topicId));
+    const lastResultSequence = database.getScopedTimeline(topicId, topic.scopeGeneration).findLast((event) => event.kind === "agent_output")?.sequence ?? null;
+    const pending = this.core.pendingPlanningHold(topic);
+    const recorded = pending ? null : database.appendEvent({ topicId, actor: "system", kind: "system", state: topic.state,
+      body: `중재자가 계획 왕복 1회 보류를 요청했습니다: ${input.reason}`,
+      payload: { planningHold: { request: randomUUID(), scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch, reason: input.reason },
+        ...(origin ? { origin } : {}), ...(requestKey ? { requestKey, requestAction: "planning-hold" } : {}) } });
+    const label = RELAY_LABEL[stage];
+    return {
+      requestId: pending?.requestId ?? String((recorded!.payload.planningHold as { request: string }).request),
+      sequence: pending?.sequence ?? recorded!.sequence, alreadyPending: Boolean(pending),
+      scopeGeneration: topic.scopeGeneration, planEpoch: topic.planEpoch, state: topic.state, stage, running, lastResultSequence,
+      appliesAfter: running && isRelayStage(topic.state)
+        ? `실행 중인 ${label} 턴(${stage})이 끝나 결과를 저장한 뒤, 다음 모델 턴을 시작하기 전에 멈춥니다(마지막 결과 기록 #${lastResultSequence ?? "없음"}).`
+        : `지금 실행 중인 계획 턴이 없습니다. ${isRelayStage(topic.state) ? "" : "재개하면 "}${label} 턴(${stage})이 끝나 결과를 저장한 뒤, 다음 모델 턴을 시작하기 전에 멈춥니다.`,
+    };
+  }
+
   private async relay(topicId: string, stage: RelayStage, signal: AbortSignal): Promise<void> {
     for (let next: RelayStage | null = stage; next;) {
       next = next === "CODEX_AUDIT" ? await this.reviewerTurn(topicId, signal) : await this.plannerTurn(topicId, next, signal);
+      // 경계 기록이 다음 단계로 가지 않았으면(중재자 보류가 정지로 바꿨다) 다음 모델 턴을 열지 않는다. 같은 단계를 잇는 경계는 상태가 그대로라 지난다.
+      if (next && this.core.dependencies.database.getTopic(topicId).state !== next) next = null;
     }
+  }
+
+  // 상시 참조 문서(설정 standingReferencePath, 결함 example-standing-reference) — 전역 지침이 먼저 읽으라고 가리키는 설계 철학 문서 하나를 계획 작성·수정·감사 턴의
+  // readablePaths 로 싣는다(538423f 가 계획 제어 턴에만 실었고 6927ce5 가 그 소비처를 지운 회귀의 복구). 새 세션·resume·같은 세션 봉투 교정이 같은 목록을
+  // 쓴다. 매 턴 정규 파일일 때만 싣고, 없거나 링크·디렉터리면 싣지 않고 계속한다 — 정지·재시도·읽음 확인은 없다.
+  private async standingReference(): Promise<string[]> {
+    const path = this.core.dependencies.standingReferencePath;
+    if (!path) return [];
+    try { return (await lstat(path)).isFile() ? [path] : []; } catch { return []; }
   }
 
   private async plannerTurn(topicId: string, stage: "CLAUDE_PLAN" | "CLAUDE_REVISION", signal: AbortSignal): Promise<RelayStage | null> {
@@ -94,7 +163,10 @@ export class PlanningPipeline {
     const seat = this.core.seatSession(topic, route);
     const first = this.isFirstTurn(topic, "planner", seat);
     const pending = this.core.pendingFacts(topic, "planner", seat);
-    const facts: RelayFacts = { ...relayFactsFrom(pending.facts), counterpart: this.counterpart(topic, "plan-reviewer", first, pending.since) };
+    // 결정 원문 파일·색인은 새 세션·이어지는 턴 모두에 싣고 읽기를 연다(자문 8) — 이 턴의 사실과 같은 커서까지다.
+    const decisionSources = await prepareDecisionSources(this.core, topic, pending.through, signal);
+    const facts: RelayFacts = { ...relayFactsFrom(pending.facts), counterpart: this.counterpart(topic, "plan-reviewer", first, pending.since), decisionSources };
+    const readablePaths = [...(current ? [current.snapshotPath] : []), ...(decisionSources ? [decisionSources.path] : []), ...await this.standingReference()];
     // 첫 턴만 과제·지침·계획 폴더·논의 원문과 지금 계획(있으면 — 이행했거나 ticket 에서 전환한 계획)을 싣는다.
     const prompt = first
       ? buildFirstTurnPrompt({ ...this.firstTurn(topic, "planner"), planDirectory, ...facts,
@@ -102,33 +174,33 @@ export class PlanningPipeline {
       : buildRelayPrompt(facts);
     const { envelope, sessionId } = await this.core.turn(route, topic, prompt, signal, {
       resultContract: "envelope", planDirectory, inputSequence: pending.through,
-      ...(current ? { readablePaths: [current.snapshotPath] } : {}),
+      ...(readablePaths.length ? { readablePaths } : {}),
     });
-    const record = (next?: EnvelopeNext) => this.core.recordEnvelope(topic, route, envelope,
-      { sessionId, deliveredThrough: pending.through, ...(next ? { next } : {}) }, signal);
+    const record = (next: EnvelopeNext | undefined, continueTo: RelayStage | null) => this.core.recordEnvelope(topic, route, envelope,
+      { sessionId, deliveredThrough: pending.through, ...(next ? { next } : {}), relayBoundary: relayBoundary(continueTo) }, signal);
     if (envelope.outcome === "needs-mediator") {
-      await record(mediatorStop(envelope.mediatorRequest ?? envelope.message, stage));
+      await record(mediatorStop(envelope.mediatorRequest ?? envelope.message, stage), null);
       return null;
     }
     // planned 계획은 항목 목록(plan-items)을 선언해야 한다 — 판을 확정(산출물 기록)하기 전에 폴더 본문으로 확인한다. 없거나 틀리면 같은 플래너 세션에 사실로
     // 돌려주고 같은 단계를 다시 연다(필수 검사 실패와 같은 루프). 같은 폴더 내용으로 되풀이하면 중재자 정지 — 같은 조건의 반복은 진척이 아니다.
     const declaration = await this.planItemsDeclaration(topic);
     if (typeof declaration === "string") {
-      await record(await this.bundleStop(topic, stage, "플래너가 ready 로 답했지만 계획 폴더를 읽지 못했습니다.", declaration));
+      await record(await this.bundleStop(topic, stage, "플래너가 ready 로 답했지만 계획 폴더를 읽지 못했습니다.", declaration), null);
       return null;
     }
     if (declaration && declaration.kind !== "declared") {
       const inputKey = planItemsInputKey("planner", declaration.version, declaration.message);
       if (this.core.repeatedCheckFailure(topic, inputKey, [PLAN_ITEMS_CHECK_ID])) {
-        await record(mediatorStop(`플래너가 같은 계획 내용으로 다시 ready 로 답했지만 항목 목록이 그대로 없거나 틀립니다 — ${declaration.message}`, stage));
+        await record(mediatorStop(`플래너가 같은 계획 내용으로 다시 ready 로 답했지만 항목 목록이 그대로 없거나 틀립니다 — ${declaration.message}`, stage), null);
         return null;
       }
-      await record({ events: [planItemsFact(declaration.message, inputKey)] });
+      await record({ events: [planItemsFact(declaration.message, inputKey)] }, stage);
       return stage;
     }
     const captured = await this.capture(topic, signal);
     if (typeof captured === "string") {
-      await record(await this.bundleStop(topic, stage, "플래너가 ready 로 답했지만 계획 폴더를 계획 판으로 확정하지 못했습니다.", captured));
+      await record(await this.bundleStop(topic, stage, "플래너가 ready 로 답했지만 계획 폴더를 계획 판으로 확정하지 못했습니다.", captured), null);
       return null;
     }
     // 계획 세션을 구현으로 잇는 토픽(계획 연속성 정책)은 이 판을 쓴 세션과 그 세션이 받은 순번을 묶어 둔다. 결속은 계획 SHA 가 같을 때만 읽히므로
@@ -138,7 +210,7 @@ export class PlanningPipeline {
     // 잘못된 A → 교정 B 채택 → 수정 중 A 재발이 첫 턴부터 정지되지 않고 교정 사실을 받는다).
     const adoption = planVersionAdoption(topic, captured);
     const declared = declaration?.kind === "declared" ? [planItemsFact(`플래너가 항목 ${declaration.items.length}개를 선언했습니다(목록 확인).`, "", "passed")] : [];
-    await record({ state: "CODEX_AUDIT", message: "리뷰어가 계획을 검토합니다.", ...adoption, events: [...(adoption.events ?? []), ...declared] });
+    await record({ state: "CODEX_AUDIT", message: "리뷰어가 계획을 검토합니다.", ...adoption, events: [...(adoption.events ?? []), ...declared] }, "CODEX_AUDIT");
     return "CODEX_AUDIT";
   }
 
@@ -152,46 +224,47 @@ export class PlanningPipeline {
     const first = this.isFirstTurn(topic, "plan-reviewer", seat);
     const pending = this.core.pendingFacts(topic, "plan-reviewer", seat);
     const relayed = relayFactsFrom(pending.facts);
+    const decisionSources = await prepareDecisionSources(this.core, topic, pending.through, signal);
     // 리뷰어가 받는 판은 언제나 지금 판이다. 이번 사실에 그 판의 확정 기록이 있으면 직전 판 대비 변경분까지, 없으면(이행한 계획) 경로·버전만 싣는다.
     const plan = relayed.plan?.version === current.version ? relayed.plan : { ...current, diffPath: null, status: "current" as const };
-    const facts: RelayFacts = { ...relayed, plan, counterpart: this.counterpart(topic, "planner", first, pending.since) };
+    const facts: RelayFacts = { ...relayed, plan, counterpart: this.counterpart(topic, "planner", first, pending.since), decisionSources };
     const prompt = first ? buildFirstTurnPrompt({ ...this.firstTurn(topic, "plan-reviewer"), ...facts }) : buildRelayPrompt(facts);
     const { envelope, sessionId } = await this.core.turn(route, topic, prompt, signal, {
       resultContract: "envelope", inputSequence: pending.through,
-      readablePaths: [plan.snapshotPath, ...(plan.diffPath ? [plan.diffPath] : [])],
+      readablePaths: [plan.snapshotPath, ...(plan.diffPath ? [plan.diffPath] : []), ...(decisionSources ? [decisionSources.path] : []), ...await this.standingReference()],
     });
-    const record = (next?: EnvelopeNext) => this.core.recordEnvelope(topic, route, envelope,
-      { sessionId, deliveredThrough: pending.through, ...(next ? { next } : {}) }, signal);
+    const record = (next: EnvelopeNext | undefined, continueTo: RelayStage | null) => this.core.recordEnvelope(topic, route, envelope,
+      { sessionId, deliveredThrough: pending.through, ...(next ? { next } : {}), relayBoundary: relayBoundary(continueTo) }, signal);
     switch (envelope.outcome) {
       case "needs-mediator":
-        await record(mediatorStop(envelope.mediatorRequest ?? envelope.message, "CODEX_AUDIT"));
+        await record(mediatorStop(envelope.mediatorRequest ?? envelope.message, "CODEX_AUDIT"), null);
         return null;
       case "changes":
-        await record({ state: "CLAUDE_REVISION", message: "플래너가 리뷰어 응답을 받아 같은 계획을 고칩니다." });
+        await record({ state: "CLAUDE_REVISION", message: "플래너가 리뷰어 응답을 받아 같은 계획을 고칩니다." }, "CLAUDE_REVISION");
         return "CLAUDE_REVISION";
       case "agree": {
         // 합의는 리뷰어가 받은 판이 지금 폴더의 판일 때만이다. 리뷰 사이에 폴더가 바뀌었으면 새 판을 확정해 같은 리뷰어 세션에 다시 보낸다(상태 유지).
         // 바뀐 폴더가 항목 목록(plan-items)을 잃었거나 틀리면 리뷰어가 고칠 수 없으므로 판을 확정하지 않고 중재자에게 넘긴다(플래너 ready 의 확인과 같은 계약).
         const declaration = await this.planItemsDeclaration(topic);
         if (typeof declaration === "string") {
-          await record(await this.bundleStop(topic, "CODEX_AUDIT", "리뷰어가 동의했지만 계획 폴더를 읽지 못했습니다.", declaration));
+          await record(await this.bundleStop(topic, "CODEX_AUDIT", "리뷰어가 동의했지만 계획 폴더를 읽지 못했습니다.", declaration), null);
           return null;
         }
         if (declaration && declaration.kind !== "declared") {
-          await record(await this.bundleStop(topic, "CODEX_AUDIT", "리뷰어가 동의했지만 지금 계획 폴더에 항목 목록(plan-items)이 없거나 틀립니다.", declaration.message));
+          await record(await this.bundleStop(topic, "CODEX_AUDIT", "리뷰어가 동의했지만 지금 계획 폴더에 항목 목록(plan-items)이 없거나 틀립니다.", declaration.message), null);
           return null;
         }
         const captured = await this.capture(topic, signal);
         if (typeof captured === "string") {
-          await record(await this.bundleStop(topic, "CODEX_AUDIT", "리뷰어가 동의했지만 동의한 판이 지금 계획 폴더와 같은지 확인하지 못했습니다.", captured));
+          await record(await this.bundleStop(topic, "CODEX_AUDIT", "리뷰어가 동의했지만 동의한 판이 지금 계획 폴더와 같은지 확인하지 못했습니다.", captured), null);
           return null;
         }
         if (!captured.changed) {
           await record({ state: "AWAITING_USER_APPROVAL",
-            message: `리뷰어가 계획 ${topic.planRevision}판(${captured.version.slice(0, 12)})에 동의했습니다. 사용자 구현 승인을 기다립니다.` });
+            message: `리뷰어가 계획 ${topic.planRevision}판(${captured.version.slice(0, 12)})에 동의했습니다. 사용자 구현 승인을 기다립니다.` }, null);
           return null;
         }
-        await record({ message: "리뷰 사이에 계획 파일이 바뀌어 새 판을 같은 리뷰어 세션에 다시 보냅니다.", ...planVersionAdoption(topic, captured) });
+        await record({ message: "리뷰 사이에 계획 파일이 바뀌어 새 판을 같은 리뷰어 세션에 다시 보냅니다.", ...planVersionAdoption(topic, captured) }, "CODEX_AUDIT");
         return "CODEX_AUDIT";
       }
       default:

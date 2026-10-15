@@ -42,10 +42,24 @@ export class EvidenceCatalogStore {
   roots(): EvidenceRoot[] {
     return this.db.prepare("SELECT record FROM evidence_roots ORDER BY rowid").all().map(r => JSON.parse(String(r.record)));
   }
+  // work_groups is read and parsed once per synchronous read computation (2026-10-15: affected() read it once per topic, and
+  // poll's managed()/due() nested that per root and source, so one poll parsed the whole table thousands of times on the main
+  // thread). The memo lives only inside readScope: those computations run no external code and the catalog never writes
+  // work_groups, so a value cannot go stale within one. Outside a scope every call reads the table again.
+  private groupsMemo?: WorkGroup[];
+  private readDepth = 0;
+  private readScope<T>(read: () => T): T {
+    this.readDepth++;
+    try { return read(); } finally { if (--this.readDepth === 0) this.groupsMemo = undefined; }
+  }
+  private groups(): WorkGroup[] {
+    const load = () => this.db.prepare("SELECT record_json FROM work_groups").all().map(r => JSON.parse(String(r.record_json)) as WorkGroup);
+    return this.readDepth === 0 ? load() : (this.groupsMemo ??= load());
+  }
   context(topicId: string): { workspace: string; group: string | null; topic: string; evidenceRootIds?: string[] } {
     const topic = this.db.prepare("SELECT repository_path FROM topics WHERE id=?").get(topicId);
     if (!topic) throw new Error("작업이 없습니다.");
-    const groups: WorkGroup[] = this.db.prepare("SELECT record_json FROM work_groups").all().map(r => JSON.parse(String(r.record_json)));
+    const groups = this.groups();
     const binding = this.db.prepare("SELECT group_id FROM evidence_group_topics WHERE topic_id=?").get(topicId);
     const group = groups.find(g => Object.values(g.links as Record<string, { topicId: string }>).some(link => link.topicId === topicId))
       ?? groups.find(g => g.id === binding?.group_id && g.repositoryPath === topic.repository_path);
@@ -60,8 +74,8 @@ export class EvidenceCatalogStore {
       (context.evidenceRootIds === undefined || context.evidenceRootIds.includes(root.id)));
   }
   affected(root: EvidenceRoot): string[] {
-    return this.db.prepare("SELECT id FROM topics").all().map(r => String(r.id))
-      .filter(id => this.forTopic(id).some(selected => selected.id === root.id));
+    return this.readScope(() => this.db.prepare("SELECT id FROM topics").all().map(r => String(r.id))
+      .filter(id => this.forTopic(id).some(selected => selected.id === root.id)));
   }
   private save(root: EvidenceRoot): void {
     this.db.prepare("INSERT INTO evidence_roots VALUES (?,?) ON CONFLICT(id) DO UPDATE SET record=excluded.record").run(root.id, JSON.stringify(root));
@@ -102,9 +116,9 @@ export class EvidenceCatalogStore {
     return root;
   }
   version(topicId: string): string {
-    return evidenceHash(stableJSON(["task-linked-workspace-slack-v2",this.context(topicId).group,
+    return this.readScope(() => evidenceHash(stableJSON(["task-linked-workspace-slack-v2",this.context(topicId).group,
       this.forTopic(topicId).map(r => [r.id, r.version, r.status]),
-      ...(this.context(topicId).evidenceRootIds === undefined ? [] : [this.context(topicId).evidenceRootIds])]));
+      ...(this.context(topicId).evidenceRootIds === undefined ? [] : [this.context(topicId).evidenceRootIds])])));
   }
   assertGroup(topicId: string, input: { version: string; groupId: string | null }): void {
     if (input.version !== this.version(topicId)) conflict("근거 목록이 바뀌었습니다. 다시 확인하세요.");
@@ -195,13 +209,13 @@ export class EvidenceCatalogStore {
     return from.scope === "workspace" && this.affected(to).some(id => this.context(id).workspace === from.owner);
   }
   private approvedElsewhere(sourceId: string, target: EvidenceRoot): boolean {
-    return this.roots().some(root => root.status === "approved" && this.sharesApproval(root,target) &&
-      this.reachableMembers(root.id).some(member => member.source_id === sourceId && member.state === "approved"));
+    return this.readScope(() => this.roots().some(root => root.status === "approved" && this.sharesApproval(root,target) &&
+      this.reachableMembers(root.id).some(member => member.source_id === sourceId && member.state === "approved")));
   }
   approvalAffected(sourceId: string, scope: EvidenceScope, owner: string): string[] {
-    return [...new Set(this.roots().filter(root => root.status === "approved" && this.sharesApproval({ scope, owner }, root) &&
+    return this.readScope(() => [...new Set(this.roots().filter(root => root.status === "approved" && this.sharesApproval({ scope, owner }, root) &&
       this.members(root.id).some(m => m.source_id === sourceId && m.state === "candidate"))
-      .flatMap(root => this.affected(root)))];
+      .flatMap(root => this.affected(root)))]);
   }
   private automaticallyApproved(child: Pick<EvidenceSource, "id" | "provider" | "resource">, root: EvidenceRoot, link: EvidenceDiscoveryLink): boolean {
     const origin = this.store.get(root.sourceId);
@@ -264,14 +278,17 @@ export class EvidenceCatalogStore {
     return members;
   }
   managed(sourceId: string): boolean {
-    return this.roots().some(root => root.status === "approved" && this.members(root.id).some(m => m.source_id === sourceId && m.state === "approved") &&
-      this.affected(root).some(id => this.db.prepare("SELECT state FROM topics WHERE id=?").get(id)?.state !== "CLOSED"));
+    return this.readScope(() => this.roots().some(root => root.status === "approved" && this.members(root.id).some(m => m.source_id === sourceId && m.state === "approved") &&
+      this.affected(root).some(id => this.db.prepare("SELECT state FROM topics WHERE id=?").get(id)?.state !== "CLOSED")));
   }
   hostManaged(sourceId: string): boolean {
     return this.roots().some(root=>root.status==="approved" && this.store.get(root.sourceId).mode==="connector" &&
       this.reachableMembers(root.id).some(m=>m.source_id===sourceId && m.state==="approved"));
   }
   state(topicId: string, options: { collection?: boolean } = {}): EvidenceCatalog {
+    return this.readScope(() => this.scopedState(topicId, options));
+  }
+  private scopedState(topicId: string, options: { collection?: boolean }): EvidenceCatalog {
     const context = this.context(topicId);
     const roots = this.forTopic(topicId), active = roots.filter(r => r.status !== "removed");
     const members = options.collection ? new Map(roots.map(root => [root.id, this.reachableMembers(root.id)])) : this.topicMembers(topicId,roots);
@@ -294,15 +311,15 @@ export class EvidenceCatalogStore {
     const history = this.db.prepare("SELECT scope,owner,at,action,url FROM evidence_catalog_history ORDER BY id DESC").all()
       .filter(row => row.owner === context[row.scope as EvidenceScope]).map(r => ({ scope: r.scope as EvidenceScope,
         at: Number(r.at), action: String(r.action), url: String(r.url) }));
-    const groups=this.db.prepare("SELECT record_json FROM work_groups").all().map(r=>JSON.parse(String(r.record_json)));
+    const groups=this.groups();
     const groupLocked=Boolean(this.db.prepare("SELECT 1 FROM topics WHERE id=? AND (state='CLOSED' OR committed_oid IS NOT NULL)").get(topicId))
       || groups.some(g=>Object.values(g.links as Record<string,{topicId:string}>).some(link=>link.topicId===topicId));
     return { version: this.version(topicId), groupId: context.group, groups:groups.filter(g=>g.repositoryPath===context.workspace).map(g=>({id:String(g.id),title:String(g.title)})),
       groupLocked, roots: roots.map(r => ({ ...r, source: this.store.get(r.sourceId) })), entries, history, unresolvedLinks: [], coverage };
   }
   due(): EvidenceRoot[] {
-    return this.roots().filter(root => root.status === "approved" && root.nextCheckAt <= this.clock() &&
-      this.affected(root).some(id => this.db.prepare("SELECT state FROM topics WHERE id=?").get(id)?.state !== "CLOSED"));
+    return this.readScope(() => this.roots().filter(root => root.status === "approved" && root.nextCheckAt <= this.clock() &&
+      this.affected(root).some(id => this.db.prepare("SELECT state FROM topics WHERE id=?").get(id)?.state !== "CLOSED")));
   }
   private resetCycle(root: EvidenceRoot): void {
     this.db.prepare("UPDATE evidence_members SET progress='pending',cursor=NULL,error=NULL WHERE root_id=? AND state='approved'").run(root.id);

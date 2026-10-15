@@ -1,5 +1,6 @@
 // 구현·리뷰·전달 파이프라인: IMPLEMENTING → CODEX_REVIEW ⇄ CLAUDE_FIX → READY_TO_DELIVER → commit/push.
 // 구현·리뷰는 역할별 봉투(message·outcome)를 잇는 왕복(relay)이고, git 사후 검증(고아 커밋 처분 포함)이 이 파일의 인도 계약이다.
+import { createHash } from "node:crypto";
 import { PlanningPaused } from "../../shared/planningControl.js";
 import { DeliveryInputSchema, type TimelineEvent, type Topic, type WorkflowState } from "../../shared/contracts.js";
 import { digestToolTrees, type ToolTreeDigest } from "../toolTree.js";
@@ -13,14 +14,41 @@ import { planCheckGate, verificationSatisfier, type PlanCheckGateVerdict } from 
 import { coverageInputKey, coverageReceipt, declaredPlanItems, deliveryCoverageProblem, implementerCoverage, PLAN_ITEMS_CHECK_ID, planItemsFact, planItemsInputKey,
   reviewerCoverage } from "./planCoverage.js";
 import type { TurnJob } from "../../shared/roles.js";
-import { buildFirstTurnPrompt, buildRelayPrompt, relayFactsFrom, type RelayFacts } from "../../shared/prompts.js";
+import { buildFirstTurnPrompt, buildRelayPrompt, decisionSourceDocument, decisionSourceEntries, relayFactsFrom, type DecisionSourcesFact, type RelayFacts } from "../../shared/prompts.js";
 import type { EnvelopeRole, TurnEnvelope, WorkerFact } from "../../shared/turnContract.js";
 import type { PreparedMerge, WorkGroup } from "../../shared/workGroups.js";
 import { bindingOf, describeBinding, legacyBinding, sameBinding, type SessionBinding, type TurnRoute } from "../turnRouting.js";
 import { hierarchyContext } from "../topicStructure.js";
+import { decisionSourceInput } from "../workGroups.js";
 
 function isWithinSelectedPaths(path: string, selectedPaths: readonly string[]): boolean {
   return selectedPaths.some((scope) => path === scope || path.startsWith(`${scope.replace(/\/$/, "")}/`));
+}
+
+// ---- 결정 원문 파일(2026-10-14 자문 8) — 구현·리뷰 왕복과 계획 왕복(planning.ts)이 매 턴 같은 함수로 싣는다 ----
+const DECISION_SOURCES_KIND = "decision-sources";
+
+// 이 턴이 싣는 결정 원문 파일 — 현재 범위 세대의 사용자 결정 가운데 이 턴의 전달 커서(through) 이하만 쓴다. 프롬프트의 사실과 같은 경계라 색인과 파일이
+// 어긋나지 않는다. 결정이 없으면 null(프롬프트·읽기 경로가 종전과 같다). 같은 내용의 판이 원장 sha256 대로 읽히면 새 판을 쓰지 않고, 읽히지 않으면(손상·유실·
+// 읽기 오류) 같은 내용으로 다시 쓴다. 결정의 내용을 판정하지 않고 새 거부 조건도 두지 않는다 — 쓰기 전 확인은 턴 spawn 직전과 같은 core.assertCurrent 이고,
+// 쓰기 거부(StaleArtifactError)도 같은 조건(core.writeArtifact 의 accept)이다. 남는 실패는 다른 턴 전 산출물 쓰기(도구 트리 기준)와 같은 파일 쓰기 오류다.
+export async function prepareDecisionSources(core: EngineCore, topic: Topic, through: number, signal: AbortSignal): Promise<DecisionSourcesFact | null> {
+  const { database, artifacts } = core.dependencies;
+  const inputs = database.getScopedTimeline(topic.id, topic.scopeGeneration)
+    .filter((event) => event.actor === "user" && event.kind === "decision" && event.sequence <= through)
+    .map(decisionSourceInput);
+  if (inputs.length === 0) return null;
+  const document = decisionSourceDocument(topic.id, topic.scopeGeneration, inputs);
+  const documentSHA256 = createHash("sha256").update(document, "utf8").digest("hex");
+  const latest = database.latestArtifact(topic.id, DECISION_SOURCES_KIND);
+  const intact = latest?.sha256 === documentSHA256
+    && await artifacts.verifiedRevision(topic.id, DECISION_SOURCES_KIND, documentSHA256).then(Boolean, () => false);
+  let stored = intact ? latest : null;
+  if (!stored) {
+    core.assertCurrent(topic.id, signal, topic.scopeGeneration, topic.state);
+    stored = await core.writeArtifact(topic, DECISION_SOURCES_KIND, database.latestArtifactRevision(topic.id, DECISION_SOURCES_KIND) + 1, document, signal);
+  }
+  return { path: stored.path, version: stored.revision, sha256: stored.sha256, entries: decisionSourceEntries(inputs) };
 }
 
 // ---- 구현·리뷰 왕복(relay) 공통 정의 ----
@@ -417,12 +445,14 @@ export class DeliveryPipeline {
     const sessionId = this.core.seatSession(topic, route);
     const pending = this.core.pendingFacts(topic, role, sessionId);
     const pendingFacts = relayFactsFrom(pending.facts);
+    // 결정 원문 파일·색인은 첫 턴·이어지는 턴·교체 세션 프롬프트 모두에 싣고 읽기를 연다(자문 8) — 이 턴의 사실과 같은 커서까지다.
+    const decisionSources = await prepareDecisionSources(this.core, topic, pending.through, signal);
     // 승인 계획의 항목 id 는 매 턴 사실로 싣는다 — 기존 세션(첫 턴 지침을 받지 않은)도 항목별 보고 의무와 형식을 안다. 이 단계의 계획 정본은 파이프라인이 정한
     // 문맥(approved·reference)이다 — 사실 커서에 실린 계획 왕복 때의 판 알림(current)이 그것을 덮지 않는다. 첫 턴 프롬프트와 재개 프롬프트가 같은 facts 를
     // 쓴다(Root 인수 검토 2, 2026-10-11 — 이전엔 첫 턴에만 넣어 재개 세션이 승인 판·스냅샷·항목 id 의무를 받지 못했다).
     const plan = input.plan ? { status: input.plan.status, version: input.plan.version, snapshotPath: input.plan.snapshotPath,
       ...(input.plan.status === "approved" && input.plan.items.length ? { items: input.plan.items.map((item) => item.id) } : {}) } : null;
-    const facts: RelayFacts = { ...pendingFacts, plan: plan ?? pendingFacts.plan, counterpart: this.relayCounterpart(topic, role, pending.since) };
+    const facts: RelayFacts = { ...pendingFacts, plan: plan ?? pendingFacts.plan, counterpart: this.relayCounterpart(topic, role, pending.since), decisionSources };
     const first = buildFirstTurnPrompt({
       ...facts, role, title: topic.title, task: hierarchyContext(this.core.dependencies.database, topic), worktreePath: topic.worktreePath, branchName: topic.branchName,
       baseRef: this.core.dependencies.database.getFlags(topic.id).implementationBaseOID,
@@ -433,7 +463,7 @@ export class DeliveryPipeline {
       resultContract: "envelope",
       session: { id: sessionId, persist: (id: string) => input.persist(id, route) },
       ...(relay ? { freshSessionPrompt: first } : {}),
-      readablePaths: input.plan ? [input.plan.snapshotPath] : [],
+      readablePaths: [...(input.plan ? [input.plan.snapshotPath] : []), ...(decisionSources ? [decisionSources.path] : [])],
       ...(input.writeGuards ? { writeGuards: input.writeGuards } : {}),
       inputSequence: pending.through,
     });

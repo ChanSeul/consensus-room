@@ -1,7 +1,9 @@
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, readFileSync, statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { evidenceHash, stableJSON } from "../src/server/evidence/store";
 import { ConsensusDatabase } from "../src/server/database";
@@ -1323,4 +1325,49 @@ it("delivers originals and receipts by explicit topic identity for shared direct
   expect(prompts[0]).toContain("First topic original");expect(prompts[0]).not.toContain("Second topic original");expect(prompts[1]).toContain("Second topic original");
   expect(db.evidence.packet(topic,"claude",`session-${topic.id}`).text).not.toContain("First topic original");
   await expect(adapter.createSession({cwd:root,prompt:"ambiguous"})).rejects.toThrow("명시적인 topicId");
+});
+
+it("orders keys the same under any process locale, in the en-US order stored hashes were written in", () => {
+  // Hangul keys sorted first under ko_KR, so the same Jira body hashed differently after a restart (2026-10-15).
+  const value = { "검증 기간 (EPIC)": 1, "상태 태그": 2, development: 3, "Open Option": 4, "QA Option": 5, "QA 이슈 구분 레이블": 6, nested: { "나": 1, b: 2, A: 3 } };
+  const module = pathToFileURL(join(process.cwd(), "src/server/evidence/identity.ts")).href;
+  const script = `const { stableJSON } = await import(${JSON.stringify(module)}); process.stdout.write(stableJSON(${JSON.stringify(value)}));`;
+  const outputs = ["ko_KR.UTF-8", "en_US.UTF-8", "C"].map(locale => {
+    const child = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script],
+      { cwd: process.cwd(), env: { ...process.env, LANG: locale, LC_ALL: locale }, encoding: "utf8", timeout: 15_000 });
+    expect(child.status, child.stderr).toBe(0);
+    return child.stdout;
+  });
+  expect(new Set(outputs).size).toBe(1);
+  expect(outputs[0]).toBe('{"development":3,"nested":{"A":3,"b":2,"나":1},"Open Option":4,"QA Option":5,"QA 이슈 구분 레이블":6,"검증 기간 (EPIC)":1,"상태 태그":2}');
+  expect(stableJSON(value)).toBe(outputs[0]);
+});
+
+it("keeps an ingested snapshot hash unchanged across process locales, including non-English unit IDs", () => {
+  const module = pathToFileURL(join(process.cwd(), "src/server/database.ts")).href;
+  const script = `
+    const { ConsensusDatabase } = await import(${JSON.stringify(module)});
+    const db = new ConsensusDatabase(":memory:");
+    try {
+      const topic = db.createTopic({ workflowMode: "planned", id: "locale", slug: "locale", title: "Locale",
+        repositoryPath: "/tmp", worktreePath: "/tmp", baseRef: "main", branchName: null, state: "DRAFT",
+        scopeGeneration: 1, planRevision: 0, planSHA256: null, approvedPlanSHA256: null,
+        createdAt: "2026-10-15T00:00:00Z", updatedAt: "2026-10-15T00:00:00Z", lastError: null });
+      const source = db.evidence.register(topic.id, ${JSON.stringify(sourceInput)});
+      const check = db.evidence.begin(source.id, true);
+      const result = db.evidence.ingest(source.id, { checkId: check.checkId, revision: "same", units:
+        [{ id: "api:/검증", kind: "message", content: "Korean route" },
+         { id: "api:/Open", kind: "message", content: "English route" }] });
+      const snapshot = db.evidence.snapshot(source.id, result.contentHash);
+      process.stdout.write(JSON.stringify({ hash: result.contentHash, ids: snapshot.units.map(unit => unit.id) }));
+    } finally { db.close(); }
+  `;
+  const outputs = ["ko_KR.UTF-8", "en_US.UTF-8", "C"].map(locale => {
+    const child = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script],
+      { cwd: process.cwd(), env: { ...process.env, LANG: locale, LC_ALL: locale }, encoding: "utf8", timeout: 15_000 });
+    expect(child.status, child.stderr).toBe(0);
+    return JSON.parse(child.stdout) as { hash: string; ids: string[] };
+  });
+  expect(outputs[0].ids).toEqual(["api:/Open", "api:/검증"]);
+  expect(new Set(outputs.map(output => output.hash)).size).toBe(1);
 });

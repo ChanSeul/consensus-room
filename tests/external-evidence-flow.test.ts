@@ -848,7 +848,7 @@ it("resumes a requested plan once after root approval and a server restart", asy
 it.each(["stop", "scope", "assignment"])("cancels evidence resume after %s, including after restart", async change => {
   const f = await waitingPlan();
   if (change === "stop") f.engine.stop("t");
-  if (change === "scope") await f.engine.handleScopeChange("t", "Changed scope");
+  if (change === "scope") await f.engine.handleScopeChange("t", "Changed scope", { confirmScopeGenerationBump: true, expectedScopeGeneration: f.database.getTopic("t").scopeGeneration });
   if (change === "assignment") f.database.roles.assign({ scope: "topic:t", role: "mediator", operation: "", participant: "new-mediator",
     profileId: null, sessionId: null, expectedVersion: 0, note: "Reassigned" });
   f.complete();

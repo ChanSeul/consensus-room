@@ -547,6 +547,17 @@ export class ConsensusDatabase {
             .run(timestamp, "서버 재시작으로 영향 검토가 중단되었습니다.", row.id as SqlValue);
           continue;
         }
+        // archive는 CLOSED에서 시작하므로 제품 완료 상태가 정리 완료를 증명하지 않는다.
+        // 중단된 삭제를 재시도하거나 성공으로 추정하지 않고, 기존 삭제 보고서와 제품 상태를 보존한다.
+        if (row.kind === "archive") {
+          const message = "서버 재시작으로 캐시 정리가 중단되어 삭제 결과를 확정할 수 없습니다. 기존 삭제 기록은 보존했습니다.";
+          this.db.prepare("UPDATE actions SET status = 'cancelled', finished_at = ?, error = ? WHERE id = ?")
+            .run(timestamp, message, row.id as SqlValue);
+          recorded.push(this.insertEventInTransaction({ topicId: String(row.topic_id), actor: "system", kind: "system",
+            state: String(row.state) as WorkflowState, body: message,
+            payload: { archiveInterrupted: true, recoveredActionId: String(row.id) } }));
+          continue;
+        }
         if (this.actionReachedWaitingState(String(row.topic_id), String(row.id), String(row.state) as WorkflowState)) {
           this.db.prepare("UPDATE actions SET status = 'succeeded', finished_at = ?, error = NULL WHERE id = ?")
             .run(timestamp, row.id as SqlValue);
@@ -970,6 +981,8 @@ export class ConsensusDatabase {
     deliveryResolution?: { action: "commit" | "push"; idempotencyKey: string; outcome: "succeeded" | "failed" };
     // Admission must not publish an active state without its recoverable action (or vice versa).
     startAction?: ActionRecord;
+    // 유지보수 idle 관측과 직렬화된 writer transaction 안에서 action 수락을 최종 확인한다.
+    assertAdmission?: () => void;
     finishAction?: { id: string; status: "succeeded" | "failed" | "cancelled"; error?: string };
     // 역할 세션 교체(계약 v3.16 (17')) — 재개의 행동 시작과 같은 transaction 에서 현재 범위 세대의 코드 리뷰 세션 행을 지우고(이전 세션은 사건 payload 에
     // 남긴다), 계획 연속성 정책을 해제한다.
@@ -984,6 +997,7 @@ export class ConsensusDatabase {
     const recorded: TimelineEvent[] = [];
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      input.assertAdmission?.();
       if (input.deliveryResolution) {
         const { action, idempotencyKey, outcome } = input.deliveryResolution;
         this.resolveUnknownDeliveryAction(input.topicId, action, idempotencyKey, outcome);
@@ -1056,6 +1070,18 @@ export class ConsensusDatabase {
     return event;
   }
 
+  // 동결 통합 결과는 같은 커밋을 가진 어느 단계에서 push해도 전달 완료다. 이전 계약의 결과도 기존 인계 판정을 유지한다.
+  workGroupDelivered(group: WorkGroup): boolean {
+    const integration = group.stages.find(stage => stage.kind === "integration");
+    const link = integration && group.links[integration.id];
+    if (!link) return false;
+    const result = group.results?.[integration!.id];
+    if (result) return Object.values(group.links).some(link => this.getFlags(link.topicId).pushedOID === result.commitOID);
+    if (!group.stages.every(stage => group.links[stage.id])) return false;
+    const topic = this.getTopic(link.topicId), flags = this.getFlags(link.topicId);
+    return Boolean(topic.approvedPlanSHA256 && flags.reviewedTreeOID && flags.committedOID && flags.pushedOID === flags.committedOID);
+  }
+
   // Only the latest closed stage owns the handoff. Opening a successor invalidates it,
   // while blocked/unstarted stages and an undelivered integration remain actionable.
   workGroupContinuation(topicId: string): { key: string; reason: string } | null {
@@ -1077,14 +1103,7 @@ export class ConsensusDatabase {
       WHERE topic_id IN (${linked.map(() => "?").join(",")}) AND actor='system'
       AND json_extract(payload_json, '$.to')='CLOSED' ORDER BY id DESC LIMIT 1`).get(...linked.map(topic => topic.id));
     const topicId = String(lastClose?.topic_id ?? linked[0].id);
-    const integration = group.stages.find(stage => stage.kind === "integration");
-    const result = integration && group.results?.[integration.id];
-    if (result && linked.some(topic => this.getFlags(topic.id).pushedOID === result.commitOID)) return null;
-    const legacyIntegration = integration && group.links[integration.id];
-    if (!result && legacyIntegration && group.stages.every(stage => group.links[stage.id])) {
-      const topic = this.getTopic(legacyIntegration.topicId), flags = this.getFlags(topic.id);
-      if (topic.approvedPlanSHA256 && flags.reviewedTreeOID && flags.committedOID && flags.pushedOID === flags.committedOID) return null;
-    }
+    if (this.workGroupDelivered(group)) return null;
     return { topicId, key: JSON.stringify([group.id, linked.map(topic => topic.id).sort()]),
       reason: `작업 묶음 ${group.id}의 단계가 닫혔습니다. 개별 단계 종료에서 중재를 끝내지 마세요. resume의 workGroupContinuation과 /api/work-groups를 읽고 기존 승인 범위에서 다음 단계를 열고 계획을 이어가세요. 막힌 질문은 최신 근거·기존 결정으로 확인하고 공식 개정 API로 처리하세요. 모든 단계가 끝났으면 통합 결과와 전달 상태를 확인하세요. 새 제품 결정·계획 승인·검증·push 권한은 생략하지 마세요.` };
   }
@@ -1212,7 +1231,11 @@ export class ConsensusDatabase {
     }));
   }
 
-  startAction(record: ActionRecord): void {
+  startAction(record: ActionRecord, assertAdmission?: () => void): void {
+    if (assertAdmission) {
+      this.atomicWithEvents(() => { assertAdmission(); this.startAction(record); }, () => []);
+      return;
+    }
     this.db.prepare(`
       INSERT INTO actions(id, topic_id, kind, status, created_at, finished_at, error, pid, pgid, process_executable, process_command, process_started_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)

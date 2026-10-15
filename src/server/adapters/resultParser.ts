@@ -257,14 +257,34 @@ export function classifyRunFailure(provider: "claude" | "codex", stderr: string,
 // 그걸 뽑아내면 4KB짜리 JSON 꼬리 대신 "월 지출 한도" 같은 한 줄이 원장에 남는다.
 // 마지막 result 이벤트의 요약. stream-json: {"type":"result","subtype":"success|error_max_turns|error_during_execution|…",
 // "is_error":bool,"num_turns":n,"result":"본문"}. codex: {"type":"turn.completed"} 다음 줄에 error 가 올 수 있다.
-// CLI 가 모델을 한 번도 부르지 않고 끝낸 결과(num_turns=0, is_error=false) — 2026-09-14 S10H 실측: 이전 프로세스가 남긴
-// 백그라운드 작업 알림이 resume 직후 큐에서 먼저 빠지며 합성 턴("No response requested")이 result 로 나갔고 실제 프롬프트는
-// 응답 없이 남았다. 모델 비용 0 이므로 같은 호출을 한 번 다시 돌리는 것이 정확한 처방이다(FAILED 로 사람을 부르는 것이 아니라).
+// 모델을 부르지 않은 합성 성공 result — resume 직후 이전 프로세스가 남긴 백그라운드 작업 알림이 큐에서 먼저 빠지면 CLI 가 이 줄을 내고
+// 같은 프로세스에서 실제 프롬프트를 이어 처리할 수 있다(2026-10-14 CP2 실측). 그래서 이 줄은 호출의 끝이 아니다.
+// 0턴 오류 결과(세션 없음 등)는 정상 종료 결과이므로 여기에 넣지 않는다. 판정은 결과 본문 문구에 기대지 않는다.
+export function isSyntheticZeroTurnResult(value: unknown): boolean {
+  return isRecord(value) && value.type === "result" && value.subtype === "success" && value.is_error === false
+    && value.num_turns === 0 && (value.structured_output === undefined || value.structured_output === null);
+}
+
+// Claude stream-json 의 최종 결과 줄(유휴 정리 타이머의 시작점) — 합성 0턴 성공 result 는 뒤에 실제 턴이 이어질 수 있어 제외한다.
+export function isClaudeFinalResult(value: unknown): boolean {
+  return isRecord(value) && value.type === "result" && !isSyntheticZeroTurnResult(value);
+}
+
+// 합성 0턴 result 만 내고 그대로 끝난 호출 — 2026-09-14 S10H 실측: 큐의 알림이 먼저 소비돼 합성 result 가 나갔고 실제 프롬프트는
+// 응답 없이 남았다. 이 호출은 모델·도구 작업을 하지 않았으므로 같은 호출을 한 번 다시 돌린다.
+// 마지막 합성 result 뒤에 실제 assistant·도구 작업이 있으면 이미 실제 턴이 진행된 호출이라 대상이 아니다(2026-10-14 CP2: 합성 result
+// 뒤 실제 턴이 약 2분 돌다 정리됐고, 이 판정이 그 호출을 '비용 0' 으로 보고 다시 돌렸다).
 export function isZeroTurnResult(candidates: readonly unknown[]): boolean {
-  const events = [...candidates].reverse().filter((value): value is Record<string, unknown> =>
-    Boolean(value) && typeof value === "object" && !Array.isArray(value));
-  const result = events.find((event) => event.type === "result");
-  return Boolean(result) && result!.num_turns === 0 && result!.is_error !== true;
+  const events = candidates.filter(isRecord);
+  const index = events.findLastIndex((event) => event.type === "result");
+  return index >= 0 && isSyntheticZeroTurnResult(events[index]) && !events.slice(index + 1).some(isModelOrToolActivity);
+}
+
+// 모델 응답(assistant·부분 스트림) 또는 도구 결과를 실은 줄.
+function isModelOrToolActivity(event: Record<string, unknown>): boolean {
+  if (event.type === "assistant" || event.type === "stream_event") return true;
+  return event.type === "user" && isRecord(event.message) && Array.isArray(event.message.content)
+    && event.message.content.some((block) => isRecord(block) && block.type === "tool_result");
 }
 
 function describeTerminalResult(candidates: readonly unknown[], stdout: string): string {

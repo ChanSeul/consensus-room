@@ -1,11 +1,13 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
-import type { DeferredFinding } from "../shared/contracts.js";
+import type { DeferredFinding, TimelineEvent } from "../shared/contracts.js";
+import type { DecisionOrigin, DecisionSourceInput } from "../shared/prompts.js";
 import { redactSecrets } from "../shared/workflow.js";
 import {
   WorkGroupInputSchema,
   workQuestionResultText,
   dependencyClosure,
+  type DeliveryObservation,
   type PreparedMerge,
   type StageDecision,
   type StageLink,
@@ -349,6 +351,15 @@ export class WorkGroups {
       this.save(g);
     });
   }
+  // 전달 관측 기록 덧붙이기(사용자 결정 1a) — 관측 기록일 뿐 개정이 아니다: version·입력·연결·결과·상태를 바꾸지 않는다.
+  appendDeliveryObservation(id: string, observation: DeliveryObservation): WorkGroup {
+    return this.atomic(() => {
+      const g = this.get(id);
+      g.deliveryObservations = [...(g.deliveryObservations ?? []), structuredClone(observation)];
+      this.save(g);
+      return g;
+    });
+  }
   // 기존 호출 호환 머리말. 연결 단계면 단계 문맥 머리말이다. prior 는 동결 결과가 없는 E4 전 흐름의 증거다 — 동결 결과(선행·합류)가 이미 덮은
   // 단계는 무시하고, 덮지 않은 단계만 옛 줄 형식으로 잇는다. 과거 결과가 동결된 뒤에는 renderStageContext 와 같다.
   prompt(
@@ -402,6 +413,10 @@ export function inheritedDecisions(group: WorkGroup, stageId: string): Array<{ s
     }
   return out;
 }
+// 승계 결정 이벤트 본문의 머리말 — 이벤트를 만드는 쪽(inheritedDecisionEvent)과 원본 본문을 되찾는 쪽(inheritedDecisionOrigin)이 같은 함수를 쓴다.
+function inheritedDecisionHeader(stageId: string, decision: Omit<StageDecision, "body">): string {
+  return `승계 결정 — 단계 ${stageId}(토픽 ${decision.topicId} #${decision.sequence}, 범위 세대 ${decision.scopeGeneration}, sha256 ${decision.sha256}):\n\n`;
+}
 // 승계 결정을 받는 토픽 타임라인에 넣을 이벤트 입력 — 생성(서비스)과 범위 변경(workflow)이 같은 함수를 써서 같은 본문·표식을 만든다.
 export function inheritedDecisionEvent(groupId: string, entry: { stageId: string; decision: StageDecision }): {
   actor: "user"; kind: "decision"; body: string;
@@ -410,10 +425,30 @@ export function inheritedDecisionEvent(groupId: string, entry: { stageId: string
   const { stageId, decision } = entry;
   return {
     actor: "user", kind: "decision",
-    body: `승계 결정 — 단계 ${stageId}(토픽 ${decision.topicId} #${decision.sequence}, 범위 세대 ${decision.scopeGeneration}, sha256 ${decision.sha256}):\n\n${decision.body}`,
+    body: `${inheritedDecisionHeader(stageId, decision)}${decision.body}`,
     payload: { inheritedDecision: { groupId, stageId, topicId: decision.topicId, sequence: decision.sequence,
       scopeGeneration: decision.scopeGeneration, sha256: decision.sha256 } },
   };
+}
+// 받는 토픽의 승계 결정 이벤트에서 원출처와 원본 본문을 되찾는다(결정 원문 묶음의 본문 비교, 2026-10-14 자문 8). 표식이 온전하고, 본문이 같은 머리말로
+// 시작하고, 머리말을 뗀 본문의 sha256 이 표식과 같을 때만 돌려준다 — 하나라도 어긋나면 null 이고 호출자는 이벤트 본문 전체를 이 토픽의 결정으로 본다.
+export function inheritedDecisionOrigin(event: Pick<TimelineEvent, "body" | "payload">): { origin: DecisionOrigin; body: string; sha256: string } | null {
+  const marker = event.payload?.inheritedDecision as Record<string, unknown> | undefined;
+  if (!marker || typeof marker.stageId !== "string" || typeof marker.topicId !== "string" || typeof marker.sequence !== "number"
+    || typeof marker.scopeGeneration !== "number" || typeof marker.sha256 !== "string") return null;
+  const origin = { stageId: marker.stageId, topicId: marker.topicId, sequence: marker.sequence, scopeGeneration: marker.scopeGeneration };
+  const header = inheritedDecisionHeader(origin.stageId, { ...origin, sha256: marker.sha256 });
+  if (!event.body.startsWith(header)) return null;
+  const body = event.body.slice(header.length);
+  return createHash("sha256").update(body, "utf8").digest("hex") === marker.sha256 ? { origin, body, sha256: marker.sha256 } : null;
+}
+// 결정 이벤트 → 결정 원문 묶음의 비교·저장 입력. 승계 이벤트는 원출처와 머리말을 뗀 원본(검증된 sha256)을 쓰고, 승계로 확인되지 않으면 이 토픽의 결정으로
+// 보고 이벤트 본문 전체를 쓴다 — 다른 본문을 같은 것으로 묶지 않는다.
+export function decisionSourceInput(event: Pick<TimelineEvent, "sequence" | "body" | "payload">): DecisionSourceInput {
+  const inherited = inheritedDecisionOrigin(event);
+  return inherited
+    ? { sequence: event.sequence, origin: inherited.origin, body: inherited.body, sha256: inherited.sha256 }
+    : { sequence: event.sequence, origin: null, body: event.body, sha256: createHash("sha256").update(event.body, "utf8").digest("hex") };
 }
 
 const resultView = (r: StageResult, seenDeferred?: Set<string>): StageContextResult => ({
@@ -571,10 +606,11 @@ const fullStage = (s: WorkStage) => ({ ...s, checklist: s.checklist ?? [] });
 const withoutChecklist = ({ checklist: _checklist, ...rest }: WorkStage) => rest;
 // 재적용 판정용 입력 비교 — 과거 레코드의 빠진 선택 필드는 빈 값과 같다.
 const comparableInput = (g: WorkGroupInput) => ({ title: g.title, goal: g.goal, contracts: g.contracts, stages: g.stages.map(fullStage),
-  budgetPolicy: g.budgetPolicy ?? null, questions: g.questions ?? [] });
+  budgetPolicy: g.budgetPolicy ?? null, questions: g.questions ?? [], deliveryBranch: g.deliveryBranch ?? null });
 // 레코드에서 입력 필드만 되돌린다(적용 때 같은 입력으로 다시 계산하려고).
 const inputFields = (g: WorkGroup): WorkGroupInput => ({ title: g.title, goal: g.goal, contracts: g.contracts, stages: g.stages,
-  ...(g.budgetPolicy ? { budgetPolicy: g.budgetPolicy } : {}), ...(g.questions ? { questions: g.questions } : {}) });
+  ...(g.budgetPolicy ? { budgetPolicy: g.budgetPolicy } : {}), ...(g.questions ? { questions: g.questions } : {}),
+  ...(g.deliveryBranch ? { deliveryBranch: g.deliveryBranch } : {}) });
 
 function planRevision(old: WorkGroup, parsed: WorkGroupInput, expectedVersion: number, closedIds: ReadonlySet<string>): RevisionPreview {
   const closed = old.stages.map((s) => s.id).filter((id) => closedIds.has(id));
@@ -643,6 +679,7 @@ function planRevision(old: WorkGroup, parsed: WorkGroupInput, expectedVersion: n
   };
   if (parsed.budgetPolicy === undefined) delete group.budgetPolicy;
   if (parsed.questions === undefined) delete group.questions;
+  if (parsed.deliveryBranch === undefined) delete group.deliveryBranch;
   // 영향 단계: 닫히지 않은 연결 단계 가운데 새 레코드의 단계 문맥 해시가 기록 해시와 다른 것. E4 전 연결(해시 없음)은 개정 전후 단계 문맥의
   // 해시를 비교한다(F006) — 목표·계약·자기 서술·체크리스트·현재 질문(추가·해소)·선행 결과·합류처럼 실제 전달 문맥이 바뀐 것이다.
   const affected = parsed.stages.filter((stage) => {

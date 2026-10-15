@@ -423,10 +423,12 @@ describe("E3-4c host-review 39d21df9 F004 — 프로토콜 턴이 만든 세션�
   const BODY = "EXECUTOR-MEMORY-BODY-MARKER";
   class StdinRunner implements CommandRunner {
     readonly calls: CommandSpec[] = [];
+    beforeAdmission?: () => void;
     private threads = 0;
     constructor(private readonly provider: "claude" | "codex") {}
     async run(spec: CommandSpec): Promise<CommandResult> {
       this.calls.push(spec);
+      this.beforeAdmission?.();
       await spec.beforeSpawn?.(); spec.admitSync?.();
       spec.onSpawn?.({ pid: 123, pgid: 123, executable: this.provider, commandLine: this.provider, startedAt: new Date().toISOString() });
       const lines: unknown[] = [];
@@ -460,7 +462,7 @@ describe("E3-4c host-review 39d21df9 F004 — 프로토콜 턴이 만든 세션�
     const idle: AgentAdapter = { role: provider === "claude" ? "codex" : "claude", validateExistingSession: async () => true,
       createSession: async () => { throw new Error("쓰지 않는 좌석"); }, resumeTurn: async () => { throw new Error("쓰지 않는 좌석"); } };
     const core = new EngineCore({ database, artifacts: new ArtifactStore(join(root, "topics"), database), git: new GitService(new SpawnCommandRunner()),
-      claude: provider === "claude" ? adapter : idle, codex: provider === "codex" ? adapter : idle });
+      claude: provider === "claude" ? adapter : idle, codex: provider === "codex" ? adapter : idle, maintenanceLockPath: join(root, "maintenance.lock") });
     // 한 action 안에서 턴을 연다(실행기는 action 의 signal·주제 상태를 현재성으로 대조한다).
     const inAction = async (work: (turn: (job: TurnJob, state: WorkflowState, session: string | null) => Promise<string>) => Promise<void>) => {
       let failure: unknown = null;
@@ -483,8 +485,56 @@ describe("E3-4c host-review 39d21df9 F004 — 프로토콜 턴이 만든 세션�
       }
       if (failure) throw failure;
     };
-    return { database, runner, inAction };
+    return { database, runner, inAction, core, root, lock: join(root, "maintenance.lock") };
   }
+  it.each(["claude", "codex"] as const)("idle-restart preserves already admitted %s turns and blocks new actions", async provider => {
+    const { database, runner, inAction, core, lock } = executorRoom(provider);
+    const actionIds: string[] = [];
+    let signal!: AbortSignal;
+    runner.beforeAdmission = () => {
+      const active = core.active.get("t")!; signal = active.controller.signal; actionIds.push(active.actionId);
+      writeFileSync(lock, JSON.stringify({ at: new Date().toISOString(), pid: process.pid, reason: "restart_room", mode: "idle-restart" }));
+      expect(() => core.assertNoMaintenanceLock(undefined, { topicId: "t", signal: new AbortController().signal })).toThrow("유지보수 잠금");
+    };
+    try {
+      await inAction(async turn => {
+        const job = { role: provider === "claude" ? "planner" : "reviewer", operation: "ack" } as TurnJob;
+        const session = await turn(job, "IMPLEMENTING", null);
+        await turn(job, "IMPLEMENTING", session);
+      });
+      expect(actionIds).toHaveLength(2); expect(new Set(actionIds).size).toBe(1);
+      expect(database.getAction(actionIds[0])?.status).toBe("succeeded");
+      expect(database.getTopic("t").state).toBe("IMPLEMENTING");
+      expect(database.getTimeline("t").some(event => event.payload.admissionRefused === "maintenance")).toBe(false);
+      expect(() => core.assertNoMaintenanceLock(undefined, { topicId: "t", signal })).toThrow("유지보수 잠금");
+      expect(() => core.startAction("t", "new", async () => {})).toThrow("유지보수 잠금");
+      expect(database.runningAction("t")).toBeNull();
+    } finally { database.close(); }
+  });
+
+  it.each(["plain", "transition", "events"])("rechecks maintenance inside the action admission transaction (%s)", async mode => {
+    const { database, core, lock } = executorRoom("codex");
+    database.updateTopic("t", { state: "DRAFT" });
+    const before = database.getTopic("t");
+    const installLock = () => writeFileSync(lock, JSON.stringify({ at: new Date().toISOString(), pid: process.pid, reason: "restart_room", mode: "idle-restart" }));
+    if (mode === "plain") {
+      const original = database.startAction.bind(database);
+      database.startAction = (record, guard) => { installLock(); return original(record, guard); };
+    } else {
+      const original = database.applyTopicTransition.bind(database);
+      database.applyTopicTransition = input => { installLock(); return original(input); };
+    }
+    try {
+      expect(() => core.startAction("t", "new", async () => {}, "rejected",
+        mode === "transition" ? { to: "CLAUDE_PLAN", message: "start" } : undefined,
+        mode === "events" ? [{ actor: "user", kind: "decision", state: "DRAFT", body: "start" }] : []))
+        .toThrow("유지보수 잠금");
+      expect(database.getAction("rejected")).toBeNull();
+      expect(database.getTopic("t")).toEqual(before);
+      expect(database.getTimeline("t")).toEqual([]);
+    } finally { database.close(); }
+  });
+
   it.each(["claude", "codex"] as const)("%s 실제 spawn 메타데이터를 확정 세션에 저장한다", async provider => {
     const { database, inAction } = executorRoom(provider);
     try {

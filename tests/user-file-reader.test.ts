@@ -65,7 +65,7 @@ it("propagates already cancelled reads through every memory entry point", async 
   }
 });
 
-// 10-05 1fd0cc86: brew 가 node keg 를 바꾸는 동안 리더 자식이 dyld 단계에서 SIGABRT 로 죽었다. 파일 접근 차단이 아니라 호스트 런타임 고장이고, 사유(stderr)가 남아야 한다.
+// 10-05 example-topic: brew 가 node keg 를 바꾸는 동안 리더 자식이 dyld 단계에서 SIGABRT 로 죽었다. 파일 접근 차단이 아니라 호스트 런타임 고장이고, 사유(stderr)가 남아야 한다.
 it("classifies a reader runtime that dies before replying as a host runtime failure and keeps its stderr", async () => {
   const dir = root(), bin = root();
   writeFileSync(join(bin, "node"), "#!/bin/sh\necho 'dyld[1]: Library not loaded: /opt/homebrew/opt/simdjson/lib/libsimdjson.33.dylib' >&2\nkill -ABRT $$\n", { mode: 0o755 });

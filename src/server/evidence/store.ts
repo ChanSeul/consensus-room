@@ -9,7 +9,7 @@ import { redactSecrets } from "../../shared/workflow.js";
 import { EvidenceResumeStore } from "./resume.js";
 import { EvidenceCatalogStore } from "./catalog.js";
 
-import { evidenceHash, stableJSON } from "./identity.js";
+import { compareEvidenceStrings, evidenceHash, stableJSON } from "./identity.js";
 export { evidenceHash, stableJSON } from "./identity.js";
 import { SqliteEvidenceReadLifecycle, type EvidenceReadLifecycle, type EvidenceReadRequest, type EvidenceReadEvent, type EvidenceReadLinks } from "./readLifecycle.js";
 
@@ -502,7 +502,7 @@ export class EvidenceStore {
       }
       // changedAt is provenance, not content. Status/assignee belong in issue content explicitly.
       return { ...unit, content, author, imageHash, contentHash: evidenceHash(stableJSON({ kind: unit.kind, content, author, imageHash })) };
-    }).sort((a, b) => a.id.localeCompare(b.id));
+    }).sort((a, b) => compareEvidenceStrings(a.id, b.id));
     const contentHash = evidenceHash(stableJSON(units.map(u => [u.id, u.contentHash])));
     const ownsTransaction = !this.db.isTransaction;
     if (ownsTransaction) this.db.exec("BEGIN IMMEDIATE");

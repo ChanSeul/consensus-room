@@ -7,7 +7,7 @@ import { redactSecrets } from "../shared/workflow.js";
 
 // 에이전트 턴이 기대는 호스트 실행 파일(사용자 파일 리더의 node, 공급자 CLI, 계획 필수 검사의 swiftc)의 유일한 해석·분류 소유자다.
 // 부팅 때 경로를 고정하지 않는다 — brew 가 node keg 를 바꾸거나 앱 업데이트가 CLI 링크를 옮기면 고정 경로는 서버 수명 내내 깨진 채 남았다
-// (2026-10-05 1fd0cc86 리더 dyld SIGABRT, 2026-09-29 'spawn codex ENOENT'). 쓸 때마다 풀고, 못 풀면 bare 이름으로 폴백하지 않고
+// (2026-10-05 example-topic 리더 dyld SIGABRT, 2026-09-29 'spawn codex ENOENT'). 쓸 때마다 풀고, 못 풀면 bare 이름으로 폴백하지 않고
 // HostRuntimeUnavailable 를 던진다. 그 오류는 core.startAction 한 분기에서 resource 정지(admissionRefused: "host-runtime")가 된다.
 // Codex 는 sandbox 안에서 자기 자신을 다시 실행하므로 PATH 의 심볼릭 링크가 아니라 실제 경로를 읽기 허용·실행에 함께 써야 한다(2026-08-29 실측).
 export type HostExecutable = "node" | "codex" | "claude" | "swiftc";

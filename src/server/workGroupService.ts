@@ -1,13 +1,13 @@
 import { assertTopicParent } from "./topicStructure.js";
-import { dependencyClosure, stageReady, WorkGroupCreateOptionsSchema, WorkGroupInputSchema } from "../shared/workGroups.js";
+import { dependencyClosure, DeliveryObservationInputSchema, stageReady, WorkGroupCreateOptionsSchema, WorkGroupInputSchema } from "../shared/workGroups.js";
 import { BudgetPolicySchema, OBSERVE_USAGE } from "../shared/budgets.js";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { ConsensusDatabase } from "./database.js";
 import type { GitService } from "./git.js";
-import type { ExternalPredecessor, PreparedMerge, StageLink, StageResult, WorkGroup, WorkGroupCreateOptions, WorkGroupInput, WorkStage } from "../shared/workGroups.js";
+import type { DeliveryObservation, DeliveryObservationInput, ExternalPredecessor, PreparedMerge, StageLink, StageResult, WorkGroup, WorkGroupCreateOptions, WorkGroupInput, WorkStage } from "../shared/workGroups.js";
 import type { AgentSettings, DeferredFinding } from "../shared/contracts.js";
 
 export interface WorkGroupServiceOptions {
@@ -49,6 +49,32 @@ export class WorkGroupService {
     private readonly settings: AgentSettings,
     private readonly options: WorkGroupServiceOptions = {},
   ) {}
+
+  async observeDelivery(id: string, input: DeliveryObservationInput, origin: "user" | "mediator", requestKey: string): Promise<DeliveryObservation> {
+    const { remote = "origin", branch: requestedBranch } = DeliveryObservationInputSchema.parse(input);
+    const group = this.database.workGroups.get(id);
+    const branch = group.deliveryBranch ?? requestedBranch;
+    if (!branch) throw Object.assign(new Error("deliveryBranch 또는 관측할 branch가 필요합니다."), { statusCode: 400 });
+    if (group.deliveryBranch && requestedBranch && requestedBranch !== group.deliveryBranch) {
+      throw Object.assign(new Error("관측할 branch가 묶음의 deliveryBranch와 다릅니다."), { statusCode: 400 });
+    }
+    const integration = group.stages.find(stage => stage.kind === "integration")!;
+    const resultSha = group.results?.[integration.id]?.commitOID;
+    if (!resultSha) throw Object.assign(new Error("동결된 통합 단계 결과가 있어야 전달을 관측할 수 있습니다."), { statusCode: 409 });
+    const observedRef = `refs/remotes/${remote}/${branch}`;
+    const observedSha = await this.git.localRefOID(group.repositoryPath, observedRef);
+    const observedAt = new Date().toISOString();
+    // ref가 이후 움직여도 기록한 SHA와 동일한 커밋으로 판정한다. 네트워크 최신화는 호출자의 책임이다.
+    const contains = observedSha !== null && await this.git.isAncestor(group.repositoryPath, resultSha, observedSha);
+    const current = this.database.workGroups.get(id);
+    if (current.repositoryPath !== group.repositoryPath || current.deliveryBranch !== group.deliveryBranch ||
+      current.stages.find(stage => stage.kind === "integration")?.id !== integration.id || current.results?.[integration.id]?.commitOID !== resultSha) {
+      throw Object.assign(new Error("관측 중 전달 대상 또는 통합 결과가 바뀌었습니다. 현재 묶음으로 다시 관측하세요."), { statusCode: 409 });
+    }
+    const observation: DeliveryObservation = { remote, branch, observedRef, observedSha, observedAt, resultSha, contains, origin, requestKey };
+    this.database.workGroups.appendDeliveryObservation(id, observation);
+    return observation;
+  }
 
   // options 는 생성 전용 입력(WorkGroupCreateOptionsSchema) — 명시 기준 커밋·단계 브랜치 접두사·묶음 밖 선행 토픽. 없으면 기존 동작이다.
   async create(
@@ -574,6 +600,23 @@ function inheritedStages(group: WorkGroup, stage: WorkStage): string[] {
     : dependencyClosure(group, stage.id);
 }
 
+// spawn ENOENT만으로는 cwd 누락과 git 실행 파일 누락을 구분할 수 없다. 실제 경로가 없을 때만 진단을 보완한다.
+async function inPriorWorktree<T>(stageId: string, worktreePath: string, work: () => Promise<T>): Promise<T> {
+  try {
+    return await work();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    try {
+      await stat(worktreePath);
+    } catch (pathError) {
+      if ((pathError as NodeJS.ErrnoException).code === "ENOENT") {
+        throw new Error(`선행 단계 ${stageId} 의 작업 폴더가 없습니다: ${worktreePath}. 원인: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+      }
+    }
+    throw error;
+  }
+}
+
 // 이전 계약(E4 전)의 승계 증거 — 승인 계획·리뷰 트리·push 된 커밋(=커밋)이 있고, 그 토픽 HEAD 가 그 커밋이며 작업 트리가 깨끗하다.
 async function legacyEvidence(
   database: ConsensusDatabase,
@@ -591,17 +634,20 @@ async function legacyEvidence(
     !flags.reviewedTreeOID
   )
     throw new Error(`E4 전에 닫힌 단계 ${stageId} 의 승인·리뷰·푸시 기록이 없어 결과를 승계할 수 없습니다.`);
-  if (
-    (await git.head(topic.worktreePath)) !== flags.pushedOID ||
-    (await git.changedPaths(topic.worktreePath)).length
-  )
-    throw new Error(`단계 ${stageId} 의 전달 커밋이 변경됐습니다.`);
-  return {
-    stageId,
-    commit: flags.pushedOID,
-    planSHA: topic.approvedPlanSHA256,
-    verification: flags.reviewedTreeOID,
-  };
+  const reviewedTreeOID = flags.reviewedTreeOID;
+  return inPriorWorktree(stageId, topic.worktreePath, async () => {
+    if (
+      (await git.head(topic.worktreePath)) !== flags.pushedOID ||
+      (await git.changedPaths(topic.worktreePath)).length
+    )
+      throw new Error(`단계 ${stageId} 의 전달 커밋이 변경됐습니다.`);
+    return {
+      stageId,
+      commit: flags.pushedOID,
+      planSHA: topic.approvedPlanSHA256,
+      verification: reviewedTreeOID,
+    };
+  });
 }
 
 // 승계 검사(E4-5) — 동결 결과마다 ① 결과 커밋 트리 == 리뷰한 트리 ② 결과 커밋이 그 단계 기준 커밋의 후손(다른 계보 거부) ③ 그 토픽 HEAD 가
@@ -618,23 +664,25 @@ async function verifySuccession(
   if (topic.state !== "CLOSED") throw new Error(`의존 단계 ${stageId} 가 아직 닫히지 않았습니다.`);
   const result = group.results?.[stageId];
   if (!result) return legacyEvidence(database, git, stageId, link);
-  if (!result.legacy) {
-    if ((await git.diffTrees(topic.worktreePath, result.commitOID, result.reviewedTreeOID)).files.length)
-      throw new Error(`단계 ${stageId} 의 결과 커밋 트리가 리뷰한 트리와 다릅니다.`);
-    if (!(await git.isAncestor(topic.worktreePath, link.baseOID, result.commitOID)))
-      throw new Error(`단계 ${stageId} 의 결과 커밋이 그 단계 기준 커밋의 후손이 아닙니다.`);
-  }
-  if (
-    (await git.head(topic.worktreePath)) !== result.commitOID ||
-    (await git.changedPaths(topic.worktreePath)).length
-  )
-    throw new Error(`단계 ${stageId} 의 결과 커밋이 변경됐습니다(작업 트리 HEAD 가 다르거나 커밋하지 않은 변경이 있습니다).`);
-  return {
-    stageId,
-    commit: result.commitOID,
-    planSHA: result.planSHA256,
-    verification: result.reviewedTreeOID,
-  };
+  return inPriorWorktree(stageId, topic.worktreePath, async () => {
+    if (!result.legacy) {
+      if ((await git.diffTrees(topic.worktreePath, result.commitOID, result.reviewedTreeOID)).files.length)
+        throw new Error(`단계 ${stageId} 의 결과 커밋 트리가 리뷰한 트리와 다릅니다.`);
+      if (!(await git.isAncestor(topic.worktreePath, link.baseOID, result.commitOID)))
+        throw new Error(`단계 ${stageId} 의 결과 커밋이 그 단계 기준 커밋의 후손이 아닙니다.`);
+    }
+    if (
+      (await git.head(topic.worktreePath)) !== result.commitOID ||
+      (await git.changedPaths(topic.worktreePath)).length
+    )
+      throw new Error(`단계 ${stageId} 의 결과 커밋이 변경됐습니다(작업 트리 HEAD 가 다르거나 커밋하지 않은 변경이 있습니다).`);
+    return {
+      stageId,
+      commit: result.commitOID,
+      planSHA: result.planSHA256,
+      verification: result.reviewedTreeOID,
+    };
+  });
 }
 
 // 단계가 턴마다 다시 확인하는 선행 결과 — 의존 폐포와 합류 대상 결과의 승계 검사(단계 순서). 반환 형식은 기존과 같다.

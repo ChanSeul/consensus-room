@@ -6,6 +6,10 @@ import { existsSync, readdirSync, readFileSync, readlinkSync, statSync, lstatSyn
 import { join, relative } from "node:path";
 
 export const TOOL_TREE_SUBDIRECTORIES = ["scripts", "bootstrap", "stages", "selftest"] as const;
+// 러너 안내(엔진 결함 example-tool-tree, 2026-10-14): 쓰기 거부는 턴 시작 때 있는 폴더만 넣으므로, 러너가 없던 폴더에 보조 파일을 만들면 다이제스트 대조로만
+// 잡혀 사유를 모른 채 턴이 멈췄다. 쓰기 턴 입력에 이 보호 목록을 미리 싣는다. 문구는 위 목록에서 만든다 — 목록을 따로 적지 않는다.
+export const TOOL_TREE_RUNNER_NOTE = `앱 밖 도구 트리: 작업 트리의 \`DerivedData/<이름>-logs/\` 아래 ${TOOL_TREE_SUBDIRECTORIES.map(sub => `\`${sub}/\``).join("·")}`
+  + " 에는 파일을 만들거나 고치거나 지우지 마세요. 엔진이 턴 전후로 이 폴더들을 대조해 바뀌었으면 턴을 실패시킵니다. 보조 스크립트와 임시 산출물은 이 폴더들 밖에 두세요.";
 const SKIP = new Set(["__pycache__", ".DS_Store"]);
 
 export function toolTreeDirectories(workspace: string): string[] {

@@ -68,20 +68,162 @@ it("ends open SSE responses before waiting for HTTP close", async () => {
   finally { response.destroy(); await app.close(); }
 });
 
-it("engine repository lock refuses that repository while another project remains admitted", async () => {
+// 엔진 결함 큐는 등록·조회·종결만 한다(2026-10-15 사용자 결정 "큐 수리 주체: Claude 워커로 단일화"). 수리는 master 가 Claude 작업으로 배정한다.
+// 지운 자동 큐는 서버 시작 때 실행 중이던 행을 blocked 로 바꾸고, 닫힌 토픽의 todo 를 집어 git·Codex 수정·host-review·정산·합류를 돌렸다.
+it("starts, registers and closes engine defects without a model call, host-review, settlement or git merge, and leaves recorded rows as they were", async () => {
+  const commands: string[] = [];
+  const refusing: CommandRunner = { run: async spec => { commands.push(`${spec.command} ${spec.args.join(" ")}`); throw new Error("엔진 결함 큐는 명령을 실행하지 않습니다."); } };
+  const { app, database, adapterCalls } = await makeApp(refusing, undefined, { gitRepository: true });
+  try {
+    draftTopic(database, "engine-source");
+    database.createTopic({ ...database.getTopic("engine-source"), id: "engine-done", slug: "engine-done", state: "CLOSED" });
+    const todo = database.engineDefects.enqueue("engine-done", { key: "waiting", title: "Waiting defect", evidence: "Observed", workaround: "" });
+    const candidate = database.engineDefects.enqueue("engine-done", { key: "candidate", title: "Kept candidate", evidence: "Observed", workaround: "" });
+    database.engineDefects.save({ ...candidate, status: "blocked", error: "host-review 실패", base: "a".repeat(40), head: "b".repeat(40),
+      worktree: "/kept/engine-defect-candidate", review: { status: "blocked" }, waiting: "예산 대기", budgetAccounts: ["engine-done", "engine-defects"],
+      reviewExecutionId: "old-review" });
+    const executing = database.engineDefects.enqueue("engine-done", { key: "executing", title: "Interrupted run", evidence: "Observed", workaround: "" });
+    database.engineDefects.save({ ...executing, status: "executing", actionId: "old-run", base: "a".repeat(40) });
+    // The candidate's review execution is still open: the removed queue settled it through host-review usage before any other work.
+    database.budgets.start({ id: "old-review", accounts: ["engine-done", "engine-defects"], stage: "ENGINE_DEFECT_REVIEW",
+      role: "codex", model: "m", effort: "xhigh", startedAt: Date.now(), dispatchStarted: true });
+    const recorded = database.engineDefects.list();
+    await listenReady(app, { host: "127.0.0.1", port: 0 });
+    await new Promise(resolve => setTimeout(resolve, 200));
+    const token = { "x-consensus-token": "launch-token-for-test" };
+    const registered = await app.inject({ method: "POST", url: "/api/topics/engine-done/engine-defects", headers: { ...token, "x-consensus-actor": "mediator" },
+      payload: { key: "new", title: "New defect", evidence: "Observed again", workaround: "" } });
+    expect(registered.statusCode).toBe(200);
+    expect(registered.json()).toMatchObject({ status: "todo" });
+    expect(database.getTimeline("engine-done").at(-1)?.body).toContain("master 가 분류해 수리를 배정합니다");
+    const closed = await app.inject({ method: "POST", url: `/api/engine-defects/${todo.id}/close`, headers: token,
+      payload: { reason: "duplicate", representativeId: candidate.id } });
+    expect(closed.statusCode).toBe(200);
+    expect((await app.inject({ method: "POST", url: `/api/engine-defects/${candidate.id}/retry`, headers: token, payload: {} })).statusCode).toBe(404);
+    await new Promise(resolve => setTimeout(resolve, 200));
+    expect(commands).toEqual([]);
+    expect(adapterCalls).toEqual([]);
+    expect(database.budgets.execution("old-review").finished).toBe(false);
+    const listed = (await app.inject({ url: "/api/engine-defects", headers: token })).json() as typeof recorded;
+    expect(listed.filter(row => row.id !== todo.id && row.key !== "new")).toEqual(recorded.filter(row => row.id !== todo.id));
+    expect(listed.find(row => row.id === todo.id)).toMatchObject({ status: "closed", closure: { reason: "duplicate", representativeId: candidate.id } });
+  } finally { await app.close(); }
+});
+
+// engine-work.lock 은 지운 자동 큐만 만들고 갱신했다. 남은 파일이 있어도 엔진 저장소 토픽의 실행 허용을 막지 않는다.
+it("a leftover engine-work.lock from the removed queue no longer refuses the engine repository", async () => {
   const { app, database, root } = await makeApp(undefined, undefined, { gitRepository: true });
   try {
-    const product = join(root, "product"); mkdirSync(product);
-    execFileSync("git", ["init", "-q", product]);
-    draftTopic(database, "engine-locked", { repositoryPath: root, worktreePath: root });
-    draftTopic(database, "product-free", { repositoryPath: product, worktreePath: root });
+    draftTopic(database, "engine-repository", { repositoryPath: root, worktreePath: root });
     writeFileSync(join(root, "engine-work.lock"), JSON.stringify({ id: "engine-fix", repository: realpathSync(join(root, ".git")) }));
-    const request = (id: string) => app.inject({ method: "POST", url: `/api/topics/${id}/actions/tool-tree-rebaseline`,
-      headers: { "x-consensus-token": "launch-token-for-test", "idempotency-key": id }, payload: { reason: "tools updated" } });
-    const blocked = await request("engine-locked");
-    expect(blocked.statusCode).toBeGreaterThanOrEqual(400);
-    expect(blocked.json().error).toContain("엔진 저장소 후속 작업");
-    expect((await request("product-free")).statusCode).toBe(200);
+    const response = await app.inject({ method: "POST", url: "/api/topics/engine-repository/actions/tool-tree-rebaseline",
+      headers: { "x-consensus-token": "launch-token-for-test", "idempotency-key": "engine-repository" }, payload: { reason: "tools updated" } });
+    expect(response.statusCode).toBe(200);
+  } finally { await app.close(); }
+});
+
+// 구현 기준 채택(2026-10-13)은 공식 action 이다 — 라우트가 있고(404 아님), head 형식 오류는 400, 정지 상태가 아닌 토픽은 사전 검사 사유(409)로 거부한다.
+it("implementation-rebaseline is an official action that validates head and refuses topics that are not interrupted", async () => {
+  const { app, database } = await makeApp();
+  try {
+    draftTopic(database, "rebaseline-draft");
+    const post = (key: string, payload: Record<string, unknown>) => app.inject({ method: "POST", url: "/api/topics/rebaseline-draft/actions/implementation-rebaseline",
+      headers: { "x-consensus-token": "launch-token-for-test", "idempotency-key": key }, payload });
+    expect((await post("bad-head", { reason: "확인", head: "abc" })).statusCode).toBe(400);
+    const draft = await post("draft", { reason: "확인", head: "a".repeat(40) });
+    expect(draft.statusCode).toBe(409);
+    expect(draft.json().error).toContain("정지 상태");
+    expect(database.getTopic("rebaseline-draft").state).toBe("DRAFT");
+  } finally { await app.close(); }
+});
+
+// 구현 기준 채택의 요청 복구 마커(정식 리뷰 F010, 2026-10-13) — 라우트가 idempotency key 를 기준 변경과 같은 transaction 의 결정 기록에 싣는다. 기준 변경 뒤 원장
+// 기록 전에 서버가 죽어도(finish·fail 모두 남지 않음) 재시작 복구가 성공으로 닫고, 같은 키 재전송은 다시 실행하지 않고 복구 응답을 재생한다.
+it("implementation-rebaseline records its request marker with the adopted baseline so restart recovery closes an interrupted request as succeeded", async () => {
+  const { app, database, root } = await makeApp(new SpawnCommandRunner(), undefined, { gitRepository: true });
+  try {
+    const git = (...args: string[]) => execFileSync("git", ["-C", root, ...args], { encoding: "utf8" }).trim();
+    git("checkout", "-qb", "consensus/rebaseline-route");
+    const pinned = git("rev-parse", "HEAD");
+    writeFileSync(join(root, "README.txt"), "외부\n");
+    git("commit", "-qam", "외부 커밋");
+    const head = git("rev-parse", "HEAD");
+    draftTopic(database, "rebaseline-route", { repositoryPath: root, worktreePath: root, branchName: "consensus/rebaseline-route" });
+    database.updateTopic("rebaseline-route", { state: "FAILED", resumeState: "CLAUDE_FIX", implementationBaseOID: pinned });
+    const post = () => app.inject({ method: "POST", url: "/api/topics/rebaseline-route/actions/implementation-rebaseline",
+      headers: { "x-consensus-token": "launch-token-for-test", "idempotency-key": "rebaseline-key" }, payload: { reason: "외부 커밋을 확인했습니다.", head } });
+    const finish = vi.spyOn(database, "finishActionRequest").mockImplementation(() => { throw new Error("서버 종료"); });
+    const fail = vi.spyOn(database, "failActionRequest").mockImplementation(() => { throw new Error("서버 종료"); });
+    try { expect((await post()).statusCode).toBe(500); } finally { finish.mockRestore(); fail.mockRestore(); }
+    expect(database.getFlags("rebaseline-route").implementationBaseOID).toBe(head);
+    expect(database.getActionRequest("rebaseline-route", "implementation-rebaseline", "rebaseline-key")?.status).toBe("running");
+    database.recoverInterruptedNonDeliveryRequests();
+    expect(database.getActionRequest("rebaseline-route", "implementation-rebaseline", "rebaseline-key")?.status).toBe("succeeded");
+    const replay = await post();
+    expect(replay.statusCode).toBe(200);
+    expect(replay.json()).toMatchObject({ recovered: true });
+    expect(database.getTimeline("rebaseline-route").filter((event) => event.payload?.implementationRebaseline)).toHaveLength(1);
+  } finally { await app.close(); }
+});
+
+// 계획 왕복 1회 보류(자문 17)는 공식 위임 action 이다 — 본문 형식 오류는 400, 계획 왕복 밖·범위 세대·계획 epoch 불일치는 409 로 거부하고 아무것도 남기지 않는다.
+// 받으면 실행을 시작하지 않고 요청 하나만 남긴다. 같은 키 재전송은 저장 응답을 재생하고, 새 키의 중복 요청은 같은 대기 요청을 돌려준다.
+it("planning-hold is a delegated action bound to the scope generation and plan epoch that records one pending request without starting work", async () => {
+  const { app, database } = await makeApp();
+  try {
+    draftTopic(database, "planning-hold");
+    const post = (key: string, payload: Record<string, unknown>, actor?: string) => app.inject({ method: "POST", url: "/api/topics/planning-hold/actions/planning-hold",
+      headers: { "x-consensus-token": "launch-token-for-test", "idempotency-key": key, ...(actor ? { "x-consensus-actor": actor } : {}) }, payload });
+    const input = { reason: "결정문을 넣고 잇는다", expectedScopeGeneration: 1, expectedPlanEpoch: 1 };
+    const requests = () => database.getTimeline("planning-hold").filter((event) => typeof (event.payload?.planningHold as { request?: unknown } | undefined)?.request === "string");
+    expect((await post("missing-epoch", { reason: "확인", expectedScopeGeneration: 1 })).statusCode).toBe(400);
+    const draft = await post("draft", input);
+    expect(draft.statusCode).toBe(409);
+    expect(draft.json().error).toContain("계획 왕복 중이 아닙니다");
+
+    database.updateTopic("planning-hold", { state: "USER_DECISION_REQUIRED", resumeState: "CLAUDE_REVISION" });
+    const stale = await post("stale-generation", { ...input, expectedScopeGeneration: 2 });
+    expect(stale.statusCode).toBe(409);
+    expect(stale.json().error).toContain("범위 세대가 다릅니다");
+    expect((await post("stale-epoch", { ...input, expectedPlanEpoch: 2 })).statusCode).toBe(409);
+    expect(requests()).toHaveLength(0);
+
+    const accepted = await post("hold", input, "mediator");
+    expect(accepted.statusCode).toBe(200);
+    const hold = accepted.json().hold;
+    expect(hold).toMatchObject({ alreadyPending: false, scopeGeneration: 1, planEpoch: 1, state: "USER_DECISION_REQUIRED", stage: "CLAUDE_REVISION", running: false });
+    expect(database.getTopic("planning-hold").state).toBe("USER_DECISION_REQUIRED");
+    expect(requests()).toHaveLength(1);
+    expect(requests()[0].payload).toMatchObject({ requestKey: "hold", requestAction: "planning-hold", origin: expect.anything() });
+    const replay = await post("hold", input, "mediator");
+    expect(replay.statusCode).toBe(200);
+    expect(replay.json().hold).toEqual(hold);
+    const duplicate = await post("hold-again", input);
+    expect(duplicate.json().hold).toMatchObject({ alreadyPending: true, requestId: hold.requestId, sequence: hold.sequence });
+    expect(requests()).toHaveLength(1);
+  } finally { await app.close(); }
+});
+
+// 계획 보류의 요청 복구 마커 — 라우트가 idempotency key 를 요청 기록과 같은 insert 에 싣는다. 원장 기록 전에 서버가 죽어도 재시작 복구가 성공으로 닫고,
+// 같은 키 재전송은 다시 실행하지 않고 복구 응답을 재생한다(요청이 두 번 남지 않는다).
+it("planning-hold records its request marker with the hold so restart recovery closes an interrupted request as succeeded", async () => {
+  const { app, database } = await makeApp();
+  try {
+    draftTopic(database, "planning-hold-route");
+    database.updateTopic("planning-hold-route", { state: "FAILED", resumeState: "CODEX_AUDIT" });
+    const post = () => app.inject({ method: "POST", url: "/api/topics/planning-hold-route/actions/planning-hold",
+      headers: { "x-consensus-token": "launch-token-for-test", "idempotency-key": "hold-key" },
+      payload: { reason: "감사 결과를 보고 결정한다", expectedScopeGeneration: 1, expectedPlanEpoch: 1 } });
+    const finish = vi.spyOn(database, "finishActionRequest").mockImplementation(() => { throw new Error("서버 종료"); });
+    const fail = vi.spyOn(database, "failActionRequest").mockImplementation(() => { throw new Error("서버 종료"); });
+    try { expect((await post()).statusCode).toBe(500); } finally { finish.mockRestore(); fail.mockRestore(); }
+    expect(database.getActionRequest("planning-hold-route", "planning-hold", "hold-key")?.status).toBe("running");
+    database.recoverInterruptedNonDeliveryRequests();
+    expect(database.getActionRequest("planning-hold-route", "planning-hold", "hold-key")?.status).toBe("succeeded");
+    const replay = await post();
+    expect(replay.statusCode).toBe(200);
+    expect(replay.json()).toMatchObject({ recovered: true });
+    expect(database.getTimeline("planning-hold-route").filter((event) => typeof (event.payload?.planningHold as { request?: unknown } | undefined)?.request === "string")).toHaveLength(1);
   } finally { await app.close(); }
 });
 
@@ -505,23 +647,41 @@ describe("HTTP idempotency", () => {
       worktreePath: join(root, "worktrees", "scope-topic"),
       branchName: "consensus/scope-topic-g1",
     });
-    const request = {
-      method: "POST" as const,
-      url: "/api/topics/topic-1/messages",
-      headers: {
-        "x-consensus-token": "launch-token-for-test",
-        "idempotency-key": "scope-once",
-      },
-      payload: { kind: "scope_change", body: "범위를 다시 잡습니다." },
-    };
+    const post = (key: string, payload: Record<string, unknown>) => app.inject({
+      method: "POST", url: "/api/topics/topic-1/messages",
+      headers: { "x-consensus-token": "launch-token-for-test", "idempotency-key": key }, payload,
+    });
+    const body = { kind: "scope_change", body: "범위를 다시 잡습니다." };
 
-    const first = await app.inject(request);
-    const second = await app.inject(request);
+    // 확인·기대 세대가 빠지면 원장 기록 전에 400 이다. 세대가 다르면 409 이고, 두 거부 모두 세대·작업 트리·타임라인을 바꾸지 않는다.
+    for (const [key, missing] of [["no-confirm", { expectedScopeGeneration: 1 }], ["no-generation", { confirmScopeGenerationBump: true }],
+      ["false-confirm", { confirmScopeGenerationBump: false, expectedScopeGeneration: 1 }]] as const) {
+      const rejected = await post(key, { ...body, ...missing });
+      expect(rejected.statusCode, key).toBe(400);
+      expect(database.getActionRequest("topic-1", "message:scope_change", key), key).toBeNull();
+    }
+    const stale = await post("stale-before", { ...body, confirmScopeGenerationBump: true, expectedScopeGeneration: 2 });
+    expect(stale.statusCode).toBe(409);
+    expect(stale.json()).toMatchObject({ code: "SCOPE_GENERATION_MISMATCH", current: 1 });
+    expect(database.getTopic("topic-1")).toMatchObject({ scopeGeneration: 1, worktreePath: join(root, "worktrees", "scope-topic") });
+    expect(worktreeAdds).toHaveLength(0);
+    expect(database.getTimeline("topic-1").filter((event) => event.kind === "scope_change")).toEqual([]);
+
+    const confirmed = { ...body, confirmScopeGenerationBump: true, expectedScopeGeneration: 1 };
+    const first = await post("scope-once", confirmed);
+    const second = await post("scope-once", confirmed);
 
     expect(first.statusCode).toBe(200);
     expect(second.json()).toEqual(first.json());
     expect(database.getTopic("topic-1").scopeGeneration).toBe(2);
     expect(worktreeAdds).toHaveLength(1);
+    // 같은 확인을 새 키로 다시 보내면 낡은 세대라 409 다 — 초기화를 두 번 하지 않는다.
+    const retried = await post("scope-again", confirmed);
+    expect(retried.statusCode).toBe(409);
+    expect(retried.json()).toMatchObject({ code: "SCOPE_GENERATION_MISMATCH", current: 2 });
+    expect(database.getTopic("topic-1").scopeGeneration).toBe(2);
+    expect(worktreeAdds).toHaveLength(1);
+    expect(database.getTimeline("topic-1").filter((event) => event.kind === "scope_change")).toHaveLength(1);
     await app.close();
   });
 
@@ -875,7 +1035,7 @@ describe("Codex 후속 F07 — 중재자 권한 경계", () => {
       draftTopic(database, "r3-scope");
       const headers = { ...token, "x-consensus-actor": "mediator" };
       writeFileSync(join(root, "mediation-autonomy.json"), JSON.stringify({ autonomy: "off" }));
-      const allowed = await app.inject({ method: "POST", url: "/api/topics/r3-scope/messages", headers: { ...headers, "idempotency-key": "r3-scope-on" }, payload: { kind: "scope_change", body: "Delegated scope change" } });
+      const allowed = await app.inject({ method: "POST", url: "/api/topics/r3-scope/messages", headers: { ...headers, "idempotency-key": "r3-scope-on" }, payload: { kind: "scope_change", body: "Delegated scope change", confirmScopeGenerationBump: true, expectedScopeGeneration: 1 } });
       expect(allowed.statusCode).toBe(200);
       expect(database.getTopic("r3-scope").scopeGeneration).toBe(2);
       const saved = database.getTimeline("r3-scope").find((event) => event.body === "Delegated scope change");

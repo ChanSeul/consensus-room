@@ -6,16 +6,19 @@ import { currentStopEvent, isRetryPoint, resetCycle, stopRecord, RESOURCE_PAUSE_
 import { ReviewBlocked } from "./reviewLedger.js";
 import { BudgetBlocked } from "./budgetLedger.js";
 import { createHash, randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { describePrune, pruneBuildTrees } from "./buildTrees.js";
 import { deliveryCoverageProblem, requireDeclaredPlanItems } from "./engine/planCoverage.js";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import {
   REENTRY_POINTS,
+  type ImplementationRebaselineInput,
+  type PlanningHoldInput,
   type ReentryPoint,
   type ResumeImplementationInput,
   type ResumeInput,
   type ReturnToPlanningInput,
+  type ScopeChangeConfirmation,
   type SessionReplacement,
   type AgentExecutionSettings,
   type Participant,
@@ -36,7 +39,7 @@ import type { AgentAdapter, ExecutionLimits, ParticipantRole, ProjectMemoryWrite
 import { isTopicGroup, workEntry } from "../shared/topicStructure.js";
 import { assertTask, assertEntryReady, hierarchyContext } from "./topicStructure.js";
 import { conflict, EngineCore, type AdmissionRelease, type MaintenanceLockOwner } from "./engine/core.js";
-import { PlanningPipeline } from "./engine/planning.js";
+import { PlanningPipeline, type PlanningHoldReceipt } from "./engine/planning.js";
 import { BrainstormPipeline } from "./engine/brainstorm.js";
 import { BrainstormDecisionSchema, BrainstormInputSchema, brainstormReplies, latestBrainstormRound } from "../shared/brainstorm.js";
 import { DeliveryPipeline } from "./engine/delivery.js";
@@ -60,6 +63,11 @@ export interface ResumeAction {
   deferredChecks?: string[];
 }
 const INTERRUPTED_STATES: ReadonlySet<WorkflowState> = new Set(["FAILED", "USER_DECISION_REQUIRED"]);
+// 구현 기준(implementationBaseOID)을 확인하는 재개 지점 — 구현자 턴 준비(IMPLEMENTING·CLAUDE_FIX)와 재리뷰 진입(CODEX_REVIEW)이 HEAD 를 기준과 대조한다.
+// 이 지점으로 재개할 정지에서만 중재자가 확인한 서버 밖 커밋을 구현 기준으로 채택할 수 있다(implementation-rebaseline).
+const IMPLEMENTATION_BASELINE_RESUME_POINTS: ReadonlySet<WorkflowState> = new Set(["IMPLEMENTING", "CLAUDE_FIX", "CODEX_REVIEW"]);
+const IMPLEMENTATION_HEAD_CHECK = "작업 트리가 토픽 브랜치 위이고 HEAD 가 구현 기준과 같은지 — 서버 밖 커밋으로 다르면 확인한 뒤 implementation-rebaseline 으로 채택";
+const IMPLEMENTATION_REBASELINE_CHECKS = ["작업 트리가 토픽 브랜치 위인지", "head 가 지금 HEAD 와 같은지", "지금 HEAD 가 구현 기준과 다르고 그 후손인지"];
 // 계획으로 돌아가기를 받는 상태(계약 v3.17 (28)) — 실행 중 상태에서는 거부한다.
 const RETURN_TO_PLANNING_STATES: ReadonlySet<WorkflowState> = new Set(["USER_DECISION_REQUIRED", "FAILED", "AWAITING_USER_APPROVAL", "READY_TO_DELIVER"]);
 const SESSION_ROLE_LABEL: Readonly<Record<SessionReplacement["role"], string>> = {
@@ -109,6 +117,9 @@ export interface WorkflowDependencies {
   maintenanceLockPath?: string;
   // 부팅 때 판정한 중첩 샌드박스 가능 여부. unavailable 이면 러너·Codex 를 spawn 하지 않는다. 없으면 판정하지 않은 것(테스트).
   hostSandbox?: HostSandboxStatus;
+  // 상시 참조 문서(설정 CONSENSUS_ROOM_STANDING_REFERENCE, config.standingReferencePath) — 전역 지침이 먼저 읽으라고 가리키는 설계 철학 문서 하나.
+  // 계획 왕복 턴(planning.ts)이 이 파일 하나를 readablePaths 로 싣는다. 없으면 싣지 않는다.
+  standingReferencePath?: string | null;
 }
 
 // 범위 변경을 허용하는 상태. WorkflowState가 늘어나면 이 표가 컴파일을 막아 새 상태를 의식적으로 판단하게 만든다.
@@ -493,7 +504,9 @@ export class WorkflowEngine {
 
   // 작업 묶음 단계가 이어받는 결정(선행 단계 동결 결과의 사용자 결정 원문)을 현재 범위 세대 타임라인에 싣는다(E4 보완 F012·F013). 계획 시작 경계(DRAFT,
   // 턴 전)에서 이 세대에 아직 없는 것만 멱등으로 적재한다 — 생성 직후 첫 계획과 범위 변경(새 세대) 뒤 첫 계획이 같은 한 경로를 지나고, 적재가 중간에
-  // 끊겨도 다음 경계가 빠진 것만 채운다. 원문은 기존 프롬프트 타임라인(현재 세대)·결정 원문 산출물·참조 페이지 경로가 그대로 전달한다.
+  // 끊겨도 다음 경계가 빠진 것만 채운다. 적재한 원문은 현재 세대의 사용자 결정으로 각 역할 세션의 다음 턴 사실에 실린다 — 앞선 결정과 같은 본문은 그 순번만,
+  // 한도를 넘는 본문은 원문 파일의 구간만 가리킨다. 매 턴 결정 원문 파일(decision-sources 산출물, readablePaths)과 색인이 세대 전체를 다시 읽게 한다
+  // (engine/delivery.ts prepareDecisionSources, 2026-10-14 자문 8).
   private ensureInheritedDecisions(topicId: string): void {
     const db = this.core.dependencies.database;
     const group = db.workGroups.forTopic(topicId);
@@ -518,17 +531,62 @@ export class WorkflowEngine {
     return this.core.startAction(topicId, "implement", (signal) => this.delivery.runImplementationRelay(topicId, signal), actionId, undefined, kickoff);
   }
 
-  // 닫힌 주제의 빌드 트리 정리(DerivedData/* 중 *-logs 제외). action 으로 돌려 원장에 남기고 중단할 수 있게 한다.
-  archiveBuildTrees(topicId: string, actionId?: string): string {
+  // 수동 실행만 제공한다. 원장과 경로 보호는 삭제 직전까지 다시 확인한다.
+  archiveBuildTrees(topicId: string, actionId: string = randomUUID(), options: { dryRun?: boolean } = {}): string {
     this.core.assertNotShuttingDown();
     this.core.assertNoActiveWork(topicId);
     const topic = this.core.requireState(topicId, "CLOSED");
-    return this.core.startAction(topicId, "archive", async () => {
-      const report = await pruneBuildTrees(topic.worktreePath);
+    return this.core.startAction(topicId, "archive", async (signal) => {
+      const report = await pruneBuildTrees(topic.worktreePath, { ...options, signal,
+        protection: () => this.buildTreeProtection(topicId, topic.worktreePath, actionId, signal),
+      });
       this.core.event(topicId, "system", "system", describePrune(report), {
         buildTreesRemoved: report.removed, buildTreesKept: report.kept, freedBytes: report.freedBytes,
+        buildTreePrune: report,
       });
+      signal.throwIfAborted();
+      if (report.incomplete.length) throw new Error(`캐시 삭제 도중 실패했습니다. 일부 파일은 삭제됐을 수 있습니다: ${report.incomplete.join(", ")}`);
     }, actionId);
+  }
+
+  private buildTreeProtection(topicId: string, worktreePath: string, actionId: string, signal: AbortSignal): string[] {
+    this.core.assertNoMaintenanceLock(undefined, { topicId, signal });
+    const database = this.core.dependencies.database;
+    const current = database.getTopic(topicId);
+    if (current.state !== "CLOSED" || current.worktreePath !== worktreePath) return ["정리 중 주제 상태 또는 작업 폴더가 바뀌었습니다."];
+    const canonical = (path: string) => { try { return realpathSync(path); } catch { return resolve(path); } };
+    const root = canonical(worktreePath);
+    const overlaps = (path: string) => {
+      const other = canonical(path);
+      return other === root || other.startsWith(root + sep) || root.startsWith(other + sep);
+    };
+    const topics = database.listTopics().filter(topic => overlaps(topic.worktreePath));
+    const related = new Set(topics.map(topic => topic.id));
+    const reasons: string[] = [];
+    for (const topic of topics) {
+      const active = this.core.active.get(topic.id);
+      if (topic.state !== "CLOSED" || active && active.actionId !== actionId ||
+        this.core.deliveryActive.has(topic.id) || this.core.scopeChangeActive.has(topic.id)) reasons.push(`활성 주제 ${topic.id}`);
+      for (const record of database.verificationRecords(topic.id)) {
+        const status = record && typeof record === "object" && "status" in record ? record.status : null;
+        if (typeof status !== "string" || !["succeeded", "failed", "cancelled", "timed_out", "stale"].includes(status)) {
+          reasons.push(`진행 중이거나 확인할 수 없는 검증 ${topic.id}`);
+        }
+      }
+    }
+    for (const action of database.runningActions()) {
+      if (action.id !== actionId && related.has(action.topicId)) reasons.push(`진행 중 작업 ${action.id}`);
+    }
+    for (const group of database.workGroups.list()) {
+      const ids = [...Object.values(group.links).map(link => link.topicId), ...Object.values(group.results ?? {}).map(result => result.topicId),
+        ...(group.predecessor ? [group.predecessor.topicId] : [])];
+      if (!ids.some(id => related.has(id) || overlaps(database.getTopic(id).worktreePath)) &&
+        !Object.values(group.pending ?? {}).some(pending => overlaps(pending.worktreePath))) continue;
+      const allClosed = !Object.keys(group.pending ?? {}).length && group.stages.every(stage =>
+        group.links[stage.id] && database.getTopic(group.links[stage.id].topicId).state === "CLOSED");
+      if (!allClosed || !database.workGroupDelivered(group)) reasons.push(`열린 작업 묶음 ${group.id}에서 참조 중입니다.`);
+    }
+    return reasons;
   }
 
   // 서버 종료 순서의 엔진 몫: 새 실행 거부 → 실행 중 action 중단 → 원장 마감 대기. 반환값은 중단한 action 수.
@@ -570,7 +628,7 @@ export class WorkflowEngine {
     if (resume !== "BRAINSTORMING") assertTask(topic);
     const interruption = currentStopEvent(topic, resume ?? null, this.core.dependencies.database.getTimeline(topicId));
     // 중재자 실행 대기(계획·구현·수정·리뷰가 함께 쓰는 정지 표식 waitingFor=mediator)는 그 정지 뒤 실행 근거(evidence)가 올라와야 재개한다. 근거 없이
-    // 재개하면 같은 러너·리뷰를 다시 사서 같은 요청을 반복한다(2026-10-06 통합 검증 1fd0cc86: 구현 러너 6회 재호출). 재개 진입점 한 곳에서 막는다 — 자동
+    // 재개하면 같은 러너·리뷰를 다시 사서 같은 요청을 반복한다(2026-10-06 통합 검증 example-topic: 구현 러너 6회 재호출). 재개 진입점 한 곳에서 막는다 — 자동
     // 재시도(사용 한도)도 이 경로다. 중재자가 재개 단계를 다른 단계로 바꾼 정지는 이 대기가 아니다.
     if (!options.resumed && topic.state === "USER_DECISION_REQUIRED" && interruption?.payload?.waitingFor === "mediator" && interruption.payload.resumeState === resume &&
         !this.core.dependencies.database.getTimeline(topicId, interruption.sequence).some(event => event.actor === "user" && event.kind === "evidence"))
@@ -906,7 +964,14 @@ export class WorkflowEngine {
     } else if (INTERRUPTED_STATES.has(topic.state)) {
       // 정지는 결정문(선택)을 실은 재개 한 번으로 정지 지점에서 잇는다(D7, 계약 v3.17 (29)) — 결정 게시 + 재시도 두 단계가 아니다. 실패(FAILED)의 일시
       // 오류도 같은 재개다.
-      actions.push({ action: "resume", input: { decision: null }, blocker: this.blocker(() => { this.retryPreconditions(topicId, { resumed: true }); }) });
+      // 구현 기준을 대조하는 재개 지점이면 그 대조(git)는 실행 때 한다 — 재개 정보는 git 을 조회하지 않고, 서버 밖 커밋을 채택하는 공식 경로를 함께 싣는다.
+      const baselineChecked = flags.resumeState !== null && IMPLEMENTATION_BASELINE_RESUME_POINTS.has(flags.resumeState) && Boolean(flags.implementationBaseOID);
+      actions.push({ action: "resume", input: { decision: null }, blocker: this.blocker(() => { this.retryPreconditions(topicId, { resumed: true }); }),
+        ...(baselineChecked ? { deferredChecks: [IMPLEMENTATION_HEAD_CHECK] } : {}) });
+      if (baselineChecked) {
+        actions.push({ action: "implementation-rebaseline", input: { reason: null, head: null },
+          blocker: this.blocker(() => { this.implementationRebaselinePreconditions(topicId); }), deferredChecks: IMPLEMENTATION_REBASELINE_CHECKS });
+      }
       if (this.scheduledRetryAt(topicId)) actions.push({ action: "stop", blocker: null });
     } else if (topic.state === "AWAITING_USER_APPROVAL") {
       if (topic.approvedPlanSHA256 !== topic.planSHA256) {
@@ -1026,7 +1091,10 @@ export class WorkflowEngine {
     const integration = stage.kind === "integration";
     const head = await git.head(topic.worktreePath);
     if ((await git.changedPaths(topic.worktreePath)).length) throw new Error("작업 트리에 커밋하지 않은 변경이 있어 단계를 닫을 수 없습니다.");
-    const reviewedBaseCandidate = !link.preparedMerge && head === link.baseOID;
+    // 무변경 결과의 기준 커밋은 단계 기준(link.baseOID)이거나 구현 기준(implementationBaseOID)이다. 구현 기준은 엔진이 구현 시작 때 고정한 HEAD(합류 병합이 없는
+    // 단계에선 단계 기준과 같다)이거나 중재자가 implementation-rebaseline 으로 채택한 그 후손이다 — 채택한 기준에 추가 변경이 없으면 공식 commit 은 바뀐 경로가 없어
+    // 결과를 만들 수 없으므로 여기서 받는다(정식 리뷰 F009, 2026-10-13). 어느 쪽이든 아래 리뷰 HEAD·리뷰 트리 결속과 단계 기준 조상 검사를 그대로 거친다.
+    const reviewedBaseCandidate = !link.preparedMerge && (head === link.baseOID || head === flags.implementationBaseOID);
     // planned 의 무변경 결과는 승인 계획이 만든 것이어야 한다. ticket 은 계획이 없으므로 아래 리뷰 기록(리뷰 HEAD·리뷰 트리)만으로 결속한다(D1).
     if (topic.workflowMode === "planned" && !flags.committedOID && !integration && reviewedBaseCandidate) {
       // 계획 버전은 산출물 원문 바이트의 sha256 이다(계획 묶음 직렬화, planBundleVersion) — 정규화 해시로 비교하지 않는다(F010).
@@ -1044,7 +1112,7 @@ export class WorkflowEngine {
       }
       commitOID = flags.committedOID;
     } else if (reviewedBaseCandidate) {
-      // 변경 없이 검증만 한 통합 또는 무변경 승인 작업 — 기준 커밋이 곧 결과다. 다만 "변경 없음" 도 리뷰가 확인한 사실이어야 한다(F004): 리뷰 HEAD 가 기준 커밋이고 리뷰한
+      // 변경 없이 검증만 한 통합 또는 무변경 승인 작업 — 기준 커밋(단계 기준 또는 채택한 구현 기준)이 곧 결과다. 다만 "변경 없음" 도 리뷰가 확인한 사실이어야 한다(F004): 리뷰 HEAD 가 기준 커밋이고 리뷰한
       // 작업 트리가 기준 커밋 트리와 같을 때만. 리뷰한 수정을 커밋하지 않고 되돌린 작업 트리는 리뷰한 결과가 아니다.
       if (!flags.reviewedTreeOID || flags.reviewedHead !== head) {
         throw new Error("변경 없는 단계 결과를 리뷰한 기록(리뷰 HEAD·리뷰 트리)이 없어 단계를 닫을 수 없습니다.");
@@ -1243,6 +1311,61 @@ export class WorkflowEngine {
     return this.core.dependencies.database.getTopic(topicId);
   }
 
+  // 구현 기준 채택의 부작용 전 검사(동기) — 실행과 재개 정보의 차단 사유가 같은 함수를 쓴다(엔진 개편 E1). git 대조는 rebaselineImplementation 이 한다.
+  private implementationRebaselinePreconditions(topicId: string): { topic: Topic; pinned: string } {
+    this.core.assertNotShuttingDown();
+    this.core.assertNoActiveWork(topicId);
+    this.assertStageContextCurrent(topicId);
+    const db = this.core.dependencies.database;
+    const topic = db.getTopic(topicId);
+    const flags = db.getFlags(topicId);
+    if (!INTERRUPTED_STATES.has(topic.state)) {
+      throw conflict(`정지 상태(${[...INTERRUPTED_STATES].join("·")})에서만 구현 기준을 채택할 수 있습니다(현재 ${topic.state}).`);
+    }
+    if (!flags.resumeState || !IMPLEMENTATION_BASELINE_RESUME_POINTS.has(flags.resumeState)) {
+      throw conflict(`구현·수정·코드 리뷰(${[...IMPLEMENTATION_BASELINE_RESUME_POINTS].join("·")})로 재개할 정지에서만 구현 기준을 채택할 수 있습니다(재개 지점 ${flags.resumeState ?? "없음"}).`);
+    }
+    if (!topic.branchName || !flags.implementationBaseOID) throw conflict("작업 브랜치나 구현 기준이 없습니다 — 구현을 시작한 토픽만 구현 기준을 채택할 수 있습니다.");
+    if (flags.orphanCommitOID) throw conflict("전달하지 못한 로컬 커밋이 있습니다 — 엔진이 거부한 커밋은 채택하지 않습니다. discard-orphan-commit 으로 되돌리거나 직접 처분하세요.");
+    if (db.unknownDeliveryAction(topicId)) throw conflict("결과가 불명확한 전달 요청이 있습니다 — reconcile-delivery 로 먼저 확정하세요.");
+    return { topic, pinned: flags.implementationBaseOID };
+  }
+
+  // 계획 왕복 1회 보류(자문 17, 사용자 결정 2026-10-15) — 중재자의 명시 제어 요청. 판정과 기록은 planning.requestHold, 경계 적용은 core.recordEnvelope 다.
+  // 실행을 시작하거나 실행 중 턴을 끊지 않는다.
+  requestPlanningHold(topicId: string, input: PlanningHoldInput, requestKey?: string, origin?: CallOrigin): PlanningHoldReceipt {
+    return this.planning.requestHold(topicId, input, requestKey, origin);
+  }
+
+  // 구현 기준 채택(2026-10-13 매물등록 중재 의뢰) — 재시도는 서버 밖 커밋을 기준으로 승격하지 않는다(감사 ⑥, delivery.requirePinnedBaseline). 중재자가 그
+  // 커밋을 확인했으면 이 공식 동작으로만 지금 HEAD 를 구현 기준으로 삼는다 — 도구 트리 기준 재설정(F04)과 같은 모양이다. 요청의 head 가 지금 HEAD 와 같아야
+  // 하고(확인한 커밋을 명시), 작업 트리가 토픽 브랜치 위여야 하며, 기존 기준의 후손이어야 한다(되감기·다시 쓴 이력은 채택하지 않음). 계획·승인·세션·
+  // 리뷰 기록·전달 플래그는 그대로 두고 implementationBaseOID 만 바꾼다 — 채택한 커밋까지는 리뷰 기준선 안이라 이후 리뷰 대상이 아니다. 사유와 이전·새
+  // OID 는 결정 기록으로 남아 다음 역할 턴의 새 사실이 된다. 실행을 시작하지 않는다(재개는 resume). 요청 키는 기준 변경과 같은 transaction 의 결정 기록에
+  // 싣는다 — 원장 finish 전에 서버가 죽어도 재시작 복구가 성공으로 닫는다(정식 리뷰 F010, workflow-mode 와 같은 모양). 채택은 같은 키로 다시 실행할 수 없는 동작이다.
+  async rebaselineImplementation(topicId: string, input: ImplementationRebaselineInput, requestKey?: string, origin?: CallOrigin): Promise<Topic> {
+    const { topic, pinned } = this.implementationRebaselinePreconditions(topicId);
+    const git = this.core.dependencies.git;
+    await git.assertCurrentBranch(topic.worktreePath, topic.branchName!);
+    const head = await git.head(topic.worktreePath);
+    if (head !== input.head) {
+      throw conflict(`요청한 head(${input.head.slice(0, 12)})가 작업 트리의 지금 HEAD(${head.slice(0, 12)})와 다릅니다 — 확인한 커밋을 지금 HEAD 로 다시 지정하세요.`);
+    }
+    if (head === pinned) throw conflict(`지금 HEAD(${head.slice(0, 12)})가 이미 구현 기준입니다.`);
+    if (!await git.isAncestor(topic.worktreePath, pinned, head)) {
+      throw conflict(`지금 HEAD(${head.slice(0, 12)})가 구현 기준(${pinned.slice(0, 12)})의 후손이 아닙니다 — 되감기·다시 쓴 이력은 채택하지 않습니다.`);
+    }
+    // git 경계 뒤 사전 검사를 다시 한다 — 그 사이 실행·전달이 시작됐거나 기준이 바뀌었으면 채택하지 않는다.
+    if (this.implementationRebaselinePreconditions(topicId).pinned !== pinned) throw conflict("확인하는 동안 구현 기준이 바뀌었습니다. 다시 확인해 주세요.");
+    return this.core.dependencies.database.applyTopicTransition({
+      topicId, changes: { implementationBaseOID: head },
+      events: [{ actor: "user", kind: "decision", state: topic.state,
+        body: `구현 기준 채택(공식): ${pinned.slice(0, 12)} → ${head.slice(0, 12)}. 중재자가 확인한 서버 밖 커밋을 구현 기준으로 삼습니다 — 이 커밋까지는 리뷰 기준선 안입니다. ${input.reason}`,
+        payload: { implementationRebaseline: { from: pinned, to: head, scopeGeneration: topic.scopeGeneration }, ...(origin ? { origin } : {}),
+          ...(requestKey ? { requestKey, requestAction: "implementation-rebaseline" } : {}) } }],
+    });
+  }
+
   async postMessage(
     topicId: string,
     kind: "note" | "evidence" | "decision",
@@ -1290,8 +1413,18 @@ export class WorkflowEngine {
     return topic;
   }
 
-  async handleScopeChange(topicId: string, body: string, requestKey?: string, origin?: CallOrigin): Promise<Topic> {
+  async handleScopeChange(topicId: string, body: string, confirmation: ScopeChangeConfirmation, requestKey?: string,
+    origin?: CallOrigin): Promise<Topic> {
     const topic = this.assertScopeChangeAllowed(topicId);
+    // 초기화 확인(2026-10-13 example-topic — 결정을 scope_change 로 보내 인도 대기 토픽이 초기화됐다). 재시도 취소·작업 트리 생성·실행 중지·별칭 삭제보다
+    // 먼저 확인 누락과 낡은 세대를 거부한다 — 거부는 아무것도 바꾸지 않는다. 같은 요청 키 재전송은 원장이 저장 응답을 재생하므로 여기까지 오지 않는다.
+    if (confirmation?.confirmScopeGenerationBump !== true) {
+      throw Object.assign(new Error("범위 변경은 범위 세대 초기화 확인(confirmScopeGenerationBump: true)이 필요합니다."), { statusCode: 400 });
+    }
+    if (topic.scopeGeneration !== confirmation.expectedScopeGeneration) {
+      throw Object.assign(conflict(`범위 세대가 요청과 다릅니다(지금 ${topic.scopeGeneration}, 요청 ${confirmation.expectedScopeGeneration}) — `
+        + "낡은 범위 변경 요청입니다. 지금 세대를 확인한 뒤 다시 정하세요."), { errorCode: "SCOPE_GENERATION_MISMATCH", current: topic.scopeGeneration });
+    }
     const nextState = topic.state === "BRAINSTORM_READY" || topic.state === "BRAINSTORMING"
       || ["BRAINSTORMING", "BRAINSTORM_READY"].includes(this.core.dependencies.database.getFlags(topicId).resumeState ?? "") ? "BRAINSTORM_READY" : "DRAFT";
     this.core.scopeChangeActive.add(topicId);
