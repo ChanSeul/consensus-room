@@ -26,6 +26,171 @@
 
 이 방식을 계속 활용하고 싶었지만, 매번 응답을 전달하고 합의를 진행하기는 어려웠다. 그래서 계획 합의 → 구현 → 교차 검토 → 검증을 자동으로 이어 가는 Consensus Room을 만들었다. 작업 범위와 우선순위, 설계 판단과 계획 승인은 직접 맡는다.
 
+# Code Agent의 주관적 성능 비교
+
+계획/검증과 코드 작성에서 직접 느낀 주관적인 평가다. 동일 조건으로 측정한 벤치마크 결과는 아니다.
+
+```diagram
+{
+  "section": "PERSONAL EXPERIENCE",
+  "lead": "실사용에서 느낀 주관적인 Code Agent의 성능 비교표.",
+  "height": 308,
+  "elements": [
+    {
+      "kind": "node",
+      "x": 0,
+      "y": 0,
+      "w": 122,
+      "h": 50,
+      "label": "Code Agent",
+      "size": 9.7,
+      "color": "blue"
+    },
+    {
+      "kind": "node",
+      "x": 128,
+      "y": 0,
+      "w": 170,
+      "h": 50,
+      "label": "계획 / 검증",
+      "size": 9.7,
+      "color": "blue"
+    },
+    {
+      "kind": "node",
+      "x": 304,
+      "y": 0,
+      "w": 207,
+      "h": 50,
+      "label": "코드 작성 / 토큰 효율",
+      "size": 9.7,
+      "color": "blue"
+    },
+    {
+      "kind": "node",
+      "x": 0,
+      "y": 58,
+      "w": 122,
+      "h": 58,
+      "label": "GPT-6 Astra",
+      "size": 10,
+      "color": "gray"
+    },
+    {
+      "kind": "node",
+      "x": 128,
+      "y": 58,
+      "w": 170,
+      "h": 58,
+      "label": "Claude 모델보다 우수",
+      "size": 10,
+      "color": "gray"
+    },
+    {
+      "kind": "node",
+      "x": 304,
+      "y": 58,
+      "w": 207,
+      "h": 58,
+      "label": "코드 작성 시 토큰 소비가 매우 큼",
+      "size": 10,
+      "color": "gray"
+    },
+    {
+      "kind": "node",
+      "x": 0,
+      "y": 122,
+      "w": 122,
+      "h": 58,
+      "label": "GPT-6.1 Sol",
+      "size": 10,
+      "color": "gray"
+    },
+    {
+      "kind": "node",
+      "x": 128,
+      "y": 122,
+      "w": 170,
+      "h": 58,
+      "label": "전반적으로 열세",
+      "size": 10,
+      "color": "gray"
+    },
+    {
+      "kind": "node",
+      "x": 304,
+      "y": 122,
+      "w": 207,
+      "h": 58,
+      "label": "전반적으로 열세",
+      "size": 10,
+      "color": "gray"
+    },
+    {
+      "kind": "node",
+      "x": 0,
+      "y": 186,
+      "w": 122,
+      "h": 58,
+      "label": "Claude Fable 5.1",
+      "size": 10,
+      "color": "gray"
+    },
+    {
+      "kind": "node",
+      "x": 128,
+      "y": 186,
+      "w": 170,
+      "h": 58,
+      "label": "Astra보다 열세",
+      "size": 10,
+      "color": "gray"
+    },
+    {
+      "kind": "node",
+      "x": 304,
+      "y": 186,
+      "w": 207,
+      "h": 58,
+      "label": "-",
+      "size": 10,
+      "color": "gray"
+    },
+    {
+      "kind": "node",
+      "x": 0,
+      "y": 250,
+      "w": 122,
+      "h": 58,
+      "label": "Claude Opus 5.5",
+      "size": 10,
+      "color": "teal"
+    },
+    {
+      "kind": "node",
+      "x": 128,
+      "y": 250,
+      "w": 170,
+      "h": 58,
+      "label": "Astra보다 열세",
+      "size": 10,
+      "color": "teal"
+    },
+    {
+      "kind": "node",
+      "x": 304,
+      "y": 250,
+      "w": 207,
+      "h": 58,
+      "label": "토큰 소비 대비 코드 작성 성능이\n압도적으로 우수",
+      "size": 10,
+      "color": "teal"
+    }
+  ],
+  "source": "사용자의 직접 사용 경험에 따른 평가 / 2026.10"
+}
+```
+
 ## 시스템 개요
 
 리팩토링을 빠짐없이 마무리하는 플랜모드와, 여러 원문의 요구사항 변화를 추적하며 구현하는 티켓모드를 둔다. 외부 자료의 변경은 자동으로 수집해 작업 세션에 전달하고, 엔진은 실행 조건과 결과 기록을 맡는다.
