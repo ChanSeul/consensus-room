@@ -3708,89 +3708,147 @@ DerivedData의 Build/Index/ModuleCache 계열과 Tuist/.build만 대상으로 �
 
 작업자와 중재자는 의미와 우선순위를 판단하고, 엔진은 권한/버전/필수 검증/실행 신원/결과를 확인한다. 원문 접근을 제공한 사실을 읽음이나 준수로 해석하지 않는다. 시간과 토큰 효율도 같은 입력의 전후 측정으로 설명하며, 서로 다른 작업의 비용을 절감률로 합치지 않는다.
 
-# 부록: 네 역할로 나눈 엔진 개발
+# 부록: 중재와 엔진 수리의 연결
 
 ```diagram
 {
-  "section": "APPENDIX / ENGINE DEVELOPMENT",
-  "lead": "내가 역할과 권한을 지정하고, 조율 / 구현 / 자문 / 검토를 나눠 엔진을 개선.",
-  "height": 315,
-  "source": "사용자 역할 지정 / 엔진 master·worker 보고 / advisor 자문 / 고정 커밋 리뷰 기록",
+  "section": "APPENDIX / MEDIATION & ENGINE DEVELOPMENT",
+  "lead": "중재자는 제품 작업을 이어 가고, 엔진 결함은 Master에게 넘겨 별도로 수리.",
+  "height": 365,
+  "source": "중재자의 제품 작업 진행과 엔진 수리 인계 / 사용자 역할 지정 / 고정 커밋의 자문·검토·운영 반영",
   "elements": [],
   "graph": {
     "nodes": [
       {
         "id": "user",
-        "x": 160,
+        "x": 165,
         "y": 0,
-        "w": 190,
-        "h": 62,
+        "w": 180,
+        "h": 55,
         "label": "사용자: 조찬슬",
-        "body": "목표 / 범위 / 권한 / 배포 결정",
+        "body": "목표 / 권한 / 중요 결정",
         "color": "purple"
       },
       {
-        "id": "master",
-        "x": 160,
-        "y": 104,
+        "id": "mediator",
+        "x": 0,
+        "y": 95,
         "w": 190,
-        "h": 72,
+        "h": 65,
+        "label": "제품 작업 중재자",
+        "body": "범위 판단 / 재개 / 인계",
+        "color": "teal"
+      },
+      {
+        "id": "master",
+        "x": 320,
+        "y": 95,
+        "w": 190,
+        "h": 65,
         "label": "Engine Master",
-        "body": "결함 분류 / 작업 배정\n통합 / 리뷰 / 운영 반영 조율",
+        "body": "수리 분류 / 배정 / 통합 조율",
+        "color": "blue"
+      },
+      {
+        "id": "product",
+        "x": 0,
+        "y": 200,
+        "w": 190,
+        "h": 70,
+        "label": "제품 작업 계속",
+        "body": "구현 / 검토 / 검증\n공식 복구 또는 허용된 작업 인계",
         "color": "teal"
       },
       {
         "id": "advisor",
-        "x": 0,
-        "y": 230,
-        "w": 145,
-        "h": 78,
+        "x": 215,
+        "y": 200,
+        "w": 135,
+        "h": 70,
         "label": "Engine Advisor",
-        "body": "원인과 수리 범위 자문\n통합 전 위험 대조",
+        "body": "원인 / 최소 범위 자문\n통합 전 위험 대조",
         "color": "purple"
       },
       {
         "id": "worker",
-        "x": 182.5,
-        "y": 230,
-        "w": 145,
-        "h": 78,
+        "x": 370,
+        "y": 200,
+        "w": 140,
+        "h": 70,
         "label": "Engine Worker",
-        "body": "담당 코드 수정 / 검사\n고정 커밋과 근거 보고",
+        "body": "코드 수정 / 검사\n고정 커밋과 근거 보고",
         "color": "blue"
       },
       {
         "id": "reviewer",
-        "x": 365,
-        "y": 230,
-        "w": 145,
-        "h": 78,
+        "x": 370,
+        "y": 300,
+        "w": 140,
+        "h": 60,
         "label": "Engine Reviewer",
-        "body": "고정 변경과 필수 검사 검토\n지적 / 통과 결과 기록",
+        "body": "고정 변경 검토\n지적 / 통과 결과",
         "color": "coral"
       }
     ],
     "edges": [
       {
         "source": "user",
+        "target": "mediator",
+        "source_port": "bottom",
+        "target_port": "top",
+        "via": [
+          [
+            95,
+            72
+          ]
+        ],
+        "color": "purple"
+      },
+      {
+        "source": "user",
         "target": "master",
         "source_port": "bottom",
         "target_port": "top",
-        "label": "역할/권한 지정",
+        "via": [
+          [
+            415,
+            72
+          ]
+        ],
         "color": "purple"
+      },
+      {
+        "source": "mediator",
+        "target": "product",
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "계속 진행",
+        "color": "teal"
+      },
+      {
+        "source": "mediator",
+        "target": "master",
+        "source_port": "right",
+        "target_port": "left",
+        "label": "결함/근거 인계",
+        "color": "blue"
       },
       {
         "source": "master",
         "target": "advisor",
-        "source_port": "left",
+        "source_port": "bottom",
         "target_port": "top",
         "via": [
           [
-            72.5,
-            140
+            415,
+            179
+          ],
+          [
+            282.5,
+            179
           ]
         ],
-        "label": "범위 자문",
+        "label": "자문",
         "color": "purple"
       },
       {
@@ -3799,27 +3857,31 @@ DerivedData의 Build/Index/ModuleCache 계열과 Tuist/.build만 대상으로 �
         "source_port": "bottom",
         "target_port": "top",
         "label": "수리 배정",
-        "color": "teal"
+        "color": "blue"
       },
       {
         "source": "worker",
         "target": "reviewer",
-        "source_port": "right",
-        "target_port": "left",
-        "color": "blue"
+        "source_port": "bottom",
+        "target_port": "top",
+        "label": "검토",
+        "color": "coral"
       },
       {
         "source": "reviewer",
         "target": "master",
-        "source_port": "top",
+        "source_port": "right",
         "target_port": "right",
         "via": [
           [
-            437.5,
-            140
+            532,
+            330
+          ],
+          [
+            532,
+            127.5
           ]
         ],
-        "label": "결과/지적",
         "color": "coral"
       }
     ]
@@ -3827,14 +3889,10 @@ DerivedData의 Build/Index/ModuleCache 계열과 Tuist/.build만 대상으로 �
 }
 ```
 
-## 내가 정한 네 역할
+## 중재자는 제품 작업을 계속 조율
 
-엔진 개선도 한 에이전트에 맡기지 않았다. 내가 목표와 권한을 정하고, Engine Master가 작업을 조율하도록 했다. Engine Worker는 수정과 검사를, Engine Advisor는 원인/범위/통합 전 자문을, Engine Reviewer는 고정된 변경의 검토를 맡도록 지정했다.
+중재자는 기존 승인 안의 공식 복구로 진행하거나, 계획/변경 코드/검증 결과를 보존해 허용된 일반 작업으로 인계한다. 진행 가능한 제품 작업을 엔진 수리의 완료까지 기다리게 하지 않는다.
 
-## 자문과 검토를 코드 변경에 연결
+## 엔진 수리는 Master가 별도로 배정
 
-Master가 실패 근거와 최소 수리 범위를 정리하면 Advisor가 기존 복구로 풀 수 있는지 대조한다. Worker는 담당 작업 트리에서 수정하고 검사와 커밋을 보고한다. Master는 자문을 반영해 통합을 조율하고, Reviewer가 고정한 변경을 검토한다. 지적은 Worker의 수정과 후속 리뷰로 잇는다.
-
-## 제품 작업과 별도로 관리한 엔진 수리
-
-제품 토픽의 플래너/구현자/리뷰어와 별도의 운영 역할이다. 가능한 제품 작업은 계속 진행하고, 엔진 수리의 자문/리뷰/배포와 제품 검수는 각각 확인했다.
+확인한 실패와 근거, 최소 수리 범위는 Engine Master에게 넘긴다. 내가 지정한 Advisor/Worker/Reviewer가 자문/수정/검토를 맡고, Master가 통합과 운영 반영을 조율한다.
