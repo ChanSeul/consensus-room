@@ -23,7 +23,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
-from reportlab.platypus import Paragraph
+from reportlab.platypus import Paragraph, Table, TableStyle
 
 ROOT = Path(__file__).resolve().parents[1]
 INK = '#183343'
@@ -99,6 +99,32 @@ def main():
         p.drawOn(c, x, H-y-height)
         return height
 
+    def draw_table(rows, x, y, widths, max_h, size=9.5):
+        if not rows or any(len(row) != len(widths) for row in rows):
+            raise ValueError(f'Invalid table columns on page {index}')
+        cells = []
+        for row_index, row in enumerate(rows):
+            cells.append([Paragraph(html.escape(str(value)).replace('\n', '<br/>'), ParagraphStyle(
+                'table-cell', fontName='PortfolioBold' if row_index == 0 or column == 0 else 'Portfolio',
+                fontSize=size, leading=size*1.45, textColor=color(INK), wordWrap='CJK'))
+                for column, value in enumerate(row)])
+        table = Table(cells, colWidths=widths, hAlign='LEFT')
+        table.setStyle(TableStyle([
+            ('GRID', (0, 0), (-1, -1), .7, color('#A8BCC7')),
+            ('BACKGROUND', (0, 0), (-1, 0), color('#E8F5F3')),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, color('#F7FAFB')]),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('LEFTPADDING', (0, 0), (-1, -1), 9),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 9),
+            ('TOPPADDING', (0, 0), (-1, -1), 7),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 7),
+        ]))
+        _, height = table.wrap(sum(widths), max_h)
+        if height > max_h + .2:
+            raise ValueError(f'Table overflow on page {index}: {height:.1f}>{max_h:.1f}')
+        table.drawOn(c, x, H-y-height)
+        return height
+
     def icon(name, x, y, size=25):
         record = icons[name]
         drawing = Drawing(size, size)
@@ -128,6 +154,8 @@ def main():
             if e.get('body'):
                 start = max(45 if e.get('icon') else 35, 14+label_h+8)
                 text(e['body'], x+14, y+start, w-28, e.get('body_size', 10), ink=INK, max_h=h-start-10)
+        elif kind == 'table':
+            draw_table(e['rows'], x, y, e['columns'], e['h'], e.get('size', 9.5))
         elif kind == 'graph_node':
             w, h = e['w'], e['h']
             rect(x,y,w,h,'#F3F7FA',accent,radius=5)
@@ -224,7 +252,13 @@ def main():
         for heading, paragraphs in spec['body']:
             y += text(heading,MARGIN,y,CW,12,True,'#087F80',max_h=35) + 9
             for paragraph in paragraphs:
-                y += text(paragraph,MARGIN,y,CW,10.8,max_h=766-y) + 9
+                if paragraph.startswith('|'):
+                    rows = [[cell.strip() for cell in line.strip().strip('|').split('|')]
+                            for line in paragraph.splitlines() if line.strip()]
+                    rows = [row for row in rows if not all(re.fullmatch(r':?-+:?', cell) for cell in row)]
+                    y += draw_table(rows, MARGIN, y, [125, 168, CW-293], 766-y) + 9
+                else:
+                    y += text(paragraph,MARGIN,y,CW,10.8,max_h=766-y) + 9
             y += 7
         text(spec.get('source',''),MARGIN,776,CW,6.8,ink=MUTED,max_h=22)
         text('조찬슬  /  2026.10.18',MARGIN,815,CW-60,7,ink=MUTED,max_h=12)
