@@ -10,7 +10,7 @@ import { SpawnCommandRunner } from "../src/server/processRunner.js";
 import type { AgentAdapter } from "../src/server/types.js";
 import { createRoomConfig } from "../src/cli/config.js";
 import { RoomClient } from "../src/cli/client.js";
-import { claudeMcpConfig, configureWorkers, connectMediator, createTopic, prepareParticipants, verifyMediator } from "../src/cli/mediation.js";
+import { claudeMcpConfig, configureWorkers, connectMediator, createTopic, mediatorBriefing, prepareParticipants, verifyMediator } from "../src/cli/mediation.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -55,6 +55,9 @@ it("configures effective worker roles and creates a ready planned topic through 
   expect(after.topic.participants).toEqual(before.topic.participants);
   expect(JSON.stringify(before.routing)).toContain("my-implementer");
   expect(await verifyMediator(f.api, f.config, topic.id)).toEqual(binding);
+  const briefing = await mediatorBriefing(f.api, f.config, join(f.config.dataDirectory, "room.json"), topic.id);
+  expect(briefing).toContain(readFileSync("docs/mediation/policy.md", "utf8"));
+  expect(briefing).not.toContain("fixture-token");
   expect(topic.nextCommand).toContain("/actions/plan");
   expect(f.modelCalls).toBe(0);
 });

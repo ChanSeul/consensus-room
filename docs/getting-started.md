@@ -70,7 +70,7 @@ npm run cr -- api GET "/api/topics/$CR_TOPIC_ID/resume"
 npm run cr -- briefing --topic "$CR_TOPIC_ID"
 ```
 
-`briefing`이 출력한 진입 지침을 **connect에 지정한 기존 대화에 붙여넣는다.** 출력에는 공개 정책의 로컬 경로, 실제 프로젝트·토픽·배정과 context·resume 조회 명령이 들어가며 인증 토큰은 없다. 세션을 배정하는 것만으로 그 대화가 CR 사용법을 전달받지는 않는다.
+`briefing`이 출력한 진입 지침을 **connect에 지정한 기존 대화에 붙여넣는다.** 출력에는 서버가 반환한 공개 정책의 전체 본문·SHA-256, 실제 프로젝트·토픽·배정과 context·resume 조회 명령이 들어가며 인증 토큰은 없다. 본문이나 공통 지식 구간을 읽지 못하면 성공한 안내로 대신하지 않는다. 세션을 배정하는 것만으로 그 대화가 CR 사용법을 전달받지는 않는다.
 
 중재자는 [중재 정책](mediation/policy.md)과 대상 프로젝트 지침을 읽고 context → resume 순서로 현재 배정·상태·승인·예산·열린 요청·다음 허용 행동을 확인한다. 실행 전에 [세션 인터럽트](mediator-interrupts.md)의 Codex bridge 또는 Claude 채널을 연결한다. Codex bridge는 별도 터미널에서 계속 실행해야 하며 자동 서비스가 아니다.
 
@@ -107,7 +107,7 @@ Goal·Source·논의, 관리 주제·하위 실행 주제와 브레인스토밍 
 | `repositoryPath` | `init`에서 선택한 실제 작업 저장소 |
 | `dataDirectory` | macOS: `~/Library/Application Support/ConsensusRoom`, Linux: `${XDG_DATA_HOME:-~/.local/share}/consensus-room` |
 | `port` | `4317`. 여러 독립 방은 데이터 폴더와 포트를 모두 구분 |
-| `memoryDirectory` | 기본 `<repository>/.consensus-room/memory`. 선택한 원문·위키 폴더이며 없으면 기존 프로젝트 지침으로 시작 |
+| `memoryDirectory` | 기본 `<repository>/.consensus-room/memory`. 선택한 원문·위키 폴더. 없어도 공개 공통 지식과 프로젝트 지침으로 시작 |
 | `standingReferencePath` | 선택한 상시 참조 문서의 절대 경로. 기본값 없음 |
 | `claudeSkillDirectories`, `codexSkillDirectories` | 선택한 스킬 폴더의 절대 경로 배열. CLI 초기 설정은 빈 목록 |
 | `codexHome`, `claudeConfigDirectory` | 선택. 자신의 CLI 계정·설정 위치. 각각 `CODEX_HOME`, `CLAUDE_CONFIG_DIR`로 전달 |

@@ -1,13 +1,13 @@
 import { parseArgs } from "node:util";
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 import { createInterface } from "node:readline/promises";
 import { createRoomConfig, defaultConfigPath, readRoomConfig, writeInitialConfig } from "./config.js";
 import { doctor } from "./doctor.js";
 import { openRoom, restartRoom, roomStatus, startRoom, stopRoom } from "./lifecycle.js";
 import { RoomClient } from "./client.js";
-import { claudeMcpConfig, configureWorkers, connectMediator, createTopic, prepareParticipants, runBridge, verifyMediator } from "./mediation.js";
+import { claudeMcpConfig, configureWorkers, connectMediator, createTopic, mediatorBriefing, prepareParticipants, runBridge, verifyMediator } from "./mediation.js";
 import { redactSecrets } from "../shared/workflow.js";
 
 const help = `Consensus Room — 개인 설정과 기존 API를 사용하는 로컬 CLI
@@ -100,18 +100,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     case "participants": await prepareParticipants(api, required("topic")); print({ topicId: values.topic, prepared: true }); return;
     case "bridge": await runBridge(api, config, required("topic")); return;
     case "briefing": {
-      const topicId = required("topic"), binding = await verifyMediator(api, config, topicId);
-      // A copyable instruction bundle contains paths and identity, never the launch token.
-      const quote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
-      const cli = `node --import ${quote(fileURLToPath(import.meta.resolve("tsx")))} ${quote(fileURLToPath(new URL("./room.ts", import.meta.url)))} --config ${quote(configFile)}`;
-      process.stdout.write(`이 대화는 Consensus Room 중재자 ${binding.participant}@${binding.version}입니다.\n`
-        + `실제 연결 세션: ${binding.sessionId}; 프로젝트: ${config.repositoryPath}; 토픽: ${topicId}\n`
-        + `먼저 ${fileURLToPath(new URL("../../docs/mediation/policy.md", import.meta.url))}의 진입·재개·완료 계약과 대상 프로젝트 지침을 읽으세요.\n`
-        + `현재 배정과 정책: ${cli} api GET '/api/mediation/context?topic=${encodeURIComponent(topicId)}'\n`
-        + `다음 허용 작업: ${cli} api GET /api/topics/${encodeURIComponent(topicId)}/resume\n`
-        + `변경은 같은 CLI의 api 명령으로 수행하며 기본 actor는 mediator입니다. 결정 본문은 --body-file을 사용하세요.\n`
-        + `배정 충돌에서 신원을 바꾸거나 DB를 직접 수정하지 마세요. 사용자의 기존 범위·승인 안에서 진행하고, 사용자만 가능한 승인·역할 변경은 대화로 요청하세요.\n`
-        + `자료를 읽지 못하거나 검사가 실패하면 해당 상태를 보존하세요. 중재 알림 수신은 실행·완료 증거가 아닙니다.\n`);
+      process.stdout.write(await mediatorBriefing(api, config, configFile, required("topic")));
       return;
     }
     case "mcp-config": {

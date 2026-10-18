@@ -8,6 +8,8 @@ import { roomEnvironment } from "./config.js";
 import { readLaunchConnection } from "./lifecycle.js";
 import { type RoomAPI, type MediatorBinding, readBinding } from "./client.js";
 import { AgentProfileInputSchema, type AgentProfileInput, type RoleAssignment } from "../shared/roles.js";
+import { extractWorkerKnowledge } from "../shared/workerKnowledge.js";
+import type { MediationPolicy } from "../server/mediation.js";
 
 export const sourceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const part = (value: string) => encodeURIComponent(value);
@@ -93,15 +95,41 @@ export async function createTopic(api: RoomAPI, input: { title: string; goal?: s
     : `api POST /api/topics/${topic.id}/actions/${input.mode === "planned" ? "plan" : "implement"} --body '{}'` };
 }
 
-export async function verifyMediator(api: RoomAPI, config: RoomConfig, topicId: string): Promise<MediatorBinding> {
+async function verifiedContext(api: RoomAPI, config: RoomConfig, topicId: string): Promise<{ binding: MediatorBinding; policy: MediationPolicy }> {
   const saved = readBinding(config);
-  const context = await api.request<{ assignment: RoleAssignment | null; profile: { provider: string } | null }>("GET", `/api/mediation/context?topic=${part(topicId)}`);
+  const context = await api.request<{ assignment: RoleAssignment | null; profile: { provider: string } | null; policy: MediationPolicy }>("GET", `/api/mediation/context?topic=${part(topicId)}`);
   const current = context.assignment;
   if (!current || current.participant !== saved.participant || current.version !== saved.version || current.sessionId !== saved.sessionId
     || current.profileId !== saved.profileId || context.profile?.provider !== saved.provider) {
     throw new Error("중재자 배정이 저장된 연결과 다릅니다. 다른 세션으로 자동 변경하지 않습니다. 현재 배정을 확인하고 connect로 다시 연결하세요.");
   }
-  return saved;
+  return { binding: saved, policy: context.policy };
+}
+
+export async function verifyMediator(api: RoomAPI, config: RoomConfig, topicId: string): Promise<MediatorBinding> {
+  return (await verifiedContext(api, config, topicId)).binding;
+}
+
+/** The emitted body, not a private file link, is the mediator's portable input. */
+export async function mediatorBriefing(api: RoomAPI, config: RoomConfig, configFile: string, topicId: string): Promise<string> {
+  const { binding, policy } = await verifiedContext(api, config, topicId);
+  if (!policy || policy.error || typeof policy.text !== "string" || !policy.text.trim()
+    || policy.version !== createHash("sha256").update(policy.text, "utf8").digest("hex")) {
+    throw new Error("현재 공통 정책의 본문과 버전을 확인할 수 없습니다. 정책을 복구한 뒤 briefing을 다시 실행하세요.");
+  }
+  // The worker section is required even when an older server supplies a valid policy hash.
+  extractWorkerKnowledge(policy.text);
+  const quote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
+  const cli = `node --import ${quote(fileURLToPath(import.meta.resolve("tsx")))} ${quote(join(sourceRoot, "src/cli/room.ts"))} --config ${quote(resolve(configFile))}`;
+  return `이 대화는 Consensus Room 중재자 ${binding.participant}@${binding.version}입니다.\n`
+    + `실제 연결 세션: ${binding.sessionId}; 프로젝트: ${config.repositoryPath}; 토픽: ${topicId}\n`
+    + `아래 공통 정책 본문과 대상 프로젝트의 현재 지침을 읽으세요. 개인 메모리·스킬은 필수 전제가 아닙니다.\n`
+    + `현재 배정과 정책: ${cli} api GET '/api/mediation/context?topic=${encodeURIComponent(topicId)}'\n`
+    + `다음 허용 작업: ${cli} api GET /api/topics/${encodeURIComponent(topicId)}/resume\n`
+    + `변경은 같은 CLI의 api 명령으로 수행하며 기본 actor는 mediator입니다. 결정 본문은 --body-file을 사용하세요.\n`
+    + `배정 충돌에서 신원을 바꾸거나 DB를 직접 수정하지 마세요. 기존 범위·승인 안에서 진행하고 사용자만 가능한 결정은 사용자에게 요청하세요.\n`
+    + `중재 알림 수신은 실행·완료 증거가 아닙니다. 이 출력은 본문 전달 자료이며 모델이 읽고 준수했다는 증명은 아닙니다.\n\n`
+    + `공통 정책 본문 시작 · SHA-256 ${policy.version}\n${policy.text}\n공통 정책 본문 끝\n`;
 }
 
 export async function runBridge(api: RoomAPI, config: RoomConfig, topicId: string): Promise<void> {

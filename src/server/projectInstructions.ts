@@ -2,6 +2,7 @@ import { readInstructionFiles } from "./userFileReader.js";
 import { join } from "node:path";
 import { PROJECT_INSTRUCTION_PRECEDENCE_NOTE } from "../shared/prompts.js";
 import { redactSecrets } from "../shared/workflow.js";
+import { loadWorkerKnowledge } from "./workerKnowledgeSource.js";
 
 export const INSTRUCTION_FILE_LIMIT_BYTES = 32_000;
 
@@ -42,11 +43,19 @@ export interface AppliedInstructions {
   projectSource: "workspace" | "repository" | null;
 }
 
+export const WORKER_KNOWLEDGE_LABEL = "CR 공통 작업 지식 (docs/mediation/policy.md)";
+
+// 공개 정본의 공통 작업 지식 블록. 개인 지침과 달리 필수 본문이라 32KB 로 자르거나 interactive-session-only 로 거르지 않는다.
+export function workerKnowledgeBlock(knowledge: string): string {
+  return [`적용되는 지시문 시작: ${WORKER_KNOWLEDGE_LABEL}`, knowledge, `적용되는 지시문 끝: ${WORKER_KNOWLEDGE_LABEL}`].join("\n");
+}
+
 export async function readAppliedInstructions(input: AppliedInstructionInput): Promise<AppliedInstructions> {
+  // 전역·프로젝트 지침이 없는 환경에도 실리는 기준선이다. 읽지 못하면 개인 파일로 대신하지 않고 턴 전에 실패한다.
+  const blocks: string[] = [workerKnowledgeBlock(await loadWorkerKnowledge(input.signal))];
   const files = await readInstructionFiles({ workspacePath: join(input.workspace, input.fileName),
     repositoryPath: input.repositoryPath ? join(input.repositoryPath, input.fileName) : undefined,
     globalPath: input.globalPath ?? undefined, injectWorkspaceFile: input.injectWorkspaceFile }, { signal: input.signal });
-  const blocks: string[] = [];
   const globalBlock = instructionBlock(`사용자 전역 ${input.fileName}`, files.global);
   if (globalBlock) blocks.push(globalBlock);
   const projectSource = files.source;
