@@ -79,9 +79,24 @@ Jira·Slack·Figma 등의 변경은 새 사실로 전달합니다. 영향은 작
 
 ## 시작 방법
 
-연결된 Claude 또는 Codex 대화에서 목표와 사용할 모드를 전달합니다. 목표가 아직 정해지지 않았다면 논의부터 시작할 수 있습니다. **지시는 대화에서, 진행 확인은 웹 화면에서** 합니다.
+Node.js 26 이상과 자신의 계정으로 로그인한 Claude Code·Codex CLI를 준비합니다. macOS·Linux에서 다음 순서로 시작합니다. `init`은 작업할 Git 저장소의 절대 경로와 본인 계정에서 사용할 두 모델을 묻습니다.
 
-[설치와 연결](docs/getting-started.md) · [목표·자료·논의로 시작하기](docs/topic-structure.md) · [사용량 집계 방법](docs/usage-report.md) · [설계와 운영 사례 PDF](docs/consensus-room-portfolio.pdf)
+```sh
+git clone https://github.com/ChanSeul/consensus-room.git
+cd consensus-room
+npm ci
+npm run cr -- init
+npm run cr -- doctor
+npm run cr -- start
+npm run cr -- configure
+npm run cr -- open
+```
+
+개인 설정·DB·로그는 저장소 밖에 둡니다. `doctor`는 준비 조건을 검사하며 모델을 호출하지 않습니다. 통과해도 실제 로그인·모델 사용 권한·세션 수신까지 확인한 것은 아닙니다. 기본 역할은 Claude 계획·구현, Codex 리뷰입니다.
+
+이어서 [설치와 연결](docs/getting-started.md)의 `connect`로 **이미 열린 중재 대화의 실제 세션 ID**를 배정합니다. 토픽을 만든 뒤 `briefing --topic <토픽 ID>`의 진입 지침을 그 대화에 붙여넣고 [인터럽트 연결](docs/mediator-interrupts.md)을 준비합니다. 연결 프로세스는 별도로 유지해야 합니다. 연결된 대화에서 목표와 사용할 모드를 전달합니다. **지시는 대화에서, 진행 확인은 웹 화면에서** 합니다.
+
+[설치와 연결](docs/getting-started.md) · [목표·자료·논의로 시작하기](docs/topic-structure.md) · [시작·재시작·갱신과 복구](docs/public-operations.md) · [사용량 집계 방법](docs/usage-report.md) · [설계와 운영 사례 PDF](docs/consensus-room-portfolio.pdf)
 
 ## 공개본 관리
 

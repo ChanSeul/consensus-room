@@ -4,45 +4,120 @@
 
 ## 준비
 
-macOS·Linux를 대상으로 한다. Node.js 26 이상, npm, Git, 사용할 Claude Code/Codex CLI가 필요하다. 각 CLI에 자신의 계정으로 로그인한다. 공급자가 요구하는 권한·샌드박스와 연결한 Jira·Figma·Slack 읽기 권한도 자신의 환경에서 준비한다. 저장소를 복제해도 작성자의 계정이나 외부 서비스 권한을 받는 것은 아니다.
+macOS·Linux를 대상으로 하며 Windows는 지원하지 않는다. Node.js 26 이상, npm, Git, `ps`·`pgrep`, Claude Code·Codex CLI가 필요하다. 기본 역할은 Claude 계획·구현과 Codex 리뷰이므로 두 CLI에 자신의 계정으로 로그인한다. 공급자가 요구하는 권한·샌드박스 의존성도 준비한다. macOS에서는 중첩 샌드박스를 피하도록 사용자 터미널에서 서버를 시작한다.
+
+CLI 설치·로그인은 [Codex 공식 안내](https://learn.chatgpt.com/docs/codex/cli)와 [Claude Code 공식 안내](https://code.claude.com/docs/en/overview)를 따른다. 설치 후 `codex --version`, `claude --version`을 확인한다. CR은 공급자 CLI를 설치하거나 계정을 복사하지 않는다. 2026-10-18의 로컬 기능 확인 환경은 macOS, Codex `0.163.0-alpha.10.2` 앱 번들 CLI, Claude Code `2.1.301`이었다. 이를 최소 버전으로 해석하지 않는다. 일반 배포판·다른 버전은 `doctor`가 출력하는 필수 실행 옵션과 선택적인 app-server·queue 기능을 확인해야 한다.
+
+대상 프로젝트는 커밋이 하나 이상 있는 로컬 Git 저장소여야 한다. 언어는 제한하지 않는다. 프로젝트의 `AGENTS.md` 등 기존 지침과 합의한 계획에 따라 검사·빌드 명령을 정한다. 포함된 Swift 정적 검사 도구는 선택 기능이며 모든 언어의 검사를 대신하지 않는다.
+
+## 1. 설치·개인 설정·서버 시작
 
 ```sh
 git clone https://github.com/ChanSeul/consensus-room.git
 cd consensus-room
 npm ci
-npm run build
-CONSENSUS_ROOM_REPOSITORY="/absolute/path/to/your-project" npm start
+npm run cr -- init
+npm run cr -- doctor
+npm run cr -- start
+npm run cr -- configure
+npm run cr -- open
 ```
 
-대상 프로젝트는 로컬 Git 저장소여야 한다. 언어는 제한하지 않는다. 프로젝트의 `AGENTS.md` 등 기존 지침과 합의한 계획에 따라 검사·빌드 명령을 정한다. 포함된 Swift 정적 검사 도구는 선택 기능이며 모든 언어의 검사를 대신하지 않는다.
+`init`은 터미널에서 누락된 저장소 절대 경로와 Claude·Codex 모델 ID를 묻는다. 모델은 자신의 계정에서 실제 사용할 수 있는 값을 고른다. 추론 강도의 기본값은 `medium`이며 공급자가 지원하는 값으로 선택한다. 플래너와 구현자의 모델을 나누려면 `--implementation-model`·`--implementation-effort`를 지정한다. 자동화에서는 질문에 답하는 대신 다음 플래그를 사용한다. 변수에는 먼저 자신의 실제 값을 넣는다.
 
-서버는 localhost에만 열린다. 터미널에 표시한 시작 URL을 브라우저에서 열고 같은 서버 주소·토큰으로 중재 세션을 연결한다. 인증된 시작 URL은 데이터 폴더의 `consensus-room.url`에도 저장된다. URL의 토큰을 공유하거나 커밋하지 않는다.
+```sh
+npm run cr -- init --repository "$CR_PROJECT" \
+  --claude-model "$CR_CLAUDE_MODEL" --codex-model "$CR_CODEX_MODEL"
+```
 
-## 로컬 설정
+기본 설정은 아래 기본 데이터 폴더의 `room.json`이며 파일 권한은 `0600`이다. `init`은 기존 설정을 덮어쓰지 않는다. `--config /absolute/private/path/room.json`으로 위치를 바꾸면 이후 **모든** `cr` 명령에 같은 `--config`를 붙인다. `--data-dir`과 `--port`도 초기화 때 지정할 수 있다. `--data-dir`만 바꿔도 기본 설정 파일 위치는 바뀌지 않으므로 독립 방마다 `--config`도 구분한다. 개인 설정과 데이터는 대상 프로젝트와 Consensus Room checkout 밖에 둔다. 설정에는 로그인 토큰을 넣지 않는다.
 
-| 환경변수 | 기본값과 용도 |
+`doctor`는 실행 파일·CLI 도움말의 기능·경로·선택 연결을 읽기 전용으로 검사한다. `npm run cr -- doctor --json`으로 결과를 저장할 수 있다. 로그인 파일의 존재나 버전·기능 검사는 실제 인증·모델 사용 권한을 보장하지 않는다. 모델 턴이나 외부 앱 요청은 보내지 않는다. 선택한 메모리·스킬·Figma가 없으면 경고할 수 있다. 실패 항목은 안내에 따라 해결한다. 웹은 빌드 의존성을 점검하며 실제 후보 산출물은 `start`가 준비한다.
+
+`start`는 후보 코드의 타입 검사와 웹 빌드를 마친 뒤 별도 서버 프로세스를 시작한다. 터미널을 닫아도 서버는 유지된다. 서버는 localhost에만 열린다. `open`은 인증 URL을 출력하지 않고 브라우저에서 연다. 비공개 데이터 폴더의 `consensus-room.url`에는 인증 토큰이 들어 있으므로 공유하거나 커밋하지 않는다.
+
+`configure`는 설정의 Claude 플래너·구현자와 Codex 리뷰어를 전역 역할에 배정한다. 같은 설정은 다시 실행해도 유지하며, 다른 기존 배정은 거부한다. 의도한 역할 변경에만 `configure --replace`를 사용한다.
+
+## 2. 이미 열린 중재 대화 연결
+
+자신의 Claude 또는 Codex 앱·CLI에서 중재에 쓸 대화를 먼저 연다. 그 앱·CLI가 제공하는 **실제 세션 ID**, 현재 모델 ID와 추론 강도를 확인한다. 임의 ID나 다른 대화의 ID를 만들지 않는다. 다음은 Codex 예시다. Claude 대화라면 `--provider claude`로 바꾼다.
+
+```sh
+printf '열어 둔 중재 대화의 실제 세션 ID: '
+read -r CR_SESSION_ID
+printf '그 대화의 현재 모델 ID: '
+read -r CR_SESSION_MODEL
+printf '그 대화의 현재 추론 강도: '
+read -r CR_SESSION_EFFORT
+npm run cr -- connect --provider codex --participant my-mediator \
+  --session "$CR_SESSION_ID" --model "$CR_SESSION_MODEL" --effort "$CR_SESSION_EFFORT"
+```
+
+`connect`는 현재 대화를 배정하고 배정 버전을 로컬에 보관한다. 대화를 새로 열거나 기존 대화의 모델을 바꾸지 않으며, 수신 성공을 검사하지 않는다. 기본 배정은 전역이다. 특정 토픽만 맡기려면 `--topic <실제 토픽 ID>`를 붙인다. 기존 중재자를 교체하는 사용자의 명시적 선택에만 `--replace`를 쓴다.
+
+## 3. 토픽 생성과 실행
+
+다음 명령은 ticket 실행 주제를 만든다. 생성은 모델을 호출하지 않으며 별도 작업 트리를 준비한다. 결과의 `id`를 입력해 같은 주제를 계속 사용한다.
+
+```sh
+npm run cr -- topic --title "첫 작업" --mode ticket --goal "사용자와 합의한 작은 변경을 구현하고 검증한다."
+printf '생성 결과의 토픽 id: '
+read -r CR_TOPIC_ID
+npm run cr -- api GET "/api/mediation/context?topic=$CR_TOPIC_ID"
+npm run cr -- api GET "/api/topics/$CR_TOPIC_ID/resume"
+npm run cr -- briefing --topic "$CR_TOPIC_ID"
+```
+
+`briefing`이 출력한 진입 지침을 **connect에 지정한 기존 대화에 붙여넣는다.** 출력에는 공개 정책의 로컬 경로, 실제 프로젝트·토픽·배정과 context·resume 조회 명령이 들어가며 인증 토큰은 없다. 세션을 배정하는 것만으로 그 대화가 CR 사용법을 전달받지는 않는다.
+
+중재자는 [중재 정책](mediation/policy.md)과 대상 프로젝트 지침을 읽고 context → resume 순서로 현재 배정·상태·승인·예산·열린 요청·다음 허용 행동을 확인한다. 실행 전에 [세션 인터럽트](mediator-interrupts.md)의 Codex bridge 또는 Claude 채널을 연결한다. Codex bridge는 별도 터미널에서 계속 실행해야 하며 자동 서비스가 아니다.
+
+`resume`에 차단 사유가 없고 사용자가 해당 실행을 요청했다면 ticket은 다음 명령으로 시작한다.
+
+```sh
+npm run cr -- api POST "/api/topics/$CR_TOPIC_ID/actions/implement" --body '{}'
+```
+
+planned로 진행하려면 위 ticket 예제 대신 다음처럼 만든다. 새 ID의 `briefing`을 같은 대화에 전달하고 이 토픽의 인터럽트 연결을 준비한 뒤 `actions/plan`을 호출한다. CLI는 planned 실행 주제에 누락된 Claude·Codex 참여자 좌석을 준비한다. 좌석 준비는 모델 실행이나 실제 세션 수신이 아니다. 도중에 실패하면 생성된 ID를 보존하고 `npm run cr -- participants --topic "$CR_TOPIC_ID"`로 이어 간다.
+
+```sh
+npm run cr -- topic --title "구조 개선" --mode planned --goal "합의한 구조 변경의 계획을 검토하고 구현한다."
+printf 'planned 생성 결과의 토픽 id: '
+read -r CR_TOPIC_ID
+npm run cr -- briefing --topic "$CR_TOPIC_ID"
+npm run cr -- api GET "/api/topics/$CR_TOPIC_ID/resume"
+```
+
+```sh
+npm run cr -- api POST "/api/topics/$CR_TOPIC_ID/actions/plan" --body '{}'
+```
+
+planned는 계획 리뷰 뒤 사용자 승인을 기다린다. 현재 계획과 해시를 검토하고 승인 의사가 있을 때만 `actions/approve`에 `{ "planSHA256": "현재 64자리 해시" }`를 보낸 뒤 `implement`를 호출한다. 결정문은 [운영 안내](public-operations.md#api-호출과-응답-유실)에 따라 `--body-file`로 보낸다. 승인·추가 예산·푸시·병합 권한은 토픽 생성이나 자율중재 ON만으로 생기지 않는다. 이후에도 매 단계 `resume`의 허용 행동을 따른다.
+
+CLI의 `api`는 같은 로컬 서버의 REST API만 사용한다. 변경 요청은 저장한 중재자 신원·버전을 기본으로 보내며, 사용자만 할 수 있는 결정에는 명시적으로 `--as user`를 쓴다. 배정이 달라져 `STALE_MEDIATOR_ASSIGNMENT`가 나오면 멈추고 현재 배정을 확인한다. DB를 직접 고치거나 다른 신원으로 자동 재시도하지 않는다.
+
+Goal·Source·논의, 관리 주제·하위 실행 주제와 브레인스토밍 API는 [주제 구조](topic-structure.md)를 따른다. `topic --group`은 관리 주제, `--parent <실제 관리 주제 ID>`는 하위 주제를 만든다.
+
+## 개인 자료와 선택 연결
+
+| 설정 | 기본값과 용도 |
 |---|---|
-| `CONSENSUS_ROOM_REPOSITORY` | 서버 실행 디렉터리. 실제 작업할 Git 저장소를 명시하는 것을 권장 |
-| `CONSENSUS_ROOM_DATA_DIR` | macOS: `~/Library/Application Support/ConsensusRoom`, Linux: `${XDG_DATA_HOME:-~/.local/share}/consensus-room` |
-| `CONSENSUS_ROOM_MEMORY_DIR` | `<repository>/.consensus-room/memory`. 선택한 원문·위키를 둘 폴더이며, 없으면 기존 프로젝트 지침으로 시작 |
-| `CONSENSUS_ROOM_CLAUDE_SKILL_DIRS` | `~/.claude/skills`. 콜론으로 경로를 구분, 빈 문자열이면 사용하지 않음 |
-| `CONSENSUS_ROOM_CODEX_SKILL_DIRS` | `~/.codex/skills`, `~/.codex/skills/.system`. 같은 형식 |
-| `CONSENSUS_ROOM_PORT` | `4317` |
-| `CONSENSUS_ROOM_CLAUDE_MODEL`, `CONSENSUS_ROOM_CODEX_MODEL` | 자신의 계정에서 사용할 모델. 시작 기본값이며 역할별 프로필로도 지정 가능 |
-| `CONSENSUS_ROOM_CLAUDE_EFFORT`, `CONSENSUS_ROOM_CODEX_EFFORT` | 공급자가 지원하는 추론 설정 |
+| `repositoryPath` | `init`에서 선택한 실제 작업 저장소 |
+| `dataDirectory` | macOS: `~/Library/Application Support/ConsensusRoom`, Linux: `${XDG_DATA_HOME:-~/.local/share}/consensus-room` |
+| `port` | `4317`. 여러 독립 방은 데이터 폴더와 포트를 모두 구분 |
+| `memoryDirectory` | 기본 `<repository>/.consensus-room/memory`. 선택한 원문·위키 폴더이며 없으면 기존 프로젝트 지침으로 시작 |
+| `standingReferencePath` | 선택한 상시 참조 문서의 절대 경로. 기본값 없음 |
+| `claudeSkillDirectories`, `codexSkillDirectories` | 선택한 스킬 폴더의 절대 경로 배열. CLI 초기 설정은 빈 목록 |
+| `codexHome`, `claudeConfigDirectory` | 선택. 자신의 CLI 계정·설정 위치. 각각 `CODEX_HOME`, `CLAUDE_CONFIG_DIR`로 전달 |
+| `figmaMcpUrl` | 기본 `null`. Claude 작업자에게 제공할 로컬 Figma Desktop MCP의 인증정보 없는 localhost URL |
 
-`CONSENSUS_ROOM_DATA_DIR`을 직접 지정하면 먼저 폴더를 만든다. 존재하지 않는 경로는 빈 방을 잘못 여는 사고를 막기 위해 거부한다. 여러 독립 방을 동시에 실행한다면 데이터 폴더와 포트를 모두 구분한다. 로컬 자료·설정을 프로젝트 안에 두면 해당 프로젝트의 Git ignore 정책도 정한다.
+설정은 `room.json`에서 편집한다. 경로는 절대 경로를 사용하며 변경 적용은 [운영 안내](public-operations.md)를 따른다. 작성자의 개인 스킬·메모리·인증 파일·DB·다른 프로젝트 자료를 복사할 필요가 없다. 프로젝트 안에 자신의 자료를 둘 때는 해당 Git ignore 정책을 정한다. `tools/host-review`·`tools/work-admission`은 Consensus Room 자체 개발에 선택적으로 설치하는 도구이며 일반 프로젝트 중재의 설치 요건이 아니다.
 
-## 작업 흐름
+Jira·Slack·Figma·Google Sheets 원문은 자신의 계정 권한으로 읽는다. 서버의 자동 수집은 **Codex 앱 연결** 또는 명시적으로 인증한 REST 수집기를 사용한다. Claude MCP에 연결했다고 서버가 그 계정을 물려받지 않는다. Sheets는 비공개 데이터 폴더의 `evidence-apps.json`에 자신의 Google Drive `googleDriveLinkId`를 지정한다. Claude 작업자의 선택적 Figma Desktop MCP와 서버의 Codex 앱 Figma 수집은 별도 경로다. 자세한 계정 선택·승인·수집 계약은 [외부 원문](external-evidence.md)을 따른다. Source의 링크 등록만으로 읽기 완료를 판정하지 않는다.
 
-1. Claude 또는 Codex 세션을 열고 중재자 역할과 실제 세션 ID를 연결한다. 역할 배정 API는 `GET/POST /api/agent-profiles`, `GET/POST /api/role-assignments`이며 세부 계약은 [역할 계약](../src/shared/roles.ts)을 따른다.
-2. Goal, Source 또는 브레인스토밍 중 출발점을 정한다. [주제 구조](topic-structure.md)의 생성 계약으로 Root·관리 주제와 말단 실행 주제를 만든다.
-3. 중재 세션에서 Goal·계획·승인·사용자 결정을 처리한다. 웹에서 계층과 진행 상황을 확인한다. 자율중재는 항상 ON이다.
-4. 작업자가 중재를 요청하면 같은 세션에서 이어받도록 [세션 인터럽트](mediator-interrupts.md)를 연결한다.
+Linux용 경로와 플랫폼 분기가 있어도 실제 공급자 CLI·샌드박스·외부 서비스까지 포함한 Linux 종단 간 성공을 보장하지 않는다. 해당 호스트에서 실제 실행·전달·수신을 확인해야 한다. macOS도 `doctor` 결과만으로 모든 공급자 E2E가 검증됐다고 판단하지 않는다.
 
-Source 모드는 지정한 링크를 증거 목록에 등록한다. 호스트의 연결 도구 또는 별도 인증한 읽기 수집기로 실제 원문을 확보한 뒤 Goal을 확정한다. 다른 사용자의 Jira·Figma·Slack 로그인이나 MCP 연결을 복사하지 않는다.
-
-Linux용 기본 경로와 플랫폼 분기는 계약 검사로 확인한다. 실제 공급자 CLI·샌드박스·외부 서비스까지 포함한 Linux 종단 간 실행은 각 환경에서 확인해야 한다.
+기존 환경변수와 `npm run build` → `CONSENSUS_ROOM_REPOSITORY="/absolute/path/to/your-project" npm start` 방식도 지원한다. CLI가 관리하는 서버와는 시작·종료 방식을 섞지 않는다. 기존 방식의 환경변수·인증과 운영 범위는 [운영 안내](public-operations.md#기존-npm-start-방식)를 참고한다.
 
 ## 작업 방식(ticket·planned)
 
@@ -93,16 +168,8 @@ planned 계획은 구현할 항목 목록을 fenced 블록 ```` ```plan-items ``
 - 새 파이프라인 생성 응답을 받지 못하면 편집을 잠그고 요청을 이 브라우저에 보관합니다. 새로고침 후에도 **실행에 적용**을 다시 눌러 같은 요청의 결과를 확인합니다. 중복 생성을 막기 위해 브라우저 저장소를 사용할 수 없으면 새 생성 요청을 보내지 않습니다.
 - 새 실행 파이프라인은 큰 그림 주제에서 만들고, 적용 후 단계별 작업 패널에서 다음 준비 단계를 엽니다. 파이프라인 저장·적용 자체가 모델을 실행하지는 않습니다.
 
-## 중재자 배정 예시
+## 역할 배정 API
 
-인증 헤더 `x-consensus-token`과 새 `Idempotency-Key`를 사용해 먼저 프로필을 만든다. 모델·추론 강도는 실제 중재 세션에서 사용 중인 값으로 바꾼다.
+일반 설치에서는 위 `configure`·`connect`를 사용한다. 역할별 세부 배정은 `GET/POST /api/agent-profiles`, `GET/POST /api/role-assignments`와 [역할 계약](../src/shared/roles.ts)을 따른다. 직접 API를 쓸 때도 모델·세션 ID는 실제 대화와 일치해야 한다.
 
-```text
-POST /api/agent-profiles
-{ "id": "my-mediator", "provider": "codex", "model": "your-model", "effort": "medium", "options": {} }
-
-POST /api/role-assignments
-{ "scope": "global", "role": "mediator", "participant": "my-mediator", "profileId": "my-mediator", "sessionId": "actual-session-id", "expectedVersion": 0 }
-```
-
-처음 배정할 때 버전은 0이다. 기존 배정이 있으면 조회한 현재 버전을 넣고, 반환된 새 버전을 이후 호출에 사용한다. 중재자의 변경 요청에는 `x-consensus-actor: mediator`, `x-consensus-mediator: my-mediator`, `x-consensus-mediator-version: <반환된 버전>`을 추가한다. 배정 변경은 사용자 권한으로만 한다. Claude 중재자는 provider와 실제 세션 값을 Claude에 맞춘다. planner·implementer·reviewer도 각 역할의 프로필을 별도로 배정할 수 있다.
+처음 배정할 때 `expectedVersion`은 0이다. 기존 배정이 있으면 조회한 현재 버전을 넣고 반환된 새 버전을 이후 호출에 사용한다. 배정 변경은 사용자 권한으로만 한다. CLI는 인증 헤더·Idempotency-Key를 관리하고, 중재자 변경 요청에는 저장한 참여자와 배정 버전을 함께 보낸다. 프로필·배정의 존재와 인터럽트의 실제 전달·수신은 별도로 확인한다.

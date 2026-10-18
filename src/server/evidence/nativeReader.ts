@@ -81,7 +81,8 @@ export class NativeAppReader implements AppReader {
   private readonly epochs = new Map<AppProvider, number>();
   private readonly identities = new Map<AppProvider, Promise<ReaderIdentity>>();
   private readonly cached = new Map<AppProvider, ReaderIdentity>();
-  constructor(private readonly directory: string, private readonly authPath = join(homedir(), ".codex", "auth.json"),
+  // 기본 인증은 Codex 어댑터와 같은 Codex 홈(CODEX_HOME, 없으면 ~/.codex)의 auth.json 이다.
+  constructor(private readonly directory: string, private readonly authPath = join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), "auth.json"),
     private readonly metric: (provider: AppProvider, name: IdentityMetric, value: number) => void = () => {}) {}
   async config(): Promise<NativeReaderConfig> {
     try {

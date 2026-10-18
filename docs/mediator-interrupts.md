@@ -12,7 +12,39 @@ planner·runner·reviewer가 사용자 결정, 증거 부족, 실패, 계획 승
 
 ## 연결 준비
 
-각 사용자의 컴퓨터에서 자신의 Claude/Codex 로그인으로 실행한다. 웹에서는 지시를 입력하지 않는다. 서버의 사용자 권한으로 중재자 profile과 역할을 먼저 배정하고 실제 세션 ID를 기록한다. `GET /api/mediation/context?topic=<topic-id>`에서 현재 참여자·배정 버전을 확인한다. 연결 프로세스는 배정을 변경하지 않는다.
+각 사용자의 컴퓨터에서 자신의 Claude/Codex 로그인으로 실행한다. 웹에서는 지시를 입력하지 않는다. [시작 안내](getting-started.md)에 따라 `connect`에 **이미 열린 실제 대화의 세션 ID·모델·추론 강도**를 지정하고 토픽을 만든다. `briefing --topic "$CR_TOPIC_ID"`의 진입 지침을 그 대화에 붙여넣어 정책과 공식 context → resume 진입 경로를 전달한다. 배정만으로 대화가 CR 사용법을 알거나 알림을 수신하지는 않는다.
+
+### Codex: 별도 터미널의 bridge
+
+수신 대화를 Codex 앱·CLI 또는 공유 app-server에 열어 둔다. 설치한 Codex CLI에 아래 설명의 `app-server proxy`·`queue` 기능이 필요하다. 별도 터미널에서 Consensus Room checkout으로 이동한 뒤 실행한다. 사용자 지정 설정이면 같은 `--config`도 붙인다.
+
+```sh
+printf '연결할 실제 토픽 ID: '
+read -r CR_TOPIC_ID
+npm run cr -- bridge --topic "$CR_TOPIC_ID"
+```
+
+명령은 전경에서 계속 실행한다. CLI가 비공개 시작 URL과 저장한 중재자 배정을 읽어 토큰을 연결 프로세스에 전달하므로 토큰을 터미널에 복사할 필요가 없다. 터미널을 닫거나 재부팅하면 다시 실행해야 한다. 앱·CLI의 실제 세션 수신과 모델의 처리 시작은 아래 상태 계약으로 확인한다.
+
+### Claude: 생성한 MCP 설정으로 기존 대화 재개
+
+먼저 `connect --provider claude`에 실제 Claude 중재 세션을 배정한다. 아래 `CR_SESSION_ID`는 그 세션의 실제 ID, `CR_TOPIC_ID`는 만든 토픽 ID다. `briefing`의 지침도 같은 대화에 전달한다. 다음 명령은 토큰 없는 로컬 MCP 설정을 새 파일에 만든다. 이미 파일이 있으면 덮어쓰지 않으므로 새 파일명을 선택한다.
+
+```sh
+mkdir -p "$HOME/.config/consensus-room"
+CR_MCP_CONFIG="$HOME/.config/consensus-room/claude-mcp.json"
+npm run cr -- mcp-config --topic "$CR_TOPIC_ID" --output "$CR_MCP_CONFIG"
+claude --resume "$CR_SESSION_ID" --mcp-config "$CR_MCP_CONFIG" \
+  --dangerously-load-development-channels server:consensus-room
+```
+
+이 설정은 현재 Node·checkout·같은 `room.json`을 가리키는 bridge 명령을 등록한다. 시작할 때 비공개 인증정보를 읽는다. 직접 만든 채널은 개발 채널 옵션을 요구할 수 있으며, 본인이 검토한 로컬 서버와 조직의 허용 정책에 맞춰 사용한다. MCP 연결만으로 채널 수신이 보장되지 않는다. 실제 채널 활성화와 `consensus_interrupt_ack` 수신 확인을 구분한다.
+
+두 방식 모두 현재 배정과 로컬 연결이 다르면 거부한다. 다른 세션이나 새 배정으로 자동 전환하지 않는다. context를 읽고 사용자가 의도한 `connect ... --replace`로 연결을 갱신한 뒤 다시 시작한다. 서버 갱신·재시작 뒤에는 [운영 안내](public-operations.md)에 따라 연결 상태와 프로세스도 확인한다.
+
+## 환경변수를 직접 전달하는 연결
+
+기존 저수준 실행도 지원한다. 서버의 사용자 권한으로 중재자 profile·역할을 먼저 배정하고 실제 세션 ID를 기록한다. `GET /api/mediation/context?topic=<topic-id>`에서 현재 참여자·배정 버전을 확인한다. 연결 프로세스는 배정을 변경하지 않는다. CLI를 쓰면 아래 변수는 bridge가 준비한다.
 
 연결 프로세스에 다음 환경변수를 전달한다. 토큰을 저장소나 로그에 쓰지 않는다.
 
@@ -85,7 +117,7 @@ POST /api/topics/<topic-id>/interrupts/<interrupt-id>/retry
 { "reason": "실제 세션에서 미수신 확인" }
 ```
 
-UI와 `GET /api/topics/<topic-id>/resume`의 `mediation.interrupt`에 미연결·대기·전송·수신 확인·실패 상태를 표시한다. 연결 프로세스 없이 자동 세션 인터럽트가 작동한다고 간주하지 않는다.
+UI와 `GET /api/topics/<topic-id>/resume`의 `mediation.interrupt`에 미연결·대기·전송·수신 확인·실패 상태를 표시한다. CLI에서는 `npm run cr -- api GET "/api/topics/$CR_TOPIC_ID/resume"`으로 확인한다. 불명확한 결과의 재전송은 사용자가 실제 세션의 미수신을 확인한 뒤 위 본문을 비공개 JSON 파일로 준비해 `api POST .../retry --as user --body-file <파일>`로 요청한다. 연결 프로세스 없이 자동 세션 인터럽트가 작동한다고 간주하지 않는다.
 
 중재자는 현재 `resume`을 확인한 뒤 실제 처리를 시작할 때 `POST /api/topics/<topic-id>/interrupts/<interrupt-id>/handling`에 자신의 `{provider, sessionId}`를 보낸다. 이 기록은 전달 영수증과 별개이며 승인·재개·완료를 뜻하지 않는다. `mediation.intervention`과 `activity.mediationIntervention`에는 전달 상태, 처리 시작 시각, 이후 서버가 새 실행을 시작한 시각과 action ID가 각각 보존된다. 새 실행 시작은 모델의 실제 진척이나 성공을 보장하지 않으며, 중재자 처리 기록이 없으면 중재자가 재개시켰다고 추정하지 않는다. 재배정·범위 변경과 응답 미확인 재전송의 기존 경계는 유지한다.
 
