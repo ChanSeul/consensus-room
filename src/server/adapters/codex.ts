@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   AgentResultJsonSchema,
   DEFAULT_AGENT_SETTINGS,
@@ -15,7 +15,8 @@ import { readAppliedInstructions } from "../projectInstructions.js";
 import type { AgentAdapter, CommandRunner, CreatedSession, OutputSchema, SessionTurn } from "../types.js";
 import { defaultDataDirectory } from "../config.js";
 import { agentEnvironment } from "../security.js";
-import { ProjectMemoryReader, type MemoryReaderOptions } from "../projectMemory.js";
+import { ProjectMemoryReader, type MemoryDelivery, type MemoryReaderOptions } from "../projectMemory.js";
+import type { TurnJob } from "../../shared/roles.js";
 import { agentRunError, parseAgentResult, parseStructuredResult, parseTurnEnvelope, SessionIdentityMismatch } from "./resultParser.js";
 import { codexHomeUsage, ExecutionMetrics } from "./executionMetrics.js";
 import { createToolTimeMeter } from "./toolTime.js";
@@ -35,6 +36,9 @@ export interface CodexAdapterOptions {
   // 토픽(worktree)별 관리형 홈이 서로 다른 config.toml 을 가지므로 토픽 간 동시 실행이 가능하다. 이 값은 전체
   // 동시 Codex 턴 상한이다(토픽 안은 항상 직렬). 기본 2 — 2026-09-07 S9·S10 병렬 계획이 Codex 턴에서 직렬화되던 것의 해소.
   maxConcurrentTurns?: number;
+  // 관리형 프로필에서 항상 거부할 경로(`= "deny"`). 메모리 본문 사본 루트처럼 `":minimal" = "read"` 가 품을 수 있는 위치(/private/tmp 등)의 보호 경로를
+  // 메모리 주입·격리·프로토콜 여부와 관계없이 막는다. 그 안에서 이번 턴에 고른 사본 파일은 더 구체적인 read 항목이 다시 연다(자문 49 실측).
+  protectedReadPaths?: readonly string[];
 }
 
 interface CodexPermissionBoundary {
@@ -64,6 +68,8 @@ interface CodexPermissionBoundary {
   writablePaths?: readonly string[];
   // planner 계획 폴더(D4, turnPolicy.planDirectoryProblem 이 검증한 실제 경로) — 읽기 프로필에서 이 폴더만 쓰기로 연다. 작업 폴더는 읽기 그대로다.
   planDirectory?: string | null;
+  // 항상 거부할 보호 경로(CodexAdapterOptions.protectedReadPaths)의 실제 경로.
+  protectedReadPaths: readonly string[];
 }
 
 // 관리형 CODEX_HOME에 매 턴 덮어쓰는 최소 설정. 사용자 mcp_servers/notify/plugins/marketplaces/shell_environment_policy를
@@ -104,7 +110,8 @@ function managedConfigBody(boundary: CodexPermissionBoundary): string {
     // 자기 재실행 대상. 빠지면 AGENTS.md 로드 단계에서 sandbox-exec가 exec을 거부한다.
     boundary.codexExecutable,
     ...hostOwned,
-  ])).filter(path => !scopedWrite?.includes(path) && path !== boundary.planDirectory && !gitMetadata.some(git => isPathInside(git, path)));
+  ])).filter(path => !scopedWrite?.includes(path) && path !== boundary.planDirectory && !gitMetadata.some(git => isPathInside(git, path))
+    && !boundary.protectedReadPaths.includes(path));
   // 도구를 닫은 턴과 격리 턴은 프로젝트 문서를 싣지 않는다. 격리 턴은 도구를 쓰더라도 호스트 밖 입력(메모리·플러그인·앱·skill 검색)을 끈다.
   const disabledFeatures = [
     ...(boundary.toolsDisabled ? ["shell_tool", "unified_exec", "multi_agent", "view_image", "apps", "browser_use", "computer_use",
@@ -116,7 +123,9 @@ function managedConfigBody(boundary: CodexPermissionBoundary): string {
     // Apps are available only through the scoped, observed host transport below. Remote plugin state must not expose unobserved tools.
     "apps", "plugins",
   ].filter((feature, index, all) => all.indexOf(feature) === index);
-  const deniedPaths = uniquePaths([join(boundary.topicHome, "auth.json"), boundary.managedAuthPath, boundary.sourceAuthPath, ...gitMetadata]);
+  // 보호 경로는 경로 하나만 deny 다. 그 아래 읽기 항목(이번 턴 사본 파일)은 빼지 않는다 — 더 구체적인 항목이 이긴다(자문 49 실측, CLI 0.163).
+  const deniedPaths = uniquePaths([join(boundary.topicHome, "auth.json"), boundary.managedAuthPath, boundary.sourceAuthPath, ...gitMetadata,
+    ...boundary.protectedReadPaths]);
   return [
     ...MANAGED_CONFIG_HEADER,
     `default_permissions = ${tomlString(profile)}`,
@@ -355,18 +364,17 @@ export class CodexAdapter implements AgentAdapter {
       if (policy.isolated) commandArgs.splice(commandArgs.length - 1, 0, "--ignore-rules");
       // 호스트 소유 세션 홈은 격리 턴에만 쓴다 — 런타임 요청 검증과 별개로 어댑터 입구에서도 막는다(엔진 턴에 임의 홈이 들어오지 않게).
       if (turn.sessionHome !== undefined && !policy.isolated) throw new Error("sessionHome 은 격리 턴에만 쓸 수 있습니다.");
-      const topicHome = await this.prepareManagedHome(codex, actionTemp, turn.cwd, policy, turn.readablePaths ?? [], turn.sessionHome,
-        policy.scopedWrite ? turn.writablePaths : undefined, planDirectory);
+      // 메모리는 세션 생성 턴에만 주입한다(claude 어댑터와 같은 근거 — resume은 스레드가 이미 기억,
+      // 매 턴 재주입은 턴당 ~20K자 중복). protocolOnly 턴은 새 세션이어도 주입하지 않는다. 예외 하나(E3-4c F004): 프로토콜 턴이 만든 세션은 본문을 받지
+      // 않았다 — 엔진이 그 세션의 첫 일반 resume 에 memoryBodies 를 실으면 그 resume 에 한 번 싣는다(매니페스트 없이). 이번 턴에 고른 문서의 본문 사본은
+      // 관리형 프로필의 읽기 목록에 더하므로 그 준비 전에 계산한다(엔진 결함 dffeb33f). 격리 턴은 메모리를 읽지 않는다(E2e.md 규칙 2).
+      const memory: MemoryDelivery = policy.isolated ? { text: turn.prompt, readablePaths: [] } : await this.memoryDelivery(turn, job, protocolOnly, newSession);
+      const topicHome = await this.prepareManagedHome(codex, actionTemp, turn.cwd, policy, [...(turn.readablePaths ?? []), ...memory.readablePaths],
+        turn.sessionHome, policy.scopedWrite ? turn.writablePaths : undefined, planDirectory);
       // 격리 턴은 프롬프트가 입력 전부다 — 메모리·지시문·실행 정책 안내문을 싣지 않는다(E2e.md 규칙 2). HOME 도 격리 홈 안의 빈 폴더로 바꿔 사용자
       // 수준 skill($HOME/.agents/skills)·셸 시작 파일이 끼어들지 못하게 한다(인증은 CODEX_HOME 의 auth.json 이다).
       if (policy.isolated) return await this.run(turn, codex, commandArgs, newSession, topicHome, turn.prompt, topicHome, { HOME: join(topicHome, "home") });
-      // 메모리는 세션 생성 턴에만 주입한다(claude 어댑터와 같은 근거 — resume은 스레드가 이미 기억,
-      // 매 턴 재주입은 턴당 ~20K자 중복). protocolOnly 턴은 새 세션이어도 주입하지 않는다. 예외 하나(E3-4c F004): 프로토콜 턴이 만든 세션은 본문을 받지
-      // 않았다 — 엔진이 그 세션의 첫 일반 resume 에 memoryBodies 를 실으면 그 resume 에 한 번 싣는다(매니페스트 없이).
-      const injectMemory = Boolean(this.memory) && !protocolOnly && (newSession || turn.memoryBodies === true);
-      const enriched = injectMemory
-        ? await this.memory!.buildPrompt(turn.prompt, this.role, turn.signal, turnContract(job).memoryUpdates, turn.memorySearch)
-        : await this.withMemoryManifest(turn, protocolOnly);
+      const enriched = memory.text;
       // 프로토콜 확인 턴은 판단에 필요한 값을 프롬프트가 다 담고 있어 프로젝트 지시문(AGENTS.md)도 싣지 않는다
       // (2026-09-07 Codex 자기 최적화 제안 ②: ACK 턴마다 지시문 블록을 재전송하던 낭비).
       const { blocks: instructions } = protocolOnly
@@ -502,15 +510,21 @@ export class CodexAdapter implements AgentAdapter {
   }
 
 
-  // resume·fork 턴에는 본문 대신 매니페스트만 덧붙인다. protocolOnly 턴(resolveTurn 이 job 에서 유도한 값)은 메모리 자체가 필요 없다.
-  private async withMemoryManifest(
+  // 본문을 싣는 턴(생성·memoryBodies)은 본문을, resume·fork 턴은 매니페스트만 덧붙인다. protocolOnly 턴(resolveTurn 이 job 에서 유도한 값)은 메모리 자체가
+  // 필요 없다. readablePaths 는 이번 턴에 고른 문서의 본문 사본뿐이다 — 이전 턴 경로를 누적하지 않는다.
+  private async memoryDelivery(
     turn: Omit<SessionTurn, "sessionId"> | SessionTurn,
+    job: TurnJob,
     protocolOnly: boolean,
-  ): Promise<string> {
-    if (!this.memory || protocolOnly) return turn.prompt;
-    const manifest = await this.memory.buildManifest(turn.prompt, this.role, turn.signal,
-      turnContract(resolveSupportedTurn("codex", turn).job).memoryUpdates, turn.memorySearch);
-    return manifest ? `${turn.prompt}\n\n${manifest}` : turn.prompt;
+    newSession: boolean,
+  ): Promise<MemoryDelivery> {
+    if (!this.memory || protocolOnly) return { text: turn.prompt, readablePaths: [] };
+    const allowUpdates = turnContract(job).memoryUpdates;
+    if (newSession || turn.memoryBodies === true) {
+      return this.memory.buildPromptDelivery(turn.prompt, this.role, turn.signal, allowUpdates, turn.memorySearch);
+    }
+    const manifest = await this.memory.buildManifestDelivery(turn.prompt, this.role, turn.signal, allowUpdates, turn.memorySearch);
+    return { text: manifest.text ? `${turn.prompt}\n\n${manifest.text}` : turn.prompt, readablePaths: manifest.readablePaths };
   }
 
   // 홈 자체는 지속되지만 설정은 턴마다 다시 쓴다. 외부에서 드리프트가 생겨도 다음 턴에 사라지게 하려는 것이고,
@@ -565,6 +579,7 @@ export class CodexAdapter implements AgentAdapter {
       readablePaths,
       writablePaths: scoped,
       planDirectory,
+      protectedReadPaths: await this.protectedReadPaths(),
     };
     await writeFile(join(topicHome, "config.toml"), managedConfigBody(boundary), { mode: 0o600 });
     return topicHome;
@@ -572,7 +587,8 @@ export class CodexAdapter implements AgentAdapter {
 
   // 호스트 격리 입력의 관리형 홈(E2e.md 규칙 2) — 운영 도구가 작업마다 쓰던 홈과 같은 구성이다: 인증 링크와 이 설정 파일만 둔다. 공유 홈의 세션·
   // 전역 AGENTS·skills 를 링크하지 않고, 세션은 이 홈 안에 쌓인다(같은 cwd 가 같은 홈이라 재개된다). 전역 지시문 파일이 생겨 있으면 싣지 않고 멈춘다.
-  // 호스트가 세션 홈을 넘기면(sessionHome, 운영 도구의 작업별 기존 홈) 그 홈을 그대로 쓴다 — 설정은 매 턴 다시 쓰고, 기존 세션·인증 링크는 둔다.
+  // 호스트가 세션 홈을 넘기면(sessionHome, 운영 도구의 작업별 기존 홈) 그 홈을 그대로 쓴다 — 설정은 매 턴 다시 쓰고, 기존 세션은 두며,
+  // 인증 링크는 지금 설정한 Codex 홈을 가리키게 한다.
   private async prepareIsolatedHome(codexExecutable: string, given: string, workspace: string, policy: Pick<TurnPolicy, "web" | "fanout" | "tools">,
     readablePaths: readonly string[], sessionHome?: string, writablePaths?: readonly string[]): Promise<string> {
     const home = sessionHome ? resolve(sessionHome) : join(this.codexHome, "isolated", managedHomeKey(given));
@@ -582,8 +598,8 @@ export class CodexAdapter implements AgentAdapter {
       if (await lstat(join(home, name)).catch(() => null)) throw new Error(`격리 턴의 관리형 Codex 홈에 전역 지시문이 있습니다: ${join(home, name)}`);
     }
     const sourceAuth = join(this.userCodexHome(), "auth.json");
-    // 이미 있으면 건드리지 않는다(갱신된 자격증명일 수 있다). 내용은 읽지 않는다.
-    if (!await lstat(join(home, "auth.json")).catch(() => null)) await symlink(sourceAuth, join(home, "auth.json")).catch(() => undefined);
+    // 공유 홈과 같은 결속 규칙이다 — 다른 홈을 가리키는 링크는 다시 걸고, 실제 파일은 두며, 내용은 읽지 않는다.
+    await this.bindAuthentication(join(home, "auth.json"));
     // 격리 턴은 공통 Git 디렉터리를 읽기에 넣지 않는다. 승인 경로만 쓰기 턴에서는 그 경로를 거부 대상으로만 쓴다(연결 worktree 의 메타데이터).
     const boundary: CodexPermissionBoundary = {
       topicHome: home, workspace, gitCommonDirectory: writablePaths ? findGitCommonDirectory(workspace) : null,
@@ -592,9 +608,18 @@ export class CodexAdapter implements AgentAdapter {
       web: policy.web, fanout: policy.fanout, writable: policy.tools === "write", toolsDisabled: policy.tools === "none", isolated: true,
       readablePaths: [...readablePaths, join(home, "home")],
       writablePaths,
+      protectedReadPaths: await this.protectedReadPaths(),
     };
     await writeFile(join(home, "config.toml"), managedConfigBody(boundary), { mode: 0o600 });
     return home;
+  }
+
+  // 사본 루트 거부의 출처는 두 가지다 — createRuntimeAdapters 가 메모리 유무와 관계없이 넘기는 protectedReadPaths 와, 판독기가 사본을 게시하는
+  // snapshotDirectory(claude.ts invokeOutput 과 같은 병합). 데이터 폴더 철자에 링크·별칭(/tmp→/private/tmp)이 있어도 실제 경로로 막는다.
+  private async protectedReadPaths(): Promise<string[]> {
+    const given = [...(this.options.protectedReadPaths ?? []),
+      ...(this.options.memoryReaderOptions?.snapshotDirectory ? [this.options.memoryReaderOptions.snapshotDirectory] : [])];
+    return uniquePaths(await Promise.all(uniquePaths(given).map(canonicalPath)));
   }
 
   private async prepareSharedHome(): Promise<{ skillSourceDirectories: string[]; globalInstructionPaths: string[] }> {
@@ -630,14 +655,21 @@ export class CodexAdapter implements AgentAdapter {
   }
 
   private async linkAuthentication(): Promise<void> {
-    const managedAuth = join(this.codexHome, "auth.json");
+    await this.bindAuthentication(join(this.codexHome, "auth.json"));
+  }
+
+  // 관리형 홈의 auth.json 을 지금 설정한 Codex 홈(CODEX_HOME)의 auth.json 에 결속한다. 링크는 대상이 다르면 다시 건다 — 설정한 홈을 바꾸고
+  // 재시작해도 작업자·native Figma 가 NativeAppReader 와 같은 인증을 쓴다(engine-review 0d1b8c76 F002). 링크가 아닌 실제 파일은 건드리지
+  // 않는다 — 더 새로운 자격증명일 수 있다. 바꾸는 것은 링크뿐이고 인증 내용은 읽지도 쓰지도 않는다.
+  private async bindAuthentication(managedAuth: string): Promise<void> {
     const userAuth = join(this.userCodexHome(), "auth.json");
     if (resolve(userAuth) === resolve(managedAuth)) return;
-    // 이미 있으면 건드리지 않는다 — 더 새로운 자격증명일 수 있다. 내용은 읽지 않는다.
-    try {
-      await lstat(managedAuth);
-      return;
-    } catch { /* 없을 때만 아래에서 연결한다 */ }
+    const existing = await lstat(managedAuth).catch(() => null);
+    if (existing && !existing.isSymbolicLink()) return;
+    if (existing) {
+      if (await readlink(managedAuth) === userAuth) return;
+      await unlink(managedAuth);
+    }
     // 복사 대신 심볼릭 링크: codex가 토큰을 갱신하면 사용자 홈과 같은 파일을 갱신한다.
     try {
       await symlink(userAuth, managedAuth);
@@ -791,6 +823,15 @@ function findGitCommonDirectory(workspace: string): string | null {
 function isPathInside(root: string, target: string): boolean {
   const scope = relative(root, target);
   return scope === "" || (scope !== ".." && !scope.startsWith(`..${sep}`) && !isAbsolute(scope));
+}
+
+// 아직 없는 경로도 실제 위치로 막도록 가장 가까운 실제 조상을 realpath 로 풀고 남은 경로를 붙인다(claude.ts canonicalPath 와 같은 규칙).
+// 조상 전체를 대신 거부하지 않는다.
+async function canonicalPath(path: string): Promise<string> {
+  const real = await realpath(path).catch(() => null);
+  if (real) return real;
+  const parent = dirname(path);
+  return parent === path ? path : join(await canonicalPath(parent), basename(path));
 }
 
 function uniquePaths(paths: readonly (string | null)[]): string[] {

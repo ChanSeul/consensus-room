@@ -3,7 +3,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { describeCommandFailure, isClaudeFinalResult, isZeroTurnResult, parseAgentResult } from "../src/server/adapters/resultParser";
+import {
+  describeCommandFailure, isClaudeFinalResult, isModelOrToolActivity, isZeroTurnResult, parseAgentResult, parsePlanRepair, parseTurnEnvelope,
+  PlanRepairViolation, UnverifiedAgentResult,
+} from "../src/server/adapters/resultParser";
 import { resolutionIds } from "../src/shared/workflow";
 import { SpawnCommandRunner } from "../src/server/processRunner";
 import { execFile } from "node:child_process";
@@ -601,6 +604,94 @@ describe("최종 결과 뒤 유휴 종료 (2026-09-03 hang 처방)", () => {
       expect(command.terminatedAfterResult).toBe(true);
       expect(command.exitCode).toBe(0);
     }
+  });
+
+  // 2026-10-19 71818d7f 실측: 첫 StructuredOutput result 뒤 같은 프로세스가 백그라운드 작업 알림으로 작업(제출 2·3, Workflow, 빌드)을 이어 갔는데,
+  // 첫 result 부터 잰 120초 타이머가 모델 요청 도중 프로세스를 끊었고 그 result 가 채택됐다. 정리 시간을 600ms 로 줄여 같은 순서를 재현한다.
+  describe("최종 result 뒤 이어진 작업 (2026-10-19 71818d7f 실측)", () => {
+    const resultEvent = (structured: unknown) => ({ type: "result", subtype: "success", is_error: false, num_turns: 3, structured_output: structured });
+    const activityEvent = { type: "assistant", message: { content: [{ type: "text", text: "이어서 작업" }] } };
+    const line = (value: unknown) => `${JSON.stringify(value)}\n`;
+    const write = (value: unknown) => `process.stdout.write(${JSON.stringify(line(value))});`;
+    const run = (script: string) => new SpawnCommandRunner().run({
+      command: process.execPath, args: ["-e", script], cwd: process.cwd(),
+      finalResultTimeoutMs: 600, isFinalResult: isClaudeFinalResult, invalidatesFinalResult: isModelOrToolActivity,
+    });
+
+    it("result 뒤 작업이 정리 시간을 넘겨 이어지면 끊지 않고 새 result 를 받는다", async () => {
+      const command = await run(`${write(resultEvent(firstResult))} setTimeout(() => { ${write(activityEvent)} }, 100);`
+        + ` setTimeout(() => { ${write(resultEvent(finalResult))} process.exit(0); }, 1_200);`);
+      expect(command.terminatedAfterResult).toBeUndefined();
+      expect(command.exitCode).toBe(0);
+      expect(parseAgentResult(command.jsonLines, command.stdout)).toMatchObject({ kind: "CLOSEOUT", summary: "마지막 검토" });
+    });
+
+    it("result 뒤 작업이 이어지다 새 result 없이 끝나면 원래 종료 코드를 쓰고, 파서는 앞 result 를 채택하지 않는다", async () => {
+      const command = await run(`${write(resultEvent(firstResult))} setTimeout(() => { ${write(activityEvent)} }, 100);`
+        + " setTimeout(() => process.exit(0), 1_200);");
+      expect(command.terminatedAfterResult).toBeUndefined();
+      expect(command.exitCode).toBe(0);
+      expect(() => parseAgentResult(command.jsonLines, command.stdout)).toThrow(/마지막 result 뒤 모델·도구 작업이 이어졌지만 새 result 가 없습니다/);
+    });
+
+    it("새 최종 result 가 오면 정리 시간을 그 줄부터 다시 잰다", async () => {
+      const command = await run(`${write(resultEvent(firstResult))} setTimeout(() => { ${write(resultEvent(finalResult))} }, 400);`
+        + ` setTimeout(() => { ${write({ type: "system", subtype: "status" })} }, 800); setTimeout(() => {}, 30_000);`);
+      expect(command.terminatedAfterResult).toBe(true);
+      expect(command.exitCode).toBe(0);
+      expect(command.jsonLines).toContainEqual({ type: "system", subtype: "status" });
+      expect(parseAgentResult(command.jsonLines, command.stdout)).toMatchObject({ kind: "CLOSEOUT" });
+    });
+
+    it("정리 SIGTERM 뒤 프로세스가 작업 줄을 내고 끝나면 결과 뒤 종료로 정규화하지 않는다", async () => {
+      const command = await run(`process.on("SIGTERM", () => { ${write(activityEvent)} process.exit(143); });`
+        + ` ${write(resultEvent(firstResult))} setTimeout(() => {}, 30_000);`);
+      expect(command.terminatedAfterResult).toBeUndefined();
+      expect(command.exitCode).toBe(143);
+      expect(() => parseAgentResult(command.jsonLines, command.stdout)).toThrow(/새 result 가 없습니다/);
+    });
+
+    // CR Engine Advisor 자문 43: 정리 발화 뒤 작업이 관측되면, 그 뒤에 온 result 가 그 사실을 지우고 중단된 실행을 정상 종료로 바꾸면 안 된다.
+    it("정리 SIGTERM 뒤 작업 줄과 새 result 를 내고 끝나도 결과 뒤 종료로 정규화하지 않는다", async () => {
+      const command = await run(`process.on("SIGTERM", () => { ${write(activityEvent)} ${write(resultEvent(finalResult))} process.exit(143); });`
+        + ` ${write(resultEvent(firstResult))} setTimeout(() => {}, 30_000);`);
+      expect(command.terminatedAfterResult).toBeUndefined();
+      expect(command.exitCode).toBe(143);
+    });
+
+    it("유지: result 뒤 진단·사용량 줄만 오면 정리 시간을 늘리지 않고 종전대로 정리한다", async () => {
+      const startedAt = Date.now();
+      const command = await run(`${write(resultEvent(finalResult))}`
+        + ` setInterval(() => { ${write({ type: "system", subtype: "status" })} ${write({ type: "rate_limit_event" })} }, 100);`);
+      expect(Date.now() - startedAt).toBeLessThan(4_000);
+      expect(command.terminatedAfterResult).toBe(true);
+      expect(command.exitCode).toBe(0);
+      expect(parseAgentResult(command.jsonLines, command.stdout)).toMatchObject({ kind: "CLOSEOUT" });
+    });
+
+    const envelope = { message: "고쳤습니다.", outcome: "done", mediatorRequest: null, memoryUpdates: null, engineDefects: null };
+    const repair = { baseSHA256: "a".repeat(64), edits: [{ find: "옛 문장", replace: "새 문장" }] };
+
+    it("result 뒤 작업이 이어지고 새 result 가 없으면 세 파서 모두 앞 result 를 채택하지 않는다", () => {
+      const stale = (structured: unknown) => [resultEvent(structured), activityEvent];
+      expect(() => parseTurnEnvelope("implementer", stale(envelope), "")).toThrow(/새 result 가 없습니다/);
+      expect(() => parseAgentResult(stale(firstResult), "")).toThrow(/새 result 가 없습니다/);
+      expect(() => parsePlanRepair(stale(repair), "")).toThrow(PlanRepairViolation);
+      // 작업 뒤 본문 없는 result(사용량만)로 끝나도 작업 앞의 result 로 물러서지 않는다.
+      const usageOnly = { type: "result", subtype: "success", is_error: false, num_turns: 4 };
+      expect(() => parseAgentResult([...stale(firstResult), usageOnly], "")).toThrow();
+      expect(() => parsePlanRepair([...stale(repair), usageOnly], "")).toThrow(PlanRepairViolation);
+    });
+
+    // 봉투·결과 파서는 종전에도 마지막 result 로 교정 경로에 갔다(유지). 부분 교정은 종전에 작업 앞의 유효 result 로 물러섰다(이번에 막음).
+    it("작업 뒤 마지막 result 가 계약을 어기면 그 result 로 판정하고 작업 앞의 result 로 물러서지 않는다", () => {
+      const lines = (valid: unknown, invalid: unknown) => [resultEvent(valid), activityEvent, resultEvent(invalid)];
+      expect(() => parseTurnEnvelope("implementer", lines(envelope, { ...envelope, outcome: "approve" }), "")).toThrow(UnverifiedAgentResult);
+      expect(() => parseAgentResult(lines(firstResult, { kind: "AUDIT" }), "")).toThrow(UnverifiedAgentResult);
+      expect(() => parsePlanRepair(lines(repair, { ...repair, edits: [] }), "")).toThrow(PlanRepairViolation);
+      // 작업 뒤 새 result 가 계약을 지키면 그것을 채택한다.
+      expect(parseTurnEnvelope("implementer", lines({ ...envelope, outcome: "continue" }, envelope), "").outcome).toBe("done");
+    });
   });
 });
 

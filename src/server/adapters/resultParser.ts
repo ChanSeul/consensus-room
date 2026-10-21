@@ -83,13 +83,14 @@ export function unverifiedResponse<T extends object>(value: T): T {
 export function parseAgentResult(candidates: unknown[], stdout: string): AgentResult {
   // 왜 구조가 없는지 남긴다 — CLI 의 result 이벤트(subtype·is_error·num_turns·본문 앞부분)가 진단의 전부인데 버려지고
   // 있었다(2026-09-13 S10 실측: 수정 턴이 tool_use 직후 result 로 끝났는데 원인을 알 길이 없었다).
-  const message = () => `에이전트가 계약된 구조의 결과를 반환하지 않았습니다.${describeTerminalResult(candidates, stdout)}`;
+  const message = () => `에이전트가 계약된 구조의 결과를 반환하지 않았습니다.${describeTerminalResult(candidates, stdout)}${supersededResultNote(candidates)}`;
   // 모델이 제출한 최종 구조화 응답을 먼저 정한다 — 그 응답이 검증에 실패하면 같은 호출의 앞선 유효 JSON(오래된 판정)으로 물러서지 않고 교정 경로로
   // 보낸다(R3 리뷰 F001: Codex 의 앞선 agent_message 가 유효한 REVIEW 이면 마지막 응답의 새 지적이 교정 없이 사라졌다).
   // 응답 본문을 가진 최종 이벤트가 있으면 내용과 관계없이 그것만 본다(R3 재리뷰 F001) — 결과 종류 없는 JSON·일반 문장·오류 본문이어도 앞선 후보로
   // 물러서지 않는다. 구조화 응답이 아니면 교정할 결과가 없으므로 일반 오류로 멈춘다. 최종 이벤트에 응답 본문이 없으면(사용량만 실린 result 이벤트 등)
-  // 그보다 새 응답이 없다는 뜻이라 지금처럼 앞선 후보를 찾는다.
-  const event = finalEvent(candidates);
+  // 그보다 새 응답이 없다는 뜻이라 지금처럼 앞선 후보를 찾는다. 단 Claude 의 마지막 작업 줄 앞으로는 물러서지 않는다(currentCandidates).
+  const current = currentCandidates(candidates);
+  const event = finalEvent(current);
   if (event && hasResponseBody(event)) {
     const final = finalStructuredResponse(event);
     if (!final) throw new Error(message());
@@ -98,7 +99,7 @@ export function parseAgentResult(candidates: unknown[], stdout: string): AgentRe
     throw new UnverifiedAgentResult(final, message());
   }
   // 응답 본문을 가진 최종 이벤트가 없을 때만 지금처럼 후보를 뒤에서부터, 그다음 stdout 을 찾는다.
-  for (const candidate of [...candidates].reverse()) {
+  for (const candidate of [...current].reverse()) {
     const parsed = parseCandidate(candidate);
     if (parsed) return parsed;
   }
@@ -123,6 +124,21 @@ function finalResponseValue(final: Record<string, unknown>): unknown {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+// Claude 는 최종 result 를 낸 뒤에도 같은 프로세스에서 모델·도구 작업을 이어 갈 수 있다(2026-10-19 71818d7f 실측: 백그라운드 작업 알림으로 이어진 턴).
+// 그 작업이 시작되면 앞 result 는 더 이상 이 호출의 결과가 아니므로, 마지막 작업 줄 뒤의 줄만 결과 후보로 본다(폴백도 그 앞으로 물러서지 않는다).
+// 작업 줄이 없는 Codex 출력은 그대로다.
+function currentCandidates(candidates: readonly unknown[]): readonly unknown[] {
+  const index = candidates.findLastIndex(isModelOrToolActivity);
+  return index < 0 ? candidates : candidates.slice(index + 1);
+}
+
+// 마지막 result 뒤에 작업 줄이 있으면 오류 사유에 그 사실을 붙인다 — 프로세스는 새 result 없이 끝났다.
+function supersededResultNote(candidates: readonly unknown[]): string {
+  const index = candidates.findLastIndex((value) => isRecord(value) && value.type === "result");
+  return index >= 0 && candidates.slice(index + 1).some(isModelOrToolActivity)
+    ? " 마지막 result 뒤 모델·도구 작업이 이어졌지만 새 result 가 없습니다." : "";
 }
 
 function finalEvent(candidates: readonly unknown[]): Record<string, unknown> | undefined {
@@ -174,8 +190,8 @@ function parseCandidate(candidate: unknown): AgentResult | null {
 const ENVELOPE_OPTIONAL_KEYS = ["mediatorRequest", "memoryUpdates", "engineDefects", "planItems"] as const;
 
 export function parseTurnEnvelope(role: EnvelopeRole, candidates: readonly unknown[], stdout: string): TurnEnvelope {
-  const message = () => `에이전트가 결과 봉투를 반환하지 않았습니다.${describeTerminalResult(candidates, stdout)}`;
-  const event = finalEvent(candidates);
+  const message = () => `에이전트가 결과 봉투를 반환하지 않았습니다.${describeTerminalResult(candidates, stdout)}${supersededResultNote(candidates)}`;
+  const event = finalEvent(currentCandidates(candidates));
   const value = event && hasResponseBody(event) ? finalResponseValue(event) : undefined;
   if (!isRecord(value)) throw new Error(message());
   const response = { ...value };
@@ -280,8 +296,10 @@ export function isZeroTurnResult(candidates: readonly unknown[]): boolean {
   return index >= 0 && isSyntheticZeroTurnResult(events[index]) && !events.slice(index + 1).some(isModelOrToolActivity);
 }
 
-// 모델 응답(assistant·부분 스트림) 또는 도구 결과를 실은 줄.
-function isModelOrToolActivity(event: Record<string, unknown>): boolean {
+// 모델 응답(assistant·부분 스트림) 또는 도구 결과를 실은 Claude 줄 — system·rate_limit·사용량 줄은 아니다. 이 줄이 result 뒤에 오면 그 result 는 호출의
+// 최종 결과가 아니다(정리 타이머 무효화 CommandSpec.invalidatesFinalResult, 파서의 currentCandidates). Codex 줄(item.*)은 해당하지 않는다.
+export function isModelOrToolActivity(event: unknown): boolean {
+  if (!isRecord(event)) return false;
   if (event.type === "assistant" || event.type === "stream_event") return true;
   return event.type === "user" && isRecord(event.message) && Array.isArray(event.message.content)
     && event.message.content.some((block) => isRecord(block) && block.type === "tool_result");
@@ -390,11 +408,12 @@ export function parsePlanRepair(candidates: unknown[], stdout: string): PlanRepa
     }
     return null;
   };
-  for (const candidate of [...candidates].reverse()) {
+  // Claude 의 마지막 작업 줄 앞의 result 는 이 호출의 결과가 아니다(currentCandidates) — 작업 뒤 새 교정이 없으면 계약 오류다.
+  for (const candidate of [...currentCandidates(candidates)].reverse()) {
     const repair = inspect(candidate);
     if (repair) return repair;
   }
   const direct = inspect(stdout);
   if (direct) return direct;
-  throw new PlanRepairViolation("부분 교정 결과가 PlanRepair 계약을 만족하지 않습니다.");
+  throw new PlanRepairViolation(`부분 교정 결과가 PlanRepair 계약을 만족하지 않습니다.${supersededResultNote(candidates)}`);
 }

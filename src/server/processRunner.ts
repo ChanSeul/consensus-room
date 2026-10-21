@@ -58,9 +58,32 @@ export class SpawnCommandRunner implements CommandRunner {
       let spawnObserverError: unknown;
       let terminationError: unknown;
       let terminationDrain: Promise<void> | undefined;
-      // 최종 결과 줄 수신 뒤 유휴 타임아웃(hang 처방). 타이머가 발화해 종료시킨 실행은 exitCode 0 으로 정규화한다.
+      // 최종 결과 줄 수신 뒤 유휴 타임아웃(hang 처방). 시간은 마지막 최종 결과 줄부터 잰다 — 그 뒤 작업 줄(invalidatesFinalResult)이 오면 그 결과는
+      // 더 이상 최종이 아니므로 타이머를 끄고, 새 최종 결과 줄이 오면 그 줄부터 다시 잰다. 진단·사용량 줄은 영향이 없다(2026-10-19 71818d7f 실측).
+      // 타이머가 발화해 종료시킨 실행은 끝날 때도 그 결과가 최종일 때만 exitCode 0 으로 정규화한다. 발화 뒤 작업 줄이 한 번이라도 오면 작업 도중
+      // 끊은 실행이므로, 그 뒤에 새 result 가 와도 정규화하지 않고 실제 종료 코드를 남긴다(CR Engine Advisor 자문 43).
       let finalResultTimer: NodeJS.Timeout | undefined;
-      let terminatedAfterResult = false;
+      let finalResultCurrent = false;
+      let terminatedByFinalResultTimer = false;
+      let workAfterFinalResultTimer = false;
+      const observeFinalResult = (parsed: unknown) => {
+        if (spec.isFinalResult?.(parsed)) {
+          finalResultCurrent = true;
+          if (!spec.finalResultTimeoutMs || terminatedByFinalResultTimer || exitCode !== null) return;
+          if (finalResultTimer !== undefined) clearTimeout(finalResultTimer);
+          finalResultTimer = setTimeout(() => {
+            if (settled || exitCode !== null) return;
+            terminatedByFinalResultTimer = true;
+            terminate();
+          }, spec.finalResultTimeoutMs);
+        } else if (spec.invalidatesFinalResult?.(parsed)) {
+          finalResultCurrent = false;
+          if (terminatedByFinalResultTimer) workAfterFinalResultTimer = true;
+          if (finalResultTimer !== undefined) clearTimeout(finalResultTimer);
+          finalResultTimer = undefined;
+        }
+      };
+      const terminatedAfterResult = () => terminatedByFinalResultTimer && finalResultCurrent && !workAfterFinalResultTimer;
       child.stdout.setEncoding("utf8");
       child.stderr.setEncoding("utf8");
       let lastOutputAt = Date.now();
@@ -83,14 +106,9 @@ export class SpawnCommandRunner implements CommandRunner {
         lineBuffer = lines.pop() ?? "";
         for (const line of lines) {
           const parsed = appendJSONLine(jsonLines, line);
-          if (parsed !== undefined) notifyJSONLine(spec, parsed);
-          if (parsed !== undefined && finalResultTimer === undefined && spec.finalResultTimeoutMs && spec.isFinalResult?.(parsed)) {
-            finalResultTimer = setTimeout(() => {
-              if (settled || exitCode !== null) return;
-              terminatedAfterResult = true;
-              terminate();
-            }, spec.finalResultTimeoutMs);
-          }
+          if (parsed === undefined) continue;
+          notifyJSONLine(spec, parsed);
+          observeFinalResult(parsed);
         }
       });
       child.stderr.on("data", (chunk: string) => { lastOutputAt = Date.now(); stderrTail.push(chunk); });
@@ -166,7 +184,7 @@ export class SpawnCommandRunner implements CommandRunner {
             finishReject(abortError(abortReason));
             return;
           }
-          if (terminationError && !terminatedAfterResult) {
+          if (terminationError && !terminatedAfterResult()) {
             finishReject(terminationError);
             return;
           }
@@ -182,7 +200,10 @@ export class SpawnCommandRunner implements CommandRunner {
       const complete = () => {
         if (lineBuffer) {
           const parsed = appendJSONLine(jsonLines, lineBuffer);
-          if (parsed !== undefined) notifyJSONLine(spec, parsed);
+          if (parsed !== undefined) {
+            notifyJSONLine(spec, parsed);
+            observeFinalResult(parsed);
+          }
         }
         if (lineTooLarge) {
           finishReject(new Error("CLI가 한 줄에 허용된 출력 크기를 넘었습니다."));
@@ -193,10 +214,11 @@ export class SpawnCommandRunner implements CommandRunner {
           return;
         }
         settled = true;
+        const afterResult = terminatedAfterResult();
         resolve({
-          exitCode: terminatedAfterResult ? 0 : (exitCode ?? -1),
+          exitCode: afterResult ? 0 : (exitCode ?? -1),
           stdout: stdoutTail.join(), stderr: stderrTail.join(), jsonLines: jsonLineValues(jsonLines),
-          ...(terminatedAfterResult ? { terminatedAfterResult: true } : {}),
+          ...(afterResult ? { terminatedAfterResult: true } : {}),
         });
       };
       try {

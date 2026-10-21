@@ -9,6 +9,8 @@ import type { AppReader } from "../src/server/evidence/nativeReader";
 import { collectPage, publicAddress, discoverLinks } from "../src/server/evidence/discovery";
 import { EvidenceFetchError } from "../src/server/evidence/connectors";
 import type { EvidenceRootInput, EvidenceSource } from "../src/shared/externalEvidence";
+import type { WorkerFact } from "../src/shared/turnContract";
+import { AppCallTimeout } from "../src/server/adapters/nativeApps";
 
 // Public catalog selection -> actual gate, inherited sources and next-session binding.
 // HTTP fixtures exercise pagination/comments/failure, never reproduce production calculations.
@@ -156,6 +158,281 @@ it("resuming REST pagination replaces old pages and links with the complete host
     expect(c.state("a").coverage.ready).toBe(true);
     expect(discover).toHaveBeenCalledTimes(calls);
   } finally {await service.stop();}
+});
+// 2026-10-19 PROJECT-456 follow-up: one Figma member the app reader could not read failed first in every collect call and the
+// call returned, so the 24 originals after it were neither read nor discovered. A failed member now stays failed and keeps its root
+// incomplete, while the same call reads the members after it and the links they lead to.
+const issue = (n: number) => `https://team.atlassian.net/browse/APP-${n}`;
+const progressByKey = (db: ConsensusDatabase, rootId: string) => Object.fromEntries(db.evidence.catalog.members(rootId)
+  .map(m => [db.evidence.get(m.source_id).url.split("/").pop(), m.progress]));
+it("a member that keeps failing no longer stops its root: later members and their links are read, and it stays failed until its retry", async () => {
+  vi.useFakeTimers({toFake:["Date"]});
+  const {db}=fixture(),c=db.evidence.catalog;
+  const root=c.add("a",input(issue(1)),true);
+  const links:Record<string,number[]>={"APP-1":[2,3,4],"APP-3":[5]};
+  let unavailable=true; const reads:string[]=[];
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("unused");},configured:()=>true,discover:async source=>{
+    const key=source.url.split("/").pop()!; reads.push(key);
+    if (key==="APP-2" && unavailable) throw new EvidenceFetchError("MCP 원문 조회 실패: figma.get_design_context.");
+    return {revision:"1",cursor:null,units:[{id:"body",kind:"issue" as const,content:key}],
+      links:(links[key] ?? []).map(n=>({url:issue(n),label:`APP-${n}`,unitId:"body",relation:"link" as const}))};
+  }});
+  try {
+    await service.collect(root.id);
+    expect(progressByKey(db,root.id)).toEqual({"APP-1":"complete","APP-2":"failed","APP-3":"complete","APP-4":"complete","APP-5":"complete"});
+    expect(c.state("a").coverage).toMatchObject({complete:4,failed:1,pending:0,ready:false});
+    expect(c.roots().find(r=>r.id===root.id)).toMatchObject({lastCompleteAt:null,nextCheckAt:Date.now()+300_000});
+    const sibling=c.members(root.id).find(m=>db.evidence.get(m.source_id).url.endsWith("/APP-3"))!;
+    expect(db.evidence.fresh(db.evidence.get(sibling.source_id))).toBe(true);
+    // An explicit collect retries only the remaining failed member, once per call. The automatic poll waits for the retry delay.
+    await service.collect(root.id);
+    expect(reads.filter(key=>key==="APP-2")).toHaveLength(2);
+    expect(reads.filter(key=>key==="APP-3")).toHaveLength(1);
+    expect(c.due().map(r=>r.id)).not.toContain(root.id);
+    unavailable=false; vi.setSystemTime(Date.now()+300_001);
+    expect(c.due().map(r=>r.id)).toContain(root.id);
+    await service.poll();
+    expect(progressByKey(db,root.id)["APP-2"]).toBe("complete");
+    expect(c.roots().find(r=>r.id===root.id)!.lastCompleteAt).not.toBeNull();
+    expect(c.state("a").coverage).toMatchObject({complete:5,failed:0,pending:0,ready:true});
+  } finally {await service.stop();}
+});
+it("each failure in one collect call keeps its restart and the longest retry delay while the remaining members are read", async () => {
+  vi.useFakeTimers({toFake:["Date"]});
+  const {db}=fixture(),c=db.evidence.catalog;
+  const root=c.add("a",input(issue(1)),true);
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("unused");},configured:()=>true,discover:async (source,cursor)=>{
+    const key=source.url.split("/").pop()!;
+    if (key==="APP-2" && cursor==="p2") throw new EvidenceFetchError("수집 중 Jira 원문이 바뀌었습니다. 처음부터 다시 확인합니다.",3600,true);
+    if (key==="APP-3") throw new EvidenceFetchError("원문 조회 실패 (HTTP 503).");
+    return {revision:"1",cursor:key==="APP-2" ? "p2" : null,units:[{id:`body-${cursor ?? 0}`,kind:"issue" as const,content:key}],
+      links:key==="APP-1" ? [2,3,4].map(n=>({url:issue(n),label:`APP-${n}`,unitId:"body-0",relation:"link" as const})) : []};
+  }});
+  try {
+    await service.collect(root.id);
+    expect(progressByKey(db,root.id)).toEqual({"APP-1":"complete","APP-2":"failed","APP-3":"failed","APP-4":"complete"});
+    expect(c.members(root.id).find(m=>db.evidence.get(m.source_id).url.endsWith("/APP-2"))?.cursor).toBeNull();
+    expect(c.roots().find(r=>r.id===root.id)!.nextCheckAt).toBe(Date.now()+3_600_000);
+  } finally {await service.stop();}
+});
+it("next() returns members still to collect before a failed member, and the failed member when only it remains", () => {
+  const {db}=fixture(),c=db.evidence.catalog;
+  const root=c.add("a",input(issue(1)),true);
+  c.acceptPage(root,db.evidence.get(root.sourceId),null,{revision:"1",cursor:null,units:[{id:"body",kind:"issue",content:"root"}],
+    links:[2,3].map(n=>({url:issue(n),label:`APP-${n}`,unitId:"body",relation:"link" as const}))});
+  const [failed,pending]=[2,3].map(n=>c.members(root.id).find(m=>db.evidence.get(m.source_id).url.endsWith(`/APP-${n}`))!.source_id);
+  c.failed(root.id,failed,"unavailable");
+  expect(c.next(root.id)?.source.id).toBe(pending);
+  expect(c.next(root.id,new Set([pending]))?.source.id).toBe(failed);
+  expect(c.next(root.id,new Set([pending,failed]))).toBeNull();
+});
+// bf81000 review 44b3b20f F001: a member that cannot be read now — a host capture past its freshness, another collection's live
+// lease, or the source's own retry wait — no longer ends the call. It is left exactly as it was and the members after it are read.
+const linkAll = (db: ConsensusDatabase, root: { id: string; sourceId: string }, urls: string[]) =>
+  db.evidence.catalog.acceptPage(db.evidence.catalog.roots().find(r=>r.id===root.id)!,db.evidence.get(root.sourceId),null,{revision:"1",cursor:null,
+    units:[{id:"body",kind:"issue",content:"root"}],links:urls.map(url=>({url,label:url,unitId:"body",relation:"link" as const}))});
+const memberId = (db: ConsensusDatabase, rootId: string, url: string) =>
+  db.evidence.catalog.members(rootId).find(m=>db.evidence.get(m.source_id).url.endsWith(`/${url.split("/").pop()}`))!.source_id;
+it.each(["stale host capture","live lease","source retry wait"] as const)("a member that cannot be read now (%s) is left as it was while the members after it are read", async kind => {
+  vi.useFakeTimers({toFake:["Date"]});
+  const {db}=fixture(),c=db.evidence.catalog;
+  const mode=kind==="stale host capture" ? "connector" as const : "rest" as const;
+  const root=c.add("a",{...input(issue(1)),mode},true);
+  const waiting=db.evidence.ensureSource({url:kind==="stale host capture" ? "https://www.figma.com/design/ABC123/file?node-id=1-2" : issue(2),label:"waiting",mode,intervalSeconds:900},true);
+  const later=db.evidence.ensureSource({url:issue(3),label:"later",mode,intervalSeconds:900},true);
+  linkAll(db,root,[waiting.url,later.url]);
+  let held:string|null=null;
+  if (kind==="stale host capture") {
+    c.select("a",{version:c.version("a"),rootId:root.id,sourceId:waiting.id,action:"accept"});
+    linkAll(db,root,[waiting.url,later.url]);
+    db.evidence.ingest(waiting.id,{checkId:db.evidence.begin(waiting.id,true)!.checkId,revision:"capture",units:[{id:"capture",kind:"document",content:"host body"}]});
+    vi.setSystemTime(Date.now()+1_800_001);
+  } else {
+    held=db.evidence.begin(waiting.id,true)!.checkId;
+    if (kind==="source retry wait") { db.evidence.failed(waiting.id,held,"retry later",3600); held=null; }
+  }
+  const reads:string[]=[];
+  const reader={fetch:async()=>{throw Error("unused");},configured:()=>true,discover:async (source:EvidenceSource)=>{
+    reads.push(source.url); return {revision:"2",cursor:null,units:[{id:"body",kind:"issue" as const,content:source.label}],links:[]};
+  }};
+  const service=new EvidenceService(db.evidence,reader,undefined,mode==="connector" ? reader : undefined);
+  const member=c.members(root.id).find(m=>m.source_id===waiting.id), source=db.evidence.get(waiting.id), nextCheckAt=c.roots().find(r=>r.id===root.id)!.nextCheckAt;
+  try {
+    await service.collect(root.id);
+    expect(reads).toEqual([later.url]);
+    expect(c.members(root.id).find(m=>m.source_id===later.id)?.progress).toBe("complete");
+    expect(c.members(root.id).find(m=>m.source_id===waiting.id)).toEqual(member);
+    expect(db.evidence.get(waiting.id)).toEqual(source);
+    expect(c.roots().find(r=>r.id===root.id)).toMatchObject({lastCompleteAt:null,nextCheckAt});
+    if (held) expect(db.evidence.begin(waiting.id,true)).toBeNull();
+    // Once the condition clears, the same member is read by its existing path and the root completes.
+    if (kind==="stale host capture") db.evidence.ingest(waiting.id,{checkId:db.evidence.begin(waiting.id,true)!.checkId,revision:"capture-2",units:[{id:"capture",kind:"document",content:"host body"}]});
+    else if (held) db.evidence.releaseCheck(waiting.id,held);
+    else vi.setSystemTime(Date.now()+3_600_001);
+    await service.collect(root.id);
+    expect(c.members(root.id).find(m=>m.source_id===waiting.id)?.progress).toBe("complete");
+    expect(c.roots().find(r=>r.id===root.id)!.lastCompleteAt).not.toBeNull();
+  } finally {await service.stop();}
+});
+it("members waiting on another collection's lease do not use the call's 20 collection attempts", async () => {
+  const {db}=fixture(),c=db.evidence.catalog;
+  const root=c.add("a",input(issue(1)),true);
+  const urls=Array.from({length:22},(_,n)=>issue(n+2));
+  linkAll(db,root,urls);
+  const ids=urls.map(url=>memberId(db,root.id,url));
+  for (const id of ids.slice(0,21)) db.evidence.begin(id,true);
+  const reads:string[]=[];
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("unused");},configured:()=>true,discover:async source=>{
+    reads.push(source.url); return {revision:"1",cursor:null,units:[{id:"body",kind:"issue" as const,content:source.url}],links:[]};
+  }});
+  try {
+    await service.collect(root.id);
+    expect(reads).toEqual([db.evidence.get(ids[21]).url]);
+  } finally {await service.stop();}
+});
+// F002: failed members are retried from the member after the one whose retry started last, across calls and restarts. A read that
+// outlasts the 20-second slice (REST 90s, MCP 120s; the slice does not cut a started read) no longer keeps every later failed member
+// from its retry.
+it("a failed member whose read outlasts the slice does not keep the next failed member from its retry, across a restart", async () => {
+  vi.useFakeTimers({toFake:["Date"]});
+  const {db}=fixture(),c=db.evidence.catalog;
+  const root=c.add("a",input(issue(1)),true);
+  linkAll(db,root,[issue(2),issue(3)]);
+  let recovered=false; const reads:string[]=[];
+  const reader={fetch:async()=>{throw Error("unused");},configured:()=>true,discover:async (source:EvidenceSource)=>{
+    const key=source.url.split("/").pop()!; reads.push(key);
+    if (key==="APP-2") { vi.setSystemTime(Date.now()+121_000); throw new EvidenceFetchError("앱 연결 응답 시간이 지났습니다."); }
+    if (!recovered) throw new EvidenceFetchError("앱 연결 응답 시간이 지났습니다.");
+    return {revision:"1",cursor:null,units:[{id:"body",kind:"issue" as const,content:key}],links:[]};
+  }};
+  const service=new EvidenceService(db.evidence,reader);
+  await service.collect(root.id);
+  await service.collect(root.id);
+  expect(reads).toEqual(["APP-2","APP-3","APP-2"]);
+  await service.stop();
+  recovered=true; reads.length=0;
+  const restarted=new EvidenceService(db.evidence,reader);
+  try {
+    await restarted.collect(root.id);
+    expect(reads[0]).toBe("APP-3");
+    expect(progressByKey(db,root.id)["APP-3"]).toBe("complete");
+  } finally {await restarted.stop();}
+});
+it("more than 20 failing members are all retried in turn across calls", async () => {
+  const {db}=fixture(),c=db.evidence.catalog;
+  const root=c.add("a",input(issue(1)),true);
+  linkAll(db,root,Array.from({length:25},(_,n)=>issue(n+2)));
+  const attempts=new Map<string,number>();
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("unused");},configured:()=>true,discover:async source=>{
+    attempts.set(source.url,(attempts.get(source.url) ?? 0)+1); throw new EvidenceFetchError("unavailable");
+  }});
+  try {
+    for (let n=0;n<3;n++) await service.collect(root.id);
+    expect(attempts.size).toBe(25);
+    expect(Math.min(...attempts.values())).toBeGreaterThanOrEqual(2);
+  } finally {await service.stop();}
+});
+// F003: a later call's shorter failure no longer shortens the root's retry wait while an earlier failure is unresolved. A resolved
+// failure, a completed cycle and a new cycle do not carry the old wait.
+it("a later call's shorter failure keeps an unresolved failure's longer wait; resolution and completion release it", async () => {
+  vi.useFakeTimers({toFake:["Date"]});
+  const {db}=fixture(),c=db.evidence.catalog;
+  const root=c.add("a",input(issue(1)),true);
+  linkAll(db,root,[issue(2),issue(3),issue(4)]);
+  let aFails=true,bFails=true;
+  const service=new EvidenceService(db.evidence,{fetch:async()=>{throw Error("unused");},configured:()=>true,discover:async (source,cursor)=>{
+    const key=source.url.split("/").pop()!, page=Number(cursor ?? 0);
+    if (key==="APP-2" && aFails) throw new EvidenceFetchError("rate limited",3600);
+    if (key==="APP-4" && bFails) { vi.setSystemTime(Date.now()+121_000); throw new EvidenceFetchError("앱 연결 응답 시간이 지났습니다."); }
+    return {revision:"1",cursor:key==="APP-3" && page<24 ? String(page+1) : null,units:[{id:`body-${page}`,kind:"issue" as const,content:key}],links:[]};
+  }});
+  const t0=Date.now(), nextCheckAt=()=>c.roots().find(r=>r.id===root.id)!.nextCheckAt;
+  try {
+    await service.collect(root.id);
+    expect(progressByKey(db,root.id)).toMatchObject({"APP-2":"failed","APP-3":"reading","APP-4":"pending"});
+    expect(nextCheckAt()).toBe(t0+3_600_000);
+    await service.collect(root.id);
+    expect(progressByKey(db,root.id)).toMatchObject({"APP-2":"failed","APP-3":"complete","APP-4":"failed"});
+    expect(nextCheckAt()).toBe(t0+3_600_000);
+    aFails=false;
+    await service.collect(root.id);
+    expect(progressByKey(db,root.id)).toMatchObject({"APP-2":"complete","APP-4":"failed"});
+    expect(nextCheckAt()).toBe(Date.now()+300_000);
+    bFails=false;
+    await service.collect(root.id);
+    expect(c.roots().find(r=>r.id===root.id)).toMatchObject({lastCompleteAt:Date.now(),nextCheckAt:Date.now()+900_000});
+  } finally {await service.stop();}
+});
+it("a new cycle starts failed retries from the first failed member again", () => {
+  const {db}=fixture(),c=db.evidence.catalog;
+  const root=c.add("a",input(issue(1)),true);
+  linkAll(db,root,[issue(2),issue(3),issue(4)]);
+  const [a,b,d]=[2,3,4].map(n=>memberId(db,root.id,issue(n)));
+  const failAll=()=>{ for (const id of [a,b,d]) c.failed(root.id,id,"unavailable"); };
+  failAll();
+  c.startRetry(root.id,b);
+  expect(c.next(root.id)?.source.id).toBe(d);
+  c.requestRefresh(root.id);
+  expect(c.roots().find(r=>r.id===root.id)!.nextCheckAt).toBe(0);
+  linkAll(db,root,[issue(2),issue(3),issue(4)]);
+  failAll();
+  expect(c.next(root.id)?.source.id).toBe(a);
+});
+// 2026-10-20 user decision D1: a Jira root spread through a Confluence page a person approved to the Jira issues that page linked
+// (282 members on root 97033fe2). Automatic approval now follows the root's scope only while the page holding the link is itself in
+// that scope, and only a member this root actually approved shares its approval with other roots.
+const sourceOf = (db: ConsensusDatabase, rootId: string, url: string) =>
+  db.evidence.catalog.members(rootId).find(m => db.evidence.get(m.source_id).url === url)!;
+const pageOf = (url: string, links: string[]) => ({revision:"1",cursor:null,units:[{id:"body",kind:"document" as const,content:[url,...links].join(" ")}],
+  links:links.map(link=>({url:link,label:link,unitId:"body",relation:"link" as const}))});
+it("a Jira link in a Confluence page a person approved under a Jira root stays a candidate, and earlier states stay as they were", () => {
+  const {db}=fixture(),c=db.evidence.catalog;
+  const root=c.add("a",input(issue(1)),true), current=()=>c.roots().find(r=>r.id===root.id)!;
+  const minutes="https://team.atlassian.net/wiki/spaces/A/pages/123/Minutes";
+  c.acceptPage(current(),db.evidence.get(root.sourceId),null,pageOf(issue(1),[minutes]));
+  const doc=sourceOf(db,root.id,minutes);
+  expect(doc.state).toBe("candidate");
+  c.select("a",{version:c.version("a"),rootId:root.id,sourceId:doc.source_id,action:"accept"});
+  c.acceptPage(current(),db.evidence.get(doc.source_id),null,pageOf(minutes,[issue(8),issue(9)]));
+  expect(sourceOf(db,root.id,issue(9)).state).toBe("candidate");
+  expect(c.collected(root.id,doc.source_id).links.map(link=>link.url)).toEqual([issue(8),issue(9)]);
+  // An approval made before this rule is not demoted when the page is read again, and its snapshot is untouched.
+  const earlier=sourceOf(db,root.id,issue(8)).source_id;
+  (c as unknown as {db:{prepare:(sql:string)=>{run:(...args:unknown[])=>unknown}}}).db
+    .prepare("UPDATE evidence_members SET state='approved' WHERE root_id=? AND source_id=?").run(root.id,earlier);
+  const kept=db.evidence.ingest(earlier,{checkId:db.evidence.begin(earlier,true)!.checkId,revision:"r",units:[{id:"body",kind:"issue",content:"kept"}]});
+  c.requestRefresh(root.id);
+  c.acceptPage(current(),db.evidence.get(root.sourceId),null,pageOf(issue(1),[minutes]));
+  c.acceptPage(current(),db.evidence.get(doc.source_id),null,pageOf(minutes,[issue(8),issue(9)]));
+  expect(sourceOf(db,root.id,issue(8)).state).toBe("approved");
+  expect(sourceOf(db,root.id,issue(9)).state).toBe("candidate");
+  expect(db.evidence.get(earlier).contentHash).toBe(kept.contentHash);
+});
+it("Jira relations of the root's own site are still explored, and an actual approval is still reused by another root", () => {
+  const {db}=fixture(),c=db.evidence.catalog;
+  const jira=c.add("a",input(issue(1)),true), current=()=>c.roots().find(r=>r.id===jira.id)!;
+  const policy=c.add("a",input("https://team.atlassian.net/wiki/spaces/A/pages/200/Policy"),true);
+  c.acceptPage(policy,db.evidence.get(policy.sourceId),null,pageOf("policy",[issue(3)]));
+  expect(sourceOf(db,policy.id,issue(3)).state).toBe("candidate");
+  c.acceptPage(current(),db.evidence.get(jira.sourceId),null,pageOf(issue(1),[issue(2)]));
+  const child=sourceOf(db,jira.id,issue(2));
+  expect(child.state).toBe("approved");
+  c.acceptPage(current(),db.evidence.get(child.source_id),null,pageOf(issue(2),[issue(3)]));
+  expect(sourceOf(db,jira.id,issue(3)).state).toBe("approved");
+  expect(sourceOf(db,policy.id,issue(3)).state).toBe("approved");
+});
+it("rediscovering a member a person rejected does not approve it in another root of the same scope", () => {
+  const {db}=fixture(),c=db.evidence.catalog;
+  const jira=c.add("a",input(issue(1)),true), current=()=>c.roots().find(r=>r.id===jira.id)!;
+  c.acceptPage(current(),db.evidence.get(jira.sourceId),null,pageOf(issue(1),[issue(5)]));
+  const rejected=sourceOf(db,jira.id,issue(5)).source_id;
+  c.select("a",{version:c.version("a"),rootId:jira.id,sourceId:rejected,action:"reject"});
+  const policy=c.add("a",input("https://team.atlassian.net/wiki/spaces/A/pages/200/Policy"),true);
+  c.acceptPage(policy,db.evidence.get(policy.sourceId),null,pageOf("policy",[issue(5)]));
+  expect(sourceOf(db,policy.id,issue(5)).state).toBe("candidate");
+  c.acceptPage(current(),db.evidence.get(jira.sourceId),null,pageOf(issue(1),[issue(5)]));
+  expect(sourceOf(db,jira.id,issue(5)).state).toBe("rejected");
+  expect(sourceOf(db,policy.id,issue(5)).state).toBe("candidate");
 });
 function fixture() {
   const path = mkdtempSync(join(tmpdir(),"catalog-")); const db = new ConsensusDatabase(join(path,"db"));
@@ -705,13 +982,42 @@ it("source leases prevent concurrent fetches and older multi-page scans cannot o
   }});
   const first=service.collect(a.id),second=service.collect(b.id);
   try { expect(calls).toBe(1); } finally { release();await Promise.allSettled([first,second]); }
+  const facts:WorkerFact[]=[],cursors:Array<string|null>=[];
   const oldReader=new EvidenceService(db.evidence,{configured:()=>true,fetch:async()=>{throw Error('unused');},discover:async(_s,cursor)=>{
-    const n=Number(cursor ?? '0');return {revision:'old',cursor:n<20 ? String(n+1):null,links:[],units:[{id:String(n),kind:'document',content:'old'}]};
-  }});
+    cursors.push(cursor);const n=Number(cursor ?? '0');return {revision:'old',cursor:n<20 ? String(n+1):null,links:[],units:[{id:String(n),kind:'document',content:'old'}]};
+  }},undefined,undefined,fact=>facts.push(fact));
   await oldReader.collect(a.id,true);
-  await service.collect(b.id);const newer=db.evidence.get(a.sourceId).contentHash;
-  await oldReader.collect(a.id);expect(db.evidence.get(a.sourceId).contentHash).toBe(newer);
+  await service.collect(b.id);const newer=db.evidence.get(a.sourceId);
+  await oldReader.collect(a.id);expect(db.evidence.get(a.sourceId).contentHash).toBe(newer.contentHash);
   expect(c.members(a.id)[0]).toMatchObject({progress:'failed',cursor:null});
+  // 1214e8c1 (자문 58 §2): the rejected scan is not a failed read. The stored source keeps the newer collection's body, error and
+  // collection state, stays usable, and no source error reaches the runners. The conflict is recorded on the root's member only.
+  expect(db.evidence.get(a.sourceId)).toEqual(newer);
+  expect(db.evidence.usableSources(db.getTopic('a')).map(source=>source.id)).toContain(a.sourceId);
+  expect(facts).toEqual([]);
+  expect(c.members(a.id)[0].error).toBe("다른 수집이 먼저 갱신한 원문입니다. 처음부터 다시 수집하세요.");
+  // The next collection of the root starts the member over from its first page.
+  const read=cursors.length;await oldReader.collect(a.id);expect(cursors[read]).toBeNull();
+});
+
+it("a scan whose last page actually fails to read still marks the shared source failed and reports it", async () => {
+  const {db}=fixture(),c=db.evidence.catalog;
+  const a=c.add('a',input('https://example.com/shared'),true),b=c.add('b',input('https://example.com/shared'),true);
+  const reader={configured:()=>true,fetch:async()=>{throw Error('unused');},discover:async(_s:EvidenceSource,cursor:string|null)=>{
+    if (cursor==='20') throw new AppCallTimeout('앱 연결 응답 시간이 지났습니다.');
+    const n=Number(cursor ?? '0');return {revision:'1',cursor:n<20 ? String(n+1):null,links:[],units:[{id:String(n),kind:'document' as const,content:'body'}]};
+  }};
+  const facts:WorkerFact[]=[];
+  const scanner=new EvidenceService(db.evidence,reader,undefined,undefined,fact=>facts.push(fact));
+  const current=new EvidenceService(db.evidence,{configured:()=>true,fetch:async()=>{throw Error('unused');},
+    discover:async()=>({revision:'new',cursor:null,links:[],units:[{id:'body',kind:'document' as const,content:'new'}]})});
+  await scanner.collect(a.id,true);
+  await current.collect(b.id);const newer=db.evidence.get(a.sourceId).contentHash;
+  await scanner.collect(a.id);
+  expect(db.evidence.get(a.sourceId)).toMatchObject({contentHash:newer,collection:{status:'error',error:'앱 연결 응답 시간이 지났습니다.'}});
+  expect(db.evidence.usableSources(db.getTopic('a')).map(source=>source.id)).not.toContain(a.sourceId);
+  expect(facts).toEqual([{kind:'source-error',sourceId:a.sourceId,error:'앱 연결 응답 시간이 지났습니다.'}]);
+  expect(c.members(a.id)[0]).toMatchObject({progress:'failed',cursor:'20'});
 });
 
 it("existing connector-mode children are reused by an authorized REST root", async () => {

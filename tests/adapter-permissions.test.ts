@@ -1,8 +1,8 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import * as fsPromises from "node:fs/promises";
-import { dirname, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { afterEach } from "vitest";
 import { describe, expect, it, vi } from "vitest";
 
@@ -16,11 +16,20 @@ import { DatabaseSync } from "node:sqlite";
 import { BudgetLedger } from "../src/server/budgetLedger";
 import { BudgetController } from "../src/server/budgetController";
 import { ExecutionMetrics, readClaudeUsageBaseline } from "../src/server/adapters/executionMetrics";
+import { createRuntimeAdapters } from "../src/server/runtime/providers";
+import { ProjectMemoryReader } from "../src/server/projectMemory";
+import { reportBackgroundFailure } from "../src/server/backgroundTask";
+import { createHash } from "node:crypto";
 import { hostCliPath } from "./setup/hostExecutables";
 
 vi.mock("node:fs/promises", async importOriginal => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
-  return { ...actual, readdir: vi.fn(actual.readdir) };
+  // mkdir·rename 은 메모리 사본 실패·취소 검사가 한 경로만 바꿔 끼운다. 나머지는 실제 구현 그대로다.
+  return { ...actual, readdir: vi.fn(actual.readdir), mkdir: vi.fn(actual.mkdir), rename: vi.fn(actual.rename) };
+});
+vi.mock("../src/server/backgroundTask", async importOriginal => {
+  const actual = await importOriginal<typeof import("../src/server/backgroundTask")>();
+  return { ...actual, reportBackgroundFailure: vi.fn(actual.reportBackgroundFailure) };
 });
 
 const planResult = {
@@ -329,6 +338,13 @@ describe("에이전트별 권한 경계", () => {
     ]);
     expect(runner.calls[0].args.at(-1)).toBe("-");
     expect(runner.instructions[0]).toContain("실행 규칙:");
+    // 공통 실행 규칙도 응답 종료·완료 알림을 대기 방법으로 안내하지 않는다. Claude 전용 대기 방법(run_in_background·Workflow)은 싣지 않는다.
+    expect(runner.instructions[0]).not.toContain("완료 알림");
+    // Codex 가 제공받은 대기 도구는 그대로 쓰게 하고, 끝내지 못한 작업은 미완료로 보고하게 한다(자문 39 §2).
+    expect(runner.instructions[0]).toContain("필요한 결과는 제공된 대기 도구 등을 사용해 같은 턴 안에서 확인하세요");
+    expect(runner.instructions[0]).toContain("응답 종료를 대기 수단으로 삼지 마세요");
+    expect(runner.instructions[0]).toContain("끝내지 못하면 미완료 작업과 이유를 보고하세요");
+    expect(runner.instructions[0]).not.toContain("run_in_background");
     expect(runner.calls[0].stdin?.endsWith("수정 계획을 다시 검토해 주세요.")).toBe(true);
   });
 
@@ -611,6 +627,40 @@ describe("에이전트별 권한 경계", () => {
     }
   });
 
+  // engine-review 0d1b8c76 F002: room.json codexHome(CODEX_HOME)을 바꾸고 재시작하면 NativeAppReader 는 새 홈을 읽는다.
+  // 작업자(공유·토픽 홈)와 native Figma(공유 홈 auth.json)도 같은 홈을 써야 한다. 링크만 다시 걸고 인증 파일 내용은 건드리지 않는다.
+  it("Codex 홈을 바꿔 재시작하면 공유·토픽 홈의 인증 링크가 새 홈을 가리키고, 두 홈의 인증 파일은 그대로다", async () => {
+    const root = mkdtempSync(join(tmpdir(), "consensus-room-codex-home-switch-"));
+    temporaryDirectories.push(root);
+    const before = join(root, "codex-before"), after = join(root, "codex-after"), worktree = join(root, "worktree");
+    for (const [home, note] of [[before, "before"], [after, "after"]]) {
+      mkdirSync(home);
+      writeFileSync(join(home, "auth.json"), `{"note":"${note}"}`);
+    }
+    mkdirSync(worktree);
+    const previousCodexHome = process.env.CODEX_HOME;
+    try {
+      const runner = new RecordingRunner(successfulResult([{ type: "thread.started", thread_id: "codex-thread-1" }, planResult]));
+      const { adapter, codexHome } = codexAdapter(runner);
+      const managedAuth = join(codexHome, "auth.json");
+      const topicAuth = join(adapter.managedHomeFor(worktree), "auth.json");
+      process.env.CODEX_HOME = before;
+      await adapter.createSession({ prompt: "계획을 검토해 주세요.", cwd: worktree });
+      expect(readlinkSync(managedAuth)).toBe(join(before, "auth.json"));
+
+      process.env.CODEX_HOME = after;
+      const restarted = new CodexAdapter(runner, join(dirname(codexHome), "agent-result.schema.json"), codexHome);
+      await restarted.createSession({ prompt: "계획을 다시 검토해 주세요.", cwd: worktree });
+      expect(lstatSync(managedAuth).isSymbolicLink()).toBe(true);
+      expect(readlinkSync(managedAuth)).toBe(join(after, "auth.json"));
+      expect(realpathSync(topicAuth)).toBe(realpathSync(join(after, "auth.json")));
+      expect(readFileSync(join(before, "auth.json"), "utf8")).toBe('{"note":"before"}');
+      expect(readFileSync(join(after, "auth.json"), "utf8")).toBe('{"note":"after"}');
+    } finally {
+      restoreEnvironment("CODEX_HOME", previousCodexHome);
+    }
+  });
+
   it("Codex shell은 worktree·필요한 스킬만 읽고 원본·관리형 인증파일은 읽지 못한다", async () => {
     const root = mkdtempSync(join(tmpdir(), "consensus-room-codex-profile-"));
     temporaryDirectories.push(root);
@@ -778,14 +828,18 @@ describe("에이전트별 권한 경계", () => {
     } finally { vi.unstubAllEnvs(); }
   });
 
-  it("planMode 턴은 코드 편집이 아닌 plan 권한으로 실행한다", async () => {
+  // 자문 51 P1(2026-10-20 사용자 결정) — planMode 입력도 CLI dontAsk 로 실행한다. CLI plan 모드는 읽기 도구를 permissions.allow 밖에서도 승인해
+  // 비선택 메모리 사본·홈 파일을 열었다(cr-fix-8 프로브, CLI 2.1.301). 쓰기 금지는 도구 목록·Edit·Write deny·sandbox denyWrite 가 맡는다.
+  it("planMode 턴도 코드 편집 권한 없이 dontAsk 로 실행하고 작업 폴더 쓰기는 sandbox 가 막는다", async () => {
     const runner = new RecordingRunner(successfulResult([planResult]));
     const adapter = new ClaudeAdapter(runner);
 
     await adapter.createSession({ prompt: "계획을 작성해 주세요.", cwd: "/tmp", planMode: true });
 
     const args = runner.calls[0].args;
-    expect(args[args.indexOf("--permission-mode") + 1]).toBe("plan");
+    expect(args[args.indexOf("--permission-mode") + 1]).toBe("dontAsk");
+    expect(args[args.indexOf("--tools") + 1].split(",")).toEqual(expect.not.arrayContaining(["Edit"]));
+    expect(args[args.indexOf("--tools") + 1].split(",")).toEqual(expect.not.arrayContaining(["Write"]));
     expect(args).not.toContain("bypassPermissions");
     expect(args).not.toContain("acceptEdits");
     const settings = JSON.parse(args[args.indexOf("--settings") + 1]) as {
@@ -936,7 +990,8 @@ describe("에이전트별 권한 경계", () => {
     expect(args).toContain("--strict-mcp-config");
     expect(args[args.indexOf("--setting-sources") + 1]).toBe("");
     // 정책 c(2026-08-31): 구현 턴은 코드 쓰기 접근과 웹의 결합(최대 유출 표면)을 막기 위해 웹 도구를 뺀다.
-    expect(args[args.indexOf("--tools") + 1]).toBe("Read,Glob,Grep,Bash,Skill,Edit,Write,Workflow,TaskOutput");
+    // CLI 2.1.301 은 TaskOutput 을 노출하지 않는다(엔진 결함 15d9ac40) — 도구 목록·허용 규칙에 넣지 않는다.
+    expect(args[args.indexOf("--tools") + 1]).toBe("Read,Glob,Grep,Bash,Skill,Edit,Write,Workflow");
     const settings = JSON.parse(args[args.indexOf("--settings") + 1]) as {
       ultracode?: boolean;
       permissions: { allow: string[]; deny: string[] };
@@ -946,7 +1001,7 @@ describe("에이전트별 권한 경계", () => {
     expect(settings.ultracode).toBe(true);
     // Workflow는 도구 목록만으로는 dontAsk에서 거부된다. allow 규칙이 함께 있어야 실제로 쓸 수 있다.
     expect(settings.permissions.allow).toContain("Workflow");
-    expect(settings.permissions.allow).toContain("TaskOutput");
+    expect(settings.permissions.allow).not.toContain("TaskOutput");
     expect(settings.permissions.allow).toContain("Edit(//tmp/**)");
     expect(settings.permissions.deny).toContain("Edit(//tmp/.git)");
     expect(settings.sandbox).toMatchObject({
@@ -957,6 +1012,13 @@ describe("에이전트별 권한 경계", () => {
       network: { deniedDomains: [], allowedDomains: expect.arrayContaining(["github.com"]) },
     });
     expect(runner.instructions[0]).toContain("실행 규칙:");
+    // 같은 턴 대기 계약 — 응답 종료·완료 알림·TaskOutput 이 아니라 foreground 실행과 결과 파일 대기를 안내한다.
+    expect(runner.instructions[0]).not.toContain("TaskOutput");
+    expect(runner.instructions[0]).not.toContain("완료 알림");
+    expect(runner.instructions[0]).toContain("응답 종료를 대기 수단으로 삼지 마세요");
+    expect(runner.instructions[0]).toContain("foreground");
+    expect(runner.instructions[0]).toContain("Workflow 는 즉시 반환");
+    expect(runner.instructions[0]).toContain("일부 에이전트의 파일이 생긴 것만으로 전체 완료를 판정하지 마세요");
     expect((runner.calls[0].stdin)?.endsWith("승인한 계획만 구현해 주세요.")).toBe(true);
     expect(args).not.toContain("승인한 계획만 구현해 주세요.");
     expect(created.result.kind).toBe("IMPLEMENTATION");
@@ -1372,6 +1434,484 @@ describe("세션별 메모리 본문 수신(memoryBodies) — 본문을 받지 �
     const adapter = adapters(runner)[provider];
     await adapter.resumeTurn({ sessionId: sessions[provider], prompt: "확인하세요.", cwd: "/tmp", protocolOnly: true, memoryBodies: true });
     for (const call of runner.calls) expect(call.stdin ?? "").not.toContain("MEMORY-BODIES-MARKER");
+  });
+});
+
+
+// 엔진 결함 dffeb33f(자문 36 §4·자문 40) — resume 매니페스트는 SHA 만 주면서 전체 교체를 제안하게 했는데, 러너는 그 SHA 의 본문을 다시 읽을 길이 없었다.
+// createRuntimeAdapters 가 만든 두 어댑터는 이번 턴에 고른 가림 없는 문서의 본문을 데이터 폴더 memory-snapshots/<sha256>.md 에 두고, 그 파일만 이번 턴 읽기로 연다.
+describe("메모리 본문 재열람 사본 — 이번 턴에 고른 문서의 그 SHA 본문만 읽기로 연다", () => {
+  const sessions = { claude: "11111111-1111-4111-8111-111111111111", codex: "thread-1" } as const;
+  const sha256 = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
+  const search = { subject: "매물등록 폼 검증" };
+  const result = () => successfulResult([{ type: "thread.started", thread_id: "thread-1" }, planResult]);
+
+  function fixture() {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "consensus-room-memory-reread-")));
+    temporaryDirectories.push(root);
+    const memory = join(root, "memory");
+    const data = join(root, "data");
+    mkdirSync(join(memory, "claude-only"), { recursive: true });
+    mkdirSync(join(memory, "codex-only"), { recursive: true });
+    mkdirSync(data);
+    const files: Record<string, string> = {
+      "context-router.md": "# Context Router\n- [매물등록 폼 검증](houseregist-form.md)\n- [매물등록 폼 인증값](houseregist-secret.md)\n"
+        + "- [숏폼 카드 재생](shortform-media.md)\n- [매물등록 폼 Claude](claude-only/houseregist-claude.md)\n"
+        + "- [매물등록 폼 Codex](codex-only/houseregist-codex.md)\n",
+      "houseregist-form.md": memoryDocument("houseregist-form", "# 매물등록 폼 검증\nHOUSE-FORM-V1"),
+      "houseregist-secret.md": memoryDocument("houseregist-secret", "# 매물등록 폼 인증값\nsk-proj-abcdefghijklmnopqrst"),
+      "shortform-media.md": memoryDocument("shortform-media", "# 숏폼 카드 재생\nSHORTFORM-BODY"),
+      "claude-only/houseregist-claude.md": memoryDocument("houseregist-claude", "# 매물등록 폼 Claude\nCLAUDE-ONLY-BODY"),
+      "codex-only/houseregist-codex.md": memoryDocument("houseregist-codex", "# 매물등록 폼 Codex\nCODEX-ONLY-BODY"),
+    };
+    for (const [path, content] of Object.entries(files)) writeFileSync(join(memory, path), content);
+    return { memory, data, snapshots: join(data, "memory-snapshots"), files };
+  }
+
+  function rows(text: string) {
+    return [...text.matchAll(/^- (\S+) @ ([a-f0-9]{64})(.*)$/gm)].map(([, path, sha, rest]) => ({
+      path, sha, rest, copy: /— 본문: `([^`]+)`/.exec(rest)?.[1] ?? null }));
+  }
+
+  function expectCopy(copy: string | null, sha: string, snapshots: string) {
+    expect(copy).not.toBeNull();
+    expect(dirname(copy!)).toBe(snapshots);
+    expect(lstatSync(copy!).isFile()).toBe(true);
+    expect(sha256(readFileSync(copy!))).toBe(sha);
+  }
+
+  // 이번 턴에 사본 폴더 아래에서 열린 읽기 경로. Claude 는 sandbox allowRead 와 Read 규칙이 파일마다 하나씩 짝을 이루고(폴더·/** 없음), Codex 는 관리형
+  // config.toml 의 읽기 항목이다. Codex 설정은 턴마다 다시 쓰므로 그 턴이 끝난 직후에 부른다.
+  function grants(provider: "claude" | "codex", call: CommandSpec, adapter: unknown, snapshots: string): string[] {
+    if (provider === "claude") {
+      const settings = JSON.parse(call.args[call.args.indexOf("--settings") + 1]);
+      const sandbox: string[] = settings.sandbox.filesystem.allowRead.filter((path: string) => path.startsWith(snapshots));
+      const rules: string[] = settings.permissions.allow.filter((rule: string) => rule.startsWith(`Read(//${snapshots.slice(1)}`));
+      expect(rules).toEqual(sandbox.map(path => `Read(//${path.slice(1)})`));
+      return sandbox;
+    }
+    const config = readFileSync(join((adapter as CodexAdapter).managedHomeFor("/tmp"), "config.toml"), "utf8");
+    // 루트 자신의 deny 줄은 허용이 아니다(expectCodexRootDeny 가 따로 본다). 그 밖에 이 경로를 담은 줄은 모두 사본 파일의 read 여야 한다.
+    const lines = config.split("\n").filter(line => line.includes(snapshots) && line !== `${JSON.stringify(snapshots)} = "deny"`);
+    for (const line of lines) expect(line).toMatch(/^".+" = "read"$/);
+    return lines.map(line => JSON.parse(line.slice(0, line.lastIndexOf(" = "))) as string);
+  }
+
+  function snapshotDiagnostics(): number {
+    return vi.mocked(reportBackgroundFailure).mock.calls.filter(([context]) => context === "memory-snapshot").length;
+  }
+
+  it.each(["claude", "codex"] as const)("%s: resume 행은 그 SHA 의 사본을 가리키고, 그 사본 파일만 하나씩 읽기로 연다", async provider => {
+    const f = fixture();
+    // 고르지 않은 문서와 다른 역할 문서의 사본이 디스크에 이미 있어도 이번 턴 안내·읽기 허용에 들어가지 않는다.
+    const other = provider === "claude" ? "codex-only/houseregist-codex.md" : "claude-only/houseregist-claude.md";
+    mkdirSync(f.snapshots);
+    const decoys = ["shortform-media.md", other].map(path => {
+      const target = join(f.snapshots, `${sha256(f.files[path])}.md`);
+      writeFileSync(target, f.files[path]);
+      return target;
+    });
+    const runner = new RecordingRunner(result());
+    const adapter = createRuntimeAdapters(runner, { dataDirectory: f.data, memoryDirectory: f.memory })[provider];
+    await adapter.resumeTurn({ sessionId: sessions[provider], prompt: "검토하세요.", cwd: "/tmp", memorySearch: search });
+    const stdin = runner.calls[0].stdin ?? "";
+    const listed = rows(stdin);
+    const paths = listed.map(row => row.path);
+    expect(paths).toContain("houseregist-form.md");
+    expect(paths).not.toContain("shortform-media.md");
+    expect(paths).not.toContain(other);
+    const copies = listed.filter(row => row.copy !== null);
+    expect(copies.map(row => row.path)).toContain("houseregist-form.md");
+    for (const row of copies) expectCopy(row.copy, row.sha, f.snapshots);
+    expect(stdin).toContain("먼저 그 행의 본문 파일을 읽고");
+    const granted = grants(provider, runner.calls[0], adapter, f.snapshots);
+    expect([...granted].sort()).toEqual(copies.map(row => row.copy!).sort());
+    for (const decoy of decoys) {
+      expect(granted).not.toContain(decoy);
+      expect(stdin).not.toContain(decoy);
+    }
+    // 쓰기 차단은 파일 모드가 아니라 sandbox 다 — Claude 는 데이터 폴더 쓰기 거부, Codex 는 읽기 항목(grants 가 "read" 만 받는다).
+    if (provider === "claude") {
+      const settings = JSON.parse(runner.calls[0].args[runner.calls[0].args.indexOf("--settings") + 1]);
+      expect(settings.sandbox.filesystem.denyWrite).toContain(f.data);
+      expect(settings.sandbox.filesystem.allowWrite.some((path: string) => path.startsWith(f.data))).toBe(false);
+    }
+  });
+
+  it.each(["claude", "codex"] as const)("%s: 민감값 가림 문서는 사본 없이 '민감값 가림 / 변경 제안 불가' 로 표시한다", async provider => {
+    const f = fixture();
+    const runner = new RecordingRunner(result());
+    const adapter = createRuntimeAdapters(runner, { dataDirectory: f.data, memoryDirectory: f.memory })[provider];
+    await adapter.resumeTurn({ sessionId: sessions[provider], prompt: "검토하세요.", cwd: "/tmp", memorySearch: search });
+    const secret = rows(runner.calls[0].stdin ?? "").find(row => row.path === "houseregist-secret.md");
+    expect(secret?.rest).toContain("민감값 가림 / 변경 제안 불가");
+    expect(secret?.copy).toBeNull();
+    // 원문(토큰)도 가린 본문([REDACTED])도 사본으로 남기지 않는다.
+    expect(existsSync(join(f.snapshots, `${secret!.sha}.md`))).toBe(false);
+    for (const name of existsSync(f.snapshots) ? readdirSync(f.snapshots) : []) {
+      const content = readFileSync(join(f.snapshots, name), "utf8");
+      expect(content).not.toContain("sk-proj-");
+      expect(content).not.toContain("[REDACTED]");
+    }
+    expect(grants(provider, runner.calls[0], adapter, f.snapshots).some(path => path.includes(secret!.sha))).toBe(false);
+  });
+
+  it.each(["claude", "codex"] as const)("%s: 문서가 바뀌면 다음 resume 은 새 SHA 사본을 가리키고 옛 사본은 그대로다. 재선택으로 처음 오른 문서도 사본을 받는다",
+    async provider => {
+      const f = fixture();
+      const runner = new RecordingRunner(result());
+      const adapter = createRuntimeAdapters(runner, { dataDirectory: f.data, memoryDirectory: f.memory })[provider];
+      const resume = (subject: string) => adapter.resumeTurn({ sessionId: sessions[provider], prompt: "검토하세요.", cwd: "/tmp", memorySearch: { subject } });
+      await resume(search.subject);
+      const first = rows(runner.calls[0].stdin ?? "").find(row => row.path === "houseregist-form.md")!;
+      expectCopy(first.copy, first.sha, f.snapshots);
+      writeFileSync(join(f.memory, "houseregist-form.md"), memoryDocument("houseregist-form", "# 매물등록 폼 검증\nHOUSE-FORM-V2"));
+      await resume(search.subject);
+      const second = rows(runner.calls[1].stdin ?? "").find(row => row.path === "houseregist-form.md")!;
+      expect(second.sha).not.toBe(first.sha);
+      expectCopy(second.copy, second.sha, f.snapshots);
+      expect(readFileSync(first.copy!, "utf8")).toBe(f.files["houseregist-form.md"]);
+      const secondGrants = grants(provider, runner.calls[1], adapter, f.snapshots);
+      expect(secondGrants).toContain(second.copy);
+      expect(secondGrants).not.toContain(first.copy);
+      expect(rows(runner.calls[1].stdin ?? "").map(row => row.path)).not.toContain("shortform-media.md");
+      await resume("숏폼 카드 재생");
+      const shortform = rows(runner.calls[2].stdin ?? "").find(row => row.path === "shortform-media.md")!;
+      expectCopy(shortform.copy, shortform.sha, f.snapshots);
+      expect(grants(provider, runner.calls[2], adapter, f.snapshots)).toContain(shortform.copy);
+    });
+
+  it.each(["claude", "codex"] as const)("%s: 본문을 싣는 턴(생성 턴·memoryBodies 첫 일반 resume)도 문서 머리에 사본 경로를 적고 그 턴 읽기로 연다", async provider => {
+    const f = fixture();
+    const runner = new RecordingRunner(result());
+    const adapter = createRuntimeAdapters(runner, { dataDirectory: f.data, memoryDirectory: f.memory })[provider];
+    const turns = [
+      () => adapter.createSession({ prompt: "검토하세요.", cwd: "/tmp", memorySearch: search }),
+      () => adapter.resumeTurn({ sessionId: sessions[provider], prompt: "검토하세요.", cwd: "/tmp", memorySearch: search, memoryBodies: true }),
+    ];
+    for (const [index, turn] of turns.entries()) {
+      await turn();
+      const stdin = runner.calls[index].stdin ?? "";
+      expect(stdin).toContain("메모리 문서 시작: houseregist-form.md");
+      const headers = [...stdin.matchAll(/^SHA-256: ([a-f0-9]{64}) \/ .* \/ 본문 파일: `([^`]+)`$/gm)].map(([, sha, copy]) => ({ sha, copy }));
+      expect(headers.length).toBeGreaterThan(0);
+      for (const header of headers) expectCopy(header.copy, header.sha, f.snapshots);
+      expect([...grants(provider, runner.calls[index], adapter, f.snapshots)].sort()).toEqual(headers.map(header => header.copy).sort());
+    }
+  });
+
+  // 자문 44 — 이 사본은 메모리 갱신을 위한 재열람 복구다. 갱신을 허용하지 않는 턴(브레인스토밍, memoryUpdates=false)은 메모리 안내를 받지만 사본과
+  // 그 읽기 권한은 받지 않는다.
+  it.each(["claude", "codex"] as const)("%s: 브레인스토밍(memoryUpdates=false)은 메모리 안내를 싣지만 사본 경로·읽기 권한은 주지 않는다", async provider => {
+    const f = fixture();
+    const runner = new RecordingRunner(result());
+    const adapter = createRuntimeAdapters(runner, { dataDirectory: f.data, memoryDirectory: f.memory })[provider];
+    const job = { role: "planner", operation: "brainstorm" } as const;
+    await adapter.createSession({ prompt: "논의하세요.", cwd: "/tmp", memorySearch: search, job });
+    const created = runner.calls[0].stdin ?? "";
+    expect(created).toContain("메모리 문서 시작: houseregist-form.md");
+    expect(created).toContain("이 작업은 메모리 변경 제안을 허용하지 않습니다");
+    expect(created).not.toContain("본문 파일:");
+    expect(grants(provider, runner.calls[0], adapter, f.snapshots)).toEqual([]);
+    expectRootBoundary(provider, runner.calls[0], adapter, f.snapshots, []);
+    await adapter.resumeTurn({ sessionId: sessions[provider], prompt: "논의하세요.", cwd: "/tmp", memorySearch: search, job });
+    const resumed = runner.calls[1].stdin ?? "";
+    expect(resumed).toContain("이 턴의 메모리는 읽기 참고용입니다");
+    const listed = rows(resumed);
+    expect(listed.map(row => row.path)).toContain("houseregist-form.md");
+    expect(listed.every(row => row.copy === null)).toBe(true);
+    expect(grants(provider, runner.calls[1], adapter, f.snapshots)).toEqual([]);
+    expectRootBoundary(provider, runner.calls[1], adapter, f.snapshots, []);
+    expect(existsSync(f.snapshots)).toBe(false);
+  });
+
+  // engine-review run c874a532 F003 — 데이터 폴더는 홈 밖일 수 있다(config.ts CONSENSUS_ROOM_DATA_DIR). Claude sandbox 의 기본 읽기 거부는 홈과 인증 파일뿐이라,
+  // 사본 루트를 거부 목록에 두지 않으면 러너가 Bash 로 다른 역할·이전 버전의 사본까지 읽는다. 루트는 데이터 폴더 위치와 관계없이 거부하고, 이번 턴에 고른
+  // 사본 파일만 allowRead 로 다시 연다. Codex 는 읽기 목록 방식이지만 `":minimal" = "read"` 가 /private/tmp 같은 위치를 품어(자문 49 실측) 루트를 명시
+  // deny 하고, 어떤 읽기 항목도 루트를 품지 않으며, 이번 턴 사본 파일만 read 로 연다(더 구체적인 항목이 이긴다).
+  function readEntries(config: string, access = "read|write"): string[] {
+    return config.split("\n").flatMap(line => new RegExp(`^(".+") = "(?:${access})"$`).test(line) ? [JSON.parse(line.slice(0, line.lastIndexOf(" = "))) as string] : []);
+  }
+
+  function codexConfig(adapter: unknown): string {
+    return readFileSync(join((adapter as CodexAdapter).managedHomeFor("/tmp"), "config.toml"), "utf8");
+  }
+
+  // Codex 관리형 프로필의 사본 루트 거부 — 루트 자신이 deny 이고(조상 전체를 대신 거부하지 않는다), 같은 키가 두 번 나오지 않는다(설정 파싱 실패).
+  function expectCodexRootDeny(config: string, root: string) {
+    const denied = readEntries(config, "deny");
+    expect(denied).toContain(root);
+    expect(denied.filter(path => path !== root && root.startsWith(`${path}/`))).toEqual([]);
+    const keys = [...readEntries(config, "read|write|deny"), ...config.split("\n").filter(line => line.startsWith('":minimal" ='))];
+    expect(new Set(keys).size).toBe(keys.length);
+  }
+
+  function expectRootBoundary(provider: "claude" | "codex", call: CommandSpec, adapter: unknown, root: string, copies: readonly string[]) {
+    if (provider === "claude") {
+      const settings = JSON.parse(call.args[call.args.indexOf("--settings") + 1]);
+      expect(settings.sandbox.filesystem.denyRead).toContain(root);
+      expect([...grants("claude", call, adapter, root)].sort()).toEqual([...copies].sort());
+      return;
+    }
+    const config = codexConfig(adapter);
+    const entries = readEntries(config);
+    const covering = entries.filter(path => root === path || root.startsWith(`${path}/`));
+    expect(covering).toEqual([]);
+    expect(entries.filter(path => path.startsWith(`${root}/`)).sort()).toEqual([...copies].sort());
+    expectCodexRootDeny(config, root);
+  }
+
+  it.each(["claude", "codex"] as const)("%s: 홈 밖 데이터 폴더의 사본 루트는 읽기 거부 경계 안에 있고, 이번 턴에 고른 사본 파일만 열린다", async provider => {
+    const f = fixture();
+    expect(f.data.startsWith(`${homedir()}/`)).toBe(false);
+    const runner = new RecordingRunner(result());
+    const adapter = createRuntimeAdapters(runner, { dataDirectory: f.data, memoryDirectory: f.memory })[provider];
+    await adapter.resumeTurn({ sessionId: sessions[provider], prompt: "검토하세요.", cwd: "/tmp", memorySearch: search });
+    const copies = rows(runner.calls[0].stdin ?? "").flatMap(row => row.copy ? [row.copy] : []);
+    expect(copies.length).toBeGreaterThan(0);
+    expectRootBoundary(provider, runner.calls[0], adapter, f.snapshots, copies);
+    // 사본이 없는 턴(프로토콜 턴)도 루트는 거부 경계 안이다.
+    await adapter.resumeTurn({ sessionId: sessions[provider], prompt: "확인하세요.", cwd: "/tmp", protocolOnly: true });
+    expectRootBoundary(provider, runner.calls[1], adapter, f.snapshots, []);
+  });
+
+  // engine-review run 7c86471a F003 잔여 — runtime/cli.ts 는 createRuntimeAdapters 에 dataDirectory 만 넘긴다. 사본 루트의 읽기 거부는 메모리 주입과
+  // 독립이어야 한다(다른 런타임이 같은 데이터 폴더에 게시한 사본을 읽지 못하게). 사본 파일의 읽기 허용만 그 턴의 메모리 전달 결과로 더한다.
+  it.each(["claude", "codex"] as const)("%s: 메모리 없이 데이터 폴더만 준 런타임도 사본 루트를 읽기 거부 경계 안에 둔다", async provider => {
+    const f = fixture();
+    expect(f.data.startsWith(`${homedir()}/`)).toBe(false);
+    mkdirSync(f.snapshots);
+    writeFileSync(join(f.snapshots, `${sha256(f.files["houseregist-form.md"])}.md`), f.files["houseregist-form.md"]);
+    const runner = new RecordingRunner(result());
+    const adapter = createRuntimeAdapters(runner, { dataDirectory: f.data })[provider];
+    await adapter.resumeTurn({ sessionId: sessions[provider], prompt: "검토하세요.", cwd: "/tmp" });
+    expect(runner.calls[0].stdin ?? "").not.toContain("메모리 스냅샷 갱신");
+    expectRootBoundary(provider, runner.calls[0], adapter, f.snapshots, []);
+    await adapter.createSession({ prompt: "검토하세요.", cwd: "/tmp" });
+    expectRootBoundary(provider, runner.calls[1], adapter, f.snapshots, []);
+  });
+
+  it.each(["claude", "codex"] as const)("%s: 사본 루트가 아직 없고 데이터 폴더 경로에 링크·공백이 있어도 루트의 실제 경로만 거부한다", async provider => {
+    const f = fixture();
+    const real = join(dirname(f.data), "real data");
+    mkdirSync(real);
+    const linked = join(dirname(f.data), "linked data");
+    symlinkSync(real, linked);
+    const runner = new RecordingRunner(result());
+    const adapter = createRuntimeAdapters(runner, { dataDirectory: linked, memoryDirectory: f.memory })[provider];
+    await adapter.resumeTurn({ sessionId: sessions[provider], prompt: "확인하세요.", cwd: "/tmp", protocolOnly: true });
+    const root = join(real, "memory-snapshots");
+    expect(existsSync(root)).toBe(false);
+    if (provider === "codex") {
+      expectCodexRootDeny(codexConfig(adapter), root);
+      expect(readEntries(codexConfig(adapter), "deny")).not.toContain(join(linked, "memory-snapshots"));
+      return;
+    }
+    const denyRead: string[] = JSON.parse(runner.calls[0].args[runner.calls[0].args.indexOf("--settings") + 1]).sandbox.filesystem.denyRead;
+    expect(denyRead).toContain(root);
+    expect(denyRead.filter(path => path !== root && root.startsWith(`${path}/`))).toEqual([]);
+  });
+
+  it.each(["claude", "codex"] as const)("%s: 홈 안 데이터 폴더(운영 기본 배치)에서도 같은 경계이고 사본은 그대로 열린다", async provider => {
+    const f = fixture();
+    const home = join(dirname(f.data), "home");
+    const data = join(home, "Library", "Application Support", "ConsensusRoom");
+    mkdirSync(data, { recursive: true });
+    vi.stubEnv("HOME", home);
+    try {
+      const runner = new RecordingRunner(result());
+      const adapter = createRuntimeAdapters(runner, { dataDirectory: data, memoryDirectory: f.memory })[provider];
+      await adapter.resumeTurn({ sessionId: sessions[provider], prompt: "검토하세요.", cwd: "/tmp", memorySearch: search });
+      const copies = rows(runner.calls[0].stdin ?? "").flatMap(row => row.copy ? [row.copy] : []);
+      expect(copies.length).toBeGreaterThan(0);
+      for (const copy of copies) expect(dirname(copy)).toBe(join(data, "memory-snapshots"));
+      expectRootBoundary(provider, runner.calls[0], adapter, join(data, "memory-snapshots"), copies);
+      if (provider === "claude") {
+        const settings = JSON.parse(runner.calls[0].args[runner.calls[0].args.indexOf("--settings") + 1]);
+        expect(settings.sandbox.filesystem.denyRead).toContain(home);
+      }
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  // 7c86471a F003 잔여의 운영 기본 배치 — runtime/cli.ts 는 데이터 폴더만 넘기고, 그 폴더는 홈 안(~/Library/Application Support/ConsensusRoom)이다.
+  // 홈 거부가 루트를 품는다는 추론에 기대지 않고, 루트 거부와 "어떤 읽기 허용도 루트나 그 조상을 다시 열지 않음"을 직접 본다.
+  it("홈 안 데이터 폴더에 메모리 없이 만든 런타임(runtime/cli.ts 기본 배치)도 사본 루트를 거부하고 어떤 읽기 허용도 루트를 다시 열지 않는다", async () => {
+    for (const provider of ["claude", "codex"] as const) {
+      const f = fixture();
+      const home = join(dirname(f.data), "home");
+      const data = join(home, "Library", "Application Support", "ConsensusRoom");
+      const snapshots = join(data, "memory-snapshots");
+      mkdirSync(snapshots, { recursive: true });
+      writeFileSync(join(snapshots, `${sha256(f.files["houseregist-form.md"])}.md`), f.files["houseregist-form.md"]);
+      vi.stubEnv("HOME", home);
+      try {
+        const runner = new RecordingRunner(result());
+        const adapter = createRuntimeAdapters(runner, { dataDirectory: data })[provider];
+        await adapter.resumeTurn({ sessionId: sessions[provider], prompt: "검토하세요.", cwd: "/tmp" });
+        expectRootBoundary(provider, runner.calls[0], adapter, snapshots, []);
+        await adapter.createSession({ prompt: "검토하세요.", cwd: "/tmp" });
+        expectRootBoundary(provider, runner.calls[1], adapter, snapshots, []);
+        for (const call of runner.calls) {
+          expect(call.stdin ?? "", provider).not.toContain("메모리 스냅샷 갱신");
+          if (provider !== "claude") continue;
+          const { denyRead, allowRead } = JSON.parse(call.args[call.args.indexOf("--settings") + 1]).sandbox.filesystem;
+          expect(denyRead).toContain(home);
+          expect(allowRead.filter((path: string) => snapshots === path || snapshots.startsWith(`${path}/`))).toEqual([]);
+        }
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    }
+  });
+
+  it("같은 SHA 사본을 동시에 두 번 만들어도 일반 파일 하나가 게시되고 임시 파일이 남지 않는다", async () => {
+    const f = fixture();
+    const reader = new ProjectMemoryReader(f.memory, { snapshotDirectory: f.snapshots });
+    const [left, right] = await Promise.all([1, 2].map(() => reader.buildManifestDelivery("검토하세요.", "claude", undefined, true, search)));
+    expect(left.readablePaths.length).toBeGreaterThan(0);
+    expect(right.readablePaths).toEqual(left.readablePaths);
+    expect(readdirSync(f.snapshots).sort()).toEqual(left.readablePaths.map(path => basename(path)).sort());
+    for (const path of left.readablePaths) expectCopy(path, basename(path, ".md"), f.snapshots);
+  });
+
+  it.each([
+    ["사본 폴더 자리에 일반 파일이 있다", (f: ReturnType<typeof fixture>) => writeFileSync(f.snapshots, "not a directory")],
+    ["사본 폴더 자리에 심볼릭 링크가 있다", (f: ReturnType<typeof fixture>) => {
+      mkdirSync(join(f.data, "elsewhere"));
+      symlinkSync(join(f.data, "elsewhere"), f.snapshots);
+    }],
+  ])("%s: 경로를 열지 않고 '본문 재열람 불가 / 기존 파일 변경 제안 금지' 로 표시하며 턴은 계속한다", async (_case, arrange) => {
+    for (const provider of ["claude", "codex"] as const) {
+      const f = fixture();
+      arrange(f);
+      const runner = new RecordingRunner(result());
+      const adapter = createRuntimeAdapters(runner, { dataDirectory: f.data, memoryDirectory: f.memory })[provider];
+      vi.mocked(reportBackgroundFailure).mockClear();
+      await adapter.resumeTurn({ sessionId: sessions[provider], prompt: "검토하세요.", cwd: "/tmp", memorySearch: search });
+      expect(runner.calls, provider).toHaveLength(1);
+      const form = rows(runner.calls[0].stdin ?? "").find(row => row.path === "houseregist-form.md");
+      expect(form?.copy, provider).toBeNull();
+      expect(form?.rest, provider).toContain("본문 재열람 불가 / 기존 파일 변경 제안 금지");
+      expect(grants(provider, runner.calls[0], adapter, f.snapshots), provider).toEqual([]);
+      expect(grants(provider, runner.calls[0], adapter, join(f.data, "elsewhere")), provider).toEqual([]);
+      expect(snapshotDiagnostics(), provider).toBeGreaterThan(0);
+    }
+  });
+
+  it.each(["claude", "codex"] as const)("%s: 손상된 기존 사본을 교체하지 못하면 그 파일을 주지 않고 '본문 재열람 불가' 로 표시한다", async provider => {
+    const f = fixture();
+    const target = join(f.snapshots, `${sha256(f.files["houseregist-form.md"])}.md`);
+    mkdirSync(f.snapshots);
+    writeFileSync(target, "CORRUPTED");
+    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    vi.mocked(fsPromises.rename).mockImplementation((async (from: string, to: string) => {
+      if (String(to) === target) throw Object.assign(new Error("EACCES: permission denied, rename"), { code: "EACCES" });
+      return actual.rename(from, to);
+    }) as never);
+    vi.mocked(reportBackgroundFailure).mockClear();
+    const runner = new RecordingRunner(result());
+    const adapter = createRuntimeAdapters(runner, { dataDirectory: f.data, memoryDirectory: f.memory })[provider];
+    try {
+      await adapter.resumeTurn({ sessionId: sessions[provider], prompt: "검토하세요.", cwd: "/tmp", memorySearch: search });
+    } finally {
+      vi.mocked(fsPromises.rename).mockImplementation(actual.rename as never);
+    }
+    const form = rows(runner.calls[0].stdin ?? "").find(row => row.path === "houseregist-form.md");
+    expect(form?.copy).toBeNull();
+    expect(form?.rest).toContain("본문 재열람 불가 / 기존 파일 변경 제안 금지");
+    expect(grants(provider, runner.calls[0], adapter, f.snapshots)).not.toContain(target);
+    expect(readFileSync(target, "utf8")).toBe("CORRUPTED");
+    expect(readdirSync(f.snapshots).filter(name => name.endsWith(".tmp"))).toEqual([]);
+    expect(snapshotDiagnostics()).toBeGreaterThan(0);
+  });
+
+  it("사본을 만드는 중 취소되면 취소를 그대로 전파하고 진단 기록으로 바꾸지 않는다", async () => {
+    const f = fixture();
+    const controller = new AbortController();
+    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    vi.mocked(fsPromises.mkdir).mockImplementation((async (path: string, options?: unknown) => {
+      if (String(path) === f.snapshots) {
+        controller.abort();
+        throw controller.signal.reason;
+      }
+      return actual.mkdir(path, options as never);
+    }) as never);
+    vi.mocked(reportBackgroundFailure).mockClear();
+    try {
+      const reader = new ProjectMemoryReader(f.memory, { snapshotDirectory: f.snapshots });
+      await expect(reader.buildManifestDelivery("검토하세요.", "claude", controller.signal, true, search)).rejects.toMatchObject({ name: "AbortError" });
+    } finally {
+      vi.mocked(fsPromises.mkdir).mockImplementation(actual.mkdir as never);
+    }
+    expect(snapshotDiagnostics()).toBe(0);
+  });
+
+  it.each(["claude", "codex"] as const)("%s: 프로토콜 턴에는 사본 경로를 주지 않는다", async provider => {
+    const f = fixture();
+    const runner = new RecordingRunner(result());
+    const adapter = createRuntimeAdapters(runner, { dataDirectory: f.data, memoryDirectory: f.memory })[provider];
+    await adapter.resumeTurn({ sessionId: sessions[provider], prompt: "확인하세요.", cwd: "/tmp", memorySearch: search, protocolOnly: true, memoryBodies: true });
+    expect(runner.calls[0].stdin ?? "").not.toContain(f.snapshots);
+    expect(grants(provider, runner.calls[0], adapter, f.snapshots)).toEqual([]);
+    expect(existsSync(f.snapshots)).toBe(false);
+  });
+
+  // cr-fix-8 프로브(2026-10-20, CLI 2.1.301) — 경로 없는 Grep·Glob allow 가 Read allow 밖의 비선택 사본 내용과 루트 목록을 열었다. 어떤 턴 설정에도
+  // Grep·Glob 규칙을 두지 않고 두 도구의 경로 판정을 Read 경로 규칙에 맡긴다. 도구 자체는 --tools 에 남는다.
+  it("Claude: 어떤 턴 설정에도 Grep·Glob allow 규칙이 없고 두 도구는 --tools 에 남는다", async () => {
+    const f = fixture();
+    const toolRules = (rules: string[]) => rules.filter(rule => /^(Grep|Glob)(\(|$)/.test(rule));
+    for (const [implementation, planDirectory] of [[false, undefined], [true, undefined], [false, f.data]] as const) {
+      const settings = buildIsolationSettings("/tmp", "/tmp", implementation, { planDirectory, fanout: true, readablePaths: [f.memory] }) as {
+        permissions: { allow: string[] } };
+      expect(toolRules(settings.permissions.allow), `implementation=${implementation} plan=${Boolean(planDirectory)}`).toEqual([]);
+    }
+    const runner = new RecordingRunner(result());
+    const adapter = createRuntimeAdapters(runner, { dataDirectory: f.data, memoryDirectory: f.memory }).claude;
+    await adapter.resumeTurn({ sessionId: sessions.claude, prompt: "검토하세요.", cwd: "/tmp", memorySearch: search });
+    const call = runner.calls[0];
+    expect(toolRules(JSON.parse(call.args[call.args.indexOf("--settings") + 1]).permissions.allow)).toEqual([]);
+    expect(call.args[call.args.indexOf("--tools") + 1].split(",")).toEqual(expect.arrayContaining(["Grep", "Glob"]));
+  });
+
+  it("Claude: planMode 입력 턴은 dontAsk 이고 도구·allow·deny·sandbox 가 planMode 없는 같은 턴과 같다(생성·resume)", async () => {
+    const f = fixture();
+    const runner = new RecordingRunner(result());
+    const adapter = createRuntimeAdapters(runner, { dataDirectory: f.data, memoryDirectory: f.memory }).claude;
+    const job = { role: "planner", operation: "plan" } as const;
+    for (const planMode of [true, false]) {
+      await adapter.createSession({ prompt: "계획하세요.", cwd: "/tmp", job, planMode, memorySearch: search });
+      await adapter.resumeTurn({ sessionId: sessions.claude, prompt: "계획하세요.", cwd: "/tmp", job, planMode, memorySearch: search });
+    }
+    // 턴 임시 폴더는 턴마다 새로 만들어지므로 자리표시로 바꿔 비교한다.
+    const shape = (call: CommandSpec) => {
+      const arg = (name: string) => call.args[call.args.indexOf(name) + 1];
+      return { permissionMode: arg("--permission-mode"), tools: arg("--tools"), settings: arg("--settings").split(String(call.environment?.TMPDIR)).join("<turn-temp>") };
+    };
+    const [planCreate, planResume, plainCreate, plainResume] = runner.calls.map(shape);
+    expect(planCreate.permissionMode).toBe("dontAsk");
+    expect(planResume.permissionMode).toBe("dontAsk");
+    expect(planCreate).toEqual(plainCreate);
+    expect(planResume).toEqual(plainResume);
+    expect(planCreate.tools.split(",")).toEqual(expect.not.arrayContaining(["Edit"]));
+    expect(planCreate.tools.split(",")).toEqual(expect.not.arrayContaining(["Write"]));
+  });
+
+  it("Codex 격리 턴에는 메모리도 사본 경로도 없고, 사본 루트는 거부한다", async () => {
+    const f = fixture();
+    let isolated = { stdin: "", config: "" };
+    const runner: CommandRunner = { run: async spec => {
+      isolated = { stdin: spec.stdin ?? "", config: readFileSync(join(String(spec.environment?.CODEX_HOME), "config.toml"), "utf8") };
+      return result();
+    } };
+    const adapter = createRuntimeAdapters(runner, { dataDirectory: f.data, memoryDirectory: f.memory }).codex;
+    await adapter.createSession({ prompt: "Review", cwd: "/tmp", isolated: true, memorySearch: search, job: { role: "reviewer", operation: "audit" } });
+    expect(isolated.stdin).toBe("Review");
+    expect(isolated.config.split("\n").filter(line => line.includes(f.snapshots))).toEqual([`${JSON.stringify(f.snapshots)} = "deny"`]);
+    expectCodexRootDeny(isolated.config, f.snapshots);
+    expect(existsSync(f.snapshots)).toBe(false);
   });
 });
 

@@ -37,6 +37,7 @@ export class EvidenceCatalogStore {
         artifact_id INTEGER NOT NULL,PRIMARY KEY(topic_id,scope_generation));
       CREATE TABLE IF NOT EXISTS evidence_group_topics(topic_id TEXT PRIMARY KEY REFERENCES topics(id) ON DELETE CASCADE,
         group_id TEXT NOT NULL REFERENCES work_groups(id));
+      CREATE TABLE IF NOT EXISTS evidence_retry_positions(root_id TEXT PRIMARY KEY, source_id TEXT NOT NULL);
     `);
   }
   roots(): EvidenceRoot[] {
@@ -217,12 +218,16 @@ export class EvidenceCatalogStore {
       this.members(root.id).some(m => m.source_id === sourceId && m.state === "candidate"))
       .flatMap(root => this.affected(root)))]);
   }
-  private automaticallyApproved(child: Pick<EvidenceSource, "id" | "provider" | "resource">, root: EvidenceRoot, link: EvidenceDiscoveryLink): boolean {
-    const origin = this.store.get(root.sourceId);
+  // The root's automatic scope is its own provider on the same site (Jira, Confluence) or the same channel (Slack). A link is approved
+  // automatically only when the page holding it is in that scope too: a page a person approved from another provider does not pass
+  // its links on (2026-10-20 D1: a Jira root spread through an approved Confluence page to the Jira issues it linked).
+  private automaticallyApproved(child: Pick<EvidenceSource, "id" | "provider" | "resource">, root: EvidenceRoot, link: EvidenceDiscoveryLink,
+    parent: Pick<EvidenceSource, "provider" | "resource">): boolean {
+    const origin = this.store.get(root.sourceId), site = (source: Pick<EvidenceSource, "resource">) => source.resource.split("/")[0];
+    const inScope = (source: Pick<EvidenceSource, "provider" | "resource">) => source.provider === origin.provider &&
+      (origin.provider === "slack" ? source.resource === origin.resource : (origin.provider === "jira" || origin.provider === "confluence") && site(source) === site(origin));
     return this.approvedElsewhere(child.id,root) ||
-      (origin.provider === "jira" && child.provider === "jira" && origin.resource.split("/")[0] === child.resource.split("/")[0]) ||
-      (origin.provider === "slack" && child.provider === "slack" && origin.resource === child.resource) ||
-      (origin.provider === "confluence" && child.provider === "confluence" && link.relation === "child" && origin.resource.split("/")[0] === child.resource.split("/")[0]);
+      (inScope(parent) && inScope(child) && (origin.provider !== "confluence" || link.relation === "child"));
   }
   afterPublication(effect: () => void): void {
     if (this.publicationEffects) this.publicationEffects.push(effect);
@@ -323,6 +328,7 @@ export class EvidenceCatalogStore {
   }
   private resetCycle(root: EvidenceRoot): void {
     this.db.prepare("UPDATE evidence_members SET progress='pending',cursor=NULL,error=NULL WHERE root_id=? AND state='approved'").run(root.id);
+    this.db.prepare("DELETE FROM evidence_retry_positions WHERE root_id=?").run(root.id);
     root.lastCompleteAt=null; root.nextCheckAt=0; root.scanStartedAt=this.clock(); this.save(root);
   }
   requestRefresh(rootId: string): void {
@@ -335,12 +341,29 @@ export class EvidenceCatalogStore {
       this.clock() <= root.lastCompleteAt + Math.min(source.intervalSeconds,this.store.get(root.sourceId).intervalSeconds) * 2000 &&
       this.reachableMembers(root.id).some(m=>m.source_id===source.id && m.state==="approved" && m.progress==="complete"));
   }
-  next(rootId: string): { root: EvidenceRoot; source: EvidenceSource; cursor: string | null } | null {
+  // A failed member waits while other members of the cycle are still unread, then is retried with its cursor (2026-10-19: a member
+  // failing first in every collect call kept the rest of its root unread and undiscovered). skip holds the members this call has
+  // already tried or cannot read now. Failed members are retried in rowid order from the one after the member whose retry started
+  // last, so a member whose every read outlasts the call cannot keep the later failed members from their retries (review 44b3b20f F002).
+  next(rootId: string, skip: ReadonlySet<string> = new Set()): { root: EvidenceRoot; source: EvidenceSource; cursor: string | null; retry: boolean } | null {
     const root = this.roots().find(r => r.id === rootId && r.status === "approved");
     if (!root) return null;
     if (root.lastCompleteAt !== null && root.nextCheckAt <= this.clock()) this.resetCycle(root);
-    const member = this.reachableMembers(root.id).find(m => m.state === "approved" && m.progress !== "complete");
-    return member ? { root, source: this.store.get(member.source_id), cursor: member.cursor } : null;
+    const reachable = this.reachableMembers(root.id);
+    const open = reachable.filter(m => m.state === "approved" && m.progress !== "complete" && !skip.has(m.source_id));
+    const member = open.find(m => m.progress !== "failed") ?? this.nextRetry(root.id, reachable, open.filter(m => m.progress === "failed"));
+    return member ? { root, source: this.store.get(member.source_id), cursor: member.cursor, retry: member.progress === "failed" } : null;
+  }
+  private nextRetry(rootId: string, reachable: Member[], failed: Member[]): Member | undefined {
+    const position = this.db.prepare("SELECT source_id FROM evidence_retry_positions WHERE root_id=?").get(rootId)?.source_id;
+    const last = reachable.findIndex(m => m.source_id === position);
+    // A position whose member left the root restarts from the first failed member.
+    return (last < 0 ? undefined : failed.find(m => reachable.indexOf(m) > last)) ?? failed[0];
+  }
+  // The retry position is internal scheduling state: it is not part of the root record, its version or the evidence digest, and it
+  // is independent of the member's page cursor. It moves only when a retry actually starts, before the read.
+  startRetry(rootId: string, sourceId: string): void {
+    this.db.prepare("INSERT INTO evidence_retry_positions VALUES (?,?) ON CONFLICT(root_id) DO UPDATE SET source_id=excluded.source_id").run(rootId, sourceId);
   }
   importHostSnapshot(topicId: string, input: EvidenceHostImport, links: EvidenceDiscoveryLink[]): EvidenceSource {
     return this.atomic(() => {
@@ -410,10 +433,13 @@ export class EvidenceCatalogStore {
           // without creating a collection requirement for unsupported navigation or prototype URLs.
           continue;
         }
-        const automatic = this.automaticallyApproved(child,current,link);
+        const automatic = this.automaticallyApproved(child,current,link,source);
         const added = this.db.prepare("INSERT OR IGNORE INTO evidence_members VALUES (?,?,?,'pending',NULL,NULL)")
           .run(root.id, child.id, automatic ? "approved" : "candidate");
-        if (automatic) this.reuseApproval(child.id,current);
+        // An existing member keeps its state. Only a member this root actually approved shares the approval: rediscovering one a
+        // person rejected or left a candidate here does not approve it in another root.
+        if (automatic && this.db.prepare("SELECT state FROM evidence_members WHERE root_id=? AND source_id=?").get(root.id, child.id)?.state === "approved")
+          this.reuseApproval(child.id,current);
         // Approved discoveries change host paging too: their IDs may precede a cursor already handed out.
         if (added.changes) { current.version++; this.audit(current, automatic ? "승인된 탐색 범위에서 새 원문 발견" : "새 연결 자료 검수 대기", child.id); }
         this.db.prepare("INSERT OR IGNORE INTO evidence_discovery_edges VALUES (?,?,?,?,?)").run(root.id, child.id, source.id, link.unitId, link.relation);
@@ -447,10 +473,15 @@ export class EvidenceCatalogStore {
     const interval=this.reachableMembers(rootId).filter(m=>m.state==="approved").reduce((minimum,m)=>Math.min(minimum,this.store.get(m.source_id).intervalSeconds),this.store.get(root.sourceId).intervalSeconds);
     root.lastCompleteAt = this.clock(); root.nextCheckAt = this.clock() + interval * 1000; this.save(root);
   }
+  // While another member of the root is still failed, the root's retry wait may come from that unresolved failure, so a shorter new
+  // failure never shortens it, in this call or a later one (review 44b3b20f F003). Without another failure the new delay replaces it,
+  // as a member's own newer retryAfter always did. complete() and resetCycle() release the wait.
   failed(rootId: string, sourceId: string, message: string, retrySeconds = 300, restart = false): void {
     this.db.prepare("UPDATE evidence_members SET progress='failed',cursor=CASE WHEN ? THEN NULL ELSE cursor END,error=? WHERE root_id=? AND source_id=?").run(restart ? 1 : 0,message.slice(0,500), rootId, sourceId);
     const root = this.roots().find(r => r.id === rootId)!;
-    root.nextCheckAt = this.clock() + Math.max(300, retrySeconds) * 1000; this.save(root);
+    const retryAt = this.clock() + Math.max(300, retrySeconds) * 1000;
+    const unresolved = this.reachableMembers(rootId).some(m => m.source_id !== sourceId && m.state === "approved" && m.progress === "failed");
+    root.nextCheckAt = unresolved ? Math.max(root.nextCheckAt, retryAt) : retryAt; this.save(root);
   }
   migrateLegacy(): void {
     if (this.db.prepare("SELECT 1 FROM evidence_catalog_migrations WHERE id='human-review-v1'").get()) return;

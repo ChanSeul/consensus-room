@@ -16,7 +16,9 @@ export const EXECUTION_POLICY_NOTE = [
   "Consensus Room 엔진 결함은 engineDefects 배열에 key·title·재현 evidence·workaround로 보고하고 토픽 작업을 계속하세요. 엔진을 직접 수정하지 마세요. 보고한 결함은 엔진 결함 원장에 보관되고, 엔진 운영 담당(master)이 분류해 수리를 배정합니다. 엔진 문제를 제품 결함 findings와 섞지 말고, 실제로 막힌 작업이나 실패는 그대로 보고하세요.",
   "웹은 검색과 공개 문서 읽기에만 씁니다. 하위 에이전트가 있다면 탐색·검증에만 쓰고 같은 파일은 한 작업자만 수정합니다.",
   "외부 원문은 자료별 한 작업자가 필요한 범위만 수집하고 저장된 원문·출처·버전을 공유하세요. 검증자는 그 원문으로 주장과 대조하며, 구체적인 누락·모순·버전 변경이 있을 때만 해당 부분을 다시 수집합니다. 모든 조사 뒤에 전체 독립 재수집 단계를 붙이지 마세요.",
-  "병렬 작업은 입력과 소유 범위가 독립적일 때만 사용하세요. 완료 알림이나 제공된 대기 도구를 쓰고, 결과 로그·현재 시각을 짧은 간격으로 반복 조회하지 마세요. 외부 서비스가 호출 제한을 반환하면 같은 조회를 반복하지 말고 확보한 원문과 미확인 부분을 구분해 보존하세요.",
+  // 응답 종료를 대기 수단으로 안내하지 않는다(엔진 결함 15d9ac40 은 Claude 러너에서 관측했다, 자문 39 §2). 공급자가 제공한 대기 도구는 그대로 쓰게 하고
+  // 미완료 보고를 허용한다. Claude 의 파일 대기·run_in_background 설명은 Claude 어댑터(inTurnWaitNote)에만 둔다.
+  "병렬 작업은 입력과 소유 범위가 독립적일 때만 사용하세요. 필요한 결과는 제공된 대기 도구 등을 사용해 같은 턴 안에서 확인하세요. 응답 종료를 대기 수단으로 삼지 마세요. 끝내지 못하면 미완료 작업과 이유를 보고하세요. 결과 로그·현재 시각을 짧은 간격으로 반복 조회하지 마세요. 외부 서비스가 호출 제한을 반환하면 같은 조회를 반복하지 말고 확보한 원문과 미확인 부분을 구분해 보존하세요.",
   // advisor 는 대화 전체를 캐시 없이 다시 읽는다. 계획자에게만 켜지므로(claude.ts) 다른 역할·Codex 턴에서는 이 줄이 모델 동작을 바꾸지 않는다.
   "Advisor (if available): call it only at a decision point — a design judgment, resolving conflicting evidence, or right before returning complete=true. Do not call it in a response that requests reads, or while required context is still being loaded; gather first.",
 ].join("\n");
@@ -123,7 +125,14 @@ export interface SourceChangeFact {
   previousHash?: string | null;
   hash?: string | null;
   changePath?: string | null;
-  error?: string | null;
+}
+
+// 이 세션이 마지막으로 받은 뒤 남은 원문 조회 오류 알림 — 내용 변경 사실이 아니라서 바뀐 원문과 다른 절에 싣는다(엔진 결함 1214e8c1, CR Engine Advisor 자문 58 §1).
+// 그 원문이 지금도 실패 중인지, 실제로 바뀌지 않았는지는 이 알림으로 알 수 없다.
+export interface SourceErrorFact {
+  sourceId: string;
+  title?: string | null;
+  error: string;
 }
 
 // 엔진이 실제로 실행한 검사의 결과(계획에 선언된 필수 검사 등) — 실패는 구현자에게, 영수증은 리뷰어에게 사실로 전한다. 모양은 check-result 사실의 항목이다.
@@ -136,6 +145,7 @@ export interface RelayFacts {
   // 이 세션이 아직 받지 않은 중재자·사용자 메시지(결정·증거·메모).
   messages?: readonly RelayMessage[];
   sourceChanges?: readonly SourceChangeFact[];
+  sourceErrors?: readonly SourceErrorFact[];
   checks?: readonly CheckFact[];
   // current = 검토·수정 중인 현재 판, approved = 사용자가 승인한 판, reference = ticket 으로 전환된 토픽에 남은 이전 계획(따를 의무 없음).
   // items = 승인 판이 선언한 항목 id(approved 에서만, 본문은 스냅샷 경로에) — 기존 세션에도 매 턴 실려 항목별 보고 의무가 빠지지 않는다.
@@ -208,9 +218,12 @@ function relaySourceChange(change: SourceChangeFact): string {
     span(change.previousRevision, change.revision) && `revision ${span(change.previousRevision, change.revision)}`,
     span(change.previousHash, change.hash) && `hash ${span(change.previousHash, change.hash)}`,
     change.changePath && `변경분 \`${change.changePath}\``,
-    change.error && `조회 오류: ${change.error}`,
   ].filter(Boolean);
   return `- ${change.sourceId}${change.title ? ` (${change.title})` : ""}${parts.length ? `: ${parts.join(" · ")}` : ""}`;
+}
+
+function relaySourceError(failure: SourceErrorFact): string {
+  return `- ${failure.sourceId}${failure.title ? ` (${failure.title})` : ""}: 조회 오류: ${failure.error}`;
 }
 
 // 메시지 한 건 — 사용자 결정은 결정 원문 색인(entry)으로 본문을 정한다. 앞선 결정과 같은 본문이면 그 순번을, 한도를 넘는 고유 본문이면 원문 파일의 구간을
@@ -250,8 +263,12 @@ function relayFactSections(facts: RelayFacts): string[] {
     sections.push(`중재자·사용자 메시지:\n${facts.messages.map(message => relayMessage(message,
       message.actor === "user" && message.kind === "decision" ? decisions.get(message.sequence) : undefined)).join("\n\n")}`);
   }
+  // 「바뀐 원문」 머리말은 실제 내용 변경이 있을 때만 붙는다 — 조회 오류만 있는 구간을 변경으로 보이지 않는다(1214e8c1).
   if (facts.sourceChanges?.length) {
     sections.push(`바뀐 원문(영향은 이 세션이 판단합니다):\n${facts.sourceChanges.map(relaySourceChange).join("\n")}`);
+  }
+  if (facts.sourceErrors?.length) {
+    sections.push(`이 전달 구간의 원문 조회 오류 — 내용 변경을 뜻하지 않으며 현재 복구 여부는 별도입니다:\n${facts.sourceErrors.map(relaySourceError).join("\n")}`);
   }
   if (facts.checks?.length) {
     sections.push(`엔진이 실행한 검사:\n${facts.checks.map(check => `- ${check.id}: ${check.status}${check.logPath ? ` · 로그 \`${check.logPath}\`` : ""}${check.summary ? `\n  ${check.summary}` : ""}`).join("\n")}`);
@@ -286,9 +303,10 @@ export function buildRelayPrompt(facts: RelayFacts): string {
 // 세션 커서 뒤의 사실 이벤트(사용자 이벤트와 payload.workerFact 가 있는 system 이벤트)를 빌더 입력으로 옮긴다. 상대 봉투 원문(counterpart)은 호출자가 더한다.
 // 계획은 가장 최근 판 하나다(그 판의 diff 는 직전 판 대비). 형식이 계약과 다른 사실 표식은 조용히 빼지도, 턴 전체를 멈추지도 않는다 — 원본과 위반을
 // 메시지로 그대로 보여 받는 세션과 중재자가 판단하게 한다(표식 하나의 오류로 독립 작업을 막지 않는다).
-export function relayFactsFrom(events: readonly TimelineEvent[]): Pick<RelayFacts, "messages" | "sourceChanges" | "checks" | "plan"> {
+export function relayFactsFrom(events: readonly TimelineEvent[]): Pick<RelayFacts, "messages" | "sourceChanges" | "sourceErrors" | "checks" | "plan"> {
   const messages: RelayMessage[] = [];
   const sourceChanges: SourceChangeFact[] = [];
+  const sourceErrors: SourceErrorFact[] = [];
   const checks: CheckFact[] = [];
   let plan: RelayFacts["plan"] = null;
   let groupRevision = -1;
@@ -314,7 +332,7 @@ export function relayFactsFrom(events: readonly TimelineEvent[]): Pick<RelayFact
           previousHash: fact.before?.contentHash, hash: fact.after?.contentHash, changePath: fact.diffPath });
         break;
       case "source-error":
-        sourceChanges.push({ sourceId: fact.sourceId, error: fact.error });
+        sourceErrors.push({ sourceId: fact.sourceId, error: fact.error });
         break;
       case "workflow-mode":
         messages.push({ sequence: event.sequence, actor: "system", kind: "workflow-mode", body: `작업 방식이 ${fact.from} 에서 ${fact.to} 로 바뀌었습니다. 사유: ${fact.reason}` });
@@ -339,7 +357,7 @@ export function relayFactsFrom(events: readonly TimelineEvent[]): Pick<RelayFact
       }
     }
   }
-  return { messages, sourceChanges, checks, plan };
+  return { messages, sourceChanges, sourceErrors, checks, plan };
 }
 
 // 봉투 계약을 어긴 응답의 같은 세션 교정(실행기가 한 번 부른다) — 작업을 다시 하지 않고 직전 응답 내용을 봉투로만 다시 낸다.

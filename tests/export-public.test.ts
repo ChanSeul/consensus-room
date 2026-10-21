@@ -64,6 +64,57 @@ sys.exit(p.returncode)
   });
 });
 
+// 공개 export 의 사내 티켓 키(CR Engine Advisor 자문 62) — 검토된 표의 키만 키 전체로 바꾸고, 표에 없는 키가 남으면 목적지에 쓰기 전에 멈춘다.
+// 이 검사 파일도 공개 대상이라 키 문자열은 실행 중에 접두어와 숫자를 이어 만든다(본문에 키가 그대로 있으면 실제 export 가 이 파일에서 멈춘다).
+describe("scripts/export-public.py — 사내 티켓 키", () => {
+  const dev = (digits: string) => `${["DEV", "SCRUM"].join("")}-${digits}`;
+  const qa = (digits: string) => `${["DS", "QA"].join("")}-${digits}`;
+  const internalKey = new RegExp(`(?:${["DEV", "SCRUM"].join("")}|${["DS", "QA"].join("")})-\\d`);
+  const run = (files: Record<string, string>) => {
+    const root = mkdtempSync(join(tmpdir(), "consensus-room-export-keys-"));
+    temporaryDirectories.push(root);
+    const repository = join(root, "repo");
+    mkdirSync(join(repository, "scripts"), { recursive: true });
+    git(root, ["init", "--initial-branch=main", repository]);
+    git(repository, ["config", "user.name", "Consensus Room Test"]);
+    git(repository, ["config", "user.email", "consensus-room@example.invalid"]);
+    writeFileSync(join(repository, "scripts", "export-public.py"), readFileSync(exportScript));
+    for (const [name, body] of Object.entries(files)) writeFileSync(join(repository, name), body);
+    writeFileSync(join(repository, "scripts", "public-export.json"), JSON.stringify({ files: Object.keys(files), approved_assets: {} }));
+    git(repository, ["add", "."]); git(repository, ["commit", "-m", "fixture"]);
+    const output = join(root, "output");
+    try {
+      execFileSync("python3", [join(repository, "scripts", "export-public.py"), output], { encoding: "utf8", cwd: repository, stdio: ["ignore", "pipe", "pipe"] });
+      return { ok: true as const, output, read: (name: string) => readFileSync(join(output, name), "utf8") };
+    } catch (error) {
+      const failure = error as { status?: number; stderr?: string };
+      return { ok: false as const, output, status: failure.status, stderr: String(failure.stderr ?? "") };
+    }
+  };
+
+  it.skipIf(!existsSync(exportScript))("검토된 키는 키 전체로 가짜 키가 되고, 출력에 사내 키가 남지 않는다", () => {
+    const result = run({ "a.txt": `// 2026-10-19 ${dev("17493")} follow-up\nsourceId: "jira:${dev("1")}"\nrefactoring/${dev("9071")}-g1\n`
+      + `토픽(${dev("17106")} 매물등록 통합)\n` });
+    expect(result.ok, result.ok ? "" : result.stderr).toBe(true);
+    if (!result.ok) return;
+    expect(result.read("a.txt")).toBe('// 2026-10-19 PROJECT-456 follow-up\nsourceId: "jira:PROJECT-1"\nrefactoring/PROJECT-123-g1\n토픽(PROJECT-123 샘플 기능 통합)\n');
+    expect(result.read("a.txt")).not.toMatch(internalKey);
+  });
+
+  it.skipIf(!existsSync(exportScript))("표에 없는 두 접두어의 키와 검토된 키를 앞부분으로 포함한 더 긴 키는 export 를 멈추고 목적지를 만들지 않는다", () => {
+    for (const key of [dev("24680"), qa("5"), dev("12"), dev("90712"), dev("174930")]) {
+      // 첫 파일은 깨끗하고 뒤 파일에만 키가 있어도 아무것도 쓰지 않는다 — 검사는 목적지 쓰기 전에 끝난다.
+      const result = run({ "clean.txt": "public fixture\n", "leak.txt": `메모 ${key} 참고\n` });
+      expect(result.ok, key).toBe(false);
+      if (result.ok) continue;
+      expect(result.status, key).not.toBe(0);
+      expect(result.stderr, key).toContain("leak.txt");
+      expect(result.stderr, key).toContain(key);
+      expect(existsSync(result.output), key).toBe(false);
+    }
+  });
+});
+
 // host-review a7a9ce86 F-008 — 공개 목록이 목록 안 코드의 상대 import 와 런타임에 읽는 저장소 파일(new URL(…, import.meta.url))을 전부 담는다.
 // 빠지면 공개본의 타입 검사·서버 실행이 깨진다(E1 의 mediation.ts·roleAssignments.ts·roles.ts·정책 문서가 빠졌던 사례).
 const manifest = join(process.cwd(), "scripts", "public-export.json");

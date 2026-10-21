@@ -2,7 +2,8 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, expect, it, vi } from "vitest";
 import { BudgetController } from "../src/server/budgetController";
 import { BudgetBlocked, BudgetLedger } from "../src/server/budgetLedger";
-import type { AgentAdapter, SessionTurn } from "../src/server/types";
+import type { AgentAdapter, CommandRunner, SessionTurn } from "../src/server/types";
+import { ClaudeAdapter } from "../src/server/adapters/claude";
 const policy={execution:{inputTokens:10,outputTokens:10,durationMs:100000},total:{inputTokens:50,outputTokens:50,durationMs:300000}};
 afterEach(()=>vi.useRealTimers());
 it("passes the narrowest remaining account allowance without changing limits, model, or resumed session", async () => {
@@ -142,4 +143,44 @@ it("charges two topics sharing cwd to their explicit accounts",async()=>{
  const wrapped=new BudgetController(ledger,(_cwd,topicId)=>{if(!topicId)throw Error("missing topic identity");return {topicId,accounts:[topicId],stage:"BRAINSTORMING"};},async()=>{}).wrap(adapter);
  await Promise.all(["one","two"].map(topicId=>wrapped.createSession({topicId,cwd:"/shared",prompt:"discuss"})));
  expect(ledger.account("one")!.used.inputTokens).toBe(3);expect(ledger.account("two")!.used.inputTokens).toBe(7);db.close();
+});
+// engine-review 1d47a14d F001: result 뒤 작업이 이어진 Claude 호출의 사용량은 원장에 그 작업까지 남고, 새 최종 집계 없이 끝났으므로 정산되지 않는다.
+it("result 뒤 작업이 이어진 Claude 호출은 후속 사용량을 원장에 남기고 최종 사용량 없이 끝나 미정산으로 남는다",async()=>{
+ const db=new DatabaseSync(":memory:"),ledger=new BudgetLedger(db);
+ ledger.configure("t",{execution:{inputTokens:1000,outputTokens:1000,durationMs:100000},total:{inputTokens:5000,outputTokens:5000,durationMs:300000}},"test");
+ const envelope={message:"변경을 검토했습니다.",outcome:"approve",mediatorRequest:null,memoryUpdates:null,engineDefects:null};
+ const lines=[{type:"assistant",message:{id:"m1",usage:{input_tokens:5,output_tokens:8}}},
+  {type:"result",subtype:"success",is_error:false,num_turns:1,structured_output:envelope,usage:{input_tokens:5,output_tokens:8}},
+  {type:"assistant",message:{id:"m2",usage:{input_tokens:2,output_tokens:3}}}];
+ const runner:CommandRunner={run:async spec=>{
+  spec.admitSync?.();spec.onSpawn?.({pid:123,pgid:123,executable:"claude",commandLine:"claude",startedAt:"now"});
+  for(const line of lines)spec.onJSONLine?.(line,Date.now());
+  return {exitCode:0,stdout:lines.map(line=>JSON.stringify(line)).join("\n"),stderr:"",jsonLines:lines};}};
+ const wrapped=new BudgetController(ledger,()=>({topicId:"t",accounts:["t"],stage:"ACK"}),async()=>{}).wrap(new ClaudeAdapter(runner));
+ await expect(wrapped.createEnvelopeSession!({cwd:"/tmp",prompt:"review",job:{role:"reviewer",operation:"review"},requiresFinalUsage:true}))
+  .rejects.toThrow(/새 result 가 없습니다/);
+ const id=String(db.prepare("SELECT id FROM budget_executions").get()!.id);
+ expect(ledger.execution(id).used).toMatchObject({inputTokens:7,outputTokens:11});
+ expect((()=>{try{ledger.assertAvailable(["t"]);return null;}catch(error){return (error as BudgetBlocked).reason;}})()).toBe("unsettled");db.close();
+});
+// CR Engine Advisor 자문 46: 합성 0턴 result 만 낸 첫 호출의 0 토큰을 완전한 최종 사용량으로 보면, 0턴 재호출이 실제 작업 뒤 새 result 없이 끝나도
+// 원장이 정산된다. 재호출 횟수(1회)는 그대로다.
+it("합성 0턴 재호출 뒤 새 result 없이 끝난 Claude 재개 호출은 첫 호출의 0 토큰으로 정산되지 않고 미정산으로 남는다",async()=>{
+ const db=new DatabaseSync(":memory:"),ledger=new BudgetLedger(db);
+ ledger.configure("t",{execution:{inputTokens:1000,outputTokens:1000,durationMs:100000},total:{inputTokens:5000,outputTokens:5000,durationMs:300000}},"test");
+ const attempts=[[{type:"result",subtype:"success",is_error:false,num_turns:0,result:"No response requested.",usage:{input_tokens:0,output_tokens:0}}],
+  [{type:"assistant",message:{id:"real",usage:{input_tokens:7,output_tokens:11}}}]];
+ let calls=0;
+ const runner:CommandRunner={run:async spec=>{
+  const lines=attempts[Math.min(calls++,attempts.length-1)];
+  spec.admitSync?.();spec.onSpawn?.({pid:123,pgid:123,executable:"claude",commandLine:"claude",startedAt:"now"});
+  for(const line of lines)spec.onJSONLine?.(line,Date.now());
+  return {exitCode:0,stdout:lines.map(line=>JSON.stringify(line)).join("\n"),stderr:"",jsonLines:lines};}};
+ const wrapped=new BudgetController(ledger,()=>({topicId:"t",accounts:["t"],stage:"ACK"}),async()=>{}).wrap(new ClaudeAdapter(runner));
+ await expect(wrapped.resumeEnvelopeTurn!({sessionId:"00000000-0000-4000-8000-000000000000",cwd:"/tmp",prompt:"이어서",
+  job:{role:"reviewer",operation:"review"},requiresFinalUsage:true})).rejects.toThrow(/결과 봉투를 반환하지 않았습니다/);
+ expect(calls).toBe(2);
+ const id=String(db.prepare("SELECT id FROM budget_executions").get()!.id);
+ expect(ledger.execution(id).used).toMatchObject({inputTokens:7,outputTokens:11});
+ expect((()=>{try{ledger.assertAvailable(["t"]);return null;}catch(error){return (error as BudgetBlocked).reason;}})()).toBe("unsettled");db.close();
 });

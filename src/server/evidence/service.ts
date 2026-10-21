@@ -11,7 +11,7 @@ import { turnFlags } from "../../shared/roles.js";
 import type { TurnEnvelope, WorkerFact } from "../../shared/turnContract.js";
 import { EvidenceFetchError, type EvidenceConnector } from "./connectors.js";
 import { DESIGN_PLANNING_CONTRACT } from "../../shared/prompts.js";
-import { evidenceHash, type EvidenceStore } from "./store.js";
+import { EvidenceGenerationConflict, evidenceHash, type EvidenceStore } from "./store.js";
 import type { EvidenceReadObservation } from "./readLifecycle.js";
 import { reportBackgroundFailure } from "../backgroundTask.js";
 
@@ -96,15 +96,23 @@ export class EvidenceService {
   private async collectRoot(rootId: string, force = false): Promise<void> {
     // Each page is persistent. A scheduling slice is not a limit on the reachable corpus.
     const deadline = Date.now() + 20_000;
-    for (let count = 0; count < 20 && Date.now() < deadline && !this.abort.signal.aborted; count++) {
+    // skip holds the members this call has already tried or cannot read now, and none of them is picked again in this call: a member
+    // that fails stays failed, and one waiting on a host refresh, another collection's lease or its own retry wait is left as it is,
+    // while the members after it are still read. Only a started read or host-capture replacement uses one of the call's 20 attempts,
+    // so waiting members cannot use them up (review 44b3b20f F001).
+    const skip = new Set<string>();
+    for (let count = 0; count < 20 && Date.now() < deadline && !this.abort.signal.aborted;) {
       const owner = this.store.catalog.roots().find(root => root.id === rootId);
       if (!owner || this.store.catalog.affected(owner).some(id => !this.canPublish(id))) return;
-      const next = this.store.catalog.next(rootId);
+      const next = this.store.catalog.next(rootId, skip);
       if (!next) { this.store.catalog.complete(rootId); return; }
-      const { root, source, cursor } = next;
+      const { root, source, cursor, retry } = next;
       const guarded = () => [...this.store.catalog.affected(root), ...this.store.linkedTopics(source.id)];
       const publishable = () => guarded().every(id => this.canPublish(id));
       if (!publishable()) return;
+      // A failed member's retry moves the root's retry position before the read, so a read that does not return within the call
+      // still passes the next call to the next failed member.
+      const attempt = () => { count++; if (retry) this.store.catalog.startRetry(rootId, source.id); };
       const reader = source.mode === "connector" ? (this.native ?? this.connector) : this.connector;
       let checkId: string | null = null; let committing = false;
       try {
@@ -122,10 +130,11 @@ export class EvidenceService {
           if (!snapshot) throw new EvidenceFetchError("호스트에서 원문을 다시 수집하세요. 이전 자료는 보존했습니다.");
           // No remote read occurred. An overdue host capture needs revalidation, not
           // a fabricated collection error or a refreshed timestamp/coverage receipt.
-          if (!this.store.fresh(source)) return;
+          if (!this.store.fresh(source)) { skip.add(source.id); continue; }
           const units=snapshot.units.map(({contentHash: _hash,imageHash,...unit})=>({ ...unit,
             ...(imageHash ? {imageBase64:this.store.image(imageHash).toString("base64")} : {}) }));
           const links = this.collectedThisPoll.get(source.id)?.links ?? discoverLinks(units,source.url);
+          attempt();
           await this.publishSelection(guarded, () => {
             if (this.abort.signal.aborted) throw new EvidenceAdmissionExpired();
             committing=true;
@@ -139,8 +148,10 @@ export class EvidenceService {
           if (this.store.get(root.sourceId).mode !== "rest") throw new EvidenceFetchError("등록된 MCP 읽기 연결이 없습니다.");
           this.store.useRest(source.id);
         }
-        const check = this.store.begin(source.id,true); if (!check) return;
+        // null: another collection holds the source's lease, or the source waits for its own retry time.
+        const check = this.store.begin(source.id,true); if (!check) { skip.add(source.id); continue; }
         checkId=check.checkId;
+        attempt();
         const generation=this.store.generation(source.id);
         this.store.recordCollection(source.id, { status: "reading" });
         const page = await this.scheduler.run(evidenceGroup(source), this.abort.signal,
@@ -165,12 +176,19 @@ export class EvidenceService {
       } catch (error) {
         if (this.abort.signal.aborted || error instanceof EvidenceAdmissionExpired) return;
         const message = error instanceof Error ? error.message.slice(0, 500) : "수집 실패";
-        this.store.recordCollection(source.id, { status: "error", error: message });
-        this.sourceFailed(source, source.collection?.error, message);
-        this.store.catalog.failed(rootId, source.id, error instanceof EvidenceFetchError ? error.message : "원문 수집이 중단됐습니다. 이전 자료는 보존했습니다.",
+        // A stale collection was refused, not a failed read (1214e8c1, 자문 58 §2): the source keeps what another collection stored —
+        // finally restores the collection state this call found under its lease — and no source error reaches the runners. Only this
+        // root's member records the conflict and restarts from its first page.
+        const stale = error instanceof EvidenceGenerationConflict;
+        if (!stale) {
+          this.store.recordCollection(source.id, { status: "error", error: message });
+          this.sourceFailed(source, source.collection?.error, message);
+        }
+        this.store.catalog.failed(rootId, source.id, error instanceof EvidenceFetchError || stale ? error.message : "원문 수집이 중단됐습니다. 이전 자료는 보존했습니다.",
           error instanceof EvidenceFetchError ? error.retryAfterSeconds : 300,
           committing || (error instanceof EvidenceFetchError && error.restart));
-        return;
+        skip.add(source.id);
+        continue;
       } finally {
         if (checkId) {
           this.store.restoreCollection(source.id,checkId,source.collection);

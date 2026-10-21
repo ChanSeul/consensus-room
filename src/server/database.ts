@@ -7,6 +7,7 @@ import { MediatorInterruptStore } from "./mediation/interruptStore.js";
 import type { ReviewScope } from "../shared/reviews.js";
 import { reviewProgressReason } from "./reviewProgress.js";
 import { ReviewLedger } from "./reviewLedger.js";
+import { CodexSpeedRegistry } from "./codexSpeed.js";
 import { RoleRegistry } from "./roleAssignments.js";
 import { EngineDefectStore } from "./engineDefects.js";
 import { PlanningStore } from "./planningStore.js";
@@ -87,6 +88,7 @@ export class ConsensusDatabase {
   readonly evidence: EvidenceStore;
   readonly planning: PlanningStore;
   readonly roles: RoleRegistry;
+  readonly codexSpeed: CodexSpeedRegistry;
   readonly sessions: SessionRecords;
   readonly engineDefects: EngineDefectStore;
   readonly interrupts: MediatorInterruptStore;
@@ -106,6 +108,7 @@ export class ConsensusDatabase {
     this.workGroups = new WorkGroups(this.db);
     this.reviews = new ReviewLedger(this.db);
     this.roles = new RoleRegistry(this.db);
+    this.codexSpeed = new CodexSpeedRegistry(this.db);
     this.sessions = new SessionRecords(this.db);
     this.engineDefects = new EngineDefectStore(this.db);
     this.interrupts = new MediatorInterruptStore(this.db, Date.now, topicId => this.workGroupContinuation(topicId));

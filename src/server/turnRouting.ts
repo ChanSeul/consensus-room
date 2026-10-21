@@ -2,6 +2,7 @@ import { AgentExecutionSettingsSchema, type AgentExecutionSettings, type Routing
 import { appliedExecutionSettings } from "../shared/execution.js";
 import { providerOptionsProblem, TURN_OPERATIONS, turnFlags, type AgentProfile, type RoleAssignment, type TurnJob, type TurnRole } from "../shared/roles.js";
 import { providerRoleOptionsProblem, providerSupport, turnPolicy } from "./adapters/turnPolicy.js";
+import { applyCodexSpeed, type CodexSpeedOverride } from "./codexSpeed.js";
 import type { ConsensusDatabase } from "./database.js";
 import type { ParticipantRole } from "./types.js";
 
@@ -30,8 +31,13 @@ export interface TurnRoute extends SessionBinding {
   seat: ParticipantRole;
   // 이 경로의 실행 설정(효과 강도 덮어쓰기 전). 공급자와 같은 결정에서 나온다 — 다른 공급자의 모델 이름이 CLI 로 가지 않게.
   settings: AgentExecutionSettings;
-  // 프로필의 공급자 옵션(E2c) — 이 공급자의 스펙으로 검증한 값. 기본 배정은 {}(어댑터 기본값).
+  // 실행에 넘기는 공급자 옵션(E2c) — 프로필 옵션에 Codex 속도 설정(codexSpeed.ts)을 덮어쓴 값. 기본 배정은 {}(어댑터 기본값)에서 시작한다.
   options: Readonly<Record<string, unknown>>;
+  // 속도 설정이 적용된 경로(speed 가 있을 때)에만 프로필 자체의 공급자 옵션(덮어쓰기 전)을 함께 싣는다. 없으면 options 가 곧 프로필 옵션이다.
+  // 세션 설정 저장은 새 프로필을 만들 때 이 값을 복사한다 — 토픽·묶음 속도를 프로필에 굽지 않는다.
+  profileOptions?: Readonly<Record<string, unknown>>;
+  // 토픽·묶음 속도 설정이 이 경로에 적용됐으면 그 값과 출처. Codex 경로에만 붙는다.
+  speed?: CodexSpeedOverride;
   // 코드 리뷰 원장 ID(E3-4c) — delivery 가 연 논리 리뷰 한 번의 호스트 소유 ID. 리뷰 좌석의 읽기 호출(review-read)·최종 판정 호출(review·final-review)이
   // 이 경로로 core.turn·실행기를 지나 SessionTurn.reviewLedger 로 예산 래퍼에 닿는다(core.turn 의 턴 요청은 호출자 필드를 받지 않아 경로가 유일한 통로다).
   // 예산 래퍼는 읽기·판정·그 판정의 계약 교정에서 이 ID 로 리뷰를 예약한다. 원장 없는 교정은 호출마다 예약하며 경로 판정·바인딩과는 무관하다.
@@ -89,8 +95,10 @@ export function resolveRoute(database: ConsensusDatabase, topic: Topic, job: Tur
   const assignment = assignmentFor(database, topic.id, job);
   if (!assignment) {
     const provider = DEFAULT_PROVIDER[job.role];
+    const speed = provider === "codex" ? database.codexSpeed.overrideFor(topic.id) : null;
     return { job, seat, provider, participant: seat, profileId: null, basis: { kind: "default" },
-      settings: appliedExecutionSettings(topic.agentSettings[provider], turnFlags(job).implementationModel), options: {} };
+      settings: appliedExecutionSettings(topic.agentSettings[provider], turnFlags(job).implementationModel),
+      options: applyCodexSpeed({}, speed), ...(speed ? { speed, profileOptions: {} } : {}) };
   }
   const basis: RouteBasis = { kind: "assignment", scope: assignment.scope, role: job.role, operation: assignment.operation, version: assignment.version };
   const label = `${job.role}${assignment.operation ? `/${assignment.operation}` : ""} 배정(${assignment.scope} v${assignment.version})`;
@@ -114,8 +122,47 @@ export function resolveRoute(database: ConsensusDatabase, topic: Topic, job: Tur
   if (optionProblem) {
     throw new UnsupportedRoute(`${label}의 프로필 ${profile.id} 옵션을 실행할 수 없습니다: ${optionProblem}.`, { job, provider: profile.provider, basis });
   }
+  const profileOptions = profile.options ?? {};
+  const speed = profile.provider === "codex" ? database.codexSpeed.overrideFor(topic.id) : null;
   return { job, seat, provider: profile.provider, participant: assignment.participant, profileId: profile.id, basis, settings: settings.data,
-    options: profile.options ?? {}, reviewCriteria: profile.reviewCriteria };
+    options: applyCodexSpeed(profileOptions, speed), ...(speed ? { speed, profileOptions } : {}), reviewCriteria: profile.reviewCriteria };
+}
+
+// Codex 속도 조회(2026-10-18). 토픽의 모든 역할·작업 경로를 실행과 같은 해석으로 풀어, Codex 로 가는 작업마다 실제로 넘길 serviceTier 와 그 출처를
+// 돌려준다 — 실행 인자(codex.ts)는 이 경로의 options 를 그대로 쓰므로 여기 값이 다음 턴의 값이다. 부속 턴(계속 진행·답변 확인 등)은 routingView·엔진과
+// 같이 부모 작업의 경로를 쓴다(host-review 0d1b8c76 F001 — 부속 작업에 따로 둔 배정은 실행에 쓰이지 않는다). 풀 수 없는 경로는 오류 문구를 싣는다.
+export interface CodexSpeedOperation {
+  role: TurnJob["role"]; operation: string; inheritsFrom: string | null; provider?: Provider; profileId?: string | null; model?: string; effort?: string;
+  serviceTier?: "fast" | "standard"; source?: "topic" | "group" | "profile" | "default"; error?: string;
+}
+export function codexSpeedView(database: ConsensusDatabase, topicId: string) {
+  const topic = database.getTopic(topicId);
+  const groupId = database.codexSpeed.groupOf(topicId);
+  const operations: CodexSpeedOperation[] = [];
+  const current = currentSeatJobs(database, topic);
+  for (const [role, names] of Object.entries(TURN_OPERATIONS) as Array<[TurnJob["role"], readonly string[]]>) {
+    for (const operation of names) {
+      const job = { role, operation } as TurnJob;
+      const parent = inheritedParent(job, current);
+      const inheritsFrom = parent?.operation ?? null;
+      try {
+        const route = resolveRoute(database, topic, parent ?? job);
+        if (route.provider !== "codex") continue;
+        operations.push({ role, operation, inheritsFrom, provider: route.provider, profileId: route.profileId, model: route.settings.model,
+          effort: route.settings.effort, serviceTier: route.options.serviceTier === "fast" ? "fast" : "standard",
+          source: route.speed?.source ?? (route.profileId ? "profile" : "default") });
+      } catch (error) {
+        operations.push({ role, operation, inheritsFrom, error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+  }
+  return {
+    topicId, appliesTo: "next-turn" as const,
+    topicSetting: database.codexSpeed.setting(`topic:${topicId}`),
+    group: groupId ? { id: groupId, setting: database.codexSpeed.setting(`group:${groupId}`) } : null,
+    effective: database.codexSpeed.overrideFor(topicId),
+    operations,
+  };
 }
 
 function profileSettingsProblem(profile: AgentProfile): string | null {

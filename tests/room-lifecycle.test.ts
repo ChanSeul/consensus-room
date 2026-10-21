@@ -135,7 +135,7 @@ describe("public room lifecycle", () => {
   it.each([
     ["another checkout", { repositoryPath: "/different/consensus-room" }],
     ["another data directory", { dataDirectory: "/different/data" }],
-    ["another executable", { executable: "/different/node" }],
+    ["a non-absolute executable", { executable: "node" }],
     ["reused PID", { startedAt: "Sun Oct 18 11:00:00 2026" }],
     ["changed command", { commandLine: "unrelated process" }],
   ])("does not adopt or signal %s", async (_label, replacement) => {
@@ -146,6 +146,24 @@ describe("public room lifecycle", () => {
     expect(signals).toEqual([]);
     expect(commands.spawn).not.toHaveBeenCalled();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  // engine-review 0d1b8c76 F003: Homebrew·nvm 으로 Node 를 갱신하면 CLI 의 실행 파일이 서버 기록의 executable 과 달라진다.
+  // 소유권은 기록한 checkout·데이터 폴더와 기록한 프로세스 신원으로 정한다 — 같은 서버를 계속 다루고, 끝난 기록 뒤에는 새 Node 로 시작한다.
+  it("keeps controlling a server recorded under an older Node and restarts it on the current Node", async () => {
+    live(); registry({ executable: "/old/node/bin/node" });
+    expect(await roomStatus(config)).toEqual({ state: "running", pid, url: `http://127.0.0.1:${config.port}` });
+    expect((await restartRoom(config)).state).toBe("running");
+    expect(signals).toEqual([{ pid, signal: "SIGTERM" }]);
+    expect(JSON.parse(readFileSync(join(directory, "server-process.json"), "utf8")).executable).toBe(process.execPath);
+  });
+
+  it("starts on the current Node after a crashed server recorded an older Node", async () => {
+    registry({ executable: "/old/node/bin/node" }); connection();
+    expect((await roomStatus(config)).state).toBe("stopped");
+    expect((await startRoom(config)).state).toBe("running");
+    expect(commands.spawn).toHaveBeenCalledTimes(1);
+    expect(signals).toEqual([]);
   });
 
   it("fails closed on EPERM and unreadable process identity", async () => {

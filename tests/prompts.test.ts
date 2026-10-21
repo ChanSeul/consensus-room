@@ -13,6 +13,15 @@ describe("역할별 원문 왕복 프롬프트", () => {
     for (const phrase of [...RETIRED_OBLIGATIONS, ...DUPLICATED_FORMAT]) expect(prompt, phrase).not.toContain(phrase);
   };
   const reviewerMessage = "## 지적\n\n1. `src/a.ts:12` 취소 경로에서 잠금을 놓지 않습니다 — **고쳐 주세요**.\n```ts\nawait lock.release()\n```\n";
+  // 원문 사실의 두 절 머리말과, 프롬프트에서 한 절(머리말부터 다음 빈 줄 전까지)만 잘라 보는 도구 — 절이 없으면 빈 문자열이다.
+  const CHANGED_SOURCES = "바뀐 원문(영향은 이 세션이 판단합니다):";
+  const SOURCE_ERRORS = "이 전달 구간의 원문 조회 오류 — 내용 변경을 뜻하지 않으며 현재 복구 여부는 별도입니다:";
+  const section = (prompt: string, heading: string) => {
+    const start = prompt.indexOf(heading);
+    if (start < 0) return "";
+    const end = prompt.indexOf("\n\n", start);
+    return prompt.slice(start, end < 0 ? undefined : end);
+  };
 
   it("구현자 첫 턴은 과제·작업 폴더·근거 위치·지금까지의 메시지를 싣고 ticket 전환 토픽의 남은 계획은 참고 경로로만 알린다", () => {
     const prompt = buildFirstTurnPrompt({
@@ -32,17 +41,41 @@ describe("역할별 원문 왕복 프롬프트", () => {
     const prompt = buildRelayPrompt({
       counterpart: { role: "code-reviewer", message: reviewerMessage },
       messages: [{ sequence: 12, actor: "codex", kind: "decision", body: "중재자 결정: 잠금 해제는 finally 에서." }],
-      sourceChanges: [{ sourceId: "jira:DEVSCRUM-1", title: "요구사항", previousRevision: "3", revision: "4", changePath: "/d/sources/jira-4.diff" },
-        { sourceId: "figma:node-9", error: "429 rate limited" }],
+      sourceChanges: [{ sourceId: "jira:PROJECT-1", title: "요구사항", previousRevision: "3", revision: "4", changePath: "/d/sources/jira-4.diff" }],
+      sourceErrors: [{ sourceId: "figma:node-9", error: "429 rate limited" }],
       checks: [{ id: "npm test", status: "failed", logPath: "/d/checks/1.log", summary: "2 failed" }],
     });
 
     expect(prompt.split(reviewerMessage)).toHaveLength(2);
     expect(prompt).toContain("코드 리뷰어 응답 원문 시작");
-    for (const part of ["[#12 codex/decision]", "jira:DEVSCRUM-1 (요구사항): revision 3 → 4 · 변경분 `/d/sources/jira-4.diff`",
+    for (const part of ["[#12 codex/decision]", "jira:PROJECT-1 (요구사항): revision 3 → 4 · 변경분 `/d/sources/jira-4.diff`",
       "figma:node-9: 조회 오류: 429 rate limited", "npm test: failed · 로그 `/d/checks/1.log`", "2 failed"]) expect(prompt).toContain(part);
+    // 실제 변경과 조회 오류가 섞이면 두 절로 나뉜다 — 「바뀐 원문」 절에는 변경 줄만, 조회 오류 절에는 오류 줄만 있다(1214e8c1).
+    const changed = section(prompt, CHANGED_SOURCES);
+    const failed = section(prompt, SOURCE_ERRORS);
+    expect(changed).toContain("jira:PROJECT-1 (요구사항)");
+    expect(changed).not.toContain("figma:node-9");
+    expect(failed).toContain("figma:node-9: 조회 오류: 429 rate limited");
+    expect(failed).not.toContain("jira:PROJECT-1");
     for (const part of ["역할:", "과제:", "작업 폴더:", "outcome:"]) expect(prompt).not.toContain(part);
     expectNoRetiredObligation(prompt);
+  });
+
+  // 1214e8c1 — 조회 오류만 있는 구간을 「바뀐 원문」으로 보이지 않는다. 오류 줄은 사건마다 한 줄인 기존 형식 그대로 별도 절에 둔다.
+  it("조회 오류만 있으면 「바뀐 원문」 머리말 없이 조회 오류 절만 싣고, 변경만 있으면 기존 절 하나다 — 첫 턴과 이어지는 턴이 같다", () => {
+    const errors = [{ sourceId: "bfe60abc", error: "앱 연결 응답 시간이 지났습니다." }, { sourceId: "bfe60abc", error: "앱 연결 응답 시간이 지났습니다." },
+      { sourceId: "bf7ccdef", error: "다른 수집이 먼저 갱신한 원문입니다. 처음부터 다시 수집하세요." }];
+    const relay = buildRelayPrompt({ sourceErrors: errors });
+    const first = buildFirstTurnPrompt({ role: "implementer", title: "지역 조회 전환", worktreePath: "/w/t", sourceErrors: errors });
+    for (const prompt of [relay, first]) {
+      expect(prompt).not.toContain("바뀐 원문");
+      expect(section(prompt, SOURCE_ERRORS).split("\n").slice(1)).toEqual([
+        "- bfe60abc: 조회 오류: 앱 연결 응답 시간이 지났습니다.", "- bfe60abc: 조회 오류: 앱 연결 응답 시간이 지났습니다.",
+        "- bf7ccdef: 조회 오류: 다른 수집이 먼저 갱신한 원문입니다. 처음부터 다시 수집하세요."]);
+    }
+
+    const changedOnly = buildRelayPrompt({ sourceChanges: [{ sourceId: "jira:A-1", previousRevision: "3", revision: "4" }] });
+    expect(changedOnly).toBe(`${CHANGED_SOURCES}\n- jira:A-1: revision 3 → 4`);
   });
 
   it("새 입력이 없는 계속 턴은 한 줄이다", () => {
@@ -145,8 +178,8 @@ describe("역할별 원문 왕복 프롬프트", () => {
       messages: [{ sequence: 5, actor: "user", kind: "decision", body: "중재자 결정 본문" },
         { sequence: 10, actor: "system", kind: "workflow-mode", body: "작업 방식이 planned 에서 ticket 로 바뀌었습니다. 사유: 작은 수정" }],
       plan: { status: "current", version: "v2", snapshotPath: "/p/v2", diffPath: "/p/v2.diff" },
-      sourceChanges: [{ sourceId: "jira:A-1", previousRevision: "3", revision: "4", previousHash: "h3", hash: "h4", changePath: "/s/a.diff" },
-        { sourceId: "figma:9", error: "429" }],
+      sourceChanges: [{ sourceId: "jira:A-1", previousRevision: "3", revision: "4", previousHash: "h3", hash: "h4", changePath: "/s/a.diff" }],
+      sourceErrors: [{ sourceId: "figma:9", error: "429" }],
       checks: [{ id: "npm test", status: "failed", summary: "2 failed" }],
     });
     const broken = relayFactsFrom([event(3, "system", "깨진 표식", { workerFact: { kind: "source-change" } })]);

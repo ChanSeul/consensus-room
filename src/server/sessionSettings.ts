@@ -65,7 +65,7 @@ export function updateSessionSettings(db: ConsensusDatabase, topicId: string, in
       const problem = routeSupport(candidate, designReadRequested(db, topicId, route.job));
       if (problem) fail(problem);
       const profile = AgentProfileInputSchema.parse({ id: `session-settings:${randomUUID()}`, provider: route.provider,
-        model: input.model, effort: input.effort, options: route.options,
+        model: input.model, effort: input.effort, options: route.profileOptions ?? route.options,
         ...(input.criteria ? { reviewCriteria: { ...input.criteria, additionalText: redactSecrets(input.criteria.additionalText) } }
           : route.reviewCriteria ? { reviewCriteria: route.reviewCriteria } : {}) });
       db.roles.createProfile(profile);

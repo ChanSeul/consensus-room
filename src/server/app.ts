@@ -58,7 +58,7 @@ import { scanWorktreeActivity } from "./activity.js";
 import { VerificationService, completeVerificationSchema } from "./verifications.js";
 import { EvidenceService, withEvidence } from "./evidence/service.js";
 import type { WorkerFact } from "../shared/turnContract.js";
-import { profileSuitability, routingView } from "./turnRouting.js";
+import { codexSpeedView, profileSuitability, routingView } from "./turnRouting.js";
 import { guardRunnerControl } from "./adapters/turnPolicy.js";
 import { RestEvidenceConnector, evidenceCredentials, type EvidenceConnector } from "./evidence/connectors.js";
 import { registerEvidenceRoutes } from "./evidence/routes.js";
@@ -639,6 +639,49 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       const result = updateSessionSettings(database, request.params.id, input);
       database.events.emit("mediation-change");
       return result;
+    });
+  });
+
+  // Codex 속도(2026-10-18 사용자 지시 "중재자한테 fast mode on/off 부탁하면 바로 처리"): 토픽·묶음의 모든 Codex 작업 serviceTier 를 한 번에 바꾼다.
+  // 모델·추론 강도·리뷰 기준과 역할 배정은 그대로다. 중재자 요청은 preHandler 의 배정 검사(토픽 경로는 그 토픽, 묶음 경로는 진행 중 연결 토픽)를
+  // 그대로 지난다 — 사용자 결정: 중재자는 토픽·묶음까지. 경로는 턴마다 정하므로 다음 턴부터 적용되고 실행 중인 턴은 끊지 않는다.
+  const CodexSpeedInputSchema = z.object({ mode: z.enum(["fast", "standard", "inherit"]), reason: z.string().trim().min(1).max(2000) }).strict();
+  type CodexSpeedInput = z.infer<typeof CodexSpeedInputSchema>;
+  const speedActor = (request: FastifyRequest): "user" | "mediator" => request.headers["x-consensus-actor"] === "mediator" ? "mediator" : "user";
+  const codexSpeedEvent = (topicId: string, label: string, input: CodexSpeedInput, actor: "user" | "mediator") => {
+    const topic = database.getTopic(topicId);
+    database.appendEvent({ topicId, actor: "system", kind: "system", state: topic.state,
+      body: `Codex 속도 ${label}: ${input.mode === "inherit" ? "상속(설정 해제)" : input.mode} — ${actor === "mediator" ? "중재자" : "사용자"} 요청 사유: ${input.reason}`,
+      payload: { codexSpeed: { label, mode: input.mode, reason: input.reason, actor } } });
+  };
+  app.get<{ Params: { id: string } }>("/api/topics/:id/codex-speed", async request => codexSpeedView(database, request.params.id));
+  app.post<{ Params: { id: string } }>("/api/topics/:id/codex-speed", async (request, reply) => {
+    const input = CodexSpeedInputSchema.parse(request.body), actor = speedActor(request), topicId = request.params.id;
+    database.getTopic(topicId);
+    return runIdempotent(request, reply, globalLedger(database, `codex-speed:topic:${topicId}`), 200, () => {
+      database.codexSpeed.set(`topic:${topicId}`, input.mode, input.reason, actor);
+      codexSpeedEvent(topicId, "토픽", input, actor);
+      database.events.emit("mediation-change");
+      return codexSpeedView(database, topicId);
+    });
+  });
+  // 묶음 설정은 연결된 단계 토픽 모두와 앞으로 연결될 단계에 적용된다(토픽 설정이 있으면 그 토픽은 토픽 설정이 앞선다).
+  const groupSpeedView = (groupId: string) => {
+    const group = database.workGroups.get(groupId);
+    return { groupId, appliesTo: "next-turn" as const, setting: database.codexSpeed.setting(`group:${groupId}`),
+      stages: Object.entries(group.links).map(([stageId, link]) => ({ stageId, ...codexSpeedView(database, link.topicId) })) };
+  };
+  app.get<{ Params: { id: string } }>("/api/work-groups/:id/codex-speed", async request => groupSpeedView(request.params.id));
+  app.post<{ Params: { id: string } }>("/api/work-groups/:id/codex-speed", async (request, reply) => {
+    const input = CodexSpeedInputSchema.parse(request.body), actor = speedActor(request), groupId = request.params.id;
+    const group = database.workGroups.get(groupId);
+    return runIdempotent(request, reply, globalLedger(database, `codex-speed:group:${groupId}`), 200, () => {
+      database.codexSpeed.set(`group:${groupId}`, input.mode, input.reason, actor);
+      for (const link of Object.values(group.links)) {
+        if (database.getTopic(link.topicId).state !== "CLOSED") codexSpeedEvent(link.topicId, `묶음 ${groupId}`, input, actor);
+      }
+      database.events.emit("mediation-change");
+      return groupSpeedView(groupId);
     });
   });
 

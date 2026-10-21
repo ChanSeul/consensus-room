@@ -5,7 +5,7 @@ import { readdirSync, lstatSync, realpathSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
   AgentResultJsonSchema,
   PlanRepairJsonSchema, type PlanRepair,
@@ -15,15 +15,15 @@ import {
 import { EXECUTION_POLICY_NOTE } from "../../shared/prompts.js";
 import type { AgentAdapter, CommandRunner, CommandResult, CreatedSession, SessionTurn } from "../types.js";
 import { agentEnvironment } from "../security.js";
-import { ProjectMemoryReader, type MemoryReaderOptions } from "../projectMemory.js";
+import { ProjectMemoryReader, type MemoryDelivery, type MemoryReaderOptions } from "../projectMemory.js";
 import { readAppliedInstructions } from "../projectInstructions.js";
-import { agentRunError, parsePlanRepair, parseAgentResult, parseTurnEnvelope, isClaudeFinalResult, isZeroTurnResult, UnverifiedAgentResult } from "./resultParser.js";
+import { agentRunError, parsePlanRepair, parseAgentResult, parseTurnEnvelope, isClaudeFinalResult, isModelOrToolActivity, isZeroTurnResult, UnverifiedAgentResult } from "./resultParser.js";
 import { ExecutionMetrics, readClaudeUsageBaseline } from "./executionMetrics.js";
 import { captureFigma } from "./figmaCapture.js";
 import { createToolTimeMeter } from "./toolTime.js";
 import { resolveSupportedTurn, runnerControlPaths } from "./turnPolicy.js";
 import { TOOL_TREE_RUNNER_NOTE } from "../toolTree.js";
-import type { TurnAccess } from "../../shared/roles.js";
+import type { TurnAccess, TurnJob } from "../../shared/roles.js";
 import { resolveHostExecutable } from "../hostRuntime.js";
 import { reportBackgroundFailure } from "../backgroundTask.js";
 
@@ -31,6 +31,8 @@ export interface ClaudeAdapterOptions {
   memoryReaderOptions?: MemoryReaderOptions;
   // 정책 3(자기 규칙 변경 차단) 방어 심층화: sandbox 기본 거부에만 의존하지 않고 명시 deny로 회귀를 막는다.
   protectedWritePaths?: readonly string[];
+  // 기본 읽기를 거부할 경로(sandbox denyRead). 메모리 본문 사본 루트처럼 홈 밖 데이터 폴더에 있을 수 있는 보호 경로를 메모리 주입 여부와 관계없이 막는다.
+  protectedReadPaths?: readonly string[];
   // v1 MCP allowlist: Figma Dev Mode 서버의 읽기 메서드만. null이면 MCP 전면 차단(기존과 동일).
   figmaMcpUrl?: string | null;
   // 서버가 검토한 native skill 디렉터리만 관리형 플러그인 아래에 연결한다(codex 미러).
@@ -86,6 +88,28 @@ const FINAL_RESULT_TIMEOUT_MS = 120_000;
 export const XCODEBUILD_CALL_CONTRACT = "xcodebuild 호출 방식: 이 턴에서 빌드할 때는 맨 이름 `xcodebuild` 또는 `xcrun xcodebuild`로 시작하는 단독 Bash 호출을 사용하세요. "
   + "cd·변수 대입·복사 같은 준비 명령은 별도 Bash 호출로 먼저 하고, 빌드 호출에는 접두·`&&`·`;` 연결·파이프·리디렉션을 붙이지 마세요. "
   + "위치는 cd 대신 `-workspace`·`-project`·`-derivedDataPath` 같은 경로 인자에 리터럴 절대 경로로 주세요.";
+
+// 같은 턴 대기 안내(엔진 결함 15d9ac40, CR Engine Advisor 자문 36 §2). `-p --json-schema` 턴은 모델이 응답을 끝내면 완료 알림보다 먼저 CLI 가 결과
+// 제출을 요구한다(`[structured-output-enforce]`). 2026-10-19 러너 기록에는 제출 뒤 같은 프로세스가 알림을 받아 이어 일하고 다시 제출한 턴도 있다. 그러나
+// 그 뒤 결과가 엔진이 받은 턴 결과에 들어가지 않은 턴이 있고, 백그라운드 Workflow 는 끝나기 전에 멈췄다(stopped 3건). 응답 종료·StructuredOutput 호출·
+// CLI result 출력·프로세스 종료는 서로 다른 경계라(자문 42) 한 시점으로 묶어 단정하지 않는다. 여러 result 의 프로세스 정리·결과 결속은 별도 수리 대상이다.
+// CLI 2.1.301 은 `--tools` 의 TaskOutput 을 노출하지 않는다(2026-10-20 실제 러너 요청의 도구 목록·init 실측). 그래서 응답 종료·완료 알림을 대기 방법으로
+// 안내하지 않고, foreground 실행과 결과 파일 + foreground 대기(99bff57c 러너의 python 대기, 71818d7f 러너의 foreground xcodebuild 실측)만 안내한다.
+// Bash 가 있는 모든 도구 턴에 싣는다 — 팬아웃이 없어도 run_in_background 는 같은 문제를 낸다.
+export function inTurnWaitNote(fanout: boolean): string {
+  return [
+    "기다리는 방법: 작업 결과는 이 턴 안에서 받으세요. 응답을 끝내면 작업 결과보다 먼저 CLI 가 결과 제출을 요구합니다. "
+      + "제출 뒤에 받은 결과는 이번 턴 결과에 반영된다는 보장이 없고, 백그라운드 Workflow 는 끝나기 전에 멈출 수 있습니다.",
+    "빌드·테스트 같은 긴 명령은 `run_in_background` 없이 foreground 로 실행해 그 호출에서 끝과 종료 코드를 받으세요(Bash `timeout` 최대 600000).",
+    "백그라운드 작업은 끝날 때 결과 파일(실패하면 실패 사유)을 이 턴의 임시 폴더에 쓰게 하고, foreground Bash 호출 한 번으로 그 파일을 기다리세요.",
+    "대기 루프는 상한 시간을 둔 한 명령(예: python3 대기 루프)으로 쓰세요. 셸 `sleep` 단독 대기는 CLI 가 막습니다.",
+    "상한까지 완료 결과를 확인하지 못하면 성공으로 보지 말고 미완료로 다루세요. 파일이 없다는 것은 아직 실행 중이라는 뜻일 수도 있습니다. 실패 결과를 실제로 확인했을 때만 실패로 보고하세요.",
+    "더 기다릴 수 있으면 같은 대기를 다시 호출하고, 이 턴에 끝낼 수 없으면 끝나지 않은 작업과 이유를 결과에 적으세요. 결과는 한 번만 제출합니다.",
+    // Workflow 는 검토 → 반증 → 취합처럼 여러 단계일 수 있다 — 먼저 끝난 단계의 파일을 전체 완료로 오인하지 않게 한다(자문 39 §2). 완료 감시 장치는 두지 않는다.
+    ...(fanout ? ["Workflow 는 즉시 반환하고 백그라운드로만 돕니다. 검토 → 반증 → 취합처럼 여러 단계일 수 있으므로, 일부 에이전트의 파일이 생긴 것만으로 전체 완료를 판정하지 마세요. "
+      + "필수 단계와 최종 산출물을 맡은 에이전트 지시의 마지막 단계에 결과 파일 경로(이 턴의 임시 폴더)를 적어 넘기고, 이번 실행의 필수 단계와 최종 산출물이 끝났는지 위 방법으로 확인하세요."] : []),
+  ].join(" ");
+}
 
 // 이 턴의 임시 폴더(actionTemp) 안내 — 샌드박스 Bash 의 $TMPDIR 은 CLI 가 사용자별 공용 폴더(/tmp/claude-<uid>)로 바꾸므로 엔진이 넘긴 TMPDIR 과
 // 다르고, 그 폴더에는 도구 규칙이 없다(엔진 결함 example-temp-access). 접근 수준에 열린 도구만 적는다 — 읽기 턴(계획자 턴 포함) 문구는 Write·Edit 를 말하지 않는다.
@@ -243,7 +267,11 @@ export class ClaudeAdapter implements AgentAdapter {
       // 실제 경로로 푼다(/var → /private/var) — sandbox·도구 규칙·러너 안내·TMPDIR 이 한 철자를 써서, 도구 규칙 대조가 CLI 의 링크 해석과
       // 무관하게 맞는다(Codex 와 같은 방식, 엔진 결함 example-temp-access).
       const actionTemp = await realpath(createdTemp);
-      const permissionMode = policy.planMode ? "plan" : "dontAsk";
+      // CLI 권한 모드는 planMode 입력과 관계없이 dontAsk 다. CLI plan 모드는 읽기 도구를 permissions.allow 밖에서도 승인해, 경로 한정 Read 규칙
+      // 밖의 비선택 메모리 사본·홈 파일을 열었다(cr-fix-8 프로브 2026-10-20, CLI 2.1.301). planMode 입력(turnPolicy)은 그대로 받는다 — 계획 턴의
+      // 쓰기 금지는 --tools(Edit·Write 없음)·Edit·Write deny·sandbox denyWrite 가 맡고, 승인된 쓰기 자리는 턴 임시 폴더(와 계획 폴더 턴의 계획 폴더)다.
+      // CLI plan 모드의 다른 행동 제한(읽기 전용 셸 명령만 등)을 대신하지는 않는다. 엔진 호출자는 2026-10-09(1f09662·a3d658b) 이후 없고 런타임 입력으로만 온다.
+      const permissionMode = "dontAsk";
       const executionSettings = turn.settings ?? DEFAULT_AGENT_SETTINGS.claude;
       const defaultWindow = policy.access === "write" ? RUNNER_AUTO_COMPACT_WINDOW.implementation : RUNNER_AUTO_COMPACT_WINDOW.planning;
       const compactWindow = policy.tools !== "none"
@@ -260,6 +288,14 @@ export class ClaudeAdapter implements AgentAdapter {
       // 쓰기 턴은 코드 쓰기 접근과 웹이 결합해 유출 표면이 가장 커서 정책이 닫는다(2026-08-31 Codex 지적, 정책 c).
       const baseTools = "Read,Glob,Grep,Bash,Skill";
       const { pluginDirectory, skillSourceDirectories, skillNames } = await this.prepareManagedPlugin();
+      // 메모리 문서는 세션이 처음 만들어질 때 한 번만 주입한다. resume 턴은 세션이 이미 그 문서를
+      // 기억하고 있고, 매 턴 다시 붙이면 턴당 ~20K자가 중복 과금된다(2026-08-30 실측: 55자 프롬프트가
+      // 20,735자로 불어남). protocolOnly 턴은 판단에 메모리가 필요 없어 새 세션이어도 주입하지 않는다.
+      // 트레이드오프: 주제 진행 중 메모리 문서가 갱신돼도 기존 세션은 예전 내용을 기억한다 — resume 매니페스트가 그 SHA 의 본문 사본 경로를 주고, 그 파일만
+      // 이번 턴 읽기로 연다(엔진 결함 dffeb33f). 그래서 인자(--settings) 조립 전에 계산한다.
+      // 예외 하나(E3-4c F004): 프로토콜 턴이 만든 세션은 생성 턴에 본문을 받지 않았다 — 엔진이 그 세션의 첫 일반 resume 에 memoryBodies 를 실으면 그 resume 에
+      // 한 번 싣는다(매니페스트 없이). 그 뒤 resume 은 다시 매니페스트만이다.
+      const memory = await this.memoryDelivery(turn, job, protocolOnly, newSession);
       const args = [
         "-p",
         "--model", executionSettings.model,
@@ -281,9 +317,13 @@ export class ClaudeAdapter implements AgentAdapter {
           {
             fanout: policy.fanout,
             protectedWritePaths: this.options.protectedWritePaths,
+            // 메모리 본문 사본 루트는 데이터 폴더가 홈 밖이어도, 이 어댑터가 메모리를 싣지 않아도 기본 읽기를 거부한다 — 이번 턴에 고른 사본 파일만
+            // readablePaths 로 다시 연다(F003). 판독기의 사본 폴더도 함께 막아, 직접 만든 어댑터가 옵션 하나만 줘도 경계가 남게 한다.
+            protectedReadPaths: [...new Set([...(this.options.protectedReadPaths ?? []),
+              ...(this.options.memoryReaderOptions?.snapshotDirectory ? [this.options.memoryReaderOptions.snapshotDirectory] : [])])],
             figmaMcpEnabled: Boolean(figmaMcpUrl),
             skillSourceDirectories,
-            readablePaths: turn.readablePaths,
+            readablePaths: [...(turn.readablePaths ?? []), ...memory.readablePaths],
             planDirectory: planDirectory ?? undefined,
             ultracode: providerOptions.ultracode,
             autoCompactWindow: compactWindow,
@@ -298,7 +338,8 @@ export class ClaudeAdapter implements AgentAdapter {
           baseTools,
           ...(policy.tools === "write" || planDirectory ? ["Edit", "Write"] : []),
           ...(policy.web ? ["WebSearch", "WebFetch"] : []),
-          ...(policy.fanout ? ["Workflow", "TaskOutput"] : []),
+          // TaskOutput 은 넣지 않는다 — CLI 2.1.301 이 노출하지 않는다(inTurnWaitNote).
+          ...(policy.fanout ? ["Workflow"] : []),
         ].join(","),
         ...(pluginDirectory ? ["--plugin-dir", pluginDirectory] : []),
         "--permission-mode", permissionMode,
@@ -317,18 +358,9 @@ export class ClaudeAdapter implements AgentAdapter {
           workspace, fileName: "CLAUDE.md", repositoryPath: this.options.repositoryPath ?? null,
           globalPath: join(homedir(), ".claude", "CLAUDE.md"), injectWorkspaceFile: true,
         });
-      // 메모리 문서는 세션이 처음 만들어질 때 한 번만 주입한다. resume 턴은 세션이 이미 그 문서를
-      // 기억하고 있고, 매 턴 다시 붙이면 턴당 ~20K자가 중복 과금된다(2026-08-30 실측: 55자 프롬프트가
-      // 20,735자로 불어남). protocolOnly 턴은 판단에 메모리가 필요 없어 새 세션이어도 주입하지 않는다.
-      // 트레이드오프: 주제 진행 중 메모리 문서가 갱신돼도 기존 세션은 예전 내용을 기억한다.
-      // 예외 하나(E3-4c F004): 프로토콜 턴이 만든 세션은 생성 턴에 본문을 받지 않았다 — 엔진이 그 세션의 첫 일반 resume 에 memoryBodies 를 실으면 그 resume 에
-      // 한 번 싣는다(매니페스트 없이). 그 뒤 resume 은 다시 매니페스트만이다.
-      const injectMemory = Boolean(this.memory) && !protocolOnly && (newSession || turn.memoryBodies === true);
-      const enriched = injectMemory
-        ? await this.memory!.buildPrompt(turn.prompt, this.role, turn.signal, turnContract(job).memoryUpdates, turn.memorySearch)
-        : await this.withMemoryManifest(turn, protocolOnly);
+      const enriched = memory.text;
       const instructionText = [EXECUTION_POLICY_NOTE,
-        ...(policy.fanout ? ["Workflow 결과는 완료 알림 또는 TaskOutput(task_id, block=true)으로 기다리세요. 로그·시각을 반복 조회하지 말고, 필요한 하위 작업이 끝난 뒤 최종 결과를 제출하세요."] : []),
+        ...(policy.tools !== "none" ? [inTurnWaitNote(policy.fanout)] : []),
         ...(policy.tools !== "none" && skillNames.length ? [`사용 가능한 관리형 스킬(Skill에 정확한 이름 전달): ${skillNames.join(", ")}`] : []),
         ...instructions].join("\n\n");
       const instructionHash = createHash("sha256").update(instructionText).digest("hex");
@@ -400,21 +432,26 @@ export class ClaudeAdapter implements AgentAdapter {
           try { turn.onUsage?.({ ...metrics.snapshot(toolTime.summary(), "progress"), autoCompactWindowTokens: compactWindow }); } catch { /* observer is non-fatal */ }
         }
       }, 10_000);
+      // 이 호출의 줄을 스트림(onJSONLine)으로 받았는가 — SpawnCommandRunner 는 파싱한 모든 줄을 알린 뒤 같은 줄을 jsonLines 로 돌려준다.
+      let streamObserved = false;
       try {
       const output = await this.runner.run({
         beforeSpawn: turn.beforeSpawn, admitSync: turn.admitSync,
         onInterruptedOutput: turn.onInterruptedOutput,
         command: claude, args, cwd: workspace, stdin,
         signal: turn.signal, onSpawn: spawned => { turn.onProcessSpawn?.(spawned); observeEnvironment(turn, "claude", policy, executionSettings, `Claude ${permissionMode}; sandbox enabled`, spawned, newSession ? "create" : "resume"); },
-        onJSONLine: (value, at) => { toolTime.observe(value, at); metrics.observe(value); observeDesign(value); observeInstructionContext(value); },
+        onJSONLine: (value, at) => { streamObserved = true; toolTime.observe(value, at); metrics.observe(value); observeDesign(value); observeInstructionContext(value); },
         // stream-json 의 마지막 줄은 {"type":"result"} 다. 그 뒤 2분 안에 프로세스가 안 끝나면 hang 으로 보고 정리한다.
-        // 합성 0턴 성공 result 는 뒤에 실제 턴이 이어질 수 있어 시작점에서 뺀다(isClaudeFinalResult).
+        // 합성 0턴 성공 result 는 뒤에 실제 턴이 이어질 수 있어 시작점에서 뺀다(isClaudeFinalResult). result 뒤 모델·도구 작업이 이어지면 그 result 는
+        // 최종이 아니다 — 타이머를 끄고 다음 최종 result 부터 다시 잰다(isModelOrToolActivity, 2026-10-19 71818d7f 실측).
         finalResultTimeoutMs: FINAL_RESULT_TIMEOUT_MS,
         isFinalResult: isClaudeFinalResult,
+        invalidatesFinalResult: isModelOrToolActivity,
         environment,
       });
-      // 테스트용 runner가 onJSONLine을 생략해도 최종 버퍼를 한 번 관찰한다.
-      for (const value of output.jsonLines) { metrics.observe(value); observeDesign(value); observeInstructionContext(value); }
+      // 테스트용 runner가 onJSONLine을 생략해도 최종 버퍼를 한 번 관찰한다. 스트림으로 이미 관찰한 계측기에는 다시 넣지 않는다 — 계측기는 result 뒤
+      // 작업 줄을 후속 작업으로 보므로, 재관찰한 result 앞의 줄이 확정을 풀게 된다(engine-review 1d47a14d F001).
+      for (const value of output.jsonLines) { if (!streamObserved) metrics.observe(value); observeDesign(value); observeInstructionContext(value); }
       recordFinal();
       if (output.exitCode !== 0) {
         throw agentRunError("claude", output.exitCode, output.stderr, output.stdout);
@@ -457,15 +494,21 @@ export class ClaudeAdapter implements AgentAdapter {
   }
 
 
-  // resume·fork 턴에는 본문 대신 매니페스트만 덧붙인다. protocolOnly 턴(resolveTurn 이 job 에서 유도한 값)은 메모리 자체가 필요 없다.
-  private async withMemoryManifest(
+  // 본문을 싣는 턴(생성·memoryBodies)은 본문을, resume·fork 턴은 매니페스트만 덧붙인다. protocolOnly 턴(resolveTurn 이 job 에서 유도한 값)은 메모리 자체가
+  // 필요 없다. readablePaths 는 이번 턴에 고른 문서의 본문 사본뿐이다 — 이전 턴 경로를 누적하지 않는다.
+  private async memoryDelivery(
     turn: Omit<SessionTurn, "sessionId"> | SessionTurn,
+    job: TurnJob,
     protocolOnly: boolean,
-  ): Promise<string> {
-    if (!this.memory || protocolOnly) return turn.prompt;
-    const manifest = await this.memory.buildManifest(turn.prompt, this.role, turn.signal,
-      turnContract(resolveSupportedTurn("claude", turn).job).memoryUpdates, turn.memorySearch);
-    return manifest ? `${turn.prompt}\n\n${manifest}` : turn.prompt;
+    newSession: boolean,
+  ): Promise<MemoryDelivery> {
+    if (!this.memory || protocolOnly) return { text: turn.prompt, readablePaths: [] };
+    const allowUpdates = turnContract(job).memoryUpdates;
+    if (newSession || turn.memoryBodies === true) {
+      return this.memory.buildPromptDelivery(turn.prompt, this.role, turn.signal, allowUpdates, turn.memorySearch);
+    }
+    const manifest = await this.memory.buildManifestDelivery(turn.prompt, this.role, turn.signal, allowUpdates, turn.memorySearch);
+    return { text: manifest.text ? `${turn.prompt}\n\n${manifest.text}` : turn.prompt, readablePaths: manifest.readablePaths };
   }
 
   // 플러그인 홈은 유지하되 구성은 턴마다 다시 맞춘다. 외부에서 스킬이 추가·오염돼도 다음 턴에 원상 복구된다(codex 미러).
@@ -555,6 +598,17 @@ function realPathOrGiven(path: string): string {
   }
 }
 
+// 없는 경로도 커널이 볼 실제 경로로 푼다 — 가장 가까운 실제 조상의 실제 경로에 남은 이름을 붙인다(/tmp → /private/tmp). CLI 는 있는 규칙 경로만
+// 실제 경로로 바꾸므로(E2c), 나중에 생길 폴더의 거부가 링크 철자 때문에 빗나가지 않게 한다.
+function canonicalPath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    const parent = dirname(path);
+    return parent === path ? path : join(canonicalPath(parent), basename(path));
+  }
+}
+
 // tuist가 매니페스트 파싱 자식에 TMPDIR을 전달하지 않아 자식이 Darwin 사용자 임시 디렉터리로
 // 폴백한다(2026-08-31 S0.2 실측: env -u TMPDIR로 재현, 쓰기 거부 시 swift가 permissionDenied로 죽어
 // tuist install/generate 둘 다 exit 1). 사용자별 경로라 getconf로 1회 계산한다.
@@ -572,6 +626,9 @@ export function buildIsolationSettings(
   implementation = true,
   options: {
     protectedWritePaths?: readonly string[];
+    // 기본 읽기를 거부할 경로(denyRead). sandbox 의 기본 읽기 거부는 홈과 인증 파일뿐이라 홈 밖 데이터 폴더 아래의 보호 경로는 따로 막는다. 그 안의 허용
+    // 파일은 readablePaths 가 allowRead 로 다시 연다(홈 거부 + 작업 폴더 허용과 같은 방식). 아직 없는 경로도 막도록 가장 가까운 실제 조상으로 푼다.
+    protectedReadPaths?: readonly string[];
     figmaMcpEnabled?: boolean;
     skillSourceDirectories?: readonly string[];
     // 턴 단위 추가 읽기 허용(주제 plan.md 등). 쓰기는 열지 않는다 — denyWrite(dataDirectory carve-out)가 그대로 막는다.
@@ -649,15 +706,16 @@ export function buildIsolationSettings(
         // 만든 파일을 Read 가 거부한다(엔진 결함 example-temp-access, 2026-10-13: 하위 에이전트 결과를 Read 로 읽다 막힘). 계획자 턴의 쓰기는 계획 폴더뿐이다.
         `Read(${permissionPath(actionTemp)}/**)`,
         ...(implementation ? [`Edit(${permissionPath(actionTemp)}/**)`, `Write(${permissionPath(actionTemp)}/**)`] : []),
-        "Glob",
-        "Grep",
+        // Grep·Glob 은 경로 없는 allow 를 두지 않는다. 경로 없는 규칙은 모든 경로와 맞아, 맞는 deny 가 없는 곳(Read allow 밖의 메모리 사본 루트 등)의
+        // 내용·이름을 그대로 열었다(cr-fix-8 프로브 2026-10-20, CLI 2.1.301: 세 배치 모두 비선택 사본 내용·루트 목록 노출). 두 도구의 경로 판정은
+        // 위 Read 경로 규칙에 맡긴다(문서: Read 규칙을 Grep·Glob 에 best-effort 로 적용, Glob(경로) 규칙은 검사하지 않음). 도구 자체는 --tools 에 남는다.
         "Bash",
         // 도구가 목록에 있어도 allow 규칙이 없으면 plan/dontAsk 모드가 자동 거부한다(실측). 웹 도구는
         // 계획 턴에만 명시로 연다(정책 c — 구현 턴은 --tools에서도 빠져 이중으로 닫힌다).
         ...(implementation ? [] : ["WebSearch", "WebFetch"]),
         "Skill",
         // 도구 목록에 Workflow가 있어도 allow 규칙이 없으면 dontAsk가 거부한다(실측: 계획 없이 열었을 때 차단됨). 팬아웃을 연 턴에서만 둔다.
-        ...(fanout ? ["Workflow", "TaskOutput"] : []),
+        ...(fanout ? ["Workflow"] : []),
         ...figmaRules.allow,
       ],
       deny: [...editRules, ...figmaRules.deny, `Read(${permissionPath(credentialPath)})`],
@@ -707,7 +765,7 @@ export function buildIsolationSettings(
         denyWrite: implementation
           ? [...protectedGitPaths, ...protectedRulePaths.flatMap((path) => carveOutWorkspace(path, workspace)), ...runnerControlPaths(workspace)]
           : [workspace, ...protectedGitPaths, ...(planDirectory ? protectedRulePaths.flatMap((path) => carveOutWorkspace(path, planDirectory)) : protectedRulePaths)],
-        denyRead: [home, credentialPath],
+        denyRead: [home, credentialPath, ...(options.protectedReadPaths ?? []).map(canonicalPath)],
         allowRead: [
           workspace,
           actionTemp,

@@ -44,9 +44,12 @@ export interface CommandSpec {
   onSpawn?: (process: SpawnedProcess) => void;
   maxOutputBytes?: number;
   // 최종 결과 줄(isFinalResult 가 true 인 JSON 줄)을 받은 뒤 이 시간 안에 프로세스가 끝나지 않으면 SIGTERM 하고
-  // 이미 받은 결과를 유효 처리한다(2026-09-03: StructuredOutput 뒤 13분 유휴 hang 실측).
+  // 이미 받은 결과를 유효 처리한다(2026-09-03: StructuredOutput 뒤 13분 유휴 hang 실측). 시간은 마지막 최종 결과 줄부터 잰다.
   finalResultTimeoutMs?: number;
   isFinalResult?: (value: unknown) => boolean;
+  // 최종 결과 줄 뒤에 오면 그 결과를 더 이상 최종으로 보지 않는 줄(모델·도구 작업). 정리 타이머를 끄고, 타이머가 종료시킨 실행도 정규화하지 않는다
+  // (2026-10-19 71818d7f 실측: 첫 result 뒤 같은 프로세스가 작업을 이어 갔는데 첫 result 부터 잰 타이머가 끊었고 그 result 가 채택됐다).
+  invalidatesFinalResult?: (value: unknown) => boolean;
   // stream-json 줄이 파싱되는 즉시 도착 시각과 함께 알린다(도구 실행 시간 측정, adapters/toolTime.ts). ring buffer 와 무관.
   onJSONLine?: (value: unknown, at: number) => void;
 }
@@ -64,7 +67,7 @@ export interface CommandResult {
   stdout: string;
   stderr: string;
   jsonLines: unknown[];
-  // 최종 결과 수신 뒤 유휴 타임아웃으로 종료시킨 실행 — exitCode 는 0 으로 정규화된다.
+  // 최종 결과 수신 뒤 유휴 타임아웃으로 종료시킨 실행 — exitCode 는 0 으로 정규화된다. 종료 뒤에 작업 줄이 와 그 결과가 최종이 아니게 되면 붙지 않는다.
   terminatedAfterResult?: boolean;
 }
 

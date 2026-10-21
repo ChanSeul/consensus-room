@@ -264,6 +264,32 @@ it("closes an engine defect only for the user: a mediator is refused and nothing
   await app.close();
 });
 
+it("closes an engine defect as not needing an engine repair only for the user, with its kind, finding, basis and source", async () => {
+  const { app, database } = await makeApp();
+  draftTopic(database, "engine-report");
+  const target = database.engineDefects.enqueue("engine-report", { key: "outside", title: "App simulator error", evidence: "Observed", workaround: "" });
+  const url = `/api/engine-defects/${target.id}/close`;
+  const payload = { reason: "not_applicable", kind: "not_engine", finding: "The app checkout's simulator failed, not the engine.",
+    basis: "triage.md 2", decidedBy: "CR Engine Advisor 자문 36 §2" };
+  const token = { "x-consensus-token": "launch-token-for-test" };
+  const closures = () => database.getTimeline("engine-report").filter(event => event.body.startsWith("엔진 결함 종결"));
+  expect((await app.inject({ method: "POST", url, payload })).statusCode).toBe(401);
+  expect((await app.inject({ method: "POST", url, payload, headers: { ...token, "x-consensus-actor": "mediator" } })).statusCode).toBe(403);
+  // The judgment needs its basis, and a cause not yet confirmed has no kind.
+  const { basis: _basis, ...withoutBasis } = payload;
+  expect((await app.inject({ method: "POST", url, payload: withoutBasis, headers: token })).statusCode).toBe(400);
+  expect((await app.inject({ method: "POST", url, payload: { ...payload, kind: "cause_unknown" }, headers: token })).statusCode).toBe(400);
+  expect(database.engineDefects.get(target.id)).toEqual(target);
+  expect(closures()).toHaveLength(0);
+  const user = await app.inject({ method: "POST", url, payload, headers: token });
+  expect(user.statusCode).toBe(200);
+  expect(user.json()).toMatchObject({ status: "closed", title: target.title, evidence: target.evidence,
+    closure: { ...payload, actor: "user" } });
+  expect(closures()).toHaveLength(1);
+  expect(closures()[0].body).toContain("비수리 종결(not_engine)");
+  await app.close();
+});
+
 it("requires authentication and an idempotency key to opt an idle topic into controlled planning", async () => {
   const { app, database } = await makeApp();
   draftTopic(database, "planning-topic");

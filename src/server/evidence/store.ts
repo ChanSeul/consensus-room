@@ -14,6 +14,12 @@ export { evidenceHash, stableJSON } from "./identity.js";
 import { SqliteEvidenceReadLifecycle, type EvidenceReadLifecycle, type EvidenceReadRequest, type EvidenceReadEvent, type EvidenceReadLinks } from "./readLifecycle.js";
 
 const fail = (message: string): never => { throw Object.assign(new Error(message), { statusCode: 409 }); };
+// A collection assembled against an older version of its source: another collection stored the source after this one took its
+// first page. The older collection is not stored. It is not a failed read either, so the collector leaves the stored source as it is.
+export class EvidenceGenerationConflict extends Error {
+  readonly statusCode = 409;
+  constructor() { super("다른 수집이 먼저 갱신한 원문입니다. 처음부터 다시 수집하세요."); }
+}
 type Binding = Pick<Topic, "id" | "scopeGeneration" | "planEpoch" | "planSHA256">;
 const binding = (topic: Binding) => stableJSON([topic.scopeGeneration, topic.planEpoch, topic.planSHA256]);
 
@@ -508,7 +514,7 @@ export class EvidenceStore {
     if (ownsTransaction) this.db.exec("BEGIN IMMEDIATE");
     try {
       const source = this.check(id, input.checkId);
-      if (expectedGeneration !== undefined && expectedGeneration !== this.generation(id)) fail("다른 수집이 먼저 갱신한 원문입니다. 처음부터 다시 수집하세요.");
+      if (expectedGeneration !== undefined && expectedGeneration !== this.generation(id)) throw new EvidenceGenerationConflict();
       this.db.prepare("INSERT INTO evidence_source_versions VALUES (?,1) ON CONFLICT(id) DO UPDATE SET version=version+1").run(id);
       for (const image of images) this.db.prepare("INSERT OR IGNORE INTO evidence_images(hash,bytes) VALUES (?,?)").run(image.hash, image.bytes);
       for (const { id: _id, changedAt: _changed, ...unit } of units) this.db.prepare("INSERT OR IGNORE INTO evidence_units(hash,record) VALUES (?,?)").run(unit.contentHash, JSON.stringify(unit));

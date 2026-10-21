@@ -50,10 +50,13 @@ function ownership(config: RoomConfig): Ownership {
       : { state: "unknown", detail: "서버 프로세스 기록을 읽을 수 없습니다." };
   }
   const record = parsed as Partial<ServerRecord> | null;
+  // The recorded executable is the server's own Node, written with its identity. It is not compared with this CLI's
+  // process.execPath: a Node upgrade changes that path for the same server (engine-review 0d1b8c76 F003). The checkout,
+  // data directory and the live identity below decide ownership.
   if (!record || !Number.isInteger(record.pid) || record.pid! <= 1 || !Number.isInteger(record.pgid) || record.pgid! <= 1 ||
       typeof record.startedAt !== "string" || !record.startedAt || typeof record.commandLine !== "string" || !record.commandLine ||
       record.repositoryPath !== sourceRoot || record.dataDirectory !== resolve(config.dataDirectory) ||
-      typeof record.executable !== "string" || !isAbsolute(record.executable) || record.executable !== process.execPath) {
+      typeof record.executable !== "string" || !isAbsolute(record.executable)) {
     return { state: "unknown", detail: "프로세스 기록이 이 Consensus Room 소스·데이터 경로와 일치하지 않습니다." };
   }
   try {

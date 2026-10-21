@@ -4,7 +4,7 @@ import { z } from "zod";
 import type { ConsensusDatabase } from "./database.js";
 import type { CommandRunner } from "./types.js";
 import { agentEnvironment } from "./security.js";
-import { EngineDefectReportSchema, type EngineDefectClosureInput } from "../shared/engineDefects.js";
+import { EngineDefectReportSchema, type EngineDefectClosureInput, type EngineDefectNotApplicableKind } from "../shared/engineDefects.js";
 import { redactSecrets } from "../shared/workflow.js";
 
 export const EngineDefectInput = EngineDefectReportSchema;
@@ -21,7 +21,9 @@ export interface EngineDefect extends z.infer<typeof EngineDefectInput> {
   waiting?: string;
   // Why a person took this defect out of the queue (status closed). The defect and its history stay; the queue skips it.
   closure?: { reason: "fixed"; commit: string; note?: string; actor: "user"; at: string }
-    | { reason: "duplicate"; representativeId: string; note?: string; actor: "user"; at: string };
+    | { reason: "duplicate"; representativeId: string; note?: string; actor: "user"; at: string }
+    | { reason: "not_applicable"; kind: EngineDefectNotApplicableKind; finding: string; basis: string; decidedBy: string;
+      note?: string; actor: "user"; at: string };
   readyAt?: string; metrics?: { queueWaitMs?: number; applyWaitMs?: number; maintenanceLockMs?: number; reviewDurationMs?: number };
 }
 
@@ -69,8 +71,9 @@ export class EngineDefectStore {
   }
 }
 
-// A person's closure of a waiting defect: one already fixed by a commit the engine checkout contains, or a duplicate of
-// another defect. It reads git only to resolve that commit; it never runs a model, a review or a merge.
+// A person's closure of a waiting defect: one already fixed by a commit the engine checkout contains, a duplicate of
+// another defect, or one judged to need no engine repair. It reads git only to resolve that commit; it never runs a
+// model, a review or a merge. A not_applicable judgment is recorded as given, with its finding, basis and source.
 export class EngineDefectCloser {
   constructor(private readonly db: ConsensusDatabase, private readonly runner: CommandRunner,
     private readonly repository: string) {}
@@ -89,7 +92,7 @@ export class EngineDefectCloser {
       const commit = await this.mergedCommit(input.commit, refuse);
       closure = { reason: "fixed", commit, ...note, actor: "user", at: new Date().toISOString() };
       because = `이미 고쳐짐(${commit.slice(0, 12)})`;
-    } else {
+    } else if (input.reason === "duplicate") {
       if (input.representativeId === id) throw refuse("자기 자신을 대표 결함으로 지정할 수 없습니다.", 400);
       let representative: EngineDefect;
       try { representative = this.db.engineDefects.get(input.representativeId); }
@@ -100,6 +103,10 @@ export class EngineDefectCloser {
       }
       closure = { reason: "duplicate", representativeId: input.representativeId, ...note, actor: "user", at: new Date().toISOString() };
       because = `중복(대표 ${input.representativeId})`;
+    } else {
+      closure = { reason: "not_applicable", kind: input.kind, finding: redactSecrets(input.finding), basis: redactSecrets(input.basis),
+        decidedBy: redactSecrets(input.decidedBy), ...note, actor: "user", at: new Date().toISOString() };
+      because = `비수리 종결(${input.kind})`;
     }
     // The commit check awaited git, so another closure may have closed the defect meanwhile.
     const row = closable();
