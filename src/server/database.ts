@@ -1074,12 +1074,17 @@ export class ConsensusDatabase {
   }
 
   // 동결 통합 결과는 같은 커밋을 가진 어느 단계에서 push해도 전달 완료다. 이전 계약의 결과도 기존 인계 판정을 유지한다.
+  // 외부 경로로 반영된 결과는 사용자의 외부 전달 확인 영수증으로 인정한다 — 지금 동결 결과·통합 단계 토픽·deliveryBranch 와 맞는 것만이다.
+  // 전달 관측(deliveryObservations)은 판정에 쓰지 않는다.
   workGroupDelivered(group: WorkGroup): boolean {
     const integration = group.stages.find(stage => stage.kind === "integration");
     const link = integration && group.links[integration.id];
     if (!link) return false;
     const result = group.results?.[integration!.id];
-    if (result) return Object.values(group.links).some(link => this.getFlags(link.topicId).pushedOID === result.commitOID);
+    if (result) return Object.values(group.links).some(link => this.getFlags(link.topicId).pushedOID === result.commitOID)
+      || (group.deliveryConfirmations ?? []).some(confirmation => confirmation.resultSha === result.commitOID
+        && confirmation.integrationStageId === integration!.id && confirmation.integrationTopicId === result.topicId
+        && (!group.deliveryBranch || confirmation.branch === group.deliveryBranch));
     if (!group.stages.every(stage => group.links[stage.id])) return false;
     const topic = this.getTopic(link.topicId), flags = this.getFlags(link.topicId);
     return Boolean(topic.approvedPlanSHA256 && flags.reviewedTreeOID && flags.committedOID && flags.pushedOID === flags.committedOID);

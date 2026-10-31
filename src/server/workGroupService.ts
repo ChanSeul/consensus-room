@@ -1,5 +1,5 @@
 import { assertTopicParent } from "./topicStructure.js";
-import { dependencyClosure, DeliveryObservationInputSchema, stageReady, WorkGroupCreateOptionsSchema, WorkGroupInputSchema } from "../shared/workGroups.js";
+import { dependencyClosure, DeliveryConfirmationInputSchema, DeliveryObservationInputSchema, stageReady, WorkGroupCreateOptionsSchema, WorkGroupInputSchema } from "../shared/workGroups.js";
 import { BudgetPolicySchema, OBSERVE_USAGE } from "../shared/budgets.js";
 import { existsSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
@@ -7,7 +7,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { ConsensusDatabase } from "./database.js";
 import type { GitService } from "./git.js";
-import type { DeliveryObservation, DeliveryObservationInput, ExternalPredecessor, PreparedMerge, StageLink, StageResult, WorkGroup, WorkGroupCreateOptions, WorkGroupInput, WorkStage } from "../shared/workGroups.js";
+import type { DeliveryConfirmation, DeliveryConfirmationInput, DeliveryObservation, DeliveryObservationInput, ExternalPredecessor, PreparedMerge, StageLink, StageResult, WorkGroup, WorkGroupCreateOptions, WorkGroupInput, WorkStage } from "../shared/workGroups.js";
 import type { AgentSettings, DeferredFinding } from "../shared/contracts.js";
 
 export interface WorkGroupServiceOptions {
@@ -51,29 +51,55 @@ export class WorkGroupService {
   ) {}
 
   async observeDelivery(id: string, input: DeliveryObservationInput, origin: "user" | "mediator", requestKey: string): Promise<DeliveryObservation> {
-    const { remote = "origin", branch: requestedBranch } = DeliveryObservationInputSchema.parse(input);
     const group = this.database.workGroups.get(id);
-    const branch = group.deliveryBranch ?? requestedBranch;
-    if (!branch) throw Object.assign(new Error("deliveryBranch 또는 관측할 branch가 필요합니다."), { statusCode: 400 });
-    if (group.deliveryBranch && requestedBranch && requestedBranch !== group.deliveryBranch) {
-      throw Object.assign(new Error("관측할 branch가 묶음의 deliveryBranch와 다릅니다."), { statusCode: 400 });
-    }
-    const integration = group.stages.find(stage => stage.kind === "integration")!;
-    const resultSha = group.results?.[integration.id]?.commitOID;
-    if (!resultSha) throw Object.assign(new Error("동결된 통합 단계 결과가 있어야 전달을 관측할 수 있습니다."), { statusCode: 409 });
+    const { remote, branch, integration, resultSha } = deliveryTarget(group, DeliveryObservationInputSchema.parse(input), "관측");
     const observedRef = `refs/remotes/${remote}/${branch}`;
     const observedSha = await this.git.localRefOID(group.repositoryPath, observedRef);
     const observedAt = new Date().toISOString();
     // ref가 이후 움직여도 기록한 SHA와 동일한 커밋으로 판정한다. 네트워크 최신화는 호출자의 책임이다.
     const contains = observedSha !== null && await this.git.isAncestor(group.repositoryPath, resultSha, observedSha);
-    const current = this.database.workGroups.get(id);
-    if (current.repositoryPath !== group.repositoryPath || current.deliveryBranch !== group.deliveryBranch ||
-      current.stages.find(stage => stage.kind === "integration")?.id !== integration.id || current.results?.[integration.id]?.commitOID !== resultSha) {
-      throw Object.assign(new Error("관측 중 전달 대상 또는 통합 결과가 바뀌었습니다. 현재 묶음으로 다시 관측하세요."), { statusCode: 409 });
-    }
+    assertDeliveryTargetUnchanged(group, this.database.workGroups.get(id), integration.id, resultSha, "관측");
     const observation: DeliveryObservation = { remote, branch, observedRef, observedSha, observedAt, resultSha, contains, origin, requestKey };
     this.database.workGroups.appendDeliveryObservation(id, observation);
     return observation;
+  }
+
+  // 외부 전달 확인(사용자 전용 — 라우트가 중재자 요청을 거부한다). 묶음이 끝났을 때만, 실제 원격 ref 를 ls-remote 로 읽어 SHA 를 고정하고 동결 통합
+  // 결과가 그 조상인지 로컬 객체로 검증한다. 성공만 영수증으로 남기고 실패는 기록 없이 거부한다. fetch·push·브랜치 생성은 하지 않는다 — 원격 커밋
+  // 객체가 로컬에 없으면 호출자가 fetch 한 뒤 새 요청으로 다시 확인한다.
+  async confirmDelivery(id: string, input: DeliveryConfirmationInput, requestKey: string): Promise<DeliveryConfirmation> {
+    const group = this.database.workGroups.get(id);
+    const { remote, branch, integration, resultSha } = deliveryTarget(group, DeliveryConfirmationInputSchema.parse(input), "확인");
+    this.assertGroupFinished(group);
+    const remoteRef = `refs/heads/${branch}`;
+    const remoteSha = await this.git.remoteHeadOID(group.repositoryPath, remote, branch);
+    if (!remoteSha) throw Object.assign(new Error(`원격 ${remote}에 ${remoteRef}가 없습니다.`), { statusCode: 409 });
+    if (await this.git.localRefOID(group.repositoryPath, remoteSha) === null) {
+      throw Object.assign(new Error(`원격 ${remote} ${remoteRef}의 커밋 ${remoteSha}가 로컬 저장소에 없어 포함 여부를 판단할 수 없습니다. git fetch ${remote} 뒤 새 Idempotency-Key로 다시 확인하세요.`), { statusCode: 409 });
+    }
+    if (!await this.git.isAncestor(group.repositoryPath, resultSha, remoteSha)) {
+      throw Object.assign(new Error(`원격 ${remote} ${remoteRef}(${remoteSha})가 동결 통합 결과 ${resultSha}를 포함하지 않습니다.`), { statusCode: 409 });
+    }
+    const current = this.database.workGroups.get(id);
+    assertDeliveryTargetUnchanged(group, current, integration.id, resultSha, "확인");
+    this.assertGroupFinished(current);
+    const integrationTopicId = current.results![integration.id].topicId;
+    const confirmation: DeliveryConfirmation = { remote, branch, remoteRef, remoteSha, integrationStageId: integration.id, integrationTopicId, resultSha,
+      confirmedAt: new Date().toISOString(), origin: "user", requestKey };
+    this.database.workGroups.appendDeliveryConfirmation(id, confirmation);
+    return confirmation;
+  }
+
+  // 외부 전달 확인 전제 — 모든 단계가 연결돼 CLOSED 이고 준비 중 단계·연결 토픽의 실행 중 action 이 없다.
+  private assertGroupFinished(group: WorkGroup): void {
+    if (Object.keys(group.pending ?? {}).length) throw Object.assign(new Error("준비 중인 단계가 있어 전달을 확인할 수 없습니다."), { statusCode: 409 });
+    const topics = group.stages.map(stage => group.links[stage.id]?.topicId);
+    if (topics.some(topicId => !topicId || this.database.getTopic(topicId).state !== "CLOSED")) {
+      throw Object.assign(new Error("모든 단계가 닫힌 뒤에만 전달을 확인할 수 있습니다."), { statusCode: 409 });
+    }
+    if (this.database.runningActions().some(action => topics.includes(action.topicId))) {
+      throw Object.assign(new Error("묶음 단계에서 실행 중인 작업이 끝난 뒤 전달을 확인하세요."), { statusCode: 409 });
+    }
   }
 
   // options 는 생성 전용 입력(WorkGroupCreateOptionsSchema) — 명시 기준 커밋·단계 브랜치 접두사·묶음 밖 선행 토픽. 없으면 기존 동작이다.
@@ -591,6 +617,29 @@ function reservation(group: WorkGroup) {
     if (value) return { stageId: stage.id, value };
   }
   return undefined;
+}
+
+// 전달 관측·확인의 대상 — 브랜치는 묶음의 deliveryBranch(있으면 같은 값만 받는다) 또는 요청 값, 결과는 동결된 통합 단계 결과 커밋이다.
+function deliveryTarget(group: WorkGroup, input: DeliveryObservationInput, verb: "관측" | "확인") {
+  const { remote = "origin", branch: requestedBranch } = input;
+  const branch = group.deliveryBranch ?? requestedBranch;
+  if (!branch) throw Object.assign(new Error(`deliveryBranch 또는 ${verb}할 branch가 필요합니다.`), { statusCode: 400 });
+  if (group.deliveryBranch && requestedBranch && requestedBranch !== group.deliveryBranch) {
+    throw Object.assign(new Error(`${verb}할 branch가 묶음의 deliveryBranch와 다릅니다.`), { statusCode: 400 });
+  }
+  const integration = group.stages.find(stage => stage.kind === "integration")!;
+  const resultSha = group.results?.[integration.id]?.commitOID;
+  if (!resultSha) throw Object.assign(new Error(`동결된 통합 단계 결과가 있어야 전달을 ${verb}할 수 있습니다.`), { statusCode: 409 });
+  return { remote, branch, integration, resultSha };
+}
+// git 조회(await) 뒤 기록 직전에 묶음을 다시 읽어 대상·통합 결과가 그대로인지 본다.
+function assertDeliveryTargetUnchanged(before: WorkGroup, current: WorkGroup, integrationId: string, resultSha: string, verb: "관측" | "확인"): void {
+  const result = current.results?.[integrationId];
+  if (current.repositoryPath !== before.repositoryPath || current.deliveryBranch !== before.deliveryBranch ||
+    current.stages.find(stage => stage.kind === "integration")?.id !== integrationId || result?.commitOID !== resultSha ||
+    result.topicId !== before.results?.[integrationId]?.topicId) {
+    throw Object.assign(new Error(`${verb} 중 전달 대상 또는 통합 결과가 바뀌었습니다. 현재 묶음으로 다시 ${verb}하세요.`), { statusCode: 409 });
+  }
 }
 
 // 이 단계가 이어받는 결과 — 의존 폐포. 통합 단계는 다른 모든 단계다(닫기 때 모든 단계 결과를 조상으로 요구하므로 기준·합류 대상도 그 기준으로 잰다).

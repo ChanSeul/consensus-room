@@ -149,6 +149,77 @@ it("uses the optional deliveryBranch and rejects a changed target before recordi
   expect(fx.database.workGroups.get(group.id).deliveryObservations).toHaveLength(1);
 });
 
+it("confirms external delivery only from the live remote ref and binds the receipt to the frozen result and target", async () => {
+  const fx = fixture(), service = fx.service();
+  const input = groupInput([work("a"), integration("z", ["a"])]);
+  const group = await service.create(input);
+  await service.next(group.id); closeStage(fx, group.id, "a", "2026-10-31T00:00:00Z");
+  await service.next(group.id);
+  // 미완료 묶음(통합 단계가 열려 있음)은 결과가 없어도, 있어도 확인하지 않는다.
+  await expect(service.confirmDelivery(group.id, { branch: "develop" }, "open")).rejects.toThrow("통합 단계 결과");
+  const closed = closeStage(fx, group.id, "z", "2026-10-31T00:01:00Z");
+  const integrationTopic = closed.topic.id;
+  fx.database.updateTopic(integrationTopic, { state: "IMPLEMENTING" });
+  await expect(service.confirmDelivery(group.id, { branch: "develop" }, "unclosed")).rejects.toThrow("모든 단계가 닫힌 뒤");
+  fx.database.updateTopic(integrationTopic, { state: "CLOSED" });
+
+  const remote = join(fx.root, "origin.git");
+  execFileSync("git", ["init", "-q", "--bare", remote]);
+  run(fx.repository, "remote", "add", "origin", remote);
+  // 로컬 원격 추적 ref 만 있고 실제 원격에는 없다 — 관측은 contains=true 지만 확인은 거부한다.
+  run(fx.repository, "update-ref", "refs/remotes/origin/develop", closed.commit);
+  expect(await service.observeDelivery(group.id, { branch: "develop" }, "user", "observe")).toMatchObject({ contains: true });
+  await expect(service.confirmDelivery(group.id, { branch: "develop" }, "missing-ref")).rejects.toThrow("refs/heads/develop가 없습니다");
+  const delivered = () => fx.database.workGroupDelivered(fx.database.workGroups.get(group.id));
+  expect(delivered()).toBe(false);
+  expect(fx.database.workGroupContinuation(integrationTopic)).not.toBeNull();
+
+  // 원격이 결과를 포함하지 않는다.
+  run(fx.repository, "push", "-q", "origin", `${fx.base}:refs/heads/develop`);
+  await expect(service.confirmDelivery(group.id, { branch: "develop" }, "not-contained")).rejects.toThrow("포함하지 않습니다");
+  // 원격이 결과의 후손으로 움직였지만 그 커밋 객체가 로컬에 없다 — fetch 뒤 다시 확인하게 한다.
+  const other = join(fx.root, "other");
+  execFileSync("git", ["clone", "-q", remote, other]);
+  run(other, "fetch", "-q", fx.repository, closed.commit);
+  const descendant = run(other, "commit-tree", closed.tree, "-p", closed.commit, "-m", "external delivery");
+  run(other, "push", "-q", "origin", `${descendant}:refs/heads/develop`);
+  await expect(service.confirmDelivery(group.id, { branch: "develop" }, "unfetched")).rejects.toThrow("git fetch origin");
+  expect(fx.database.workGroups.get(group.id).deliveryConfirmations).toBeUndefined();
+
+  run(fx.repository, "fetch", "-q", "origin");
+  const before = fx.database.workGroups.get(group.id), flags = fx.database.getFlags(integrationTopic);
+  const receipt = await service.confirmDelivery(group.id, { branch: "develop" }, "confirmed");
+  expect(receipt).toMatchObject({ remote: "origin", branch: "develop", remoteRef: "refs/heads/develop", remoteSha: descendant,
+    resultSha: closed.commit, integrationStageId: "z", integrationTopicId: integrationTopic, origin: "user", requestKey: "confirmed" });
+  const { deliveryConfirmations, ...unchanged } = fx.database.workGroups.get(group.id);
+  expect(deliveryConfirmations).toEqual([receipt]);
+  expect(unchanged).toEqual(before);
+  expect(fx.database.getFlags(integrationTopic)).toEqual(flags);
+  expect(flags.pushedOID ?? null).toBeNull();
+  // 목록·인계·archive 가 같은 판정을 쓴다.
+  expect(delivered()).toBe(true);
+  expect(fx.database.workGroupContinuation(integrationTopic)).toBeNull();
+
+  // 전달 대상이 바뀌면(deliveryBranch 지정) 다른 브랜치의 옛 영수증은 전달 완료가 아니다.
+  const preview = fx.database.workGroups.previewRevision(group.id, { ...input, deliveryBranch: "release" }, before.version);
+  fx.database.workGroups.applyRevision(group.id, preview, "user");
+  expect(delivered()).toBe(false);
+  // 검증 중 묶음 대상이 바뀌면 기록하지 않는다.
+  run(fx.repository, "push", "-q", "origin", `${descendant}:refs/heads/release`);
+  vi.spyOn(fx.git, "isAncestor").mockImplementationOnce(async () => {
+    const current = fx.database.workGroups.get(group.id);
+    fx.database.workGroups.applyRevision(group.id, fx.database.workGroups.previewRevision(group.id, { ...input, deliveryBranch: "release-next" }, current.version), "user");
+    return true;
+  });
+  await expect(service.confirmDelivery(group.id, {}, "moved")).rejects.toThrow("확인 중 전달 대상");
+  expect(fx.database.workGroups.get(group.id).deliveryConfirmations).toHaveLength(1);
+
+  // 동결 결과가 다른 영수증은 인정하지 않는다.
+  const stale = { ...receipt, branch: "release-next", resultSha: fx.base };
+  fx.database.workGroups.appendDeliveryConfirmation(group.id, stale);
+  expect(delivered()).toBe(false);
+});
+
 it("continuation reports the actual default admission blocker and never readies integration early", async () => {
   const fx = fixture(), service = fx.service();
   const group = await service.create(groupInput([

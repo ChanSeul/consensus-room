@@ -1530,6 +1530,30 @@ describe("닫힌 주제 빌드 트리 정리(archive)", () => {
     database.close();
   });
 
+  it("accepts an external delivery confirmation of the current frozen result and keeps stale receipts protected", async () => {
+    const { database, engine, worktree } = closedTopicWithDerivedData();
+    database.createTopic({ ...database.getTopic("topic-1"), id: "integration-topic", slug: "integration-topic", worktreePath: join(worktree, "..", "integration") });
+    const budget = { mode: "observe" } as const, commit = "a".repeat(40);
+    database.workGroups.create("external", { title: "done", goal: "done", contracts: "contract", stages: [
+      { id: "one", kind: "work", title: "work", goal: "work", acceptance: "done", dependsOn: [], budget },
+      { id: "two", kind: "integration", title: "integration", goal: "integrate", acceptance: "done", dependsOn: ["one"], budget },
+    ] }, "/tmp/repository", commit);
+    database.workGroups.link("external", "one", "topic-1", commit);
+    database.workGroups.link("external", "two", "integration-topic", commit);
+    database.workGroups.freezeResult("external", { stageId: "two", topicId: "integration-topic", baseOID: commit, commitOID: commit,
+      reviewedTreeOID: commit, planSHA256: null, evidenceDigest: null, verifications: [], memoryChanges: [], openQuestions: [], deferredFindings: [], decisions: [], closedAt: new Date().toISOString() });
+    const receipt = { remote: "origin", branch: "develop", remoteRef: "refs/heads/develop", remoteSha: "c".repeat(40), integrationStageId: "two",
+      integrationTopicId: "integration-topic", resultSha: "b".repeat(40), confirmedAt: new Date().toISOString(), origin: "user" as const, requestKey: "stale" };
+    database.workGroups.appendDeliveryConfirmation("external", receipt);
+    engine.archiveBuildTrees("topic-1", undefined, { dryRun: true }); await waitForActionCompletion(database, "topic-1");
+    expect(database.getTimeline("topic-1").at(-1)?.body).toContain("열린 작업 묶음 external");
+    database.workGroups.appendDeliveryConfirmation("external", { ...receipt, resultSha: commit, requestKey: "current" });
+    expect(database.workGroupDelivered(database.workGroups.get("external"))).toBe(true);
+    engine.archiveBuildTrees("topic-1"); await waitForActionCompletion(database, "topic-1");
+    expect(existsSync(join(worktree, "DerivedData/gate2-a/Build"))).toBe(false);
+    database.close();
+  });
+
   it("records deletion failure separately and fails only archive while keeping CLOSED", async () => {
     const { database, engine, worktree } = closedTopicWithDerivedData();
     const blocked = join(worktree, "DerivedData/s71-post/Build");

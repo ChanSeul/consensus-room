@@ -7,6 +7,7 @@ import {
   WorkGroupInputSchema,
   workQuestionResultText,
   dependencyClosure,
+  type DeliveryConfirmation,
   type DeliveryObservation,
   type PreparedMerge,
   type StageDecision,
@@ -356,6 +357,15 @@ export class WorkGroups {
     return this.atomic(() => {
       const g = this.get(id);
       g.deliveryObservations = [...(g.deliveryObservations ?? []), structuredClone(observation)];
+      this.save(g);
+      return g;
+    });
+  }
+  // 외부 전달 확인 영수증 덧붙이기 — 관측과 같이 version·입력·연결·결과·상태를 바꾸지 않는다. 검증은 서비스(confirmDelivery)가 끝냈다.
+  appendDeliveryConfirmation(id: string, confirmation: DeliveryConfirmation): WorkGroup {
+    return this.atomic(() => {
+      const g = this.get(id);
+      g.deliveryConfirmations = [...(g.deliveryConfirmations ?? []), structuredClone(confirmation)];
       this.save(g);
       return g;
     });

@@ -14,7 +14,7 @@ import {ReviewGrantInputSchema} from "../shared/reviews.js";
 import {
   ImplementationRebaselineInputSchema, PlanningHoldInputSchema, ToolTreeRebaselineInputSchema,
   ResumeImplementationInputSchema, ResumeInputSchema, ReturnToPlanningInputSchema } from "../shared/contracts.js";
-import { DeliveryObservationInputSchema, parseWorkGroupCreateBody, WorkGroupInputSchema, type WorkGroupView } from "../shared/workGroups.js";
+import { DeliveryConfirmationInputSchema, DeliveryObservationInputSchema, parseWorkGroupCreateBody, WorkGroupInputSchema, type WorkGroupView } from "../shared/workGroups.js";
 import { WorkGroupService } from "./workGroupService.js";
 import { BudgetPolicySchema, BudgetResumeInputSchema } from "../shared/budgets.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -293,6 +293,13 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
     const origin=request.headers["x-consensus-actor"]==="mediator"?"mediator":"user";
     return runIdempotent(request,reply,globalLedger(database,`work-group:delivery-observation:${request.params.id}`),200,
       key=>workGroups.observeDelivery(request.params.id,input,origin,key));
+  });
+  // 외부 전달 확인은 사용자 전용이다 — 묶음 전달 완료(delivered)·인계 종료·archive 보호 해제로 이어지므로 중재자 위임 범위에 넣지 않는다.
+  app.post<{Params:{id:string}}>("/api/work-groups/:id/delivery-confirmation",async(request,reply)=>{
+    if (request.headers["x-consensus-actor"] === "mediator") throw Object.assign(new Error("외부 전달 확인은 사용자만 요청할 수 있습니다."), { statusCode: 403 });
+    const input=DeliveryConfirmationInputSchema.parse(request.body ?? {});
+    return runIdempotent(request,reply,globalLedger(database,`work-group:delivery-confirmation:${request.params.id}`),200,
+      key=>workGroups.confirmDelivery(request.params.id,input,key));
   });
   // 본문 stageId 가 있으면 막힌 단계 옆 독립 준비 단계를 골라 연다(E4-6). 없으면 기본 규칙(한 번에 한 단계, 첫 준비 단계).
   app.post<{Params:{id:string}}>("/api/work-groups/:id/next",async(request,reply)=>{

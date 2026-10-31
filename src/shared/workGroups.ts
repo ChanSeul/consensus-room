@@ -225,6 +225,25 @@ export interface DeliveryObservation {
   origin: "user" | "mediator";
   requestKey: string;
 }
+// 외부 전달 확인 요청(2026-10-31 사용자 승인) — 사용자가 명시적으로 부른다. 관측과 같은 입력 규칙(remote 기본 origin, branch 는 deliveryBranch 가
+// 없을 때만)이지만 로컬 원격 추적 ref 가 아니라 실제 원격(ls-remote)의 SHA 를 고정해 검증한다.
+export const DeliveryConfirmationInputSchema = DeliveryObservationInputSchema;
+export type DeliveryConfirmationInput = DeliveryObservationInput;
+// 외부 전달 확인 영수증 — 원격 refs/heads/<branch> 가 확인 시점에 remoteSha 를 가리켰고 동결 통합 결과(resultSha)가 그 조상임을 엔진이 검증했다.
+// CR 직접 push 기록(pushedOID)과 별개다. 성공만 덧붙이며 version·결과·단계 상태를 바꾸지 않는다. 전달 판정(workGroupDelivered)은 현재 동결 결과·
+// 통합 단계 토픽·deliveryBranch 와 맞는 영수증만 인정한다 — 결과나 대상이 바뀌면 옛 영수증은 새 결과의 전달 완료가 아니다.
+export interface DeliveryConfirmation {
+  remote: string;
+  branch: string;
+  remoteRef: string;
+  remoteSha: string;
+  integrationStageId: string;
+  integrationTopicId: string;
+  resultSha: string;
+  confirmedAt: string;
+  origin: "user";
+  requestKey: string;
+}
 // 묶음 밖 선행 작업의 동결 기록(생성 때 한 번) — 검증한 범위 세대·전달 커밋과 그때의 보류 원장. 뒤에 선행 토픽이 범위를 바꾸거나 다시 커밋해도
 // 이 기록은 바뀌지 않는다(묶음 기준 커밋이 그대로이므로 승계 근거도 그대로다).
 export interface ExternalPredecessor {
@@ -265,6 +284,8 @@ export interface WorkGroup extends WorkGroupInput {
   results?: Record<string, StageResult>;
   // 전달 관측 기록(덧붙이기만 한다 — 미포함에서 포함으로 바뀐 이력을 남긴다). 개정이 아니라서 version 을 올리지 않는다.
   deliveryObservations?: DeliveryObservation[];
+  // 외부 전달 확인 영수증(덧붙이기만 한다). 관측과 같이 개정이 아니라서 version 을 올리지 않는다.
+  deliveryConfirmations?: DeliveryConfirmation[];
 }
 // 목록 API 가 붙이는 파생 상태(저장하지 않는다).
 export interface WorkGroupView extends WorkGroup {

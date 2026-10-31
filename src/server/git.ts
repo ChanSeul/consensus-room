@@ -331,6 +331,15 @@ export class GitService {
     return oid && /^[a-f0-9]{40,64}$/.test(oid) ? oid : null;
   }
 
+  // 지정 원격의 refs/heads/<branch> 를 원격에 직접 물어 읽는다(외부 전달 확인) — 로컬 원격 추적 ref 를 믿지 않는다. ls-remote 패턴은 ref 꼬리로도
+  // 맞으므로 ref 이름이 정확히 같은 줄만 쓴다. 없으면 null, 원격 조회 실패는 판정할 수 없으므로 던진다. fetch·push 는 하지 않는다.
+  async remoteHeadOID(repositoryPath: string, remote: string, branchName: string): Promise<string | null> {
+    const ref = `refs/heads/${branchName}`;
+    const result = await this.run(repositoryPath, ["ls-remote", "--heads", "--", remote, ref]);
+    const line = result.stdout.split("\n").map((entry) => entry.split("\t")).find(([oid, name]) => name === ref && /^[a-f0-9]{40,64}$/.test(oid ?? ""));
+    return line ? line[0] : null;
+  }
+
   // 허용 오차 대조용(2026-09-08). 인자로 준 경로 중 git 이 추적하는 것만 돌려준다(없는 파일·untracked 는 제외).
   async trackedPaths(worktreePath: string, paths: readonly string[]): Promise<string[]> {
     if (paths.length === 0) return [];
