@@ -1065,7 +1065,7 @@ describe("계획 왕복 턴의 모델 설정", () => {
     const { database, planTurn, revisionTurn } = await run();
     expect(database.getTopic("topic-1").state).toBe("AWAITING_USER_APPROVAL");
     for (const turn of [planTurn, revisionTurn]) {
-      expect(turn.settings).toEqual({ model: "claude-fable-5-1", effort: "xhigh" });
+      expect(turn.settings).toEqual({ model: "claude-fable-5-1", effort: "max" });
     }
     database.close();
   });
