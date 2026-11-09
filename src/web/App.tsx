@@ -8,6 +8,7 @@ import { WorkGroupsPanel } from "./WorkGroupsPanel";
 import { BudgetPanel } from "./BudgetPanel";
 import { EntryGuide, TopicOverview, TopicTree, WORKING_STATES } from "./TopicStructure";
 import { isTopicGroup, workEntry, topicAncestors } from "../shared/topicStructure";
+import { recordedSender } from "../shared/messageOrigin";
 import {
   FormEvent,
   ReactNode,
@@ -92,6 +93,11 @@ function actorLabel(event: TimelineEvent): string {
   if ((provider === "claude" || provider === "codex") && (role === "planner" || role === "implementer" || role === "reviewer")) {
     return `${route?.job?.operation === "brainstorm" ? `논의 참여자 ${role === "planner" ? 1 : 2}` : ROLE_COPY[role]} · ${PROVIDER_COPY[provider]}`;
   }
+  // 서버가 기록한 호출 출처(payload.origin, CallOrigin)가 있으면 실제 발신자를 쓴다 — 중재자가 올린 결정(actor=user 저장)을 '나' 로 보이지 않는다.
+  // 출처가 없는 기록은 좌석 역할 그대로다(없는 근거로 발신자를 추정하지 않는다).
+  const sender = recordedSender(event.payload);
+  if (sender === "mediator") return "중재자";
+  if (sender === "user") return ACTOR_COPY.user;
   return ACTOR_COPY[event.actor];
 }
 

@@ -274,6 +274,23 @@ describe("역할과 실제 실행 AI", () => {
     expect(unroutedMessage.querySelector(".message-meta strong")).toHaveTextContent(/^작성자$/);
   });
 
+  // 2026-11-09 한정 수리 1/3 — 중재자가 올린 결정은 actor=user 로 저장되고 payload.origin 에 호출 출처(CallOrigin)가 남는다. 타임라인은 그 출처를 발화자로
+  // 보이고, 출처가 없는 사용자 이벤트는 지금처럼 '나' 다(없는 근거로 발신자를 추정하지 않는다).
+  it("타임라인: 기록된 호출 출처가 중재자인 사용자 이벤트는 '중재자' 로, 출처가 없거나 사용자인 이벤트는 '나' 로 보여 준다", async () => {
+    const topic = auditing();
+    const mediated: TimelineEvent = { ...timelineEvent(1, "중재자가 올린 결정"), actor: "user", kind: "decision",
+      payload: { resumeDecision: true, origin: { actor: "mediator", delegationSetAt: null, mediator: null, policyVersion: "p" } } };
+    const legacy: TimelineEvent = { ...timelineEvent(2, "출처 없는 결정"), actor: "user", kind: "decision" };
+    const direct: TimelineEvent = { ...timelineEvent(3, "사용자 출처 결정"), actor: "user", kind: "decision", payload: { origin: { actor: "user" } } };
+    vi.spyOn(api, "listTopics").mockResolvedValue([topic]);
+    vi.spyOn(api, "getTopic").mockResolvedValue(makeDetail(topic, [mediated, legacy, direct]));
+    render(<App />);
+    fireEvent.click(await screen.findByRole("tab", { name: "대화창" }));
+    expect((await screen.findByText("중재자가 올린 결정")).closest("article")!.querySelector(".message-meta strong")).toHaveTextContent(/^중재자$/);
+    expect(screen.getByText("출처 없는 결정").closest("article")!.querySelector(".message-meta strong")).toHaveTextContent(/^나$/);
+    expect(screen.getByText("사용자 출처 결정").closest("article")!.querySelector(".message-meta strong")).toHaveTextContent(/^나$/);
+  });
+
 
 
 
@@ -480,6 +497,7 @@ function makeDetail(
     implementationReport: null,
     codexReview: null,
     changedPaths: [],
+    changedPathsError: null,
     orphanCommitOID,
     deliveryRecovery: null,
   };

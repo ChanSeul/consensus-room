@@ -1,4 +1,5 @@
 import type { TimelineEvent } from "./contracts";
+import { recordedSender, type RecordedSender } from "./messageOrigin";
 import { PLAN_ITEMS_EXAMPLE, type PlanItemReport } from "./planItems";
 import { TURN_OUTCOMES, WorkerFactSchema, type EnvelopeRole, type WorkerFact } from "./turnContract";
 
@@ -54,7 +55,8 @@ const RELAY_ROLE_NAMES: Readonly<Record<EnvelopeRole, string>> = {
 // 계획 묶음의 한 판 — 세션 3 의 계획 묶음 타입과 같은 모양이다(서로 import 하지 않는다). snapshotPath 는 그 판의 스냅샷 폴더, diffPath 는 직전 판 대비 변경분.
 export interface PlanBundleFact { version: string; snapshotPath: string; diffPath?: string | null }
 
-export interface RelayMessage { sequence: number; actor: string; kind: string; body: string }
+// sender: 서버가 기록한 호출 출처(payload.origin.actor)가 있을 때만 — 중재자가 올린 결정은 actor=user 로 저장되므로 actor 만으로는 발신자를 모른다.
+export interface RelayMessage { sequence: number; actor: string; kind: string; body: string; sender?: RecordedSender }
 
 // ---- 결정 원문 묶음(2026-10-14 자문 8) ----
 // 러너에게 넘기는 사용자 결정의 본문을 한 번만 싣고, 현재 범위 세대의 결정 원문을 다시 읽을 수 있는 파일로 연다. 저장된 결정·승계 이벤트·단계 결과 digest 는
@@ -228,8 +230,14 @@ function relaySourceError(failure: SourceErrorFact): string {
 
 // 메시지 한 건 — 사용자 결정은 결정 원문 색인(entry)으로 본문을 정한다. 앞선 결정과 같은 본문이면 그 순번을, 한도를 넘는 고유 본문이면 원문 파일의 구간을
 // 가리키고, 어느 쪽이든 순번·종류·출처·길이·sha256 은 남긴다(본문 공유이지 결정 사실 삭제가 아니다). 나머지는 원문을 그대로 싣는다.
+// 기록된 발신자 — 서버가 남긴 호출 출처만 밝힌다. 출처가 없으면 저장된 역할만 보인다(출처 없는 과거 기록에 사용자 승인을 붙이지 않는다).
+function senderLabel(message: RelayMessage): string {
+  if (!message.sender) return "";
+  return ` · ${message.sender === "mediator" ? "중재자" : "사용자"} ${message.kind === "decision" ? "결정" : "메시지"}`;
+}
+
 function relayMessage(message: RelayMessage, entry: DecisionSourceEntry | undefined): string {
-  const head = `[#${message.sequence} ${message.actor}/${message.kind}]`;
+  const head = `[#${message.sequence} ${message.actor}/${message.kind}${senderLabel(message)}]`;
   if (!entry || (entry.sameAs === null && entry.chars <= DECISION_INLINE_LIMIT)) return `${head}\n${message.body}`;
   const facts = `${head} ${decisionOriginLabel(entry.origin)} · ${entry.chars}자 · sha256 ${entry.sha256.slice(0, 12)}`;
   return entry.sameAs !== null
@@ -312,7 +320,8 @@ export function relayFactsFrom(events: readonly TimelineEvent[]): Pick<RelayFact
   let groupRevision = -1;
   for (const event of [...events].sort((left, right) => left.sequence - right.sequence)) {
     if (event.actor === "user") {
-      messages.push({ sequence: event.sequence, actor: event.actor, kind: event.kind, body: event.body });
+      const sender = recordedSender(event.payload);
+      messages.push({ sequence: event.sequence, actor: event.actor, kind: event.kind, body: event.body, ...(sender ? { sender } : {}) });
       continue;
     }
     if (event.payload.workerFact === undefined) continue;

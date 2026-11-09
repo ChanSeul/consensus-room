@@ -315,7 +315,10 @@ export const TopicDetailSchema = z.object({
   consensus: z.record(z.string(), z.unknown()).nullable(),
   implementationReport: z.string().nullable(),
   codexReview: z.string().nullable(),
-  changedPaths: z.array(z.string()),
+  // 변경 파일 목록은 작업 트리 조회에 성공했을 때만 배열이다. 작업 트리가 정리됐거나 git 이 실패하면 null 이고 changedPathsError 에 사유가 있다 —
+  // 빈 배열(실제 변경 0개)과 구분한다(2026-11-09 한정 수리 3/3).
+  changedPaths: z.array(z.string()).nullable(),
+  changedPathsError: z.string().nullable(),
   orphanCommitOID: z.string().nullable(),
   deliveryRecovery: z.object({
     action: z.enum(["commit", "push"]),

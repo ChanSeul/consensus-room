@@ -540,12 +540,21 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   // 커밋·되돌리기 직후에도 낡은 목록이 보이지 않는다.
   const changedPathsCache = new Map<string, { at: number; paths: string[] }>();
   const CHANGED_PATHS_TTL_MS = 2_000;
-  const readChangedPaths = async (topicId: string, worktreePath: string): Promise<string[]> => {
+  // git 조회 실패(정리된 작업 트리·git 오류)는 상세 응답 전체를 막지 않고 「조회 불가 + 사유」로 싣는다 — 빈 목록(변경 0개)과 구분한다(2026-11-09 한정 수리 3/3,
+  // 작업 트리가 정리된 CLOSED 토픽의 상세가 500 이던 결함). 실패는 캐시하지 않아 다음 조회가 다시 시도한다.
+  type ChangedPathsView = { paths: string[]; error: null } | { paths: null; error: string };
+  const readChangedPaths = async (topicId: string, worktreePath: string): Promise<ChangedPathsView> => {
     const cached = changedPathsCache.get(topicId);
-    if (cached && Date.now() - cached.at < CHANGED_PATHS_TTL_MS) return cached.paths;
-    const paths = await git.changedPaths(worktreePath);
+    if (cached && Date.now() - cached.at < CHANGED_PATHS_TTL_MS) return { paths: cached.paths, error: null };
+    let paths: string[];
+    try {
+      paths = await git.changedPaths(worktreePath);
+    } catch (error) {
+      // git 이 stderr 를 예외에 붙이므로 전역 오류 응답과 같은 가림(safeError)을 거친다 — 사유는 남기고 자격값은 뺀다.
+      return { paths: null, error: safeError(error) };
+    }
     changedPathsCache.set(topicId, { at: Date.now(), paths });
-    return paths;
+    return { paths, error: null };
   };
 
   let graphHostCache: { at: number; value: ReturnType<typeof readHostReviewGraph> } | null = null;
@@ -559,6 +568,7 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
   app.get<{ Params: { id: string }; Querystring: { after?: string } }>("/api/topics/:id", async (request) => {
     const topic = database.getTopic(request.params.id);
     const after = Number(request.query.after ?? 0);
+    const changed = await readChangedPaths(topic.id, topic.worktreePath);
     const detail: TopicDetail = {
       topic,
       timeline: database.getTimeline(topic.id, Number.isFinite(after) ? after : 0),
@@ -568,7 +578,9 @@ export async function buildApp(dependencies: AppDependencies): Promise<FastifyIn
       consensus: await readJsonArtifact(artifacts, topic.id, "consensus"),
       implementationReport: await artifacts.readLatest(topic.id, "implementation"),
       codexReview: await artifacts.readLatest(topic.id, "codexReview"),
-      changedPaths: await readChangedPaths(topic.id, topic.worktreePath),
+      // 변경 파일은 조회에 성공했을 때만 목록이다. 조회 불가는 null 과 사유로 구분한다(빈 목록은 실제 변경 0개다).
+      changedPaths: changed.paths,
+      changedPathsError: changed.error,
       orphanCommitOID: database.getFlags(topic.id).orphanCommitOID,
       deliveryRecovery: toDeliveryRecovery(database.unknownDeliveryAction(topic.id)),
       // 역할과 실제 실행 AI(E2c C3) — 엔진 경로 판정과 같은 계획 제어 식으로 계산한다.

@@ -56,6 +56,8 @@ import type { TimelineEvent } from "../shared/contracts.js";
 import type { VerificationProfileId } from "../shared/planChecks.js";
 import type { VerificationOutcome } from "./verifications.js";
 // 재개 정보의 다음 허용 작업 — blocker 는 실제 액션의 사전 검사가 던지는 문구, deferredChecks 는 실행 때만 할 수 있는 검사(엔진 개편 E1).
+// input 은 그 액션의 요청 본문 틀이다. resume 의 틀은 요청 스키마(ResumeInputSchema)가 그대로 받는 본문이다: 일반 재개·CODEX_REVIEW 재진입은 결정문이
+// 선택이라 싣지 않고(`{}`·`{ reentry }`), CLAUDE_FIX 재진입만 결정문이 필수라 `decision: null` 자리로 보인다(2026-11-09 한정 수리 2/3). 다른 액션의 틀은 종전대로다.
 export interface ResumeAction {
   action: string;
   blocker: string | null;
@@ -966,7 +968,8 @@ export class WorkflowEngine {
       // 오류도 같은 재개다.
       // 구현 기준을 대조하는 재개 지점이면 그 대조(git)는 실행 때 한다 — 재개 정보는 git 을 조회하지 않고, 서버 밖 커밋을 채택하는 공식 경로를 함께 싣는다.
       const baselineChecked = flags.resumeState !== null && IMPLEMENTATION_BASELINE_RESUME_POINTS.has(flags.resumeState) && Boolean(flags.implementationBaseOID);
-      actions.push({ action: "resume", input: { decision: null }, blocker: this.blocker(() => { this.retryPreconditions(topicId, { resumed: true }); }),
+      // 결정문은 선택이라 틀에 싣지 않는다 — `{}` 그대로 보내면 정지 지점에서 재개되고, 결정문은 호출자가 decision 으로 더한다.
+      actions.push({ action: "resume", input: {}, blocker: this.blocker(() => { this.retryPreconditions(topicId, { resumed: true }); }),
         ...(baselineChecked ? { deferredChecks: [IMPLEMENTATION_HEAD_CHECK] } : {}) });
       if (baselineChecked) {
         actions.push({ action: "implementation-rebaseline", input: { reason: null, head: null },
@@ -999,8 +1002,9 @@ export class WorkflowEngine {
         : this.blocker(() => this.closePreconditions(topicId)),
         ...(!grouped && topic.workflowMode === "planned" ? { deferredChecks: ["작업 트리가 최종 리뷰 스냅샷과 같은지"] } : {}) });
       // 중재자 재진입(F009) — 같은 역할 세션의 수정·재리뷰. 상태 검사는 이 분기가 보장하므로 차단 사유는 재개의 사전 검사와 같다.
+      // 수정 재진입(CLAUDE_FIX)은 무엇을 고칠지 적은 결정문이 필수라 null 자리로 보이고(resume 이 결정문 없는 호출을 거절한다), 재리뷰(CODEX_REVIEW)는 선택이라 싣지 않는다.
       for (const reentry of REENTRY_POINTS) {
-        actions.push({ action: "resume", input: { reentry, decision: null },
+        actions.push({ action: "resume", input: { reentry, ...(reentry === "CLAUDE_FIX" ? { decision: null } : {}) },
           blocker: this.blocker(() => { this.retryPreconditions(topicId, { resumed: true, reentry }); }) });
       }
     } else if (topic.state === "CLOSED") {

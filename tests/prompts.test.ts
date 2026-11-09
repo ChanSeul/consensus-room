@@ -188,6 +188,36 @@ describe("역할별 원문 왕복 프롬프트", () => {
     expect(broken.messages![0].body).toContain("sourceId");
   });
 
+  // 2026-11-09 한정 수리 1/3 — 중재자가 올린 결정은 actor=user 로 저장되고 payload.origin 에 호출 출처(CallOrigin)가 남는다. 전달 메시지와 머리말이 그 출처를
+  // 보존한다. 출처가 없는 과거 기록은 지금처럼 역할만 보이고, 출처 형식이 다르면(문자열 등) 발신자를 추정하지 않는다.
+  it("사용자 이벤트의 기록된 호출 출처(payload.origin.actor)를 sender 로 옮기고 머리말에 중재자·사용자를 밝히며, 출처가 없으면 지금처럼 역할만 보인다", () => {
+    const event = (sequence: number, payload: Record<string, unknown>, kind: TimelineEvent["kind"] = "decision"): TimelineEvent =>
+      ({ id: sequence, topicId: "t", sequence, scopeGeneration: 1, actor: "user", kind, state: "IMPLEMENTING", body: `본문 ${sequence}`, payload, createdAt: "2026-11-09T00:00:00.000Z" });
+    const facts = relayFactsFrom([
+      event(17, { resumeDecision: true, origin: { actor: "mediator", delegationSetAt: null, mediator: null, policyVersion: "p" } }),
+      event(18, {}),
+      event(19, { origin: { actor: "user" } }),
+      event(20, { origin: "mediator" }),
+      event(21, { origin: { actor: "mediator" } }, "note"),
+    ]);
+    expect(facts.messages).toEqual([
+      { sequence: 17, actor: "user", kind: "decision", body: "본문 17", sender: "mediator" },
+      { sequence: 18, actor: "user", kind: "decision", body: "본문 18" },
+      { sequence: 19, actor: "user", kind: "decision", body: "본문 19", sender: "user" },
+      { sequence: 20, actor: "user", kind: "decision", body: "본문 20" },
+      { sequence: 21, actor: "user", kind: "note", body: "본문 21", sender: "mediator" },
+    ]);
+    expect(facts.messages![1]).not.toHaveProperty("sender");
+    expect(facts.messages![3]).not.toHaveProperty("sender");
+    const prompt = buildRelayPrompt(facts);
+    expect(prompt).toContain("[#17 user/decision · 중재자 결정]\n본문 17");
+    expect(prompt).toContain("[#18 user/decision]\n본문 18");
+    expect(prompt).toContain("[#19 user/decision · 사용자 결정]\n본문 19");
+    expect(prompt).toContain("[#20 user/decision]\n본문 20");
+    expect(prompt).toContain("[#21 user/note · 중재자 메시지]\n본문 21");
+    expectNoRetiredObligation(prompt);
+  });
+
   // 작업 묶음 개정 사실(v3.18 (33')·(33'a)) — 본문은 개정 시점의 단계 문맥 전체이고, 한 번에 받은 개정 가운데 가장 최근 하나만 싣는다.
   it("작업 묶음 개정 사실은 단계 문맥 본문 전체를 system 메시지로 싣고, 여러 개정이 함께 오면 최근 것만 남기며, 형식이 틀리면 원본째 보인다", () => {
     const event = (sequence: number, actor: TimelineEvent["actor"], body: string, payload: Record<string, unknown> = {}, kind: TimelineEvent["kind"] = "system"): TimelineEvent =>
