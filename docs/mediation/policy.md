@@ -121,6 +121,7 @@ planner·runner·reviewer가 결정·증거·승인을 기다리거나 실패하
 - 역할별 세션은 판단 맥락에 맞게 유지한다. 설정을 임의로 낮추거나 모델·공급자를 다른 것으로 조용히 대체하지 않는다. 모델·캐시 비용 감소는 비교 가능한 실측이 있을 때만 주장한다.
 - 보장할 동작과 실제 실패 위험에 맞는 최소 검사를 고른다. 입력·도구·환경이 같은 성공 증거는 재사용하고 관련 변경·새 실패·반증 때 다시 검사한다. 전체 검사를 반복하는 것 자체를 완료 조건으로 만들지 않는다.
 - 테스트·컴파일·UI·실기기·원격 전달의 증거를 구분한다. 필요한 증거가 없으면 부족한 점과 다음 행동을 기록한다. 언어별 검사·빌드 정책은 해당 프로젝트의 지침과 승인 계획에서 정한다.
+- 중재자가 호스트에서 직접 실행하는 빌드·테스트 검증은 `npm run verify:host -- --label <이름> [--cwd DIR] [--preserve build/Logs ...] -- <명령> [인자...]`로 실행한다. 이 진입점이 실행마다 임시 build·cache·work·tmp 폴더를 만들어 소유하고(환경 변수 `CR_VERIFY_BUILD_DIR`·`CR_VERIFY_CACHE_DIR`·`CR_VERIFY_WORK_DIR`·`CR_VERIFY_TMP_DIR`·`CR_VERIFY_EVIDENCE_DIR`, `TMPDIR`·`XDG_CACHE_HOME`·`CLANG_MODULE_CACHE_PATH`, 인자 토큰 `{build}`·`{cache}`·`{work}`·`{tmp}`·`{evidence}`), 명령이 끝나는 경계(성공·실패·취소·시간 초과)에서 소유 프로세스 그룹이 빈 뒤 표준 증거(`build/Logs`·`build/TestResults`·`build/*.xcresult`, 있을 때)와 `--preserve`로 더 지정한 로그·결과를 증거 폴더(`<데이터 폴더>/host-verification/<이름>-<시각>-<난수>` 또는 `--evidence-dir`, 실행 하나가 `command.json`으로 먼저 차지한 빈 폴더)의 `preserved/`로 복사해 바이트를 대조하고, 그때만 임시 폴더를 지운다. 보존 트리 밖을 가리키는 링크·루트 교체(dev/ino 불일치)·보존 실패·프로세스 생존·삭제 실패는 `result.json`의 `cleanup`과 종료 코드 3으로 드러나며 검증 성공으로 숨기지 않는다. 빌드 산출물의 위치를 도구 인자로 받는 명령(xcodebuild의 `-derivedDataPath`, swiftc의 `-module-cache-path`)에는 토큰으로 소유 경로를 넘긴다. `/tmp`·홈 아래에 직접 만든 임시 빌드 폴더는 이 진입점의 소유가 아니므로 자동 정리되지 않는다.
 - 정지·실패 뒤에도 사용량, 계획, 원문, 열린 요청, 검토 지적, 작업 트리와 커밋을 보존한다. 서버가 허용한 복구 API를 사용하고 DB 값을 직접 바꿔 승인·한도·완료 상태를 우회하지 않는다.
 
 ## 완료 확인과 종료

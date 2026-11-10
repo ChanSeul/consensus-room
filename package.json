@@ -18,6 +18,7 @@
     "check": "npm run test && npm run build",
     "agent-runtime": "tsx src/server/runtime/cli.ts",
     "verify:static": "tsx src/server/verificationCli.ts",
+    "verify:host": "tsx src/server/hostVerificationCli.ts",
     "explore": "tsx src/server/exploreCli.ts",
     "compare:search": "node scripts/search-comparison.mjs",
     "mediator:interrupts": "tsx src/server/mediation/interruptBridge.ts"

@@ -366,7 +366,8 @@ function psEnvironment(): NodeJS.ProcessEnv {
 const PIPE_DRAIN_IDLE_MS = 100;
 const PIPE_DRAIN_MAX_MS = 2_000;
 
-function terminateProcessGroup(pid: number | undefined, signal: NodeJS.Signals, group = true): void {
+// 아래 세 함수는 호스트 검증 실행(hostVerification.ts)도 같은 종료 계약으로 쓴다 — SIGTERM 1초 유예 → SIGKILL → 5초 확인. 동작은 그대로다.
+export function terminateProcessGroup(pid: number | undefined, signal: NodeJS.Signals, group = true): void {
   if (!pid) return;
   try {
     if (process.platform === "win32" || !group) process.kill(pid, signal);
@@ -377,7 +378,7 @@ function terminateProcessGroup(pid: number | undefined, signal: NodeJS.Signals, 
 }
 
 // SIGTERM 유예 1초를 기다렸다가 남아 있으면 SIGKILL을 보내고 group이 빌 때까지(상한 5초) 확인한다.
-async function drainProcessGroup(pid: number | undefined, group = true): Promise<unknown> {
+export async function drainProcessGroup(pid: number | undefined, group = true): Promise<unknown> {
   if (!pid) return undefined;
   const graceDeadline = Date.now() + 1_000;
   while (Date.now() < graceDeadline) {
@@ -402,7 +403,7 @@ function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-function processGroupAlive(pid: number | undefined, group = true): boolean {
+export function processGroupAlive(pid: number | undefined, group = true): boolean {
   if (!pid) return false;
   try {
     if (process.platform === "win32" || !group) process.kill(pid, 0);
