@@ -4,6 +4,8 @@ import { closeSync, createReadStream, openSync } from "node:fs";
 import { cp, lstat, mkdir, mkdtemp, readdir, readlink, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { acquireSimulator, describeSimulator, simulatorComplete, SIMULATOR_ENV, SIMULATOR_LOG_FILE, SIMULATOR_TOKEN, type SimulatorHandle, type SimulatorLimits,
+  type SimulatorRecord, type SimulatorRequest } from "./hostVerificationSimulator.js";
 import { drainProcessGroup, processGroupAlive, terminateProcessGroup } from "./processRunner.js";
 
 // 중재자가 호스트에서 실행하는 검증 명령(xcodebuild·swiftc·테스트 러너 등)의 임시 빌드·캐시 수명을 코드가 소유한다.
@@ -13,7 +15,10 @@ import { drainProcessGroup, processGroupAlive, terminateProcessGroup } from "./p
 // 보존 실패·신원 변경·삭제 오류)는 result.json 에 남고 성공으로 가려지지 않는다.
 // 소유 경계: 자기가 만든 루트(mkdtemp 로 받은 dev/ino)만 지운다 — /tmp 순회·이름·나이로 남의 폴더를 추정하지 않고, 명령의 작업 폴더(원본 소스)와
 // 공유 캐시는 건드리지 않는다. 보존 복사는 스크래치 루트 안에서 읽고 증거 폴더 안에만 쓴다(조상 링크·루트 교체는 거부). 증거 폴더는 실행 하나가
-// 원자적으로 차지한다(command.json 을 wx 로 만든 실행만 그 폴더에 쓴다). 서버는 이 모듈을 부르지 않는다(서버는 등록 프로필만 실행한다 —
+// 원자적으로 차지한다(command.json 을 wx 로 만든 실행만 그 폴더에 쓴다).
+// iOS 시뮬레이터: simulator 요청이 있으면 이 실행 전용 기기를 만들어 띄우고 log stream 을 소유한 뒤(hostVerificationSimulator.ts), 명령이 어떻게 끝나든
+// 보존·스크래치 삭제 전에 스트림 종료 → 기기 shutdown·delete 를 한다. 기기 이름·UDID 는 만들자마자 command.json 에 적는다. 명령이 직접 `simctl boot` 한
+// 기기나 직접 띄운 스트림은 이 실행의 소유로 추정하지 않는다(정리하지 않는다). 서버는 이 모듈을 부르지 않는다(서버는 등록 프로필만 실행한다 —
 // verifications.ts). 진입점은 중재자 CLI(hostVerificationCli.ts, `npm run verify:host`)다.
 
 export const HOST_VERIFICATION_ENV = {
@@ -26,7 +31,7 @@ export type HostVerificationToken = typeof HOST_VERIFICATION_TOKENS[number];
 // 선언 누락이 조용한 로그 손실이 되지 않게 한다(R3). 추가 경로는 옵션으로 받는다.
 export const DEFAULT_PRESERVE_PATHS = ["build/Logs", "build/TestResults"] as const;
 const LABEL = /^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/;
-export const HOST_VERIFICATION_RESULT_VERSION = 1;
+export const HOST_VERIFICATION_RESULT_VERSION = 2;
 const CLAIM_FILE = "command.json";
 
 export interface PreserveRequest { path: string; required: boolean }
@@ -44,10 +49,13 @@ export interface HostVerificationOptions {
   preserve?: readonly PreserveRequest[];
   environment?: NodeJS.ProcessEnv;
   signal?: AbortSignal;
-  // 테스트 주입 — 그룹 소멸 대기의 결과를 바꿔 "살아 있으면 지우지 않는다" 를 확인한다. 운영 호출은 쓰지 않는다.
-  hooks?: { drainProcessGroup?: (pid: number | undefined) => Promise<unknown> };
+  // 이 실행 전용 iOS 시뮬레이터 — 있으면 기기를 만들어 띄운 뒤 명령에 UDID 를 넘기고({simulator} 토큰·CR_VERIFY_SIMULATOR_UDID), 끝나면 끄고 지운다.
+  simulator?: SimulatorRequest;
+  // 테스트 주입 — 그룹 소멸 대기의 결과를 바꿔 "살아 있으면 지우지 않는다" 를 확인하고, simctl 대신 가짜 실행 파일·작은 상한을 쓴다. 운영 호출은 쓰지 않는다.
+  hooks?: { drainProcessGroup?: (pid: number | undefined) => Promise<unknown>; simctl?: readonly string[]; simulatorLimits?: Partial<SimulatorLimits> };
 }
-export type HostVerificationStatus = "succeeded" | "failed" | "cancelled" | "timed_out" | "spawn_failed";
+// setup_failed = 시뮬레이터 준비(create·boot·bootstatus·log stream)가 실패해 명령을 실행하지 않았다.
+export type HostVerificationStatus = "succeeded" | "failed" | "cancelled" | "timed_out" | "spawn_failed" | "setup_failed";
 export interface PreservedEntry {
   path: string; required: boolean; status: "preserved" | "missing" | "failed";
   destination: string | null; files: number; bytes: number; error: string | null;
@@ -66,7 +74,9 @@ export interface HostVerificationResult {
   processGroup: { drained: boolean; error: string | null };
   preserved: PreservedEntry[];
   cleanup: { status: "removed" | "kept" | "failed"; reason: string | null; error: string | null };
-  // 검증 성공·보존 성공·삭제 완료가 모두 맞을 때만 true — CLI 종료 코드 0 의 조건.
+  // 이 실행이 소유한 시뮬레이터(요청이 없으면 null). 기기 정리가 removed·not_created 가 아니거나 시작한 로그 수집이 captured 가 아니면 complete 는 false 다.
+  simulator: SimulatorRecord | null;
+  // 검증 성공·보존 성공·삭제 완료(시뮬레이터 정리 포함)가 모두 맞을 때만 true — CLI 종료 코드 0 의 조건.
   complete: boolean;
   // result.json 을 차지한 증거 폴더에 썼는가 — 증거 폴더의 신원이 실행 중 바뀌었으면 false 이고 그 자리에는 아무것도 쓰지 않았다.
   recorded: boolean;
@@ -83,6 +93,10 @@ export async function runHostVerification(options: HostVerificationOptions): Pro
   const timeoutMs = options.timeoutMs ?? 0;
   if (!Number.isFinite(timeoutMs) || timeoutMs < 0) throw new Error("timeoutMs 는 0 이상의 수여야 합니다.");
   const extraPreserve = (options.preserve ?? []).map((request) => ({ ...request, path: normalizePreservePath(request.path) }));
+  if (options.simulator && !options.simulator.deviceType.trim()) throw new Error("시뮬레이터 device type 이 비어 있습니다.");
+  if (!options.simulator && options.args.some((arg) => arg.includes(SIMULATOR_TOKEN))) {
+    throw new Error(`${SIMULATOR_TOKEN} 토큰은 시뮬레이터를 요청한 실행(--simulator-device)에서만 쓸 수 있습니다.`);
+  }
   const scratchBase = await realpath(options.scratchBase ?? tmpdir());
   // 증거 폴더 점유(R4) — 폴더가 없으면 만들고, command.json 을 O_EXCL 로 만든 실행만 이 폴더의 주인이다. 진 쪽은 아무것도 쓰지 않고 거절된다.
   const claimedDirectory = resolve(options.evidenceDirectory);
@@ -123,14 +137,53 @@ export async function runHostVerification(options: HostVerificationOptions): Pro
     const cwd = resolve(substitute(options.cwd, paths));
     if (!(await stat(cwd).catch(() => null))?.isDirectory()) throw new Error(`작업 폴더가 디렉터리가 아닙니다: ${cwd}`);
     // 프로세스를 띄우기 전에 소유 경로를 점유 파일에 적는다 — 이 프로세스가 죽어도 어느 폴더가 이 실행의 것이었는지 남는다.
-    await writeFile(files.command, JSON.stringify({ version: HOST_VERIFICATION_RESULT_VERSION, label: options.label, state: "running", pid: process.pid,
+    // 시뮬레이터를 쓰면 기기 이름을 정한 직후와 UDID 를 안 직후에 같은 파일을 다시 쓴다 — finally 를 못 도는 종료(SIGKILL·OS)에서도 어느 기기가 이 실행의 것이었는지 남는다.
+    const claim = { version: HOST_VERIFICATION_RESULT_VERSION, label: options.label, state: "running", pid: process.pid,
       command: options.command, args, cwd, scratch, scratchIdentity: rootIdentity, evidence, environment, timeoutMs,
-      preserve: extraPreserve, defaultPreserve: DEFAULT_PRESERVE_PATHS, createdAt: new Date().toISOString() }, null, 2) + "\n", { mode: 0o600 });
+      preserve: extraPreserve, defaultPreserve: DEFAULT_PRESERVE_PATHS, simulatorRequest: options.simulator ?? null, createdAt: new Date().toISOString() };
+    const writeClaim = (extra: Record<string, unknown>) => writeFile(files.command, JSON.stringify({ ...claim, ...extra }, null, 2) + "\n", { mode: 0o600 });
+    await writeClaim({});
     const drain = options.hooks?.drainProcessGroup ?? ((pid: number | undefined) => drainProcessGroup(pid));
     const startedAt = new Date();
     phase = "running";
-    const execution = await execute({ command: options.command, args, cwd, environment: { ...(options.environment ?? process.env), ...environment },
-      stdout: files.stdout, stderr: files.stderr, timeoutMs, signal: options.signal, drain });
+    let simulator: SimulatorHandle | null = null;
+    let simulatorRecord: SimulatorRecord | null = null;
+    let execution: Execution;
+    // 결과에는 실제로 넘긴 인자({simulator} 를 UDID 로 바꾼 뒤)를 적는다.
+    let runArgs = args;
+    // 차지한 증거 폴더와 만든 스크래치 루트가 그대로인지 — 시뮬레이터 준비(비동기) 중의 쓰기와 명령을 띄우기 직전에 확인한다.
+    // 어느 쪽이든 바뀌었으면 명령을 실행하지 않는다(명령은 스크래치에 쓰고, 출력은 증거 폴더에 쓴다). 바뀐 자리의 폴더는 소유가 아니므로 쓰지도 지우지도 않는다.
+    const ownedPathsChanged = async (): Promise<string | null> => {
+      const changed = [
+        ...(await identityHolds(root!, rootIdentity!)) ? [] : ["스크래치 루트"],
+        ...(await identityHolds(evidence, evidenceIdentity)) ? [] : ["증거 폴더"],
+      ];
+      return changed.length ? `${changed.join("·")}의 신원(dev/ino·실제 경로)이 만든·차지한 것과 달라 명령을 실행하지 않았습니다.` : null;
+    };
+    const guardOwnedPaths = async () => { const changed = await ownedPathsChanged(); if (changed) throw new Error(changed); };
+    try {
+      if (options.simulator) {
+        simulator = await acquireSimulator({ label: options.label, request: options.simulator, logPath: join(evidence, SIMULATOR_LOG_FILE),
+          simctl: options.hooks?.simctl ?? ["xcrun", "simctl"], limits: options.hooks?.simulatorLimits, signal: options.signal,
+          onOwnership: (ownership) => writeClaim({ simulator: ownership }), guard: guardOwnedPaths });
+      }
+      const changed = await ownedPathsChanged();
+      if (changed) {
+        execution = { status: "setup_failed", pid: null, exitCode: null, signal: null, durationMs: 0, error: changed, processGroup: { drained: true, error: null } };
+      } else if (simulator && !simulator.ready) {
+        execution = { status: simulator.record.setup.status === "cancelled" ? "cancelled" : "setup_failed", pid: null, exitCode: null, signal: null, durationMs: 0,
+          error: simulator.record.setup.error, processGroup: { drained: true, error: null } };
+      } else {
+        const udid = simulator?.record.udid ?? null;
+        if (udid) environment[SIMULATOR_ENV] = udid;
+        if (udid) runArgs = args.map((arg) => arg.split(SIMULATOR_TOKEN).join(udid));
+        execution = await execute({ command: options.command, args: runArgs, cwd,
+          environment: { ...(options.environment ?? process.env), ...environment }, stdout: files.stdout, stderr: files.stderr, timeoutMs, signal: options.signal, drain });
+      }
+    } finally {
+      // 명령이 어떻게 끝나든(예외 포함) 보존·삭제보다 먼저 스트림과 기기를 회수한다. release 는 예외를 던지지 않는다.
+      if (simulator) simulatorRecord = await simulator.release();
+    }
     const finishedAt = new Date();
     // 보존·삭제는 만든 루트와 차지한 증거 폴더가 그대로일 때만 한다(R2) — 명령이 루트를 옮기고 다른 폴더를 그 자리에 두면 그 폴더는 소유가 아니다.
     // 두 신원은 따로 본다: 증거 폴더가 바뀌었으면 그 자리에는 결과도 쓰지 않는다(그 폴더의 파일은 다른 작업의 것일 수 있다).
@@ -160,11 +213,11 @@ export async function runHostVerification(options: HostVerificationOptions): Pro
       cleanup = await removeScratch(root, rootIdentity);
     }
     const result: HostVerificationResult = {
-      version: HOST_VERIFICATION_RESULT_VERSION, label: options.label, status: execution.status, command: options.command, args, cwd,
-      pid: execution.pid, exitCode: execution.exitCode, signal: execution.signal,
+      version: HOST_VERIFICATION_RESULT_VERSION, label: options.label, status: execution.status, command: options.command, args: runArgs, cwd,
+      pid: execution.pid, exitCode: execution.exitCode, signal: execution.signal, simulator: simulatorRecord,
       startedAt: startedAt.toISOString(), finishedAt: finishedAt.toISOString(), durationMs: execution.durationMs, error: execution.error,
       scratch, evidence: { directory: evidence, ...files }, environment, processGroup: execution.processGroup, preserved, cleanup,
-      complete: execution.status === "succeeded" && !preservationFailed && cleanup.status === "removed",
+      complete: execution.status === "succeeded" && !preservationFailed && cleanup.status === "removed" && simulatorComplete(simulatorRecord),
       // 차지한 폴더가 아닌 곳에는 결과를 쓰지 않는다 — 호출자(CLI stdout)에게만 돌려준다.
       recorded: evidenceError === null,
     };
@@ -187,7 +240,7 @@ export function describeHostVerification(result: HostVerificationResult): string
   const problems = result.preserved.filter((entry) => entry.status === "failed" || (entry.status === "missing" && entry.required)).map((entry) => `${entry.path}: ${entry.status}`);
   return `호스트 검증 ${result.label}: ${result.status}(${exit}, ${(result.durationMs / 1000).toFixed(1)}초) — 보존 ${kept}/${result.preserved.length}`
     + `${problems.length ? `(실패: ${problems.join(", ")})` : ""}, 스크래치 ${result.cleanup.status === "removed" ? "삭제됨" : `${result.cleanup.status}: ${result.cleanup.reason ?? result.cleanup.error}`}`
-    + `${result.processGroup.error ? `, 프로세스 그룹: ${result.processGroup.error}` : ""}. 증거 ${result.evidence.directory}${result.recorded ? "" : "(result.json 미기록 — 증거 폴더 신원 변경)"}`;
+    + `${result.processGroup.error ? `, 프로세스 그룹: ${result.processGroup.error}` : ""}${result.simulator ? `, ${describeSimulator(result.simulator)}` : ""}. 증거 ${result.evidence.directory}${result.recorded ? "" : "(result.json 미기록 — 증거 폴더 신원 변경)"}`;
 }
 
 function substitute(value: string, paths: Record<HostVerificationToken, string>): string {
